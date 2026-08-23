@@ -129,6 +129,33 @@ def _legacy_lora_floor_gb(lora_rank: int, effective_params_b: float) -> float:
     return (lora_rank / 16.0) * (0.3 + 0.04 * effective_params_b)
 
 
+def _lora_parameter_count(
+    lora_rank: int, model_info=None, *, tensor_parallel: int = 1
+) -> int | None:
+    """lora parameters resident on one tensor-parallel rank from concrete target geometry."""
+    shapes = tuple(getattr(model_info, "lora_target_shapes", ()) or ())
+    rank = int(lora_rank)
+    if not shapes or rank <= 0:
+        return None
+    tp_size = max(1, int(tensor_parallel))
+    if tp_size == 1:
+        return rank * sum((int(i) + int(o)) * int(count) for i, o, count in shapes)
+    # vllm shards one factor, except the current min-dim-1 gate keeps that factor whole. integer shard
+    # sizing covers that catalog shape exactly; this is not a general replicated-layer classifier.
+    return sum(
+        rank * int(count) * (max(int(i), int(o)) + math.ceil(min(int(i), int(o)) / tp_size))
+        for i, o, count in shapes
+    )
+
+
+def _lora_weight_memory_gb(
+    lora_rank: int, model_info=None, *, tensor_parallel: int = 1
+) -> float | None:
+    """rank-local resident bf16 lora weights, or none without catalog target geometry."""
+    params = _lora_parameter_count(lora_rank, model_info, tensor_parallel=tensor_parallel)
+    return None if params is None else params * _BYTES_PER_PARAM["bf16"] / 1e9
+
+
 def _lora_memory_gb(
     lora_rank: int,
     effective_params_b: float,
@@ -137,14 +164,9 @@ def _lora_memory_gb(
 ) -> float:
     """Adapter, gradient, and optimizer memory for the actual PEFT all-linear targets."""
     floor = _legacy_lora_floor_gb(lora_rank, effective_params_b)
-    shapes = tuple(getattr(model_info, "lora_target_shapes", ()) or ())
-    if not shapes:
+    trainable_params = _lora_parameter_count(lora_rank, model_info)
+    if trainable_params is None:
         return floor
-    target_dims = sum(
-        (int(in_features) + int(out_features)) * int(count)
-        for in_features, out_features, count in shapes
-    )
-    trainable_params = max(1, int(lora_rank)) * target_dims
     bytes_per_param = (
         _LORA_PAGED_BYTES_PER_PARAM
         if (algorithm or "").lower() in ("grpo", "rl")
@@ -225,15 +247,15 @@ def grpo_kv_floor_gb(
     fp8_kv: bool = False,
     model_info=None,
     preserve_legacy_floor: bool = False,
+    lora_rank: int = 0,
+    tensor_parallel: int = 1,
 ) -> int:
-    """Smallest card (GB) whose colocated vLLM executor budget still leaves a viable KV pool.
-
-    The 0.45/0.55 cap must hold the weight copy plus half the concurrent group's KV; otherwise
-    vLLM can fail with "No available memory for the cache blocks".
-    """
+    """Smallest card whose cap holds rank-local weights, adapter, and half the KV pool."""
     kv_params_b = float(active_params_b) if active_params_b else float(params_b)
-    weights_gb = max(0.5, float(params_b)) * 2.0
-    need = weights_gb + 0.5 * _resident_kv_gb(
+    tp_size = max(1, int(tensor_parallel))
+    weights_gb = max(0.5, float(params_b)) * 2.0 / tp_size
+    adapter_gb = _lora_weight_memory_gb(lora_rank, model_info, tensor_parallel=tp_size) or 0.0
+    kv_gb = _resident_kv_gb(
         kv_params_b,
         vllm_max_len,
         group_size,
@@ -241,6 +263,7 @@ def grpo_kv_floor_gb(
         model_info=model_info,
         preserve_legacy_floor=preserve_legacy_floor,
     )
+    need = weights_gb + adapter_gb + 0.5 * kv_gb
     lower = math.ceil(need / 0.55)
     upper = math.ceil(need / 0.45)
     for total_vram_gb in range(lower, upper + 1):
@@ -249,10 +272,31 @@ def grpo_kv_floor_gb(
     return upper
 
 
+def _rollout_stays_resident(model_info, model_id: str = "") -> bool:
+    """True when the rollout engine is pinned resident and never sleeps.
+
+    Named for the property sizing actually depends on rather than the catalog flag that currently
+    implies it: ``sleep_unsupported`` records that a model HANGS on wake, and
+    ``rollout_resident_overrides`` turns that into ``free_cache_engine=false``. Sizing cares only
+    about the second fact, so it reads through this predicate -- the worker gate
+    (``rollout_fp8_kv``) answers the same question, and the two must not drift.
+    """
+    if getattr(model_info, "sleep_unsupported", False):
+        return True
+    if not model_id:
+        return False
+    from flash.core.catalog import MODELS
+
+    info = MODELS.get(model_id)
+    return bool(info is not None and getattr(info, "sleep_unsupported", False))
+
+
 def _declares_linear_attention(model_info, model_id: str = "") -> bool:
     """True for a GDN hybrid, using the catalog rather than a network config fetch.
 
-    GDN workers reject fp8 KV, so sizing must not apply that discount. Fall back to catalog lookup
+    A GDN worker rejects fp8 KV only when its rollout engine sleeps, because the crash is vllm's
+    ``init_fp8_kv_scales`` on wake; a model the catalog pins resident keeps fp8. Callers that size a
+    KV pool must therefore pair this with ``_rollout_stays_resident``. Fall back to catalog lookup
     by model id for pinned revisions because attention family is revision-independent.
     """
     if int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0:
@@ -274,6 +318,7 @@ def _rollout_kv_floor_gb(
     model_info=None,
     model_id: str = "",
     preserve_legacy_floor: bool = False,
+    lora_rank: int = 0,
 ) -> int:
     floor = grpo_kv_floor_gb(
         params_b,
@@ -282,6 +327,7 @@ def _rollout_kv_floor_gb(
         active_params_b=active_params_b,
         model_info=model_info,
         preserve_legacy_floor=preserve_legacy_floor,
+        lora_rank=lora_rank,
     )
     from flash.providers.base import max_non_fp8_kv_vram_gb
 
@@ -302,6 +348,7 @@ def _rollout_kv_floor_gb(
         fp8_kv=True,
         model_info=model_info,
         preserve_legacy_floor=preserve_legacy_floor,
+        lora_rank=lora_rank,
     )
     return max(fp8_floor, ceiling + 1)
 
@@ -661,7 +708,12 @@ def _opd_fp8_adjust(
     """Re-size an OPD requirement with fp8 KV on modern cards when sufficient."""
     from flash.providers.base import max_non_fp8_kv_vram_gb
 
-    if _declares_linear_attention(model_info, model_id):
+    # a gdn hybrid keeps the bf16 reservation only while its engine sleeps. once the catalog pins
+    # it resident the worker sends fp8 (rollout_fp8_kv), so sizing must price the same cache or it
+    # reserves a full-width pool nobody allocates.
+    if _declares_linear_attention(model_info, model_id) and not _rollout_stays_resident(
+        model_info, model_id
+    ):
         return need
     ceiling = max_non_fp8_kv_vram_gb()
     if need <= ceiling:
@@ -812,6 +864,7 @@ def _catalog_model_required_vram_gb(
                 model_info=sizing_info,
                 model_id=model_id,
                 preserve_legacy_floor=is_opd,
+                lora_rank=lora_rank,
             ),
         )
     return need

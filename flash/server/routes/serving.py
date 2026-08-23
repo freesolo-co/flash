@@ -22,10 +22,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from jsonschema.validators import validator_for  # noqa: F401
 
-from flash._internal.channel import CLI_NAME
 from flash.core.spec import JobSpec, require_project_id
 from flash.runner import (
-    _internal_spec_from_status,
     effective_spec_from_status,
     # kept although this module no longer calls it: a deploy test patches
     # `serving.mark_deployed`, and `monkeypatch.setattr` needs the attribute to already exist.
@@ -191,7 +189,6 @@ def _reject_contended_deploy(
 
 def _queued_deployment_record(
     run_id: str,
-    spec: JobSpec,
     effective_spec: JobSpec,
     deploy_prefix: str,
     checkpoint_step,
@@ -206,7 +203,7 @@ def _queued_deployment_record(
         from flash.serve.deploy import validate_serving_lora_rank
 
         validate_serving_lora_rank(
-            spec.model,
+            effective_spec.model,
             effective_spec.train.lora_rank,
             rank_source="effective prepared LoRA rank",
         )
@@ -216,7 +213,7 @@ def _queued_deployment_record(
     try:
         dep_dict = _app.deployment_record(
             run_id=run_id,
-            model=spec.model,
+            model=effective_spec.model,
             adapter_prefix=deploy_prefix,
             state="queued",
             checkpoint_step=checkpoint_step,
@@ -241,37 +238,12 @@ def _queued_deployment_record(
 
 
 def _validate_deploy_request(
-    run_id: str, status, spec: JobSpec, payload: dict, dry_run: bool
+    run_id: str, status, payload: dict, dry_run: bool
 ) -> tuple[JobSpec, dict]:
     """Reject a deploy that cannot proceed, before anything is queued or registered.
 
-    Returns the effective spec and the current deployment record for the caller to work from.
+    Returns the effective spec and current deployment record.
     """
-    # A pin the AUTHOR wrote before the config key was removed is a request serving cannot honour, so
-    # it stays refused for persisted runs.
-    #
-    # A pin the RUNNER assigned is different. SFT is force-pinned by
-    # `runner.submit.prepare_job` -> `_resolve_model_revision(required=True)` so workload profiling
-    # keys on an immutable commit. Rejecting those made every SFT run, and every adapter warm-started
-    # from one, permanently undeployable, which also blocks `flash models chat` and `flash env eval`,
-    # since both require a deployment.
-    #
-    # provenance and the pin are read from the INTERNAL worker spec, not `spec`: to_dict() strips both
-    # from new public specs. that includes a new child inheriting a legacy authored source pin, which
-    # must remain rejected just like its parent. `_internal_spec_from_status` falls back to the public
-    # spec for pre-upgrade runs without a worker snapshot, so historical authored pins also fail closed.
-    internal_spec = _internal_spec_from_status(status)
-    if (
-        spec.model_revision or internal_spec.model_revision
-    ) and not internal_spec.model_revision_auto:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "deployment does not support this run's legacy revision-pinned base model; "
-                f"submit a new run without the removed model_revision key, or use `{CLI_NAME} "
-                "models export` to load the adapter from Hugging Face"
-            ),
-        )
     try:
         effective_spec = effective_spec_from_status(status)
     except ValueError as exc:
@@ -349,10 +321,9 @@ def deploy(
     job_owns_lock = False
     try:
         status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
-        spec = JobSpec.from_dict(status.spec)
         dry_run = _require_bool(payload, "dry_run", False)
         effective_spec, current_deployment = _validate_deploy_request(
-            run_id, status, spec, payload, dry_run
+            run_id, status, payload, dry_run
         )
         checkpoint_step, is_checkpoint, deploy_prefix = _resolve_deployable_target(
             run_id,
@@ -395,16 +366,16 @@ def deploy(
                 ) from exc
         deploy_kwargs = {
             "run_id": run_id,
-            "model": spec.model,
+            "model": effective_spec.model,
             "hf_repo": effective_spec.train.hf_repo,
             "adapter_prefix": deploy_prefix,
             "dry_run": dry_run,
             "lora_rank": effective_spec.train.lora_rank,
             # a run trained with thinking serves with thinking (per-run parity)
-            "thinking": spec.thinking,
+            "thinking": effective_spec.thinking,
             # a run trained with structured_outputs serves under the same grammar. thinking runs
             # are registered only after serving advertises deferred post-reasoning constraints.
-            "structured_outputs": spec.train.structured_outputs,
+            "structured_outputs": effective_spec.train.structured_outputs,
             "org_id": deploy_org_id,
             "checkpoint_step": checkpoint_step,
             "expected_adapter_revision": expected_adapter_revision,
@@ -420,7 +391,6 @@ def deploy(
 
         dep_dict = _queued_deployment_record(
             run_id,
-            spec,
             effective_spec,
             deploy_prefix,
             checkpoint_step,
@@ -556,7 +526,6 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         private = _require_bool(payload, "private", True)
 
         status = owned_run(run_id, key)
-        spec = JobSpec.from_dict(status.spec)
         try:
             effective_spec = effective_spec_from_status(status)
         except ValueError as exc:
@@ -580,10 +549,9 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 dest_repo=repository,
                 dest_token=hf_token,
                 private=private,
-                base_model=spec.model,
-                # the effective half, not the public one: a runner-assigned pin is stripped from
-                # the public spec (it cannot carry the marker that labels it), so `spec` reads "".
-                # the worker stamps the real sha into adapter_config.json from its internal spec,
+                base_model=effective_spec.model,
+                # the effective half carries the runner-assigned revision stripped from the public
+                # spec. the worker stamps that sha into adapter_config.json from its internal spec,
                 # and export refuses a stamped revision that disagrees with what it is handed --
                 # so reading the public half here 404s every auto-pinned sft run and every warm
                 # start that inherited its pin.
@@ -704,7 +672,6 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
         preferred_revision=ready_revision if isinstance(ready_revision, str) else None,
     )
     serving_model = pinned_revision or run_id
-    spec = JobSpec.from_dict(status.spec)
     try:
         effective_spec = effective_spec_from_status(status)
     except ValueError as exc:
@@ -780,7 +747,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
     # rather than EOS would otherwise pass verification and then run to max_tokens, or emit trailing
     # text past its answer, on every real request.
     stop_sequences = [
-        str(value) for value in (getattr(spec.train, "stop_sequences", ()) or ())
+        str(value) for value in (getattr(effective_spec.train, "stop_sequences", ()) or ())
     ] or None
     try:
         if payload.get("stream") is True:
@@ -795,7 +762,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    thinking=spec.thinking,
+                    thinking=effective_spec.thinking,
                     stop=stop_sequences,
                 ),
                 media_type="text/plain; charset=utf-8",
@@ -805,7 +772,7 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
-            thinking=spec.thinking,
+            thinking=effective_spec.thinking,
             stop=stop_sequences,
         )
     except Exception as exc:

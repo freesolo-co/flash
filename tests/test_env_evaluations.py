@@ -3111,6 +3111,9 @@ def _stub_pil(monkeypatch, mime: str = "image/png") -> None:
     class _Image:
         def __init__(self, data: bytes) -> None:
             self.width, self.height, self.format = 2, 2, "PNG"
+            self.size = (self.width, self.height)
+            self.mode = "RGB"
+            self.n_frames = 1
             self._data = data
 
         def __enter__(self):
@@ -3119,15 +3122,35 @@ def _stub_pil(monkeypatch, mime: str = "image/png") -> None:
         def __exit__(self, *_exc):
             return False
 
+        def getexif(self):
+            return {}
+
+        def verify(self):
+            return None
+
+        def load(self):
+            return None
+
+        def convert(self, _mode):
+            return self
+
+        def close(self):
+            return None
+
     module = ModuleType("PIL")
     image_module = ModuleType("PIL.Image")
+    image_ops_module = ModuleType("PIL.ImageOps")
     image_module.Image = _Image
+    image_module.DecompressionBombWarning = UserWarning
     image_module.MIME = {"PNG": mime}
     image_module.open = lambda stream: _Image(stream.getvalue())
     image_module.new = lambda *_a, **_k: _Image(b"")
+    image_ops_module.exif_transpose = lambda image, **_kwargs: image
     module.Image = image_module
+    module.ImageOps = image_ops_module
     monkeypatch.setitem(sys.modules, "PIL", module)
     monkeypatch.setitem(sys.modules, "PIL.Image", image_module)
+    monkeypatch.setitem(sys.modules, "PIL.ImageOps", image_ops_module)
     monkeypatch.setattr("flash.content.multimodal._is_pil_image", lambda _value: False)
 
 

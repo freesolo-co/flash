@@ -105,13 +105,16 @@ def _positive_int(value: Any, *, source: str, field: str) -> int:
 
 
 def _file_identity(file_info: Any) -> str:
+    # the producer is `HfApi.list_repo_tree`, which yields `RepoFile` -- whose `__init__` always
+    # sets `path`/`size`/`blob_id` and builds `lfs` as a `BlobLfsInfo` (field `sha256`, no `oid`).
+    # verified at the declared floor `huggingface-hub>=1.2.0` and at the installed 1.27.0, so the
+    # mapping-shaped `lfs` and the `lfs.oid` spelling have no producer in the supported range.
+    # `getattr` stays only on `lfs` itself, which is legitimately optional (non-LFS files), and on
+    # the entry object, because a listing also yields `RepoFolder` -- no size, no blob_id -- which
+    # must fail closed rather than hash to a folder's tree id.
     lfs = getattr(file_info, "lfs", None)
-    if isinstance(lfs, Mapping):
-        oid = lfs.get("sha256") or lfs.get("oid")
-        size = lfs.get("size")
-    else:
-        oid = getattr(lfs, "sha256", None) or getattr(lfs, "oid", None)
-        size = getattr(lfs, "size", None)
+    oid = getattr(lfs, "sha256", None)
+    size = getattr(lfs, "size", None)
     blob_id = getattr(file_info, "blob_id", None)
     size = size if size is not None else getattr(file_info, "size", None)
     immutable = oid or blob_id
@@ -281,6 +284,8 @@ def rank_from_adapter_config(config: Mapping[str, Any], *, source: str) -> int:
 
 _LORA_A_INFIX = ".lora_A."
 _LORA_B_INFIX = ".lora_B."
+# PEFT appends this rung for every parameter wrapper nested inside another one.
+_NESTED_WRAPPER_RUNG = ".base_layer"
 
 
 @dataclass(frozen=True)
@@ -296,26 +301,9 @@ class DeclaredLoraRanks:
         return self.default is not None or bool(self.by_module)
 
 
-def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
-    """Read the per-module LoRA rank structure out of ``adapter_config.json``."""
-    if not isinstance(config, Mapping):
-        return DeclaredLoraRanks()
-    try:
-        default = _positive_int(config["r"], source="adapter_config.json", field="r")
-    except (KeyError, ValueError):
-        default = None
-
-    by_module: dict[str, int] = {}
-    pattern = config.get("rank_pattern")
-    if isinstance(pattern, Mapping):
-        for module, value in pattern.items():
-            try:
-                by_module[str(module)] = _positive_int(
-                    value, source="adapter_config.json", field="rank_pattern"
-                )
-            except ValueError:
-                continue
-
+def _declared_lora_rank_context(
+    config: Mapping[str, Any], *, default: int | None, by_module: Mapping[str, int]
+) -> DeclaredLoraRanks:
     stacked_rank_modules: list[str] = []
     targets = config.get("target_parameters")
     if isinstance(targets, list):
@@ -335,6 +323,41 @@ def declared_lora_ranks(config: Mapping[str, Any]) -> DeclaredLoraRanks:
     )
 
 
+def strict_declared_lora_ranks(
+    config: Mapping[str, Any], *, source: str = "adapter_config.json"
+) -> DeclaredLoraRanks:
+    """validate and preserve PEFT rank declarations for an authoritative load boundary."""
+    if not isinstance(config, Mapping):
+        raise ValueError(f"{source} must be an object")
+
+    default = None
+    if "r" in config:
+        value = config["r"]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{source} r must be a positive integer")
+        default = value
+
+    by_module: dict[str, int] = {}
+    if "rank_pattern" in config:
+        pattern = config["rank_pattern"]
+        if not isinstance(pattern, Mapping):
+            raise ValueError(f"{source} rank_pattern must be an object")
+        for module, value in pattern.items():
+            if not isinstance(module, str) or not module.strip():
+                raise ValueError(f"{source} rank_pattern keys must be non-empty strings")
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{source} rank_pattern values must be positive integers")
+            try:
+                re.compile(rf"(.*\.)?({module})$")
+            except re.error as exc:
+                raise ValueError(
+                    f"{source} rank_pattern contains invalid regex {module!r}"
+                ) from exc
+            by_module[module] = value
+
+    return _declared_lora_rank_context(config, default=default, by_module=by_module)
+
+
 def _rank_for_module(module_path: str, declared: DeclaredLoraRanks) -> int | None:
     """Resolve a module's rank with PEFT's ordered, anchored ``rank_pattern`` matching."""
     for module, rank in declared.by_module.items():
@@ -350,9 +373,27 @@ def _rank_for_module(module_path: str, declared: DeclaredLoraRanks) -> int | Non
 
 
 def _module_uses_target_parameters(module_path: str, declared: DeclaredLoraRanks) -> bool:
-    """Whether this serialized module came from one of PEFT's targeted parameters."""
+    """Whether this serialized module came from one of PEFT's targeted parameters.
+
+    PEFT wraps the module that *owns* a targeted parameter, keeping the parameter name off the
+    serialized path. When several targeted parameters share one owner, the wrappers nest and every
+    wrapper after the first appends a ``base_layer`` rung, so a single owner produces keys like::
+
+        mlp.experts                          (the outermost wrapper)
+        mlp.experts.base_layer               (the one nested inside it)
+
+    Those inner rungs carry the same stacked axis as the outer one, so peeling the ``base_layer``
+    rungs off before matching is what keeps a valid adapter from being measured against the scalar
+    rank.
+    """
+    candidates = [module_path]
+    trimmed = module_path
+    while trimmed.endswith(_NESTED_WRAPPER_RUNG):
+        trimmed = trimmed[: -len(_NESTED_WRAPPER_RUNG)]
+        candidates.append(trimmed)
     return any(
-        module_path == module or module_path.endswith(f".{module}")
+        candidate == module or candidate.endswith(f".{module}")
+        for candidate in candidates
         for module in declared.stacked_rank_modules
     )
 
@@ -409,11 +450,22 @@ def inspect_adapter_config(
         raise ValueError(f"could not verify adapter metadata: {source} is not a JSON object")
     if str(config.get("peft_type") or "").strip().upper() != "LORA":
         raise ValueError(f"could not verify adapter metadata: {source} peft_type must be LORA")
+    # both fields are REQUIRED, not "checked when present": every warm-start source is a
+    # flash-owned adapter resolved from a run or checkpoint reference, and the one exporter every
+    # publish path funnels through stamps `base_model_name_or_path = model_id` unconditionally
+    # (engine/worker/verl/checkpoints.py) while the builder always sets `task_type = CAUSAL_LM`
+    # (engine/worker/model/adapter.py). treating a blank value as "no opinion" made the base-model
+    # match SKIP itself, so an adapter trained on a different base passed preflight and was
+    # inherited into the run -- the check failing open is worse than an old artifact failing loudly.
     task_type = str(config.get("task_type") or "").strip().upper()
-    if task_type and task_type != "CAUSAL_LM":
+    if task_type != "CAUSAL_LM":
         raise ValueError(f"could not verify adapter metadata: {source} task_type must be CAUSAL_LM")
     base_model = _normalized_model(config.get("base_model_name_or_path"))
-    if base_model and base_model != _normalized_model(target_model):
+    if not base_model:
+        raise ValueError(
+            f"could not verify adapter metadata: {source} does not name its base model"
+        )
+    if base_model != _normalized_model(target_model):
         raise ValueError(
             f"train.init_from_adapter base model {base_model!r} does not match target model "
             f"{target_model!r}"

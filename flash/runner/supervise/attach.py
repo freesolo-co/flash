@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import contextlib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from flash.core.spec import JobSpec
-from flash.providers._lifecycle.deadline import deadline_kwargs
+from flash.envs.staged import StagedEnvironmentTransientError
 from flash.providers._lifecycle.poll import _attempt_int
 
 # imported by value rather than through `_deploy()`: the set and its lock are mutated in place and
@@ -53,7 +53,7 @@ def _resume_after_confirmed_teardown(
     worker_spec: JobSpec,
     persisted_remote: dict,
     next_attempt: int,
-    code_prefix: str | None,
+    source_snapshot: dict | None,
     log,
     *,
     failure: str,
@@ -63,15 +63,17 @@ def _resume_after_confirmed_teardown(
         _compare_and_clear_remote,
         _compare_and_fail_remote,
         _load_run_deadline_at,
+        _persist_effective_worker_spec,
         _record_cleanup_remote,
         _run_training,
         _RunCancelled,
         _spec_with_remaining_wall,
         _update,
         _verified_opd_next_attempt,
-        flash_code_prefix,
         get_status,
         reallocation_spec_from_status,
+        source_snapshot_from_status,
+        stage_environment_package,
     )
 
     if int(worker_spec.gpu.max_retries) == 0:
@@ -80,6 +82,15 @@ def _resume_after_confirmed_teardown(
             f"attach: {run_id} exhausted its one-shot retry budget; not resubmitting",
             file=log,
         )
+        return get_status(run_id)
+    try:
+        from flash.source_snapshot import parse_descriptor
+
+        source_snapshot = parse_descriptor(
+            source_snapshot or source_snapshot_from_status(get_status(run_id), required=True)
+        ).to_dict()
+    except Exception as exc:
+        _compare_and_fail_remote(run_id, persisted_remote, str(exc))
         return get_status(run_id)
     if worker_spec.algorithm == "opd":
         verified_next_attempt = _verified_opd_next_attempt(run_id)
@@ -96,6 +107,12 @@ def _resume_after_confirmed_teardown(
         print(f"attach: {run_id} {exc}", file=log)
         return get_status(run_id)
     worker_spec = reallocation_spec_from_status(get_status(run_id), verify_source=True)
+    if worker_spec.run_id != run_id:
+        worker_spec = replace(worker_spec, run_id=run_id)
+    deadline_at = _load_run_deadline_at(run_id)
+    worker_spec = stage_environment_package(worker_spec, deadline_at=deadline_at)
+    if not _persist_effective_worker_spec(worker_spec):
+        raise _RunCancelled(f"run {run_id} went terminal before environment staging")
     if not _compare_and_clear_remote(run_id, persisted_remote):
         print(
             f"attach: {run_id} persisted remote changed before clear; not resuming",
@@ -110,25 +127,12 @@ def _resume_after_confirmed_teardown(
         "run-global wall deadline",
         file=log,
     )
-    if code_prefix is None:
-        from flash.providers._lifecycle.worker import upload_code
-
-        code_prefix = flash_code_prefix()
-        try:
-            upload_code(
-                worker_spec.train.hf_repo,
-                code_prefix=code_prefix,
-                **deadline_kwargs(upload_code, _load_run_deadline_at(run_id)),
-            )
-        except Exception as exc:
-            _compare_and_fail_remote(run_id, None, str(exc))
-            raise
     try:
         _run_training(
             worker_spec,
             log,
             prior_cost=float(get_status(run_id).cost_usd or 0.0),
-            code_prefix=code_prefix,
+            source_snapshot=source_snapshot,
             attempt_start=next_attempt,
         )
     except _RunCancelled:
@@ -304,7 +308,7 @@ def _reconcile_attached_remote(
     expected_remote: dict,
     worker_spec: JobSpec,
     next_attempt: int,
-    code_prefix: str | None,
+    source_snapshot: dict | None,
     log,
     failure: str,
 ) -> None:
@@ -413,7 +417,7 @@ def _reconcile_attached_remote(
                 worker_spec,
                 expected_remote,
                 next_attempt,
-                code_prefix,
+                source_snapshot,
                 log,
                 failure=failure,
             )
@@ -445,7 +449,7 @@ def _schedule_attach_reconciliation(
     expected_remote: dict,
     worker_spec: JobSpec,
     next_attempt: int,
-    code_prefix: str | None,
+    source_snapshot: dict | None,
     log,
     failure: str,
 ) -> bool:
@@ -462,7 +466,7 @@ def _schedule_attach_reconciliation(
                 expected_remote,
                 worker_spec,
                 next_attempt,
-                code_prefix,
+                source_snapshot,
                 log,
                 failure,
             )
@@ -494,9 +498,7 @@ class _AttachContext:
     seed: int
     recovered_attempt: int
     next_attempt: int
-    code_prefix: str | None
-    allocated_gpu: object | None
-    allocated_gpu_count: object | None
+    source_snapshot: dict | None
 
 
 def _build_attach_context(
@@ -505,18 +507,23 @@ def _build_attach_context(
 ) -> _AttachContext:
     """Validate the persisted handle and collect the inputs needed to poll it."""
     from flash.providers.base import JobHandle
+    from flash.runner import get_status, source_snapshot_from_status
 
     remote = dict(persisted_remote)
     seed = int(remote.pop("seed", worker_spec.seed))
-    code_prefix = remote.pop("code_prefix", None)
+    remote.pop("code_prefix", None)
+    source_snapshot = source_snapshot_from_status(get_status(worker_spec.run_id))
     provider_name = remote.get("provider")
     if not isinstance(provider_name, str) or not provider_name:
         raise ValueError("persisted provider identity is missing or invalid")
     recovered_attempt = _attempt_int(remote.get("attempt"))
     if recovered_attempt is None:
         raise ValueError("persisted attempt identity is missing or invalid")
-    allocated_gpu = remote.pop("allocated_gpu", None)
-    allocated_gpu_count = remote.pop("allocated_gpu_count", None)
+    # strip the allocation stamp off the HANDLE copy only: `JobHandle.from_dict` round-trips
+    # unknown keys, and the stamp belongs to `persisted_remote`, which `_carry_allocation_stamp`
+    # reads whole when adopting metrics.
+    remote.pop("allocated_gpu", None)
+    remote.pop("allocated_gpu_count", None)
     return _AttachContext(
         worker_spec=worker_spec,
         persisted_remote=persisted_remote,
@@ -524,9 +531,7 @@ def _build_attach_context(
         seed=seed,
         recovered_attempt=recovered_attempt,
         next_attempt=recovered_attempt + 1,
-        code_prefix=code_prefix,
-        allocated_gpu=allocated_gpu,
-        allocated_gpu_count=allocated_gpu_count,
+        source_snapshot=source_snapshot,
     )
 
 
@@ -622,7 +627,7 @@ def _handle_attach_wall_deadline(
             context.persisted_remote,
             context.worker_spec,
             context.next_attempt,
-            context.code_prefix,
+            context.source_snapshot,
             log,
             str(exc),
         )
@@ -688,7 +693,7 @@ def _handle_failed_attach_poll(
             context.persisted_remote,
             context.worker_spec,
             context.next_attempt,
-            context.code_prefix,
+            context.source_snapshot,
             log,
             failure,
         )
@@ -716,7 +721,7 @@ def _handle_failed_attach_poll(
             context.worker_spec,
             context.persisted_remote,
             context.next_attempt,
-            context.code_prefix,
+            context.source_snapshot,
             log,
             failure=failure,
         )
@@ -725,7 +730,7 @@ def _handle_failed_attach_poll(
         context.persisted_remote,
         context.worker_spec,
         context.next_attempt,
-        context.code_prefix,
+        context.source_snapshot,
         log,
         failure,
     )
@@ -744,12 +749,15 @@ def _adopt_attached_poll_result(
     log,
 ) -> None:
     """Restore allocation metadata and adopt one successful provider result."""
+    from flash.runner.supervise.deploy import _carry_allocation_stamp
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
-    if context.allocated_gpu and isinstance(result.metrics, dict):
-        result.metrics.setdefault("allocated_gpu", context.allocated_gpu)
-    if context.allocated_gpu_count and isinstance(result.metrics, dict):
-        result.metrics.setdefault("allocated_gpu_count", int(context.allocated_gpu_count))
+    # the shared carrier, not a local copy of two of its three fields: `_build_attach_context` pops
+    # gpu and count off its handle copy but leaves `persisted_remote` whole, so the provider is
+    # available here too. dropping it left `_gpu_rate` to fall back to whichever configured provider
+    # offers the class -- normally RunPod -- so an attached vast or lambda run was priced at the
+    # wrong substrate's rate and its notes named a provider that never ran it.
+    _carry_allocation_stamp(result.metrics, context.persisted_remote)
     if not _adopt_completed_attempt(
         run_id,
         context.worker_spec,
@@ -803,7 +811,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         return _fail_unparseable_attach(run_id, status, exc, log_stream or sys.stderr)
     persisted_remote = dict(status.remote)
     next_attempt = 0
-    code_prefix = None
+    source_snapshot = None
     log = log_stream or sys.stderr
 
     from flash.providers import get_provider
@@ -812,7 +820,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         worker_spec = effective_spec_from_status(status)
         context = _build_attach_context(worker_spec, persisted_remote)
         next_attempt = context.next_attempt
-        code_prefix = context.code_prefix
+        source_snapshot = context.source_snapshot
         try:
             poll_spec = _spec_with_remaining_wall(worker_spec, require_provider_minimum=False)
         except RuntimeError as exc:
@@ -840,7 +848,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             persisted_remote,
             worker_spec,
             next_attempt,
-            code_prefix,
+            source_snapshot,
             log,
             str(exc),
         )
@@ -852,6 +860,22 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     except _RunCancelled:
         with contextlib.suppress(Exception):
             cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
+    except StagedEnvironmentTransientError as exc:
+        _deploy()._schedule_attach_reconciliation(
+            run_id,
+            persisted_remote,
+            worker_spec,
+            next_attempt,
+            source_snapshot,
+            log,
+            str(exc),
+        )
+        print(
+            f"attach: {run_id} staged environment verification is temporarily unavailable; "
+            "deferring replacement",
+            file=log,
+        )
+        return status_for_return()
     except Exception as exc:
         try:
             _record_cleanup_remote(run_id, persisted_remote)
@@ -865,7 +889,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
                     persisted_remote,
                     worker_spec,
                     next_attempt,
-                    code_prefix,
+                    source_snapshot,
                     log,
                     str(exc),
                 )

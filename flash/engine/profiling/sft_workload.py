@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-import io
 import math
 import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, TypedDict, cast
 
+from flash.content.multimodal import NormalizedImages
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
+from flash.engine.profiling.sft_image_rows import (
+    estimate_sft_image_row,
+    process_sft_image_row,
+)
 from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
     horizon_row_count,
@@ -50,102 +55,111 @@ class PreparedSftWorkload:
     sampled_texts: list[str]
     multiturn_targets: int
     coerced_singleturn_targets: int
+    role_aware_multiturn_targets: int
+    fallback_multiturn_targets: int
     authored_reasoning_turns: int
     rendered_reasoning_spans: int
     truncated_reasoning_spans: int
 
 
-def _serialize_multimodal_inputs(values: dict) -> bytes:
-    if not values:
-        return b""
-    import numpy as np
-
-    arrays = {}
-    for key, value in values.items():
-        if value is None:
-            continue
-        if hasattr(value, "detach"):
-            value = value.detach().cpu().numpy()
-        arrays[key] = np.asarray(value)
-    if not arrays:
-        return b""
-    payload = io.BytesIO()
-    np.savez(payload, **arrays)
-    return payload.getvalue()
+_ImageRowResult = tuple[list[int], list[int], bytes, int, bool]
 
 
-def _multimodal_messages_with_images(messages: list[dict], images: list[object]) -> list[dict]:
-    image_iter = iter(images)
-    prepared = []
-    for message in messages:
-        copied = dict(message)
-        content = copied.get("content")
-        if isinstance(content, list):
-            blocks = []
-            for block in content:
-                block = dict(block)
-                if block.get("type") == "image":
-                    block["image"] = next(image_iter)
-                blocks.append(block)
-            copied["content"] = blocks
-        prepared.append(copied)
-    try:
-        next(image_iter)
-    except StopIteration:
-        return prepared
-    raise ValueError("unused decoded image while preparing multimodal sft tokens")
+class _NormalizeSftImageRow(Protocol):
+    def __call__(
+        self,
+        record: dict,
+        messages: list[dict],
+        package_root: str | Path | None,
+    ) -> NormalizedImages: ...
 
 
-def _processor_tokenized_row(
-    processor,
-    prompt_messages: list[dict],
-    completion_messages: list[dict],
-    images: list[object],
+class _TokenizeSftImageRow(Protocol):
+    def __call__(
+        self,
+        prompt_messages: list[dict],
+        completion_messages: list[dict],
+        descriptors: list[str],
+        *,
+        package_root: str | Path | None,
+    ) -> _ImageRowResult: ...
+
+
+@dataclass(frozen=True)
+class _SftImagePipeline:
+    """the bound normalization and tokenization path for every image row in one run."""
+
+    normalize: _NormalizeSftImageRow
+    tokenize: _TokenizeSftImageRow
+
+
+@dataclass(frozen=True)
+class _SftTokenization:
+    """the tokenizer and optional structurally complete image pipeline for one run."""
+
+    tokenizer: Any
+    processor: Any | None
+    image: _SftImagePipeline | None
+
+
+def _resolve_sft_tokenization(
+    spec,
     *,
+    multimodal: bool,
+    require_processor: bool,
+    tokenizer_loader: Callable[[str, str], Any],
+    processor_loader: Callable[[str, str], Any] | None,
     max_length: int,
-    thinking: bool,
-) -> tuple[list[int], list[int], bytes, int]:
-    from flash.engine.worker.model.packing import completion_mask_from_ids
+) -> _SftTokenization:
+    """resolve the tokenizer and bind the image-row tokenizer this run will use."""
+    from flash.content.multimodal import normalize_prompt_images, validate_multimodal_training
+    from flash.engine.profiling.image_tokens import ImageProfileValidationState, load_image_geometry
 
-    prepared_prompt = _multimodal_messages_with_images(prompt_messages, images)
-    full_messages = [*prepared_prompt, *completion_messages]
-    common = {
-        "tokenize": True,
-        "return_dict": True,
-        "return_tensors": "pt",
-        "enable_thinking": thinking,
-    }
-    full = dict(
-        processor.apply_chat_template(
-            full_messages,
-            add_generation_prompt=False,
-            **common,
+    if not multimodal:
+        tokenizer = tokenizer_loader(spec.model, spec.model_revision)
+        resolved = _SftTokenization(tokenizer, None, None)
+    else:
+        validate_multimodal_training(
+            spec.model,
+            "sft",
+            getattr(spec.train, "teacher_model", None),
         )
-    )
-    prompt = dict(
-        processor.apply_chat_template(
-            prepared_prompt,
-            add_generation_prompt=True,
-            **common,
-        )
-    )
-
-    def ids(value) -> list[int]:
-        if hasattr(value, "tolist"):
-            value = value.tolist()
-        if value and isinstance(value[0], list):
-            value = value[0]
-        return [int(item) for item in value]
-
-    untruncated_ids = ids(full.pop("input_ids"))
-    # true length BEFORE the cap: realized_max_length is measured after this slice, so it can never
-    # report more than max_length and cannot say whether the cap actually bound.
-    untruncated_length = len(untruncated_ids)
-    input_ids = untruncated_ids[:max_length]
-    prompt_ids = ids(prompt["input_ids"])[:max_length]
-    loss_mask = completion_mask_from_ids(prompt_ids, input_ids)
-    full.pop("attention_mask", None)
-    return input_ids, loss_mask, _serialize_multimodal_inputs(full), untruncated_length
+        if require_processor:
+            processor = (processor_loader or _default_processor_loader)(
+                spec.model,
+                spec.model_revision,
+            )
+            tokenizer = processor.tokenizer
+            image = _SftImagePipeline(
+                normalize=normalize_prompt_images,
+                tokenize=partial(
+                    process_sft_image_row,
+                    processor,
+                    max_length=max_length,
+                    thinking=bool(spec.thinking),
+                ),
+            )
+            resolved = _SftTokenization(tokenizer, processor, image)
+        else:
+            geometry = load_image_geometry(spec.model, spec.model_revision)
+            tokenizer = tokenizer_loader(spec.model, spec.model_revision)
+            image = _SftImagePipeline(
+                # the estimator validates each descriptor through one cached, budgeted pass, so
+                # normalization defers the eager decode instead of decoding every image twice.
+                normalize=partial(normalize_prompt_images, defer_validation=True),
+                tokenize=partial(
+                    estimate_sft_image_row,
+                    tokenizer,
+                    geometry=geometry,
+                    validation_state=ImageProfileValidationState(),
+                    max_length=max_length,
+                    thinking=bool(spec.thinking),
+                ),
+            )
+            resolved = _SftTokenization(tokenizer, None, image)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return resolved
 
 
 def _materialize_verl_images(
@@ -160,19 +174,23 @@ def _materialize_verl_images(
     from flash.content.multimodal import decode_image_descriptors
 
     os.makedirs(image_dir, exist_ok=True)
-    images = decode_image_descriptors(descriptors, package_root)
+    images = cast("list[Any]", decode_image_descriptors(descriptors, package_root))
     rows: list[str] = []
-    for image_index, image in enumerate(images):
-        path = Path(image_dir, f"row-{row_index}-image-{image_index}.png").resolve()
-        image.save(path, format="PNG")
-        rows.append(path.as_uri())
-    return rows
+    try:
+        for image_index, image in enumerate(images):
+            path = Path(image_dir, f"row-{row_index}-image-{image_index}.png").resolve()
+            image.save(path, format="PNG")
+            rows.append(path.as_uri())
+        return rows
+    finally:
+        for image in images:
+            image.close()
 
 
 def _default_processor_loader(model_id: str, revision: str):
     from transformers import AutoProcessor
 
-    from flash.engine.worker.io.hf import model_revision_kwargs
+    from flash.engine.huggingface import model_revision_kwargs
 
     return AutoProcessor.from_pretrained(
         model_id,
@@ -269,6 +287,10 @@ class _TokenizedSftRows:
     sampled_texts: list[str]
     multiturn_targets: int
     coerced_singleturn_targets: int
+    # multi-turn rows only: present means the row has a multi-turn target, and the value says whether
+    # its mask was role-aware or fell back to the contiguous span. one map rather than a set plus a
+    # parallel dict, so a row can never be counted as multi-turn while its mask status is missing.
+    multiturn_mask_applied: dict[int, bool]
     reasoning_by_index: dict[int, _RowReasoning]
     dropped: int
 
@@ -280,6 +302,8 @@ class _RetainedSftRows:
     authored_reasoning_turns: int
     rendered_reasoning_spans: int
     truncated_reasoning_spans: int
+    role_aware_multiturn_targets: int
+    fallback_multiturn_targets: int
     dropped: int
     # kept PER ROW, in the retained order, so the warning can be bounded to the rows the optimizer
     # actually consumes. the totals above describe the whole retained dataset, which is what the
@@ -386,17 +410,57 @@ def _row_reasoning(
     return _RowReasoning(authored, rendered, truncated)
 
 
+def _text_sft_row_spec(
+    spec,
+    prompt_messages: list[dict],
+    completion_messages: list[dict],
+    *,
+    tokenizer,
+    render_transcript: Callable[[list[dict]], str],
+    max_length: int,
+    row_index: int,
+    multiturn: bool,
+) -> tuple[str, _RowReasoning, dict[str, Any]]:
+    text = render_transcript([*prompt_messages, *completion_messages])
+    prompt_text = tokenizer.apply_chat_template(
+        prompt_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=spec.thinking,
+    )
+    reasoning = _row_reasoning(
+        prompt_messages,
+        completion_messages,
+        render=render_transcript,
+        tokenizer=tokenizer,
+        max_length=max_length,
+    )
+    return (
+        text,
+        reasoning,
+        {
+            "text": text,
+            "prompt_text": prompt_text,
+            "target_messages": completion_messages,
+            "source_messages": [*prompt_messages, *completion_messages],
+            "template_kwargs": {"enable_thinking": spec.thinking},
+            # measurement carried alongside the row rather than in it: the parquet row is built from
+            # an explicit key list below, so neither key reaches verl.
+            "row_index": row_index,
+            "multiturn": multiturn,
+        },
+    )
+
+
 def _tokenize_prompt_rows(
     spec,
     prompt_rows: list[tuple[Any, list[dict], list[dict], bool]],
     *,
     package_root,
     tokenizer,
-    processor,
+    image: _SftImagePipeline | None,
     max_length: int,
     image_dir: str | None,
-    decode_image_descriptors: Callable,
-    normalize_prompt_images: Callable,
     record_has_images: Callable,
     text_only_prompt_messages: Callable,
 ) -> _TokenizedSftRows:
@@ -409,6 +473,7 @@ def _tokenize_prompt_rows(
     sampled_texts: list[str] = []
     multiturn_targets = 0
     coerced_singleturn_targets = 0
+    multiturn_mask_applied: dict[int, bool] = {}
     # kept per row rather than summed here, for the same reason as `untruncated_by_index`: rows that
     # lose their whole completion to the cap are dropped below, and folding their reasoning into a
     # running total would report loss from rows the run never trains on against a retained-row
@@ -429,8 +494,11 @@ def _tokenize_prompt_rows(
         completion_messages,
         coerced_scalar_output,
     ) in enumerate(prompt_rows):
-        _reject_image_completion(completion_messages)
-        if len(completion_messages) > 1:
+        has_images = record_has_images(example, prompt_messages)
+        _reject_image_completion(completion_messages, image_bearing=has_images)
+        # read before the image branch rewrites `completion_messages` to its text-only form.
+        multiturn = len(completion_messages) > 1
+        if multiturn:
             multiturn_targets += 1
         elif (
             coerced_scalar_output
@@ -438,21 +506,26 @@ def _tokenize_prompt_rows(
             and completion_messages[0].get("role") == "assistant"
         ):
             coerced_singleturn_targets += 1
-        if record_has_images(example, prompt_messages):
-            if processor is None:
-                raise RuntimeError("multimodal sft row has no processor")
-            normalized = normalize_prompt_images(example, prompt_messages, package_root)
+        if has_images:
+            if image is None:
+                raise RuntimeError("multimodal sft row has no image pipeline")
+            normalized = image.normalize(example, prompt_messages, package_root)
             completion_messages = text_only_prompt_messages(completion_messages)
-            decoded_images = decode_image_descriptors(normalized.descriptors, package_root)
-            input_ids, loss_mask, multimodal_inputs, untruncated_length = _processor_tokenized_row(
-                processor,
+            (
+                input_ids,
+                loss_mask,
+                multimodal_inputs,
+                untruncated_length,
+                assistant_mask_applied,
+            ) = image.tokenize(
                 normalized.messages,
                 completion_messages,
-                decoded_images,
-                max_length=max_length,
-                thinking=bool(spec.thinking),
+                normalized.descriptors,
+                package_root=package_root,
             )
             untruncated_by_index[row_index] = untruncated_length
+            if multiturn:
+                multiturn_mask_applied[row_index] = assistant_mask_applied
             row_by_index[row_index] = {
                 "input_ids": input_ids,
                 "loss_mask": loss_mask,
@@ -466,11 +539,8 @@ def _tokenize_prompt_rows(
             }
             text = render_transcript([*normalized.messages, *completion_messages])
             sampled_texts.append(text)
-            # training truncates the PROCESSOR's ids, which expand each image into visual tokens the
-            # text render never contains, so measuring a span against the raw cap would call a block
-            # retained that the visual tokens had already pushed past it. every image is in the
-            # prompt (`_reject_image_completion` above), so the expansion is a constant shift on
-            # every completion position: charging it to the budget puts the two back in scale.
+            # every image is in the prompt, so visual expansion shifts every completion position by
+            # the same amount; charge that inflation before measuring reasoning against the cap.
             visual_inflation = max(0, untruncated_length - _encoded_length(tokenizer, text))
             reasoning_by_index[row_index] = _row_reasoning(
                 normalized.messages,
@@ -480,22 +550,19 @@ def _tokenize_prompt_rows(
                 max_length=max_length - visual_inflation,
             )
         else:
-            text = render_transcript([*prompt_messages, *completion_messages])
-            prompt_text = tokenizer.apply_chat_template(
-                prompt_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=spec.thinking,
-            )
-            sampled_texts.append(text)
-            reasoning_by_index[row_index] = _row_reasoning(
+            text, reasoning, text_spec = _text_sft_row_spec(
+                spec,
                 prompt_messages,
                 completion_messages,
-                render=render_transcript,
                 tokenizer=tokenizer,
+                render_transcript=render_transcript,
                 max_length=max_length,
+                row_index=row_index,
+                multiturn=multiturn,
             )
-            text_specs.append({"text": text, "prompt_text": prompt_text, "row_index": row_index})
+            sampled_texts.append(text)
+            reasoning_by_index[row_index] = reasoning
+            text_specs.append(text_spec)
 
     dropped = 0
     if text_specs:
@@ -506,9 +573,12 @@ def _tokenize_prompt_rows(
         )
         dropped += text_dropped
         for spec_row, tokenized in zip(kept_specs, tokenized_rows, strict=True):
+            row_index = spec_row["row_index"]
             input_ids = tokenized["input_ids"]
-            untruncated_by_index[spec_row["row_index"]] = tokenized["untruncated_length"]
-            row_by_index[spec_row["row_index"]] = {
+            untruncated_by_index[row_index] = tokenized["untruncated_length"]
+            if spec_row["multiturn"]:
+                multiturn_mask_applied[row_index] = tokenized["assistant_mask_applied"]
+            row_by_index[row_index] = {
                 "input_ids": input_ids,
                 "loss_mask": tokenized["completion_mask"],
                 "images": [],
@@ -520,6 +590,7 @@ def _tokenize_prompt_rows(
         sampled_texts=sampled_texts,
         multiturn_targets=multiturn_targets,
         coerced_singleturn_targets=coerced_singleturn_targets,
+        multiturn_mask_applied=multiturn_mask_applied,
         reasoning_by_index=reasoning_by_index,
         dropped=dropped,
     )
@@ -533,6 +604,8 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
     authored_reasoning = 0
     rendered_reasoning = 0
     truncated_reasoning = 0
+    role_aware_multiturn_targets = 0
+    fallback_multiturn_targets = 0
     per_row: list[_RowReasoning] = []
     dropped = tokenized.dropped
     for row_index in sorted(tokenized.row_by_index):
@@ -542,6 +615,11 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
             # appended in lockstep with the row it measures, so the truncation counts below describe
             # the rows that are actually trained on rather than the ones that were dropped.
             retained_untruncated.append(tokenized.untruncated_by_index[row_index])
+            if row_index in tokenized.multiturn_mask_applied:
+                if tokenized.multiturn_mask_applied[row_index]:
+                    role_aware_multiturn_targets += 1
+                else:
+                    fallback_multiturn_targets += 1
             # summed here for the same reason, so the reasoning-loss warning describes the rows the
             # run trains on. a dropped row contributes neither its authored reasoning nor its
             # survivors, which would otherwise be reported against a retained-row denominator.
@@ -566,6 +644,8 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
         authored_reasoning_turns=authored_reasoning,
         rendered_reasoning_spans=rendered_reasoning,
         truncated_reasoning_spans=truncated_reasoning,
+        role_aware_multiturn_targets=role_aware_multiturn_targets,
+        fallback_multiturn_targets=fallback_multiturn_targets,
         dropped=dropped,
         row_reasoning=per_row,
     )
@@ -708,9 +788,16 @@ def _build_sft_profile(
     )
 
 
+class _HorizonReasoningFields(TypedDict):
+    authored_reasoning_turns: int
+    rendered_reasoning_spans: int
+    truncated_reasoning_spans: int
+    reasoning_rows: int
+
+
 def _horizon_reasoning_fields(
     retained: _RetainedSftRows, horizon: _SftStepHorizon
-) -> dict[str, int]:
+) -> _HorizonReasoningFields:
     """The three reasoning counts, plus the row count they were totalled over.
 
     ``retained.row_reasoning`` is index-aligned with the retained rows, so the horizon's row count
@@ -781,19 +868,14 @@ def prepare_sft_workload(
     producer_version: str,
     processor_loader: Callable[[str, str], Any] | None = None,
     image_dir: str | None = None,
+    require_processor: bool = True,
     allow_packing: bool = True,
     packing_support: Callable[[str, str], tuple[str, bool]] | None = None,
     source_examples: int | None = None,
     examples_preselected: bool = False,
 ) -> PreparedSftWorkload:
-    """Render, tokenize, filter, and pack the exact rows consumed by SFT."""
-    from flash.content.multimodal import (
-        decode_image_descriptors,
-        normalize_prompt_images,
-        record_has_images,
-        text_only_prompt_messages,
-        validate_multimodal_training,
-    )
+    """render, tokenize, filter, and pack the exact rows consumed by sft."""
+    from flash.content.multimodal import record_has_images, text_only_prompt_messages
 
     train_spec = spec.train
     max_length = sft_max_length(spec)
@@ -821,33 +903,24 @@ def prepare_sft_workload(
         record_has_images(example, prompt_messages)
         for example, prompt_messages, _completion, _used_fallback in prompt_rows
     )
-    processor = None
-    if multimodal:
-        validate_multimodal_training(
-            spec.model,
-            "sft",
-            getattr(spec.train, "teacher_model", None),
-        )
-        processor = (processor_loader or _default_processor_loader)(
-            spec.model,
-            spec.model_revision,
-        )
-        tokenizer = processor.tokenizer
-    else:
-        tokenizer = tokenizer_loader(spec.model, spec.model_revision)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenization = _resolve_sft_tokenization(
+        spec,
+        multimodal=multimodal,
+        require_processor=require_processor,
+        tokenizer_loader=tokenizer_loader,
+        processor_loader=processor_loader,
+        max_length=max_length,
+    )
+    tokenizer = tokenization.tokenizer
 
     tokenized = _tokenize_prompt_rows(
         spec,
         prompt_rows,
         package_root=package_root,
         tokenizer=tokenizer,
-        processor=processor,
+        image=tokenization.image,
         max_length=max_length,
         image_dir=image_dir,
-        decode_image_descriptors=decode_image_descriptors,
-        normalize_prompt_images=normalize_prompt_images,
         record_has_images=record_has_images,
         text_only_prompt_messages=text_only_prompt_messages,
     )
@@ -891,10 +964,12 @@ def prepare_sft_workload(
         profile=profile,
         multimodal=multimodal,
         tokenizer=tokenizer,
-        processor=processor,
+        processor=tokenization.processor,
         sampled_texts=tokenized.sampled_texts,
         multiturn_targets=tokenized.multiturn_targets,
         coerced_singleturn_targets=tokenized.coerced_singleturn_targets,
+        role_aware_multiturn_targets=retained.role_aware_multiturn_targets,
+        fallback_multiturn_targets=retained.fallback_multiturn_targets,
         authored_reasoning_turns=retained.authored_reasoning_turns,
         rendered_reasoning_spans=retained.rendered_reasoning_spans,
         truncated_reasoning_spans=retained.truncated_reasoning_spans,

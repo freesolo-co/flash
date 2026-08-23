@@ -8,17 +8,17 @@ from __future__ import annotations
 
 import contextlib
 import os
-import time  # noqa: F401
+import time
 from dataclasses import dataclass
 
 from flash.core.spec import JobSpec, gpu_count_of, require_matching_seed
-from flash.providers._lifecycle.deadline import deadline_kwargs
 
 # Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
 # max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
 INFRA_RETRY_FLOOR = 5
 INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_preempted"})
 RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
+_STAGED_ENVIRONMENT_RETRY_S = 5.0
 
 
 class _SelectedQuoteUnaffordable(RuntimeError):
@@ -100,8 +100,6 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
 
     preflight_validate_image_opd(spec)
 
-    # Lazy import: dry-run / unit tests never construct a Flash endpoint.
-    from flash.providers._lifecycle.worker import upload_code
     from flash.runner import (
         RUNS_DIR,
         TERMINAL_STATES,
@@ -117,11 +115,38 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
     _update(spec.run_id, "provisioning")
     log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
     try:
-        _run_job_inner(spec, log_path, upload_code, runtime_secrets=runtime_secrets)
+        while True:
+            try:
+                _run_job_inner(spec, log_path, runtime_secrets=runtime_secrets)
+                break
+            except Exception as exc:
+                from flash.envs.staged import StagedEnvironmentTransientError
+                from flash.runner import _load_run_deadline_at
+
+                if not isinstance(exc, StagedEnvironmentTransientError):
+                    raise
+                if get_status(spec.run_id).state in TERMINAL_STATES:
+                    return
+                remaining = _load_run_deadline_at(spec.run_id) - time.time()
+                if remaining <= 0:
+                    _update(
+                        spec.run_id,
+                        "failed",
+                        error="RuntimeError: run wall deadline exhausted during environment staging",
+                    )
+                    raise RuntimeError(
+                        "run wall deadline exhausted during environment staging"
+                    ) from exc
+                with open(log_path, "a") as log:
+                    print(
+                        "environment staging is temporarily unavailable; deferring before retry",
+                        file=log,
+                        flush=True,
+                    )
+                time.sleep(min(_STAGED_ENVIRONMENT_RETRY_S, remaining))
     finally:
-        # GC registered endpoints — undeleted endpoints count against the account-wide worker quota.
-        # Skip when the run is still non-terminal: that means another live supervisor already owns the
-        # durable handle (see _submit_seed_supervised's "already has a durable provider handle" bail),
+        # gc registered endpoints because undeleted endpoints count against the account-wide worker quota.
+        # skip when the run is still non-terminal: another live supervisor then owns the durable handle,
         # and reaping here would tear down its still-active provider resources.
         if get_status(spec.run_id).state in TERMINAL_STATES:
             _gc_run_endpoints(spec)
@@ -150,52 +175,6 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _spec_with_resolved_env_sha(spec: JobSpec, sha: str) -> JobSpec:
-    """The spec carrying an already-resolved environment SHA, or the spec unchanged."""
-    if not sha or spec.environment.resolved_sha == sha:
-        return spec
-    d = spec.to_internal_dict()
-    d["environment"] = {**d["environment"], "resolved_sha": sha}
-    return JobSpec.from_dict(d)
-
-
-def _pin_environment_for_run(spec: JobSpec, log, *, attempt_started: bool) -> JobSpec:
-    """Resolve the environment ref once before attempts begin, then keep that pin.
-
-    A moving ``environment-hub@main`` ref could otherwise change code between retries. After an
-    unpinned attempt starts, its commit is unknowable, so ``attempt_started`` leaves later attempts
-    unpinned rather than mixing commits with a resumed checkpoint.
-    """
-    if spec.environment.resolved_sha:
-        return spec
-    if attempt_started:
-        # no pin is recoverable from here; see the docstring. warn once more so the condition is
-        # visible in the log at the point the retry is launched, not only at the start of the run.
-        print(
-            f"warning: environment {spec.environment.id!r} ran unpinned on an earlier attempt; "
-            "leaving it unpinned so this retry cannot resolve a different commit",
-            file=log,
-            flush=True,
-        )
-        return spec
-    from flash.runner import _assign_resolved_env_sha
-
-    pinned = _assign_resolved_env_sha(spec)
-    sha = pinned.environment.resolved_sha
-    if not sha:
-        # still unpinned: the ref stays symbolic and every attempt resolves it on its own worker. say
-        # so in the run log, which is the one place the user actually reads.
-        print(
-            f"warning: could not pin environment {spec.environment.id!r} to a commit; "
-            "a retry may resolve it to a newer push",
-            file=log,
-            flush=True,
-        )
-        return spec
-    print(f"environment {spec.environment.id!r} pinned to {sha}", file=log, flush=True)
-    return pinned
-
-
 def _drop_weight_cache(spec: JobSpec) -> JobSpec:
     """Spec with the SHARED weight-cache volume removed for an unrestricted cross-region retry.
 
@@ -216,7 +195,7 @@ def _submit_seed_supervised(
     seed: int,
     log,
     runtime_secrets: dict[str, str] | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     attempt_start: int = 0,
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures.
@@ -232,7 +211,7 @@ def _submit_seed_supervised(
         seed,
         log,
         runtime_secrets=runtime_secrets,
-        code_prefix=code_prefix,
+        source_snapshot=source_snapshot,
         attempt_start=attempt_start,
     )
 
@@ -257,7 +236,6 @@ def _terminal_failure_detail(exc: BaseException) -> str:
 def _run_job_inner(
     spec: JobSpec,
     log_path: str,
-    upload_code,
     runtime_secrets: dict[str, str] | None = None,
 ) -> None:
     from flash.runner import (
@@ -265,28 +243,32 @@ def _run_job_inner(
         _run_training,
         _RunCancelled,
         _update,
-        flash_code_prefix,
         get_status,
+        stage_environment_package,
     )
 
     try:
-        code_prefix = flash_code_prefix()
-        upload_code(
-            spec.train.hf_repo,
-            code_prefix=code_prefix,
-            **deadline_kwargs(upload_code, _load_run_deadline_at(spec.run_id)),
-        )
+        # dev replaced the explicit code upload with managed source snapshots, so staging only has
+        # to pin the environment package before the provider is allocated. the staged package rides
+        # into the persisted snapshot at the per-attempt persist in `_submit_seed_supervised`, which
+        # already runs after this with the fully planned spec -- persisting a second time here would
+        # hash a half-planned spec no later integrity check can reproduce.
+        deadline_at = _load_run_deadline_at(spec.run_id)
+        spec = stage_environment_package(spec, deadline_at=deadline_at)
         with open(log_path, "a") as log:
             _run_training(
                 spec,
                 log,
                 prior_cost=0.0,
                 runtime_secrets=runtime_secrets,
-                code_prefix=code_prefix,
             )
     except _RunCancelled:
         return  # cancel_run already set the terminal state
     except Exception as exc:
+        from flash.envs.staged import StagedEnvironmentTransientError
+
+        if isinstance(exc, StagedEnvironmentTransientError):
+            raise
         if get_status(spec.run_id).state != "cancelled":
             _update(spec.run_id, "failed", error=_terminal_failure_detail(exc))
         raise
@@ -298,7 +280,7 @@ def _run_training(
     *,
     prior_cost: float,
     runtime_secrets: dict[str, str] | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     attempt_start: int = 0,
 ) -> None:
     """Train the run's single adapter under supervision; finalize the run.
@@ -316,9 +298,18 @@ def _run_training(
         _update,
         artifacts_dir,
         get_status,
+        source_snapshot_from_status,
+        validate_terminal_source_metrics,
     )
 
-    # Defense in depth against the recovery TOCTOU (see attach_run): a run can be flipped into ANY
+    if spec.algorithm == "opd":
+        from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+
+        preflight_validate_managed_teacher(spec)
+    status = get_status(spec.run_id)
+    if source_snapshot is None:
+        source_snapshot = source_snapshot_from_status(status, required=True)
+    # defense in depth against the recovery toctou (see attach_run): a run can be flipped into any
     # terminal state — not just `cancelled` — by a concurrent thread/process between the resume
     # decision and here. Bail before _update + the supervised submit so we never submit PAID GPU
     # work for an already-terminal run. _RunCancelled is the terminal signal; callers swallow it.
@@ -340,10 +331,11 @@ def _run_training(
         spec.seed,
         log,
         runtime_secrets=runtime_secrets,
-        code_prefix=code_prefix,
+        source_snapshot=source_snapshot,
         attempt_start=attempt_start,
     )
-    # measured wall x $/hr is recorded in metrics.json for analytics, but is NOT what we charge.
+    metrics, verified_attempt = validate_terminal_source_metrics(get_status(spec.run_id), metrics)
+    # measured wall x $/hr is recorded in metrics.json for analytics, but is not what we charge.
     measured_cost = prior_cost + _persist_metrics(spec, metrics)
     # The customer is charged the submit-time QUOTE, not measured wall. Legacy runs without a
     # persisted quote are re-priced from the spec, falling back only for old/unpriceable records.
@@ -359,6 +351,7 @@ def _run_training(
         "done",
         cost_usd=charge_usd,
         artifacts_dir=artifacts_dir(spec),
+        source_verified_attempt=verified_attempt,
     )
     print(
         f"done: train_wall={metrics.get('wall_seconds')} measured={measured_cost:.4f} "

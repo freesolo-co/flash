@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import uuid
+from typing import NamedTuple
 
 from flash import __version__
 from flash._internal.channel import BRAND_NAME, CLI_NAME
@@ -15,12 +16,12 @@ from flash.cli.ui import render
 from flash.cli.ui.tty import TtyStatusLine
 from flash.client import (
     ApiClient,
-    ApiError,
     ClientError,
     client_from_config,
     save_credentials,
     verify_freesolo_key,
 )
+from flash.client import ApiError as ApiError
 
 # `shadowed_login_warning` has no call site left here since the cost quote moved to
 # `.train_cost`, but the estimate tests patch it on THIS module and that quote reads it back
@@ -380,18 +381,12 @@ def cmd_train(args) -> int:
         # dry-run runs submit-time server preflights without allocating a training gpu or charging
         # for training. a rejection surfaces as the server's error with exit status 1. for sft the
         # server reads the packaged dataset file and builds the quote without executing environment.py.
-        try:
-            status = client.create_run(
-                payload,
-                runtime_secrets=runtime_secrets,
-                dry_run=True,
-                client_train_schema=client_train_schema,
-            )
-        except ApiError as exc:
-            detail = _legacy_train_key_rejection_detail(exc, authored_train_keys)
-            if detail is None:
-                raise
-            raise ApiError(exc.status, detail, detail=detail) from exc
+        status = client.create_run(
+            payload,
+            runtime_secrets=runtime_secrets,
+            dry_run=True,
+            client_train_schema=client_train_schema,
+        )
         compatibility = status.pop("train_schema_compatibility", None)
         _print_train_schema_compatibility(compatibility)
         # the server fails open on a billing-infra problem, so "cost" is only in the validated list
@@ -430,6 +425,8 @@ def cmd_train(args) -> int:
             )
         else:
             print(json.dumps(status, indent=2))
+        if spec.algorithm == "sft":
+            _print_published_sft_environment_note(status, spec)
         _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
         print_status_prompt_budget_warning(status)
         _print_reasoning_loss_warning(status)
@@ -476,16 +473,10 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     parts = [state]
     heartbeat = status.get("last_heartbeat") if isinstance(status, dict) else None
     # retries rewind steps while state remains running, so surface the 0-based attempt identity.
-    # prefer live `remote.attempt`; the heartbeat may belong to the superseded worker. fall back only
-    # when `remote` is absent, not explicitly null: null marks the allocation window after teardown,
-    # when the new attempt is unknown and the attached heartbeat is stale.
-    from flash.providers._lifecycle.poll import _attempt_int
-
-    remote = status.get("remote")
-    remote_cleared = "remote" in status and remote is None
-    attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
-    if attempt is None and not remote_cleared and isinstance(heartbeat, dict):
-        attempt = _attempt_int(heartbeat.get("attempt"))
+    # `live_attempt` owns the provenance order (live `remote.attempt` first, heartbeat only when
+    # `remote` is absent rather than cleared at teardown) and is shared with the worker-artifact
+    # labelling below, so the spinner and the appended sections name the same current attempt.
+    attempt = render.live_attempt(status)
     if isinstance(heartbeat, dict):
         heartbeat_age_seconds = render._heartbeat_age_seconds(heartbeat.get("ts"))
         # stage and step come from the heartbeat, attempt from `remote` below. during the relaunch
@@ -611,12 +602,17 @@ def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
     return rows
 
 
-def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bool]:
-    """Stream offset-paged logs until the run reaches a terminal state.
+class _LogPollResult(NamedTuple):
+    state: str
+    printed_any: bool
+    live_attempt: int | None
 
-    Returns (terminal state, whether any log bytes were printed)."""
+
+def _poll_logs(client: ApiClient, run_id: str, interval: float) -> _LogPollResult:
+    """Stream logs until terminal and return the final state, output, and attempt snapshot."""
     offset = 0
     printed_any = False
+    attempt: int | None = None
     last_progress: str | None = None
     seen_metric_steps: set = set()
     spinner = _LogFollowSpinner(run_id)
@@ -632,6 +628,7 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bo
             # from the run status endpoint. The log page's embedded state is only a fallback for
             # older servers or test doubles.
             status = client.get_run(run_id)
+            attempt = render.live_attempt(status) if isinstance(status, dict) else attempt
             state, progress = _log_follow_progress(status, str(page.get("state") or ""))
             metric_rows = _log_follow_metric_rows(status, seen_metric_steps)
             if metric_rows:
@@ -640,7 +637,7 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bo
                     print(row, file=sys.stderr, flush=True)
             if state in _CLI_DONE_STATES:
                 spinner.clear()
-                return state, printed_any
+                return _LogPollResult(state, printed_any, attempt)
             if not spinner.enabled and progress != last_progress:
                 print(f"status: {progress}", file=sys.stderr, flush=True)
                 last_progress = progress
@@ -689,12 +686,12 @@ def _print_detached_note(run_id: str) -> None:
 def _follow_run(client: ApiClient, run_id: str) -> int:
     """Poll logs until the run reaches a terminal state, then print the final status."""
     try:
-        state, _ = _poll_logs(client, run_id, interval=2.0)
+        result = _poll_logs(client, run_id, interval=2.0)
     except KeyboardInterrupt:
         _print_detached_note(run_id)
         return 130
     print(_render_status(client.get_run(run_id)))
-    return 0 if state in _OK_STATES else 1
+    return 0 if result.state in _OK_STATES else 1
 
 
 def _follow_status(
@@ -718,34 +715,27 @@ def _follow_status(
         return 130
 
 
-def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = False) -> bool:
-    for name, text in (client.get_worker_output(run_id) or {}).items():
-        if not text:
-            continue
-        sep = "\n" if printed_any else ""
-        if render.styled():
-            print(f"{sep}{render.log_section(name)}")
-        else:
-            print(f"{sep}----- {name} -----")
-        print(text, end="" if text.endswith("\n") else "\n")
-        printed_any = True
-    return printed_any
-
-
 def cmd_log(args) -> int:
     client = client_from_config()
     if getattr(args, "follow", False):
         try:
-            state, printed_any = _poll_logs(client, args.run_id, interval=2.0)
+            result = _poll_logs(client, args.run_id, interval=2.0)
         except KeyboardInterrupt:
             _print_detached_note(args.run_id)
             return 130
-        _print_worker_output(client, args.run_id, printed_any=printed_any)
-        return 0 if state in _OK_STATES else 1
+        sections = _worker_sections(client, args.run_id)
+        _print_worker_output(
+            sections,
+            printed_any=result.printed_any,
+            current_attempt=result.live_attempt,
+        )
+        return 0 if result.state in _OK_STATES else 1
     text = str(client.get_logs(args.run_id, offset=0).get("logs") or "")
     if text:
         print(text, end="" if text.endswith("\n") else "\n")
-    _print_worker_output(client, args.run_id, printed_any=bool(text))
+    sections = _worker_sections(client, args.run_id)
+    attempt = _snapshot_live_attempt(client, args.run_id) if sections else None
+    _print_worker_output(sections, printed_any=bool(text), current_attempt=attempt)
     return 0
 
 
@@ -979,11 +969,20 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _cmd_train_cost,
     _cmd_train_cost_offline,
     _cmd_train_cost_sft,
-    _legacy_train_key_rejection_detail,
+    _print_published_sft_environment_note,
     _print_reasoning_loss_warning,
     _print_sft_cost,
     _print_train_schema_compatibility,
     _print_unpacked_batch_warning,
     _sft_cost_rows,
     _warn_if_wandb_requested_without_key,
+)
+
+# re-exported because cmd_log and focused cli tests address these through the command package.
+from flash.cli.commands.worker_output import (  # noqa: E402,F401
+    _artifact_attempt,
+    _print_worker_output,
+    _snapshot_live_attempt,
+    _worker_section_name,
+    _worker_sections,
 )

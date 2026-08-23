@@ -3413,3 +3413,24 @@ def test_env_test_scores_the_junk_probe_once_per_run(monkeypatch, tmp_path, caps
     assert cmd_env_test(_args(env_dir, algorithm="grpo")) != 0
     # one real episode plus exactly one junk probe.
     assert scored == ["4", "test"]
+
+
+def test_replay_state_rejects_a_state_with_no_prompt_rather_than_using_its_transcript():
+    # `prompt` and `messages` are not two spellings of one field: `new_rollout_state` seeds
+    # `messages` with a COPY of `prompt` and appends every turn onto it. falling back to `messages`
+    # when `prompt` is absent therefore records the transcript-so-far as the frozen prefix -- on any
+    # state past turn zero that silently includes model turns the prompt never had. every producer
+    # sets `prompt`, so its absence is a corrupt state and must be named as one.
+    from flash.cli.commands.env.test import _new_multi_turn_replay_state
+
+    class _Env:
+        def new_rollout_state(self, _example):
+            return {
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "a"},
+                ]
+            }
+
+    with pytest.raises(ValueError, match="prompt is not well-formed"):
+        _new_multi_turn_replay_state(_Env(), {}, {})

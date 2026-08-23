@@ -1,14 +1,16 @@
-"""Provider-neutral worker packaging: the deps/image/env every rent-a-box or serverless worker ships, plus upload_code for the HF code snapshot. Shared kernel — no provider package imports another for this."""
+"""Provider-neutral worker packaging and immutable managed source publication."""
 
 from __future__ import annotations
 
 import os
 import time
 from io import BytesIO
+from pathlib import Path
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash._internal.logging import get_logger
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
+from flash.core.grpo import GRPO_CONTROL_PLANE_OWNED_ENV_KEYS, GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import (
     CONTROL_PLANE_OWNED_ENV_KEYS,
     MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
@@ -17,7 +19,6 @@ from flash.core.spec import (
     JobSpec,
     require_matching_seed,
 )
-from flash.envs.base import FREESOLO_WORKER_SPEC
 from flash.providers.artifacts.hf import hf_call, hf_status_code
 from flash.providers.base import get_gpu_info
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
@@ -29,53 +30,6 @@ from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 logger = get_logger("flash.providers.runpod.train")
 
 
-# vllm 0.19.1: first vllm compatible with transformers 5.x; vllm>=0.20 pins torch 2.11
-# (CUDA-13 wheels) which reports no GPU on 12.8/12.9 drivers common on 4090/5090 hosts.
-WORKER_DEPS = [
-    "torch==2.10.0",
-    "transformers>=5.6,<5.13",
-    "tokenizers>=0.22",
-    "tiktoken>=0.12",
-    "peft>=0.19",
-    "vllm==0.19.1",
-    # FlashInfer: vLLM's Blackwell-native attention backend. vllm 0.19.1 pins flashinfer-python==0.6.6
-    # but treats it as an OPTIONAL extra (the plain `vllm` install does not pull it), so a consumer-
-    # Blackwell (sm120) / B200 rollout would silently fall back to a PTX-fragile default attention
-    # without it. Pin the matching 0.6.6 so the worker image carries the FLASHINFER attention backend
-    # (resolve_blackwell_attention_backends picks FLASHINFER when it imports). No-op elsewhere.
-    "flashinfer-python==0.6.6",
-    "bitsandbytes>=0.49",
-    # resolve_verl_python shells out to `uv` to provision the isolated verl interpreter whenever
-    # FLASH_VERL_PYTHON is unset. sft and opd are verl-only, so on the no-image path that call is
-    # unconditional and a missing `uv` fails the run with FileNotFoundError before training.
-    "uv>=0.5",
-    "datasets>=4.7,<6",
-    # >=0.2.54: includes robust JSONL loading and corrected package metadata.
-    FREESOLO_WORKER_SPEC,
-    # >=1.2.0: built-in RateLimit-header-aware 429 retry for HF downloads (base-model pulls) and
-    # paginated Hub API calls. Must match Dockerfile.worker's floor (the baked image is the default
-    # run path; this list only installs on the no-image/live-function path) -- see
-    # tests/test_kernel_fingerprint.py::test_huggingface_hub_floor_is_in_lockstep.
-    "huggingface_hub>=1.2.0",
-    "accelerate>=1.4",
-    # HF `kernels` Hub NOT pinned: torch2.10-compatible versions crash `import transformers` (LayerRepository API mismatch).
-    "wandb>=0.17",
-    # fla from git: PyPI wheel is a broken stub missing fla.modules. SHA-pinned for reproducibility;
-    # keep in lockstep with Dockerfile.worker. fla kept on ALL arches — worker ensures tilelang
-    # backend on sm90 before model import (fla #640: chunk_bwd miscompute with Triton>=3.4 on Hopper)
-    # and OPTS OUT of tilelang on sm100 (B200) where tilelang's chunk_bwd_dqkwg miscomputes grads
-    # (worker _force_fla_triton_gdn_on_sm100; upstream default-gates tilelang to Hopper since fla #975).
-    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@9c8e42e762fce087c27b673af4922795d9edb85e",
-    # flashqla GDN backend (fla 0.5.2 dispatch); bound on sm90 only by the child shim, since on
-    # sm100 it miscomputes gradients the same way tilelang's backward does.
-    "flash-qla==0.1.2",
-    # tilelang version-pinned with the worker image and flash/engine/worker/perf/__init__.py runtime reinstall.
-    "tilelang==0.1.11",
-    "apache-tvm-ffi==0.1.11",  # pin: 0.1.12 double-registers TVM-FFI -> `import tilelang` aborts
-    # causal_conv1d NOT pip-listed: CUDA extension compiled in Dockerfile.worker with TORCH_CUDA_ARCH_LIST.
-]
-WORKER_SYSTEM_DEPS = ["build-essential"]  # Triton/Inductor need a C compiler
-
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 
 # MUST mirror the bake matrix in .github/workflows/bake-kernel-cache.yml. Unlisted arches fall
@@ -83,20 +37,15 @@ WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100"})
 
 
-def worker_image_for_gpu(friendly_gpu: str | None, *, allow_default: bool = True) -> str | None:
+def worker_image_for_gpu(friendly_gpu: str | None) -> str:
     """Return the worker Docker image for a GPU class (per-SM kernel-cache tag or base)."""
-    if friendly_gpu and allow_default:
+    if friendly_gpu:
         info = get_gpu_info(friendly_gpu)
         # Per-SM baked kernel-cache image is always used for baked arches (skips ~10-15 min
         # cold-start JIT). Unbaked arches fall through to the base image to avoid a 404 docker pull.
         if info.sm in BAKED_PER_SM_ARCHES:
             return f"{WORKER_IMAGE}-{info.sm}"
-    return WORKER_IMAGE if allow_default else None
-
-
-def resolve_worker_deps() -> list[str]:
-    """Return the pinned worker dependency list."""
-    return list(WORKER_DEPS)
+    return WORKER_IMAGE
 
 
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h cap
@@ -192,10 +141,8 @@ def build_worker_env(
         "HF_TOKEN",
         "GITHUB_TOKEN",
     ):
-        # Stripped, and a blank value forwards NOTHING. The worker's git askpass and HF client both
-        # branch on presence, so a whitespace-only credential is worse than an absent one: it turns
-        # an anonymous public fetch into an authenticated request with a malformed token, which
-        # GitHub and HF reject outright.
+        # stripped, and a blank value forwards nothing. the pip bootstrap uses github only for a
+        # request-scoped askpass helper, then removes both values before launching training code.
         value = (os.environ.get(key) or "").strip()
         if value:
             env[key] = value
@@ -208,11 +155,13 @@ def build_worker_env(
     # populated. removed keys are filtered here too. the two sets are disjoint and answer
     # different questions: control-plane ownership prevents overrides such as SEED, while removed
     # optimization keys configure nothing and must not silently reach the worker.
+    owned_env_keys = CONTROL_PLANE_OWNED_ENV_KEYS
+    if str(getattr(spec, "algorithm", "")).lower() == "grpo":
+        owned_env_keys |= GRPO_CONTROL_PLANE_OWNED_ENV_KEYS
     allowed_runtime_secrets = {
         k
         for k in (set(DEFAULT_RUNTIME_SECRET_KEYS) | set(spec.environment.secrets))
-        if k.upper() not in CONTROL_PLANE_OWNED_ENV_KEYS
-        and k.upper() not in _REMOVED_OPTIMIZATION_ENV
+        if k.upper() not in owned_env_keys and k.upper() not in _REMOVED_OPTIMIZATION_ENV
     }
     for k, v in (runtime_secrets or {}).items():
         if k in allowed_runtime_secrets and v:
@@ -238,6 +187,8 @@ def build_worker_env(
             raise RuntimeError("managed opd control-panel teacher transport is missing")
         env[PUBLIC_URL_ENV] = public_url
         env[TEACHER_CAPABILITY_ENV] = capability
+    if str(getattr(spec, "algorithm", "")).lower() == "grpo":
+        env.update(GRPO_NATIVE_THREAD_ENV)
     # declared runtime secrets can carry any name, so their names are listed explicitly for the
     # redactors (flash._internal.diagnostics and the provider bootstraps): the name-shape
     # heuristic alone would let AWS_SECRET_ACCESS_KEY-style values through. set last so no
@@ -256,9 +207,6 @@ def build_worker_env(
     if secret_keys:
         env[SECRET_ENV_KEYS_ENV] = ",".join(sorted(secret_keys))
     return env
-
-
-_CODE_SNAPSHOT_COMPLETE = ".flash-code-snapshot-complete"
 
 
 def _hf_call(call, label: str, *, deadline_at: float | None = None):
@@ -299,53 +247,120 @@ def _ensure_private_artifact_repo(
     )
 
 
-def upload_code(
+def _repo_revision(api, repo: str, *, deadline_at: float | None) -> str:
+    info = _hf_call(
+        lambda: api.repo_info(repo_id=repo, repo_type="dataset"),
+        f"read artifact repo revision {repo}",
+        deadline_at=deadline_at,
+    )
+    revision = str(getattr(info, "sha", None) or getattr(info, "oid", None) or "").strip()
+    if not revision:
+        raise RuntimeError("artifact repository revision is unavailable")
+    return revision
+
+
+def _download_source_archive(
+    repo: str,
+    archive_path: str,
+    revision: str,
+    token: str | None,
+    *,
+    deadline_at: float | None,
+) -> bytes | None:
+    from huggingface_hub import hf_hub_download
+
+    try:
+        local_path = _hf_call(
+            lambda: hf_hub_download(
+                repo_id=repo,
+                repo_type="dataset",
+                filename=archive_path,
+                revision=revision,
+                token=token,
+            ),
+            f"download source snapshot {repo}:{archive_path}@{revision}",
+            deadline_at=deadline_at,
+        )
+    except Exception as exc:
+        if hf_status_code(exc) == 404 or exc.__class__.__name__ in {
+            "EntryNotFoundError",
+            "LocalEntryNotFoundError",
+        }:
+            return None
+        raise
+    with open(local_path, "rb") as source:
+        return source.read()
+
+
+def publish_source_snapshot(
     repo: str | None = None,
     *,
-    code_prefix: str | None = None,
     deadline_at: float | None = None,
-) -> str:
-    """Upload the ``flash`` package to its content-addressed HF artifact prefix."""
+) -> dict:
+    """Publish one deterministic source archive and return its immutable descriptor."""
     from huggingface_hub import HfApi
 
     import flash
-    from flash.runner import flash_code_prefix
+    from flash.source_snapshot import (
+        build_source_archive,
+        canonical_archive_path,
+        descriptor_for_archive,
+        read_verified_archive,
+        sha256_bytes,
+    )
 
     if not repo:
         raise RuntimeError(
             "hf_repo must be set (the run's [train] hf_repo: HF dataset repo for code + artifacts)"
         )
     token = os.environ.get("HF_TOKEN")
-    pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     api = HfApi(token=token)
     _ensure_private_artifact_repo(api, repo, deadline_at=deadline_at)
-    code_prefix = code_prefix or flash_code_prefix()
-    code_marker = f"{code_prefix}/{_CODE_SNAPSHOT_COMPLETE}"
-    if _hf_call(
-        lambda: api.file_exists(repo_id=repo, filename=code_marker, repo_type="dataset"),
-        f"check flash code snapshot {repo}:{code_marker}",
-        deadline_at=deadline_at,
-    ):
-        return repo
-    _hf_call(
-        lambda: api.upload_folder(
-            folder_path=pkg_dir,
-            path_in_repo=code_prefix,
-            repo_id=repo,
-            repo_type="dataset",
-            ignore_patterns=["__pycache__/*", "*.pyc", "*.pyo"],
-        ),
-        f"upload flash code to {repo}:{code_prefix}",
-        deadline_at=deadline_at,
-    )
-    _hf_call(
-        lambda: api.upload_file(
-            path_or_fileobj=BytesIO(b"complete\n"),
-            path_in_repo=code_marker,
-            repo_id=repo,
-            repo_type="dataset",
-        ),
-        f"mark flash code snapshot complete {repo}:{code_marker}",
-        deadline_at=deadline_at,
-    )
-    return repo
+    package_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
+    archive = build_source_archive(package_dir=Path(package_dir))
+    digest = sha256_bytes(archive)
+    archive_path = canonical_archive_path(digest)
+
+    def verified_at(revision: str) -> dict | None:
+        candidate = _download_source_archive(
+            repo,
+            archive_path,
+            revision,
+            token,
+            deadline_at=deadline_at,
+        )
+        if candidate is None:
+            return None
+        descriptor = descriptor_for_archive(archive, revision)
+        read_verified_archive(candidate, descriptor)
+        return descriptor.to_dict()
+
+    head = _repo_revision(api, repo, deadline_at=deadline_at)
+    existing = verified_at(head)
+    if existing is not None:
+        return existing
+    try:
+        commit = _hf_call(
+            lambda: api.upload_file(
+                path_or_fileobj=BytesIO(archive),
+                path_in_repo=archive_path,
+                repo_id=repo,
+                repo_type="dataset",
+                commit_message=f"publish flash source {digest}",
+            ),
+            f"publish source snapshot {repo}:{archive_path}",
+            deadline_at=deadline_at,
+        )
+        revision = str(getattr(commit, "oid", None) or "").strip()
+        if not revision:
+            raise RuntimeError("source snapshot publication returned no immutable revision")
+        published = verified_at(revision)
+        if published is None:
+            raise RuntimeError("published source snapshot is not readable at its commit revision")
+        return published
+    except Exception:
+        winner_revision = _repo_revision(api, repo, deadline_at=deadline_at)
+        winner = verified_at(winner_revision)
+        if winner is not None:
+            return winner
+        raise

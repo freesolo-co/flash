@@ -9,15 +9,18 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 
+from flash.adapters.targets import resolve_lora_targeting
+from flash.content.multimodal import messages_with_decoded_images
 from flash.content.structured_outputs import reasoning_parser_for
-from flash.engine.profiling.sft_workload import _multimodal_messages_with_images
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
     rollout_max_num_seqs,
+    rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
     rollout_sleep_unsupported,
     trainer_dtype_overrides,
@@ -126,7 +129,7 @@ def _processor_expanded_prompt(
     from flash.content.multimodal import decode_image_descriptors
 
     images = decode_image_descriptors(list(image_descriptors), package_root)
-    prepared = _multimodal_messages_with_images(messages, images)
+    prepared = messages_with_decoded_images(messages, images)
     rendered = processor.apply_chat_template(
         prepared, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
     )
@@ -209,6 +212,7 @@ def _data_overrides(cfg: dict) -> list[str]:
         # thread flash's thinking mode so the rollout sees the same prompt the retired trl path saw.
         f"+data.apply_chat_template_kwargs.enable_thinking={str(bool(cfg.get('thinking', False))).lower()}",
         f"data.seed={cfg['seed']}",
+        "data.dataloader_num_workers=0",
         # set the rollout seed through engine_kwargs: verl 0.8.0 has no RolloutConfig.seed, and
         # direct keys either fail hydra or the dataclass conversion. engine_kwargs is declared and
         # overrides verl's own vllm seed; `++` is required because this sub-key is absent.
@@ -226,8 +230,6 @@ def _data_overrides(cfg: dict) -> list[str]:
                 "data.return_multi_modal_inputs=false",
                 "data.filter_overlong_prompts=true",
                 "data.truncation=error",
-                # the processor's image loader is not fork-safe under verl's default workers.
-                "data.dataloader_num_workers=0",
                 "actor_rollout_ref.model.trust_remote_code=true",
             ]
             if cfg.get("multimodal")
@@ -243,6 +245,7 @@ def _actor_model_overrides(cfg: dict) -> list[str]:
         f"actor_rollout_ref.model.lora_rank={cfg['lora_rank']}",
         f"actor_rollout_ref.model.lora_alpha={cfg['lora_alpha']}",
         f"actor_rollout_ref.model.target_modules={cfg['target_modules']}",
+        f"actor_rollout_ref.model.exclude_modules={_hydra_val(cfg.get('exclude_modules'))}",
         *(
             ["++actor_rollout_ref.model.target_parameters=" + _hydra_val(cfg["target_parameters"])]
             if cfg.get("target_parameters")
@@ -306,10 +309,19 @@ def _rollout_overrides(cfg: dict) -> list[str]:
     return [
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
+        # hydra's composed rollout node omits this real rollout config field.
+        "++actor_rollout_ref.rollout.limit_images=4",
         # verl 0.8.0 chunks the rollout batch across agent workers with exact divisibility
         # (agent_loop.py:1111 -> protocol.py:874). choose the largest divisor of
-        # prompts_per_step * group_size up to 8, so small or final short batches cannot abort.
-        f"actor_rollout_ref.rollout.agent.num_workers={agent_loop_workers(int(cfg['prompts_per_step']) * int(cfg['group_size']))}",
+        # prompts_per_step * group_size up to the cap, so small or final short batches cannot abort.
+        # a multimodal run halves the cap: every agent worker is a ray actor holding its own
+        # processor copy, and on an image run that processor is a full image processor living
+        # beside the vllm engine, enginecore, load balancer and http server in one container. at
+        # eight workers one actor dies with `libgomp: Thread creation failed`, and because it dies
+        # mid-grading the rollouts generate but never get graded, so the run hangs until the
+        # child-silence watchdog kills it 1200s later. capping the pool leaves group_size and
+        # prompts_per_step exactly as authored -- only scheduling parallelism narrows.
+        f"actor_rollout_ref.rollout.agent.num_workers={agent_loop_workers(int(cfg['prompts_per_step']) * int(cfg['group_size']), cap=4 if cfg.get('multimodal') else 8)}",
         # one grpo step submits exactly prompts_per_step * group_size sequences. left unset verl
         # keeps its 1024 default, and vllm sizes cuda-graph capture and (on a gdn/mamba hybrid)
         # per-slot recurrent state from that number, both up front -- so a 32-sequence run paid a
@@ -338,6 +350,7 @@ def _rollout_overrides(cfg: dict) -> list[str]:
         ),
         # safetensors load format is required for lora rollout on vllm.
         "actor_rollout_ref.rollout.load_format=safetensors",
+        *rollout_mm_processor_cache_overrides(),
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
         # sleep_unsupported). shared with the opd driver, which runs the same verl sleep path.
         *rollout_resident_overrides(bool(cfg.get("sleep_unsupported"))),
@@ -492,24 +505,31 @@ def resolve_gpu_mem_util(
     n_gpus: int,
     fp8_kv: bool,
     sleep_unsupported: bool,
+    preserve_legacy_floor: bool = False,
 ) -> float:
     """size vllm's colocated executor budget from this run's geometry.
 
-    ``gpu_memory_utilization`` covers the second bf16 weight copy plus kv pool. using
+    ``gpu_memory_utilization`` covers the second bf16 weight copy, lora adapter, and kv pool. using
     ``colocate_kv_util`` keeps worker allocation aligned with preflight admission.
 
-    the flat constant is kept where the model does NOT apply, because a wrong number is worse than
+    for multi-gpu runs, vllm shards its bf16 weight copy across tensor-parallel ranks. its default
+    lora layout shards only one factor of each projection's a/b pair, so the rank-local adapter uses
+    the larger safe orientation from catalog geometry rather than dividing the full adapter evenly.
+    the kv term remains unsharded here because vllm can replicate kv heads when tensor parallelism is
+    wider than the model's kv-head count. the adapter lives inside vllm's reservation, and the result
+    is explicitly capped at the old 0.5 constant, so this path can only lower a rank's reservation
+    and cannot create a new over-reservation.
+
+    the flat constant is kept where the model does not apply, because a wrong number is worse than
     a conservative one:
 
-    - UNKNOWN CARD (empty/unmanaged ``gpu.type``): the budget is a fraction of the card, so without
+    - unknown card (empty/unmanaged ``gpu.type``): the budget is a fraction of the card, so without
       its size there is nothing to take a fraction of.
-    - MULTI-GPU (``n_gpus > 1``): the rollout is tensor-parallel, so vLLM's weight copy is sharded
-      ACROSS cards while ``colocate_kv_util`` sizes one whole copy against one card. a single-card
-      number would over-reserve per rank on exactly the shapes already tight.
-    - PINNED REVISION with no resolvable parameter count: the weight term dominates, so a guessed
+    - pinned revision with no resolvable parameter count: the weight term dominates, so a guessed
       size is not worth acting on.
+    - any sizing exception: launch falls back to the previous constant instead of failing.
     """
-    if n_gpus > 1 or not (gpu_type or "").strip():
+    if not (gpu_type or "").strip():
         return _DEFAULT_GPU_MEM_UTIL
     try:
         from flash.core.catalog import MODELS
@@ -538,7 +558,7 @@ def resolve_gpu_mem_util(
         )
         if params_b <= 0:
             return _DEFAULT_GPU_MEM_UTIL
-        return colocate_kv_util(
+        sized = colocate_kv_util(
             params_b,
             int(inp["engine_len"]),
             total_vram_gb,
@@ -551,7 +571,13 @@ def resolve_gpu_mem_util(
             active_params_b=float(getattr(info, "active_params_b", 0.0) or 0.0) or None,
             fp8_kv=fp8_kv,
             model_info=info,
+            preserve_legacy_floor=preserve_legacy_floor,
+            tensor_parallel=n_gpus,
+            lora_rank=int(inp["lora_rank"]),
         )
+        # multi-rank sizing is strictly one-directional against the previous worker contract: it may
+        # free memory but can never claim more than the flat reservation a working run already used.
+        return min(_DEFAULT_GPU_MEM_UTIL, sized) if n_gpus > 1 else sized
     except Exception as e:  # sizing must never be what stops a run from launching
         print(
             f"[rl-verl] gpu_memory_utilization sizing failed ({e}); using {_DEFAULT_GPU_MEM_UTIL}"
@@ -589,6 +615,9 @@ def _build_verl_training_cfg(
 ) -> dict:
     engine_len = int(inp["engine_len"])
     sleep_unsupported = rollout_sleep_unsupported(inp["model_id"])
+    targeting = resolve_lora_targeting(
+        inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
+    )
     return {
         "fused_ce_backend": ce_backend,
         "train_files": train_files,
@@ -596,11 +625,11 @@ def _build_verl_training_cfg(
         "model_path": model_path,
         "lora_rank": inp["lora_rank"],
         "lora_alpha": inp["lora_alpha"],
-        "target_modules": "all-linear",
-        # the catalog id, never model_path: lora_target_parameters matches an exact hf repo id, so a
-        # snapshot dir yields None and leaves the fused routed-expert parameters unadapted on a run
-        # that otherwise looks healthy.
-        "target_parameters": _w.lora_target_parameters(inp["model_id"]),
+        "target_modules": targeting.target_modules,
+        "exclude_modules": None,
+        # the catalog id, never model_path: fused routed-expert parameters are part of the same
+        # resolved target surface and must not be derived from the local snapshot path.
+        "target_parameters": targeting.target_parameters,
         "multimodal": bool(inp.get("multimodal")),
         "lr": inp["lr"],
         "group_size": inp["group_size"],
@@ -685,6 +714,11 @@ def _build_verl_train_notes(
     wandb_id: str | None = None,
     reward_bridge_batching: bool = False,
     gdn_boundary_resets: bool | None = None,
+    host_census: dict | None = None,
+    rollout_identity_evidence: dict | None = None,
+    advantage_spread_history: list[float] | None = None,
+    advantage_bounds: list[dict] | None = None,
+    multi_turn_accounting: dict | None = None,
 ) -> dict:
     return {
         "backend": "verl",
@@ -741,6 +775,17 @@ def _build_verl_train_notes(
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
         "reward_bridge_batching": bool(reward_bridge_batching),
+        "host_census": copy.deepcopy(host_census or {}),
+        "rollout_identity_evidence": copy.deepcopy(
+            rollout_identity_evidence or {"steps": [], "validation": []}
+        ),
+        "advantage_spread_history": list(advantage_spread_history or []),
+        "advantage_bounds": copy.deepcopy(advantage_bounds or []),
+        # episode and turn totals for a multi-turn run; None for single-turn, which has no
+        # episode loop to account for. published in the durable notes rather than only on the
+        # heartbeat because this is the evidence that separates "multi-turn was configured" from
+        # "multi-turn actually iterated", and a one-turn collapse passes every other gate.
+        "multi_turn_accounting": copy.deepcopy(multi_turn_accounting),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
             "entropy_quantile": inp["entropy_quantile"],

@@ -14,7 +14,7 @@ import hashlib
 import json
 from typing import TYPE_CHECKING
 
-from flash.engine.profiling.sft_workload import _multimodal_messages_with_images
+from flash.content.multimodal import messages_with_decoded_images
 from flash.engine.worker.train.opd.gkd import _trim_trailing_stop
 
 if TYPE_CHECKING:  # the prompt record, for annotations only -- it lives in the orchestrator
@@ -58,6 +58,35 @@ def _normalize_prompt_ids(value) -> tuple[int, ...]:
     )
 
 
+def _processor_expanded_prompt(
+    processor,
+    messages: list[dict],
+    image_descriptors: tuple[str, ...],
+    package_root: str | None,
+    *,
+    enable_thinking: bool,
+) -> tuple[tuple[int, ...], str]:
+    from flash.content.multimodal import decode_image_descriptors
+
+    images = decode_image_descriptors(list(image_descriptors), package_root)
+    prepared = messages_with_decoded_images(messages, images)
+    raw_prompt = processor.apply_chat_template(
+        prepared,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+    )
+    processor_kwargs = {
+        "text": [raw_prompt],
+        "videos": None,
+        "return_tensors": "pt",
+    }
+    if images:
+        processor_kwargs["images"] = images
+    model_inputs = processor(**processor_kwargs)
+    return _normalize_prompt_ids(model_inputs), raw_prompt
+
+
 def _processor_expanded_prompt_ids(
     processor,
     messages: list[dict],
@@ -66,23 +95,14 @@ def _processor_expanded_prompt_ids(
     *,
     enable_thinking: bool,
 ) -> tuple[int, ...]:
-    from flash.content.multimodal import decode_image_descriptors
-
-    images = decode_image_descriptors(list(image_descriptors), package_root)
-    prepared = _multimodal_messages_with_images(messages, images)
-    raw_prompt = processor.apply_chat_template(
-        prepared,
-        tokenize=False,
-        add_generation_prompt=True,
+    prompt_ids, _raw_prompt = _processor_expanded_prompt(
+        processor,
+        messages,
+        image_descriptors,
+        package_root,
         enable_thinking=enable_thinking,
     )
-    model_inputs = processor(
-        text=[raw_prompt],
-        images=images,
-        videos=None,
-        return_tensors="pt",
-    )
-    return _normalize_prompt_ids(model_inputs)
+    return prompt_ids
 
 
 def encode_shifted_group_metadata(

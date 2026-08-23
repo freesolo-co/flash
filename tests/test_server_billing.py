@@ -14,6 +14,8 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from tests._helpers.source_snapshot import valid_source_snapshot
+
 SPEC = {
     "model": "Qwen/Qwen3.5-4B",
     "project": "11111111-1111-4111-8111-111111111111",
@@ -26,6 +28,7 @@ SPEC = {
 }
 
 _USER_PREFIX = "fslo-user-"
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _identity_for_token(token: str) -> dict[str, str]:
@@ -269,6 +272,7 @@ def api(tmp_path, monkeypatch):
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo: _SOURCE_SNAPSHOT)
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
     # Keep submit offline: validate + record, but the GPU job body is a no-op.
@@ -310,6 +314,9 @@ def api(tmp_path, monkeypatch):
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **k: {"ok": True})
     with TestClient(app_mod.create_app()) as client:
+        # startup preflight needs the fake token above; billing requests do not. keeping `ghp-test`
+        # here turns an offline billing test into a real environment-pin request to GitHub.
+        monkeypatch.delenv("GITHUB_TOKEN")
         yield client
 
 
@@ -438,7 +445,7 @@ def test_transient_environment_resolve_is_attempted_once_per_request(api, monkey
     spec = {
         **SPEC,
         "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
+        "train": {**SPEC["train"], "teacher_model": "deepseek-v4-pro"},
     }
 
     res = api.post(
@@ -472,7 +479,7 @@ def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monk
     spec = {
         **SPEC,
         "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
+        "train": {**SPEC["train"], "teacher_model": "deepseek-v4-pro"},
     }
 
     res = api.post(
@@ -637,16 +644,17 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
     unsupported_spec = {
         **SPEC,
-        # image-bearing OPD is single-turn only, so a multi-turn environment carrying an image
-        # record can never launch regardless of the org's balance.
+        # image records distilled from a text-only teacher. the subject of this test is the
+        # ORDERING, so the case only has to be something static validation refuses; it deliberately
+        # is not a warm-start or a multi-turn-image case, because both of those were once
+        # unsupported and have since been implemented, and each silently turned this into a test
+        # that asserted nothing the moment its premise became supported. a teacher that cannot see
+        # images is a property of the teacher, not a gap waiting to be closed.
         "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "qwen3-vl-235b"},
+        "train": {**SPEC["train"], "teacher_model": "deepseek-v4-pro"},
         "environment": {
             **SPEC["environment"],
             "params": {
-                # multi_turn rides in params, not as an [environment] key: the spec schema rejects
-                # unknown top-level environment keys, and the validator reads either.
-                "multi_turn": True,
                 "records": [
                     {
                         "input": [
@@ -669,7 +677,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     )
 
     assert res.status_code == 400, res.text
-    assert "multi-turn image-bearing opd is not supported" in res.text
+    assert "cannot see images" in res.text
     assert "insufficient" not in res.text
 
 

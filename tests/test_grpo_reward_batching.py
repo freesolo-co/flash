@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import math
+import sys
 import threading
 import time
 
@@ -10,6 +11,7 @@ import pytest
 from flash.engine.worker import rl_train
 from flash.engine.worker.runtime.pkg_proxy import W
 from flash.engine.worker.score_batcher import ScoreBatcher
+from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
 
 @pytest.fixture
@@ -19,7 +21,7 @@ def _identity_graded(monkeypatch):
     monkeypatch.setattr(W, "think_token_count", lambda text, tok, prompt_opened_thinking=False: 3)
 
 
-def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order():
+def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order(monkeypatch):
     calls = []
     live = 0
     peak = 0
@@ -42,6 +44,7 @@ def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order():
         score_batch=score_batch,
     )
     try:
+        monkeypatch.setitem(sys.modules, "flash_grpo_multiturn", grpo_multiturn)
         namespace: dict = {}
         exec(
             compile(rl_train.render_reward_module("TEST_URL"), "<reward>", "exec"),
@@ -52,7 +55,18 @@ def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order():
             results = list(
                 pool.map(
                     lambda i: namespace["compute_score"](
-                        "env", f"a{i}", "unused", extra_info={"index": i}
+                        "env",
+                        f"a{i}",
+                        "unused",
+                        extra_info={
+                            "index": i,
+                            "flash_rollout_identity": {
+                                "optimizer_step": 1,
+                                "sample_index": i,
+                                "rollout_ordinal": 0,
+                                "validate": False,
+                            },
+                        },
                     ),
                     range(8),
                 )

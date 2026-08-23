@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-import ast
 import base64
 import hashlib
 import io
 import json
 import math
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, ClassVar
 
 from flash.providers._lifecycle.deadline import remaining_seconds, require_deadline_at
 from flash.providers._lifecycle.poll import _attempt_int
+from flash.runtime_capsule import build_capsule, sha256_bytes
+
+# the capsule the rented-box providers ship. built once and cached: the archive is deterministic,
+# so rebuilding it per launch would burn cpu to produce identical bytes.
+INSTANCE_BOOTSTRAP_PROFILE = "instance-bootstrap"
+_INSTANCE_CAPSULE: tuple[str, str] | None = None
 
 # Bounded so the name is never truncated at launch — truncation desyncs the sweep-matched prefix.
 _MAX_NAME = 60
@@ -30,10 +34,10 @@ _USER_DATA_BUDGET = _USER_DATA_CAP - _USER_DATA_MARGIN
 
 # Fast path only: above this, the spec is spilled to HF without first rendering a payload that
 # cannot fit. What is left of the ~64,000-byte cap after the fixed framing -- this module's template
-# plus every source it heredocs in (bootstrap.py, bootstrap_secrets.py, bootstrap_pip.py) -- is
-# ~5,800 bytes, and base64 + json escaping inflate the spec ~1.35x on the way in. Shrink this again
-# whenever those sources grow; docstrings are stripped on the way in, so only code and COMMENTS
-# count, and prose belongs in a docstring rather than a comment for exactly that reason.
+# plus the base64 runtime capsule -- is the inline headroom, and base64 + json escaping inflate the
+# spec ~1.35x on the way in. The capsule is compressed, so it costs far less than the raw sources it
+# replaced: the framing that forced this down to 2,000 when bootstrap.py and its console, secret,
+# and pip siblings each rode as their own heredoc now fits in one archive, with room to spare.
 # test_build_user_data_spills_large_spec_out_of_cloud_init pins the worst inline case against the
 # cap so the two cannot drift apart silently. Sized for a REAL payload, which carries ~760 bytes of
 # env, deadline, and cache fields that the test's minimal one does not: at 4_000 the worst case
@@ -187,7 +191,7 @@ def build_payload(
     cache_host_mount: str | None = None,
     mode: str | None = None,
     models: list | None = None,
-    code_prefix: str | None = None,
+    source_snapshot: dict | None = None,
     deadline_at: float | None = None,
 ) -> dict:
     """The bootstrap's input — field-compatible with the RunPod ``_train_body`` payload, plus the
@@ -199,7 +203,7 @@ def build_payload(
         build_worker_env,
         strip_runpod_volume_env,
     )
-    from flash.runner import flash_code_prefix
+    from flash.source_snapshot import parse_descriptor
 
     canonical_seed = require_matching_seed(spec, seed)
     # strip the runpod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.
@@ -229,12 +233,13 @@ def build_payload(
         # [environment] pip is appended to the worker requirement, never substituted for it.
         "extra_pip": worker_pip_with_extras(spec.environment.id, spec.environment.pip),
         "hf_prefix": f"{spec.phase}/{spec.run_id}",
-        "code_prefix": code_prefix or flash_code_prefix(),
         "deadline_at": absolute_deadline,
         "run_created_at": absolute_deadline - max_wall_seconds,
         "run_max_wall_seconds": max_wall_seconds,
         "attempt": attempt_id,
     }
+    if mode != "preload":
+        payload["source_snapshot"] = parse_descriptor(source_snapshot).to_dict()
     if cache_host_mount:
         payload["cache_host_mount"] = cache_host_mount
         # Carry the mount sentinel filename so the bootstrap's mount-check reads it from one constant.
@@ -244,140 +249,6 @@ def build_payload(
         payload["mode"] = mode
         payload["models"] = list(models or [])
     return payload
-
-
-# host helper: cap every cloud-init polling and retry delay at the canonical run deadline.
-_DEADLINE_SLEEP_PY = """\
-import json, math, sys, time
-try:
-    requested = float(sys.argv[1])
-    p = json.load(open("/opt/flash/payload.json"))
-    deadline = p.get("deadline_at")
-    created_at = p.get("run_created_at")
-    max_wall_seconds = p.get("run_max_wall_seconds")
-    clocks = (deadline, created_at, max_wall_seconds)
-    if (
-        not math.isfinite(requested)
-        or requested < 0
-        or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in clocks)
-    ):
-        raise ValueError("invalid deadline sleep")
-    deadline, created_at, max_wall_seconds = map(float, clocks)
-    now = time.time()
-    if (
-        not all(math.isfinite(value) and value > 0 for value in clocks)
-        or not math.isfinite(now)
-        or now <= 0
-        or not math.isclose(deadline, created_at + max_wall_seconds, rel_tol=0.0, abs_tol=1e-6)
-    ):
-        raise ValueError("invalid deadline clock")
-    remaining = deadline - now
-    if remaining <= 0:
-        raise SystemExit(124)
-    delay = min(requested, remaining)
-    if delay > 0:
-        time.sleep(delay)
-    if requested >= remaining:
-        raise SystemExit(124)
-except Exception:
-    raise SystemExit(125)
-"""
-
-# host helper: best-effort Lambda boot-log upload to hf. attempt-scoped path.
-_HOSTLOG_PY = """\
-import json, math, time
-try:
-    p = json.load(open("/opt/flash/payload.json"))
-    arm = p.get("flash_arm", "instance")
-    att = p.get("attempt")
-    deadline = p.get("deadline_at")
-    created_at = p.get("run_created_at")
-    max_wall_seconds = p.get("run_max_wall_seconds")
-    clocks = (deadline, created_at, max_wall_seconds)
-    if isinstance(att, bool) or not isinstance(att, int) or att < 0:
-        raise ValueError("invalid attempt")
-    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in clocks):
-        raise ValueError("invalid deadline")
-    deadline, created_at, max_wall_seconds = map(float, clocks)
-    now = time.time()
-    if (
-        not all(math.isfinite(value) and value > 0 for value in clocks)
-        or not math.isfinite(now)
-        or now <= 0
-        or now >= deadline
-        or not math.isclose(deadline, created_at + max_wall_seconds, rel_tol=0.0, abs_tol=1e-6)
-    ):
-        raise ValueError("invalid clock")
-    from huggingface_hub import HfApi
-    HfApi(token=(p.get("env") or {}).get("HF_TOKEN")).upload_file(
-        path_or_fileobj="/opt/flash/host_boot.log",
-        path_in_repo=p["hf_prefix"] + "/" + arm + "_attempt" + str(att) + "_boot.log",
-        repo_id=p["hf_repo"],
-        repo_type="dataset",
-    )
-except Exception:
-    pass
-"""
-
-# Host helper: write a RETRIABLE attempt-failure marker to HF only when the worker wrote none (it owns the path).
-_FAILMARK_PY = """\
-import json, math, time
-try:
-    p = json.load(open("/opt/flash/payload.json"))
-    arm = p.get("flash_arm", "instance")
-    att = p.get("attempt")
-    run_id = p.get("run_id")
-    deadline = p.get("deadline_at")
-    created_at = p.get("run_created_at")
-    max_wall_seconds = p.get("run_max_wall_seconds")
-    if isinstance(att, bool) or not isinstance(att, int) or att < 0:
-        raise ValueError("invalid attempt")
-    if not isinstance(run_id, str) or not run_id:
-        raise ValueError("invalid run id")
-    clocks = (deadline, created_at, max_wall_seconds)
-    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in clocks):
-        raise ValueError("invalid deadline")
-    deadline, created_at, max_wall_seconds = map(float, clocks)
-    now = time.time()
-    if (
-        not all(math.isfinite(value) and value > 0 for value in clocks)
-        or not math.isfinite(now)
-        or now <= 0
-        or now >= deadline
-        or not math.isclose(
-            deadline, created_at + max_wall_seconds, rel_tol=0.0, abs_tol=1e-6
-        )
-    ):
-        raise ValueError("invalid clock")
-    marker_path = p["hf_prefix"] + "/" + arm + "_attempt" + str(att) + ".json"
-    from huggingface_hub import HfApi
-    api = HfApi(token=(p.get("env") or {}).get("HF_TOKEN"))
-    def worker_marker_present():
-        try:
-            return api.file_exists(repo_id=p["hf_repo"], filename=marker_path, repo_type="dataset")
-        except Exception:
-            return True  # conservative: on a read error, never risk clobbering
-    if not worker_marker_present():
-        marker = {
-            "attempt": att,
-            "error": "host bootstrap failure",
-            "ok": False,
-            "retriable": True,
-            "run_id": run_id,
-            "ts": now,
-        }
-        open("/opt/flash/fm.json", "w").write(json.dumps(marker))
-        # re-check right before the upload: the worker may have written its own ok=false marker in
-        # the gap since the first check; honor it instead of clobbering with the retriable host one.
-        if not worker_marker_present():
-            api.upload_file(
-                path_or_fileobj="/opt/flash/fm.json",
-                path_in_repo=marker_path,
-                repo_id=p["hf_repo"], repo_type="dataset",
-            )
-except Exception:
-    pass
-"""
 
 
 def _spill_large_spec_to_hf(payload: dict, *, force: bool = False) -> dict:
@@ -431,78 +302,27 @@ def build_user_data(payload: dict, *, image: str) -> str:
     return user_data
 
 
-def _strip_docstrings(source: str) -> str:
-    """``source`` with every module/class/function docstring replaced by ``pass``.
+def _instance_capsule() -> tuple[str, str]:
+    """The base64 instance-bootstrap capsule and its sha256, built once per process.
 
-    Only docstrings go: comments stay, since a comment sits next to the line it explains and is
-    what a reader debugging ON the box needs. Docstrings are the bulk of the prose and none of the
-    behaviour, so dropping them buys user_data budget at no cost to the shipped module.
-
-    What is replaced is the docstring's exact character span, never the LINES it sits on. A
-    docstring can share its line with the ``def`` that owns it (``def f(): "doc"``) or with a
-    statement that follows it (``"doc"; x = 1``), and dropping whole lines in those positions
-    either strands the body's indentation or silently deletes real code -- silently, because what
-    is left still parses. ``pass`` is valid wherever a docstring was, including a body it was the
-    only statement of, so one rule covers every case without a line-position special case.
-
-    The MODULE docstring is the one exception: it is deleted rather than substituted, because
-    ``from __future__ import annotations`` must be the first statement in a file and a ``pass``
-    standing where the docstring was would displace it.
+    The digest returned here is what the launch script checks the decoded archive against, so both
+    values must come from the same build; returning them together is what makes that structural
+    rather than a convention two call sites have to remember.
     """
-    # ast reports col_offset in utf-8 BYTES, and this source is not ascii, so the spans are cut in
-    # bytes; slicing the str by those numbers would drift on the first non-ascii character.
-    data = source.encode()
-    starts: list[int] = []
-    offset = 0
-    for line in data.splitlines(keepends=True):
-        starts.append(offset)
-        offset += len(line)
-    spans: list[tuple[int, int, bytes]] = []
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        body = getattr(node, "body", None)
-        if (
-            body
-            and isinstance(first := body[0], ast.Expr)
-            and isinstance(first.value, ast.Constant)
-            and isinstance(first.value.value, str)
-            and first.end_lineno is not None
-            and first.end_col_offset is not None
-        ):
-            start = starts[first.lineno - 1] + first.col_offset
-            end = starts[first.end_lineno - 1] + first.end_col_offset
-            if isinstance(node, ast.Module):
-                # deleted outright rather than replaced: `from __future__` must be the file's first
-                # statement, and a `pass` standing where the docstring was would displace it. a
-                # statement sharing its line (`"doc"; VALUE = 7`) would then be left behind a bare
-                # separator, so the separator goes with it.
-                trailing = len(data[end:]) - len(data[end:].lstrip(b" \t;"))
-                spans.append((start, end + trailing, b""))
-            else:
-                spans.append((start, end, b"pass"))
-    # latest first, so replacing one span cannot move the offsets of those not yet applied.
-    for start, end, replacement in sorted(spans, reverse=True):
-        data = data[:start] + replacement + data[end:]
-    stripped = data.decode()
-    ast.parse(stripped)  # never ship something that will not import on the box
-    return stripped
+    global _INSTANCE_CAPSULE
+    if _INSTANCE_CAPSULE is None:
+        archive, _manifest = build_capsule(INSTANCE_BOOTSTRAP_PROFILE)
+        _INSTANCE_CAPSULE = (base64.encodebytes(archive).decode(), sha256_bytes(archive))
+    return _INSTANCE_CAPSULE
 
 
 def _render_user_data(payload: dict, *, image: str) -> str:
     """The user_data text for an already-spill-decided ``payload``."""
     payload_b64 = base64.encodebytes(json.dumps(payload).encode()).decode()
-    # Both shipped modules are stripped of docstrings on the way in. They are for the reader of the
-    # repo, not the box, and user_data is a hard-capped budget shared with the payload's runtime
-    # secrets -- prose explaining WHY a module is shaped a certain way must not be what pushes a
-    # launch over the cap. Comments survive: those sit next to the line they explain and are what a
-    # reader debugging ON the box needs.
-    bootstrap_src = _strip_docstrings((Path(__file__).parent / "bootstrap.py").read_text())
-    # shipped next to bootstrap.py: the bootstrap imports each as a bare sibling module on the box.
-    bootstrap_secrets_src = _strip_docstrings(
-        (Path(__file__).parent / "bootstrap_secrets.py").read_text()
-    )
-    bootstrap_pip_src = _strip_docstrings((Path(__file__).parent / "bootstrap_pip.py").read_text())
+    # The runtime code ships as ONE verified capsule rather than a heredoc per module. user_data
+    # carries only the base64 archive plus its expected digest; the box refuses to execute anything
+    # whose bytes do not match, so a corrupted or substituted payload fails before it can run.
+    capsule_b64, capsule_sha256 = _instance_capsule()
     # Bind the host cache mount into the container at the fixed /weight-cache so prefetch persists; absent -> cold.
     cache_host_mount = payload.get("cache_host_mount")
     cache_bind = (
@@ -513,53 +333,41 @@ def _render_user_data(payload: dict, *, image: str) -> str:
 # flash instance worker (generated by flash.providers._lifecycle.instance.build_user_data; arm={payload.get("flash_arm")})
 set -x
 mkdir -p /opt/flash
-# Consolidate ALL boot output (this script + the container) into one host log the uploader ships
-# to HF since Lambda has no provider console API, so this is the only window into a pre-worker failure.
+# collect host and container boot output for lambda diagnostics.
 exec >>/opt/flash/host_boot.log 2>&1
 cat > /opt/flash/payload.b64 <<'FLASH_PAYLOAD_EOF'
 {payload_b64}FLASH_PAYLOAD_EOF
 base64 -d /opt/flash/payload.b64 > /opt/flash/payload.json
-cat > /opt/flash/bootstrap.py <<'FLASH_BOOTSTRAP_EOF'
-{bootstrap_src}FLASH_BOOTSTRAP_EOF
-cat > /opt/flash/bootstrap_secrets.py <<'FLASH_BOOTSTRAP_SECRETS_EOF'
-{bootstrap_secrets_src}FLASH_BOOTSTRAP_SECRETS_EOF
-cat > /opt/flash/bootstrap_pip.py <<'FLASH_BOOTSTRAP_PIP_EOF'
-{bootstrap_pip_src}FLASH_BOOTSTRAP_PIP_EOF
-cat > /opt/flash/deadline_sleep.py <<'FLASH_DEADLINE_SLEEP_EOF'
-{_DEADLINE_SLEEP_PY}FLASH_DEADLINE_SLEEP_EOF
-cat > /opt/flash/hostlog.py <<'FLASH_HOSTLOG_EOF'
-{_HOSTLOG_PY}FLASH_HOSTLOG_EOF
-cat > /opt/flash/failmark.py <<'FLASH_FAILMARK_EOF'
-{_FAILMARK_PY}FLASH_FAILMARK_EOF
+# The runtime capsule: a versioned zipapp whose every member is sha256'd in its manifest. The
+# expected digest below comes from the control plane, NOT from inside the archive -- an archive
+# cannot authenticate itself, and a manifest swapped together with its members stays self-
+# consistent. Verifying before the first execution is the whole point: a capsule that does not
+# match these bytes never runs.
+cat > /opt/flash/capsule.b64 <<'FLASH_CAPSULE_EOF'
+{capsule_b64}FLASH_CAPSULE_EOF
+base64 -d /opt/flash/capsule.b64 > /opt/flash/capsule.pyz
+CAPSULE_SHA256={capsule_sha256!r}
+echo "$CAPSULE_SHA256  /opt/flash/capsule.pyz" | sha256sum -c - >/dev/null 2>&1 \\
+  || {{ echo "FLASH: runtime capsule failed verification" >&2; exit 1; }}
 IMAGE={image!r}
-fail() {{ echo "FLASH: $1" >&2; python3 /opt/flash/failmark.py "$1" >/dev/null 2>&1 || true; exit 1; }}
-deadline_sleep() {{ python3 /opt/flash/deadline_sleep.py "$1"; }}
+fail() {{ echo "FLASH: $1" >&2; python3 /opt/flash/capsule.pyz failmark "$1" >/dev/null 2>&1 || true; exit 1; }}
+deadline_sleep() {{ python3 /opt/flash/capsule.pyz deadline_sleep "$1"; }}
 # huggingface_hub on the host for the boot-log + failure-marker uploaders (best-effort).
 deadline_sleep 0 || exit 124
 pip3 install -q huggingface_hub >/dev/null 2>&1 \\
   || python3 -m pip install -q --break-system-packages huggingface_hub >/dev/null 2>&1 || true
-# Host->HF boot-log uploader, STARTED EARLY — BEFORE the docker-readiness wait and the (large, slow)
-# image pull — so a box that actually executed cloud-init leaves a liveness artifact on HF within
-# ~2 min. The control plane's poller keys its fast "instance active but the worker never started"
-# failover on this artifact's PRESENCE: it tells a healthy box still pulling the multi-GB image
-# (boot.log present, no heartbeat yet) from a silently dead one (cloud-init never ran -> no boot.log),
-# so the latter fails over in ~15 min instead of burning the full ~50 min setup grace. THROTTLED to
-# 120s and bounded (~30 min) to respect HF's per-repo hourly commit cap; it self-stops once the
-# worker container has STARTED and then exited (inspect succeeds + not running). The `docker inspect`
-# guard is what lets it keep emitting THROUGH the pull/start window: before the container exists the
-# inspect fails, so it does not mistake "not started yet" for "started then exited".
+# upload the host log while docker and the worker image start.
 ( for i in $(seq 1 15); do
-    python3 /opt/flash/hostlog.py >/dev/null 2>&1 || true
+    python3 /opt/flash/capsule.pyz hostlog >/dev/null 2>&1 || true
     if docker inspect flashrun >/dev/null 2>&1 \\
        && ! docker ps --filter name=flashrun --filter status=running -q | grep -q .; then
-      python3 /opt/flash/hostlog.py >/dev/null 2>&1 || true
+      python3 /opt/flash/capsule.pyz hostlog >/dev/null 2>&1 || true
       break
     fi
     deadline_sleep 120 || break
   done ) &
 disown || true
-# The provider's default image ships Docker + the NVIDIA Container Toolkit, but cloud-init can run
-# before they finish initializing — wait for both (up to ~10 min) before launching the worker.
+# wait for docker and the gpu before launching the worker.
 for i in $(seq 1 100); do
   deadline_sleep 0 || fail "run wall deadline exceeded"
   if docker info >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then break; fi
@@ -569,9 +377,7 @@ done
 docker info >/dev/null 2>&1 || fail "docker never became ready"
 nvidia-smi >/dev/null 2>&1 || fail "gpu never became ready"
 {cache_setup}
-# Pull with retries (the image is large; a transient registry blip must not fail the run). On total
-# failure, write a RETRYABLE marker and exit NOW instead of leaving a billed box idling the whole
-# setup grace with no DONE/marker.
+# retry transient image-pull failures before writing the failure marker.
 PULLED=0
 for i in 1 2 3 4 5; do
   deadline_sleep 0 || fail "run wall deadline exceeded"
@@ -580,23 +386,13 @@ for i in 1 2 3 4 5; do
   deadline_sleep 20 || fail "run wall deadline exceeded"
 done
 [ "$PULLED" -eq 1 ] || fail "worker image pull failed after retries"
-# Run the worker container detached so cloud-init completes promptly; completion is signaled via the
-# worker's HF artifacts (DONE/metrics.json/marker), never a return channel from the box.
+# run detached; worker artifacts signal completion.
 deadline_sleep 0 || fail "run wall deadline exceeded"
 docker run -d --name flashrun --gpus all --shm-size=16g --network host \\
   -v /opt/flash:/root/flash {cache_bind}-w /root/flash \\
-  "$IMAGE" python /root/flash/bootstrap.py || fail "docker run failed"
+  "$IMAGE" python /root/flash/capsule.pyz bootstrap || fail "docker run failed"
 deadline_sleep 5 || fail "run wall deadline exceeded"
-# The container must be running OR have already exited CLEANLY. The bootstrap returns 0 ONLY on
-# genuine success (it confirms metrics.json and uploads its ok-marker first) — so an exit code of 0
-# is itself the success signal (e.g. an already-complete retry that finished in <5s), and the host
-# must NOT write any marker for it: the worker OWNS the attempt marker, and writing to that path here
-# would clobber its ok-marker (HF listing can lag the worker's just-finished upload). A NON-zero
-# exit reaches fail(), but its failmark uploader is itself marker-aware: a container that started
-# and then fast-failed on a real user/config error has ALREADY written its own ok=false marker here,
-# and the host failmark SKIPS the write when that marker exists (so a genuine user error is never
-# relabeled retriable/job_preempted). Only a never-started container — no worker marker — gets the
-# retriable host failmark.
+# a stopped container succeeds only at exit 0; failmark preserves any worker marker.
 if ! docker ps --filter name=flashrun --filter status=running -q | grep -q .; then
   EXIT="$(docker inspect -f '{{{{.State.ExitCode}}}}' flashrun 2>/dev/null || echo 1)"
   [ "$EXIT" = "0" ] || fail "worker container did not start (exit ${{EXIT}})"

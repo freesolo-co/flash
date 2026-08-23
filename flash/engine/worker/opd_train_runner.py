@@ -13,8 +13,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from flash.adapters.targets import resolve_lora_targeting
+from flash.core.catalog import get_model
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
+from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.train.opd.reporting import (
     _build_train_note_sections as _build_train_note_sections,
 )
@@ -26,10 +29,7 @@ from flash.engine.worker.train.opd.state import (
     _RuntimeState,
     _WorkloadState,
 )
-from flash.engine.worker.verl.child_io import (
-    LORA_ROLLOUT_GUARD_SHIM,
-    render_lora_rollout_guard_fragment,
-)
+from flash.engine.worker.verl.child_io import LORA_ROLLOUT_GUARD_SHIM
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
     resolve_reshard_after_forward,
@@ -105,7 +105,9 @@ def _render_prompt_rows(request: _OpdRequest) -> tuple[list[tuple[Any, Any]], bo
         for example in train:
             prompt_rows.append((example, request.env.prompt_messages(example)))
             scanned[0] += 1
-    multimodal = any(record_has_images(example, messages) for example, messages in prompt_rows)
+    multimodal = bool(getattr(request.env, "image_observations", False)) or any(
+        record_has_images(example, messages) for example, messages in prompt_rows
+    )
     # shuffle cached rendered rows, not examples: prompt_messages may be stateful and a second
     # render could change multimodal classification. the same seeded permutation preserves resume order.
     random.Random(_opd_train._w.SEED).shuffle(prompt_rows)
@@ -127,6 +129,31 @@ def _validate_teacher_transport() -> tuple[str, str]:
     return capability, control_panel_url
 
 
+def _prepare_prompt_messages(
+    example: dict,
+    messages: list[dict],
+    *,
+    multi_turn: bool,
+    package_root: str | None,
+) -> tuple[list[dict], tuple[str, ...]]:
+    from flash.content.multimodal import normalize_prompt_images, record_has_images
+
+    if record_has_images(example, messages):
+        normalized = normalize_prompt_images(example, messages, package_root)
+        if multi_turn:
+            _opd_train.validate_transcript_messages(
+                normalized.messages,
+                source="environment initial prompt",
+                allow_content_blocks=True,
+            )
+        return normalized.messages, tuple(normalized.descriptors)
+    if multi_turn:
+        messages = _opd_train.validate_transcript_messages(
+            messages, source="environment initial prompt"
+        )
+    return messages, ()
+
+
 def _prepare_prompts(
     request: _OpdRequest,
     prompt_rows: list[tuple[Any, Any]],
@@ -134,12 +161,9 @@ def _prepare_prompts(
     capability: str,
     control_panel_url: str,
 ) -> _PromptState:
-    from flash.content.multimodal import (
-        image_teacher_prompt_messages,
-        normalize_prompt_images,
-        record_has_images,
-    )
+    from flash.content.multimodal import image_teacher_prompt_messages
     from flash.engine.worker.teacher.client import TeacherClient
+    from flash.engine.worker.train.core.child.glue import parent_image_digests
 
     teacher = TeacherClient(capability, control_panel_url, request.knobs.teacher_model)
     processor = None
@@ -187,22 +211,22 @@ def _prepare_prompts(
     package_root_value = getattr(request.env, "package_root", None)
     package_root = str(Path(package_root_value).resolve()) if package_root_value else None
     prepped = [0]
+    thinking_semantics_set = False
     with _opd_train.liveness_heartbeat("opd_image_prep", progress=lambda: prepped[0]):
         for example, messages in prompt_rows:
             prepped[0] += 1
-            if request.multi_turn:
-                messages = _opd_train.validate_transcript_messages(
-                    messages, source="environment initial prompt"
-                )
-            if record_has_images(example, messages):
+            student_messages, image_descriptors = _prepare_prompt_messages(
+                example,
+                messages,
+                multi_turn=request.multi_turn,
+                package_root=package_root,
+            )
+            if image_descriptors:
                 assert processor is not None
-                normalized = normalize_prompt_images(example, messages, package_root)
-                student_messages = normalized.messages
-                image_descriptors = tuple(normalized.descriptors)
                 teacher_messages = image_teacher_prompt_messages(
                     student_messages, len(image_descriptors)
                 )
-                prompt_ids = _opd_train._processor_expanded_prompt_ids(
+                prompt_ids, rendered_prompt = _opd_train._processor_expanded_prompt(
                     processor,
                     student_messages,
                     image_descriptors,
@@ -210,14 +234,12 @@ def _prepare_prompts(
                     enable_thinking=bool(_opd_train._w.THINKING),
                 )
             else:
-                student_messages = messages
-                teacher_messages = messages
-                image_descriptors = ()
+                teacher_messages = student_messages
                 if processor is not None:
-                    # mixed job: the verl child tokenizes EVERY row through the multimodal dataset
+                    # mixed job: the verl child tokenizes every row through the multimodal dataset
                     # path (the processor), so text-only rows must freeze via the same path or the
                     # bridge's exact prompt-id check trips on tokenizer-vs-processor differences.
-                    prompt_ids = _opd_train._processor_expanded_prompt_ids(
+                    prompt_ids, rendered_prompt = _opd_train._processor_expanded_prompt(
                         processor,
                         student_messages,
                         (),
@@ -225,9 +247,15 @@ def _prepare_prompts(
                         enable_thinking=bool(_opd_train._w.THINKING),
                     )
                 else:
+                    rendered_prompt = tokenizer.apply_chat_template(
+                        student_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=_opd_train._w.THINKING,
+                    )
                     prompt_ids = _opd_train._normalize_prompt_ids(
                         tokenizer.apply_chat_template(
-                            messages,
+                            student_messages,
                             tokenize=True,
                             add_generation_prompt=True,
                             enable_thinking=_opd_train._w.THINKING,
@@ -236,6 +264,19 @@ def _prepare_prompts(
             if len(prompt_ids) > prompt_budget:
                 dropped_long += 1
                 continue
+            # derive the run-level flag from the first RETAINED prompt, as grpo does. a row dropped
+            # for length never reaches the student, so latching on it can describe the run by a
+            # prompt no rollout ever sees: a retained prompt that does open thinking would then be
+            # graded as if it did not, and `strip_think` would return the reasoning as the answer.
+            if not thinking_semantics_set:
+                thinking = bool(_opd_train._w.THINKING)
+                if hasattr(request.env, "thinking"):
+                    request.env.thinking = thinking
+                if hasattr(request.env, "prompt_opens_thinking"):
+                    request.env.prompt_opens_thinking = (
+                        thinking and _opd_train._w.prompt_opens_thinking(rendered_prompt)
+                    )
+                thinking_semantics_set = True
             prompts.append(
                 _opd_train._BridgePrompt(
                     student_messages=student_messages,
@@ -244,6 +285,9 @@ def _prepare_prompts(
                     image_descriptors=image_descriptors,
                     package_root=package_root,
                     example=example if request.multi_turn else None,
+                    image_digests=tuple(
+                        parent_image_digests(processor, image_descriptors, package_root)
+                    ),
                 )
             )
     return _PromptState(
@@ -254,7 +298,15 @@ def _prepare_prompts(
         prompt_budget,
         prompts,
         dropped_long,
+        processor,
     )
+
+
+def _reset_workdir(workdir: str) -> None:
+    shutil.rmtree(workdir, ignore_errors=True)
+    if os.path.lexists(workdir):
+        raise RuntimeError(f"could not clear stale OPD attempt workdir {workdir!r}")
+    os.makedirs(workdir)
 
 
 def _prepare_workload(
@@ -276,7 +328,7 @@ def _prepare_workload(
     workdir = os.path.join(
         "/tmp", "flash-opd-verl", _opd_train._w.RUN_ID, f"seed-{_opd_train._w.SEED}"
     )
-    shutil.rmtree(workdir, ignore_errors=True)
+    _reset_workdir(workdir)
     data_dir = os.path.join(workdir, "data")
     image_dir = os.path.join(workdir, "images")
     shim_dir = os.path.join(workdir, "shim")
@@ -284,6 +336,7 @@ def _prepare_workload(
     export_root = os.path.join(workdir, "checkpoint-adapters")
     mutation_failure_path = os.path.join(workdir, "mutation-failure")
     score_delivery_failure_path = os.path.join(workdir, "score-delivery-failure")
+    rollout_failure_path = os.path.join(workdir, "rollout-failure")
     abandonment_failure_path = os.path.join(workdir, "abandonment-failure")
     resample_failure_path = os.path.join(workdir, "resample-failure")
     cycle_commit_failure_path = os.path.join(workdir, "cycle-commit-failure")
@@ -327,7 +380,8 @@ def _prepare_workload(
     _opd_train._write_opd_parquet(rows, train_file)
     _opd_train._write_opd_parquet([rows[0]], val_file)
     lora_config = _opd_train._w.make_lora(request.model_id)
-    target_modules = lora_config.target_modules
+    targeting = resolve_lora_targeting(request.model_id, algorithm="opd", multimodal=multimodal)
+    target_modules = targeting.target_modules
     if isinstance(target_modules, set | frozenset):
         target_modules = sorted(target_modules)
     lora_rank = int(lora_config.r)
@@ -341,6 +395,7 @@ def _prepare_workload(
         export_root,
         mutation_failure_path,
         score_delivery_failure_path,
+        rollout_failure_path,
         abandonment_failure_path,
         resample_failure_path,
         cycle_commit_failure_path,
@@ -349,7 +404,14 @@ def _prepare_workload(
         lora_rank,
         int(lora_config.lora_alpha),
         target_modules,
-        _opd_train._warmstart_adapter_path(request.model_id, request.model_revision, lora_rank),
+        targeting.exclude_modules,
+        _opd_train._warmstart_adapter_path(
+            request.model_id,
+            request.model_revision,
+            lora_rank,
+            int(lora_config.lora_alpha),
+            targeting,
+        ),
     )
 
 
@@ -395,6 +457,7 @@ def _materialize_child_files(
     )
     bridge = _opd_train._TeacherAlignmentBridge(
         prompts=prompt_state.prompts,
+        processor=prompt_state.processor,
         tokenizer=prompt_state.tokenizer,
         teacher=prompt_state.teacher,
         thinking_prefill=prompt_state.thinking_prefill,
@@ -435,38 +498,27 @@ def _write_child_shims(
     shim_dir = workload.shim_dir
     parent_dir = os.path.dirname(_opd_train.__file__)
     copies = (
+        ("train/core/child/runtime.py", "flash_verl_runtime.py"),
+        ("train/core/child/glue.py", "flash_multiturn_glue.py"),
+        ("train/opd/child/runtime.py", "flash_opd_runtime.py"),
         ("train/opd/child/plugin.py", "flash_opd_plugin.py"),
-        # the plugin imports this by its flat name at child-import time, so it has to land next to it.
         ("train/opd/child/bridge.py", "flash_opd_bridge.py"),
         ("train/opd/child/structured.py", "flash_opd_structured.py"),
         ("train/opd/child/multiturn.py", "flash_opd_multiturn.py"),
-        ("train/core/child/glue.py", "flash_multiturn_glue.py"),
+        ("train/opd/child/entry.py", "flash_opd_entry.py"),
+        ("train/opd/child/replay_guard.py", "flash_opd_replay_guard.py"),
+        ("../../_internal/diagnostics.py", "flash_child_diagnostics.py"),
     )
     for source, target in copies:
         shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))
     entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
-    with open(entry_path, "w", encoding="utf-8") as file:
-        file.write("import verl\nfrom flash_opd_plugin import main\nmain()\n")
     # use a zero custom reward: verl still runs scoring when use_task_rewards=false, and its default
     # registry has no flash_opd entry (reward_loop.py:146-155).
     reward_path = os.path.join(shim_dir, "flash_opd_reward.py")
     with open(reward_path, "w", encoding="utf-8") as file:
         file.write(_opd_train._OPD_ZERO_REWARD_SOURCE)
-    opd_shim_source = _opd_train._render_opd_sitecustomize(
-        save_at_steps=request.knobs.save_at_steps,
-        total_steps=workload.update_horizon,
-    )
-    if gdn_reset_arch is not None:
-        opd_shim_source += _opd_train.render_gdn_varlen_shim(gdn_reset_arch)
-    # fail closed because base-model rollouts can look healthy while distilling the wrong policy.
-    opd_shim_source += render_lora_rollout_guard_fragment()
-    if "wandb" in loggers:
-        opd_shim_source += _opd_train.render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(
-            _opd_train.render_shim_marker_prologue(_opd_train.shim_marker_file(shim_dir))
-            + opd_shim_source
-        )
+        file.write(_opd_train.render_sitecustomize_bootstrap())
     return entry_path, reward_path
 
 
@@ -478,6 +530,47 @@ def _spec_gpu_type(spec: Any) -> str:
     may not have.
     """
     return str(getattr(getattr(spec, "gpu", None), "type", "") or "")
+
+
+def _resolve_opd_gpu_mem_util(
+    request: _OpdRequest,
+    prompt_state: _PromptState,
+    workload: _WorkloadState,
+    runtime: _RuntimeState,
+    model_id: str,
+    fp8_kv: bool,
+) -> float:
+    """Size vLLM's colocated executor budget from this run's geometry, as the GRPO path does.
+
+    Left unset, verl substitutes its own default of 0.5 and the engine claims half the CARD on
+    every wake regardless of what the trainer already holds. That is not a spare-capacity request:
+    `wake_up` re-acquires the physical pages it released to sleep, so an overcommit is a hard
+    `CUDA Error: out of memory` in cumem_allocator rather than a smaller pool. Observed on a 27B
+    image OPD run on one H200 -- the trainer reserved 83.35 GB, the default handed vLLM 70.5 GB of
+    a 141 GB card, and the weight-sync wake after step 2 died 12.85 GB short.
+
+    Shares GRPO's resolver rather than restating it: both run the same colocated sleep/wake path,
+    so a second equation here could only drift from the one preflight admits against.
+    """
+    from flash.engine.worker.backend_common import rollout_sleep_unsupported
+    from flash.engine.worker.train.rl.verl_config import resolve_gpu_mem_util
+
+    return resolve_gpu_mem_util(
+        {
+            "model_id": model_id,
+            "model_revision": str(getattr(request, "model_revision", "") or ""),
+            "engine_len": int(prompt_state.max_model_len),
+            "lora_rank": int(workload.lora_rank),
+            # opd submits prompts_per_step * group_size generations to the rollout engine together.
+            # grpo's concurrency is group_size because its resolver receives one prompt group here.
+            "group_size": int(workload.prompts_per_step) * int(request.knobs.group_size),
+        },
+        gpu_type=_spec_gpu_type(getattr(request, "spec", None)),
+        n_gpus=int(runtime.gpu_count),
+        fp8_kv=bool(fp8_kv),
+        sleep_unsupported=rollout_sleep_unsupported(model_id),
+        preserve_legacy_floor=True,
+    )
 
 
 def _build_base_config(
@@ -499,6 +592,7 @@ def _build_base_config(
         "lora_rank": workload.lora_rank,
         "lora_alpha": workload.lora_alpha,
         "target_modules": workload.target_modules,
+        "exclude_modules": None,
         "target_parameters": _opd_train._w.lora_target_parameters(request.model_id),
         "lora_adapter_path": workload.warmstart_adapter,
         "learning_rate": knobs.learning_rate,
@@ -552,6 +646,7 @@ def _build_child_callbacks(
     bridge: Any,
     resume_step: int,
     shim_markers: str,
+    expected_shims: tuple[str, ...],
 ) -> _ChildCallbacks:
     progress = {
         "step": resume_step,
@@ -580,7 +675,7 @@ def _build_child_callbacks(
         # whole gpu and teacher budget. not on the first output line: fragments print while later
         # ones are still applying.
         if not shims_verified:
-            _opd_train.verify_applied_shim_markers(shim_markers, (LORA_ROLLOUT_GUARD_SHIM,))
+            _opd_train.verify_applied_shim_markers(shim_markers, expected_shims)
             shims_verified = True
         # use parse_verl_metric because numpy 2 pprint emits np.float64(...); float() would drop
         # every step and leave a trained run with an empty loss curve.
@@ -613,9 +708,14 @@ def _build_child_callbacks(
         _opd_train._w.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
 
     child_tail = _opd_train.ChildOutputTail()
-    # one instance for the whole run: it measures silence ACROSS ticks, so it cannot live inside
+    # one instance for the whole run: it measures silence across ticks, so it cannot live inside
     # the per-tick callback.
     tail_staleness = _opd_train.ChildTailStaleness()
+    silence_watchdog = _opd_train.VerlChildSilenceWatchdog(
+        child_tail,
+        baseline_step=resume_step,
+        parent_work=bridge.parent_work,
+    )
 
     def liveness_fields() -> dict[str, object]:
         return _opd_train.stall_tail_fields(
@@ -630,6 +730,7 @@ def _build_child_callbacks(
         progress,
         wandb_link,
         child_tail,
+        silence_watchdog,
     )
 
 
@@ -645,8 +746,21 @@ def _run_child(
     progress_state = _opd_train._OpdProgressState(runtime.resume_state)
     watcher = _build_checkpoint_watcher(request, workload, runtime, progress_state)
     shim_markers = _opd_train.shim_marker_file(workload.shim_dir)
+    # the child installs opd-core only for a nonempty schedule, because exact-save
+    # filtering is the entire meaning of that marker.
+    expected_shims = (
+        (("opd-core",) if request.knobs.save_at_steps else ())
+        + ((TEXT_LORA_TARGET_SHIM,) if getattr(workload, "exclude_modules", None) else ())
+        + (LORA_ROLLOUT_GUARD_SHIM,)
+        + (("gdn-varlen",) if runtime.gdn_reset_arch else ())
+    )
     callbacks = _build_child_callbacks(
-        watcher, progress_state, runtime.bridge, runtime.resume_step, shim_markers
+        watcher,
+        progress_state,
+        runtime.bridge,
+        runtime.resume_step,
+        shim_markers,
+        expected_shims,
     )
     child_env = _build_child_env(request, prompt_state, workload, runtime, eos_token_ids)
     command = [runtime.python_bin, runtime.entry_path, *overrides]
@@ -663,6 +777,7 @@ def _run_child(
                 progress=lambda: int(callbacks.progress["step"] or 0),
                 progress_step=True,
                 fields=callbacks.liveness_fields,
+                sample_off_thread=True,
             ):
                 return_code = _opd_train.run_verl_training(
                     command,
@@ -671,9 +786,20 @@ def _run_child(
                     on_line=callbacks.on_line,
                     heartbeat=callbacks.child_heartbeat,
                     tail=callbacks.child_tail,
+                    silence_watchdog=callbacks.silence_watchdog,
                 )
                 training_completed = return_code == 0
     finally:
+        # the watcher stamps checkpoints, and stamping BLOCKS on this run's accounting. a child
+        # that died before printing its last step will never record it, so tell the gate the run
+        # is over first -- otherwise `watcher.stop` waits out the accounting timeout and reports a
+        # bookkeeping stall in place of the exit that actually ended the run.
+        if not training_completed:
+            progress_state.fail(
+                f"verl child exited with code {return_code}"
+                if return_code
+                else "verl child ended without completing training"
+            )
         try:
             watcher.stop(require_complete=training_completed)
         finally:
@@ -721,15 +847,15 @@ def _build_checkpoint_watcher(
         model_id=request.model_id,
         model_revision=request.model_revision,
         required_steps=request.knobs.save_at_steps,
+        exclude_modules=workload.exclude_modules,
+        preprocessor=runtime.bridge.processor,
         seed=int(_opd_train._w.SEED),
         prompt_pool_fingerprint=workload.prompt_pool_fingerprint,
         prompts_per_step=workload.prompts_per_step,
         group_size=request.knobs.group_size,
         accounting_state=progress_state.checkpoint_state,
     )
-    watcher.processed_steps.update(
-        _opd_train._processed_resume_steps(request.knobs.save_at_steps, runtime.resume_step)
-    )
+    _opd_train._seed_resume_lifecycle(watcher, request.knobs.save_at_steps, runtime.resume_step)
     return watcher
 
 
@@ -757,9 +883,20 @@ def _build_child_env(
         max_model_len=prompt_state.max_model_len,
         mutation_failure_path=workload.mutation_failure_path,
         score_delivery_failure_path=workload.score_delivery_failure_path,
+        rollout_failure_path=workload.rollout_failure_path,
         abandonment_failure_path=workload.abandonment_failure_path,
         resample_failure_path=workload.resample_failure_path,
         cycle_commit_failure_path=workload.cycle_commit_failure_path,
+        plugin_config=_opd_train._build_opd_plugin_config(
+            shim_dir=workload.shim_dir,
+            save_at_steps=request.knobs.save_at_steps,
+            total_steps=workload.update_horizon,
+            lora_language_prefix=(
+                get_model(request.model_id).lora_language_prefix if workload.exclude_modules else ""
+            ),
+            gdn_model_type=runtime.gdn_reset_arch,
+            loggers=runtime.loggers,
+        ),
     )
 
 
@@ -789,6 +926,7 @@ def _reconcile_child_failures(
     cycle_commit_failure = _opd_train._read_classified_failure_fallback(
         workload.cycle_commit_failure_path
     )
+    rollout_failure = _opd_train._read_rollout_failure_fallback(workload.rollout_failure_path)
     _opd_train._raise_verl_failure(
         return_code,
         bridge.teacher_failure,
@@ -796,6 +934,7 @@ def _reconcile_child_failures(
         cycle_commit_failure,
         no_signal_failure,
         score_delivery_failure,
+        rollout_failure=rollout_failure,
         truncation_window=truncation_window,
     )
 
@@ -845,7 +984,9 @@ def _export_and_upload_adapter(
         adapter_dir,
         model_id=request.model_id,
         model_revision=request.model_revision,
+        exclude_modules=workload.exclude_modules,
         python_bin=runtime.python_bin,
+        preprocessor=runtime.bridge.processor,
     )
     _opd_train._w.hf_upload_folder(adapter_dir, "adapter", required=True)
     return adapter_dir

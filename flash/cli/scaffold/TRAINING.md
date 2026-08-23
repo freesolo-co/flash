@@ -140,6 +140,11 @@ def load_environment(**kwargs) -> MyEnv:
 For tool use, dialogue, or games, subclass `EnvironmentMultiTurn` instead and drive the
 conversation across turns. The reward is the same `RewardResult` contract either way.
 
+If the environment class can return image-bearing user observations from `step_episode`, declare
+`image_observations = True` on that class. This is a class capability, not a TOML setting: Flash uses
+it to reject a text-only model or OPD teacher before model work. Set it only for environments that
+can actually emit images. The capability does not by itself enable per-turn image rollout wiring.
+
 ### 2. Publish the environment
 
 A managed run references a **published** environment by id — so push your folder first:
@@ -272,8 +277,10 @@ lora_rank = 32              # lora_alpha defaults to 2 x lora_rank; set it to ov
 # All knobs live under [train]. Do not add [sft], [grpo], or [opd] tables.
 
 [wandb]
-# project  = "my-project"   # the table allows exactly `project` and `run_name`;
-# run_name = "sft-run-1"    # `name` is rejected
+# new scaffolds set `project` from the selected Freesolo project and `run_name` from the folder
+# plus algorithm. edit either value as needed; only `project` and `run_name` are allowed.
+# project  = "my-project"
+# run_name = "sft-run-1"
 ```
 
 **Knobs are scoped by algorithm.** `[train]` is one flat table shared by all three algorithms,
@@ -844,6 +851,15 @@ Pick SFT when you already have good answers and want the model to imitate them.
   `max_context_tokens` that plausibly fits prompt + completion, and only raise it when you see
   truncation (outputs cut off mid-thought, degraded loss). A bigger context just costs
   more.
+- **Multi-turn targets train on the assistant turns only.** When `sft_completion` returns a
+  full target transcript (assistant turns interleaved with the environment's tool/user
+  observations), Flash supervises the assistant turns and masks the observations out of the
+  loss — the model is trained to produce its own replies, not to predict the environment's.
+  For every ChatML target, including a single assistant turn, control strings `<|im_start|>` and
+  `<|im_end|>` are reserved in every message field the active template renders into the body,
+  including text content, reasoning, and tool-call serialization. They are indistinguishable from
+  structural turn delimiters after tokenization. The run logs role-aware masked rows and any
+  completion-only fallback rows separately.
 - **For Qwen3.5 thinking multi-turn SFT, put reasoning only in the final assistant
   turn.** Qwen3.5's chat template strips literal `<think>` blocks from prior assistant
   history and pre-opens `<think>\n` in the next generation prompt. If every assistant
@@ -856,23 +872,29 @@ Pick SFT when you already have good answers and want the model to imitate them.
   emit another opener.
 - **SFT is a great warm start for GRPO.** SFT first to teach the format and a competent
   baseline, then GRPO to optimize past it. Across that lineage keep the **same base
-  model**. Warm-start CONTINUES the one SFT adapter in place — GRPO/OPD keep training
-  the same LoRA (VL and text-only alike), so the run trains and serves at the SFT
+  model**. Warm-start CONTINUES one adapter in place — the next run keeps training the
+  same LoRA (VL and text-only alike), so it trains and serves at the source
   adapter's rank-`r` and just has to fit the selected model's serving `max_lora_rank` (some
   serving models allow rank 128, larger serving paths cap at 64). Do **NOT** set `lora_rank`
   or `lora_alpha` for a warm-start: the source adapter's rank/alpha metadata is authoritative.
   Flash reads the rank from the source adapter and uses it for cost, GPU allocation, and
   GRPO-sleep sizing, so setting either alongside `init_from_adapter` is rejected at submit; it
   also rejects a source adapter whose rank exceeds the serving cap.
+- **Any algorithm can warm-start from any other.** All nine source/target combinations are
+  supported — `sft`, `grpo`, and `opd` each read a source adapter produced by any of the three,
+  including same-algorithm continuation (`sft` → `sft` to keep training on more data, `grpo` →
+  `grpo` to extend a run). The source is named the same way in every case, and the only
+  cross-run requirements are the shared base model and the rank/alpha rules above.
 
 ```toml
 # configs/rl.toml — warm-start GRPO from the SFT run's adapter
 algorithm = "grpo"
 
 [train]
-# the sft run id (as printed by `flash runs status`); add /step-n to warm-start from a
-# specific checkpoint listed by `flash runs checkpoint <run-id>`
-init_from_adapter = "<sft-run-id>"
+# the source run id (as printed by `flash runs status`); add /step-n to warm-start from a
+# specific checkpoint listed by `flash runs checkpoint <run-id>`. the source may be an sft,
+# grpo, or opd run, and `algorithm` above may be any of the three.
+init_from_adapter = "<source-run-id>"
 # do NOT set lora_rank or lora_alpha for a warm-start: the source adapter's rank and alpha
 # metadata are authoritative, and setting either alongside init_from_adapter is rejected
 ```
@@ -1082,14 +1104,21 @@ in a sensible value, so only override with a reason.
 
 | Knob                           | Convention                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `group_size`                   | Completions sampled per prompt (default 8). More = more signal and more cost; drop to 4 to trim cost. The group needs _within-group variance_ for an advantage to exist.                                                                                                                                                                                                                                          |
+| `group_size`                   | Completions sampled per prompt. GRPO accepts exactly `2`, `4`, or `8` and defaults to `8`; Flash never changes the configured value. More completions can improve the within-group comparison but multiply rollout cost.                                                                                                                                                                                          |
 | `max_completion_tokens`        | Completion cap for each model turn, not the whole episode. In multi-turn runs every turn gets the full cap again, while the whole transcript (all model turns plus environment replies) must fit inside `max_context_tokens`. Size `max_context_tokens` for the whole episode, not just one turn; an undersized turn cap silently truncates good answers and poisons the reward.                                  |
 | `temperature`                  | Rollout sampling temperature. Keep it near 1.0 for GRPO — too low collapses diversity (and the model can collapse within a few steps); raise it to widen exploration against uniform-reward groups.                                                                                                                                                                                                               |
 | `kl_penalty_coef`              | Keeps the trained model from drifting too far from the base. Raise it to anchor against entropy collapse; lower it for more freedom to move.                                                                                                                                                                                                                                                                      |
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy.                                                                                                                                                                                                                                                                                              |
 | `learning_rate`                | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it.                                                                                                                                                                                                                                                                                             |
-| `prompts_per_step`             | The effective prompts-per-step. Too small and the reward trend is pure noise; size it so the trend is readable.                                                                                                                                                                                                                                                                                                   |
+| `prompts_per_step`             | The optimizer prompt batch. It defaults to `64`. Flash preserves the authored positive integer in the job spec and admission checks and never rounds it. At execution, after `max_examples` and prompt-budget filtering, the effective value clamps to the number of retained valid prompts when fewer remain. Too small and the reward trend is pure noise.                                                      |
 | `structured_outputs`           | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
+
+The default GRPO step is `64 * 8 = 512` completions. Every configured step must satisfy
+`prompts_per_step * group_size <= 512`; admission checks the authored values, or their defaults when
+omitted, before GPU lookup or allocation. The exact ceiling passes and the first value above it is
+rejected. A later retained-data clamp cannot rescue an oversized authored shape. At execution only
+the effective prompt count may clamp to the retained valid prompts; `group_size` is never changed.
+Rollout generation, reward work, and cost multiply by the effective execution product.
 
 For thinking models, each turn's `max_completion_tokens` is shared between `<think>` reasoning and
 its final answer or action, so undersizing it can truncate the action and teach the model to stop

@@ -8,19 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from flash.cost.facts import (
-    GPU_COMPUTE_TFLOPS,
-    gpu_hourly_usd,
-    gpu_tflops,
-    gpu_vram_gb,
-    pick_gpu,
-)
+from flash.cost.facts import GPU_COMPUTE_TFLOPS, gpu_tflops, gpu_vram_gb
 from flash.providers.base import GPU_INFO
-
-
-def test_static_rate_is_positive_for_any_class():
-    for name in GPU_INFO:
-        assert gpu_hourly_usd(name) > 0, name
 
 
 def test_compute_table_only_lists_real_classes():
@@ -36,70 +25,18 @@ def test_gpu_tflops_known_and_default():
 
 
 def test_lambda_a100_40gb_band_has_real_tflops():
-    # Removing A6000 exposes the Lambda-only `A100 SXM 40GB` as the cheapest fit for the 33-40 GB
-    # band on the Lambda path; it must carry a real TFLOPS figure rather than fall back to
-    # _DEFAULT_TFLOPS, or Lambda cost quotes overstate runtime ~3x for that band.
-    pick = pick_gpu(35, provider="lambda")
-    assert pick == "A100 SXM 40GB"
-    assert gpu_tflops(pick) == GPU_COMPUTE_TFLOPS["A100 SXM 40GB"]
-    assert gpu_tflops(pick) > 100.0  # not the _DEFAULT_TFLOPS fallback
+    assert gpu_tflops("A100 SXM 40GB") == GPU_COMPUTE_TFLOPS["A100 SXM 40GB"]
+    assert gpu_tflops("A100 SXM 40GB") > 100.0
 
 
-def test_pricing_and_vram_track_the_registry():
-    for name, g in GPU_INFO.items():
-        assert gpu_hourly_usd(name) == g.hourly_usd
-        assert gpu_vram_gb(name) == g.vram_gb
+def test_vram_tracks_the_registry():
+    for name, gpu in GPU_INFO.items():
+        assert gpu_vram_gb(name) == gpu.vram_gb
 
 
-def test_unknown_gpu_lookup_raises():
-    with pytest.raises(KeyError):
-        gpu_hourly_usd("Tesla T4")
+def test_unknown_gpu_vram_lookup_raises():
     with pytest.raises(KeyError):
         gpu_vram_gb("Tesla T4")
-
-
-def test_pick_gpu_cheapest_fit_no_validation_gate():
-    # No validation gate: every fitting class is eligible, ranked by static rate. The cheapest
-    # managed card is the 24 GB RTX 4090 ($0.69), so anything that fits <=24 GB lands on it.
-    assert pick_gpu(12) == "RTX 4090"
-    assert pick_gpu(24) == "RTX 4090"
-    # 40 GB has no card between the 32 GB RTX 5090 and the 80 GB A100 PCIe ($1.39, the cheapest fit).
-    assert pick_gpu(40) == "A100 PCIe"
-
-
-def test_pick_gpu_result_actually_fits_and_is_cheapest():
-    for need in (8, 16, 24, 33, 48, 80):
-        gpu = pick_gpu(need)
-        assert gpu_vram_gb(gpu) >= need
-        # No validation gate: nothing fitting is cheaper at the static rate.
-        cheaper_fits = [
-            g
-            for g in GPU_INFO.values()
-            if g.vram_gb >= need and gpu_hourly_usd(g.name) < gpu_hourly_usd(gpu)
-        ]
-        assert not cheaper_fits, f"{cheaper_fits} cheaper than {gpu} for {need} GB"
-
-
-def test_pick_gpu_includes_unvalidated_classes(monkeypatch):
-    # No validation gate: the cheapest static-rate class wins regardless of validation status.
-    # The managed catalog is now fully validated, so inject a synthetic UNVALIDATED cheap class
-    # and confirm pick_gpu still selects it (the submit-time allocator is what applies the gate).
-    from flash.providers.base import GPU_INFO, GpuClass
-
-    fake = GpuClass("FAKE Cheap", "NVIDIA_FAKE", 24, "fakecheap", "sm80", 0.10)
-    assert not fake.validated
-    monkeypatch.setitem(GPU_INFO, "FAKE Cheap", fake)
-    assert pick_gpu(12) == "FAKE Cheap"
-
-
-def test_pick_gpu_impossible_raises():
-    with pytest.raises(ValueError, match="no GPU class fits"):
-        pick_gpu(100_000)
-
-
-def test_pick_gpu_auto_matches_default():
-    assert pick_gpu(24, provider="auto") == pick_gpu(24)
-    assert pick_gpu(12) == "RTX 4090"
 
 
 def test_effective_train_tflops_caps_b200_at_h200_class():
@@ -542,56 +479,6 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
     with pytest.raises(UnknownPromptPoolSize):
         runconfig_from_spec(env_only)
 
-    # a submit-time refusal is only correct because the run never launches: `_estimate_selected_quote`
-    # fails closed before allocation. the CANCEL path prices a run that already ran and must never
-    # refuse -- `charge_usd_for_spec` pins `max_steps` onto the very same spec and its outer
-    # `except Exception` converts any raise into the $0 fallback, billing nothing for real work. an
-    # overcharge is visible and disputable; a silent zero is neither, and the persisted quote caps
-    # the charge anyway. so this stays priced, and pinning it here keeps a future "refuse everywhere
-    # the key appears" tightening from turning a cancelled run into free GPU time.
-    from types import SimpleNamespace
-
-    from flash.runner.costs import cancelled_charge_usd
-
-    # 10 epochs over a 2-row env pool is a TEN step horizon, and that matters: a one-epoch spec
-    # plans a single step, where "cancelled after 1" and "cancelled after all" are the same charge
-    # and the proration below cannot be observed at all. The horizon has to exceed 1 for this to
-    # test anything.
-    cancelled = JobSpec.from_dict(
-        {
-            **base,
-            "algorithm": "grpo",
-            "run_id": "q",
-            "environment": {
-                "id": "github:owner/repo@main:env/environment.py",
-                "params": {"max_examples": 2},
-            },
-            "train": {"epochs": 10, "group_size": 4, "prompts_per_step": 128},
-        }
-    )
-
-    accepted_quote = 0.1
-    status = SimpleNamespace(
-        estimated_cost_usd=accepted_quote,
-        remote={"provider": "runpod", "allocated_gpu": "H100", "allocated_gpu_count": 1},
-    )
-    charged = cancelled_charge_usd(status, cancelled, steps=7, fallback=0.0)
-    assert charged > 0.0, "a cancelled run that really trained must not bill $0"
-    # and never above the quote the customer accepted, which is what bounds the overcharge.
-    assert charged <= accepted_quote
-
-    # the fraction itself, which is the part a dead `partial / full` silently destroys. with the
-    # full-work reprice unpriceable the ratio is skipped and every cancel falls through to the quote
-    # cap, so a run stopped after ONE of ten steps bills the whole quote. assert the curve, not just
-    # the bounds: these are the same proportions dev bills, and they only hold while the legacy pool
-    # still yields a full-work horizon to divide by.
-    for completed, expected_fraction in ((1, 0.1), (2, 0.2), (5, 0.5), (10, 1.0)):
-        billed = cancelled_charge_usd(status, cancelled, steps=completed, fallback=0.0)
-        assert billed == pytest.approx(accepted_quote * expected_fraction, rel=0.02), (
-            f"cancelled after {completed}/10 steps billed {billed}, "
-            f"expected ~{expected_fraction:.0%} of the accepted quote"
-        )
-
     # and when both are stated, the enforced [train] cap is the one that binds.
     both = JobSpec.from_dict(
         {
@@ -769,14 +656,14 @@ def test_sft_fit_credits_only_the_ranks_that_will_launch():
     # here breaks the other. reading 1 for grpo under-credited it eightfold and REJECTED runs that fit.
     assert _executed_gpu_count("grpo", {"prompts_per_step": 1}, None, 8) == 8
     assert _executed_gpu_count("opd", {"prompts_per_step": 1}, None, 8) == 1
-    # an explicit group still wins over the default.
-    assert _executed_gpu_count("grpo", {"prompts_per_step": 1, "group_size": 1}, None, 8) == 1
+    # an explicit supported group still wins over the default.
+    assert _executed_gpu_count("grpo", {"prompts_per_step": 1, "group_size": 2}, None, 8) == 2
 
-    # the quote must agree on every one of those, or a shape it prices gets refused at submit.
+    # the quote must agree on every supported shape, or a shape it prices gets refused at submit.
     from flash.cost.analytical import executed_gpu_count
     from flash.cost.types import RunConfig
 
-    for method, prompts, group in (("grpo", 1, None), ("opd", 1, None), ("grpo", 1, 1)):
+    for method, prompts, group in (("grpo", 1, None), ("opd", 1, None), ("grpo", 1, 2)):
         train = {"prompts_per_step": prompts} | ({"group_size": group} if group else {})
         quoted = executed_gpu_count(
             RunConfig(

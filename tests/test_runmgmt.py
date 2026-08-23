@@ -9,8 +9,10 @@ import tempfile
 import pytest
 
 from tests._helpers.runner import provisioned_status
+from tests._helpers.source_snapshot import valid_source_snapshot
 
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):
@@ -171,6 +173,7 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", lambda spec: spec)
+    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
 
     seen: dict[str, float] = {}
 
@@ -371,6 +374,111 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
         assert out.gpu_status["gpu_util_pct"] == 94
 
 
+def test_an_error_heartbeat_carries_gpu_diagnostics_through_to_status(monkeypatch):
+    """The failure heartbeat must spell its diagnostics `gpu`, the key the consumer reads.
+
+    a wrong spelling loses the FAILURE's own diagnostics -- the memory figure that says whether an
+    oom was the cause -- and leaves `gpu_status` showing the last healthy sample instead, which
+    reads as if nothing was wrong. every other producer already spells it `gpu`.
+    """
+    import inspect
+    import tempfile as _tempfile
+
+    import flash.engine.worker as worker
+
+    # the producer half: the error path must not reintroduce a spelling the consumer ignores.
+    assert "diag=gpu_diagnostics()" not in inspect.getsource(worker)
+
+    with _tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+        from tests._helpers.profile import satisfy_sft_profile
+
+        spec = JobSpec(
+            run_id="hb-oom",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            environment=EnvironmentSpec(id="team/example"),
+            train=TrainSpec(max_examples=8),
+        )
+        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
+        status.state = "running"
+        runner._save_status(status)
+
+        runner.record_heartbeat(
+            "hb-oom",
+            {"stage": "sft_step", "step": 20, "gpu": {"device_name": "B200", "gpu_util_pct": 99}},
+        )
+        # the consumer half: the failure heartbeat's own diagnostics must survive, and must not be
+        # replaced by None just because the run is now failing.
+        runner.record_heartbeat(
+            "hb-oom",
+            {
+                "stage": "error_sft",
+                "oom": True,
+                "gpu": {"device_name": "B200", "memory_used_gb": 179.4},
+            },
+        )
+
+        out = runner.get_status("hb-oom")
+        assert out.gpu_status is not None, "the oom heartbeat cleared the gpu snapshot"
+        assert out.gpu_status["memory_used_gb"] == 179.4
+
+
+def test_a_heartbeat_without_gpu_keeps_the_attempts_snapshot(monkeypatch):
+    """Only 8 of the ~51 heartbeat producers send `gpu`; the rest must not blank the snapshot.
+
+    the periodic liveness tick samples the card, but a checkpoint upload can run for minutes
+    between two of them, and every heartbeat in that window omits `gpu`. assigning it
+    unconditionally made `flash runs status` and the `gpuStatus` API field report no GPU for a
+    healthy running job -- and the longer the upload, the longer the blank.
+
+    a NEW attempt still starts clean: it is a different card, so carrying the old one forward would
+    describe hardware this attempt never touched.
+    """
+    import tempfile as _tempfile
+
+    with _tempfile.TemporaryDirectory() as tmp:
+        import flash.runner as runner
+
+        importlib.reload(runner)
+        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+        from tests._helpers.profile import satisfy_sft_profile
+
+        spec = JobSpec(
+            run_id="hb-carry",
+            model="Qwen/Qwen3.5-4B",
+            algorithm="sft",
+            environment=EnvironmentSpec(id="team/example"),
+            train=TrainSpec(max_examples=8),
+        )
+        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
+        status.state = "running"
+        runner._save_status(status)
+
+        runner.record_heartbeat(
+            "hb-carry",
+            {"stage": "sft_step", "attempt": 1, "gpu": {"device_name": "B200", "gpu_util_pct": 91}},
+        )
+        # the long silent stretch: a checkpoint upload, which sends no gpu sample at all.
+        runner.record_heartbeat("hb-carry", {"stage": "checkpoint_uploading", "attempt": 1})
+
+        out = runner.get_status("hb-carry")
+        assert out.gpu_status is not None, "a checkpoint heartbeat blanked the gpu snapshot"
+        assert out.gpu_status["device_name"] == "B200"
+        assert out.gpu_status["gpu_util_pct"] == 91
+
+        # a retry is a different card; nothing from attempt 1 may describe it.
+        runner.record_heartbeat("hb-carry", {"stage": "boot", "attempt": 2})
+        assert runner.get_status("hb-carry").gpu_status is None, (
+            "attempt 2 inherited attempt 1's gpu snapshot"
+        )
+
+
 def test_status_sanitizer_preserves_metric_backlog_and_bounds_other_lists():
     import flash.runner as runner
 
@@ -460,62 +568,6 @@ def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypa
         # a same-state terminal re-write (e.g. terminal cost fields) keeps the original too
         runner._update("fa", "done", cost_usd=2.0)
         assert runner.get_status("fa").finished_at == teardown
-
-
-def test_legacy_finished_at_backfill_uses_prior_updated_at_on_same_state_touch(monkeypatch):
-    """A LEGACY run (finished_at never stamped) that is ALREADY terminal and gets a same-state
-    field-only touch (e.g. billing_state via _update(run_id, current_state, ...)) must backfill
-    finished_at from the PRIOR persisted terminal updated_at, NOT the freshly-set now — otherwise
-    a routine post-completion update would move the billed run_end / reconcile window forward."""
-    with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
-        from flash.core.spec import JobSpec, TrainSpec
-
-        runner.submit_job(
-            JobSpec(
-                run_id="leg",
-                model="Qwen/Qwen3.5-4B",
-                algorithm="grpo",
-                train=TrainSpec(max_examples=8),
-            ),
-            dry_run=True,
-        )
-        # Simulate a legacy record: already `done`, real teardown time in updated_at, no finished_at.
-        teardown = 1_000.0
-        s = runner.get_status("leg")
-        s.state = "done"
-        s.updated_at = teardown
-        s.finished_at = None
-        runner._save_status(s)
-
-        # A same-state field-only touch (the run is ALREADY done) backfills from the PRIOR updated_at,
-        # not now -- and updated_at still advances to now as usual.
-        assert runner._update("leg", "done", billing_state="charged") is True
-        out = runner.get_status("leg")
-        assert out.finished_at == teardown  # frozen to the prior terminal time, NOT now
-        assert out.updated_at > teardown  # the touch still bumped updated_at
-
-        # Contrast: a genuine non-terminal -> terminal transition stamps finished_at to the NEW
-        # updated_at (the real teardown), as before.
-        runner.submit_job(
-            JobSpec(
-                run_id="fresh",
-                model="Qwen/Qwen3.5-4B",
-                algorithm="grpo",
-                train=TrainSpec(max_examples=8),
-            ),
-            dry_run=True,
-        )
-        s2 = runner.get_status("fresh")
-        s2.state = "running"
-        s2.finished_at = None
-        runner._save_status(s2)
-        assert runner._update("fresh", "done") is True
-        done2 = runner.get_status("fresh")
-        assert done2.finished_at == done2.updated_at  # transition: stamps to now
 
 
 def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
@@ -664,7 +716,12 @@ def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must use submit quote")),
     )
 
-    lifecycle._run_training(spec, io.StringIO(), prior_cost=0.0)
+    monkeypatch.setattr(
+        runner,
+        "validate_terminal_source_metrics",
+        lambda _status, metrics, expected_attempt=None: (metrics, expected_attempt),
+    )
+    lifecycle._run_training(spec, io.StringIO(), prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
 
     st = runner.get_status(spec.run_id)
     assert st.state == "done"
@@ -744,7 +801,9 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    metrics = lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
+    metrics = lifecycle._submit_seed_supervised(
+        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
 
     assert metrics["wall_seconds"] == 1.0
     assert provider.attempts == [0, 1]
@@ -816,7 +875,9 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
+    lifecycle._submit_seed_supervised(
+        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
 
     assert provider.attempts == [0, 1]
     assert runner.get_status(spec.run_id).remote["attempt"] == 1
@@ -902,7 +963,9 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
+    lifecycle._submit_seed_supervised(
+        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
 
     assert provider.attempts == [0, 1]
     assert allocation_walls == [200.0, 120.0]
@@ -981,7 +1044,7 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
 
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance") as exc_info:
-        lifecycle._submit_seed_supervised(spec, spec.seed, log)
+        lifecycle._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert provider.attempts == [0]
     assert allocations == [True]
@@ -1479,6 +1542,156 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     assert raw["remote"] == confirmed
 
 
+def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
+    monkeypatch, tmp_path
+):
+    """A deployed-format record still names a billable endpoint, so teardown must reach it.
+
+    `key_fingerprint` is validated at exactly 68 chars, but the deployed release writes the 16-char
+    form, so such a record fails the strict `from_dict` behind `_canonical_cleanup_remote` and
+    `_remote_resource_identity`. The teardown loop builds a base `JobHandle` (which validates only
+    `provider`) and `_delete_runpod_endpoint` resolves that exact fingerprint through
+    `resolve_prefix_key_fingerprint`. Filtering the record out before teardown would leave a live
+    RunPod endpoint billing forever with nothing left to delete it.
+    """
+    import json as _json
+
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+    from flash.providers.runpod import api as runpod_api
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="cleanup-legacy", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner._save_status(
+        runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
+    )
+    legacy_fingerprint = "rpk-" + "0" * 12
+    resolved_fingerprint = "rpk-" + "a" * 64
+    legacy = _runpod_remote("endpoint-legacy", None, attempt=1, key_fingerprint=legacy_fingerprint)
+    # the strict writer rejects the legacy record, so seed the status file directly.
+    path = runner.runs_file_path(spec.run_id, ".json")
+    with open(path) as f:
+        raw = _json.load(f)
+    raw[runner._CLEANUP_REMOTES_KEY] = [legacy]
+    with open(path, "w") as f:
+        _json.dump(raw, f)
+
+    def _key_for_fingerprint(fingerprint):
+        raise runpod_api.RunpodApiError("no configured key matches the stored fingerprint")
+
+    resolved = []
+    deleted = []
+
+    def resolve_legacy(endpoint_id, fingerprint):
+        resolved.append((endpoint_id, fingerprint))
+        return resolved_fingerprint
+
+    def delete_endpoint(endpoint_id, fingerprint):
+        deleted.append((endpoint_id, fingerprint))
+        return True
+
+    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", _key_for_fingerprint)
+    monkeypatch.setattr(runpod_api, "resolve_prefix_key_fingerprint", resolve_legacy)
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
+
+    attempted = runner._drain_cleanup_remotes(spec.run_id)
+
+    assert resolved == [("endpoint-legacy", legacy_fingerprint)], (
+        "the legacy fingerprint resolver was never reached"
+    )
+    assert deleted == [("endpoint-legacy", resolved_fingerprint)], (
+        "the billable endpoint was never deleted"
+    )
+    assert any("endpoint-legacy" in repr(item) for item in attempted)
+    # and the confirmed-deleted record must actually leave the file. removal derives its key from
+    # the same record the drain admitted, so a strict-only derivation would return None here and
+    # clear nothing -- leaving every later sweep to tear down an endpoint that is already gone.
+    with open(path) as f:
+        assert not _json.load(f).get(runner._CLEANUP_REMOTES_KEY), (
+            "the confirmed-deleted record survived, so every later sweep retries a deleted endpoint"
+        )
+
+
+def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypatch, tmp_path):
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+    from flash.providers.runpod import api as runpod_api
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="cleanup-absent", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner._save_status(
+        runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
+    )
+    other_fingerprint = "rpk-" + "f" * 64
+    confirmed = _runpod_remote("endpoint-shared", "job-confirmed", attempt=1)
+    different_owner = _runpod_remote(
+        "endpoint-shared",
+        "job-confirmed",
+        attempt=1,
+        key_fingerprint=other_fingerprint,
+        started_ts=2.0,
+    )
+    different_job = _runpod_remote(
+        "endpoint-shared",
+        "job-other",
+        attempt=1,
+        started_ts=3.0,
+    )
+    different_attempt = _runpod_remote(
+        "endpoint-shared",
+        "job-confirmed",
+        attempt=2,
+        started_ts=4.0,
+    )
+    for remote in (confirmed, different_owner, different_job, different_attempt):
+        assert runner._preserve_cleanup_remote(spec.run_id, remote) is True
+
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kwargs: {
+            "id": job_id,
+            "status": "CANCELLED",
+        },
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda _endpoint_id, _fingerprint: False,
+    )
+    exact_lookups = []
+
+    def exact_lookup(endpoint_id, fingerprint):
+        exact_lookups.append((endpoint_id, fingerprint))
+        if len(exact_lookups) == 1:
+            return True
+        raise runpod_api.RunpodApiError("exact endpoint lookup unconfirmed")
+
+    monkeypatch.setattr(runpod_api, "endpoint_absent_for_fingerprint", exact_lookup)
+
+    attempted = runner._drain_cleanup_remotes(spec.run_id)
+
+    assert attempted == {
+        ("runpod", 1, "endpoint-shared", "job-confirmed", _RUNPOD_FINGERPRINT),
+        ("runpod", 1, "endpoint-shared", "job-confirmed", other_fingerprint),
+        ("runpod", 1, "endpoint-shared", "job-other", _RUNPOD_FINGERPRINT),
+        ("runpod", 2, "endpoint-shared", "job-confirmed", _RUNPOD_FINGERPRINT),
+    }
+    assert exact_lookups == [
+        ("endpoint-shared", _RUNPOD_FINGERPRINT),
+        ("endpoint-shared", other_fingerprint),
+        ("endpoint-shared", _RUNPOD_FINGERPRINT),
+        ("endpoint-shared", _RUNPOD_FINGERPRINT),
+    ]
+    raw = runner._load_status_json(spec.run_id)
+    assert raw[runner._CLEANUP_REMOTES_KEY] == [
+        different_owner,
+        different_job,
+        different_attempt,
+    ]
+    assert raw["remote"] == confirmed
+
+
 def test_next_attempt_requires_persisted_integer_identity():
     import flash.runner as runner
 
@@ -1530,7 +1743,9 @@ def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatc
     monkeypatch.setattr(allocator, "allocate", lambda *_args, **_kwargs: allocations.append(True))
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
-        lifecycle._submit_seed_supervised(spec, spec.seed, io.StringIO())
+        lifecycle._submit_seed_supervised(
+            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+        )
 
     assert allocations == []
     assert runner._load_status_json(spec.run_id)[runner._NEXT_ATTEMPT_KEY] == 0
@@ -1595,10 +1810,11 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
         "endpoint-old",
         "job-old",
         attempt=persisted_attempt,
-        code_prefix="code/revision",
     )
+    status = provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
     runner._save_status(
-        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
+        status,
         _run_deadline_at=300.0,
         _next_attempt=2,
     )
@@ -1784,6 +2000,49 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
     )
 
 
+def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
+    # the OTHER attach exit: a provider poll that returns ok. the wall-deadline route above carries
+    # all three fields through `_carry_allocation_stamp`, but this one restored only gpu and count
+    # from the context -- so a vast or lambda run that simply finished its poll was priced by
+    # `_gpu_rate`'s fallback (normally RunPod) and its notes named a provider that never ran it.
+    import io
+    from types import SimpleNamespace
+
+    import flash.runner.supervise.attach as attach
+    from flash.providers.base import JobHandle
+
+    remote = _vast_remote(allocated_gpu="RTX 4090", allocated_gpu_count=4)
+    context = attach._AttachContext(
+        worker_spec=None,
+        persisted_remote=remote,
+        handle=JobHandle.from_dict({"provider": "vast", "instance_id": 7}),
+        seed=0,
+        recovered_attempt=0,
+        next_attempt=1,
+        source_snapshot=None,
+    )
+    result = SimpleNamespace(ok=True, metrics={"wall_seconds": 3600.0})
+    adopted = {}
+    # `_adopt_attached_poll_result` imports the adopter from its owning module at call time, so the
+    # patch has to land there rather than on a name bound into `attach`.
+    import flash.runner.supervise.lifecycle as lifecycle_mod
+
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "_adopt_completed_attempt",
+        lambda *_a, **_k: adopted.update(result.metrics) or True,
+    )
+
+    attach._adopt_attached_poll_result("attach-poll-multicard", context, result, io.StringIO())
+
+    assert adopted["allocated_gpu"] == "RTX 4090"
+    assert adopted["allocated_gpu_count"] == 4
+    assert adopted["allocated_provider"] == "vast", (
+        "a polled vast run reached persistence with no provider, so its wall is priced at "
+        "whichever provider offers the class rather than the one that billed it"
+    )
+
+
 def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, tmp_path):
     import io
 
@@ -1826,6 +2085,116 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     assert status.state == "running"
     assert status.remote == remote
     assert len(scheduled) == 1
+
+
+def test_completed_attempt_metrics_rereads_a_marker_that_is_not_visible_yet(monkeypatch):
+    """Recovery must RE-READ the marker, not sample it once.
+
+    The marker and metrics are two uploads of the same completion racing HF read-after-write lag, so
+    a marker that is invisible on the first read routinely surfaces moments later. Reading once would
+    report ABSENT and let the caller tear down an attempt that had already finished its paid work.
+    """
+    import io
+
+    import flash.providers._lifecycle.poll_instance as instance_poll
+    import flash.providers._lifecycle.terminal_artifacts as ta
+    import flash.providers.artifacts.hf as hf_artifacts
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="lagging-marker",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        train=TrainSpec(hf_repo="org/repo"),
+    )
+    # the reread window must stay NONZERO: the shared cutoff is `now + tries * wait_s`, so a zero
+    # wait would expire the budget before the second read and the test would pass for the wrong
+    # reason. sleep is faked instead, leaving the retry loop real.
+    monkeypatch.setattr(instance_poll, "_TERMINAL_REREAD_WAIT_S", 5.0)
+    monkeypatch.setattr(lifecycle.time, "time", lambda: 201.0)
+    monkeypatch.setattr(ta.time, "sleep", lambda _s: None)
+    marker_reads = {"n": 0}
+
+    def artifact_reader(_repo, path):
+        def read(force=False):
+            if path.endswith("/vast_attempt0.json"):
+                marker_reads["n"] += 1
+                # invisible on the first read, exactly as HF lag presents it
+                if marker_reads["n"] <= 1:
+                    return None
+                return (
+                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
+                    '"run_id":"lagging-marker","ts":199.0}'
+                )
+            return json.dumps({"train_tokens": 4096})
+
+        return read
+
+    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+
+    assert lifecycle._completed_attempt_metrics(
+        spec,
+        provider="vast",
+        attempt=0,
+        launch_floor=100.0,
+        deadline_at=200.0,
+        log=io.StringIO(),
+    ) == {"train_tokens": 4096}
+    assert marker_reads["n"] >= 2  # a single sample would have reported ABSENT
+
+
+def test_completed_attempt_metrics_never_adopts_an_unverifiable_marker(monkeypatch):
+    """Recovery must not adopt an artifact it cannot tie to this attempt, and must SAY so.
+
+    Live polling classifies an unverifiable marker as a terminal failure while recovery used to
+    swallow the decode error into a bare ``None``, so identical bytes produced different stories
+    depending on which layer observed the attempt. Both now route through one resolver: recovery
+    still returns ``None`` (there is no completed work to adopt) but names the artifact instead of
+    logging silence, and a corrupt marker can never be mistaken for a success.
+    """
+    import io
+
+    import flash.providers.artifacts.hf as hf_artifacts
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import JobSpec, TrainSpec
+
+    spec = JobSpec(
+        run_id="corrupt-marker",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        train=TrainSpec(hf_repo="org/repo"),
+    )
+
+    def artifact_reader(_repo, path):
+        # a well-formed marker body that speaks for a DIFFERENT run: it decodes as json but can
+        # never be validated against this attempt's identity.
+        def read(force=False):
+            if path.endswith("/vast_attempt0.json"):
+                return (
+                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
+                    '"run_id":"some-other-run","ts":199.0}'
+                )
+            return json.dumps({"train_tokens": 4096})
+
+        return read
+
+    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+    monkeypatch.setattr(lifecycle.time, "time", lambda: 201.0)
+    log = io.StringIO()
+
+    assert (
+        lifecycle._completed_attempt_metrics(
+            spec,
+            provider="vast",
+            attempt=0,
+            launch_floor=100.0,
+            deadline_at=200.0,
+            log=log,
+        )
+        is None
+    )
+    assert "invalid or unverifiable" in log.getvalue()
 
 
 @pytest.mark.parametrize(
@@ -2001,7 +2370,6 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
         "deploy_train_endpoint",
         lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT),
     )
-    monkeypatch.setattr(jobs, "build_function_input", lambda payload: payload)
     monkeypatch.setattr(
         jobs.runpod_api,
         "submit_job",
@@ -2017,7 +2385,7 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
         spec,
         0,
         attempt=2,
-        code_prefix="code/revision",
+        source_snapshot=_SOURCE_SNAPSHOT,
         on_handle=handles.append,
         deadline_at=10_000_000_000.0,
     )
@@ -2257,71 +2625,6 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
     assert "persisted spec is malformed" in (status.error or "")
 
 
-def test_recover_runs_fails_a_legacy_workload_profile_run_instead_of_resubmitting_it(
-    monkeypatch, tmp_path
-):
-    # a profile job left in flight by a pre-#1095 plane. its spec still parses, but the job it
-    # describes no longer exists and it carries no accepted sft workload profile, so resubmitting
-    # would rent a gpu only to fail. before the removal, JobSpec.phase reported "profile" and kept
-    # these out of the training path; workload_profile_kind is a dropped key now, so recovery has to
-    # read the marker off the raw record.
-    import flash.providers as providers
-    import flash.runner as runner
-    import flash.server.platform.runtime as runtime
-    from flash.core.spec import JobSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    rid = "recover-legacy-profile"
-    remote = {"provider": "runpod", "endpoint_id": "ep-profile", "attempt": 0}
-    runner._save_status(
-        runner.RunStatus(
-            run_id=rid,
-            state="running",
-            spec=JobSpec(run_id=rid, model="Qwen/Qwen3.5-4B", algorithm="sft").to_dict(),
-            remote=dict(remote),
-        )
-    )
-    # the old plane stamped the marker on the persisted spec; this build's _save_status would drop
-    # it, so write it the way the older plane left it on disk.
-    stored_path = runner.runs_file_path(rid, ".json")
-    with open(stored_path, encoding="utf-8") as handle:
-        stored = json.load(handle)
-    stored["spec"]["workload_profile_kind"] = "sft"
-    with open(stored_path, "w", encoding="utf-8") as handle:
-        json.dump(stored, handle)
-
-    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": rid}])
-    monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
-    monkeypatch.setattr(providers, "configured_providers", list)
-    torn: list[tuple[dict, str]] = []
-
-    def fake_teardown(handle, run_id):
-        torn.append((dict(handle), run_id))
-        return True
-
-    monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
-    attached: list[str] = []
-    monkeypatch.setattr(runner, "attach_run", lambda r: attached.append(r))
-
-    class Thread:
-        def __init__(self, *, target, args=(), daemon=False):
-            self._target, self._args = target, args
-
-        def start(self):
-            self._target(*self._args)
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
-
-    runtime.recover_runs()
-
-    # never reattached, never resubmitted, and the rented worker is released
-    assert attached == []
-    assert torn == [(remote, rid)]
-    status = runner.get_status(rid)
-    assert status.state == "failed"
-    assert "workload-profile job was removed" in (status.error or "")
-
-
 def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):
     # when `_strict_teardown_handle` cannot confirm the delete, the handle is recorded for the
     # cleanup drain -- but this run's drain was already dispatched at the top of the loop and had
@@ -2339,7 +2642,7 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
         "provider": "runpod",
         "endpoint_id": "ep-unconfirmed",
         "endpoint_name": "flash-recover-unconfirmed",
-        "key_fingerprint": "rpk-0123456789ab",
+        "key_fingerprint": "rpk-" + "0" * 64,
         "attempt": 0,
         "started_ts": 1.0,
     }
@@ -2455,8 +2758,10 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=120),
     )
+    status = provisioned_status(runner, spec, state="provisioning", created_at=10.0)
+    status.source_snapshot = _SOURCE_SNAPSHOT
     runner._save_status(
-        provisioned_status(runner, spec, state="provisioning", created_at=10.0),
+        status,
         _run_deadline_at=130.0,
         _next_attempt=0,
     )
@@ -2734,7 +3039,7 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
             spec,
             spec.seed,
             io.StringIO(),
-            code_prefix="code/revision",
+            source_snapshot=_SOURCE_SNAPSHOT,
         )
 
     status = runner.get_status(spec.run_id)
@@ -2817,7 +3122,7 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
             spec,
             spec.seed,
             io.StringIO(),
-            code_prefix="code/revision",
+            source_snapshot=_SOURCE_SNAPSHOT,
         )
 
     raw = runner._load_status_json(spec.run_id)
@@ -2853,5 +3158,5 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     )
 
     with pytest.raises(runner._RunCancelled):
-        lifecycle._run_training(spec, None, prior_cost=0.0)
+        lifecycle._run_training(spec, None, prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
     assert submitted == []  # never charged a GPU for an already-terminal run

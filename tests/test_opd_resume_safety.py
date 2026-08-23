@@ -20,8 +20,10 @@ from flash.teacher.retry_contract import (
     validate_opd_resume_state_metadata,
 )
 from tests._helpers.runner import provisioned_status
+from tests._helpers.source_snapshot import valid_source_snapshot
 
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 @pytest.fixture(autouse=True)
@@ -72,6 +74,10 @@ def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
         "opd_phase_seconds": {},
         "opd_phase_counts": {},
         "train_wall_seconds": 0.0,
+        # `accounting_snapshot` emits both unconditionally, so every real version-4 state carries
+        # the pair and the contract requires it.
+        "align_group_sum": 0.0,
+        "align_group_n": 0,
     }
     state.update(overrides)
     return state
@@ -110,14 +116,14 @@ def _save_status(
     next_attempt=0,
     remote=None,
     contracted=True,
+    source_snapshot=None,
 ):
     kwargs = {"_next_attempt": next_attempt}
     if contracted:
         kwargs["_opd_retry_contract_version"] = OPD_RETRY_CONTRACT_VERSION
-    runner._save_status(
-        provisioned_status(runner, spec, state=state, remote=remote),
-        **kwargs,
-    )
+    status = provisioned_status(runner, spec, state=state, remote=remote)
+    status.source_snapshot = source_snapshot
+    runner._save_status(status, **kwargs)
 
 
 def test_status_initialization_stamps_opd_contract_only_when_explicit(monkeypatch, tmp_path):
@@ -608,7 +614,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     private_hf = _FakePrivateHf(tmp_path)
     private_hf.install(monkeypatch)
     spec = _opd_spec("automatic-retry-absent")
-    _save_status(runner, spec, next_attempt=0)
+    _save_status(runner, spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
     monkeypatch.setattr(
         allocator,
@@ -682,7 +688,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
     private_hf = _FakePrivateHf(tmp_path)
     private_hf.install(monkeypatch)
     spec = _opd_spec("automatic-retry-pinned")
-    _save_status(runner, spec, next_attempt=0)
+    _save_status(runner, spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
     monkeypatch.setattr(
         allocator,
@@ -783,7 +789,13 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
         run_id=spec.run_id, attempt=0, seed=42
     )
     private_hf.install(monkeypatch)
-    _save_status(runner, spec, next_attempt=1, remote=_remote(attempt=0))
+    _save_status(
+        runner,
+        spec,
+        next_attempt=1,
+        remote=_remote(attempt=0),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
     events = []
 
     class Provider:
@@ -830,7 +842,13 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
         run_id=spec.run_id, attempt=0, seed=42
     )
     private_hf.install(monkeypatch)
-    _save_status(runner, spec, state="provisioning", next_attempt=1)
+    _save_status(
+        runner,
+        spec,
+        state="provisioning",
+        next_attempt=1,
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
     started = []
     monkeypatch.setattr(runner, "_run_job_background", lambda *_args: started.append(True))
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
@@ -889,7 +907,7 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
     private_hf.install(monkeypatch)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("ambiguous-upload")
-    _save_status(runner, spec, next_attempt=1)
+    _save_status(runner, spec, next_attempt=1, source_snapshot=_SOURCE_SNAPSHOT)
     monkeypatch.setattr(
         allocator,
         "allocate",
@@ -1096,42 +1114,117 @@ def test_nested_shards_do_not_count_toward_checkpoint_completeness(monkeypatch, 
         _run_gate()
 
 
-def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width():
-    """A pinned resume drops every shape whose card count the checkpoint cannot be loaded on.
-
-    This is the defect: allocation re-ranks each retry from scratch, so a 2-card attempt could be
-    re-ranked onto 4 cards, and the worker -- which fails closed on a width mismatch for a PINNED
-    resume -- would then permanently refuse the only checkpoint it is authorized to continue from.
-    """
+@pytest.mark.parametrize(
+    ("resume_world_size", "survivor_indexes", "headline"),
+    [
+        pytest.param(2, (0, 1), ("runpod", "h100", 1.0, 4), id="accept-four-cards-two-ranks"),
+        pytest.param(4, (2,), ("modal", "b200", 3.0, 4), id="reject-four-cards-two-ranks"),
+    ],
+)
+def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
+    resume_world_size, survivor_indexes, headline
+):
+    """a pinned resume admits only candidates that execute at the checkpoint width."""
     from flash.providers.base import Allocation, Candidate
     from flash.runner.supervise.seed_submission import _pinned_to_resume_width
 
-    def candidate(gpu: str, count: int) -> Candidate:
-        return Candidate(provider="runpod", gpu=gpu, hourly_usd=1.0, vram_gb=80, gpu_count=count)
-
-    four, two, one = candidate("h100", 4), candidate("h100", 2), candidate("h200", 1)
+    candidates = (
+        Candidate("runpod", "h100", 1.0, 80, 4, 2),
+        Candidate("vast", "h200", 2.0, 141, 2, 2),
+        Candidate("modal", "b200", 3.0, 180, 4, 4),
+    )
     allocation = Allocation(
         provider="runpod",
         gpu="h100",
         hourly_usd=1.0,
         min_vram_gb=80,
-        candidates=(four, two, one),
+        candidates=candidates,
         gpu_count=4,
     )
 
-    pinned = _pinned_to_resume_width(allocation, 2)
-    assert pinned.candidates == (two,)
-    # the headline shape follows the surviving candidate, or the run would be submitted at a count
-    # no remaining candidate offers.
-    assert (pinned.gpu_count, pinned.gpu) == (2, "h100")
+    pinned = _pinned_to_resume_width(allocation, resume_world_size)
+    expected = tuple(candidates[index] for index in survivor_indexes)
+    assert pinned.candidates == expected
+    assert all(
+        survivor is candidate
+        for survivor, candidate in zip(pinned.candidates, expected, strict=True)
+    )
+    assert (pinned.provider, pinned.gpu, pinned.hourly_usd, pinned.gpu_count) == headline
+    assert [(candidate.gpu_count, candidate.executed_gpu_count) for candidate in candidates] == [
+        (4, 2),
+        (2, 2),
+        (4, 4),
+    ]
 
-    # no pin (nothing mutated, or an unreadable width) leaves the ranking completely untouched.
     assert _pinned_to_resume_width(allocation, None) is allocation
     assert _pinned_to_resume_width(allocation, 0) is allocation
-
-    # no loadable shape: empty rather than silently resuming on a width that cannot load, which
-    # would burn the retry and reject the checkpoint.
     assert _pinned_to_resume_width(allocation, 8).candidates == ()
+
+
+def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
+    """a filtered rental reports the incompatible execution width, not its card count."""
+    from flash.providers.base import Allocation, Candidate
+    from flash.runner.supervise.seed_submission import (
+        _build_candidate_plan,
+        _pinned_to_resume_width,
+    )
+
+    rented_two_executes_one = Candidate("runpod", "h100", 1.0, 80, 2, 1)
+    allocation = Allocation("runpod", "h100", 1.0, 80, (rented_two_executes_one,), gpu_count=2)
+    filtered = _pinned_to_resume_width(allocation, 2)
+    ctx = SimpleNamespace(oom_vram_floor=0.0, last_detail=None, seed=42, log=io.StringIO())
+    prepared = SimpleNamespace(resume_world_size=2)
+
+    assert filtered.candidates == ()
+    assert _build_candidate_plan(ctx, prepared, filtered) is None
+    assert ctx.last_detail == (
+        "no candidate executing at checkpoint world size 2 is available, and this retry must "
+        "preserve that executed rank width"
+    )
+    assert ctx.log.getvalue() == (
+        "seed=42 no candidate executes at pinned OPD checkpoint world size 2; not retrying\n"
+    )
+
+
+class _IntSubclass(int):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("executed_present", "executed_gpu_count", "wrong_width"),
+    [
+        pytest.param(False, None, 2, id="absent"),
+        pytest.param(True, None, 2, id="none"),
+        pytest.param(True, 0, 2, id="zero"),
+        pytest.param(True, -1, -1, id="negative"),
+        pytest.param(True, True, 1, id="boolean-true"),
+        pytest.param(True, False, 2, id="boolean-false"),
+        pytest.param(True, _IntSubclass(2), 2, id="int-subclass"),
+        pytest.param(True, 2.0, 2, id="float"),
+        pytest.param(True, "2", 2, id="string"),
+        pytest.param(True, object(), 2, id="opaque"),
+    ],
+)
+def test_retry_allocation_falls_back_for_unusable_executed_width(
+    executed_present, executed_gpu_count, wrong_width
+):
+    """absent and malformed executed widths fall back to the rented card count."""
+    from flash.providers.base import Allocation, Candidate
+    from flash.runner.supervise.seed_submission import _pinned_to_resume_width
+
+    if executed_present:
+        candidate = Candidate("runpod", "h100", 1.0, 80, 4, executed_gpu_count)
+    else:
+        candidate = SimpleNamespace(
+            provider="runpod", gpu="h100", hourly_usd=1.0, vram_gb=80, gpu_count=4
+        )
+    allocation = Allocation("runpod", "h100", 1.0, 80, (candidate,), gpu_count=4)
+
+    fallback = _pinned_to_resume_width(allocation, 4)
+    assert fallback.candidates == (candidate,)
+    assert fallback.candidates[0] is candidate
+    assert fallback.gpu_count == 4
+    assert _pinned_to_resume_width(allocation, wrong_width).candidates == ()
 
 
 @pytest.mark.parametrize(
@@ -1175,9 +1268,13 @@ def test_resume_state_version_rejects_states_predating_alignment_granularity():
         validate_opd_resume_state_metadata(stale, expected_seed=42, checkpoint_step=2)
 
 
-def test_resume_validator_accepts_alignment_granularity_and_states_without_it():
-    # verl writes the pair; trl does not. both must validate, so the fields are checked when present
-    # rather than required -- otherwise adding them would reject every trl checkpoint.
+def test_resume_validator_requires_the_alignment_granularity_pair():
+    # `accounting_snapshot` is the ONLY producer of a version-4 state and always emits both fields,
+    # so an absent one means a corrupt record, not an older writer: the trl backend that wrote
+    # neither was deleted (8421a240, 2026-07-31) before this contract version existed (975ddbdc,
+    # 2026-08-05), so no version-4 state can lack them. required rather than optional because the
+    # reader defaults an absent field to 0, and the published mean_align_granularity would then
+    # divide a real sum by a zeroed count -- or report 0.0 for a run that measured every group.
     with_granularity = _valid_resume_state(2, align_group_sum=3.0, align_group_n=2)
     validated = validate_opd_resume_state_metadata(
         with_granularity, expected_seed=42, checkpoint_step=2
@@ -1185,26 +1282,22 @@ def test_resume_validator_accepts_alignment_granularity_and_states_without_it():
     assert validated["align_group_sum"] == 3.0
     assert validated["align_group_n"] == 2
 
-    without = _valid_resume_state(2)
-    assert "align_group_sum" not in without
-    validate_opd_resume_state_metadata(without, expected_seed=42, checkpoint_step=2)
-
 
 @pytest.mark.parametrize(
-    ("overrides", "missing"),
+    ("dropped", "missing"),
     [
-        ({"align_group_sum": 3.0}, "align_group_n"),
-        ({"align_group_n": 2}, "align_group_sum"),
+        (("align_group_n",), "align_group_n"),
+        (("align_group_sum",), "align_group_sum"),
+        (("align_group_sum", "align_group_n"), "align_group_"),
     ],
 )
-def test_resume_validator_rejects_a_half_present_alignment_pair(overrides, missing):
-    # Regression (opd_retry_contract.py): the two accumulators were checked INDEPENDENTLY, so a
-    # state carrying one of them passed. the reader then defaults the absent one to 0 (opd_train
-    # reads each with its own.get default), and the published mean_align_granularity divides a real
-    # sum by a zeroed count -- or reports 0.0 for a run that measured alignment on every group.
-    # absent-together stays valid (trl writes neither, which the test above pins); only the
-    # half-present state is a corrupt one.
-    state = _valid_resume_state(2, **overrides)
+def test_resume_validator_rejects_an_incomplete_alignment_pair(dropped, missing):
+    # both a half-present pair and an entirely absent one are corrupt: the reader defaults each
+    # missing field to 0 independently, so the published mean_align_granularity divides a real sum
+    # by a zeroed count, or reports 0.0 for a run that measured alignment on every group.
+    state = _valid_resume_state(2)
+    for field in dropped:
+        del state[field]
 
     with pytest.raises(ValueError, match=missing):
         validate_opd_resume_state_metadata(state, expected_seed=42, checkpoint_step=2)
@@ -1212,10 +1305,9 @@ def test_resume_validator_rejects_a_half_present_alignment_pair(overrides, missi
 
 def test_discarded_rollouts_is_not_part_of_the_resume_accounting_contract():
     required = set(retry_contract._OPD_RESUME_ACCOUNTING_SCHEMA)
-    optional = set(retry_contract._OPD_RESUME_OPTIONAL_ACCOUNTING_SCHEMA)
 
     assert "truncated_rollouts" in required
-    assert "discarded_rollouts" not in required | optional
+    assert "discarded_rollouts" not in required
 
 
 def test_shared_resume_metadata_validator_returns_a_copy():

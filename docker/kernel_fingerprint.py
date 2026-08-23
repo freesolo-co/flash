@@ -236,6 +236,7 @@ def collect_inputs(
             root / "flash" / "providers" / "runpod" / "serverless" / "endpoints.py"
         ),
         "make_rp_handler_sha256": _sha256_file(root / "docker" / "make_rp_handler.py"),
+        "source_snapshot_sha256": _sha256_file(root / "flash" / "source_snapshot.py"),
     }
     return cache_inputs, base_inputs_partial
 

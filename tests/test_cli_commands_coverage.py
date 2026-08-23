@@ -73,11 +73,19 @@ def test_follow_run_returns_success_and_failure_codes(monkeypatch, capsys) -> No
     """Following a run must print its final state and preserve terminal success semantics."""
     client = _Client(run={"run_id": "flash-1", "state": "done"})
     monkeypatch.setattr(commands, "_render_status", lambda status: f"final:{status['state']}")
-    monkeypatch.setattr(commands, "_poll_logs", lambda *args, **kwargs: ("done", False))
+    monkeypatch.setattr(
+        commands,
+        "_poll_logs",
+        lambda *args, **kwargs: commands._LogPollResult("done", False, None),
+    )
     assert commands._follow_run(client, "flash-1") == 0
     assert capsys.readouterr().out == "final:done\n"
 
-    monkeypatch.setattr(commands, "_poll_logs", lambda *args, **kwargs: ("failed", False))
+    monkeypatch.setattr(
+        commands,
+        "_poll_logs",
+        lambda *args, **kwargs: commands._LogPollResult("failed", False, None),
+    )
     assert commands._follow_run(client, "flash-1") == 1
     assert capsys.readouterr().out == "final:done\n"
 
@@ -90,7 +98,7 @@ def test_print_worker_output_skips_empty_sections_and_styles_nonempty_output(
     monkeypatch.setattr(commands.render, "styled", lambda: True)
     monkeypatch.setattr(commands.render, "log_section", lambda name: f"section:{name}")
 
-    assert commands._print_worker_output(client, "flash-1") is True
+    assert commands._print_worker_output(commands._worker_sections(client, "flash-1")) is True
 
     assert capsys.readouterr().out == "section:console.txt\nworker line\n"
 

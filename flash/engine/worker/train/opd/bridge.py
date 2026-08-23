@@ -22,24 +22,28 @@ import time
 from http.server import BaseHTTPRequestHandler
 from typing import TYPE_CHECKING
 
+from flash.content.multimodal import normalize_environment_reply
 from flash.engine.worker.entry.opd import _drop_fully_forced_groups
 from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.teacher.client import TeacherError
+from flash.engine.worker.teacher.client import TeacherClient, TeacherError
 from flash.engine.worker.teacher.tokenizer_align import groupwise_alignment, groupwise_coverage
-from flash.engine.worker.train.core.child.glue import (
-    EnvGlueTokenizer,
-    dedup_seam_terminator,
-    validate_transcript_messages,
-)
+from flash.engine.worker.train.core.child.glue import validate_structured_messages
 from flash.engine.worker.train.opd.batching import (
     _align_granularity,
     _TeacherBridgeHTTPServer,
     _TextTeacherBatcher,
 )
+from flash.engine.worker.train.opd.bridge_failures import TeacherFailureRecording
 from flash.engine.worker.train.opd.gkd import (
     _rollout_terminated,
     _teacher_prompt_text,
     student_tokens_with_offsets,
+)
+from flash.engine.worker.train.opd.multiturn_media import (
+    normalize_initial_prompt,
+    prepare_environment_reply,
+    step_media_identity,
+    validate_start_media,
 )
 from flash.engine.worker.train.opd.multiturn_validation import validated_multiturn_response
 from flash.engine.worker.train.opd.prompts import (
@@ -47,7 +51,12 @@ from flash.engine.worker.train.opd.prompts import (
     _validate_forced_mask,
     encode_shifted_group_metadata,
 )
-from flash.engine.worker.train.opd.scoring import score_rollout
+from flash.engine.worker.train.opd.scoring import (
+    build_multimodal_score_items,
+    score_multimodal_items,
+    score_rollout,
+)
+from flash.engine.worker.verl.parent_work import ParentWorkGauge
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
 if TYPE_CHECKING:  # annotation-only: `opd_train` imports this module, so a runtime import
@@ -68,12 +77,13 @@ def _opd_train():
     return opd_train
 
 
-class _TeacherAlignmentBridge:
+class _TeacherAlignmentBridge(TeacherFailureRecording):
     def __init__(
         self,
         *,
         prompts: list[_BridgePrompt],
-        tokenizer,
+        processor=None,
+        tokenizer=None,
         teacher,
         thinking_prefill: str,
         eos_token_ids: frozenset[int],
@@ -90,6 +100,7 @@ class _TeacherAlignmentBridge:
     ) -> None:
         state = initial_state or {}
         self.prompts = prompts
+        self.processor = processor
         self.tokenizer = tokenizer
         self.teacher = teacher
         self.thinking_prefill = thinking_prefill
@@ -99,9 +110,7 @@ class _TeacherAlignmentBridge:
         self.active_env = active_env
         self.multi_turn = bool(multi_turn)
         self.max_turns = int(max_turns)
-        self._env_glue = (
-            EnvGlueTokenizer(tokenizer, thinking=bool(thinking)) if self.multi_turn else None
-        )
+        self.thinking = bool(thinking)
         self.session_lease_s = float(session_lease_s)
         self.session_reap_interval_s = float(session_reap_interval_s)
         if self.multi_turn and self.session_lease_s <= 0:
@@ -113,6 +122,7 @@ class _TeacherAlignmentBridge:
         self._server = None
         self._thread = None
         self._text_teacher_batcher: _TextTeacherBatcher | None = None
+        self.parent_work = ParentWorkGauge()
         self._env_lock = threading.Lock()
         self._sessions_lock = threading.Lock()
         self._sessions: dict[str, dict] = {}
@@ -137,7 +147,11 @@ class _TeacherAlignmentBridge:
         self.coverage_sum = float(state.get("coverage_sum", 0.0))
         # alignment GRANULARITY (mean aligned-groups-per-sequence), distinct from coverage: a
         # collapsed alignment that maps every student token onto one group still scores coverage
-        # ~1.0, so coverage alone cannot flag that failure mode.
+        # ~1.0, so coverage alone cannot flag that failure mode. the zero default is reachable only
+        # on a FRESH start (no `initial_state`), where nothing has been measured yet and 0 is the
+        # true count; a resume state is required by `validate_opd_resume_state_metadata` to carry
+        # both, so an absent field there is rejected rather than silently defaulted -- otherwise the
+        # published `mean_align_granularity` would read 0.0 for a run that measured every group.
         self.align_group_sum = float(state.get("align_group_sum", 0.0))
         self.align_group_n = int(state.get("align_group_n", 0))
         # resume: baseline the per-step delta counters at the restored cumulative mass, so the
@@ -160,94 +174,7 @@ class _TeacherAlignmentBridge:
         self._skip_baseline = dict(self.skip_counts)
         self.opd_phase_seconds = dict(state.get("opd_phase_seconds", {}))
         self.opd_phase_counts = dict(state.get("opd_phase_counts", {}))
-        self._teacher_failure: tuple[str, str] | None = None
-        self._mutation_failure: tuple[str, str] | None = None
-        self._mutation_callback_failure: tuple[str, str] | None = None
-        self._mutation_callback_succeeded = False
-        self._pending_teacher_transient: tuple[str, str] | None = None
-        self._pending_teacher_success = False
-
-    def _record_teacher_failure(
-        self,
-        classification: str,
-        message: str,
-        *,
-        terminal: bool = False,
-    ) -> None:
-        with self._stats_lock:
-            if classification == "transient":
-                self.teacher_transient += 1
-                if terminal and self._teacher_failure is None:
-                    self._teacher_failure = (classification, message)
-                elif self._pending_teacher_transient is None:
-                    self._pending_teacher_transient = (classification, message)
-            else:
-                self.teacher_error += 1
-                self._teacher_failure = (classification, message)
-
-    @property
-    def teacher_failure(self) -> tuple[str, str] | None:
-        with self._stats_lock:
-            return self._teacher_failure
-
-    def _promote_recovered_teacher_failure(self, failure: tuple[str, str]) -> None:
-        with self._stats_lock:
-            if self._teacher_failure is None:
-                self._teacher_failure = failure
-
-    def _record_teacher_delivery_failure(self, error: Exception) -> None:
-        with self._stats_lock:
-            if self._teacher_failure is None:
-                self._teacher_failure = (
-                    "transient",
-                    f"teacher bridge response delivery failed: {type(error).__name__}",
-                )
-
-    def _record_mutation_failure(self, classification: str, message: str) -> None:
-        with self._stats_lock:
-            if self._mutation_callback_failure is not None:
-                return
-            if self._mutation_callback_succeeded:
-                return
-            if classification == "permanent" or self._mutation_failure is None:
-                self._mutation_failure = (classification, message)
-
-    def _record_mutation_callback_failure(
-        self,
-        classification: str,
-        message: str,
-    ) -> tuple[str, str]:
-        with self._stats_lock:
-            if self._mutation_callback_failure is None:
-                self._mutation_callback_failure = (classification, message)
-            return self._mutation_callback_failure
-
-    @staticmethod
-    def _raise_recorded_mutation_failure(failure: tuple[str, str]) -> None:
-        classification, message = failure
-        raise _opd_train()._RecordedMutationCallbackFailure(classification, message)
-
-    @property
-    def mutation_failure(self) -> tuple[str, str] | None:
-        with self._stats_lock:
-            if self._mutation_callback_failure is not None:
-                return self._mutation_callback_failure
-            if self._mutation_callback_succeeded:
-                return None
-            return self._mutation_failure
-
-    def _promote_pending_teacher_failure(self) -> bool:
-        with self._stats_lock:
-            if (
-                self._teacher_failure is None
-                and self._pending_teacher_transient is not None
-                and not self._pending_teacher_success
-            ):
-                self._teacher_failure = self._pending_teacher_transient
-                self._pending_teacher_transient = None
-                self._pending_teacher_success = False
-                return True
-            return False
+        self._init_failure_state()
 
     def accounting_snapshot(self) -> dict:
         with self._stats_lock:
@@ -363,6 +290,7 @@ class _TeacherAlignmentBridge:
                 teacher=self.teacher,
                 thinking_prefill=self.thinking_prefill,
                 text_teacher_batcher=self._text_teacher_batcher,
+                on_scored=self.parent_work.complete,
             )
         except TeacherError as error:
             if error.permanent:
@@ -413,6 +341,10 @@ class _TeacherAlignmentBridge:
         if self.max_turns <= 0:
             raise ValueError("flash OPD bridge multi-turn limit is invalid")
 
+    def _env_call(self, method: str, *args):
+        with self.parent_work.busy():
+            return getattr(self.active_env, method)(*args)
+
     @staticmethod
     def _validate_session_id(session_id: str) -> str:
         if not isinstance(session_id, str) or not session_id or len(session_id) > 256:
@@ -444,12 +376,6 @@ class _TeacherAlignmentBridge:
         while not self._session_reaper_stop.wait(self.session_reap_interval_s):
             self._reap_stale_sessions()
 
-    @property
-    def active_session_count(self) -> int:
-        with self._sessions_lock:
-            self._reap_stale_sessions_locked(time.monotonic())
-            return len(self._sessions)
-
     def _session(self, session_id: str) -> dict:
         session_id = self._validate_session_id(session_id)
         with self._sessions_lock:
@@ -469,6 +395,8 @@ class _TeacherAlignmentBridge:
         session_id: str,
         prompt_ids: list[int],
         raw_prompt: list[dict],
+        image_count: int,
+        image_digests: list[str] | None = None,
     ) -> dict:
         self._require_multiturn()
         if index < 0 or index >= len(self.prompts):
@@ -476,16 +404,27 @@ class _TeacherAlignmentBridge:
         prompt = self.prompts[index]
         if prompt.example is None:
             raise ValueError("multi-turn OPD prompt is missing its environment example")
+        expected_digests = validate_start_media(
+            prompt,
+            self.processor,
+            index,
+            image_count,
+            image_digests,
+        )
         prompt_ids = [int(token_id) for token_id in prompt_ids]
         if prompt_ids != list(prompt.prompt_ids):
             raise ValueError("multi-turn rollout prompt ids do not match the frozen flash prompt")
-        raw_prompt = validate_transcript_messages(raw_prompt, source="child initial prompt")
-        if raw_prompt != prompt.student_messages:
+        raw_prompt = validate_structured_messages(raw_prompt, source="child initial prompt")
+        frozen_prompt = validate_structured_messages(
+            prompt.student_messages, source="frozen environment prompt"
+        )
+        if raw_prompt != frozen_prompt:
             raise ValueError("multi-turn child prompt does not match the frozen environment prompt")
         session_id = self._validate_session_id(session_id)
         start_identity = (
             int(index),
             tuple(prompt_ids),
+            expected_digests,
             json.dumps(raw_prompt, sort_keys=True, separators=(",", ":")),
         )
         with self._sessions_lock:
@@ -500,12 +439,13 @@ class _TeacherAlignmentBridge:
                 existing["lease_deadline"] = now + self.session_lease_s
                 return {"max_turns": existing["turn_limit"]}
             with self._env_lock:
-                state = self.active_env.new_rollout_state(prompt.example)
-                initial_messages = state.get("prompt") or state.get("messages")
-                initial_messages = validate_transcript_messages(
-                    initial_messages, source="environment initial prompt"
+                state = self._env_call("new_rollout_state", prompt.example)
+                initial_messages, fresh_descriptors = normalize_initial_prompt(
+                    prompt,
+                    state,
+                    self.processor,
                 )
-            if initial_messages != prompt.student_messages:
+            if initial_messages != frozen_prompt or fresh_descriptors != prompt.image_descriptors:
                 raise ValueError(
                     "multi-turn environment initial prompt changed after prompt freezing"
                 )
@@ -525,7 +465,9 @@ class _TeacherAlignmentBridge:
             self._sessions[session_id] = {
                 "index": int(index),
                 "state": state,
-                "messages": [dict(message) for message in initial_messages],
+                "messages": copy.deepcopy(initial_messages),
+                "descriptors": list(prompt.image_descriptors),
+                "image_digests": list(expected_digests),
                 "turns": [],
                 "required_prefix": list(prompt.prompt_ids),
                 "terminal": False,
@@ -552,12 +494,15 @@ class _TeacherAlignmentBridge:
         session = self._session(payload.get("session_id"))
         turn_ordinal = int(payload.get("turn_ordinal", -1))
         accepted_prefix = [int(token_id) for token_id in payload.get("accepted_prefix", [])]
+        image_count, image_digests = step_media_identity(payload)
         raw_response_ids, response_ids, completion_text, skip_reason = (
             self._validated_multiturn_response(payload)
         )
         request_identity = (
             turn_ordinal,
             tuple(accepted_prefix),
+            image_count,
+            tuple(image_digests),
             tuple(raw_response_ids),
             tuple(response_ids),
             completion_text,
@@ -582,7 +527,16 @@ class _TeacherAlignmentBridge:
                 raise ValueError(
                     "multi-turn rollout prompt does not exactly match the authenticated environment context"
                 )
-            context_messages = [dict(message) for message in session["messages"]]
+            if image_count != len(session["image_digests"]) or tuple(image_digests) != tuple(
+                session["image_digests"]
+            ):
+                raise ValueError(
+                    "multi-turn rollout media does not match the authenticated environment context"
+                )
+            context_messages = copy.deepcopy(session["messages"])
+            context_descriptors = tuple(session["descriptors"])
+            context_image_digests = tuple(session["image_digests"])
+            prompt = self.prompts[session["index"]]
             state = session["state"]
             terminal = bool(payload.get("truncated")) or bool(skip_reason)
             # an unusable turn is excluded from teacher scoring below (see the `scorable` filter),
@@ -591,7 +545,7 @@ class _TeacherAlignmentBridge:
             # routine no-signal rollout into a permanent paid failure. the grpo bridge already
             # returns before its own `record_model_turn` on exactly this predicate.
             if not terminal:
-                self.active_env.record_model_turn(state, completion_text)
+                self._env_call("record_model_turn", state, completion_text)
                 session["messages"].append({"role": "assistant", "content": completion_text})
             messages: list[dict] = []
             next_prefix = [*accepted_prefix, *response_ids]
@@ -601,24 +555,41 @@ class _TeacherAlignmentBridge:
                 # env call and appends a user turn no model turn will ever answer.
                 assistant_turns = turn_ordinal + 1
                 turn_limit = session["turn_limit"]
-                terminal = assistant_turns >= turn_limit or self.active_env.rollout_done(
-                    state, turn_limit
+                terminal = assistant_turns >= turn_limit or self._env_call(
+                    "rollout_done", state, turn_limit
                 )
+            image_data_uris: tuple[str, ...] = ()
             if not terminal:
-                messages = self.active_env.env_reply(session["messages"], state)
-                messages = validate_transcript_messages(messages, source="environment reply")
-                session["messages"].extend(messages)
-                # the env's reply may itself end the episode (rollout_done consults the updated
-                # state); recheck before gluing a next-turn prompt no model turn will answer.
-                terminal = not messages or self.active_env.rollout_done(
-                    state, session["turn_limit"]
+                raw_messages = self._env_call("env_reply", session["messages"], state)
+                # the env's reply may itself end the episode. terminal replies remain in env state
+                # for task semantics but never enter actor or teacher context.
+                terminal = not raw_messages or self._env_call(
+                    "rollout_done", state, session["turn_limit"]
                 )
                 if not terminal:
-                    assert self._env_glue is not None
-                    next_prefix.extend(
-                        dedup_seam_terminator(response_ids, self._env_glue(messages))
+                    prepared_reply = prepare_environment_reply(
+                        raw_messages,
+                        normalize_reply=normalize_environment_reply,
+                        prompt=prompt,
+                        cumulative_descriptors=session["descriptors"],
+                        processor=self.processor,
+                        tokenizer=self.tokenizer,
+                        thinking=self.thinking,
+                        response_ids=response_ids,
                     )
-            step_response = {"messages": messages, "terminal": bool(terminal)}
+                    next_prefix.extend(prepared_reply.glue_ids)
+                    messages = prepared_reply.messages
+                    image_data_uris = prepared_reply.data_uris
+                    session["messages"].extend(copy.deepcopy(messages))
+                    session["descriptors"].extend(prepared_reply.descriptors)
+                    session["image_digests"].extend(prepared_reply.image_digests)
+            step_response = {
+                "messages": messages,
+                "terminal": bool(terminal),
+                "image_data_uris": list(image_data_uris),
+                "image_count": len(session["image_digests"]),
+                "image_digests": list(session["image_digests"]),
+            }
             session["terminal"] = bool(terminal)
             session["required_prefix"] = next_prefix
             session["score_cache"] = None
@@ -629,6 +600,8 @@ class _TeacherAlignmentBridge:
                     "raw_response_ids": raw_response_ids,
                     "completion_text": completion_text,
                     "context_messages": context_messages,
+                    "image_descriptors": context_descriptors,
+                    "image_digests": context_image_digests,
                     "truncated": bool(payload.get("truncated")),
                     "skip_reason": skip_reason,
                     "request_identity": request_identity,
@@ -663,25 +636,61 @@ class _TeacherAlignmentBridge:
                 if not turn["truncated"] and not turn["skip_reason"] and turn["response_ids"]
             ]
             if scorable:
-                items = [
-                    (
-                        _teacher_prompt_text(
-                            turns[position]["context_messages"], self.thinking_prefill
-                        ),
-                        turns[position]["completion_text"],
-                    )
-                    for position in scorable
-                ]
-                # ONE call, not a chunk-and-drain loop. score_many already bounds itself to
-                # OPD_TEACHER_SCORING_CONCURRENCY workers, so slicing the items first did not lower
-                # the provider-facing rate -- it only added a BARRIER every 32 items, where the
-                # slowest request in a wave held back the whole next wave and the gpu idled behind
-                # it. handing the full list over keeps the same concurrency ceiling while letting a
-                # finished worker start the next item immediately. `executor.map` preserves input
-                # order, so the zip with `scorable` below is unchanged.
-                teacher_batches = self.teacher.score_many(items)
-                if len(teacher_batches) != len(scorable):
-                    raise RuntimeError("teacher returned the wrong number of multi-turn OPD scores")
+                prompt = self.prompts[session["index"]]
+                teacher_batches = []
+                group_start = 0
+                while group_start < len(scorable):
+                    uses_images = bool(turns[scorable[group_start]]["image_descriptors"])
+                    group_end = group_start + 1
+                    while (
+                        group_end < len(scorable)
+                        and bool(turns[scorable[group_end]]["image_descriptors"]) == uses_images
+                    ):
+                        group_end += 1
+                    positions = scorable[group_start:group_end]
+                    if uses_images:
+                        items = build_multimodal_score_items(
+                            prompt,
+                            [
+                                (
+                                    turns[position]["context_messages"],
+                                    turns[position]["completion_text"],
+                                    turns[position]["image_descriptors"],
+                                )
+                                for position in positions
+                            ],
+                            thinking_prefill=self.thinking_prefill,
+                        )
+                        scored = score_multimodal_items(
+                            self.teacher,
+                            items,
+                            on_scored=self.parent_work.complete,
+                        )
+                    else:
+                        items = [
+                            (
+                                _teacher_prompt_text(
+                                    turns[position]["context_messages"], self.thinking_prefill
+                                ),
+                                turns[position]["completion_text"],
+                            )
+                            for position in positions
+                        ]
+                        if isinstance(self.teacher, TeacherClient):
+                            scored = self.teacher.score_many(
+                                items,
+                                on_scored=self.parent_work.complete,
+                            )
+                        else:
+                            scored = self.teacher.score_many(items)
+                            for _score in scored:
+                                self.parent_work.complete()
+                    if len(scored) != len(positions):
+                        raise RuntimeError(
+                            "teacher returned the wrong number of multi-turn OPD scores"
+                        )
+                    teacher_batches.extend(scored)
+                    group_start = group_end
                 with self._stats_lock:
                     self.teacher_ok += len(teacher_batches)
                 for position, teacher_score in zip(scorable, teacher_batches, strict=True):
@@ -828,6 +837,10 @@ class _TeacherAlignmentBridge:
                 session_id=payload["session_id"],
                 prompt_ids=payload["prompt_ids"],
                 raw_prompt=payload["raw_prompt"],
+                # required like every sibling field: defaulting it to 0 would let a child that
+                # never sent the count pass the check for an image-bearing prompt.
+                image_count=payload["image_count"],
+                image_digests=payload["image_digests"],
             ),
             "/multiturn/step": self.step_multiturn,
             "/multiturn/score": lambda payload: self.score_multiturn(payload["session_id"]),
@@ -933,6 +946,7 @@ class _TeacherAlignmentBridge:
             self.teacher,
             max_batch_size=OPD_TEACHER_SCORING_CONCURRENCY,
             flush_wait_s=_opd_train()._TEXT_TEACHER_FLUSH_WAIT_S,
+            on_scored=self.parent_work.complete,
         )
         self._text_teacher_batcher.start()
         try:

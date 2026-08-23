@@ -9,39 +9,41 @@ import time
 from typing import Any
 from uuid import uuid4
 
-try:  # inside the verl child, copied in beside this file
+if __name__ == "flash_opd_multiturn":
     from flash_multiturn_glue import (
-        EnvGlueTokenizer,
+        EnvGlueProcessor,
         dedup_seam_terminator,
         normalize_token_ids,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         validate_glue_template,
-        validate_transcript_messages,
     )
-except ImportError:  # in-tree (parent process, tests, lint)
+    from flash_opd_bridge import _write_rollout_failure_fallback
+else:
     from flash.engine.worker.train.core.child.glue import (
-        EnvGlueTokenizer,
+        EnvGlueProcessor,
         dedup_seam_terminator,
         normalize_token_ids,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         validate_glue_template,
-        validate_transcript_messages,
     )
+    from flash.engine.worker.train.opd.child.bridge import _write_rollout_failure_fallback
 
 __all__ = [
-    "EnvGlueTokenizer",
+    "EnvGlueProcessor",
     "build_flash_multi_turn_agent_loop",
     "dedup_seam_terminator",
     "normalize_token_ids",
     "prepare_assistant_turn",
+    "prepare_episode_prompt",
     "run_executor_call",
     "sum_preemptions",
     "validate_glue_template",
-    "validate_transcript_messages",
 ]
 
 
@@ -120,17 +122,24 @@ def _opd_turn_output_fields(
     turn_ordinal: int,
     generated_seconds: float,
     num_preempted: int,
+    media_snapshot,
+    mm_processor_kwargs,
 ) -> dict:
     """the fields one OPD turn contributes to its own AgentLoopOutput.
 
     OPD emits one output per turn rather than one per episode, so the prompt is the prefix this turn
     conditioned on and the whole response is model-generated (mask all ones).
+
+    every turn carries an immutable snapshot of the cumulative media present in its prefix. the
+    actor forward re-tokenizes that prompt and must see exactly the same pixels as generation.
     """
     return {
         "prompt_ids": list(prefix_ids),
         "response_ids": list(response_ids),
         "response_mask": [1] * len(response_ids),
         "response_logprobs": response_logprobs,
+        "multi_modal_data": media_snapshot or None,
+        "mm_processor_kwargs": mm_processor_kwargs,
         "num_turns": turn_ordinal + 1,
         "metrics": {
             "generate_sequences": generated_seconds,
@@ -140,6 +149,30 @@ def _opd_turn_output_fields(
         },
         "extra_fields": dict(generated.extra_fields or {}),
     }
+
+
+def _close_reply_images(images) -> None:
+    for image in images:
+        with contextlib.suppress(Exception):
+            image.close()
+
+
+def _validate_opd_reply_media(prompt, reply_glue, step) -> None:
+    expected_digests = [*prompt.image_digests, *reply_glue.image_digests]
+    try:
+        returned_count = int(step["image_count"])
+        returned_digests = list(step["image_digests"])
+    except (KeyError, TypeError, ValueError) as error:
+        _close_reply_images(reply_glue.images)
+        raise RuntimeError(
+            "multi-turn OPD bridge returned invalid cumulative media identity"
+        ) from error
+    if returned_count != len(expected_digests) or returned_digests != expected_digests:
+        _close_reply_images(reply_glue.images)
+        raise RuntimeError(
+            "multi-turn OPD bridge returned cumulative media that does not match the decoded "
+            "environment reply"
+        )
 
 
 class _OpdEpisodeSettings:
@@ -181,15 +214,18 @@ async def _opd_run(
     *,
     post_json,
     score_failure_handler,
+    fatal_rollout_exit_code,
+    mark_prompt_failure,
     permanent_teacher_exit: int,
     transient_teacher_exit: int,
     exit_process,
     **kwargs,
 ):
-    raw_prompt = validate_transcript_messages(
-        [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
-    )
-    prompt_ids = await self.apply_chat_template(raw_prompt)
+    # extract media from the original blocks before structured canonicalization, then send that
+    # canonical block view to the bridge so image placement remains authenticated.
+    prompt = await prepare_episode_prompt(self, kwargs["raw_prompt"])
+    raw_prompt = prompt.structured_messages
+    prompt_ids = prompt.prompt_ids
     settings = _OpdEpisodeSettings()
     bridge_url = settings.bridge_url
     bridge_token = settings.bridge_token
@@ -199,7 +235,6 @@ async def _opd_run(
     session_id = f"{uuid4().hex}-{global_step}-{example_index}-{rollout_ordinal}"
     outputs = []
     start_attempted = False
-    failure_exit_code = None
     try:
         start_attempted = True
         start = await run_executor_call(
@@ -213,6 +248,8 @@ async def _opd_run(
                     "session_id": session_id,
                     "prompt_ids": prompt_ids,
                     "raw_prompt": raw_prompt,
+                    "image_count": prompt.image_count(),
+                    "image_digests": list(prompt.image_digests),
                 },
             ),
         )
@@ -223,7 +260,7 @@ async def _opd_run(
             sampling_params,
             outputs,
             settings=settings,
-            prompt_ids=prompt_ids,
+            prompt=prompt,
             session_id=session_id,
             turn_limit=turn_limit,
             global_step=global_step,
@@ -243,14 +280,20 @@ async def _opd_run(
         )
         _attach_teacher_rows(outputs, score_payload)
     except Exception as error:
-        failure_exit_code = (
-            transient_teacher_exit
-            if getattr(error, "classification", None) == "transient"
-            else permanent_teacher_exit
+        failure_exit_code = fatal_rollout_exit_code(error)
+        failure_classification = (
+            "transient" if failure_exit_code == transient_teacher_exit else "permanent"
         )
-    finally:
+        _write_rollout_failure_fallback(error, failure_classification)
+        with contextlib.suppress(BaseException):
+            mark_prompt_failure(
+                str(kwargs["uid"]),
+                "train",
+                global_step,
+                "failure",
+            )
         if start_attempted:
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(BaseException):
                 await run_executor_call(
                     self.loop,
                     lambda: post_json(
@@ -260,9 +303,19 @@ async def _opd_run(
                         {"session_id": session_id},
                     ),
                 )
-    if failure_exit_code is not None:
         exit_process(failure_exit_code)
-        raise AssertionError("multi-turn OPD process exit returned unexpectedly")
+        raise AssertionError("multi-turn OPD process exit returned unexpectedly") from error
+    if start_attempted:
+        with contextlib.suppress(Exception):
+            await run_executor_call(
+                self.loop,
+                lambda: post_json(
+                    bridge_url,
+                    bridge_token,
+                    "/multiturn/close",
+                    {"session_id": session_id},
+                ),
+            )
     return outputs
 
 
@@ -272,7 +325,7 @@ async def _opd_run_turns(
     outputs: list,
     *,
     settings,
-    prompt_ids,
+    prompt,
     session_id: str,
     turn_limit: int,
     global_step: int,
@@ -289,10 +342,10 @@ async def _opd_run_turns(
     max_model_len = settings.max_model_len
     stop_sequences = settings.stop_sequences
     eos_token_ids = settings.eos_token_ids
-    glue_tokenizer = EnvGlueTokenizer(self.tokenizer, thinking=settings.thinking)
+    glue_processor = EnvGlueProcessor(self, thinking=settings.thinking)
     generated_seconds = 0.0
     num_preempted = -1
-    prefix_ids = list(prompt_ids)
+    prefix_ids = list(prompt.prompt_ids)
     for turn_ordinal in range(turn_limit):
         remaining_context = max_model_len - len(prefix_ids)
         if remaining_context <= 0:
@@ -315,11 +368,20 @@ async def _opd_run_turns(
             stop_sequences=stop_sequences,
             eos_token_ids=eos_token_ids,
         )
+        accepted_prefix = list(prefix_ids)
+        accepted_image_count = prompt.image_count()
+        accepted_image_digests = list(prompt.image_digests)
+        turn_media_snapshot = prompt.media_snapshot()
         request_started = time.perf_counter()
+        # every turn receives an immutable view of the exact cumulative media in its prefix.
         generated = await self.server_manager.generate(
             request_id=uuid4().hex,
             prompt_ids=prefix_ids,
             sampling_params=params,
+            image_data=list(prompt.images) or None,
+            video_data=list(prompt.videos) or None,
+            audio_data=list(prompt.audios) or None,
+            mm_processor_kwargs=prompt.mm_processor_kwargs,
         )
         generated_seconds += time.perf_counter() - request_started
         num_preempted = sum_preemptions(num_preempted, generated.num_preempted)
@@ -337,7 +399,7 @@ async def _opd_run_turns(
             response_logprobs = list(response_logprobs[: len(response_ids)])
         step = await run_executor_call(
             self.loop,
-            lambda turn_ordinal=turn_ordinal, prefix_ids=list(prefix_ids), turn=dict(turn): (
+            lambda turn_ordinal=turn_ordinal, accepted_prefix=accepted_prefix, accepted_image_count=accepted_image_count, accepted_image_digests=accepted_image_digests, turn=dict(turn): (
                 post_json(
                     bridge_url,
                     bridge_token,
@@ -345,7 +407,9 @@ async def _opd_run_turns(
                     {
                         "session_id": session_id,
                         "turn_ordinal": turn_ordinal,
-                        "accepted_prefix": prefix_ids,
+                        "accepted_prefix": accepted_prefix,
+                        "image_count": accepted_image_count,
+                        "image_digests": accepted_image_digests,
                         "raw_response_ids": turn["raw_response_ids"],
                         "response_ids": turn["response_ids"],
                         "completion_text": turn["completion_text"],
@@ -368,21 +432,27 @@ async def _opd_run_turns(
                     turn_ordinal=turn_ordinal,
                     generated_seconds=generated_seconds,
                     num_preempted=num_preempted,
+                    media_snapshot=turn_media_snapshot,
+                    mm_processor_kwargs=prompt.mm_processor_kwargs,
                 )
             )
         )
         if turn["truncated"] or turn["skip_reason"] or step["terminal"]:
             break
         prefix_ids.extend(response_ids)
-        env_messages = validate_transcript_messages(step["messages"], source="environment reply")
+        env_messages = step["messages"]
         if not env_messages:
             break
-        glue_ids = dedup_seam_terminator(response_ids, glue_tokenizer(env_messages))
+        reply_glue = await glue_processor(env_messages, step.get("image_data_uris"))
+        _validate_opd_reply_media(prompt, reply_glue, step)
+        glue_ids = dedup_seam_terminator(response_ids, reply_glue.token_ids)
         # stop while at least a minimal generation window remains: gluing right up to
         # max_model_len leaves the next turn zero tokens to generate (the engine would
         # immediately truncate), so reserve a small slack for the next model turn.
         if len(prefix_ids) + len(glue_ids) + 8 > max_model_len:
+            _close_reply_images(reply_glue.images)
             break
+        prompt.append_images(reply_glue.images, reply_glue.image_digests)
         prefix_ids.extend(glue_ids)
 
 
@@ -393,6 +463,8 @@ def build_flash_multi_turn_agent_loop(
     agent_loop_output,
     post_json,
     score_failure_handler,
+    fatal_rollout_exit_code,
+    mark_prompt_failure,
     deterministic_seed,
     permanent_teacher_exit: int = 86,
     transient_teacher_exit: int = 87,
@@ -411,6 +483,10 @@ def build_flash_multi_turn_agent_loop(
                     if getattr(error, "classification", None) == "transient"
                     else permanent_teacher_exit
                 )
+                failure_classification = (
+                    "transient" if exit_code == transient_teacher_exit else "permanent"
+                )
+                _write_rollout_failure_fallback(error, failure_classification)
                 exit_process(exit_code)
                 raise AssertionError("multi-turn OPD process exit returned unexpectedly") from error
 
@@ -420,6 +496,8 @@ def build_flash_multi_turn_agent_loop(
                 sampling_params,
                 post_json=post_json,
                 score_failure_handler=score_failure_handler,
+                fatal_rollout_exit_code=fatal_rollout_exit_code,
+                mark_prompt_failure=mark_prompt_failure,
                 permanent_teacher_exit=permanent_teacher_exit,
                 transient_teacher_exit=transient_teacher_exit,
                 exit_process=exit_process,
@@ -432,7 +510,7 @@ def build_flash_multi_turn_agent_loop(
             outputs: list,
             *,
             settings,
-            prompt_ids,
+            prompt,
             session_id: str,
             turn_limit: int,
             global_step: int,
@@ -450,7 +528,7 @@ def build_flash_multi_turn_agent_loop(
                 sampling_params,
                 outputs,
                 settings=settings,
-                prompt_ids=prompt_ids,
+                prompt=prompt,
                 session_id=session_id,
                 turn_limit=turn_limit,
                 global_step=global_step,

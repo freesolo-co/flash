@@ -81,7 +81,7 @@ class RunpodProvider:
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
-        code_prefix: str | None = None,
+        source_snapshot: dict | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
         from flash.core.spec import require_matching_seed
@@ -93,7 +93,7 @@ class RunpodProvider:
             "on_handle": on_handle,
             "attempt": attempt,
             "on_last_gpu": on_last_gpu,
-            "code_prefix": code_prefix,
+            "source_snapshot": source_snapshot,
             **deadline_kwargs(submit_run, _deadline_at),
         }
         if runtime_secrets:
@@ -190,8 +190,12 @@ class RunpodProvider:
         from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
 
         strict = RunpodJobHandle.from_dict(handle.to_dict())
-        if not runpod_api.delete_endpoint_for_fingerprint(
-            strict.endpoint_id, strict.key_fingerprint
+        if runpod_api.delete_endpoint_for_fingerprint(strict.endpoint_id, strict.key_fingerprint):
+            return
+
+        if (
+            runpod_api.endpoint_absent_for_fingerprint(strict.endpoint_id, strict.key_fingerprint)
+            is not True
         ):
             raise runpod_api.RunpodApiError(
                 f"runpod delete_endpoint({strict.endpoint_id}) unconfirmed; endpoint may still bill"

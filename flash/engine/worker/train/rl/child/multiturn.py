@@ -17,25 +17,25 @@ import urllib.request
 from typing import Any
 from uuid import uuid4
 
-try:  # inside the verl child, copied in beside this file
+if __name__ == "flash_grpo_multiturn":
     from flash_multiturn_glue import (
-        EnvGlueTokenizer,
+        EnvGlueProcessor,
         dedup_seam_terminator,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         turn_is_unusable,
-        validate_transcript_messages,
     )
-except ImportError:  # in-tree (tests, lint)
+else:
     from flash.engine.worker.train.core.child.glue import (
-        EnvGlueTokenizer,
+        EnvGlueProcessor,
         dedup_seam_terminator,
         prepare_assistant_turn,
+        prepare_episode_prompt,
         run_executor_call,
         sum_preemptions,
         turn_is_unusable,
-        validate_transcript_messages,
     )
 
 # reserve enough room after gluing an environment reply that the next model turn can actually
@@ -45,13 +45,14 @@ except ImportError:  # in-tree (tests, lint)
 _NEXT_TURN_SLACK = 8
 
 
-def post_json(url: str, path: str, payload: dict) -> dict:
-    """post one json request to the parent's multi-turn bridge and return the decoded reply.
+def post_json(url: str, path: str, payload: dict, *, error_style: str = "multi-turn") -> dict:
+    """post one json request to a parent bridge and return the decoded reply.
 
-    Every failure raises because continuing would train on environment state that never completed.
-    Use no request deadline: lock queueing is batch-size dependent; the stall watchdog in
-    ``flash/providers/_lifecycle/poll.py`` bounds genuine wedges.
+    Every failure raises because continuing would train on state that never completed. Use no request
+    deadline: lock queueing is batch-size dependent; the stall watchdog bounds genuine wedges.
     """
+    if error_style not in {"multi-turn", "reward"}:
+        raise ValueError(f"unknown flash bridge error style: {error_style}")
     request = urllib.request.Request(
         url.rstrip("/") + path,
         data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
@@ -62,17 +63,20 @@ def post_json(url: str, path: str, payload: dict) -> dict:
         with urllib.request.urlopen(request) as response:
             body = response.read()
     except urllib.error.HTTPError as error:
-        # decode inside the guard, raise outside it: `suppress(Exception)` around the raise as well
-        # swallowed the detail-bearing RuntimeError it was meant to let through, so the bridge's own
-        # error text ("can't start new thread") could never reach the user and every failure read as
-        # a bare "returned HTTP 400".
+        # decode inside the guard, raise outside it: suppressing the raise itself drops the bridge's
+        # detail and leaves only a bare status code.
         detail = None
         with contextlib.suppress(Exception):
             detail = str(json.loads(error.read().decode("utf-8"))["error"])
-        # 5xx is the bridge failing to serve a valid request (resource exhaustion); 4xx is this
-        # request being rejected. naming which one it was stops a server fault from being read as a
-        # malformed payload.
         fault = "could not serve" if error.code >= 500 else "rejected"
+        if error_style == "reward":
+            if detail:
+                raise RuntimeError(
+                    f"flash reward bridge {fault} the request (HTTP {error.code}): {detail}"
+                ) from error
+            raise RuntimeError(
+                f"flash reward bridge {fault} the request: HTTP {error.code} with no error detail"
+            ) from error
         if detail:
             raise RuntimeError(
                 f"flash multi-turn bridge {fault} {path} (HTTP {error.code}): {detail}"
@@ -81,12 +85,24 @@ def post_json(url: str, path: str, payload: dict) -> dict:
             f"flash multi-turn bridge {fault} {path}: HTTP {error.code} with no error detail"
         ) from error
     except (OSError, http.client.HTTPException) as error:
+        if error_style == "reward":
+            raise RuntimeError(f"flash reward bridge request failed: {error}") from error
         raise RuntimeError(
             f"flash multi-turn bridge transport failed on {path}: {type(error).__name__}"
         ) from error
+    except Exception as error:
+        if error_style == "reward":
+            raise RuntimeError(
+                f"flash reward bridge returned an invalid response: {error}"
+            ) from error
+        raise
     try:
         return json.loads(body.decode("utf-8"))
     except (TypeError, ValueError) as error:
+        if error_style == "reward":
+            raise RuntimeError(
+                f"flash reward bridge returned an invalid response: {error}"
+            ) from error
         raise RuntimeError(f"flash multi-turn bridge returned malformed json for {path}") from error
 
 
@@ -174,41 +190,6 @@ class _EpisodeTranscript:
         self.prefix_ids.extend(glue_ids)
 
 
-class _EpisodePrompt:
-    """the tokenized initial prompt plus the decoded media every generate call must carry.
-
-    an image-bearing prompt tokenizes to placeholder tokens that carry no pixels. both
-    apply_chat_template and every generate call need the decoded media alongside the ids, or the
-    engine sees placeholders it cannot expand and the rollout either dies on a feature/placeholder
-    mismatch or conditions on nothing. text-only prompts yield {}.
-    """
-
-    def __init__(self, multi_modal_data, mm_processor_kwargs, prompt_ids):
-        self.multi_modal_data = multi_modal_data
-        self.mm_processor_kwargs = mm_processor_kwargs
-        self.prompt_ids = prompt_ids
-        self.images = multi_modal_data.get("images")
-        self.videos = multi_modal_data.get("videos")
-        self.audios = multi_modal_data.get("audios")
-
-
-async def _prepare_episode_prompt(loop_self, raw_prompt) -> _EpisodePrompt:
-    """decode the prompt's media and apply the chat template, in that order."""
-    multi_modal_data = await loop_self.process_multi_modal_info(raw_prompt)
-    images = multi_modal_data.get("images")
-    videos = multi_modal_data.get("videos")
-    audios = multi_modal_data.get("audios")
-    mm_processor_kwargs = loop_self._get_mm_processor_kwargs(audios)
-    prompt_ids = await loop_self.apply_chat_template(
-        raw_prompt,
-        images=images,
-        videos=videos,
-        audios=audios,
-        mm_processor_kwargs=mm_processor_kwargs,
-    )
-    return _EpisodePrompt(multi_modal_data, mm_processor_kwargs, prompt_ids)
-
-
 class _EpisodeSettings:
     """the per-run rollout settings the parent hands the child through the environment.
 
@@ -260,7 +241,7 @@ def _agent_loop_output_fields(prompt, episode, *, reward_score, turn_rewards) ->
         # the training pass re-tokenizes this episode through the processor, so it needs the
         # same media the rollout conditioned on; without it the actor's forward would see
         # placeholders with no pixels behind them.
-        "multi_modal_data": prompt.multi_modal_data or None,
+        "multi_modal_data": prompt.media_snapshot() or None,
         "mm_processor_kwargs": prompt.mm_processor_kwargs,
         "num_turns": episode.turn_count,
         # reward_score is authoritative: verl copies it to rm_scores and skips
@@ -306,6 +287,133 @@ def _episode_turn_rewards(score_payload, turn_spans):
     return None
 
 
+async def _score_episode(self, bridge_post, bridge_url, session_id, episode, identity):
+    score_payload = await run_executor_call(
+        self.loop,
+        lambda: bridge_post(
+            bridge_url,
+            "/multiturn/score",
+            # use the turns the env was told about, not generated turns: an aborted turn is never
+            # recorded into env state, so the env cannot return a reward for it.
+            {
+                "session_id": session_id,
+                "turn_count": len(episode.turn_spans),
+                "identity": dict(identity),
+            },
+        ),
+    )
+    return float(score_payload["score"]), _episode_turn_rewards(score_payload, episode.turn_spans)
+
+
+def _close_reply_images(images) -> None:
+    for image in images:
+        with contextlib.suppress(Exception):
+            image.close()
+
+
+def _validate_grpo_reply_media(prompt, reply_glue, step) -> None:
+    expected_digests = [*prompt.image_digests, *reply_glue.image_digests]
+    try:
+        returned_count = int(step["image_count"])
+        returned_digests = list(step["image_digests"])
+    except (KeyError, TypeError, ValueError) as error:
+        _close_reply_images(reply_glue.images)
+        raise RuntimeError(
+            "flash multi-turn bridge returned invalid cumulative media identity"
+        ) from error
+    if returned_count != len(expected_digests) or returned_digests != expected_digests:
+        _close_reply_images(reply_glue.images)
+        raise RuntimeError(
+            "flash multi-turn bridge returned cumulative media that does not match the decoded "
+            "environment reply"
+        )
+
+
+async def _grpo_run_turns(
+    self,
+    sampling_params: dict[str, Any],
+    *,
+    prompt,
+    episode,
+    settings,
+    session_id: str,
+    glue_processor,
+    bridge_post,
+    turn_limit: int,
+) -> None:
+    max_completion_tokens = settings.max_completion_tokens
+    for turn_ordinal in range(turn_limit):
+        max_tokens = episode.turn_budget(max_completion_tokens)
+        if max_tokens <= 0:
+            break
+        params = _turn_sampling_params(
+            sampling_params,
+            max_tokens=max_tokens,
+            stop_sequences=settings.stop_sequences,
+            eos_token_ids=settings.eos_token_ids,
+        )
+        accepted_prefix = list(episode.prefix_ids)
+        accepted_image_count = prompt.image_count()
+        accepted_image_digests = list(prompt.image_digests)
+        request_started = time.perf_counter()
+        # every generation receives the exact cumulative media authenticated with its prefix.
+        generated = await self.server_manager.generate(
+            request_id=uuid4().hex,
+            prompt_ids=episode.prefix_ids,
+            sampling_params=params,
+            image_data=list(prompt.images) or None,
+            video_data=list(prompt.videos) or None,
+            audio_data=list(prompt.audios) or None,
+            mm_processor_kwargs=prompt.mm_processor_kwargs,
+        )
+        episode.generated_seconds += time.perf_counter() - request_started
+        episode.num_preempted = sum_preemptions(episode.num_preempted, generated.num_preempted)
+        turn = prepare_assistant_turn(
+            self.tokenizer,
+            generated.token_ids,
+            stop_reason=generated.stop_reason,
+            max_tokens=max_tokens,
+            eos_token_ids=settings.eos_token_ids,
+            stop_sequences=settings.stop_sequences,
+        )
+        turn_ids = turn["response_ids"]
+        episode.append_model_turn(turn, generated.log_probs)
+        episode.turn_count = turn_ordinal + 1
+        step = await run_executor_call(
+            self.loop,
+            lambda turn_ordinal=turn_ordinal, turn=dict(turn), accepted_prefix=accepted_prefix, accepted_image_count=accepted_image_count, accepted_image_digests=accepted_image_digests: (
+                bridge_post(
+                    settings.bridge_url,
+                    "/multiturn/step",
+                    {
+                        "session_id": session_id,
+                        "turn_ordinal": turn_ordinal,
+                        "accepted_prefix": accepted_prefix,
+                        "response_ids": turn["response_ids"],
+                        "completion_text": turn["completion_text"],
+                        "truncated": turn["truncated"],
+                        "skip_reason": turn["skip_reason"],
+                        "image_count": accepted_image_count,
+                        "image_digests": accepted_image_digests,
+                    },
+                )
+            ),
+        )
+        if turn["truncated"] or turn["skip_reason"] or step["terminal"]:
+            break
+        env_messages = step["messages"]
+        if not env_messages:
+            break
+        reply_glue = await glue_processor(env_messages, step.get("image_data_uris"))
+        _validate_grpo_reply_media(prompt, reply_glue, step)
+        glue_ids = dedup_seam_terminator(turn_ids, reply_glue.token_ids)
+        if not episode.glue_fits(glue_ids):
+            _close_reply_images(reply_glue.images)
+            break
+        prompt.append_images(reply_glue.images, reply_glue.image_digests)
+        episode.append_environment_glue(glue_ids)
+
+
 async def _grpo_run(
     self,
     sampling_params: dict[str, Any],
@@ -314,19 +422,16 @@ async def _grpo_run(
     agent_loop_output,
     **kwargs,
 ):
-    raw_prompt = validate_transcript_messages(
-        [dict(message) for message in kwargs["raw_prompt"]], source="initial prompt"
-    )
-    prompt = await _prepare_episode_prompt(self, raw_prompt)
+    prompt = await prepare_episode_prompt(self, kwargs["raw_prompt"])
     prompt_ids = prompt.prompt_ids
-    mm_processor_kwargs = prompt.mm_processor_kwargs
     settings = _EpisodeSettings()
     bridge_url = settings.bridge_url
-    max_completion_tokens = settings.max_completion_tokens
-    stop_sequences = settings.stop_sequences
-    eos_token_ids = settings.eos_token_ids
     example_index = int(kwargs["index"])
-    glue_tokenizer = EnvGlueTokenizer(self.tokenizer, thinking=settings.thinking)
+    identity = kwargs.get("flash_rollout_identity")
+    if not isinstance(identity, dict):
+        raise RuntimeError("flash multi-turn rollout is missing its completion identity")
+    identity = dict(identity)
+    glue_processor = EnvGlueProcessor(self, thinking=settings.thinking)
     session_id = uuid4().hex
 
     # the response tensor's width. the whole EPISODE has to fit in it, not just one turn:
@@ -348,91 +453,31 @@ async def _grpo_run(
                 {
                     "index": example_index,
                     "session_id": session_id,
+                    "raw_prompt": prompt.structured_messages,
                     "prompt_ids": prompt_ids,
+                    "identity": dict(identity),
+                    "image_count": prompt.image_count(),
+                    "image_digests": list(prompt.image_digests),
                 },
             ),
         )
         turn_limit = int(start["max_turns"])
         if turn_limit <= 0 or turn_limit > settings.max_turns:
             raise RuntimeError("flash multi-turn bridge returned an invalid per-example turn limit")
-        for turn_ordinal in range(turn_limit):
-            max_tokens = episode.turn_budget(max_completion_tokens)
-            if max_tokens <= 0:
-                break
-            params = _turn_sampling_params(
-                sampling_params,
-                max_tokens=max_tokens,
-                stop_sequences=stop_sequences,
-                eos_token_ids=eos_token_ids,
-            )
-            request_started = time.perf_counter()
-            # the media rides along on EVERY turn, not just the first: each turn re-sends the
-            # whole prefix, whose placeholder tokens still need their pixels to expand.
-            generated = await self.server_manager.generate(
-                request_id=uuid4().hex,
-                prompt_ids=episode.prefix_ids,
-                sampling_params=params,
-                image_data=prompt.images,
-                video_data=prompt.videos,
-                audio_data=prompt.audios,
-                mm_processor_kwargs=mm_processor_kwargs,
-            )
-            episode.generated_seconds += time.perf_counter() - request_started
-            episode.num_preempted = sum_preemptions(episode.num_preempted, generated.num_preempted)
-            turn = prepare_assistant_turn(
-                self.tokenizer,
-                generated.token_ids,
-                stop_reason=generated.stop_reason,
-                max_tokens=max_tokens,
-                eos_token_ids=eos_token_ids,
-                stop_sequences=stop_sequences,
-            )
-            turn_ids = turn["response_ids"]
-            episode.append_model_turn(turn, generated.log_probs)
-            episode.turn_count = turn_ordinal + 1
-            step = await run_executor_call(
-                self.loop,
-                lambda turn_ordinal=turn_ordinal, turn=dict(turn): bridge_post(
-                    bridge_url,
-                    "/multiturn/step",
-                    {
-                        "session_id": session_id,
-                        "turn_ordinal": turn_ordinal,
-                        "completion_text": turn["completion_text"],
-                        "truncated": turn["truncated"],
-                        "skip_reason": turn["skip_reason"],
-                    },
-                ),
-            )
-            # a truncated or unusable turn ends the episode: a model that could not finish
-            # its turn cannot meaningfully answer an environment reply, and the bridge has
-            # marked the session terminal for the same reason. matches trl's driver, which
-            # breaks out of the turn loop on the same conditions.
-            if turn["truncated"] or turn["skip_reason"] or step["terminal"]:
-                break
-            env_messages = validate_transcript_messages(
-                step["messages"], source="environment reply"
-            )
-            if not env_messages:
-                break
-            glue_ids = dedup_seam_terminator(turn_ids, glue_tokenizer(env_messages))
-            if not episode.glue_fits(glue_ids):
-                break
-            episode.append_environment_glue(glue_ids)
-        score_payload = await run_executor_call(
-            self.loop,
-            lambda: bridge_post(
-                bridge_url,
-                "/multiturn/score",
-                # the count the ENV was told about, not `turn_count`: an aborted turn is
-                # generated (and counted in num_turns) but never recorded into env state,
-                # so asking for a reward per generated turn would request one the env has
-                # no turn for. len(turn_spans) is the same quantity trl scores on.
-                {"session_id": session_id, "turn_count": len(episode.turn_spans)},
-            ),
+        await _grpo_run_turns(
+            self,
+            sampling_params,
+            prompt=prompt,
+            episode=episode,
+            settings=settings,
+            session_id=session_id,
+            glue_processor=glue_processor,
+            bridge_post=bridge_post,
+            turn_limit=turn_limit,
         )
-        reward_score = float(score_payload["score"])
-        turn_rewards = _episode_turn_rewards(score_payload, episode.turn_spans)
+        reward_score, turn_rewards = await _score_episode(
+            self, bridge_post, bridge_url, session_id, episode, identity
+        )
     finally:
         if start_attempted:
             # best effort: a failing close would mask the real error from the body above,

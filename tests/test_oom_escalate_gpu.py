@@ -12,7 +12,7 @@ import pytest
 def _cuda_untouched(monkeypatch):
     """Assert the boot condition unless a test says otherwise: no CUDA context in this process.
 
-    `preflight_free_vram` declines to run once one exists, so without this every occupancy assertion
+    `preflight_gpu_occupancy` declines to run once one exists, so without this every occupancy assertion
     below would pass for the wrong reason -- silently, and identically on a CI box with no torch and
     a developer box with a live one.
     """
@@ -503,7 +503,7 @@ def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
         "job_status",
         lambda _eid, _jid, **_kw: {"status": "FAILED", "error": "x"},
     )
-    handle = jobs.JobHandle("ep", "name", "rpk-0123456789ab", "job", 2, 1.0)
+    handle = jobs.JobHandle("ep", "name", "rpk-" + "0" * 64, "job", 2, 1.0)
 
     res = jobs.poll_job(
         handle,
@@ -548,9 +548,9 @@ def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
     import flash.engine.worker as worker
     from flash.engine.worker.perf import lifecycle as lc
 
-    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (3.4, 22.5))
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: (3.4, 22.5))
     with pytest.raises(lc.DirtyGpuError) as excinfo:
-        lc.preflight_free_vram()
+        lc.preflight_gpu_occupancy(1)
 
     assert "19.1 GB of 22.5 GB (85%) already in use before this run has touched it" in str(
         excinfo.value
@@ -558,6 +558,103 @@ def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
     # the whole point: infra retry, NOT an oom escalation onto a bigger (equally dirty) card.
     monkeypatch.setattr(worker, "is_cuda_oom", lambda _exc: False)
     assert worker._worker_failure_flags(excinfo.value) == {"retriable": True, "oom": False}
+
+
+def _install_nvml_memory_stub(monkeypatch, readings):
+    import sys
+
+    queried = []
+    pynvml = types.ModuleType("pynvml")
+    pynvml.nvmlInit = lambda: None
+    pynvml.nvmlShutdown = lambda: None
+
+    def _handle(device_index):
+        queried.append(device_index)
+        if readings[device_index] is None:
+            raise RuntimeError("unreadable device")
+        return device_index
+
+    def _memory(device_index):
+        free_gb, total_gb = readings[device_index]
+        return types.SimpleNamespace(free=int(free_gb * 1024**3), total=int(total_gb * 1024**3))
+
+    pynvml.nvmlDeviceGetHandleByIndex = _handle
+    pynvml.nvmlDeviceGetMemoryInfo = _memory
+    monkeypatch.setitem(sys.modules, "pynvml", pynvml)
+    return queried
+
+
+def test_clean_gpu0_dirty_gpu1_is_rejected(monkeypatch):
+    import flash.engine.worker as worker
+    from flash.engine.worker.perf import lifecycle as lc
+
+    queried = _install_nvml_memory_stub(monkeypatch, {0: (22.1, 22.5), 1: (3.4, 22.5)})
+    with pytest.raises(lc.DirtyGpuError, match="GPU device 1") as excinfo:
+        lc.preflight_gpu_occupancy(2)
+
+    assert queried == [0, 1]
+    assert worker._worker_failure_flags(excinfo.value) == {"retriable": True, "oom": False}
+
+
+def test_unreadable_gpu0_does_not_hide_dirty_gpu1(monkeypatch):
+    from flash.engine.worker.perf import lifecycle as lc
+
+    queried = _install_nvml_memory_stub(monkeypatch, {0: None, 1: (3.4, 22.5)})
+    with pytest.raises(lc.DirtyGpuError, match="GPU device 1"):
+        lc.preflight_gpu_occupancy(2)
+
+    assert queried == [0, 1]
+
+
+def test_invalid_gpu0_does_not_hide_dirty_gpu1(monkeypatch):
+    from flash.engine.worker.perf import lifecycle as lc
+
+    queried = _install_nvml_memory_stub(monkeypatch, {0: (0.0, 0.0), 1: (3.4, 22.5)})
+    with pytest.raises(lc.DirtyGpuError, match="GPU device 1"):
+        lc.preflight_gpu_occupancy(2)
+
+    assert queried == [0, 1]
+
+
+def test_resolved_count_bounds_gpu_enumeration(monkeypatch):
+    import flash.engine.worker as worker
+    from flash.engine.worker.perf import lifecycle as lc
+
+    queried = _install_nvml_memory_stub(
+        monkeypatch,
+        {
+            0: (3.4, 22.5),
+            1: (22.1, 22.5),
+            2: (22.1, 22.5),
+            3: (22.1, 22.5),
+        },
+    )
+    monkeypatch.setattr(
+        worker, "JOB_SPEC", types.SimpleNamespace(gpu=types.SimpleNamespace(count=2))
+    )
+    with pytest.raises(lc.DirtyGpuError, match="GPU device 0"):
+        worker._preflight_gpu_occupancy_for_spec()
+
+    assert queried == [0, 1]
+
+
+def test_sub_five_percent_occupancy_is_an_explicit_limit(monkeypatch):
+    """This boundary is best-effort occupancy screening, not proof that the run fits."""
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: (21.5, 22.5))
+    lc.preflight_gpu_occupancy(1)
+
+
+def test_five_percent_boundary_is_accepted_and_above_is_rejected(monkeypatch):
+    from flash.engine.worker.perf import lifecycle as lc
+
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: (19.0, 20.0))
+    lc.preflight_gpu_occupancy(1)
+
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: (18.999, 20.0))
+    with pytest.raises(lc.DirtyGpuError, match="GPU device 0"):
+        lc.preflight_gpu_occupancy(1)
 
 
 @pytest.mark.parametrize(
@@ -569,30 +666,28 @@ def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
     ],
 )
 def test_preflight_accepts_a_card_nobody_else_is_using(monkeypatch, free_gb, total_gb):
-    """The gate catches a grossly occupied card and nothing else.
+    """The occupancy screen accepts empty cards and expected driver reserve.
 
-    It measures occupancy, so it has no opinion about whether the run FITS -- that is the
-    allocator's call and it already made it at submit. Re-litigating fit here would reject clean
-    cards two ways: a run sized from profile-measured knobs needs far less than its authored spec
-    implies, and a run sized exactly at a catalog tier (24 GB) can never fit a real 4090's usable
-    22.5 GB no matter how empty it is.
+    It has no opinion about whether the run fits. Reconstructing fit here would reject clean cards
+    when profile-measured execution differs from the authored spec or driver-reported usable memory
+    differs from the catalog's nominal tier.
     """
     from flash.engine.worker.perf import lifecycle as lc
 
-    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (free_gb, total_gb))
-    lc.preflight_free_vram()
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: (free_gb, total_gb))
+    lc.preflight_gpu_occupancy(1)
 
 
 def test_preflight_is_inert_when_the_driver_will_not_answer(monkeypatch):
     """No CUDA, or a driver that will not answer, is not evidence of a dirty card."""
     from flash.engine.worker.perf import lifecycle as lc
 
-    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: None)
-    lc.preflight_free_vram()
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: None)
+    lc.preflight_gpu_occupancy(1)
 
     # a total of 0 is a nonsense reading, not a 100%-occupied card. dividing by it would raise.
-    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (0.0, 0.0))
-    lc.preflight_free_vram()
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: (0.0, 0.0))
+    lc.preflight_gpu_occupancy(1)
 
 
 def test_the_check_declines_once_this_process_holds_a_cuda_context(monkeypatch):
@@ -610,15 +705,15 @@ def test_the_check_declines_once_this_process_holds_a_cuda_context(monkeypatch):
     """
     from flash.engine.worker.perf import lifecycle as lc
 
-    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (3.4, 22.5))
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: (3.4, 22.5))
     monkeypatch.setattr(lc, "cuda_is_initialized", lambda: True)
-    lc.preflight_free_vram()  # no raise: the reading would include our own context
+    lc.preflight_gpu_occupancy(1)  # no raise: the reading would include our own context
 
 
 def test_boot_reads_the_card_before_anything_initializes_cuda():
     """The check must run before `_force_fla_triton_gdn_on_sm100`, which creates a context.
 
-    That function calls `torch.cuda.get_device_capability`, and from that moment `preflight_free_vram`
+    That function calls `torch.cuda.get_device_capability`, and from that moment `preflight_gpu_occupancy`
     correctly declines to judge the card -- so ordering it after would not weaken the check, it would
     silently disable it. Asserted on the source because the alternative is booting a worker.
     """
@@ -626,28 +721,26 @@ def test_boot_reads_the_card_before_anything_initializes_cuda():
 
     import flash.engine.worker as worker
 
-    # the boot function specifically, not the module: at module scope the DEFINITION of
-    # `_preflight_free_vram_for_spec` precedes everything, so the ordering assertion would hold no
+    # the boot function specifically, not the module: at module scope the definition of
+    # `_preflight_gpu_occupancy_for_spec` precedes everything, so the ordering assertion would hold no
     # matter how the calls were arranged and the test would pass while the check was disabled.
     body = inspect.getsource(worker._run_worker_mode)
-    preflight = body.index("_preflight_free_vram_for_spec()")
+    preflight = body.index("_preflight_gpu_occupancy_for_spec()")
     forcer = body.index("_force_fla_triton_gdn_on_sm100()")
     assert preflight < forcer, "the occupancy read must precede the first CUDA context"
 
 
 def test_a_small_co_tenant_that_still_breaks_a_close_fitting_run_is_refused(monkeypatch):
-    """A tenant does not have to be large to be fatal, so the threshold cannot be sized to a run.
+    """A 5 GB co-tenant is above the fixed occupancy boundary and must be rejected.
 
-    5 GB held on a 22.5 GB card leaves 17.5 GB, which OOMs a 20 GB run -- exactly the delayed OOM
-    this exists to prevent -- while being only 22% occupancy. Any threshold loose enough to call
-    that acceptable is implicitly asserting what the run needs, which is the sizing model this
-    check refuses to own. Refusing every card with a stranger on it needs no such assertion.
+    The case demonstrates useful protection for a close-fitting run without claiming that the
+    screen detects every co-tenant or proves exact fit. Occupancy at or below 5% remains accepted.
     """
     from flash.engine.worker.perf import lifecycle as lc
 
-    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (17.5, 22.5))
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: (17.5, 22.5))
     with pytest.raises(lc.DirtyGpuError):
-        lc.preflight_free_vram()
+        lc.preflight_gpu_occupancy(1)
 
 
 def test_cuda_is_initialized_is_false_before_any_cuda_call(monkeypatch):
@@ -693,15 +786,15 @@ def test_preflight_never_re_derives_what_the_run_needs(monkeypatch):
     rented for and rejects the instance the allocator correctly picked.
     """
     import flash.providers.allocator as allocator
-    from flash.engine.worker import _preflight_free_vram_for_spec
+    from flash.engine.worker import _preflight_gpu_occupancy_for_spec
     from flash.engine.worker.perf import lifecycle as lc
 
     def _fail(*_a, **_k):
-        raise AssertionError("the free-vram preflight must not re-size the run")
+        raise AssertionError("the occupancy preflight must not re-size the run")
 
     monkeypatch.setattr(allocator, "required_vram_gb", _fail)
-    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda: (22.1, 22.5))
-    _preflight_free_vram_for_spec()
+    monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: (22.1, 22.5))
+    _preflight_gpu_occupancy_for_spec()
 
 
 def test_free_vram_reads_nvml_and_never_starts_cuda(monkeypatch):

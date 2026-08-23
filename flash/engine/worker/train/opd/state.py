@@ -28,6 +28,7 @@ class _PromptState:
     prompt_budget: int
     prompts: list[Any]
     dropped_long: int
+    processor: Any = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class _WorkloadState:
     export_root: str
     mutation_failure_path: str
     score_delivery_failure_path: str
+    rollout_failure_path: str
     abandonment_failure_path: str
     resample_failure_path: str
     cycle_commit_failure_path: str
@@ -49,6 +51,7 @@ class _WorkloadState:
     lora_rank: int
     lora_alpha: int
     target_modules: Any
+    exclude_modules: str | None
     warmstart_adapter: str | None
 
 
@@ -78,6 +81,7 @@ class _ChildCallbacks:
     progress: dict[str, Any]
     wandb_link: dict[str, str | None]
     child_tail: Any
+    silence_watchdog: Any
 
 
 @dataclass(frozen=True)

@@ -6,8 +6,9 @@ helper (runs on the CPU runner) does that offload and lands the artifact in ``--
 following ``docker build --build-arg BUILD_KERNEL_CACHE=true`` bakes it into the per-sm image:
 
   1. upload THIS checkout's flash package to a fresh private HF dataset (code/flash), like a worker,
-  2. create a RunPod pod FROM the worker image on a GPU of the target arch (retried past transient
-     capacity rejections); its command base64-decodes docker/bake_pod_entry.py and runs it
+  2. create a RunPod pod FROM the worker image by walking the target arch's secure-cloud GPU types
+     (and retrying the walk past transient capacity rejections); its command base64-decodes
+     docker/bake_pod_entry.py and runs it
      (download code/** -> kernel_warmup -> upload out/),
   3. poll HF for the out/STATUS marker (and pod liveness) until done or the deadline,
   4. download out/ into ``--out`` (build/kernel_cache), terminate the pod, delete the temp dataset.
@@ -29,6 +30,42 @@ import uuid
 
 ARTIFACT_NAMESPACE = "Freesolo-Co"
 
+# ordered secure-cloud gpu types for each baked architecture. the first entry keeps the measured
+# preferred sku; later entries prevent one empty provider pool from leaving the per-sm image stale
+# and forcing ordinary worker starts back through jit. every created pod is still checked against
+# --arch by kernel_warmup before any compilation, so this list cannot silently mislabel a cache.
+GPU_WALK_BY_SM: dict[str, tuple[str, ...]] = {
+    "sm80": (
+        "NVIDIA A100 80GB PCIe",
+        "NVIDIA A100-SXM4-80GB",
+    ),
+    "sm86": (
+        "NVIDIA RTX A6000",
+        "NVIDIA A40",
+        "NVIDIA RTX A5000",
+        "NVIDIA GeForce RTX 3090",
+    ),
+    "sm89": (
+        "NVIDIA L40S",
+        "NVIDIA L40",
+        "NVIDIA RTX 6000 Ada Generation",
+        "NVIDIA GeForce RTX 4090",
+    ),
+    "sm90": (
+        "NVIDIA H200",
+        "NVIDIA H200 NVL",
+        "NVIDIA H100 80GB HBM3",
+        "NVIDIA H100 PCIe",
+        "NVIDIA H100 NVL",
+    ),
+    "sm100": ("NVIDIA B200",),
+    "sm120": (
+        "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "NVIDIA GeForce RTX 5090",
+    ),
+}
+
 # RunPod picks the host at create time, so a create can be rejected simply because the machine it
 # picked has nothing free right now. that is transient placement, not a broken bake: the API takes
 # no "not this machine" hint, but each create is placed again server-side, so retrying is what moves
@@ -42,9 +79,9 @@ CAPACITY_MARKERS = (
     "no longer any instances",
     "no instances available",
 )
-CREATE_ATTEMPTS = 5
-# capacity on a scarce class (Blackwell, A6000) frees up in minutes, not seconds; the last entry
-# repeats for any further attempt. under 10 min of waiting worst case, well inside the 120-min cap.
+CREATE_ROUNDS = 5
+# a round tries every same-sm type before waiting. the last entry repeats for any further round;
+# under 10 min of waiting worst case, well inside the 120-min cap.
 CREATE_BACKOFF_S = (30, 60, 120, 240)
 
 
@@ -88,32 +125,38 @@ def _is_capacity_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in CAPACITY_MARKERS)
 
 
-def _create_pod_with_retry(
+def _create_pod_with_gpu_walk(
     runpod,
     *,
-    attempts: int = CREATE_ATTEMPTS,
+    gpu_type_ids: tuple[str, ...],
+    rounds: int = CREATE_ROUNDS,
     backoff_s: tuple[int, ...] = CREATE_BACKOFF_S,
     **kwargs,
 ):
-    """create_pod, retried past capacity rejections; any other failure raises on the first try."""
+    """walk same-sm gpu types by capacity; any other failure raises on the first try."""
+    if not gpu_type_ids:
+        raise ValueError("gpu walk must contain at least one gpu type")
     last: BaseException | None = None
-    for i in range(attempts):
-        try:
-            return runpod.create_pod(**kwargs)
-        except Exception as e:
-            if not _is_capacity_error(e):
-                raise
-            last = e
-            log(f"create attempt {i + 1}/{attempts} rejected for capacity: {str(e)[:160]}")
-            if i == attempts - 1:
-                break
-            # jitter so the matrix legs (and concurrent runs) do not re-ask in lockstep.
-            delay = backoff_s[min(i, len(backoff_s) - 1)]
-            delay += random.uniform(0, 0.25 * delay)
-            log(f"retrying create in {delay:.0f}s")
-            time.sleep(delay)
+    for round_index in range(rounds):
+        for gpu_type_id in gpu_type_ids:
+            try:
+                log(f"gpu walk round {round_index + 1}/{rounds}: trying {gpu_type_id!r}")
+                pod = runpod.create_pod(gpu_type_id=gpu_type_id, **kwargs)
+                return pod, gpu_type_id
+            except Exception as e:
+                if not _is_capacity_error(e):
+                    raise
+                last = e
+                log(f"{gpu_type_id!r} rejected for capacity: {str(e)[:160]}")
+        if round_index == rounds - 1:
+            break
+        # jitter so the matrix legs and concurrent runs do not re-ask in lockstep.
+        delay = backoff_s[min(round_index, len(backoff_s) - 1)]
+        delay += random.uniform(0, 0.25 * delay)
+        log(f"all {len(gpu_type_ids)} gpu types full; retrying walk in {delay:.0f}s")
+        time.sleep(delay)
     raise RuntimeError(
-        f"no {kwargs.get('gpu_type_id')!r} capacity after {attempts} create attempts"
+        f"no capacity across gpu walk {gpu_type_ids!r} after {rounds} rounds"
     ) from last
 
 
@@ -122,7 +165,10 @@ def main() -> int:
     ap.add_argument("--arch", required=True, help="TORCH_CUDA_ARCH_LIST target, e.g. 9.0")
     ap.add_argument("--sm", required=True, help="sm tag, e.g. sm90 (must match the produced cache)")
     ap.add_argument(
-        "--gpu-type-id", required=True, help="RunPod gpuTypeId, e.g. 'NVIDIA H100 80GB HBM3'"
+        "--gpu-type-id",
+        action="append",
+        default=[],
+        help="override gpu walk with this RunPod gpuTypeId; repeat for multiple ordered choices",
     )
     ap.add_argument("--image", default="ghcr.io/freesolo-co/flash-worker:cu128")
     ap.add_argument("--out", default="build/kernel_cache")
@@ -140,6 +186,10 @@ def main() -> int:
         help="comma-separated host CUDA versions to allow (e.g. 13.0 for Blackwell); empty = any",
     )
     args = ap.parse_args()
+    gpu_type_ids = tuple(args.gpu_type_id) or GPU_WALK_BY_SM.get(args.sm)
+    if not gpu_type_ids:
+        ap.error(f"no default gpu walk for {args.sm!r}; pass --gpu-type-id")
+    allowed_cuda = [v.strip() for v in args.allowed_cuda.split(",") if v.strip()] or None
 
     token = os.environ["HF_TOKEN"]
     import runpod
@@ -153,7 +203,6 @@ def main() -> int:
     suffix = args.run_id or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
     repo = f"{ARTIFACT_NAMESPACE}/kernel-bake-{args.sm}-{suffix}"
     entry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bake_pod_entry.py")
-    allowed_cuda = [v.strip() for v in args.allowed_cuda.split(",") if v.strip()] or None
 
     _upload_flash_code(api, repo, token)
 
@@ -163,11 +212,11 @@ def main() -> int:
     outcome = "error"
     rc = 1
     try:
-        pod = _create_pod_with_retry(
+        pod, gpu_type_id = _create_pod_with_gpu_walk(
             runpod,
+            gpu_type_ids=gpu_type_ids,
             name=f"kernel-bake-{args.sm}-{suffix}",
             image_name=args.image,
-            gpu_type_id=args.gpu_type_id,
             # token-bearing pod (carries HF_TOKEN + private code/cache) -> Secure Cloud only, never a
             # community/peer-provider host.
             cloud_type="SECURE",
@@ -182,7 +231,7 @@ def main() -> int:
             },
         )
         pod_id = pod["id"]
-        log(f"created pod {pod_id} ({args.gpu_type_id}, {args.sm}); polling for out/STATUS")
+        log(f"created pod {pod_id} ({gpu_type_id}, {args.sm}); polling for out/STATUS")
 
         deadline = time.time() + args.deadline_min * 60
         outcome = "timeout"

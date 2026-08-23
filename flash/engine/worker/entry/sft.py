@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import random
 
+from flash.engine.worker.model.chatml_mask import assistant_only_mask
 from flash.engine.worker.model.packing import (
     completion_mask_from_ids,
+    packing_appends_eos,
     tokenize_for_packing,
     untruncated_lengths_for_packing,
 )
@@ -37,7 +39,8 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
 
     Returns ``(kept_texts, pretok, n_dropped)``. Each pretok row also carries
     ``untruncated_length``: its token count BEFORE the cap. The post-slice length can never exceed
-    max_length, so it cannot say whether the cap actually bound; this can.
+    max_length, so it cannot say whether the cap actually bound; this can. It also carries
+    ``assistant_mask_applied``: whether the render was readable enough to mask non-assistant turns.
     """
     full_ids = tokenize_for_packing([t["text"] for t in texts], tokenizer, max_length)
     # the same encode without the cap, so a truncated row reports its real size rather than the cap.
@@ -45,14 +48,27 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
     prompt_ids = tokenizer(
         [t["prompt_text"] for t in texts], truncation=True, max_length=max_length
     )["input_ids"]
-    pretok = [
-        {
-            "input_ids": ids,
-            "completion_mask": completion_mask_from_ids(pids, ids),
-            "untruncated_length": length,
-        }
-        for ids, pids, length in zip(full_ids, prompt_ids, untruncated, strict=True)
-    ]
+    pretok = []
+    for text, ids, pids, length in zip(texts, full_ids, prompt_ids, untruncated, strict=True):
+        mask, role_aware = assistant_only_mask(
+            completion_mask_from_ids(pids, ids),
+            ids,
+            tokenizer,
+            text["target_messages"],
+            # the appended EOS counts only when it SURVIVED the cap: an equal-length row proves the
+            # token that terminates the example is still there to supervise.
+            appended_eos=packing_appends_eos(text["text"], tokenizer) and len(ids) == length,
+            source_messages=text["source_messages"],
+            template_kwargs=text["template_kwargs"],
+        )
+        pretok.append(
+            {
+                "input_ids": ids,
+                "completion_mask": mask,
+                "assistant_mask_applied": role_aware,
+                "untruncated_length": length,
+            }
+        )
     special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
     kept = [
         (t, r)
@@ -135,11 +151,50 @@ def sft_under_ran(final_step: int, update_horizon: int) -> bool:
     return int(final_step) < int(update_horizon)
 
 
-def _reject_image_completion(completion) -> None:
-    from flash.content.multimodal import record_has_images
+def _reject_image_completion(
+    completion,
+    *,
+    image_bearing: bool,
+    source_messages=None,
+    template_source=None,
+    template_kwargs: dict | None = None,
+) -> None:
+    """reject image targets always, and reserved pad tokens only on image-bearing rows.
 
-    if record_has_images({}, completion):
+    the estimator tokenizes an image-bearing prompt and completion as one stream, so a literal
+    image-pad token in any field emitted by the chat template is indistinguishable from a real image
+    block. the rendered field probe covers content and nested tool-call fields without rejecting
+    unrendered metadata. on a text-only row the same registered token is ordinary authored text and
+    retains the normal prompt mask or completion supervision.
+    """
+    from flash.content.multimodal import (
+        IMAGE_PAD_TOKEN,
+        completion_has_images,
+        message_content_text,
+    )
+
+    if completion_has_images(completion):
         raise ValueError("image-bearing SFT completions are not supported")
+    if not image_bearing:
+        return
+    for message in completion or []:
+        if IMAGE_PAD_TOKEN in message_content_text(
+            message.get("content") if isinstance(message, dict) else None
+        ):
+            raise ValueError(
+                f"sft completion text contains the reserved image marker {IMAGE_PAD_TOKEN!r}; "
+                "remove it from the target"
+            )
+    if template_source is not None:
+        from flash.engine.worker.model.chatml_mask import reject_rendered_message_token
+
+        messages = list(source_messages if source_messages is not None else completion or [])
+        reject_rendered_message_token(
+            template_source,
+            messages,
+            IMAGE_PAD_TOKEN,
+            template_kwargs=template_kwargs or {},
+        )
 
 
 def run_sft():

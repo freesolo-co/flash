@@ -47,6 +47,11 @@ def _config(**overrides):
         "base_model_name_or_path": "Qwen/Qwen3.5-4B",
         "r": 16,
         "lora_alpha": 32,
+        # every peft>=0.19 save carries this key, null for a multimodal run, so a config without it
+        # is not a shape any supported writer produces. present here because submit rejects an
+        # unmarked adapter outright: omitting it would make these rank/alpha cases exercise that
+        # rejection instead of what they are about.
+        "exclude_modules": None,
     }
     config.update(overrides)
     return config
@@ -122,14 +127,27 @@ def test_inspection_rejects_incompatible_base_model():
         )
 
 
-def test_inspection_allows_empty_optional_compatibility_fields():
-    metadata = inspect_adapter_config(
-        _config(base_model_name_or_path="", task_type=""),
-        source="adapter",
-        target_model="Qwen/Qwen3.5-4B",
-    )
-    assert metadata.rank == 16
-    assert metadata.alpha == 32
+def test_inspection_requires_the_adapter_to_name_its_base_model():
+    # a blank base model must not read as "no opinion": that made the base-model comparison below
+    # skip itself, so an adapter trained on a DIFFERENT base passed preflight and was inherited
+    # into the run. every flash-published adapter is stamped by the exporter, so a blank value is
+    # an artifact that predates it and must fail loudly rather than silently disable the check.
+    with pytest.raises(ValueError, match="does not name its base model"):
+        inspect_adapter_config(
+            _config(base_model_name_or_path=""),
+            source="adapter",
+            target_model="Qwen/Qwen3.5-4B",
+        )
+
+
+def test_inspection_requires_a_causal_lm_task_type():
+    # same failure direction: a blank task_type skipped the check instead of failing it.
+    with pytest.raises(ValueError, match="task_type must be CAUSAL_LM"):
+        inspect_adapter_config(
+            _config(task_type=""),
+            source="adapter",
+            target_model="Qwen/Qwen3.5-4B",
+        )
 
 
 def test_inspection_requires_alpha_metadata():
@@ -228,7 +246,9 @@ def test_adapter_identity_binds_config_and_weight_metadata(monkeypatch):
                     path="sft/sft-run/adapter/adapter_model.safetensors",
                     blob_id=None,
                     size=123,
-                    lfs={"sha256": state["oid"], "size": 123},
+                    # attribute-style, as `list_repo_tree` really returns it: `RepoFile.__init__`
+                    # builds a `BlobLfsInfo` dataclass, never a mapping.
+                    lfs=SimpleNamespace(sha256=state["oid"], size=123),
                 )
             ]
 
@@ -257,7 +277,7 @@ def test_adapter_identity_digests_decimal_config_values_exactly(monkeypatch):
                     path="sft/sft-run/adapter/adapter_model.safetensors",
                     blob_id=None,
                     size=123,
-                    lfs={"sha256": "sha256:weights-v1", "size": 123},
+                    lfs=SimpleNamespace(sha256="sha256:weights-v1", size=123),
                 )
             ]
 
@@ -309,3 +329,336 @@ def test_lora_rank_uses_schema_adapter_storage_ref_parser():
         "owner/runs",
         "sft/source-run/checkpoints/step-40",
     )
+
+
+_FUSED_MODEL = "Qwen/Qwen3.6-35B-A3B"
+_FUSED_TARGETS = [
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+]
+_MISSING = object()
+
+
+@pytest.mark.parametrize("targets", [_FUSED_TARGETS, list(reversed(_FUSED_TARGETS))])
+def test_fused_expert_config_accepts_exact_target_order_variants(targets):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    validate_fused_expert_adapter_config(
+        {"r": 16, "target_parameters": targets, "target_modules": ["q_proj"]},
+        _FUSED_MODEL,
+    )
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        pytest.param(_MISSING, id="missing"),
+        pytest.param(None, id="null"),
+        pytest.param([], id="empty"),
+        pytest.param("mlp.experts.gate_up_proj", id="string"),
+        pytest.param(["mlp.experts.gate_up_proj"], id="partial"),
+        pytest.param([*_FUSED_TARGETS, "mlp.router"], id="extra"),
+        pytest.param([_FUSED_TARGETS[0], _FUSED_TARGETS[0]], id="duplicate"),
+        pytest.param([_FUSED_TARGETS[0], 7], id="non-string"),
+    ],
+)
+def test_fused_expert_config_rejects_noncanonical_target_parameters(targets):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    config = {"r": 16, "target_modules": ["q_proj"]}
+    if targets is not _MISSING:
+        config["target_parameters"] = targets
+    with pytest.raises(ValueError, match=r"target_parameters|fused expert targets"):
+        validate_fused_expert_adapter_config(config, _FUSED_MODEL)
+
+
+@pytest.mark.parametrize(
+    "modules",
+    [
+        pytest.param("all-linear", id="string"),
+        pytest.param(["q_proj", "v_proj"], id="list"),
+    ],
+)
+def test_fused_expert_config_accepts_supported_target_module_shapes(modules):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    validate_fused_expert_adapter_config(
+        {
+            "r": 16,
+            "target_parameters": list(_FUSED_TARGETS),
+            "target_modules": modules,
+        },
+        _FUSED_MODEL,
+    )
+
+
+@pytest.mark.parametrize(
+    "modules",
+    [
+        pytest.param(_MISSING, id="missing"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_fused_expert_config_rejects_missing_ordinary_targets(modules):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    config = {"r": 16, "target_parameters": list(_FUSED_TARGETS)}
+    if modules is not _MISSING:
+        config["target_modules"] = modules
+    with pytest.raises(ValueError, match="target_modules"):
+        validate_fused_expert_adapter_config(config, _FUSED_MODEL)
+
+
+@pytest.mark.parametrize(
+    "modules",
+    [
+        pytest.param("experts", id="synthetic-string-experts"),
+        pytest.param("base_layer", id="synthetic-string-base-layer"),
+        pytest.param(r".*\.mlp\.experts", id="synthetic-regex"),
+        pytest.param("[", id="invalid-regex"),
+        pytest.param(["q_proj", "experts"], id="synthetic-list-experts"),
+        pytest.param(["base_layer", "q_proj"], id="synthetic-list-base-layer"),
+        pytest.param(["mlp.experts"], id="synthetic-list-owner"),
+        pytest.param(["experts.base_layer"], id="synthetic-list-nested"),
+        pytest.param(["model.layers.0.mlp.experts"], id="synthetic-list-qualified"),
+        pytest.param([], id="empty-list"),
+        pytest.param(["q_proj", ""], id="empty-list-entry"),
+        pytest.param(7, id="integer"),
+        pytest.param({"q_proj"}, id="set"),
+        pytest.param(("q_proj",), id="tuple"),
+        pytest.param(["q_proj", 7], id="non-string-list-entry"),
+    ],
+)
+def test_fused_expert_config_rejects_synthetic_or_malformed_target_modules(modules):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match="target_modules"):
+        validate_fused_expert_adapter_config(
+            {
+                "r": 16,
+                "target_parameters": list(_FUSED_TARGETS),
+                "target_modules": modules,
+            },
+            _FUSED_MODEL,
+        )
+
+
+def test_fused_expert_config_accepts_per_target_rank_patterns_and_scalar_fallback():
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    validate_fused_expert_adapter_config(
+        {
+            "r": 16,
+            "target_parameters": list(_FUSED_TARGETS),
+            "target_modules": ["q_proj"],
+            "rank_pattern": {"mlp.experts.gate_up_proj": 8},
+        },
+        _FUSED_MODEL,
+    )
+
+
+def test_fused_expert_config_accepts_overrides_for_every_declared_target():
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    validate_fused_expert_adapter_config(
+        {
+            "target_parameters": list(_FUSED_TARGETS),
+            "target_modules": ["q_proj", "v_proj"],
+            "rank_pattern": {
+                "mlp.experts.gate_up_proj": 8,
+                "mlp.experts.down_proj": 4,
+                "q_proj": 16,
+                "v_proj": 8,
+            },
+        },
+        _FUSED_MODEL,
+    )
+
+
+@pytest.mark.parametrize(
+    "rank_pattern",
+    [
+        pytest.param([], id="list"),
+        pytest.param("mlp.experts", id="string"),
+        pytest.param({"": 16}, id="empty-pattern"),
+        pytest.param({"mlp.experts": 0}, id="zero-rank"),
+        pytest.param({"mlp.experts": -1}, id="negative-rank"),
+        pytest.param({"mlp.experts": True}, id="bool-rank"),
+        pytest.param({"mlp.experts": 1.5}, id="float-rank"),
+    ],
+)
+def test_fused_expert_config_rejects_malformed_rank_patterns(rank_pattern):
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match="rank_pattern"):
+        validate_fused_expert_adapter_config(
+            {
+                "r": 16,
+                "target_parameters": list(_FUSED_TARGETS),
+                "target_modules": ["q_proj"],
+                "rank_pattern": rank_pattern,
+            },
+            _FUSED_MODEL,
+        )
+
+
+def test_fused_expert_config_rejects_malformed_rank_pattern_regex():
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match="rank_pattern"):
+        validate_fused_expert_adapter_config(
+            {
+                "r": 16,
+                "target_parameters": list(_FUSED_TARGETS),
+                "target_modules": ["q_proj"],
+                "rank_pattern": {"[": 8},
+            },
+            _FUSED_MODEL,
+        )
+
+
+def test_fused_expert_config_rejects_unresolved_fused_target_rank():
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match="no resolved LoRA rank"):
+        validate_fused_expert_adapter_config(
+            {
+                "target_parameters": list(_FUSED_TARGETS),
+                "target_modules": ["q_proj"],
+                "rank_pattern": {"mlp.experts.gate_up_proj": 8},
+            },
+            _FUSED_MODEL,
+        )
+
+
+def test_fused_expert_config_rejects_unresolved_ordinary_target_rank():
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    with pytest.raises(ValueError, match="ordinary target_modules"):
+        validate_fused_expert_adapter_config(
+            {
+                "target_parameters": list(_FUSED_TARGETS),
+                "target_modules": ["q_proj"],
+                "rank_pattern": {
+                    "mlp.experts.gate_up_proj": 8,
+                    "mlp.experts.down_proj": 4,
+                },
+            },
+            _FUSED_MODEL,
+        )
+
+
+def test_fused_expert_config_is_a_noop_for_non_fused_models():
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
+
+    malformed = {"target_parameters": None, "target_modules": {"experts"}}
+    validate_fused_expert_adapter_config(malformed, "Qwen/Qwen3.5-9B")
+
+
+def _patch_fused_submit_preflight(monkeypatch, config, *, reject_config):
+    import flash.adapters.fused_experts as fused_experts
+    import flash.adapters.lora_rank as lora_rank
+    import flash.runner.preparation as preparation
+    import flash.runner.results.checkpoints as checkpoints
+
+    target_spec = _spec(model=_FUSED_MODEL)
+    target_spec = replace(
+        target_spec,
+        train=replace(target_spec.train, init_from_adapter="source-run"),
+    )
+    source_spec = replace(
+        target_spec,
+        train=replace(
+            target_spec.train,
+            init_from_adapter="",
+            hf_repo="owner/runs",
+        ),
+    )
+    status = SimpleNamespace(state="done")
+    runner = SimpleNamespace(
+        get_status=lambda _run_id: status,
+        _warmstart_source_is_authorized=lambda *_args, **_kwargs: True,
+        effective_spec_from_status=lambda _status: source_spec,
+    )
+    events = []
+
+    def load_config(_ref, _token, _revision):
+        events.append(("load", config))
+        return config
+
+    def validate_config(seen, model_id):
+        assert seen is config
+        assert model_id == _FUSED_MODEL
+        events.append(("validate", seen))
+        if reject_config:
+            raise ValueError("invalid fused config")
+
+    def preflight(spec, *, token, config_loader):
+        assert spec.model == _FUSED_MODEL
+        seen = config_loader("unused", token, "unused")
+        assert seen is config
+        events.append(("preflight", seen))
+        return SimpleNamespace(rank=16, alpha=32)
+
+    monkeypatch.setattr(preparation, "_runner", lambda: runner)
+    monkeypatch.setattr(preparation, "_adopted_warmstart_revision", lambda spec, _source: spec)
+    monkeypatch.setattr(checkpoints, "adapter_artifact_exists", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(lora_rank, "resolve_hf_dataset_revision", lambda *_args: "revision")
+    monkeypatch.setattr(lora_rank, "load_hf_adapter_config", load_config)
+    monkeypatch.setattr(lora_rank, "preflight_init_adapter_lora_rank", preflight)
+    monkeypatch.setattr(
+        lora_rank,
+        "adapter_artifact_identity",
+        lambda *_args, **_kwargs: SimpleNamespace(to_dict=dict),
+    )
+    monkeypatch.setattr(fused_experts, "validate_fused_expert_adapter_config", validate_config)
+    return preparation, target_spec, events
+
+
+def test_submit_rejects_fused_config_before_rank_preflight(monkeypatch):
+    config = _config(target_parameters=None)
+    preparation, target_spec, events = _patch_fused_submit_preflight(
+        monkeypatch, config, reject_config=True
+    )
+
+    with pytest.raises(ValueError, match="invalid fused config"):
+        preparation._prepare_init_from_adapter_inner(target_spec)
+
+    assert events == [("load", config), ("validate", config)]
+
+
+def test_submit_rejects_an_unmarked_adapter_before_any_gpu_is_allocated(monkeypatch):
+    """An adapter with no modality marker must fail at submit, not on the rented GPU.
+
+    The marker decides which module surface the run trains, so an unmarked source is unusable by
+    every algorithm -- the answer never depends on anything only the worker knows. The worker still
+    re-checks the bytes it downloads; what this pins is that the control plane, which already holds
+    this exact config, does not defer a decision it can make for free into a paid allocation.
+    """
+    config = _config()
+    del config["exclude_modules"]
+    preparation, target_spec, events = _patch_fused_submit_preflight(
+        monkeypatch, config, reject_config=False
+    )
+
+    with pytest.raises(ValueError, match="required exclude_modules modality marker"):
+        preparation._prepare_init_from_adapter_inner(target_spec)
+
+    # rejected on the loaded config alone: nothing downstream ran, so no later stage can be what
+    # caught it and no allocation could have happened first.
+    assert events == [("load", config)]
+
+
+def test_submit_passes_the_loaded_config_to_validation_then_rank_preflight(monkeypatch):
+    config = _config(target_parameters=list(_FUSED_TARGETS))
+    preparation, target_spec, events = _patch_fused_submit_preflight(
+        monkeypatch, config, reject_config=False
+    )
+
+    preparation._prepare_init_from_adapter_inner(target_spec)
+
+    assert events == [
+        ("load", config),
+        ("validate", config),
+        ("preflight", config),
+    ]

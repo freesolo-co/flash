@@ -114,8 +114,12 @@ def test_runconfig_preserves_old_positional_constructor():
     assert order.index("opd_multi_turn") < order.index("opd_max_turns")
     assert order.index("opd_max_turns") < order.index("sft_retained_examples")
     # anything added later must be APPENDED, never slotted beside a related field: an old positional
-    # caller would silently bind its opd flag to the newcomer rather than fail.
-    assert order[-2:] == ["sft_retained_examples", "providers"], (
+    # caller would silently bind its opd flag to the newcomer rather than fail. asserted as a
+    # PREFIX rather than an exact tail so the guard keeps failing on an insertion while a correctly
+    # appended field does not have to edit it -- the previous exact-tail form failed either way,
+    # which makes the failure uninformative about which mistake was made.
+    appended_so_far = ["sft_retained_examples", "providers", "gpu_type_fallbacks"]
+    assert order[-len(appended_so_far) :] == appended_so_far, (
         "a new RunConfig field must be appended; inserting one shifts every later parameter and "
         "silently reinterprets old positional calls as different quantities"
     )
@@ -320,157 +324,6 @@ def test_quote_preparation_never_calls_live_allocate(monkeypatch):
     assert estimate.gpu == "H100"
 
 
-def test_vast_live_pricing_duration_mirrors_launch(monkeypatch):
-    # The live pricing API remains duration-aware when called explicitly; provisional run quoting no
-    # longer calls it because offer lookup is also a capacity lookup.
-    from flash.cost.facts import gpu_hourly_usd
-    from flash.providers.vast import jobs as vast
-    from flash.providers.vast import pricing
-
-    seen: list[float] = []
-
-    def fake_usable(min_vram_gb, disk_gb, *a, max_wall_seconds=0, **k):
-        seen.append(max_wall_seconds)
-        return []
-
-    monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    monkeypatch.setattr(vast, "usable_offers", fake_usable)
-
-    def market_walls(wall: float) -> set[float]:
-        seen.clear()
-        monkeypatch.setattr(pricing, "_rates_cache", {"ts": 0.0, "data": None})
-        gpu_hourly_usd("H100", provider="vast", max_wall_seconds=wall)
-        return set(seen)
-
-    assert market_walls(0) == {0.0}
-    assert market_walls(7200) == {7200.0}
-
-
-def test_pick_gpu_vast_duration_bound_fetches_market_once(monkeypatch):
-    # Copilot: pick_gpu ranks every fitting class by $/hr. A duration-bound Vast query bypasses the
-    # per-call rate cache, so pricing each candidate individually inside min(key=...) would fire one
-    # identical full market fetch PER fitting class. pick_gpu must fetch the live rate map ONCE and
-    # rank from it -> exactly one usable_offers call no matter how many classes fit.
-    from flash.cost.facts import pick_gpu
-    from flash.providers.vast import jobs as vast
-    from flash.providers.vast import pricing
-
-    calls = {"n": 0}
-
-    def fake_usable(min_vram_gb, disk_gb, *a, max_wall_seconds=0, **k):
-        calls["n"] += 1
-        return []
-
-    monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    monkeypatch.setattr(vast, "usable_offers", fake_usable)
-    monkeypatch.setattr(pricing, "_rates_cache", {"ts": 0.0, "data": None})  # isolate cache
-
-    # A tiny VRAM floor leaves MANY fitting Vast classes -> per-candidate pricing would fetch many times.
-    gpu = pick_gpu(8, provider="vast", max_wall_seconds=7200.0)
-    assert gpu  # a class was chosen
-    assert calls["n"] == 1  # ONE market fetch despite multiple fitting candidates (was N)
-
-
-def test_pick_gpu_vast_skips_classes_without_a_live_offer(monkeypatch):
-    # Codex: ranking via the static-merged map could SELECT and quote a cheaper class (e.g. RTX 4090)
-    # that has NO surviving offer under the wall cap — one the launch-time usable_offers path would
-    # never rent. pick_gpu(provider="vast") must restrict selection to classes that ACTUALLY have a
-    # rentable offer, even when a cheaper class fits and is cheaper on its static (RunPod) rate.
-    from types import SimpleNamespace
-
-    from flash.cost.facts import pick_gpu
-    from flash.providers.vast import jobs as vast
-
-    # The live market has ONLY an A100 SXM offer (a larger/pricier class); the cheaper 24/48 GB classes
-    # fit the 8 GB requirement and are cheaper statically, but have NO surviving offer.
-    def fake_usable(min_vram_gb, disk_gb, *a, max_wall_seconds=0, **k):
-        return [SimpleNamespace(gpu="A100 SXM", dph_total=1.20)]
-
-    monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    monkeypatch.setattr(vast, "usable_offers", fake_usable)
-    gpu = pick_gpu(8, provider="vast", max_wall_seconds=7200.0)
-    assert gpu == "A100 SXM"  # the only class with a rentable offer, NOT the cheaper-static 4090
-
-
-def test_pick_gpu_vast_floors_market_search_at_required_vram(monkeypatch):
-    # Codex: the live Vast offer map for a HIGH-VRAM job must be searched at the job's required VRAM, not
-    # the smallest managed class. The market page is price-sorted + LIMITED, so a small-class floor lets
-    # cheap 24-40 GB offers crowd the 80 GB classes off it -> they'd be omitted and the quote would fall
-    # back to static pricing. pick_gpu must thread required_vram_gb into the search floor (allocator parity).
-    from types import SimpleNamespace
-
-    from flash.cost.facts import pick_gpu
-    from flash.providers.vast import jobs as vast
-
-    seen = {}
-
-    def fake_usable(min_vram_gb, disk_gb, *a, max_wall_seconds=0, **k):
-        seen["floor"] = min_vram_gb
-        return [SimpleNamespace(gpu="A100 SXM", dph_total=1.20)]
-
-    monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    monkeypatch.setattr(vast, "usable_offers", fake_usable)
-    pick_gpu(80, provider="vast", max_wall_seconds=7200.0)
-    # Old behavior floored at the smallest managed class (~24 GB); the fix floors at the required 80 GB.
-    assert seen["floor"] == 80
-
-
-def test_gpu_hourly_usd_vast_floors_rate_at_required_vram(monkeypatch):
-    # Codex 3519040487: pick_gpu floors the market at the required VRAM, but the follow-up RATE lookup
-    # (gpu_hourly_usd -> vast.hourly_rate) used to search from the smallest managed class -> the same
-    # crowd-off, so a high-VRAM selection missed the live map and the quote silently fell back to the
-    # static catalog rate. The rate lookup must thread min_vram_gb too (selection/quote parity), and
-    # then return the LIVE offer rate for the selected class, not the static one.
-    from types import SimpleNamespace
-
-    from flash.cost.facts import gpu_hourly_usd
-    from flash.providers.vast import jobs as vast
-
-    seen = {}
-
-    def fake_usable(min_vram_gb, disk_gb, *a, max_wall_seconds=0, **k):
-        seen["floor"] = min_vram_gb
-        return [SimpleNamespace(gpu="A100 SXM", dph_total=1.20)]
-
-    monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    monkeypatch.setattr(vast, "usable_offers", fake_usable)
-    rate = gpu_hourly_usd("A100 SXM", provider="vast", max_wall_seconds=7200.0, min_vram_gb=80)
-    assert seen["floor"] == 80  # floored at required VRAM, not the smallest managed class
-    assert rate == 1.20  # live offer rate, not the static catalog fallback
-
-
-def test_gpu_hourly_usd_vast_exact_threads_class_constraint(monkeypatch):
-    from types import SimpleNamespace
-
-    from flash.cost.facts import gpu_hourly_usd
-    from flash.providers.vast import jobs as vast
-
-    seen: list[str] = []
-
-    def fake_usable(min_vram_gb, disk_gb, *args, gpu_type="", **kwargs):
-        seen.append(gpu_type)
-        return [SimpleNamespace(gpu="A100 SXM 40GB", dph_total=0.77)]
-
-    monkeypatch.setenv("VAST_API_KEY", "vk-test")
-    monkeypatch.setattr(vast, "usable_offers", fake_usable)
-
-    exact = gpu_hourly_usd(
-        "A100 SXM 40GB",
-        provider="vast",
-        min_vram_gb=40,
-        gpu_type="A100 SXM 40GB",
-    )
-    unconstrained = gpu_hourly_usd(
-        "A100 SXM 40GB",
-        provider="vast",
-        min_vram_gb=40,
-    )
-
-    assert exact == 0.77
-    assert unconstrained == 0.77
-    assert seen == ["A100 SXM 40GB", ""]
-
-
 def test_explicit_vast_quote_stays_offline(monkeypatch):
     from flash.providers.base import get_gpu_info
     from flash.providers.vast import jobs as vast
@@ -511,16 +364,6 @@ def test_a100_sxm_40gb_has_real_tflops_not_default():
     assert gpu_tflops("A100 SXM 40GB") != _DEFAULT_TFLOPS
 
 
-def test_pick_gpu_vast_offline_falls_back_to_static(monkeypatch):
-    # When the market is unreachable (no VAST_API_KEY -> live_offer_rates returns {}), selection must
-    # stay offline-safe: rank ALL fitting classes by their static rate rather than crash or pick nothing.
-    from flash.cost.facts import pick_gpu
-
-    monkeypatch.delenv("VAST_API_KEY", raising=False)
-    gpu = pick_gpu(8, provider="vast")
-    assert gpu  # a fitting class is still chosen from the static fallback
-
-
 def test_selected_live_candidate_overrides_provisional_provider_rate_and_count():
     from flash.providers.base import Candidate
 
@@ -541,12 +384,12 @@ def test_b200_not_cheaper_or_faster_than_h200_for_grpo():
     # regression: the estimator must not advertise b200 as faster/cheaper than h200 on peak flops.
     # b200/sm100 training is h200-class (portable kernels), so at its higher $/hr b200 must never
     # come out cheaper, and never faster, than h200 for the same run.
-    from flash.cost.facts import gpu_hourly_usd
+    from flash.providers.base import GPU_INFO
 
     h200 = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, gpu_type="H200"))
     b200 = estimate_cost(RunConfig("Qwen/Qwen3.5-4B", "grpo", 100, gpu_type="B200"))
 
-    assert gpu_hourly_usd("B200") > gpu_hourly_usd("H200")  # b200 is the pricier card
+    assert GPU_INFO["B200"].hourly_usd > GPU_INFO["H200"].hourly_usd
     # same effective training throughput => b200 is no faster than h200 ...
     assert b200.seconds_per_step == pytest.approx(h200.seconds_per_step)
     assert b200.train_seconds == pytest.approx(h200.train_seconds)
@@ -595,8 +438,8 @@ def test_offline_unpinned_estimate_does_not_bill_the_ceiling():
     assert not any("wall cap" in note for note in single.notes)
     assert single.gpu_count == 1
     assert wide.gpu_count == 1
-    # pick_gpu returns a class that fits the whole run alone, so an offline estimate has no basis for
-    # charging the ceiling. server-side submit uses allocate() and records the selected count instead.
+    # offline selection returns a class that fits the whole run alone, so the estimate has no basis
+    # for charging the ceiling. server-side submit uses allocate() and records the selected count.
     assert wide.gpu_hourly_usd == single.gpu_hourly_usd
     assert wide.train_seconds == pytest.approx(single.train_seconds)
     assert wide.total_usd == pytest.approx(single.total_usd)

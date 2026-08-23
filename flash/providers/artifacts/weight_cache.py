@@ -36,7 +36,6 @@ from flash.providers.runpod import api as runpod_api  # noqa: F401
 # half reads them back through it. an autofix that drops them as unused breaks those tests.
 from flash.providers.runpod.jobs import (  # noqa: F401
     GraceTimer,
-    build_function_input,
     decode_output,
     deploy_train_endpoint,
     weight_cache_datacenters,
@@ -203,7 +202,10 @@ def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
             "model": "Qwen/Qwen3.5-0.8B",
             "algorithm": "sft",
             "run_id": run_id,
-            "train": {"hf_repo": _preload_status_repo()},
+            "train": {
+                "hf_repo": _preload_status_repo(),
+                "credit_assignment": "per_episode",
+            },
             "gpu": {
                 "type": gpu,
                 "max_wall_seconds": max(60, int(wall_s)),

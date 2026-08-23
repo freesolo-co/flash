@@ -356,6 +356,83 @@ def test_heartbeat_omits_progress_age_before_first_progress(monkeypatch):
     assert ne._HB_LAST_PROGRESS_TS == 0.0
 
 
+def test_heartbeat_console_marks_commit_state_and_bounds_payload():
+    import json
+
+    from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
+
+    payload = {
+        "stage": "rl_step",
+        "step": 3,
+        "metrics_last": [{}] * 8,
+        "sampled_completions": ["private"] * 4,
+    }
+    committed = json.loads(_console_heartbeat_snapshot(payload))
+    pending = json.loads(_console_heartbeat_snapshot(payload, False, True))
+    throttled = json.loads(_console_heartbeat_snapshot(payload, False, False))
+
+    for snapshot in (committed, pending, throttled):
+        assert "metrics_last" not in snapshot
+        assert "sampled_completions" not in snapshot
+        assert snapshot["metrics_last_count"] == 8
+        assert snapshot["samples_count"] == 4
+    assert pending["pending"] is True
+    assert throttled["throttled"] is True
+    assert "pending" not in committed
+    assert "throttled" not in committed
+
+
+def test_concurrent_heartbeat_commits_once_and_skips_the_duplicate(monkeypatch):
+    """Two throttled heartbeats racing one HF commit produce exactly one upload.
+
+    Previously the second thread proved this by BLOCKING on the upload lock and re-checking
+    eligibility after the first commit landed. That wait is the contention this no longer pays: the
+    in-flight marker makes the second heartbeat skip immediately. The outcome contract is unchanged
+    and is what this asserts -- one upload attempt, one committed result, one skipped result, and
+    the committed step recorded from the commit that actually ran.
+    """
+    import flash.engine.worker as worker
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    attempts: list[int] = []
+    results: list[bool] = []
+
+    def upload(*_args, **_kwargs):
+        attempts.append(1)
+        first_started.set()
+        assert release_first.wait(5.0)
+        return True
+
+    monkeypatch.setattr(worker, "hf_upload_file", upload)
+    monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(worker, "_HB_LAST_COMMITTED_STEP", 0)
+    monkeypatch.setattr(worker, "_HB_LAST_FORCED_UPLOAD", 0.0)
+    monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+
+    threads = [
+        threading.Thread(
+            target=lambda step=step: results.append(worker.heartbeat("rl_step", step=step))
+        )
+        for step in (1, 2)
+    ]
+    threads[0].start()
+    assert first_started.wait(5.0)
+    threads[1].start()
+    # the second thread must not need the first to finish: it skips instead of queueing.
+    threads[1].join(timeout=5.0)
+    assert not threads[1].is_alive(), "the second heartbeat blocked behind the in-flight upload"
+    release_first.set()
+    for thread in threads:
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+    assert attempts == [1]
+    assert sorted(results) == [False, True]
+    assert worker._HB_LAST_COMMITTED_STEP == 1
+
+
 def test_heartbeat_console_summarizes_metric_backlog():
     import json
 
@@ -374,6 +451,164 @@ def test_heartbeat_console_summarizes_metric_backlog():
     assert "metrics_last" not in console
     assert console["metrics_last_count"] == 1024
     assert console["step"] == 1024
+
+
+def _last_console_heartbeat(capsys) -> dict:
+    import json
+
+    lines = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("HEARTBEAT {")
+    ]
+    assert lines
+    return json.loads(lines[-1].removeprefix("HEARTBEAT "))
+
+
+def _reset_console_heartbeat_state(monkeypatch, worker) -> None:
+    monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(worker, "_HB_LAST_COMMITTED_STEP", -1)
+    monkeypatch.setattr(worker, "_HB_LAST_FORCED_UPLOAD", 0.0)
+    monkeypatch.setattr(worker, "_HB_LAST_PROGRESS_TS", 0.0)
+    monkeypatch.setattr(worker, "_HB_PROGRESS_SEQ", 0)
+    monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+    monkeypatch.setattr(worker, "_HB_PENDING_CHECKPOINT_FAILURE", None)
+
+
+def _capture_heartbeat_payloads(monkeypatch, worker) -> list[dict]:
+    import json
+
+    committed: list[dict] = []
+
+    def capture(path, destination, **_kwargs):
+        if destination == "heartbeat.json":
+            with open(path) as file:
+                committed.append(json.load(file))
+        return True
+
+    _reset_console_heartbeat_state(monkeypatch, worker)
+    monkeypatch.setattr(worker, "hf_upload_file", capture)
+    return committed
+
+
+def test_fatal_heartbeat_preserves_checkpoint_failure_and_terminal_error(monkeypatch):
+    import flash.engine.worker as worker
+
+    committed = _capture_heartbeat_payloads(monkeypatch, worker)
+    failure = {"step": 50, "operation": "resume", "error": "quota denied"}
+
+    worker.heartbeat("checkpoint_upload_failed", step=50, checkpoint_failure=failure)
+    worker.heartbeat("error_sft", error="watcher failed")
+
+    assert committed[-1]["stage"] == "error_sft"
+    assert committed[-1]["error"] == "watcher failed"
+    assert committed[-1]["checkpoint_failure"] == failure
+
+
+def test_finalize_preserves_failed_checkpoint_identity(monkeypatch):
+    import flash.engine.worker as worker
+    from flash.engine.result.accounting import RunMetrics
+
+    committed = _capture_heartbeat_payloads(monkeypatch, worker)
+    monkeypatch.setattr(worker, "gpu_diagnostics", dict)
+    failure = {"step": 50, "operation": "resume", "error": "quota denied"}
+
+    worker.heartbeat("checkpoint_upload_failed", step=50, checkpoint_failure=failure)
+    worker._finalize(RunMetrics(phase="sft", step=100))
+
+    assert committed[-1]["stage"] == "done"
+    assert committed[-1]["step"] == 100
+    assert committed[-1]["checkpoint_failure"] == failure
+
+
+@pytest.mark.parametrize("terminal_stage", ["done", "error_sft"])
+def test_successful_checkpoint_clears_failure_before_any_terminal(monkeypatch, terminal_stage):
+    import flash.engine.worker as worker
+    from flash.engine.result.accounting import RunMetrics
+
+    committed = _capture_heartbeat_payloads(monkeypatch, worker)
+    failure = {"step": 50, "operation": "resume", "error": "quota denied"}
+
+    worker.heartbeat("checkpoint_upload_failed", step=50, checkpoint_failure=failure)
+    worker.heartbeat("checkpoint_uploaded", step=75)
+    if terminal_stage == "done":
+        monkeypatch.setattr(worker, "gpu_diagnostics", dict)
+        worker._finalize(RunMetrics(phase="sft", step=100))
+    else:
+        worker.heartbeat(terminal_stage, step=100, error="later fatal")
+
+    assert committed[-1]["stage"] == terminal_stage
+    assert "checkpoint_failure" not in committed[-1]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "upload_result", "expected_result", "marker"),
+    [
+        pytest.param("success", True, True, None, id="success"),
+        pytest.param("upload-false", False, False, "pending", id="upload-false"),
+        pytest.param("lock-skip", None, False, "pending", id="noninitial-lock-skip"),
+        pytest.param("local-throttle", None, False, "throttled", id="local-throttle"),
+    ],
+)
+def test_heartbeat_console_and_upload_marker_matrix(
+    monkeypatch, capsys, scenario, upload_result, expected_result, marker
+):
+    import json
+
+    import flash.engine.worker as worker
+
+    heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
+    uploaded: list[dict] = []
+    samples = [{"completion": "visible only in the uploaded payload"}]
+
+    def _upload(local, *args, **kwargs):
+        with open(local) as handle:
+            uploaded.append(json.load(handle))
+        return upload_result
+
+    _reset_console_heartbeat_state(monkeypatch, worker)
+    held = False
+    if scenario in {"success", "upload-false"}:
+        monkeypatch.setattr(worker, "hf_upload_file", _upload)
+    elif scenario == "lock-skip":
+        monkeypatch.setattr(heartbeat_module, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(
+            worker,
+            "hf_upload_file",
+            lambda *args, **kwargs: pytest.fail("a skipped upload must not call hf"),
+        )
+        assert heartbeat_module._HB_UPLOAD_LOCK.acquire(timeout=1.0)
+        held = True
+    else:
+        monkeypatch.setattr(heartbeat_module.time, "time", lambda: 1000.0)
+        monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 999.0)
+        monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
+        monkeypatch.setattr(
+            worker,
+            "hf_upload_file",
+            lambda *args, **kwargs: pytest.fail("a throttled heartbeat must not call hf"),
+        )
+
+    stage = "sft_step" if scenario == "local-throttle" else "rl_train_start"
+    kwargs = {"step": 1} if scenario == "local-throttle" else {}
+    try:
+        result = worker.heartbeat(stage, sampled_completions=samples, **kwargs)
+    finally:
+        if held:
+            heartbeat_module._HB_UPLOAD_LOCK.release()
+
+    assert result is expected_result
+    console = _last_console_heartbeat(capsys)
+    assert "sampled_completions" not in console
+    assert console["samples_count"] == 1
+    assert ("pending" in console) is (marker == "pending")
+    assert ("throttled" in console) is (marker == "throttled")
+
+    if uploaded:
+        assert len(uploaded) == 1
+        assert uploaded[0]["sampled_completions"] == samples
+        assert "pending" not in uploaded[0]
+        assert "throttled" not in uploaded[0]
+    else:
+        assert scenario in {"lock-skip", "local-throttle"}
 
 
 def test_rl_lifecycle_heartbeats_carry_latest_metrics():
@@ -1352,3 +1587,119 @@ def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
     assert all("\n" not in name for name in bounded)
     assert "reward" not in bounded
     assert "step" not in bounded
+
+
+def test_throttled_heartbeat_does_not_block_behind_an_in_flight_upload(monkeypatch):
+    """A slow HF commit must not stall every other throttled heartbeat on the upload lock.
+
+    The throttle clock only advances AFTER a commit lands, so while one is in flight every other
+    throttled caller still computes ``upload_due`` and blocks in ``_HB_UPLOAD_LOCK.acquire()`` for
+    up to the acquire timeout (30s, or 120s on a critical stage). That window stalls the liveness
+    daemon, and ``liveness_heartbeat``'s join delays leaving the wrapped stage by the same amount.
+    """
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    import flash.engine.worker as ne
+
+    monkeypatch.setattr(hb, "_HB_UPLOAD_LOCK_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(ne, "_HB_TERMINAL_ONLY", False)
+    monkeypatch.setattr(ne, "_HB_LAST_UPLOAD", 0.0)  # never uploaded -> due
+
+    upload_started = threading.Event()
+    release_upload = threading.Event()
+
+    def slow_upload(*args, **kwargs):
+        upload_started.set()
+        release_upload.wait(10)
+        return True
+
+    monkeypatch.setattr(ne, "hf_upload_file", slow_upload)
+
+    committer = threading.Thread(target=lambda: ne.heartbeat("rl_step", step=1), daemon=True)
+    committer.start()
+    try:
+        assert upload_started.wait(5), "the first heartbeat never reached its upload"
+
+        t0 = time.time()
+        assert ne.heartbeat("rl_step", liveness=True) is False
+        blocked = time.time() - t0
+        assert blocked < 1.0, (
+            f"a throttled heartbeat waited {blocked:.2f}s behind an in-flight upload; it must skip "
+            "rather than queue on the upload lock"
+        )
+    finally:
+        release_upload.set()
+        committer.join(10)
+
+    # the marker is transient: once the commit lands, later heartbeats are eligible again.
+    assert hb._HB_UPLOAD_IN_FLIGHT is False
+
+
+def test_terminal_heartbeat_still_queues_behind_an_in_flight_upload(monkeypatch):
+    """Skipping is only for throttled pings. A terminal/error snapshot has no later heartbeat to
+    repair it, so it must still wait for the lock and commit."""
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    import flash.engine.worker as ne
+
+    monkeypatch.setattr(ne, "_HB_TERMINAL_ONLY", False)
+    with hb._HB_LOCK:
+        hb._set_upload_in_flight(True)
+    try:
+        with hb._HB_LOCK:
+            assert (
+                hb._heartbeat_upload_due(
+                    "done",
+                    liveness=False,
+                    force=False,
+                    initial=False,
+                    first_timing=False,
+                    fields={},
+                    now=time.time(),
+                )
+                is True
+            ), "a terminal stage must not be skipped by the in-flight marker"
+            assert (
+                hb._heartbeat_upload_due(
+                    "rl_step",
+                    liveness=False,
+                    force=False,
+                    initial=True,
+                    first_timing=False,
+                    fields={},
+                    now=time.time(),
+                )
+                is True
+            ), "the initial heartbeat must not be skipped by the in-flight marker"
+    finally:
+        with hb._HB_LOCK:
+            hb._set_upload_in_flight(False)
+
+
+def test_failed_upload_clears_the_in_flight_marker(monkeypatch):
+    """A raising upload must not strand the marker, which would skip every later heartbeat."""
+    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    import flash.engine.worker as ne
+
+    monkeypatch.setattr(ne, "_HB_TERMINAL_ONLY", False)
+    monkeypatch.setattr(ne, "_HB_LAST_UPLOAD", 0.0)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("hf unreachable")
+
+    monkeypatch.setattr(ne, "hf_upload_file", boom)
+    with pytest.raises(RuntimeError, match="hf unreachable"):
+        ne.heartbeat("rl_step", step=1)
+
+    assert hb._HB_UPLOAD_IN_FLIGHT is False
+    with hb._HB_LOCK:
+        assert (
+            hb._heartbeat_upload_due(
+                "rl_step",
+                liveness=False,
+                force=False,
+                initial=False,
+                first_timing=False,
+                fields={},
+                now=time.time(),
+            )
+            is True
+        ), "a failed upload must leave later heartbeats eligible"

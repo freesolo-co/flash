@@ -135,12 +135,10 @@ def _require_supported_environment_form(env_raw: dict) -> None:
     A self-hosted plane is the exact inverse: the hub is ``freesolo-co/environment-hub``, which is
     private and hardcoded with no override, and ``managed_slug_to_github_ref`` maps EVERY slug onto
     it. So a slug names the one repo such a plane provably cannot read -- not an environment it
-    happens to lack. Accepted, it passes submit, survives the best-effort sha pin in
-    ``_assign_resolved_env_sha`` (which logs and defers to the worker), and surfaces on the rented
-    GPU as a bare GitHub 404 naming a repo the operator has never heard of, after the run has
-    already cost money. Rejecting at submit turns that into a free, explained failure. The explicit
-    GitHub forms remain a self-hosted plane's only environment source (a local ``path`` is already
-    rejected above).
+    happens to lack. accepted, it passes submit, survives the best-effort sha preflight, and fails
+    later during controller staging with a github 404 naming a repo the operator has never heard of.
+    rejecting it at submit keeps that failure synchronous and explained. the explicit github forms
+    remain a self-hosted plane's only environment source (a local ``path`` is already rejected above).
 
     Checked through ``canonical_managed_environment_slug`` rather than ``is_managed_...`` because
     the hub has four spellings that all resolve to the same private repo -- the bare slug, the

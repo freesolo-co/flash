@@ -116,6 +116,24 @@ def test_cancel_prices_an_unbounded_on_policy_run_from_its_completed_steps():
         assert runner.cancelled_charge_usd(st, spec, steps=7, fallback=float("nan")) == charge
 
 
+def test_cancelled_unbounded_on_policy_run_never_exceeds_its_quote():
+    # when the full-work horizon is unknowable, cancellation falls back to the completed-step
+    # reprice. that fallback still cannot exceed the price the customer accepted at submission.
+    for algorithm in ("grpo", "opd"):
+        spec = _unbounded_on_policy_spec(algorithm)
+        repriced = runner.charge_usd_for_spec(spec, steps=7, fallback=float("nan"))
+        accepted_quote = repriced / 2
+        st = runner.RunStatus(
+            run_id="r",
+            state="cancelled",
+            spec={},
+            estimated_cost_usd=accepted_quote,
+        )
+        assert (
+            runner.cancelled_charge_usd(st, spec, steps=7, fallback=float("nan")) == accepted_quote
+        )
+
+
 def test_quoting_an_unbounded_on_policy_run_still_refuses_to_guess():
     # the paired control: with no steps to state there is still no horizon, so a PRE-run quote must
     # keep refusing. without this, a fix for the cancel path could silently restore the guess the

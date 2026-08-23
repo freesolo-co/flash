@@ -9,10 +9,11 @@ deployed that ``init_from_adapter`` then refuses to load.
 from __future__ import annotations
 
 import json
-import struct
 import time
 
+import numpy as np
 import pytest
+from safetensors.numpy import save
 
 from flash.adapters.artifacts import (
     has_loadable_adapter_weights,
@@ -28,9 +29,13 @@ _INDEX = "adapter_model.safetensors.index.json"
 
 
 def _safetensors_bytes(keys: list[str]) -> bytes:
-    header = {key: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]} for key in keys}
-    encoded = json.dumps(header).encode("utf-8")
-    return struct.pack("<Q", len(encoded)) + encoded + b"\x01\x02"
+    return save({key: np.zeros((1,), dtype=np.float16) for key in keys})
+
+
+def _write_sharded_adapter(tmp_path, shard_keys, weight_map):
+    for name, keys in zip(_SHARDS, shard_keys, strict=True):
+        (tmp_path / name).write_bytes(_safetensors_bytes(keys))
+    (tmp_path / _INDEX).write_text(json.dumps({"weight_map": weight_map}))
 
 
 def test_an_orphan_shard_is_not_loadable_weights():
@@ -113,15 +118,16 @@ def test_a_single_file_adapter_wins_over_leftover_shards():
     assert loadable_adapter_weight_files(names) == ["adapter_model.safetensors"]
 
 
-def test_safetensors_is_preferred_over_a_stale_bin():
+def test_bin_adapter_weights_are_rejected_beside_safetensors():
     names = ["adapter_model.safetensors", "adapter_model.bin"]
+    assert not is_adapter_weight_filename("adapter_model.bin")
     assert loadable_adapter_weight_files(names) == ["adapter_model.safetensors"]
 
 
-def test_an_orphan_safetensors_shard_falls_through_to_a_complete_bin():
-    """an unloadable representation must not mask the loadable one in the other suffix."""
+def test_an_orphan_safetensors_shard_does_not_fall_through_to_bin():
     names = [_SHARDS[0], "adapter_model.bin"]
-    assert loadable_adapter_weight_files(names) == ["adapter_model.bin"]
+    assert not has_loadable_adapter_weights(names)
+    assert loadable_adapter_weight_files(names) == []
 
 
 def test_paths_are_matched_by_basename():
@@ -164,6 +170,92 @@ def test_worker_key_reader_reads_every_shard(tmp_path):
     )
 
     assert lora._read_adapter_tensor_keys(str(tmp_path)) == [first, second]
+
+
+def test_worker_metadata_reader_rejects_duplicate_keys_across_shards(tmp_path):
+    import flash.engine.worker.model.lora as lora
+
+    first = "base_model.model.layers.0.q_proj.lora_A.default.weight"
+    second = "base_model.model.layers.0.q_proj.lora_B.default.weight"
+    _write_sharded_adapter(
+        tmp_path,
+        ([first], [first, second]),
+        {first: _SHARDS[0], second: _SHARDS[1]},
+    )
+
+    with pytest.raises(ValueError, match="duplicate tensor keys"):
+        lora._read_adapter_tensor_metadata(str(tmp_path))
+
+
+def test_worker_metadata_reader_rejects_missing_mapped_key(tmp_path):
+    import flash.engine.worker.model.lora as lora
+
+    first = "base_model.model.layers.0.q_proj.lora_A.default.weight"
+    missing = "base_model.model.layers.0.q_proj.lora_B.default.weight"
+    _write_sharded_adapter(
+        tmp_path,
+        ([first], []),
+        {first: _SHARDS[0], missing: _SHARDS[1]},
+    )
+
+    with pytest.raises(ValueError, match=r"missing=.*lora_B"):
+        lora._read_adapter_tensor_metadata(str(tmp_path))
+
+
+def test_worker_metadata_reader_rejects_unmapped_header_key(tmp_path):
+    import flash.engine.worker.model.lora as lora
+
+    first = "base_model.model.layers.0.q_proj.lora_A.default.weight"
+    second = "base_model.model.layers.0.q_proj.lora_B.default.weight"
+    extra = "base_model.model.layers.1.q_proj.lora_A.default.weight"
+    _write_sharded_adapter(
+        tmp_path,
+        ([first], [second, extra]),
+        {first: _SHARDS[0], second: _SHARDS[1]},
+    )
+
+    with pytest.raises(ValueError, match="disagrees with weight_map"):
+        lora._read_adapter_tensor_metadata(str(tmp_path))
+
+
+def test_worker_metadata_reader_rejects_weight_map_shard_disagreement(tmp_path):
+    import flash.engine.worker.model.lora as lora
+
+    first = "base_model.model.layers.0.q_proj.lora_A.default.weight"
+    second = "base_model.model.layers.0.q_proj.lora_B.default.weight"
+    _write_sharded_adapter(
+        tmp_path,
+        ([first], [second]),
+        {first: _SHARDS[1], second: _SHARDS[0]},
+    )
+
+    with pytest.raises(ValueError, match="disagrees with weight_map"):
+        lora._read_adapter_tensor_metadata(str(tmp_path))
+
+
+def test_worker_metadata_reader_rejects_duplicate_weight_map_key(tmp_path):
+    import flash.engine.worker.model.lora as lora
+
+    first = "base_model.model.layers.0.q_proj.lora_A.default.weight"
+    for name in _SHARDS:
+        (tmp_path / name).write_bytes(_safetensors_bytes([first]))
+    (tmp_path / _INDEX).write_text(
+        '{"weight_map":{"duplicate":"adapter_model-00001-of-00002.safetensors",'
+        '"duplicate":"adapter_model-00002-of-00002.safetensors"}}'
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        lora._read_adapter_tensor_metadata(str(tmp_path))
+
+
+def test_worker_metadata_reader_rejects_index_shard_set_disagreement(tmp_path):
+    import flash.engine.worker.model.lora as lora
+
+    first = "base_model.model.layers.0.q_proj.lora_A.default.weight"
+    _write_sharded_adapter(tmp_path, ([first], []), {first: _SHARDS[0]})
+
+    with pytest.raises(ValueError, match="do not match selected shards"):
+        lora._read_adapter_tensor_metadata(str(tmp_path))
 
 
 def test_worker_key_reader_reports_nothing_for_an_orphan_shard(tmp_path):
@@ -268,7 +360,8 @@ def test_warmstart_identity_binds_every_shard(monkeypatch):
                     path=f"sft/run/adapter/{name}",
                     blob_id=None,
                     size=123,
-                    lfs={"sha256": oids[name], "size": 123},
+                    # attribute-style `BlobLfsInfo`, the only shape `list_repo_tree` produces.
+                    lfs=SimpleNamespace(sha256=oids[name], size=123),
                 )
                 for name in (*_SHARDS, _INDEX)
             ]

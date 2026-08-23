@@ -71,9 +71,6 @@ def _commit_verified_deployment(
 
 def _promote_final_deployment(status: RunStatus, deployment: dict) -> None:
     """Apply the lifecycle state for a final-adapter deployment."""
-    # Preserve teardown time for legacy `done` runs (finished_at=None) before deploy bumps updated_at.
-    if status.state == "done" and status.finished_at is None and not status.reconciled_at:
-        status.finished_at = status.updated_at
     status.deployment = deployment
     status.state = "deployed"
 

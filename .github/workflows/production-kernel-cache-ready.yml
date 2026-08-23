@@ -1,0 +1,98 @@
+name: production kernel-cache readiness
+
+# this check is registry-only and never starts a gpu. branch protection can require its named job
+# to prove every production sm already has the cache or has a compatible dev candidate to promote.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  ready:
+    name: production kernel cache ready
+    if: github.repository == 'freesolo-co/flash'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FA2_SPEC: https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
+      FA2_SHA256: a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12e36a0f
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Compute proposed kernel fingerprint
+        id: fp
+        run: python3 docker/kernel_fingerprint.py --format github --fa2-spec "$FA2_SPEC" --fa2-sha256 "$FA2_SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          ver=v0.20.2
+          sha=c14340087103ba9dadf61d45acd20675490fd0ccbd56ac7901fc1b502137f44b
+          curl -fsSL -o /tmp/crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${ver}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${sha}  /tmp/crane.tar.gz" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f /tmp/crane.tar.gz crane
+          rm -f /tmp/crane.tar.gz
+          crane version
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify every sm cache is ready
+        env:
+          FP_CACHE: ${{ steps.fp.outputs.fp_cache }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          arches=$(python3 docker/kernel_fingerprint.py --print-baked-arches)
+          missing=()
+          summary="| arch | production | dev candidate | result |\n|---|---|---|---|\n"
+          for sm in $arches; do
+            prod="ghcr.io/freesolo-co/flash-worker:cu128-$sm"
+            candidate="ghcr.io/freesolo-co/flash-worker:cu128-dev-ready-$sm"
+
+            prod_pc=""
+            if cfg=$(crane config "$prod" 2>/dev/null); then
+              prod_pc=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_cache"] // ""')
+            fi
+
+            candidate_pc=""; candidate_rev=""
+            if cfg=$(crane config "$candidate" 2>/dev/null); then
+              candidate_pc=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_cache"] // ""')
+              candidate_rev=$(echo "$cfg" | jq -r '.config.Labels["org.opencontainers.image.revision"] // ""')
+            fi
+
+            if [ "$prod_pc" = "$FP_CACHE" ]; then
+              result="production ready"
+            elif [ "$candidate_pc" = "$FP_CACHE" ]; then
+              result="dev candidate ready"
+            else
+              result="missing"
+              missing+=("$sm")
+            fi
+            summary="$summary| $sm | \`${prod_pc:-missing}\` | \`${candidate_pc:-missing}\` at \`${candidate_rev:-unknown}\` | $result |\n"
+          done
+
+          {
+            echo "### production kernel-cache readiness"
+            echo ""
+            echo "required fp_cache: \`$FP_CACHE\`"
+            echo ""
+            echo -e "$summary"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::missing kernel-cache candidates for: ${missing[*]}. Run the dev kernel-cache candidate workflow for $HEAD_SHA."
+            exit 1
+          fi

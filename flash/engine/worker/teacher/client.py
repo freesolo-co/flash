@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -24,6 +25,10 @@ from flash.engine.worker.teacher.encoding import (
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
 from flash.envs.base import map_bounded
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
+from flash.teacher.provider_status import (
+    BODY_INDEPENDENT_TRANSIENT_STATUSES,
+    validated_provider_status,
+)
 
 _MAX_LOGPROB_ROUNDING_ERROR = 1e-6
 _BROKER_PROVIDER_TIMEOUT_CEILING_S = 90.0
@@ -48,9 +53,10 @@ from flash.content.multimodal import (  # noqa: E402
 class TeacherError(RuntimeError):
     """A classified managed-teacher failure."""
 
-    def __init__(self, *args, permanent: bool = False) -> None:
+    def __init__(self, *args, permanent: bool = False, provider_status: int | None = None) -> None:
         super().__init__(*args)
         self.permanent = permanent
+        self.provider_status = validated_provider_status(provider_status)
 
 
 def _remaining_run_wall_seconds() -> float | None:
@@ -566,18 +572,30 @@ class TeacherClient:
             except urllib.error.HTTPError as error:
                 code = "broker_http_error"
                 classification = "permanent"
+                provider_status = None
+                structured_error = False
                 try:
                     payload = json.loads(error.read(64 * 1024 + 1).decode("utf-8"))
                     broker_error = payload.get("error") if isinstance(payload, dict) else None
                     if isinstance(broker_error, dict):
                         raw_code = broker_error.get("code")
                         raw_classification = broker_error.get("classification")
+                        provider_status = validated_provider_status(
+                            broker_error.get("provider_status")
+                        )
                         if isinstance(raw_code, str) and raw_code:
                             code = raw_code
                         if isinstance(raw_classification, str) and raw_classification in {
                             "permanent",
                             "transient",
                         }:
+                            # authoritative only once the body actually CLASSIFIES. an
+                            # intermediary can answer a safe-to-retry status with its own generic
+                            # JSON -- `{"error": {"message": "rate limited"}}` is a dict with no
+                            # code and no classification -- and treating that shape as the
+                            # broker's verdict suppresses the status-only fallback below, so the
+                            # default `permanent` aborts a paid run the broker meant us to retry.
+                            structured_error = True
                             classification = raw_classification
                 except (
                     UnicodeDecodeError,
@@ -586,11 +604,27 @@ class TeacherClient:
                     http.client.IncompleteRead,
                 ):
                     pass
+                if not structured_error and error.code in BODY_INDEPENDENT_TRANSIENT_STATUSES:
+                    # the body was lost or replaced in transit. the broker raises a retryable
+                    # failure only on these statuses precisely so the signal survives that. 408 and
+                    # 5xx stay ambiguous after dispatch and must not spend twice. see
+                    # BODY_INDEPENDENT_TRANSIENT_STATUSES.
+                    #
+                    # gated on the CLASSIFICATION being absent, not on the code still being the
+                    # default: an intermediary can name its own code (`gateway_rate_limited`)
+                    # without ever classifying, and requiring the default code there would leave
+                    # the same paid run aborted on a status the broker meant us to retry.
+                    classification = "transient"
                 retryable = classification == "transient"
+                provider_status_detail = (
+                    f" provider_status={provider_status}" if provider_status is not None else ""
+                )
                 broker_failure = TeacherError(
-                    f"teacher broker HTTP {error.code} for {request_id} on {path}: {code} "
+                    f"teacher broker HTTP {error.code} for {request_id} on {path}: {code}"
+                    f"{provider_status_detail} "
                     f"({'transient' if retryable else 'permanent'})",
                     permanent=not retryable,
+                    provider_status=provider_status,
                 )
                 if not retryable:
                     raise broker_failure from None
@@ -779,7 +813,12 @@ class TeacherClient:
             turn_end_token_id=turn_end_tokens[0].token_id,
         )
 
-    def score_many(self, items: list[tuple[str, str]]) -> list[TeacherScore]:
+    def score_many(
+        self,
+        items: list[tuple[str, str]],
+        *,
+        on_scored: Callable[[], None] | None = None,
+    ) -> list[TeacherScore]:
         """Score each unique prompt and completion through one idempotent broker request.
 
         Bounded by `map_bounded`, which consumes completions as they arrive rather than in input
@@ -792,22 +831,43 @@ class TeacherClient:
         """
         if not items:
             return []
+
+        def score_one(item):
+            scored = self._score_one(*item)
+            if on_scored is not None:
+                on_scored()
+            return scored
+
         return map_bounded(
             items,
-            lambda item: self._score_one(*item),
+            score_one,
             cap=OPD_TEACHER_SCORING_CONCURRENCY,
         )
 
     def score_many_multimodal(
         self,
         items: list[tuple[list[dict[str, Any]], str, list[str] | tuple[str, ...], bool]],
+        *,
+        on_scored: Callable[[], None] | None = None,
     ) -> list[TeacherScore]:
-        """Score image-conditioned completions through the managed chat broker route."""
+        """Score image-conditioned completions through the managed chat broker route.
+
+        Reports each completion through `on_scored` for the same reason the text route does: the
+        child is silent while the parent waits on the teacher, so without this signal a long image
+        scoring phase is indistinguishable from a wedged child.
+        """
         if not items:
             return []
+
+        def score_one(item):
+            scored = self._score_one_multimodal(*item)
+            if on_scored is not None:
+                on_scored()
+            return scored
+
         return map_bounded(
             items,
-            lambda item: self._score_one_multimodal(*item),
+            score_one,
             cap=OPD_TEACHER_SCORING_CONCURRENCY,
         )
 

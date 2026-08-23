@@ -5,7 +5,7 @@ The fla/tilelang/cudart fixup group stays IN THIS MODULE on purpose: tests monke
 through the patched module globals. Do NOT move this group into a submodule.
 
 NOTE: ``tests/test_worker_stack.py`` reads THIS file as TEXT to assert the fla SHA /
-TILELANG_PIN stay in lockstep with WORKER_DEPS / Dockerfile.worker.
+TILELANG_PIN stay in lockstep with Dockerfile.worker.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from flash.engine.worker.perf.lifecycle import (
     RetriableInfraError,
     free_vram_gb,
     is_cuda_oom,
-    preflight_free_vram,
+    preflight_gpu_occupancy,
     total_vram_gb,
     wait_for_gpu,
 )
@@ -315,9 +315,10 @@ def _ensure_fla_fastpath_on_hopper() -> None:
             return False
         return rc == 0
 
-    # 0.1.12 double-registers the TVM-FFI runtime -> `import tilelang` aborts; keep in lockstep with WORKER_DEPS / Dockerfile.
-    TVM_FFI_PIN = "0.1.11"
-    TILELANG_PIN = "0.1.11"
+    # flash-qla requires exactly these two, and 0.1.12 double-registers the TVM-FFI runtime ->
+    # `import tilelang` aborts; keep in lockstep with Dockerfile.worker and capabilities.py.
+    TVM_FFI_PIN = "0.1.9"
+    TILELANG_PIN = "0.1.9"
 
     try:
         tilelang_ok = True
@@ -334,7 +335,7 @@ def _ensure_fla_fastpath_on_hopper() -> None:
         fla_ok = True
         if not (_have("fla") and _have("fla.modules")):
             _remove_fla_from_disk()
-            # Pinned commit — keep in lockstep with WORKER_DEPS / Dockerfile.worker.
+            # Pinned commit — keep in lockstep with Dockerfile.worker.
             fla_ok = _pip(
                 "--no-deps",
                 "git+https://github.com/fla-org/flash-linear-attention.git"
@@ -403,7 +404,7 @@ __all__ = [
     "grad_checkpointing_on",
     "grpo_use_reentrant",
     "is_cuda_oom",
-    "preflight_free_vram",
+    "preflight_gpu_occupancy",
     "total_vram_gb",
     "wait_for_gpu",
 ]

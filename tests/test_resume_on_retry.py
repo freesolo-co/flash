@@ -23,11 +23,13 @@ import pytest
 
 from flash.core.spec import JobSpec
 from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 # Infra-shaped failure categories the retry loop resumes on (see lifecycle._submit_seed_supervised).
 # Mirrors the literal tuple in the source; this test is the guard that the set doesn't silently drift.
 INFRA_SHAPED = ("stalled", "no_capacity", "poll_error", "job_preempted")
-_RUNPOD_FINGERPRINT = "rpk-0123456789ab"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
 class _RecordingHfApi:
@@ -671,7 +673,14 @@ def orch(monkeypatch, tmp_path):
 
 
 def _seed_status(orch, spec):
-    orch._save_status(orch.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict()))
+    orch._save_status(
+        orch.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+    )
 
 
 @pytest.mark.parametrize("failure", INFRA_SHAPED)
@@ -1123,6 +1132,7 @@ def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypa
         if attempt == 0:
             print("Traceback (most recent call last):\ntorch.OutOfMemoryError: CUDA OOM", file=log)
             return PollResult(False, failure="stalled", detail="infra")
+        print("worker: stage=rl_step attempt=1 step=1", file=log)
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
@@ -1137,6 +1147,9 @@ def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypa
     assert marker in text, "a retry must say which attempt the following bytes belong to"
     assert text.index("CUDA OOM") < text.index(marker), (
         "the marker must sit after the failure it disowns, or it cannot separate the two attempts"
+    )
+    assert text.index(marker) < text.index("worker: stage=rl_step attempt=1 step=1"), (
+        "the replacement attempt's heartbeat must follow the boundary that assigns its provenance"
     )
 
 

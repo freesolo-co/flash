@@ -28,7 +28,6 @@ from flash.adapters.artifacts import MAX_ATTEMPT_ID as MAX_ATTEMPT_ID
 # moved code reads them back through it. an autofix that drops them breaks those tests.
 from flash.core.catalog import ModelInfo, resolve_model  # noqa: F401
 from flash.core.spec import (  # noqa: F401
-    _DROPPED_TOP_LEVEL_KEYS,
     MANAGED_GPU_KEYS,
     TRAINER_BACKEND,
     GpuSpec,
@@ -124,16 +123,11 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     raw_worker = (status.effective_preparation or {}).get("worker_spec")
     if not raw_worker:
         return None
-    # a workload-profile run recorded before #1095 removed the profile job has a managed hf_repo but
-    # never produced an adapter. its worker payload still carries the marker, which JobSpec.from_dict
-    # now drops, so read it off the raw record rather than reviving the field.
-    if isinstance(raw_worker, dict) and raw_worker.get("workload_profile_kind"):
-        return None
     try:
         spec = _internal_spec_from_status(status)
     except Exception:
-        # a status json written by an OLDER plane can carry since-removed spec keys (e.g.
-        # ``gpu.exact_type`` pre-#670), and stored run records are never rewritten. JobSpec.from_dict
+        # a status json written by an older plane can carry since-removed spec keys (e.g.
+        # ``gpu.exact_type`` pre-#670), and stored run records are never rewritten. jobspec.from_dict
         # is strict, so parsing raises -- and one such record would 500 the whole runs list. same
         # operational tolerance as _runstatus_from_json: the record stays readable, it just shows no
         # adapter ref (its spec cannot name one we could resolve).
@@ -196,6 +190,9 @@ class RunStatus:
     # none for sft, which reports truncation through workload_profile, and for older records.
     prompt_budget: PromptBudget | None = None
     effective_preparation: dict | None = None
+    # full managed source descriptor, kept private because it carries the repository path.
+    source_snapshot: dict | None = None
+    source_verified_attempt: int | None = None
 
     def to_dict(self) -> dict:
         """Return the public run status representation."""
@@ -206,6 +203,18 @@ class RunStatus:
         data.pop("report_sequence", None)
         # internal warm-start preparation (storage locators, digests) never leaves the server
         data.pop("effective_preparation", None)
+        heartbeat = data.get("last_heartbeat")
+        if isinstance(heartbeat, dict):
+            heartbeat.pop("source_provenance", None)
+        source_snapshot = data.pop("source_snapshot", None)
+        data.pop("source_verified_attempt", None)
+        if source_snapshot is not None:
+            from flash.source_snapshot import safe_public_projection
+
+            data["source_provenance"] = safe_public_projection(
+                source_snapshot,
+                verified_attempt=self.source_verified_attempt,
+            )
         if isinstance(self.deployment, dict):
             data["deployment"] = public_deployment(self.deployment)
         return data
@@ -278,6 +287,8 @@ def _redact_internal_adapter_ref(data: dict) -> None:
 def _status_storage_dict(status: RunStatus) -> dict:
     """Serialize status for persistence without filtering internal deployment state."""
     data = asdict(status)
+    if data.get("source_snapshot") is None:
+        data.pop("source_snapshot", None)
     data["adapter_ref"] = (
         _adapter_ref_for_status(status) if status.state in {"done", "deployed"} else None
     )
@@ -378,16 +389,11 @@ _WEIGHT_CACHE_PEAK_FACTOR = 2.0
 def _run_job_background(
     spec: JobSpec,
     runtime_secrets: dict[str, str] | None = None,
-    *,
-    resolve_env_sha: bool = False,
 ) -> None:
     """Daemon-thread entrypoint: swallows exceptions to suppress noisy thread tracebacks."""
     import logging
 
     try:
-        if resolve_env_sha:
-            with contextlib.suppress(Exception):
-                spec = _assign_resolved_env_sha(spec)
         if runtime_secrets:
             _run_job(spec, runtime_secrets=runtime_secrets)
         else:
@@ -434,8 +440,6 @@ class PreparedJob:
 
 
 _BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
-# deployed is non-terminal but reconciled; its finished_at must survive billing field-only writes.
-_FINISHED_AT_PRESERVED_STATES = TERMINAL_STATES | {"deployed"}
 
 
 def _send_status_report(status: RunStatus) -> bool:
@@ -761,6 +765,7 @@ def _save_status_unlocked(
             os.unlink(tmp)
 
 
+from flash.providers._lifecycle.worker import publish_source_snapshot  # noqa: E402,F401
 from flash.runner.artifacts import (  # noqa: E402,F401
     _assign_managed_hf_repo,
     _assign_resolved_env_sha,
@@ -768,9 +773,9 @@ from flash.runner.artifacts import (  # noqa: E402,F401
     _file_digest,
     _pin_env_sha_with_reason,
     artifact_namespace,
-    flash_code_prefix,
     managed_hf_repo_for_environment,
     preflight_validate_environment_ref,
+    stage_environment_package,
 )
 from flash.runner.attempts import (  # noqa: E402,F401
     _heartbeat_attempt_is_current,
@@ -805,13 +810,10 @@ from flash.runner.preparation import (  # noqa: E402,F401
     _preparation_digest,
     _prepare_init_from_adapter,
     _prepare_init_from_adapter_inner,
-    _prepared_before_public_alpha,
     _profile_producer_version,
     _require_pinned_profile_environment,
     _require_sft_workload_profile,
-    _require_supported_adapter_continuation,
     _resolve_model_revision,
-    _stored_rollout_batch_spelling,
     _validate_effective_spec,
     _warmstart_source_is_authorized,
 )
@@ -852,8 +854,11 @@ from flash.runner.status import (  # noqa: E402,F401
     list_runs,
     reallocation_spec_from_status,
     record_heartbeat,
+    source_snapshot_from_status,
+    validate_terminal_source_metrics,
 )
 from flash.runner.submit import (  # noqa: E402,F401
+    SourceSnapshotPublicationError,
     _persist_effective_worker_spec,
     _reject_managed_volume_removal,
     prepare_job,

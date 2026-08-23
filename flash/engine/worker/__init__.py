@@ -17,7 +17,8 @@ import time
 import traceback
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.core.spec import FIXED_SEED, load_job_spec_from_env
+from flash.adapters.fused_experts import lora_target_parameters
+from flash.core.spec import FIXED_SEED, gpu_count_of, load_job_spec_from_env
 from flash.engine.result.accounting import RunMetrics
 from flash.engine.worker.backend_common import collect_ray_failure_logs
 from flash.engine.worker.entry.opd import run_opd
@@ -56,9 +57,8 @@ from flash.engine.worker.io.wandb_log import (
 )
 from flash.engine.worker.model.adapter import (
     _download_adapter,
-    lora_target_parameters,
     make_lora,
-    validate_lora_target_parameters,
+    validate_warmstart_adapter,
 )
 from flash.engine.worker.model.decoding import (
     graded_text,
@@ -80,7 +80,7 @@ from flash.engine.worker.perf import (
     grad_checkpointing_on,
     grpo_use_reentrant,
     is_cuda_oom,
-    preflight_free_vram,
+    preflight_gpu_occupancy,
     wait_for_gpu,
 )
 from flash.engine.worker.runtime.kernel_warmup import _current_cuda_sm, load_mega_cache
@@ -92,8 +92,12 @@ from flash.engine.worker.train.rl.config import (
     grpo_overrides,
     resolve_grpo_prompts_per_step,
 )
-from flash.envs.adapter import GitHubTransientError
-from flash.envs.base import load_environment
+from flash.envs.identity import GitHubTransientError
+from flash.envs.staged import (
+    StagedEnvironmentMaterialization,
+    StagedEnvironmentTransientError,
+    load_staged_freesolo_environment,
+)
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 
@@ -141,6 +145,9 @@ _HB_LAST_PROGRESS_TS = 0.0
 # per-step heartbeat past the provider's stall window, killing a healthy run.
 _HB_PROGRESS_SEQ = 0
 _HB_PROGRESS_UPLOADED_SEQ = 0
+# a replace-in-place failure heartbeat can be overwritten before the provider polls it. retain the
+# failed checkpoint identity and cause so every terminal heartbeat carries the same structured state.
+_HB_PENDING_CHECKPOINT_FAILURE: dict[str, int | str] | None = None
 # Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
 # per-repo commit cap while staying under the provider poller's training stall window
 # (STALL_AFTER_S=1500s in flash/providers/_lifecycle/poll.py).
@@ -184,9 +191,17 @@ def _load_active_env():
             "(a Freesolo environment id like 'your-org/your-project/your-env', returned by "
             "`flash env push --project <project-uuid> --name <name>`)."
         )
-    env = load_environment(
-        env_id, JOB_SPEC.environment.params, resolved_sha=JOB_SPEC.environment.resolved_sha
+    global ACTIVE_ENV_PACKAGE
+    env, ACTIVE_ENV_PACKAGE = load_staged_freesolo_environment(
+        JOB_SPEC.environment,
+        JOB_SPEC.environment.params,
+        hf_repo=JOB_SPEC.train.hf_repo,
     )
+    from flash.content.multimodal import validate_image_observation_environment
+
+    # this capability classifies a future dynamic-image environment only. full per-turn media wiring
+    # remains separate; the guard makes an incompatible model or opd teacher fail before model work.
+    validate_image_observation_environment(env, JOB_SPEC)
     # tell the env whether this run samples <think> blocks, so the multi-turn scoring path strips
     # reasoning exactly like the single-turn path does (see FreesoloEnvironment.record_model_turn).
     if hasattr(env, "thinking"):
@@ -195,6 +210,15 @@ def _load_active_env():
 
 
 ACTIVE_ENV = None
+ACTIVE_ENV_PACKAGE: StagedEnvironmentMaterialization | None = None
+
+
+def _cleanup_active_env_package() -> None:
+    global ACTIVE_ENV_PACKAGE
+    if ACTIVE_ENV_PACKAGE is None:
+        return
+    ACTIVE_ENV_PACKAGE.cleanup()
+    ACTIVE_ENV_PACKAGE = None
 
 
 def require_active_env():
@@ -214,29 +238,25 @@ def require_active_env():
 
 
 def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
-    # GitHubTransientError covers both the quota case and GitHub being unreachable. The worker's
-    # answer to either is the same -- reschedule -- so it catches the base; only the control plane,
-    # which has a status code to report, distinguishes them.
-    retriable = isinstance(exc, (RetriableInfraError, GitHubTransientError))
+    # both transient families, not just the staged one: `GitHubTransientError` (quota and outage)
+    # still reaches here from the environment identity path, and the worker's answer to either is
+    # the same -- reschedule. classifying only the staged type would fail those runs permanently.
+    retriable = isinstance(
+        exc, (RetriableInfraError, StagedEnvironmentTransientError, GitHubTransientError)
+    )
     return {"retriable": retriable, "oom": (not retriable and is_cuda_oom(exc))}
 
 
-def _preflight_free_vram_for_spec() -> None:
-    """Reject a card that arrived already occupied by another tenant.
+def _preflight_gpu_occupancy_for_spec() -> None:
+    """Screen every GPU in the allocator-resolved worker allocation for substantial occupancy.
 
-    Nothing about the spec is read. An earlier draft re-derived the run's requirement here and
-    compared free bytes against it, which is a second sizing model competing with the allocator's
-    and wrong in both directions -- see ``preflight_free_vram``. Occupancy needs no requirement, so
-    it runs on any shape without reimplementing ``combined_vram_gb``'s non-linear multi-card fit.
+    The allocator stamps the chosen count onto ``JOB_SPEC`` before provider launch, so this passes
+    only the cards rented for this worker. It does not re-derive required VRAM or claim exact fit.
 
-    It samples device 0 only. On a multi-card node that leaves a tenant sitting on device 3 alone
-    undetected, which is a gap and not a false alarm -- device 0 occupancy is still evidence of a
-    shared host.
-
-    Must stay the first CUDA-adjacent call in boot: the reading is only trustworthy while this
+    This must stay the first CUDA-adjacent call in boot. The reading is trustworthy only while this
     process has no context of its own, and ``_force_fla_triton_gdn_on_sm100`` below creates one.
     """
-    preflight_free_vram()
+    preflight_gpu_occupancy(gpu_count_of(JOB_SPEC))
 
 
 THINKING = JOB_SPEC.thinking if JOB_SPEC else False
@@ -276,11 +296,6 @@ def _run_worker_mode() -> None:
     remaining = _remaining_worker_wall_seconds()
     if remaining is not None and remaining <= 0:
         raise RuntimeError("worker run wall deadline exceeded")
-    if RUN_MODE == "sft" and JOB_SPEC and JOB_SPEC.train.init_from_adapter:
-        raise ValueError(
-            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
-            "SFT adapter continuation is not supported"
-        )
     # Idempotency: check DONE before any env-mutating pip install (fla fast path).
     if HF_REPO:
         from huggingface_hub import hf_hub_download
@@ -347,14 +362,14 @@ def _run_worker_mode() -> None:
     # FIRST, and specifically before `_force_fla_triton_gdn_on_sm100`: that reads
     # `get_device_capability`, which initializes CUDA in this process, and from that moment the
     # driver's "used" includes our own context with no sound way to subtract it -- the occupancy
-    # check declines to run rather than guess (see `preflight_free_vram`), so calling it later means
-    # never calling it at all. This is also before `_ensure_fla_fastpath_on_hopper`, whose repair
+    # check declines to run rather than guess (see `preflight_gpu_occupancy`), so calling it later
+    # means never calling it at all. this is also before `_ensure_fla_fastpath_on_hopper`, whose repair
     # path runs pip installs with 600s timeouts: a card handed over with a co-tenant's ~18GB still
     # resident fails the run either way, and the only question is whether that happens now or after
     # dependency repair, the model download and FSDP init have spent paid GPU on the same
     # conclusion. NVML answers without a context, so nothing here dirties the reading for the code
     # below.
-    _preflight_free_vram_for_spec()
+    _preflight_gpu_occupancy_for_spec()
     # run before model imports: sm100 tilelang GDN computes wrong gradients, so use Triton.
     _force_fla_triton_gdn_on_sm100()
     _ensure_fla_fastpath_on_hopper()
@@ -363,8 +378,11 @@ def _run_worker_mode() -> None:
     _restrict_fla_gdn_autotune_on_blackwell()
     heartbeat("boot", gpu=gpu_diagnostics(include_torch=False))
     load_mega_cache()
-    handler()
-    # Hard-exit: colocated vLLM can deadlock on NCCL/CUDA teardown; all artifacts already on HF.
+    try:
+        handler()
+    finally:
+        _cleanup_active_env_package()
+    # hard-exit: colocated vllm can deadlock on nccl/cuda teardown; all artifacts are already on hf.
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
@@ -415,7 +433,12 @@ def main():
                 error=detail,
                 **hb_flags,
                 **_err_metrics,
-                diag=gpu_diagnostics(),
+                # `gpu=`, like every other producer here: this was the one path spelling it `diag`,
+                # and the consumer reads `gpu` alone. the mismatch is worse than a missing field --
+                # `record_heartbeat` assigns `gpu_status` unconditionally, so an error heartbeat
+                # whose diagnostics land under an unread key CLEARS the snapshot a healthy
+                # heartbeat already stored, losing the evidence exactly when an oom needs it.
+                gpu=gpu_diagnostics(),
             )
         except Exception:
             heartbeat(f"error_{RUN_MODE}", error=detail, **hb_flags, **_err_metrics)
@@ -503,7 +526,7 @@ __all__ = [
     "think_token_count",
     "thinking_text",
     "upload_resume_checkpoint",
-    "validate_lora_target_parameters",
+    "validate_warmstart_adapter",
     "wait_for_gpu",
     "wandb_run_name",
     "write_base_model_provenance",

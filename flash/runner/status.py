@@ -18,7 +18,8 @@ import os
 import time
 
 import flash.runner as runner
-from flash.core.spec import _DROPPED_TOP_LEVEL_KEYS, JobSpec
+from flash.core.spec import JobSpec
+from flash.core.spec_persistence import validate_persisted_spec_envelope
 from flash.runner import RunStatus
 
 # every other collaborator is reached through `runner.` rather than bound here. `RUNS_DIR`,
@@ -29,10 +30,14 @@ from flash.runner import RunStatus
 
 
 def _runstatus_from_json(d: dict) -> RunStatus:
-    # Tolerant load: drop unknown keys before constructing RunStatus. ``resume_seed_index``
-    # from the pre-#317 multi-seed era) -- and `~/.flash/runs/*.json` is never GC'd, so those
-    # files exist in prod RIGHT NOW.
-    return RunStatus(**{k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__})
+    # tolerant load: drop unknown keys before constructing runstatus. source_snapshot is different:
+    # malformed persisted identity must fail closed rather than be treated as a legacy absence.
+    values = {k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__}
+    if d.get("source_snapshot") is not None:
+        from flash.source_snapshot import parse_descriptor
+
+        values["source_snapshot"] = parse_descriptor(d["source_snapshot"]).to_dict()
+    return RunStatus(**values)
 
 
 def _load_status_json(run_id: str) -> dict:
@@ -50,8 +55,33 @@ def get_status(run_id: str) -> RunStatus:
     return runner._runstatus_from_json(runner._load_status_json(run_id))
 
 
+def source_snapshot_from_status(status: RunStatus, *, required: bool = False) -> dict | None:
+    """Return the strict persisted descriptor without ever reconstructing source identity."""
+    raw = status.source_snapshot
+    if raw is None:
+        if required:
+            raise RuntimeError(
+                "managed source identity is unavailable; descriptor-less attempts cannot be replaced"
+            )
+        return None
+    from flash.source_snapshot import parse_descriptor
+
+    return parse_descriptor(raw).to_dict()
+
+
 def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
     """Load the private prepared worker spec, optionally revalidating its source artifact."""
+    managed_revision_keys = {
+        "model_revision",
+        "model_revision_auto",
+        "model_revision_force_pin",
+    }
+    leaked_revision_keys = sorted(managed_revision_keys & set(status.spec))
+    if leaked_revision_keys:
+        raise ValueError(
+            "persisted public spec contains platform-managed model revision key(s): "
+            + ", ".join(leaked_revision_keys)
+        )
     public_spec = JobSpec.from_dict(status.spec)
     snapshot = status.effective_preparation
     if not isinstance(snapshot, dict):
@@ -68,35 +98,18 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     runner._validate_effective_spec(public_spec, worker_spec)
     expected = snapshot.get("adapter_identity")
     stored_digest = snapshot.get("preparation_digest")
-    # A pre-upgrade snapshot hashed since-removed keys into its digest, and `worker_spec` no longer
-    # carries them -- so reproducing that digest needs the values the STORED payload holds.
-    legacy_keys = {k: raw_worker[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_worker}
-    raw_public = status.spec if isinstance(status.spec, dict) else {}
-    legacy_public_keys = {k: raw_public[k] for k in _DROPPED_TOP_LEVEL_KEYS if k in raw_public}
-    legacy_public_alpha = runner._prepared_before_public_alpha(raw_public)
-    # the rollout optimizer batch was renamed, and `from_dict` moves it -- so a snapshot has to be
-    # rehashed under the spelling it actually stored, including a key it did not carry. Each half is
-    # read from its OWN payload, like legacy_keys/legacy_public_keys above: reusing the worker's
-    # reading for the public half would overwrite the stored public value before hashing, and the
-    # parse drops a superseded `batch_size` so `_validate_effective_spec` cannot see it either --
-    # which would leave a tampered public batch neither bound nor compared.
-    stored_rollout_batch = runner._stored_rollout_batch_spelling(raw_worker)
-    stored_public_rollout_batch = runner._stored_rollout_batch_spelling(raw_public)
+    if stored_digest is not None:
+        validate_persisted_spec_envelope(snapshot)
     has_workload_profile = bool(
         worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
-    # the auto-pin marker is excluded from the structural compare (the public half always reads
-    # False by construction), so nothing else here would catch a forged worker-half marker. deploy
-    # reads it to decide whether to relax the authored-pin rejection, which makes it a privilege
-    # decision taken on an otherwise unverified value: a plain grpo/opd run reaches neither branch
-    # below, so a forged marker would skip the 400 and deploy against base weights the run never
-    # trained on. binding it to the digest closes that -- the marker is hashed into the digest at
-    # persist time, so a snapshot claiming one cannot reproduce it.
+    # a runner-managed revision exists only in the worker half, so bind it and its provenance marker
+    # to the preparation digest. a plain grpo or opd run otherwise reaches neither digest branch.
     if has_workload_profile and snapshot.get("workload_profile") != (
         worker_spec.workload_profile or None
     ):
         raise ValueError("persisted workload profile does not match the worker spec")
-    # `gpu_count_auto` is deliberately NOT a trigger here, unlike `model_revision_auto`. The digest
+    # `gpu_count_auto` is deliberately NOT a trigger here, unlike `model_revision_auto`. the digest
     # covers the whole public spec including `gpu.type`, which the allocator legitimately rewrites
     # onto the stored status when a run is provisioned -- so gating on the marker made the digest
     # reject ordinary provisioned runs at deploy. Measured: two specs differing only in whether
@@ -110,16 +123,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     if (has_workload_profile or worker_spec.model_revision_auto) and (
         not isinstance(stored_digest, str)
         or stored_digest
-        != runner._preparation_digest(
-            public_spec,
-            worker_spec,
-            expected,
-            legacy_keys=legacy_keys,
-            legacy_public_keys=legacy_public_keys,
-            legacy_public_alpha=legacy_public_alpha,
-            stored_rollout_batch=stored_rollout_batch,
-            stored_public_rollout_batch=stored_public_rollout_batch,
-        )
+        != runner._preparation_digest(public_spec, worker_spec, expected, stored_public=status.spec)
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
@@ -129,14 +133,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
                 "because its original artifact identity is unavailable"
             )
         if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
-            public_spec,
-            worker_spec,
-            expected,
-            legacy_keys=legacy_keys,
-            legacy_public_keys=legacy_public_keys,
-            legacy_public_alpha=legacy_public_alpha,
-            stored_rollout_batch=stored_rollout_batch,
-            stored_public_rollout_batch=stored_public_rollout_batch,
+            public_spec, worker_spec, expected, stored_public=status.spec
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:
@@ -282,28 +279,83 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
     if not os.path.exists(runner.runs_file_path(run_id, ".json")):
         return
     hb = runner._sanitize_status_value(heartbeat)
-    gpu = (hb.get("gpu") or hb.get("diag")) if isinstance(hb, dict) else None
+    gpu = hb.get("gpu") if isinstance(hb, dict) else None
     with runner._status_guard(run_id):
         try:
             status = runner.get_status(run_id)
         except FileNotFoundError:
             return
+        prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
+        # a boot/retry heartbeat for a NEW attempt must inherit nothing from the previous one: its
+        # metrics are a different run of the steps and its gpu snapshot is a different card.
+        same_attempt = prev is not None and prev.get("attempt") == hb.get("attempt")
         # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
         # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
         # metrics-bearing heartbeat lands.
         if isinstance(hb, dict) and not hb.get("metrics_last"):
-            prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
             prev_metrics = prev.get("metrics_last") if isinstance(prev, dict) else None
-            # only carry the backlog forward within the same attempt; a boot/retry heartbeat for a
-            # new attempt must not inherit the prior attempt's stale per-step metrics.
-            same_attempt = prev is not None and prev.get("attempt") == hb.get("attempt")
             if same_attempt and isinstance(prev_metrics, list) and prev_metrics:
                 hb["metrics_last"] = prev_metrics
         status.last_heartbeat = hb
-        status.gpu_status = gpu if isinstance(gpu, dict) else None
+        # carried forward on the same rule as the metric backlog above, and for the same reason: most
+        # heartbeats carry no `gpu` at all -- only the periodic liveness tick and the terminal ones do
+        # -- so assigning unconditionally blanks the snapshot on every checkpoint-stage heartbeat and
+        # leaves `flash runs status` and the API reporting no GPU for a running job.
+        if isinstance(gpu, dict):
+            status.gpu_status = gpu
+        elif not same_attempt:
+            status.gpu_status = None
         status.updated_at = time.time()
         runner._save_status_unlocked(status)
     runner._report_status(status)
+
+
+def validate_terminal_source_metrics(
+    status: RunStatus,
+    metrics: dict,
+    *,
+    expected_attempt: int | None = None,
+) -> tuple[dict, int | None]:
+    """Require trusted attempt-bound evidence for runs carrying a source descriptor."""
+    if not isinstance(metrics, dict):
+        raise RuntimeError("terminal metrics are invalid")
+    from flash.source_snapshot import (
+        PUBLIC_PROVENANCE_KEY,
+        TERMINAL_ATTESTATION_KEY,
+        safe_public_projection,
+        validate_attestation,
+    )
+
+    sanitized = dict(metrics)
+    raw_attestation = sanitized.pop(TERMINAL_ATTESTATION_KEY, None)
+    sanitized.pop(PUBLIC_PROVENANCE_KEY, None)
+    descriptor = runner.source_snapshot_from_status(status)
+    if descriptor is None:
+        return sanitized, None
+    if expected_attempt is None:
+        remote = status.remote if isinstance(status.remote, dict) else {}
+        candidate = remote.get("attempt")
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+            expected_attempt = candidate
+    if expected_attempt is None:
+        expected_attempt = runner._latest_reserved_attempt(status.run_id)
+    if (
+        isinstance(expected_attempt, bool)
+        or not isinstance(expected_attempt, int)
+        or expected_attempt < 0
+    ):
+        raise RuntimeError("managed attempt identity is unavailable for source attestation")
+    validate_attestation(
+        raw_attestation,
+        descriptor,
+        run_id=status.run_id,
+        attempt=expected_attempt,
+    )
+    sanitized[PUBLIC_PROVENANCE_KEY] = safe_public_projection(
+        descriptor,
+        verified_attempt=expected_attempt,
+    )
+    return sanitized, expected_attempt
 
 
 def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
@@ -368,12 +420,10 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
         ):
             return False
         was_terminal = status.state in runner.TERMINAL_STATES
-        prev_updated_at = status.updated_at
         status.state = state
         status.updated_at = time.time()
-        if state in runner.TERMINAL_STATES and status.finished_at is None:
-            # legacy run already terminal: backfill from prior updated_at, not now.
-            status.finished_at = prev_updated_at if was_terminal else status.updated_at
+        if not was_terminal and state in runner.TERMINAL_STATES and status.finished_at is None:
+            status.finished_at = status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
         runner._save_status_unlocked(status)

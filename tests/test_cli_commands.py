@@ -513,7 +513,11 @@ def test_env_setup_maps_inaccessible_project_to_client_error(monkeypatch) -> Non
     )
 
     with pytest.raises(ClientError, match="not accessible") as excinfo:
-        env_setup._require_setup_project(Namespace(project="11111111-1111-4111-8111-111111111111"))
+        env_setup._require_setup_project(
+            Namespace(project="11111111-1111-4111-8111-111111111111"),
+            api_url="https://flash.freesolo.co",
+            api_key="key-1",
+        )
     assert type(excinfo.value) is ClientError
 
 
@@ -541,9 +545,11 @@ def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypat
     )
 
     resolved = env_setup._require_setup_project(
-        Namespace(project="11111111-1111-4111-8111-111111111111")
+        Namespace(project="11111111-1111-4111-8111-111111111111"),
+        api_url="http://127.0.0.1:8080",
+        api_key="operator-key",
     )
-    assert resolved == "11111111-1111-4111-8111-111111111111"
+    assert resolved == {"id": "11111111-1111-4111-8111-111111111111"}
 
 
 _SCAFFOLD_PROJECT = "11111111-1111-4111-8111-111111111111"
@@ -555,7 +561,11 @@ def _scaffold(monkeypatch, tmp_path, api_url: str | None, *, turn_mode: str | No
 
     from flash.cli.commands.env import setup as env_setup
 
-    monkeypatch.setattr(env_setup, "_require_setup_project", lambda _args: _SCAFFOLD_PROJECT)
+    monkeypatch.setattr(
+        env_setup,
+        "_require_setup_project",
+        lambda _args, **_kwargs: {"id": _SCAFFOLD_PROJECT, "name": "Test"},
+    )
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: (api_url, "key"))
     tmp_path.mkdir(parents=True, exist_ok=True)
     monkeypatch.chdir(tmp_path)
@@ -765,7 +775,11 @@ def test_env_setup_survives_a_retained_starter_it_cannot_decode(
 
     # not through `_scaffold`: its read-back of every written file is itself strict UTF-8, so it
     # would raise on the byte this test just wrote and hide whether the CLI survived.
-    monkeypatch.setattr(env_setup, "_require_setup_project", lambda _args: _SCAFFOLD_PROJECT)
+    monkeypatch.setattr(
+        env_setup,
+        "_require_setup_project",
+        lambda _args, **_kwargs: {"id": _SCAFFOLD_PROJECT, "name": "Test"},
+    )
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("https://plane.example.test", "key")
     )
@@ -931,7 +945,11 @@ def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatc
     )
 
     with pytest.raises(ValueError, match="valid UUID"):
-        env_setup._require_setup_project(Namespace(project="not-a-uuid"))
+        env_setup._require_setup_project(
+            Namespace(project="not-a-uuid"),
+            api_url="http://127.0.0.1:8080",
+            api_key="operator-key",
+        )
 
 
 def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypatch) -> None:
@@ -953,7 +971,11 @@ def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypa
     )
 
     with pytest.raises(ClientError, match=r"--project PROJECT_UUID.*no\s+Freesolo backend"):
-        env_setup._require_setup_project(Namespace(project=""))
+        env_setup._require_setup_project(
+            Namespace(project=""),
+            api_url="http://127.0.0.1:8080",
+            api_key="operator-key",
+        )
 
 
 def test_env_setup_interactive_lists_projects_from_an_operator_backend(monkeypatch) -> None:
@@ -980,7 +1002,29 @@ def test_env_setup_interactive_lists_projects_from_an_operator_backend(monkeypat
     monkeypatch.setattr(env_setup.render, "select_required", lambda _prompt, _options: project_id)
     monkeypatch.setattr("flash.client.get_project", lambda *_a, **_k: {"id": project_id})
 
-    assert env_setup._require_setup_project(Namespace(project="")) == project_id
+    assert env_setup._require_setup_project(
+        Namespace(project=""),
+        api_url="http://127.0.0.1:8080",
+        api_key="operator-key",
+    ) == {"id": project_id}
+
+
+def test_resolve_project_returns_the_canonical_mapping_and_id(monkeypatch) -> None:
+    from flash.client import resolve_project, resolve_project_id
+
+    project_id = "11111111-1111-4111-8111-111111111111"
+    project = {"id": project_id, "name": "Canonical Project"}
+    calls = []
+
+    def _get_project(selected, api_key):
+        calls.append((selected, api_key))
+        return project
+
+    monkeypatch.setattr("flash.client.get_project", _get_project)
+
+    assert resolve_project(project_id, "key-1") == project
+    assert resolve_project_id(project_id, "key-1") == project_id
+    assert calls == [(project_id, "key-1"), (project_id, "key-1")]
 
 
 def test_supplied_project_is_ownership_checked_against_an_operator_backend(monkeypatch) -> None:
@@ -1022,12 +1066,75 @@ def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> No
 
     def _resolve(selected, api_key, selected_api_url):
         seen.update(selected=selected, api_key=api_key, api_url=selected_api_url)
-        return selected
+        return {"id": selected, "name": "Example"}
 
-    monkeypatch.setattr("flash.client.resolve_project_id", _resolve)
+    monkeypatch.setattr("flash.client.resolve_project", _resolve)
 
-    assert env_setup._require_setup_project(Namespace(project="")) == project_id
+    assert env_setup._require_setup_project(
+        Namespace(project=""), api_url=api_url, api_key="key-1"
+    ) == {
+        "id": project_id,
+        "name": "Example",
+    }
     assert seen == {"selected": project_id, "api_key": "key-1", "api_url": api_url}
+
+
+def test_env_setup_interactive_retains_the_selected_project_name(monkeypatch, tmp_path) -> None:
+    from argparse import Namespace
+
+    from flash.cli.commands.env import setup as env_setup
+
+    project_id = "11111111-1111-4111-8111-111111111111"
+    project_name = "Interactive Project"
+    calls = {"load_credentials": 0, "get_project": 0, "fetch_records": 0}
+
+    def _load_credentials():
+        calls["load_credentials"] += 1
+        return "https://flash.freesolo.co", "key-1"
+
+    def _get_project(selected, _key):
+        calls["get_project"] += 1
+        return {"id": selected, "name": project_name}
+
+    def _fetch_records(selected, api_key):
+        calls["fetch_records"] += 1
+        assert (selected, api_key) == (project_id, "key-1")
+        return {"records": [{"input": "trace input", "output": "trace output"}]}
+
+    monkeypatch.setattr("flash.client.config.load_credentials", _load_credentials)
+    monkeypatch.setattr(env_setup, "_setup_interactive", lambda _args: True)
+    monkeypatch.setattr(
+        "flash.client.list_projects", lambda _key: [{"id": project_id, "name": "Listed Name"}]
+    )
+    monkeypatch.setattr(env_setup.render, "select_required", lambda _prompt, _options: project_id)
+    monkeypatch.setattr(env_setup.render, "select", lambda *_a, **_k: "yes")
+    monkeypatch.setattr("flash.client.get_project", _get_project)
+    monkeypatch.setattr(env_setup.traces, "fetch_records", _fetch_records)
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        env_setup.cmd_env_setup(
+            Namespace(
+                project="",
+                yes=False,
+                turn_mode="single",
+                reasoning=False,
+                from_traces=None,
+                trace=None,
+                force=False,
+            )
+        )
+        == 0
+    )
+
+    assert calls == {"load_credentials": 1, "get_project": 1, "fetch_records": 1}
+    assert json.loads((tmp_path / "dataset/train.jsonl").read_text()) == {
+        "input": "trace input",
+        "output": "trace output",
+    }
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
+        assert parsed["wandb"]["project"] == project_name
 
 
 def test_login_shows_who_you_are(monkeypatch, capsys) -> None:
@@ -1215,6 +1322,129 @@ def test_train_dry_run_keeps_compatibility_on_stderr(
     assert call[1]["train"] == {"epochs": 1, "max_examples": 2}
 
 
+def test_train_dry_run_attributes_sft_counts_to_the_managed_environment(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    original_create_run = fake_client.create_run
+
+    def create_run_with_profile(*args, **kwargs):
+        response = original_create_run(*args, **kwargs)
+        response["workload_profile"] = {
+            "environment_id": "owner/project/env",
+            "environment_revision": "a" * 40,
+            "source_examples": 125,
+        }
+        return response
+
+    monkeypatch.setattr(fake_client, "create_run", create_run_with_profile)
+
+    assert _run(["train", str(_train_config(tmp_path)), "--dry-run"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["workload_profile"]["environment_id"] == "owner/project/env"
+    assert payload["workload_profile"]["environment_revision"] == "a" * 40
+    assert (
+        "published environment: owner/project/env @ aaaaaaaaaaaa (125 source rows)" in captured.err
+    )
+    assert "dataset counts come from this resolved published copy, not local files" in captured.err
+    assert "If you expected local dataset edits to be included" in captured.err
+    assert (
+        "run `flash env push --name NAME --project PROJECT_UUID [path]` again for this managed "
+        "environment"
+    ) in captured.err
+
+
+def test_train_dry_run_keeps_inline_records_off_the_published_environment_note(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    """inline rows are already authoritative, so the published-copy warning does not apply."""
+    original_create_run = fake_client.create_run
+
+    def create_run_with_profile(*args, **kwargs):
+        response = original_create_run(*args, **kwargs)
+        response["workload_profile"] = {
+            "environment_id": "owner/project/env",
+            "environment_revision": "a" * 40,
+            "source_examples": 2,
+        }
+        return response
+
+    monkeypatch.setattr(fake_client, "create_run", create_run_with_profile)
+    config = tmp_path / "inline.toml"
+    config.write_text(
+        'model = "Qwen/Qwen3.5-4B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
+        'algorithm = "sft"\n'
+        '[environment]\nid = "owner/project/env"\n'
+        '[environment.params]\nrecords = [{ input = "a", output = "b" }]\n'
+        "[train]\nepochs = 1\nmax_examples = 2\n"
+    )
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["workload_profile"]["source_examples"] == 2
+    assert "published environment:" not in captured.err
+    assert "SFT dataset counts come from" not in captured.err
+    assert "env push" not in captured.err
+
+
+def test_inline_records_are_not_labelled_a_published_copy_in_cost_rows(monkeypatch) -> None:
+    """The cost panel and the provenance note sit within a few lines of each other.
+
+    If only the note learns that the rows came from the request body, the panel above it still
+    reads "source rows in published copy" and the quote contradicts itself in one screen.
+    """
+    from types import SimpleNamespace
+
+    from flash.cli.commands import train_cost
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    profile = {
+        "environment_id": "owner/project/env",
+        "environment_revision": "d" * 40,
+        "source_examples": 9,
+        "retained_examples": 8,
+        "selected_examples": 9,
+    }
+    spec = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        environment=SimpleNamespace(params={"records": [{"input": "x"}]}),
+    )
+
+    rows = dict(train_cost._sft_cost_rows(spec, profile))
+
+    assert "inline records" in rows["examples"]
+    assert "published copy" not in rows["examples"]
+    assert rows["env"] == "resolved environment owner/project/env"
+    assert "published" not in rows["revision"]
+
+
+def test_published_rows_keep_their_published_labels(monkeypatch) -> None:
+    """The inline branch must not relabel an ordinary published quote."""
+    from types import SimpleNamespace
+
+    from flash.cli.commands import train_cost
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    profile = {
+        "environment_id": "owner/project/env",
+        "environment_revision": "e" * 40,
+        "source_examples": 9,
+        "retained_examples": 8,
+        "selected_examples": 9,
+    }
+    spec = SimpleNamespace(model="Qwen/Qwen3.5-4B", environment=SimpleNamespace(params={}))
+
+    rows = dict(train_cost._sft_cost_rows(spec, profile))
+
+    assert "source rows in published copy" in rows["examples"]
+    assert rows["env"] == "published environment owner/project/env"
+    assert "(published commit)" in rows["revision"]
+
+
 def test_train_dry_run_sends_declared_runtime_secrets(
     fake_client, tmp_path, capsys, monkeypatch
 ) -> None:
@@ -1234,66 +1464,6 @@ def test_train_dry_run_sends_declared_runtime_secrets(
 
     assert call[2] == {"SERPAPI_API_KEY": "serp-secret"}
     assert call[3] is True
-
-
-def test_train_dry_run_enriches_legacy_unknown_authored_key_rejection(
-    fake_client, tmp_path, capsys, monkeypatch
-) -> None:
-    from flash.client import ApiError
-
-    detail = "[train] unknown key(s): save_at_steps (allowed: epochs, hf_repo, max_examples)"
-
-    def reject(*_args, **_kwargs):
-        raise ApiError(400, detail)
-
-    monkeypatch.setattr(fake_client, "create_run", reject)
-    # the authored key has to be one THIS algorithm accepts: an sft config authoring a
-    # rollout-only knob is now rejected by the client's own parser, so the request would never
-    # reach the server whose response this test is about.
-    config = _train_config(tmp_path, extra_train="max_steps = 4\nsave_at_steps = [1]\n")
-
-    assert _run(["train", str(config), "--dry-run"]) == 1
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert detail in captured.err
-    assert "save_at_steps (minimum released Flash version 0.2.57)" in captured.err
-    assert "client/server [train] schemas disagree" in captured.err
-
-
-@pytest.mark.parametrize(
-    ("status", "detail"),
-    [
-        (400, "budget precheck rejected this run"),
-        (
-            400,
-            "[train] unknown key(s): structured_outputs (allowed: epochs, hf_repo, max_examples)",
-        ),
-        (
-            400,
-            "[train] unknown key(s): future_knob (allowed: epochs, hf_repo, max_examples)",
-        ),
-        (
-            500,
-            "[train] unknown key(s): save_at_steps (allowed: epochs, hf_repo, max_examples)",
-        ),
-    ],
-)
-def test_train_dry_run_does_not_enrich_unrelated_or_unknown_errors(
-    fake_client, tmp_path, capsys, monkeypatch, status, detail
-) -> None:
-    from flash.client import ApiError
-
-    def reject(*_args, **_kwargs):
-        raise ApiError(status, detail)
-
-    monkeypatch.setattr(fake_client, "create_run", reject)
-    # sft-applicable by necessity: see the enrichment test above.
-    config = _train_config(tmp_path, extra_train="max_steps = 4\nsave_at_steps = [1]\n")
-
-    assert _run(["train", str(config), "--dry-run"]) == 1
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err == f"error: {detail}\n"
 
 
 def test_train_dry_run_authoritative_rejection_keeps_stdout_empty(
@@ -1366,13 +1536,16 @@ def test_status_runs_and_log_command(fake_client, capsys, monkeypatch) -> None:
             {"run_id": "flash-1", "state": "done"},
         ]
     )
-    monkeypatch.setattr(fake_client, "get_run", lambda _run_id: next(statuses))
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
-    assert _run(["runs", "status", "flash-1", "--follow", "--json"]) == 0
-    assert [json.loads(line)["state"] for line in capsys.readouterr().out.splitlines()] == [
-        "running",
-        "done",
-    ]
+    with monkeypatch.context() as patched:
+        # scoped: this iterator holds exactly the two statuses this one assertion consumes, so
+        # letting it stay installed would starve every later command of a status it needs.
+        patched.setattr(fake_client, "get_run", lambda _run_id: next(statuses))
+        patched.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+        assert _run(["runs", "status", "flash-1", "--follow", "--json"]) == 0
+        assert [json.loads(line)["state"] for line in capsys.readouterr().out.splitlines()] == [
+            "running",
+            "done",
+        ]
 
     assert _run(["runs", "log", "flash-1"]) == 0
     out = capsys.readouterr().out
@@ -1380,6 +1553,158 @@ def test_status_runs_and_log_command(fake_client, capsys, monkeypatch) -> None:
     assert "----- console_sft.txt -----" in out
     assert "worker stdout line" in out
     assert "cost_usd" not in out
+
+
+def test_log_labels_previous_attempt_artifacts_after_the_live_attempt_log(
+    fake_client, capsys, monkeypatch
+) -> None:
+    live_heartbeat = {
+        "stage": "rl_step",
+        "step": 4,
+        "ts": 456.0,
+        "attempt": 1,
+        "gpu": {"device_name": "NVIDIA B200"},
+    }
+    fake_client.log_text = _format_heartbeat(live_heartbeat) + "\n"
+    monkeypatch.setattr(
+        fake_client,
+        "get_run",
+        lambda _run_id: {
+            "run_id": "flash-1",
+            "state": "running",
+            "remote": {"attempt": 1},
+            "last_heartbeat": live_heartbeat,
+        },
+    )
+    monkeypatch.setattr(
+        fake_client,
+        "get_worker_output",
+        lambda _run_id: {
+            "console_rl_attempt0.txt": (
+                'HEARTBEAT {"stage":"rl_step","step":0,"attempt":0,'
+                '"gpu":{"device_name":"NVIDIA H200"}}\n'
+            ),
+            "error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n",
+            "raylogs_rl_attempt0.txt": "raylet exited\n",
+        },
+    )
+
+    assert _run(["runs", "log", "flash-1"]) == 0
+    out = capsys.readouterr().out
+
+    live_line = "worker: stage=rl_step attempt=1 step=4"
+    previous_header = (
+        "----- console_rl_attempt0.txt (attempt=0, previous attempt; current attempt=1) -----"
+    )
+    assert live_line in out
+    assert previous_header in out
+    assert (
+        "----- error_rl_attempt0.txt (attempt=0, previous attempt; current attempt=1) -----" in out
+    )
+    assert (
+        "----- raylogs_rl_attempt0.txt (attempt=0, previous attempt; current attempt=1) -----"
+        in out
+    )
+    assert out.index(live_line) < out.index(previous_header)
+    assert 'HEARTBEAT {"stage":"rl_step","step":0,"attempt":0' in out
+
+
+def test_log_still_prints_artifacts_when_the_attempt_lookup_fails(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """A failed status read costs the heading, never the artifacts.
+
+    The artifacts hold the traceback the user ran this command to read. Losing them to a lookup
+    that only decorates a section header would hide the failure behind an unrelated one.
+    """
+    from flash.client import ClientError
+
+    def unavailable(_run_id):
+        raise ClientError("freesolo is unreachable")
+
+    monkeypatch.setattr(fake_client, "get_run", unavailable)
+    monkeypatch.setattr(
+        fake_client,
+        "get_worker_output",
+        lambda _run_id: {"error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n"},
+    )
+
+    assert _run(["runs", "log", "flash-1"]) == 0
+    out = capsys.readouterr().out
+    assert "torch.OutOfMemoryError: CUDA OOM" in out
+    # unlabelled against a live attempt, since none could be established -- but still attributed.
+    assert "----- error_rl_attempt0.txt (attempt=0) -----" in out
+
+
+def test_log_reads_no_status_when_there_are_no_artifacts_to_label(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """The status only names a heading, so with no headings it is never worth a request."""
+    calls: list[str] = []
+
+    def get_run(_run_id):
+        calls.append("get_run")
+        return {"run_id": "flash-1", "state": "running", "remote": {"attempt": 0}}
+
+    monkeypatch.setattr(fake_client, "get_run", get_run)
+    monkeypatch.setattr(fake_client, "get_worker_output", lambda _run_id: {})
+
+    assert _run(["runs", "log", "flash-1"]) == 0
+    capsys.readouterr()
+    assert calls == []
+
+
+def test_log_reads_no_status_and_prints_nothing_when_all_artifacts_are_empty(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """Empty artifact values are not printable sections and must not trigger a status read."""
+    fake_client.log_text = ""
+    calls: list[str] = []
+
+    def get_run(_run_id):
+        calls.append("get_run")
+        return {"run_id": "flash-1", "state": "running", "remote": {"attempt": 1}}
+
+    monkeypatch.setattr(fake_client, "get_run", get_run)
+    monkeypatch.setattr(
+        fake_client,
+        "get_worker_output",
+        lambda _run_id: {
+            "console_rl_attempt1.txt": "",
+            "error_rl_attempt1.txt": "",
+        },
+    )
+
+    assert _run(["runs", "log", "flash-1"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert calls == []
+
+
+def test_log_labels_artifacts_against_a_retry_that_starts_mid_command(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """Artifact acquisition must precede the status snapshot used for its heading."""
+    events: list[str] = []
+
+    def get_worker_output(_run_id):
+        events.append("artifacts")
+        return {"error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n"}
+
+    def get_run(_run_id):
+        events.append("status")
+        return {"run_id": "flash-1", "state": "running", "remote": {"attempt": 1}}
+
+    monkeypatch.setattr(fake_client, "get_worker_output", get_worker_output)
+    monkeypatch.setattr(fake_client, "get_run", get_run)
+
+    assert _run(["runs", "log", "flash-1"]) == 0
+    out = capsys.readouterr().out
+    assert events == ["artifacts", "status"]
+    assert (
+        "----- error_rl_attempt0.txt (attempt=0, previous attempt; current attempt=1) -----" in out
+    )
 
 
 def test_log_prints_partial_log_line_with_newline(fake_client, capsys) -> None:
@@ -1523,7 +1848,7 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
     monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
+    state, printed_any, _ = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
 
     assert state == "done"
     assert printed_any is True
@@ -1532,6 +1857,21 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
     assert "following logs for flash-spin (queued)" in err
     assert "\r" in err
     assert err.endswith("\r")
+
+
+def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> None:
+    class _AttemptClient(_FakeClient):
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            return {"run_id": run_id, "logs": "", "offset": 0, "state": "done"}
+
+        def get_run(self, run_id: str) -> dict:
+            return {"run_id": run_id, "state": "done", "remote": {"attempt": 1}}
+
+    result = cli.commands._poll_logs(_AttemptClient(), "flash-attempt", interval=0)
+
+    assert result == cli.commands._LogPollResult("done", False, 1)
+    assert result.live_attempt == 1
+    assert capsys.readouterr().out == ""
 
 
 def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys) -> None:
@@ -1570,7 +1910,7 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
     monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any = cli.commands._poll_logs(_LaggingLogClient(), "flash-lag", interval=0.2)
+    state, printed_any, _ = cli.commands._poll_logs(_LaggingLogClient(), "flash-lag", interval=0.2)
 
     assert state == "done"
     assert printed_any is False
@@ -1643,7 +1983,7 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
 
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any = cli.commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
+    state, printed_any, _ = cli.commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
 
     assert state == "done"
     assert printed_any is False
@@ -1961,6 +2301,14 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "platform-managed" in opd_text
     # single-turn opd runs fine, so it carries NO multi-turn "fails fast" warning
     assert "fail fast" not in opd_text
+    for name, suffix in (("sft.toml", "sft"), ("rl.toml", "grpo"), ("opd.toml", "opd")):
+        parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
+        assert parsed["wandb"] == {
+            "project": "Test",
+            "run_name": f"{tmp_path.name}-{suffix}",
+        }
+        assert "wandb" not in parsed.get("train", {}), name
+        assert "wandb" not in parsed.get("environment", {}), name
     training = tmp_path / "TRAINING.md"
     assert training.is_file()
     training_text = training.read_text(encoding="utf-8")
@@ -1992,6 +2340,82 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "configs/rl.toml" in out
     assert "configs/opd.toml" in out
     assert "TRAINING.md" in out
+
+
+def test_env_setup_wandb_metadata_escapes_project_and_folder_names(monkeypatch, tmp_path) -> None:
+    project_name = 'Project "quoted" 🚀\nsecond line'
+    folder = tmp_path / 'environment "quoted" 🧪'
+    folder.mkdir()
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda project_id, _api_key: {"id": project_id, "name": project_name},
+    )
+    monkeypatch.chdir(folder)
+
+    assert _run(["env", "setup", "--project", _SCAFFOLD_PROJECT]) == 0
+
+    for name, suffix in (("sft.toml", "sft"), ("rl.toml", "grpo"), ("opd.toml", "opd")):
+        config_text = (folder / "configs" / name).read_text()
+        assert "🚀" in config_text
+        assert "🧪" in config_text
+        parsed = tomllib.loads(config_text)
+        assert parsed["wandb"] == {
+            "project": project_name,
+            "run_name": f"{folder.name}-{suffix}",
+        }
+
+
+@pytest.mark.parametrize(
+    "project_name",
+    [
+        None,
+        42,
+        "",
+        "   ",
+        "invalid/project",
+        "invalid\\project",
+        "invalid#project",
+        "invalid?project",
+        "invalid%project",
+        "invalid:project",
+        "x" * 129,
+    ],
+)
+def test_env_setup_falls_back_to_project_id_for_unusable_wandb_project_names(
+    monkeypatch, tmp_path, project_name
+) -> None:
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda project_id, _api_key: {"id": project_id, "name": project_name},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert _run(["env", "setup", "--project", _SCAFFOLD_PROJECT]) == 0
+
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
+        assert parsed["wandb"]["project"] == _SCAFFOLD_PROJECT
+
+
+def test_env_setup_does_not_backfill_wandb_into_existing_configs(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    project = ["--project", _SCAFFOLD_PROJECT]
+    assert _run(["env", "setup", *project]) == 0
+
+    retained = {}
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        path = tmp_path / "configs" / name
+        before, rest = path.read_text().split("[wandb]\n", 1)
+        _, after = rest.split("[environment]\n", 1)
+        retained[name] = before + "[environment]\n" + after
+        path.write_text(retained[name])
+
+    assert _run(["env", "setup", *project]) == 0
+
+    for name, expected in retained.items():
+        path = tmp_path / "configs" / name
+        assert path.read_text() == expected
+        assert "wandb" not in tomllib.loads(expected)
 
 
 def test_env_setup_does_not_overwrite_existing_evaluations(monkeypatch, tmp_path) -> None:
@@ -2463,6 +2887,46 @@ def test_env_setup_yes_requires_project_before_creating_files(
     monkeypatch.chdir(tmp_path)
     assert _run(["env", "setup", "--yes"]) == 1
     assert "--project PROJECT_UUID is required" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "canonical_fields",
+    [{}, {"name": None}, {"name": 7}, {"name": ""}, {"name": "   "}],
+)
+def test_env_setup_uses_project_id_when_canonical_name_is_unusable(
+    monkeypatch, tmp_path, canonical_fields
+) -> None:
+    monkeypatch.setattr(
+        "flash.client.get_project",
+        lambda project_id, _api_key: {"id": project_id, **canonical_fields},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert _run(["env", "setup", "--project", _SCAFFOLD_PROJECT]) == 0
+
+    for name in ("sft.toml", "rl.toml", "opd.toml"):
+        parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
+        assert parsed["wandb"]["project"] == _SCAFFOLD_PROJECT
+
+
+def test_env_setup_rejects_blank_folder_name_before_writes(monkeypatch, tmp_path, capsys) -> None:
+    from flash.cli.commands.env import setup as env_setup
+
+    class _BlankCwd:
+        name = "   "
+
+    class _Path:
+        @staticmethod
+        def cwd():
+            return _BlankCwd()
+
+    monkeypatch.setattr(env_setup, "Path", _Path)
+    monkeypatch.chdir(tmp_path)
+
+    assert _run(["env", "setup", "--project", _SCAFFOLD_PROJECT]) == 1
+
+    assert "environment folder name must be nonblank" in capsys.readouterr().err
     assert list(tmp_path.iterdir()) == []
 
 

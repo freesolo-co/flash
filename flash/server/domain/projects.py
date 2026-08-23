@@ -58,17 +58,11 @@ def _project_payload_id(payload: Any) -> str:
 
 
 def _payload_project_slug(payload: Any) -> str:
-    """The project slug carried by a validation response, or ``""``.
+    """Return the authoritative project slug carried by a validation response, or ``""``.
 
-    Accepted at the top level or nested under ``project``, and under either spelling, because the
-    internal and user-key validation endpoints return differently shaped bodies.
-
-    The project directory stores no slug column, so no deployment actually sends one of those
-    fields today: the slug is derived from the project's name instead, which the directory does
-    return and holds ``UNIQUE (org_id, name)``. That uniqueness is what makes the derivation a
-    stable identity rather than a guess -- two projects in one org cannot normalize to the same
-    directory. An explicit field still wins when a backend grows one, so this needs no second
-    change to hand authority back.
+    The internal and user-key validation endpoints return differently shaped bodies, so accept the
+    canonical field at the top level or nested under ``project`` and under either current spelling.
+    Project display names are not identity and are never used as a fallback.
     """
     if not isinstance(payload, dict):
         return ""
@@ -81,26 +75,7 @@ def _payload_project_slug(payload: Any) -> str:
             value = source.get(field)
             if isinstance(value, str) and value.strip():
                 return value.strip()
-    for source in candidates:
-        for field in ("projectName", "name"):
-            derived = _slug_from_project_name(source.get(field))
-            if derived:
-                return derived
     return ""
-
-
-def _slug_from_project_name(value: Any) -> str:
-    """The hub directory segment a project ``name`` normalizes to, or ``""``.
-
-    Shares :func:`normalize_env_name_segment` with the name segment so both halves of a published
-    ``<org>/<project>/<name>`` id obey one grammar, and so a name that survives normalization here
-    is one ``publish_slug_for_name`` will accept rather than reject a step later.
-    """
-    from flash.schema import normalize_env_name_segment
-
-    if not isinstance(value, str) or not value.strip():
-        return ""
-    return normalize_env_name_segment(value) or ""
 
 
 def _internal_http_error(*, status: int, raw: bytes, project_id: str) -> HTTPException:
@@ -191,20 +166,11 @@ def require_project_access_slug(
     authorization: str | None,
     org_id: str | None = None,
 ) -> tuple[str, str]:
-    """As :func:`require_project_access`, but also returns the project's non-empty slug.
+    """Validate project access and return its authoritative non-empty slug.
 
-    The slug is the second segment of every environment slug this project publishes, so a caller
-    that asked for one cannot proceed without it. Validation therefore ends here rather than at
-    the publish itself: the destination is unknowable, and the failure has to name that.
-
-    Two ways a slug can come back empty, both of which used to reach ``publish_slug_for_name``
-    and surface as "re-run `flash login` to refresh the key" -- advice that cannot help, because
-    neither cause is the caller's key. A standalone plane has no Freesolo project directory to
-    resolve a slug from and cannot publish to the managed hub at all; on a managed plane the slug
-    is derived from the project's name, so the only remaining way to reach here is a name with no
-    character that survives normalization (``"???"``). Reporting them apart is the point: one is a
-    permanent property of the deployment, the other is fixed by renaming the project -- and the
-    second is actionable by the caller, so it must not be reported as an opaque upstream fault.
+    User keys always pass through the public bearer-authenticated project endpoint first so project
+    scoping is enforced. If that response omits the canonical slug, the existing internal endpoint
+    resolves it for the already-approved project and the verified organization.
     """
     project_id, slug = _project_access(
         project_id=project_id,
@@ -212,23 +178,36 @@ def require_project_access_slug(
         authorization=authorization,
         org_id=org_id,
     )
-    if not slug:
-        if standalone():
+    if slug:
+        return project_id, slug
+    if standalone():
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "publishing environments requires a Freesolo project directory to resolve "
+                "the project slug, which a standalone plane does not have; reference the "
+                "environment from git instead (see SELF_HOSTING.md)"
+            ),
+        )
+
+    if key.get("auth_kind") != "internal":
+        expected_org = str(key.get("org_id") or "").strip()
+        if not expected_org:
             raise HTTPException(
-                status_code=501,
+                status_code=502,
                 detail=(
-                    "publishing environments requires a Freesolo project directory to resolve "
-                    "the project slug, which a standalone plane does not have; reference the "
-                    "environment from git instead (see SELF_HOSTING.md)"
+                    "authenticated Freesolo key is missing the organization id required to "
+                    "resolve the canonical project slug"
                 ),
             )
+        _, slug = _require_internal_project_access(
+            project_id=project_id,
+            org_id=expected_org,
+        )
+    if not slug:
         raise HTTPException(
-            status_code=400,
-            detail=(
-                f"project {project_id!r} has no name that can form a publishable slug, so the "
-                "environment's destination cannot be resolved; rename the project to include "
-                "a letter or digit"
-            ),
+            status_code=502,
+            detail="Freesolo project validation did not return a canonical project slug",
         )
     return project_id, slug
 

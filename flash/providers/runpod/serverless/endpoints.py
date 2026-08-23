@@ -7,25 +7,15 @@ import contextlib
 import os
 import re
 import threading
-from typing import Any
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.providers._lifecycle.worker import (
-    DEFAULT_EXECUTION_TIMEOUT_MS,
-    WORKER_SYSTEM_DEPS,
-    logger,
-    resolve_worker_deps,
-    worker_image_for_gpu,
-)
+from flash.providers._lifecycle.worker import logger
 from flash.providers.base import canonical_gpu, gpu_short
-from flash.providers.runpod.gpus import flash_gpu
 
 # runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
 
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
-
-_ENDPOINT_CACHE: dict[str, Any] = {}
 
 
 def _reset_flash_resource_manager(rm_module) -> None:
@@ -57,6 +47,7 @@ def _train_body(input_data: dict) -> dict:
     """
     import collections
     import contextlib
+    import importlib.util
     import json
     import math
     import os
@@ -71,31 +62,57 @@ def _train_body(input_data: dict) -> dict:
 
     from huggingface_hub import snapshot_download
 
+    try:
+        import source_snapshot as _source_snapshot
+    except ModuleNotFoundError:
+        from flash import source_snapshot as _source_snapshot
+
+    class _TransientSourceFetchError(RuntimeError):
+        flash_retriable = True
+
+    def _percent_pattern(needle):
+        """Regex matching only percent-escape hex digits case-insensitively."""
+        escape_re = re.compile(r"%([0-9A-Fa-f]{2})")
+        parts = []
+        offset = 0
+        for match in escape_re.finditer(needle):
+            parts.append(re.escape(needle[offset : match.start()]))
+            parts.append("%")
+            parts.extend(
+                f"[{char.lower()}{char.upper()}]" if char.isalpha() else char
+                for char in match.group(1)
+            )
+            offset = match.end()
+        parts.append(re.escape(needle[offset:]))
+        return "".join(parts)
+
     def _needles(secrets=None):
-        """The (plain, bounded) credential needle sets for os.environ plus ``secrets``.
+        """Typed value matchers, shape-only needles, and raw values for all known secrets.
 
-        a value at or above the floor is a plain needle, replaced as a substring; a SHORTER one is
-        bounded, matched only where it is not adjacent to a word character. short values used to be
-        dropped outright, which leaked them verbatim -- [environment] secrets accepts any name and
-        any value. plain replacement is not the alternative: a 3-char needle corrupts every
-        diagnostic that merely contains those letters (the value "ati" rewrites "authentication").
+        each value matcher carries ``(needle, bounded, encoded)`` metadata. a value at or above the
+        floor is plain and replaced as a substring; a shorter one is bounded, matched only where it is
+        not adjacent to a word character. short values used to be dropped outright, which leaked them
+        verbatim. plain replacement is not the alternative: a 3-char needle corrupts every diagnostic
+        that merely contains those letters (the value "ati" rewrites "authentication"). a short raw
+        candidate with no alphanumeric or underscore character is shape-only because it is
+        indistinguishable from ordinary punctuation. explicit percent-octet forms remain bounded.
 
-        a multiline secret (a PEM key) never appears whole in any single call: the child's stdout is
-        sanitized one line at a time, so only a component line is ever seen. component lines keep
-        the floor as a hard skip -- a short one is punctuation such as "}", not a credential.
-        Mirrors flash.providers._lifecycle.bootstrap_secrets._needles.
+        a multiline secret never appears whole in any single call: the child's stdout is sanitized one
+        line at a time, so only a component line is ever seen. component lines keep the floor as a hard
+        skip: a short one is punctuation such as "}", not a credential. mirrors
+        flash.providers._lifecycle.bootstrap_secrets._needles.
         """
         import urllib.parse
 
         mapping = {**os.environ, **(secrets or {})}
         # declared runtime secrets can carry any name, so the control plane lists them in
-        # FLASH_SECRET_ENV_KEYS; the name-shape rule stays as the fail-closed fallback.
+        # flash_secret_env_keys; the name-shape rule stays as the fail-closed fallback.
         declared = {
             name.strip().upper()
             for name in str(mapping.get("FLASH_SECRET_ENV_KEYS") or "").split(",")
             if name.strip()
         }
-        plain, bounded = set(), set()
+        matchers, shaped, raw_values = set(), set(), set()
         for key, secret in mapping.items():
             upper = str(key).upper()
             if not secret or not (
@@ -105,34 +122,78 @@ def _train_body(input_data: dict) -> dict:
             ):
                 continue
             value_str = str(secret)
-            target = plain if len(value_str) >= 8 else bounded
-            target.update({value_str, urllib.parse.quote(value_str, safe="")})
+            raw_values.add(value_str)
+            candidates = {(value_str, False)}
+            encoded = urllib.parse.quote(value_str, safe="")
+            if encoded != value_str:
+                candidates.add((encoded, True))
+            if len(value_str) < 8 and not any(char.isalnum() or char == "_" for char in value_str):
+                candidates.add(("".join(f"%{byte:02X}" for byte in value_str.encode()), True))
+            if len(value_str) >= 8:
+                matchers.update(
+                    (candidate, False, is_encoded) for candidate, is_encoded in candidates
+                )
+            else:
+                for candidate, is_encoded in candidates:
+                    if any(char.isalnum() or char == "_" for char in candidate):
+                        matchers.add((candidate, True, is_encoded))
+                    else:
+                        shaped.add(candidate)
             if "\n" in value_str:
                 for raw in value_str.splitlines():
                     if len(line := raw.strip()) >= 8:
-                        plain.update({line, urllib.parse.quote(line, safe="")})
-        return plain, bounded
+                        matchers.add((line, False, False))
+                        encoded_line = urllib.parse.quote(line, safe="")
+                        if encoded_line != line:
+                            matchers.add((encoded_line, False, True))
+        return matchers, shaped, raw_values
 
     def _safe_detail(value, secrets=None, limit=1000):
         text = (
             f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
         )
-        plain, bounded = _needles(secrets)
-        # longest-first so one secret containing another cannot leave a suffix of the longer
-        # one behind; encoded forms cover the percent-encoded urls http and git errors print.
-        for needle in sorted(plain, key=len, reverse=True):
-            text = text.replace(needle, "<redacted>")
-        for needle in sorted(bounded, key=len, reverse=True):
-            # the word guard is applied per EDGE, and only where the needle's own edge is a word
-            # character. a value with a punctuation edge already separates itself from neighbouring
-            # text, and demanding a non-word character beyond it asks the wrong question: "/a"
-            # inside "https://host/a/repo" is preceded by the "t" of "host", so an unconditional
-            # left guard fails and the secret prints verbatim. "ati" keeps both guards and so still
-            # cannot rewrite "authentication".
-            # Mirrors flash.providers._lifecycle.bootstrap_secrets._bounded_pattern.
-            left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""
-            right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
-            text = re.sub(f"{left}{re.escape(needle)}{right}", "<redacted>", text)
+        matchers, shaped, raw_values = _needles(secrets)
+        # protect exact punctuation credentials before a separate value can erase their syntax.
+        for needle in sorted(shaped, key=len, reverse=True):
+            escaped = re.escape(needle)
+            text = re.sub(
+                rf"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)(\s*[:=]\s*)(?:bearer\s+)?{escaped}(?=[\s,;]|$)",
+                lambda match: (
+                    "<redacted>"
+                    if match.group(1) in raw_values
+                    else f"{match.group(1)}{match.group(2)}<redacted>"
+                ),
+                text,
+            )
+            text = re.sub(
+                rf"(?i)\b(bearer)\s+{escaped}(?=[\s,;]|$)",
+                lambda match: "<redacted>" if match.group(1) in raw_values else "Bearer <redacted>",
+                text,
+            )
+        # longest-first across both matcher types so a shorter plain value cannot consume the prefix
+        # of a longer bounded encoded value; encoded forms cover urls http and git errors print.
+        for needle, is_bounded, is_encoded in sorted(
+            matchers, key=lambda item: len(item[0]), reverse=True
+        ):
+            if is_encoded:
+                pattern = _percent_pattern(needle)
+                if is_bounded:
+                    left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""
+                    right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
+                    pattern = f"{left}{pattern}{right}"
+                text = re.sub(pattern, "<redacted>", text)
+            elif is_bounded:
+                # the word guard is applied per edge, and only where the needle's own edge is a word
+                # character. a value with a punctuation edge already separates itself from
+                # neighbouring text, and demanding a non-word character beyond it asks the wrong
+                # question: "/a" inside "https://host/a/repo" is preceded by the "t" of "host", so
+                # an unconditional left guard fails and the secret prints verbatim. "ati" keeps both
+                # guards and so still cannot rewrite "authentication".
+                left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""
+                right = r"(?!\w)" if needle[-1:].isalnum() or needle[-1:] == "_" else ""
+                text = re.sub(f"{left}{re.escape(needle)}{right}", "<redacted>", text)
+            else:
+                text = text.replace(needle, "<redacted>")
         text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
         text = re.sub(
             r"(?i)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)"
@@ -234,6 +295,7 @@ def _train_body(input_data: dict) -> dict:
         def _extra_pip_env() -> tuple[dict[str, str], str | None]:
             env = dict(os.environ)
             env.update(overrides)
+            env.pop("GIT_ASKPASS", None)
             env["GIT_TERMINAL_PROMPT"] = "0"
             askpass = None
             if env.get("GITHUB_TOKEN"):
@@ -250,149 +312,131 @@ def _train_body(input_data: dict) -> dict:
                 env["GIT_ASKPASS"] = askpass
             return env, askpass
 
-        extra_pip = input_data.get("extra_pip") or []
-        if extra_pip:
-            # Network/index-shaped pip failures. A resolution failure ("no matching distribution",
-            # an unsatisfiable pin) reaches the index fine and carries NONE of these, so a bad
-            # package spec still fails fast; only a PyPI blip retries (as the instance bootstrap).
-            pip_transient_re = re.compile(
-                r"(?i)connection (?:broken|reset|aborted|refused|timed out)|read timed out"
-                r"|temporary failure in name resolution|failed to establish a new connection"
-                r"|network is unreachable|remote end closed connection|incompleteread|proxyerror"
-                r"|newconnectionerror|maxretryerror|ssleoferror|service unavailable|bad gateway"
-                r"|gateway time-?out|too many requests|retrying \(retry\("
-                r"|\b(?:429|5\d\d) (?:client|server) error"
-                # a VCS pin fails through git, not urllib, so its blips carry git's own phrasing
-                # and none of the shapes above: git says "could not resolve host" where urllib
-                # says "temporary failure in name resolution", and reports an http status as
-                # "returned error: NNN". On the status form, only 429/5xx: a 404 or 403 is a bad
-                # pin or a missing token and must still fail fast rather than burn three backoffs.
-                r"|returned error: (?:429|5\d\d)|could not resolve (?:host|proxy)"
-            )
-            # Build/resolution failures, which name the cause and outrank a transient warning pip
-            # already recovered from in the same tail; without that precedence one early
-            # "Retrying (Retry(" makes a deterministic failure look retriable and this ladder
-            # repeats it for nothing. Kept identical to the instance bootstrap's _PIP_TERMINAL_RE:
-            # the two classifiers must agree on what is retriable, including excluding the bare
-            # subprocess-exited-with-error marker that a network-interrupted VCS `git clone` also
-            # prints.
-            pip_terminal_re = re.compile(
-                r"(?i)failed building wheel|metadata-generation-failed|could not build wheels"
-                r"|no matching distribution|could not find a version|resolutionimpossible"
-                r"|invalid requirement"
-            )
-            # The subset pip can print having downloaded NOTHING: an unreachable index yields no
-            # candidate versions, so it finishes with exactly the footer a typo'd name produces.
-            # When that footer is the only terminal evidence and the tail also carries a transient
-            # marker, the network explains it and the run retries. Mirrors the bootstrap's
-            # _PIP_NO_CANDIDATE_RE / _is_terminal.
-            pip_no_candidate_re = re.compile(
-                r"(?i)no matching distribution|could not find a version"
-            )
+        def _install_extra_pip() -> None:
+            extra_pip = input_data.get("extra_pip") or []
+            if extra_pip:
+                # Network/index-shaped pip failures. A resolution failure ("no matching distribution",
+                # an unsatisfiable pin) reaches the index fine and carries NONE of these, so a bad
+                # package spec still fails fast; only a PyPI blip retries (as the instance bootstrap).
+                pip_transient_re = re.compile(
+                    r"(?i)connection (?:broken|reset|aborted|refused|timed out)|read timed out"
+                    r"|temporary failure in name resolution|failed to establish a new connection"
+                    r"|network is unreachable|remote end closed connection|incompleteread|proxyerror"
+                    r"|newconnectionerror|maxretryerror|ssleoferror|service unavailable|bad gateway"
+                    r"|gateway time-?out|too many requests|retrying \(retry\("
+                    r"|\b(?:429|5\d\d) (?:client|server) error"
+                    # a VCS pin fails through git, not urllib, so its blips carry git's own phrasing
+                    # and none of the shapes above: git says "could not resolve host" where urllib
+                    # says "temporary failure in name resolution", and reports an http status as
+                    # "returned error: NNN". On the status form, only 429/5xx: a 404 or 403 is a bad
+                    # pin or a missing token and must still fail fast rather than burn three backoffs.
+                    r"|returned error: (?:429|5\d\d)|could not resolve (?:host|proxy)"
+                )
+                # Build/resolution failures, which name the cause and outrank a transient warning pip
+                # already recovered from in the same tail; without that precedence one early
+                # "Retrying (Retry(" makes a deterministic failure look retriable and this ladder
+                # repeats it for nothing. Kept identical to the instance bootstrap's _PIP_TERMINAL_RE:
+                # the two classifiers must agree on what is retriable, including excluding the bare
+                # subprocess-exited-with-error marker that a network-interrupted VCS `git clone` also
+                # prints.
+                pip_terminal_re = re.compile(
+                    r"(?i)failed building wheel|metadata-generation-failed|could not build wheels"
+                    r"|no matching distribution|could not find a version|resolutionimpossible"
+                    r"|invalid requirement"
+                )
+                # The subset pip can print having downloaded NOTHING: an unreachable index yields no
+                # candidate versions, so it finishes with exactly the footer a typo'd name produces.
+                # When that footer is the only terminal evidence and the tail also carries a transient
+                # marker, the network explains it and the run retries. Mirrors the bootstrap's
+                # _PIP_NO_CANDIDATE_RE / _is_terminal.
+                pip_no_candidate_re = re.compile(
+                    r"(?i)no matching distribution|could not find a version"
+                )
 
-            def _pip_is_terminal(output: str) -> bool:
-                if not pip_terminal_re.search(output):
-                    return not pip_transient_re.search(output)
-                if not pip_transient_re.search(output):
-                    return True
-                # a build or resolver failure surviving the footer strip proves pip held real
-                # content, so it stays deterministic; nothing left means the outage explains it.
-                return bool(pip_terminal_re.search(pip_no_candidate_re.sub("", output)))
+                def _pip_is_terminal(output: str) -> bool:
+                    if not pip_terminal_re.search(output):
+                        return not pip_transient_re.search(output)
+                    if not pip_transient_re.search(output):
+                        return True
+                    # a build or resolver failure surviving the footer strip proves pip held real
+                    # content, so it stays deterministic; nothing left means the outage explains it.
+                    return bool(pip_terminal_re.search(pip_no_candidate_re.sub("", output)))
 
-            pip_retry_delays = (3.0, 9.0, 27.0)
-            # held back from a deadline-clamped backoff so the retry it precedes has wall to run in
-            _PIP_RETRY_RESERVE_S = 1.0
-            extra_env, askpass = _extra_pip_env()
-            args = [sys.executable, "-m", "pip", "install", *extra_pip]
-            try:
-                for pip_attempt in range(len(pip_retry_delays) + 1):
-                    _require_deadline_allowance()
-                    tail = collections.deque(maxlen=400)
-                    # errors="replace": a build or VCS child can emit bytes invalid under the
-                    # container's locale, and strict decoding raises mid-stream, failing a paid
-                    # run whose install actually succeeded.
-                    pip_proc = subprocess.Popen(
-                        args,
-                        env=extra_env,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        errors="replace",
-                    )
-                    try:
-                        with pip_proc.stdout:  # tee so a long install streams into the console
-                            for line in pip_proc.stdout:
-                                tail.append(line)
-                                # best-effort: a closed console must not end the drain, or pip is
-                                # left running while the askpass helper below is deleted and the
-                                # console error is reported in place of pip's own exit status.
-                                with contextlib.suppress(OSError, ValueError):
-                                    print(line, end="", flush=True)
-                        rc = pip_proc.wait()
-                    except BaseException:  # never orphan a running pip on a paid box
-                        pip_proc.kill()
-                        pip_proc.wait()
-                        raise
-                    if rc == 0:
-                        break
-                    pip_output = "".join(tail)
-                    if _pip_is_terminal(pip_output):
-                        raise RuntimeError(f"extra_pip install failed: pip exited {rc}")
-                    if pip_attempt >= len(pip_retry_delays):
-                        raise RuntimeError(
-                            f"extra_pip install could not reach the package index after "
-                            f"{pip_attempt + 1} attempts (pip exited {rc})"
+                pip_retry_delays = (3.0, 9.0, 27.0)
+                # held back from a deadline-clamped backoff so the retry it precedes has wall to run in
+                _PIP_RETRY_RESERVE_S = 1.0
+                extra_env, askpass = _extra_pip_env()
+                args = [sys.executable, "-m", "pip", "install", *extra_pip]
+                try:
+                    for pip_attempt in range(len(pip_retry_delays) + 1):
+                        _require_deadline_allowance()
+                        tail = collections.deque(maxlen=400)
+                        # errors="replace": a build or VCS child can emit bytes invalid under the
+                        # container's locale, and strict decoding raises mid-stream, failing a paid
+                        # run whose install actually succeeded.
+                        pip_proc = subprocess.Popen(
+                            args,
+                            env=extra_env,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            errors="replace",
                         )
-                    # reserve a slice for the attempt this backoff precedes: clamping to the
-                    # remaining wall alone sleeps the whole window, so the retry just announced
-                    # never issues and the next pass only fails the deadline precheck.
-                    delay = max(
-                        0.0,
-                        min(
-                            pip_retry_delays[pip_attempt],
-                            _require_deadline_allowance() - _PIP_RETRY_RESERVE_S,
-                        ),
-                    )
-                    # best-effort like the tee above: a console that closed between attempts must
-                    # not end the install with a terminal console error, losing the retry this
-                    # line only announces.
-                    with contextlib.suppress(OSError, ValueError):
-                        print(
-                            f"extra_pip install hit a transient index error; "
-                            f"retrying in {delay:.0f}s",
-                            flush=True,
+                        try:
+                            with pip_proc.stdout:  # tee so a long install streams into the console
+                                for line in pip_proc.stdout:
+                                    tail.append(line)
+                                    # best-effort: a closed console must not end the drain, or pip is
+                                    # left running while the askpass helper below is deleted and the
+                                    # console error is reported in place of pip's own exit status.
+                                    with contextlib.suppress(OSError, ValueError):
+                                        print(line, end="", flush=True)
+                            rc = pip_proc.wait()
+                        except BaseException:  # never orphan a running pip on a paid box
+                            pip_proc.kill()
+                            pip_proc.wait()
+                            raise
+                        if rc == 0:
+                            break
+                        pip_output = "".join(tail)
+                        if _pip_is_terminal(pip_output):
+                            raise RuntimeError(f"extra_pip install failed: pip exited {rc}")
+                        if pip_attempt >= len(pip_retry_delays):
+                            raise RuntimeError(
+                                f"extra_pip install could not reach the package index after "
+                                f"{pip_attempt + 1} attempts (pip exited {rc})"
+                            )
+                        # reserve a slice for the attempt this backoff precedes: clamping to the
+                        # remaining wall alone sleeps the whole window, so the retry just announced
+                        # never issues and the next pass only fails the deadline precheck.
+                        delay = max(
+                            0.0,
+                            min(
+                                pip_retry_delays[pip_attempt],
+                                _require_deadline_allowance() - _PIP_RETRY_RESERVE_S,
+                            ),
                         )
-                    if delay > 0:
-                        time.sleep(delay)
-            finally:
-                if askpass:
-                    with contextlib.suppress(OSError):
-                        os.remove(askpass)
+                        # best-effort like the tee above: a console that closed between attempts must
+                        # not end the install with a terminal console error, losing the retry this
+                        # line only announces.
+                        with contextlib.suppress(OSError, ValueError):
+                            print(
+                                f"extra_pip install hit a transient index error; "
+                                f"retrying in {delay:.0f}s",
+                                flush=True,
+                            )
+                        if delay > 0:
+                            time.sleep(delay)
+                finally:
+                    if askpass:
+                        with contextlib.suppress(OSError):
+                            os.remove(askpass)
 
-        def _code_prefix() -> str:
-            raw = input_data.get("code_prefix")
-            if not isinstance(raw, str) or not raw.strip():
-                raise ValueError("missing code_prefix")
-            prefix = raw.strip().strip("/")
-            parts = prefix.split("/")
-            digest = parts[1] if len(parts) == 3 else ""
-            if (
-                len(parts) != 3
-                or parts[0] != "code"
-                or parts[2] != "flash"
-                or len(digest) != 32
-                or any(c not in "0123456789abcdef" for c in digest)
-            ):
-                raise ValueError(f"invalid code_prefix: {prefix!r}")
-            return prefix
+        def _source_descriptor():
+            return _source_snapshot.parse_descriptor(input_data.get("source_snapshot"))
 
         def _hf_status_code(exc: BaseException) -> int | None:
-            response = getattr(exc, "response", None)
-            code = getattr(response, "status_code", None)
-            try:
-                return int(code)
-            except (TypeError, ValueError):
-                return None
+            return _source_snapshot.response_status_code(exc)
 
         def _hf_retry_after(exc: BaseException) -> float | None:
             response = getattr(exc, "response", None)
@@ -419,13 +463,12 @@ def _train_body(input_data: dict) -> dict:
 
         def _hf_call(call, label: str):
             retry_delays = (1.0, 3.0, 8.0, 20.0, 60.0)
-            transient_status_codes = {429, 500, 502, 503, 504}
             for attempt in range(len(retry_delays) + 1):
                 _require_deadline_allowance()
                 try:
                     return call()
                 except Exception as exc:
-                    if _hf_status_code(exc) not in transient_status_codes or attempt >= len(
+                    if not _source_snapshot.is_transient_fetch_error(exc) or attempt >= len(
                         retry_delays
                     ):
                         raise
@@ -447,46 +490,70 @@ def _train_body(input_data: dict) -> dict:
                         raise exc from None
             raise AssertionError("unreachable")
 
-        def _download_code_prefix(repo_id: str, prefix: str, token: str | None) -> None:
-            from huggingface_hub import HfApi, hf_hub_download
+        def _load_exact_module(code_dir: str, relative_path: str, name: str):
+            path = os.path.join(code_dir, relative_path)
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"could not load downloaded module: {relative_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
 
-            api = HfApi(token=token)
-            files = [
-                entry.path
-                for entry in _hf_call(
-                    lambda: list(
-                        api.list_repo_tree(
-                            repo_id=repo_id,
-                            repo_type="dataset",
-                            path_in_repo=prefix,
-                            recursive=True,
-                            token=token,
-                        )
-                    ),
-                    f"list flash code under {repo_id}:{prefix}",
-                )
-                if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
-            ]
-            if not files:
-                raise RuntimeError(f"no flash code files found under {repo_id}:{prefix}")
-            for filename in files:
-                _hf_call(
-                    lambda filename=filename: hf_hub_download(
+        def _download_source_snapshot(repo_id: str, descriptor, token: str | None) -> str:
+            from huggingface_hub import hf_hub_download
+
+            try:
+                archive_path = _hf_call(
+                    lambda: hf_hub_download(
                         repo_id=repo_id,
                         repo_type="dataset",
-                        filename=filename,
-                        local_dir="/runcode",
+                        filename=descriptor.archive_path,
+                        revision=descriptor.revision,
                         token=token,
                     ),
-                    f"download flash code file {repo_id}:{filename}",
+                    "download pinned flash source snapshot",
                 )
+            except Exception as exc:
+                error_type = (
+                    _TransientSourceFetchError
+                    if _source_snapshot.is_transient_fetch_error(exc)
+                    else RuntimeError
+                )
+                raise error_type("failed to fetch the pinned flash source snapshot") from None
+            destination = str(
+                _source_snapshot.attempt_materialization_path(
+                    "/runcode",
+                    input_data.get("run_id"),
+                    input_data.get("attempt"),
+                )
+            )
+            _source_snapshot.materialize_verified_archive_file(
+                archive_path,
+                descriptor,
+                destination,
+            )
+            return destination
 
-        code_prefix = _code_prefix()
-        _download_code_prefix(input_data["hf_repo"], code_prefix, overrides.get("HF_TOKEN"))
-        code_dir = os.path.join("/runcode", os.path.dirname(code_prefix) or ".")
+        descriptor = _source_descriptor()
+        code_dir = _download_source_snapshot(
+            input_data["hf_repo"], descriptor, overrides.get("HF_TOKEN")
+        )
+        _install_extra_pip()
+        console_module = _load_exact_module(
+            code_dir,
+            "flash/providers/_lifecycle/bootstrap_console.py",
+            "_flash_downloaded_bootstrap_console",
+        )
+        artifact_module = _load_exact_module(
+            code_dir,
+            "flash/adapters/artifacts.py",
+            "_flash_downloaded_artifacts",
+        )
 
         env = dict(os.environ)
         env.update(overrides)
+        env.pop("GITHUB_TOKEN", None)
+        env.pop("GIT_ASKPASS", None)
         # inlined: handler is baked standalone (flash not importable); mirrors the worker cache cleanup.
         if not os.path.isdir("/runpod-volume"):
             for _k in [k for k, v in env.items() if str(v).startswith("/runpod-volume")]:
@@ -499,20 +566,32 @@ def _train_body(input_data: dict) -> dict:
         env.pop("FLASH_JOB_SPEC_JSON", None)
         env["PHASE"] = input_data["phase"]
         env["SEED"] = str(input_data["seed"])
+        env["ATTEMPT"] = str(input_data["attempt"])
         env["PYTHONPATH"] = code_dir + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
 
-        def _upload_console(mode: str) -> None:
-            """Upload the captured console tail for ``mode`` to ``{phase_ns}/{run_id}/
-            console_<mode>.txt`` in the run repo. Idempotent and best-effort, so it is safe to call
-            from both the subprocess-failure path and the missing-metrics crash path: a worker killed
-            without a Python exception (OOM/SIGKILL, segfault, or a silent early exit) writes NO
-            ``error_<mode>.txt``, so the captured console is then the only root-cause record — and a
-            crash that exits 0 would otherwise skip the upload entirely, leaving the failure opaque."""
+        console_teardown = threading.Event()
+
+        def _upload_console(mode: str, final: bool = False) -> bool:
+            """Upload the captured console tail for ``mode`` to the run repo.
+
+            Idempotent and best-effort, so it is safe to call from both the subprocess-failure path
+            and the missing-metrics crash path: a worker killed without a Python exception
+            (OOM/SIGKILL, segfault, or a silent early exit) writes NO ``error_<mode>.txt``, so the
+            captured console is then the only root-cause record -- and a crash that exits 0 would
+            otherwise skip the upload entirely, leaving the failure opaque.
+
+            ``final`` writes the canonical ``console_<mode>.txt`` and closes the live path; live
+            snapshots are attempt-scoped so a retry cannot overwrite the previous attempt's tail.
+            """
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
-                return
+                return False
+            if final:
+                console_teardown.set()
+            elif console_teardown.is_set():
+                return False
             try:
                 from huggingface_hub import HfApi
 
@@ -520,7 +599,7 @@ def _train_body(input_data: dict) -> dict:
                 spec = json.loads(input_data["job_spec_json"])
                 phase_ns = "rl" if spec.get("algorithm") == "grpo" else spec["algorithm"]
                 prefix = f"{phase_ns}/{spec['run_id']}"
-                # Keep the newest bytes only; the uploaded tail's end is never truncated.
+                # keep the newest bytes only; the uploaded tail's end is never truncated.
                 tail_bytes = 64_000
                 with open(console, "rb") as f:
                     f.seek(0, os.SEEK_END)
@@ -547,27 +626,37 @@ def _train_body(input_data: dict) -> dict:
                     if raw[:1] != b"\n":
                         cut = tail.find("\n")
                         tail = tail[cut + 1 :] if cut >= 0 else ""
-                with open(console + ".tail", "w", encoding="utf-8", errors="replace") as f:
+                suffix = ".final.tail" if final else ".live.tail"
+                tail_path = console + suffix
+                with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
                     f.write(_safe_detail(tail, env, 64_000))
                 _require_deadline_allowance()
+                if not final and console_teardown.is_set():
+                    return False
+                attempt = int(env.get("ATTEMPT") or 0)
+                artifact = (
+                    f"console_{mode}.txt"
+                    if final
+                    else artifact_module.attempt_scoped_artifact_name("console", mode, attempt)
+                )
                 HfApi(token=env.get("HF_TOKEN")).upload_file(
-                    path_or_fileobj=console + ".tail",
-                    path_in_repo=f"{prefix}/console_{mode}.txt",
+                    path_or_fileobj=tail_path,
+                    path_in_repo=f"{prefix}/{artifact}",
                     repo_id=input_data["hf_repo"],
                     repo_type="dataset",
                 )
+                return True
             except Exception as e:
                 print("console upload warn:", _safe_detail(e, env))
+                return False
 
         def run_mode(mode: str, check: bool) -> int:
-            """Run worker subprocess, tee console to file, upload tail periodically and on exit."""
+            """run the worker, stream its console, and upload live and terminal tails."""
             console = f"/tmp/console_{mode}.txt"
-            interval = 3600.0
             stop_upload = threading.Event()
 
-            def _upload_loop() -> None:
-                while not stop_upload.wait(interval):
-                    _upload_console(mode)  # best-effort; swallows its own errors
+            def _upload_live() -> bool:
+                return _upload_console(mode)
 
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
@@ -580,7 +669,12 @@ def _train_body(input_data: dict) -> dict:
                     text=True,
                     errors="replace",
                 )
-                uploader = threading.Thread(target=_upload_loop, daemon=True)
+                uploader = threading.Thread(
+                    target=console_module._run_console_upload_loop,
+                    args=(console, 3600.0, stop_upload),
+                    kwargs={"upload": _upload_live},
+                    daemon=True,
+                )
                 uploader.start()
                 try:
                     for line in proc.stdout:
@@ -594,7 +688,7 @@ def _train_body(input_data: dict) -> dict:
                 finally:
                     stop_upload.set()
                     uploader.join(timeout=10)
-            _upload_console(mode)
+            _upload_console(mode, final=True)
             if proc.returncode != 0 and check:
                 raise RuntimeError(
                     f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
@@ -610,14 +704,21 @@ def _train_body(input_data: dict) -> dict:
         run_mode(input_data["phase"], check=False)
         if not os.path.exists("/tmp/metrics.json"):
             phase = input_data["phase"]
-            _upload_console(phase)
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
                 f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
                 f"dataset repo for the full traceback"
             )
         with open("/tmp/metrics.json") as f:
-            return json.load(f)
+            metrics = json.load(f)
+        if not isinstance(metrics, dict):
+            raise RuntimeError("train metrics are invalid")
+        metrics[_source_snapshot.TERMINAL_ATTESTATION_KEY] = _source_snapshot.source_attestation(
+            descriptor,
+            run_id=input_data["run_id"],
+            attempt=input_data["attempt"],
+        )
+        return metrics
     finally:
         deadline_timer.cancel()
 
@@ -702,65 +803,6 @@ def endpoint_name(friendly_gpu: str, suffix: str | None = None) -> str:
     return f"{base}-{safe}" if safe else base
 
 
-def get_train_endpoint(
-    friendly_gpu: str,
-    execution_timeout_ms: int | None = None,
-    name_suffix: str | None = None,
-    disk_gb: int | None = None,
-    spec=None,
-):
-    """Build (and cache) the live Flash endpoint handler for a GPU class."""
-    from runpod_flash import Endpoint
-
-    from flash.core.spec import gpu_count_of
-    from flash.providers.runpod.auth import ensure_auth
-
-    ensure_auth()
-    _patch_runpod_backoff()
-
-    friendly = canonical_gpu(friendly_gpu)
-    name = endpoint_name(friendly, name_suffix)
-    cache_handler = name_suffix is None
-    with FLASH_SDK_LOCK:
-        isolate_flash_state(name_suffix)
-        if cache_handler and name in _ENDPOINT_CACHE:
-            return _ENDPOINT_CACHE[name]
-        kwargs = {
-            "name": name,
-            "gpu": flash_gpu(friendly),
-            # one worker occupies gpu.count cards of this class; count == 1 is the historical path.
-            "gpu_count": gpu_count_of(spec),
-            "min_cuda_version": min_cuda_for(friendly),
-            "execution_timeout_ms": execution_timeout_ms or DEFAULT_EXECUTION_TIMEOUT_MS,
-            "workers": (0, 1),
-        }
-        image = worker_image_for_gpu(friendly, allow_default=False)
-        if image:
-            kwargs["image"] = image
-        else:
-            kwargs["dependencies"] = resolve_worker_deps()
-            kwargs["system_dependencies"] = WORKER_SYSTEM_DEPS
-        # Local import: avoids a jobs<->endpoints import cycle (jobs imports this module).
-        from flash.providers.runpod.jobs import (
-            grow_weight_cache_volumes,
-            weight_cache_endpoint_kwargs,
-        )
-
-        # resize before attach because existing volumes keep their provisioned size.
-        # reread the key after waiting for the lock so resize and Endpoint use the same account.
-        grow_weight_cache_volumes(spec, ensure_auth())
-        kwargs.update(weight_cache_endpoint_kwargs(spec))
-        ep = Endpoint(**kwargs)
-        handler = ep(_train_body)
-        from flash.providers.runpod.jobs import apply_disk_gb
-
-        cfg = ep._build_resource_config()
-        apply_disk_gb(cfg, disk_gb)
-        if cache_handler:
-            _ENDPOINT_CACHE[name] = handler
-        return handler
-
-
 def _run_suffix(run_id: str | None) -> str | None:
     """Stable, collision-free per-run endpoint suffix: sha1(run_id)[:8] with a readable prefix.
 
@@ -774,27 +816,6 @@ def _run_suffix(run_id: str | None) -> str | None:
     h = hashlib.sha1(run_id.encode()).hexdigest()[:8]
     prefix = re.sub(r"[^a-z0-9]", "", run_id.lower())[-12:]
     return f"{prefix}{h}" if prefix else h
-
-
-def stop_endpoint(friendly_gpu: str, name: str | None = None) -> None:
-    """Scale cached endpoint(s) to zero. Only touches in-process cache; use terminate_endpoint for cross-process teardown."""
-    friendly = canonical_gpu(friendly_gpu)
-    prefix = f"flash-{gpu_short(friendly)}"
-    if name:
-        match = [k for k in _ENDPOINT_CACHE if k == name]
-    else:
-        match = [k for k in _ENDPOINT_CACHE if k.startswith(prefix)]
-    for key in match:
-        handler = _ENDPOINT_CACHE.pop(key, None)
-        ep = getattr(handler, "__self__", None) or getattr(handler, "endpoint", None)
-        for meth in ("scale_to_zero", "stop", "delete"):
-            fn = getattr(ep, meth, None)
-            if callable(fn):
-                try:
-                    fn()
-                    break
-                except Exception:
-                    continue
 
 
 def _endpoint_name_matches_run(name: str, target: str) -> bool:
@@ -936,6 +957,4 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
     except Exception as exc:
         logger.warning("REST endpoint cleanup failed for %s: %s", target, exc)
 
-    with contextlib.suppress(Exception):
-        stop_endpoint(friendly, name=target)
     return results

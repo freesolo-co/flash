@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio  # noqa: F401
-import base64
 import contextlib
 import json
 import math
@@ -39,12 +38,9 @@ from flash.providers.runpod.serverless import (  # noqa: F401
     DEFAULT_EXECUTION_TIMEOUT_MS,
     FLASH_SDK_LOCK,
     WORKER_IMAGE,
-    WORKER_SYSTEM_DEPS,
     _patch_runpod_backoff,
-    _train_body,
     isolate_flash_state,
     min_cuda_for,
-    resolve_worker_deps,
     worker_image_for_gpu,
 )
 from flash.providers.runpod.serverless import (
@@ -64,7 +60,6 @@ __all__ = [
     "JobHandle",
     "PollResult",
     "apply_disk_gb",
-    "build_function_input",
     "capacity_escalation_note",
     "capacity_grace_multiplier",
     "decode_output",
@@ -189,12 +184,7 @@ class JobHandle:
         if not isinstance(endpoint_name, str) or not endpoint_name:
             raise ValueError("persisted RunPod endpoint name is invalid")
         fingerprint = d.get("key_fingerprint")
-        if (
-            not isinstance(fingerprint, str)
-            or len(fingerprint) != 16
-            or not fingerprint.startswith("rpk-")
-            or any(char not in "0123456789abcdef" for char in fingerprint[4:])
-        ):
+        if not runpod_api._is_valid_key_fingerprint(fingerprint):
             raise ValueError("persisted RunPod key fingerprint is invalid")
         job_id = d.get("job_id")
         if job_id is not None and (not isinstance(job_id, str) or not job_id):
@@ -216,24 +206,6 @@ def _is_balance_error(exc: Exception) -> bool:
     return "account balance" in str(exc).lower()
 
 
-def build_function_input(payload: dict) -> dict:
-    """The FunctionRequest dict a Flash queue worker expects for `_train_body(payload)`."""
-    if WORKER_IMAGE:
-        return payload
-    from runpod_flash.runtime.serialization import serialize_args
-    from runpod_flash.stubs.live_serverless import get_function_source
-
-    source, _src_hash = get_function_source(_train_body)
-    return {
-        "function_name": "_train_body",
-        "function_code": source,
-        "args": serialize_args((payload,)),
-        "accelerate_downloads": True,
-        "dependencies": resolve_worker_deps(),
-        "system_dependencies": WORKER_SYSTEM_DEPS,
-    }
-
-
 def _safe_failure_text(value: object, limit: int = FAILURE_TEXT_LIMIT) -> str:
     """Redact credentials out of one part of a user-visible RunPod failure detail.
 
@@ -248,7 +220,7 @@ def _safe_failure_text(value: object, limit: int = FAILURE_TEXT_LIMIT) -> str:
 
 
 def decode_output(output) -> dict:
-    """Decode a queue-job output into the worker's metrics dict (handles live-function and baked-image shapes)."""
+    """Decode a queue-job output into the worker's metrics dict."""
     if isinstance(output, str):
         try:
             output = json.loads(output)
@@ -258,20 +230,6 @@ def decode_output(output) -> dict:
             ) from exc
     if not isinstance(output, dict):
         raise RuntimeError(f"unexpected job output type: {type(output)}")
-    if "success" in output or "result" in output:
-        if output.get("success") and output.get("result") is not None:
-            import cloudpickle
-
-            result = cloudpickle.loads(base64.b64decode(output["result"]))
-            if not isinstance(result, dict):
-                raise RuntimeError(f"flash job returned no metrics: {result!r}")
-            return result
-        err = output.get("error") or "unknown worker error"
-        stdout_tail = _safe_failure_text(output.get("stdout") or "")
-        raise RuntimeError(
-            f"Remote execution failed: {_safe_failure_text(err)}\n"
-            f"--- worker stdout tail ---\n{stdout_tail}"
-        )
     if output.get("error"):
         stdout_tail = _safe_failure_text(output.get("stdout") or "")
         msg = f"Remote execution failed: {_safe_failure_text(output['error'])}"
@@ -344,18 +302,20 @@ def submit_run(
     attempt: int = 0,
     runtime_secrets: dict[str, str] | None = None,
     on_last_gpu: bool = False,
-    code_prefix: str | None = None,
+    *,
+    source_snapshot: dict,
     deadline_at: float | None = None,
 ) -> PollResult:
     """Deploy, submit, persist handle via ``on_handle``, and poll to completion."""
     from flash.envs.base import worker_pip_with_extras
     from flash.providers.runpod.serverless import _run_suffix, build_worker_env
-    from flash.runner import flash_code_prefix
+    from flash.source_snapshot import parse_descriptor
 
     deadline_at = require_deadline_at(deadline_at)
     attempt_id = _attempt_int(attempt)
     if attempt_id is None:
         raise ValueError("RunPod attempt identity is invalid")
+    source_descriptor = parse_descriptor(source_snapshot)
     timeout_s = int(require_create_allowance(deadline_at))
     # Per-attempt suffix so a retry lands on a fresh endpoint, not the same throttled/sick host.
     suffix = _run_suffix(spec.run_id)
@@ -381,10 +341,12 @@ def submit_run(
         "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
+        "run_id": spec.run_id,
+        "attempt": attempt_id,
         "seed": spec.seed,
         "env": worker_env,
         "extra_pip": extra_pip,
-        "code_prefix": code_prefix or flash_code_prefix(),
+        "source_snapshot": source_descriptor.to_dict(),
         "deadline_at": deadline_at,
     }
     try:
@@ -392,7 +354,7 @@ def submit_run(
         submitted_ts = time.time()
         job_id = runpod_api.submit_job(
             endpoint_id,
-            build_function_input(payload),
+            payload,
             key_fingerprint=key_fingerprint,
             **deadline_kwargs(runpod_api.submit_job, deadline_at),
         )

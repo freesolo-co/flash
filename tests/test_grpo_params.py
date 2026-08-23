@@ -247,22 +247,22 @@ def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypa
 def test_opt_int_float_reject_bools() -> None:
     """A JSON boolean must NOT silently coerce to a numeric train knob: bool is an int
     subclass in Python, so ``int(True)`` would become 1. JobSpec.from_dict (via
-    _opt_int/_opt_float) rejects it, matching schema._opt_num."""
+    opt_int/opt_float) rejects it, matching schema._opt_num."""
     import pytest
 
-    from flash.core.spec import _opt_float, _opt_int
+    from flash.core.spec_persistence import opt_float, opt_int
 
     for bad in (True, False):
         with pytest.raises(TypeError):
-            _opt_int(bad)
+            opt_int(bad)
         with pytest.raises(TypeError):
-            _opt_float(bad)
+            opt_float(bad)
 
     # Genuine numbers (and None) still parse.
-    assert _opt_int(None) is None
-    assert _opt_int(4) == 4
-    assert _opt_float(None) is None
-    assert _opt_float(0.7) == 0.7
+    assert opt_int(None) is None
+    assert opt_int(4) == 4
+    assert opt_float(None) is None
+    assert opt_float(0.7) == 0.7
 
     # A bool train knob propagates through JobSpec.from_dict as an error, not a 0/1 coercion.
     with pytest.raises(TypeError):
@@ -520,7 +520,7 @@ def test_grpo_rejects_single_generation_group_before_paid_worker() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
 
-    with pytest.raises(ConfigError, match=r"group_size.*>= 2.*GRPO"):
+    with pytest.raises(ConfigError, match=r"group_size.*one of \{2, 4, 8\}.*GRPO"):
         spec_from_dict(
             {**base, "train": {"epochs": 1, "max_examples": 8, "group_size": 1}}, run_id="bad"
         )

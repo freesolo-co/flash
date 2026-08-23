@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.plan.steps import (
     final_save_due,
@@ -13,7 +14,7 @@ from flash.engine.plan.steps import (
     sft_update_steps,
     validate_save_steps,
 )
-from flash.schema import ConfigError, spec_and_train_keys_from_file
+from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 
 _BASE_TOML = """
 model = "Qwen/Qwen3.5-0.8B"
@@ -172,11 +173,12 @@ def test_save_step_validation_rejects_unreachable_runtime_step():
 
 
 @pytest.mark.parametrize("interval", [0, -1, -20])
-def test_nonpositive_save_every_canonicalizes_to_the_unset_sentinel(interval):
-    # the public schema rejects these, but a persisted or internally built spec reaches TrainSpec
-    # directly. without canonicalization the horizon clamp reads a signed interval as one and
-    # checkpoints every optimizer step.
-    assert TrainSpec(save_every=interval).save_every is None
+def test_nonpositive_save_every_is_rejected(interval):
+    with pytest.raises(ValueError, match=r"train\.save_every must be positive"):
+        TrainSpec(save_every=interval)
+
+
+def test_positive_save_every_is_preserved():
     assert TrainSpec(save_every=20).save_every == 20
 
 
@@ -208,6 +210,167 @@ def test_resume_first_companion_retries_without_reuploading_full_state(monkeypat
         4, str(tmp_path), after_upload=publish_once_then_succeed
     )
     assert calls == {"resume": 1, "deployable": 2}
+
+
+def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatch, tmp_path):
+    import flash.engine.worker as worker
+    from flash.engine.worker.io import hf as worker_hf
+
+    secret = "hf_checkpoint_upload_secret"
+    calls = 0
+    heartbeats: list[tuple[str, dict]] = []
+
+    class Api:
+        def upload_folder(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise PermissionError(f"hf quota refused credential {secret} " + "x" * 400)
+
+    monkeypatch.setenv("HF_TOKEN", secret)
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(
+        worker, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+    )
+    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
+
+    assert not worker_hf.upload_resume_checkpoint(50, str(tmp_path))
+
+    failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
+    assert calls == worker_hf._CKPT_UPLOAD_RETRIES
+    assert len(failed) == 1
+    assert failed[0]["step"] == 50
+    failure = failed[0]["checkpoint_failure"]
+    assert failure["step"] == 50
+    assert failure["operation"] == "resume"
+    assert failure["error"].startswith("PermissionError: hf quota refused")
+    assert "<redacted>" in failure["error"]
+    assert secret not in failure["error"]
+    assert len(failure["error"]) <= 300
+
+
+@pytest.mark.parametrize("failure_stage", ["before", "after"])
+def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path, failure_stage):
+    import flash.engine.worker as worker
+    from flash.engine.worker.io import hf as worker_hf
+
+    calls = {"resume": 0, "companion": 0}
+    heartbeats: list[tuple[str, dict]] = []
+
+    class Api:
+        def upload_folder(self, **_kwargs):
+            calls["resume"] += 1
+
+        def list_repo_files(self, **_kwargs):
+            return []
+
+    def fail_companion():
+        calls["companion"] += 1
+        raise RuntimeError(f"{failure_stage} companion failed")
+
+    callbacks = {f"{failure_stage}_upload": fail_companion}
+    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(
+        worker, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+    )
+    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
+
+    with pytest.raises(RuntimeError, match=f"{failure_stage} companion failed"):
+        worker_hf.upload_resume_checkpoint(50, str(tmp_path), **callbacks)
+
+    failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
+    assert calls["companion"] == worker_hf._CKPT_UPLOAD_RETRIES
+    assert calls["resume"] == (0 if failure_stage == "before" else 1)
+    assert len(failed) == 1
+    failure = failed[0]["checkpoint_failure"]
+    assert failure["step"] == 50
+    assert failure["operation"] == failure_stage
+    assert f"{failure_stage} companion failed" in failure["error"]
+
+
+def test_upload_failure_cause_reaches_the_rendered_run_log():
+    """The payload is not the deliverable: `get_logs()` shows only what the formatter renders.
+
+    The formatter emits a fixed list of numeric metric keys, so a stage whose entire content is an
+    explanation rather than a measurement committed the cause and printed `stage=... step=50` alone.
+    """
+    from flash.providers._lifecycle.poll import _format_heartbeat
+
+    line = _format_heartbeat(
+        {
+            "stage": "checkpoint_upload_failed",
+            "step": 50,
+            "checkpoint_failure": {
+                "step": 50,
+                "operation": "resume",
+                "error": "PermissionError: hf quota refused credential <redacted>",
+            },
+        }
+    )
+
+    assert "stage=checkpoint_upload_failed" in line
+    assert "step=50" in line
+    assert "checkpoint_failure_step=50" in line
+    assert "checkpoint_failure_stage=resume" in line
+    assert "checkpoint_error=PermissionError: hf quota refused credential <redacted>" in line
+
+
+def test_a_failure_cause_cannot_rewrite_the_log_it_is_printed_in():
+    """This text is an exception message, so it is not ours: a hook or provider response wrote it.
+
+    The same line already neutralizes child output and sampled completions. Surfacing the cause
+    raw would let a `\\x1b[2J` clear the screen or a `\\r` overwrite the line the user is reading
+    the failure in -- and the failure report is exactly when the log has to stay legible.
+    """
+    from flash.providers._lifecycle.poll import _format_heartbeat
+
+    line = _format_heartbeat(
+        {
+            "stage": "checkpoint_upload_failed",
+            "step": 50,
+            "checkpoint_failure": {
+                "step": 50,
+                "operation": "resume",
+                "error": "boom\x1b[2Jwiped\roverwrite",
+            },
+        }
+    )
+
+    assert "\x1b" not in line
+    assert "\r" not in line
+    assert "checkpoint_error=boom\\x1b[2Jwiped\\x0doverwrite" in line
+
+
+def test_a_heartbeat_without_a_failure_cause_is_unchanged():
+    """The failure fields are additive: an ordinary step line must not grow an empty `error=`."""
+    from flash.providers._lifecycle.poll import _format_heartbeat
+
+    line = _format_heartbeat(
+        {"stage": "sft_step", "step": 12, "error": "   ", "checkpoint_failure": {}}
+    )
+
+    assert line == "worker: stage=sft_step step=12"
+
+
+def test_an_upload_failure_is_critical_so_an_in_flight_commit_cannot_drop_it():
+    """This heartbeat is raised from inside a long HF upload -- when a ping is otherwise dropped.
+
+    `_HB_UPLOAD_IN_FLIGHT` is set for the duration of that upload, and an unforced non-critical
+    stage returns not-due immediately. The failure is reported once and nothing restates it, so the
+    one case that produces this heartbeat is the case that would discard it.
+    """
+    from flash.engine.worker.io.heartbeat import _is_critical_stage, _is_terminal_stage
+
+    assert _is_critical_stage("checkpoint_upload_failed")
+    # criticality and checkpoint carry use one terminal predicate.
+    assert _is_terminal_stage("done")
+    assert _is_terminal_stage("error_oom")
+    assert not _is_terminal_stage("checkpoint_upload_failed")
+    assert _is_critical_stage("done")
+    assert _is_critical_stage("error_oom")
+    assert not _is_critical_stage("sft_step")
+    assert not _is_critical_stage("rl_step")
 
 
 def test_seed_training_rngs_initializes_all_supported_generators(monkeypatch):
@@ -343,9 +506,9 @@ def test_from_dict_rejects_falsy_non_object_train(bad):
         JobSpec.from_dict({"train": bad})
 
 
-def test_from_dict_defaults_omitted_or_null_train_to_empty():
-    assert JobSpec.from_dict({}).seed == FIXED_SEED
-    assert JobSpec.from_dict({"train": None}).train.max_steps is None
+@pytest.mark.parametrize("payload", [{}, {"train": None}, {"train": {}}])
+def test_from_dict_defaults_missing_credit_assignment(payload):
+    assert JobSpec.from_dict(payload).train.credit_assignment == "per_episode"
 
 
 def test_from_dict_rejects_removed_legacy_train_seeds():
@@ -400,3 +563,38 @@ def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
     )
     with pytest.raises(ConfigError, match="platform-managed key"):
         spec_and_train_keys_from_file(str(path))
+
+
+def _spec_with_declared_secret(algorithm: str, secret: str) -> dict:
+    return {
+        "model": "Qwen/Qwen3.5-4B",
+        "algorithm": algorithm,
+        "environment": {"id": "owner/project/env", "secrets": [secret]},
+        "train": {"epochs": 1},
+    }
+
+
+@pytest.mark.parametrize("secret", GRPO_NATIVE_THREAD_ENV)
+@pytest.mark.parametrize("algorithm", ["sft", "opd"])
+def test_non_grpo_authoring_accepts_grpo_native_thread_secrets(algorithm, secret):
+    spec = spec_from_dict(_spec_with_declared_secret(algorithm, secret))
+
+    assert spec.environment.secrets == (secret,)
+
+
+@pytest.mark.parametrize("secret", GRPO_NATIVE_THREAD_ENV)
+def test_grpo_authoring_rejects_native_thread_secrets(secret):
+    with pytest.raises(
+        ConfigError,
+        match=rf"\[environment\] secrets must not include platform-managed key\(s\): {secret}",
+    ):
+        spec_from_dict(_spec_with_declared_secret("grpo", secret))
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "opd", "grpo"])
+def test_all_algorithms_reject_unconditional_control_plane_secrets(algorithm):
+    with pytest.raises(
+        ConfigError,
+        match=r"\[environment\] secrets must not include platform-managed key\(s\): SEED",
+    ):
+        spec_from_dict(_spec_with_declared_secret(algorithm, "SEED"))

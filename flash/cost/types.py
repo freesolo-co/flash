@@ -61,6 +61,12 @@ class RunConfig:
     sft_retained_examples: int | None = None
     # appended for the same positional-constructor reason as sft_retained_examples above.
     providers: tuple[str, ...] = ()
+    # the remaining classes an ordered `[gpu] type` list accepts, after gpu_type takes the head.
+    # allocation cost-ranks the whole acceptable set, so quoting the head alone prices a shape the
+    # run may never be given: an authored ["B200", "H100"] is quoted on B200 while allocate() would
+    # rent the cheaper H100, and the affordability precheck runs on that inflated estimate.
+    # appended for the same positional-constructor reason as the two fields above.
+    gpu_type_fallbacks: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
@@ -87,6 +93,24 @@ class RunConfig:
             if prov != "auto" and prov not in providers_for(exact):
                 raise ValueError(f"provider {prov!r} cannot provision gpu_type {exact!r}")
         object.__setattr__(self, "gpu_type", exact)
+        # canonicalized and validated exactly like the head above, so a quote cannot rank a class the
+        # spec layer would have rejected. deduped against the head and each other because the
+        # ranking loop would otherwise price the same class twice.
+        fallbacks: list[str] = []
+        for entry in self.gpu_type_fallbacks or ():
+            if not isinstance(entry, str):
+                raise TypeError("gpu_type_fallbacks entries must be strings")
+            name = canonical_gpu(entry)
+            info = GPU_INFO.get(name)
+            if info is None or not info.validated:
+                raise ValueError(
+                    f"gpu_type_fallbacks entry {name!r} must name an active validated GPU class"
+                )
+            if name != exact and name not in fallbacks:
+                fallbacks.append(name)
+        if fallbacks and not exact:
+            raise ValueError("gpu_type_fallbacks requires gpu_type")
+        object.__setattr__(self, "gpu_type_fallbacks", tuple(fallbacks))
         if not isinstance(self.model_revision, str):
             raise TypeError("model_revision must be a string")
         object.__setattr__(self, "model_revision", self.model_revision.strip())
@@ -173,8 +197,12 @@ class RunConfig:
                 if self.seq_len is not None
                 else max(1024, rc.max_prompt_len + int(comp))
             )
-            batch = self.batch_size if self.batch_size is not None else rc.prompts_per_step
-            group = self.group_size if self.group_size is not None else rc.group_size
+            if self.is_grpo:
+                batch = self.batch_size if self.batch_size is not None else rc.prompts_per_step
+                group = self.group_size if self.group_size is not None else rc.group_size
+            else:
+                batch = self.batch_size if self.batch_size is not None else rc.prompts_per_step
+                group = self.group_size if self.group_size is not None else rc.group_size
         else:
             seq = self.seq_len
             if seq is None:

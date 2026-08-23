@@ -178,6 +178,78 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
     return False
 
 
+def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
+    """Delete one exact RunPod endpoint without trusting the persisted handle's own metadata."""
+    from flash.providers.runpod import api as runpod_api
+
+    endpoint_id = data.get("endpoint_id")
+    if not isinstance(endpoint_id, str) or not endpoint_id:
+        raise ValueError("persisted RunPod endpoint identity is invalid")
+
+    fingerprint = data.get("key_fingerprint")
+    if canonical is not None:
+        from flash.providers import get_provider
+
+        get_provider("runpod").destroy(canonical)
+        return
+
+    owner_resolved = False
+    try:
+        runpod_api._key_for_fingerprint(fingerprint)
+    except runpod_api.RunpodApiError:
+        if runpod_api._is_prefix_key_fingerprint(fingerprint):
+            try:
+                fingerprint = runpod_api.resolve_prefix_key_fingerprint(endpoint_id, fingerprint)
+            except runpod_api.RunpodApiError:
+                pass
+            else:
+                owner_resolved = True
+    else:
+        owner_resolved = True
+
+    if owner_resolved:
+        if runpod_api.delete_endpoint_for_fingerprint(endpoint_id, fingerprint):
+            return
+        if not runpod_api.endpoint_absent_for_fingerprint(endpoint_id, fingerprint):
+            raise runpod_api.RunpodApiError(f"runpod endpoint {endpoint_id} deletion unconfirmed")
+        return
+
+    by_fingerprint, failed = runpod_api.list_endpoints_by_key(
+        deadline_at=time.time() + _RUNPOD_STATUS_PROBE_TIMEOUT_S
+    )
+    owners = [
+        owner_fingerprint
+        for owner_fingerprint, endpoints in by_fingerprint.items()
+        if any(
+            isinstance(endpoint, dict) and endpoint.get("id") == endpoint_id
+            for endpoint in endpoints
+        )
+    ]
+    if len(owners) > 1:
+        raise runpod_api.RunpodApiError(
+            f"runpod endpoint {endpoint_id} appears in multiple accounts; cleanup unconfirmed"
+        )
+    if not owners:
+        # an inventory over the CONFIGURED keys cannot prove absence. this branch is reached only
+        # when the persisted fingerprint did not resolve, so the owning credential may simply no
+        # longer be in RUNPOD_API_KEY -- "none of my accounts list it" and "it was deleted" are
+        # indistinguishable from here. reporting deletion would let the caller drop the cleanup
+        # record while the unreachable endpoint stays live and billing, so refuse instead and let
+        # the record survive for a later drain that may have the owning key configured again.
+        if failed:
+            raise runpod_api.RunpodApiError(
+                f"runpod endpoint {endpoint_id} owner discovery was incomplete; cleanup unconfirmed"
+            )
+        raise runpod_api.RunpodApiError(
+            f"runpod endpoint {endpoint_id} has no reachable owner account; cleanup unconfirmed"
+        )
+
+    if runpod_api.delete_endpoint_for_fingerprint(endpoint_id, owners[0]):
+        return
+    if not runpod_api.endpoint_absent_for_fingerprint(endpoint_id, owners[0]):
+        raise runpod_api.RunpodApiError(f"runpod endpoint {endpoint_id} deletion unconfirmed")
+
+
 def _strict_teardown_handle(handle, run_id: str) -> bool:
     """Request exact teardown, then prove the captured attempt's worker is gone.
 
@@ -187,22 +259,28 @@ def _strict_teardown_handle(handle, run_id: str) -> bool:
     """
     from flash.providers import INSTANCE_PROVIDERS, get_provider
 
-    handle = _canonical_provider_handle(handle)
-    provider = get_provider(handle.provider)
-    data = handle.to_dict()
-    if handle.provider == "runpod":
-        if data.get("job_id"):
+    raw = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
+    if raw.get("provider") == "runpod":
+        canonical = None
+        with contextlib.suppress(Exception):
+            canonical = _canonical_provider_handle(raw)
+        if canonical is not None and canonical.to_dict().get("job_id"):
             with contextlib.suppress(Exception):
-                provider.cancel(handle)
+                get_provider("runpod").cancel(canonical)
         try:
-            provider.destroy(handle)
+            _delete_runpod_endpoint(raw, canonical)
         except Exception as exc:
-            if _worker_provably_gone(run_id, handle):
+            # malformed legacy handles deliberately cannot use the job-status escape hatch: without
+            # a strict owner identity, only confirmed endpoint deletion may settle teardown.
+            if canonical is not None and _worker_provably_gone(run_id, canonical):
                 return False
             raise RuntimeError(
                 "runpod endpoint deletion could not be confirmed and its worker may still be live"
             ) from exc
         return True
+
+    handle = _canonical_provider_handle(raw)
+    provider = get_provider(handle.provider)
     if handle.provider in INSTANCE_PROVIDERS:
         destroy_error: Exception | None = None
         try:
@@ -233,12 +311,15 @@ def _completed_attempt_metrics(
         return None
     from flash.providers._lifecycle.poll import make_say
     from flash.providers._lifecycle.poll_instance import (
-        _METRICS_AFTER_SUCCESS_RETRIES,
-        _METRICS_AFTER_SUCCESS_WAIT_S,
         _TERMINAL_REREAD_RETRIES,
         _TERMINAL_REREAD_WAIT_S,
-        _read_with_retries,
-        decode_terminal_marker,
+    )
+    from flash.providers._lifecycle.terminal_artifacts import (
+        INVALID_MARKER_DETAIL,
+        AttemptIdentity,
+        ProbeBudget,
+        TerminalKind,
+        resolve_terminal_artifacts,
     )
     from flash.providers.artifacts.hf import make_hf_text_reader
 
@@ -249,62 +330,38 @@ def _completed_attempt_metrics(
     )
     metrics_reader = make_hf_text_reader(spec.train.hf_repo, f"{prefix}/metrics.json")
     say = make_say(log)
-    observation_deadline = time.time() + (_TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S)
-    marker_raw = _read_with_retries(
-        lambda: marker_reader(force=True),
-        tries=_TERMINAL_REREAD_RETRIES,
-        wait_s=_TERMINAL_REREAD_WAIT_S,
+    marker_bound = deadline_at + _RECOVERY_MARKER_GRACE_S
+    # ONE observation window for both artifacts. it previously computed a fresh window for the
+    # marker and then another fresh one for metrics, so the real ceiling was their sum and moved
+    # with however long the marker read took.
+    resolution = resolve_terminal_artifacts(
+        AttemptIdentity(run_id=spec.run_id, attempt=attempt, launch_floor=launch_floor),
+        read_marker=lambda: marker_reader(force=True),
+        read_metrics=lambda: metrics_reader(force=True),
+        budget=ProbeBudget(
+            tries=_TERMINAL_REREAD_RETRIES,
+            wait_s=_TERMINAL_REREAD_WAIT_S,
+            cutoff_at=time.time() + _TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S,
+        ),
         say=say,
-        message="recovery deadline reached; waiting for the terminal attempt marker",
-        deadline_at=observation_deadline,
+        marker_deadline_at=marker_bound,
+        marker_wait_message="recovery deadline reached; waiting for the terminal attempt marker",
+        metrics_message="successful recovery marker seen; waiting for metrics.json",
     )
-    if marker_raw is None:
+    if resolution.kind is TerminalKind.SUCCESS:
+        return resolution.metrics
+    if resolution.kind is TerminalKind.UNVERIFIABLE:
+        # name it the way live polling does instead of logging it as silence. it is still not
+        # completed work, so recovery does not adopt it either way.
+        say(f"recovery: {INVALID_MARKER_DETAIL}; not adopting it as completed work")
         return None
-    try:
-        marker = decode_terminal_marker(
-            marker_raw,
-            run_id=spec.run_id,
-            attempt=attempt,
-            launch_floor=launch_floor,
-            deadline_at=deadline_at + _RECOVERY_MARKER_GRACE_S,
-        )
-    except (TypeError, ValueError):
-        return None
-    if not marker["ok"]:
-        return None
-    metrics_observation_deadline = time.time() + (
-        _METRICS_AFTER_SUCCESS_RETRIES * _METRICS_AFTER_SUCCESS_WAIT_S
-    )
-    metrics_raw = _read_with_retries(
-        lambda: metrics_reader(force=True),
-        tries=_METRICS_AFTER_SUCCESS_RETRIES,
-        wait_s=_METRICS_AFTER_SUCCESS_WAIT_S,
-        say=say,
-        message="successful recovery marker seen; waiting for metrics.json",
-        deadline_at=metrics_observation_deadline,
-    )
-    metrics_grace_expired = time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S
-    if metrics_raw is None:
-        if metrics_grace_expired:
-            return None
+    # a success marker landed but its metrics have not. keep reconciling within the grace window
+    # rather than tearing down an attempt that already finished its paid work.
+    if resolution.kind is TerminalKind.PENDING and time.time() < marker_bound:
         raise _CompletedAttemptPending(
             "successful recovery marker is present but metrics.json is not readable yet"
         )
-    try:
-        metrics = json.loads(metrics_raw)
-    except (TypeError, ValueError) as exc:
-        if metrics_grace_expired:
-            return None
-        raise _CompletedAttemptPending(
-            "successful recovery marker is present but metrics.json is not parseable yet"
-        ) from exc
-    if not isinstance(metrics, dict):
-        if metrics_grace_expired:
-            return None
-        raise _CompletedAttemptPending(
-            "successful recovery marker is present but metrics.json is not an object yet"
-        )
-    return metrics
+    return None
 
 
 def _adopt_completed_attempt(

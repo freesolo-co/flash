@@ -25,15 +25,30 @@ import pytest
 
 from flash.providers._lifecycle import bootstrap as b
 from flash.providers._lifecycle.deadline import deadline_kwargs
+from tests._helpers.source_snapshot import valid_source_snapshot
 
-CODE_PREFIX = "code/0123456789abcdef0123456789abcdef/flash"
+SOURCE_SNAPSHOT = valid_source_snapshot()
+
+
+@pytest.mark.parametrize("arm", ["lambda", "vast"])
+def test_arm_accepts_current_provider_identity(arm):
+    assert b._arm({"flash_arm": arm}) == arm
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [pytest.param({}, id="missing"), {"flash_arm": None}, {"flash_arm": ""}],
+)
+def test_arm_rejects_missing_provider_identity(payload):
+    with pytest.raises(ValueError, match="missing flash_arm"):
+        b._arm(payload)
 
 
 def _sleeping_upload_child():
     time.sleep(60.0)
 
 
-def _sigterm_ignoring_final_upload(payload, _console, _mode, _extra):
+def _sigterm_ignoring_final_upload(payload, _console, _mode, _extra, _final=False):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     payload["ready"].set()
     while True:
@@ -191,28 +206,24 @@ def test_deadline_kwargs_fails_closed_for_uninspectable_callable():
 
 
 # ---------------------------------------------------------------------------
-# _code_prefix validation
+# source descriptor validation
 # ---------------------------------------------------------------------------
-def test_code_prefix_rejects_missing_and_malformed():
-    # Missing / blank / non-str -> "missing code_prefix".
-    for bad in ({}, {"code_prefix": ""}, {"code_prefix": "   "}, {"code_prefix": 123}):
-        with pytest.raises(ValueError, match="missing code_prefix"):
-            b._code_prefix(bad)
+def test_source_descriptor_rejects_missing_and_malformed():
+    with pytest.raises(RuntimeError, match="descriptor"):
+        b._source_descriptor({})
 
-    # Present but structurally invalid -> "invalid code_prefix".
-    invalid = [
-        "code/deadbeef/flash",  # digest too short
-        "code/0123456789abcdef0123456789abcdeZ/flash",  # non-hex char (Z)
-        "notcode/0123456789abcdef0123456789abcdef/flash",  # wrong root segment
-        "code/0123456789abcdef0123456789abcdef/notflash",  # wrong tail segment
-        "code/0123456789abcdef0123456789abcdef",  # only two segments
-    ]
-    for prefix in invalid:
-        with pytest.raises(ValueError, match="invalid code_prefix"):
-            b._code_prefix({"code_prefix": prefix})
+    for field, value in (
+        ("sha256", "a" * 63),
+        ("size", 0),
+        ("revision", "b" * 39),
+        ("archive_path", "source/not-the-digest/flash-source.zip"),
+    ):
+        malformed = dict(SOURCE_SNAPSHOT)
+        malformed[field] = value
+        with pytest.raises(RuntimeError):
+            b._source_descriptor({"source_snapshot": malformed})
 
-    # The valid form round-trips (leading/trailing slashes stripped).
-    assert b._code_prefix({"code_prefix": "/" + CODE_PREFIX + "/"}) == CODE_PREFIX
+    assert b._source_descriptor({"source_snapshot": SOURCE_SNAPSHOT}).to_dict() == SOURCE_SNAPSHOT
 
 
 # ---------------------------------------------------------------------------
@@ -270,8 +281,9 @@ def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(m
         attempts["n"] += 1
         raise _err(status=503, headers={"retry-after": "5"})
 
+    deadline_at = time.time() + 3600.0
     with pytest.raises(_HFError) as ei:
-        b._hf_call(always_503, "list")
+        b._hf_call(always_503, "list", deadline_at=deadline_at)
     assert "boom" in str(ei.value)
     assert attempts["n"] == len(b._HF_RETRY_DELAYS_S) + 1  # initial try + one per delay
     assert sleeps == [5.0] * len(b._HF_RETRY_DELAYS_S)  # Retry-After overrides the default schedule
@@ -285,7 +297,7 @@ def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(m
         raise _err(status=400)
 
     with pytest.raises(_HFError):
-        b._hf_call(bad_request, "list")
+        b._hf_call(bad_request, "list", deadline_at=deadline_at)
     assert calls["n"] == 1
     assert sleeps == []
 
@@ -299,7 +311,7 @@ def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(m
             raise nxt
         return nxt
 
-    assert b._hf_call(flaky, "download") == "ok-result"
+    assert b._hf_call(flaky, "download", deadline_at=deadline_at) == "ok-result"
     assert sleeps == [b._HF_RETRY_DELAYS_S[0]]  # one default-scheduled backoff before the retry
 
 
@@ -340,8 +352,18 @@ def test_hf_upload_targets_prefixed_path_and_swallows_errors(monkeypatch):
             recorded.update(kw)
 
     _install_fake_hf(monkeypatch, HfApi=_Api)
-    payload = {"hf_repo": "org/repo", "hf_prefix": "sft/run", "env": {"HF_TOKEN": "hf-tok"}}
-    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is None
+    created_at = time.time()
+    payload = {
+        "hf_repo": "org/repo",
+        "hf_prefix": "sft/run",
+        "env": {"HF_TOKEN": "hf-tok"},
+        "deadline_at": created_at + 60.0,
+        "run_created_at": created_at,
+        "run_max_wall_seconds": 60.0,
+    }
+    # True only when the artifact landed: the error is swallowed, so a caller tracking what is
+    # already stored would otherwise read a failed upload as success and skip its retry.
+    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is True
     assert recorded["token"] == "hf-tok"
     assert recorded["path_or_fileobj"] == "/tmp/x.txt"
     assert recorded["path_in_repo"] == "sft/run/console.txt"
@@ -357,7 +379,7 @@ def test_hf_upload_targets_prefixed_path_and_swallows_errors(monkeypatch):
             raise RuntimeError("hf 500")
 
     _install_fake_hf(monkeypatch, HfApi=_BoomApi)
-    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is None
+    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is False
 
 
 def test_hf_upload_starts_no_request_at_deadline(monkeypatch):
@@ -378,7 +400,7 @@ def test_hf_upload_starts_no_request_at_deadline(monkeypatch):
         "run_max_wall_seconds": 100.0,
     }
 
-    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is None
+    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is False
     assert calls == []
 
 
@@ -394,13 +416,49 @@ def test_hf_file_exists_delegates_to_api(monkeypatch):
             return kw["filename"].endswith("DONE")
 
     _install_fake_hf(monkeypatch, HfApi=_Api)
-    payload = {"hf_repo": "o/r", "hf_prefix": "p", "env": {"HF_TOKEN": "t"}}
+    created_at = time.time()
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "p",
+        "env": {"HF_TOKEN": "t"},
+        "deadline_at": created_at + 60.0,
+        "run_created_at": created_at,
+        "run_max_wall_seconds": 60.0,
+    }
     assert b.hf_file_exists(payload, "DONE") is True
     assert seen["filename"] == "p/DONE"
     assert seen["repo_id"] == "o/r"
     assert seen["repo_type"] == "dataset"
     assert seen["token"] == "t"
     assert b.hf_file_exists(payload, "metrics.json") is False
+
+
+def test_bootstrap_network_helpers_reject_payload_without_deadline(monkeypatch):
+    calls = []
+
+    class _Api:
+        def __init__(self, token=None):
+            calls.append(("init", token))
+
+    _install_fake_hf(monkeypatch, HfApi=_Api)
+    monkeypatch.setattr(
+        b.bootstrap_pip.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("pip must not start without a run deadline"),
+    )
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "p",
+        "env": {},
+        "extra_pip": ["private-package"],
+    }
+
+    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is False
+    with pytest.raises(RuntimeError, match="run wall deadline"):
+        b.hf_file_exists(payload, "DONE")
+    with pytest.raises(RuntimeError, match="run wall deadline"):
+        b.install_extra_pip(payload)
+    assert calls == []
 
 
 def test_hf_file_exists_starts_no_request_at_deadline(monkeypatch):
@@ -471,35 +529,93 @@ def test_install_extra_pip_starts_no_process_at_deadline(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# fetch_code: empty listing is a hard error
+# fetch_code: pinned download and failure classification
 # ---------------------------------------------------------------------------
-def test_fetch_code_raises_when_no_files_under_prefix(monkeypatch):
-    class _Api:
-        def __init__(self, token=None):
-            pass
-
-        def list_repo_tree(self, **kw):
-            # Only directory/size-less entries -> filtered out -> no downloadable files.
-            return [
-                types.SimpleNamespace(path=CODE_PREFIX, size=None),
-                types.SimpleNamespace(path=None, size=10),
-            ]
-
-    def _dl(**kw):  # pragma: no cover - must never be reached with an empty file set
-        raise AssertionError("should not download when no files are listed")
-
-    _install_fake_hf(monkeypatch, HfApi=_Api, hf_hub_download=_dl)
+def _source_payload() -> dict:
     created_at = b.time.time()
-    payload = {
+    return {
         "hf_repo": "org/repo",
-        "code_prefix": CODE_PREFIX,
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
         "env": {"HF_TOKEN": "t"},
         "deadline_at": created_at + 60.0,
         "run_created_at": created_at,
         "run_max_wall_seconds": 60.0,
     }
-    with pytest.raises(RuntimeError, match="no flash code files"):
-        b.fetch_code(payload)
+
+
+def test_fetch_code_uses_exact_revision_and_verified_file_materialization(monkeypatch):
+    seen = {}
+    events = []
+
+    def download(**kwargs):
+        seen.update(kwargs)
+        events.append("download")
+        return "/tmp/archive.zip"
+
+    _install_fake_hf(monkeypatch, hf_hub_download=download)
+    monkeypatch.setattr(
+        b._source_snapshot,
+        "materialize_verified_archive_file",
+        lambda path, descriptor, destination: events.append(
+            ("materialize", path, descriptor.sha256, destination)
+        ),
+    )
+
+    b.fetch_code(_source_payload())
+
+    assert seen["filename"] == SOURCE_SNAPSHOT["archive_path"]
+    assert seen["revision"] == SOURCE_SNAPSHOT["revision"]
+    assert events == [
+        "download",
+        ("materialize", "/tmp/archive.zip", SOURCE_SNAPSHOT["sha256"], "/runcode/run-1-attempt-0"),
+    ]
+
+
+def test_fetch_code_distinguishes_transport_from_integrity_failure(monkeypatch):
+    monkeypatch.setattr(
+        b,
+        "_hf_call",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError("network down")),
+    )
+    with pytest.raises(b.RetriableBootstrapError, match="pinned flash source"):
+        b.fetch_code(_source_payload())
+
+    _install_fake_hf(monkeypatch, hf_hub_download=lambda **_kwargs: "/tmp/archive.zip")
+    monkeypatch.setattr(b, "_hf_call", lambda call, *_args, **_kwargs: call())
+    monkeypatch.setattr(
+        b._source_snapshot,
+        "materialize_verified_archive_file",
+        lambda *_args: (_ for _ in ()).throw(
+            b._source_snapshot.SourceSnapshotError("integrity failed")
+        ),
+    )
+    with pytest.raises(b._source_snapshot.SourceSnapshotError, match="integrity"):
+        b.fetch_code(_source_payload())
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+def test_fetch_code_http_client_failures_are_terminal(monkeypatch, status):
+    monkeypatch.setattr(
+        b,
+        "_hf_call",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(_err(status=status)),
+    )
+    with pytest.raises(RuntimeError, match="pinned flash source") as raised:
+        b.fetch_code(_source_payload())
+    assert not isinstance(raised.value, b.RetriableBootstrapError)
+
+
+@pytest.mark.parametrize("status", [429, 500, 503, 599])
+def test_fetch_code_http_transient_failures_are_retriable(monkeypatch, status):
+    monkeypatch.setattr(
+        b,
+        "_hf_call",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(_err(status=status)),
+    )
+    with pytest.raises(b.RetriableBootstrapError, match="pinned flash source"):
+        b.fetch_code(_source_payload())
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +749,7 @@ def _run_final_console_upload_inline(
 ):
     assert upload_deadline_at < reaping_deadline_at
     assert upload_deadline_at > b.time.time()
-    b._upload_console_snapshot(payload, console, mode, extra)
+    b._upload_console_snapshot(payload, console, mode, extra, True)
     return True
 
 
@@ -651,7 +767,14 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
 
     monkeypatch.setattr(b.subprocess, "Popen", popen)
 
-    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {}, "code_prefix": CODE_PREFIX}
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
     deadline = b.time.time() + 100
     rc = b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=deadline)
     assert rc == 0
@@ -690,7 +813,9 @@ def test_run_mode_sanitizes_the_echoed_child_line_but_not_the_console_file(monke
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "sft/run",
-        "code_prefix": CODE_PREFIX,
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
         # AWS_SECRET_ACCESS_KEY matches no suffix heuristic, so this covers the declared channel.
         "env": {"FLASH_SECRET_ENV_KEYS": "AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY": secret},
     }
@@ -718,7 +843,14 @@ def test_run_mode_echoes_the_end_of_an_oversized_child_line(monkeypatch, capfd):
     proc = _FakeProc(["x" * 120_000 + "ROOTCAUSE: CUDA OOM\n"], rc=1)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
 
-    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "code_prefix": CODE_PREFIX, "env": {}}
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+        "env": {},
+    }
     b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=b.time.time() + 100)
 
     echoed = capfd.readouterr().out
@@ -769,7 +901,9 @@ def test_run_mode_caps_the_worker_at_the_declared_wall_budget(monkeypatch):
         "hf_repo": "o/r",
         "hf_prefix": "profile/run",
         "env": {},
-        "code_prefix": CODE_PREFIX,
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
         "run_max_wall_seconds": budget,
     }
     assert b.run_mode(payload, {}, "profile", deadline_ts=deadline) == 0
@@ -801,7 +935,9 @@ def test_run_mode_leaves_a_deadline_already_inside_the_budget_alone(monkeypatch)
         "hf_repo": "o/r",
         "hf_prefix": "sft/run",
         "env": {},
-        "code_prefix": CODE_PREFIX,
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
         "run_max_wall_seconds": 3600.0,
     }
     assert b.run_mode(payload, {}, "sft", deadline_ts=deadline) == 0
@@ -832,7 +968,7 @@ def test_run_mode_reaps_uploader_before_base_exception_propagates(monkeypatch, w
     )
 
     with pytest.raises(type(wait_error)) as raised:
-        b.run_mode({}, {}, "sft", deadline_ts=b.time.time() + 100)
+        b.run_mode({"attempt": 0, "run_id": "run-1"}, {}, "sft", deadline_ts=b.time.time() + 100)
 
     assert raised.value is wait_error
     assert stop_upload.is_set()
@@ -852,6 +988,9 @@ def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeyp
     created_at = b.time.time()
     payload = {
         "phase": "sft",
+        "attempt": 0,
+        "run_id": "run-1",
+        "source_snapshot": SOURCE_SNAPSHOT,
         "run_created_at": created_at,
         "run_max_wall_seconds": 100.0,
         "deadline_at": created_at + 100.0,
@@ -1084,7 +1223,14 @@ def test_run_mode_reaps_final_uploader_before_terminal_marker_reserve(monkeypatc
         "Popen",
         lambda *args, **kwargs: _FakeProc(["done\n"], rc=0),
     )
-    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {}, "code_prefix": CODE_PREFIX}
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
 
     assert b.run_mode(payload, {}, "sft", deadline_ts=deadline) == 0
 
@@ -1172,7 +1318,14 @@ def test_run_mode_drains_delayed_terminal_output_before_upload(monkeypatch):
     monkeypatch.setattr(b, "hf_upload", upload)
     proc = _FakeProc(_DelayedOutput(), rc=0)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *args, **kwargs: proc)
-    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {}, "code_prefix": CODE_PREFIX}
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
 
     assert b.run_mode(payload, {}, "sft", deadline_ts=b.time.time() + 20) == 0
 
@@ -1230,7 +1383,14 @@ def test_run_mode_reaps_periodic_uploader_before_terminal_marker_reserve(monkeyp
         "Popen",
         lambda *args, **kwargs: _FakeProc(["hello\n"], rc=0),
     )
-    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {}, "code_prefix": CODE_PREFIX}
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
 
     assert b.run_mode(payload, {}, "sft", deadline_ts=deadline) == 0
 
@@ -1338,7 +1498,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
-        "code_prefix": CODE_PREFIX,
+        "source_snapshot": SOURCE_SNAPSHOT,
         "run_id": "run",
         "run_created_at": started_at,
         "run_max_wall_seconds": deadline - started_at,
@@ -1581,7 +1741,14 @@ def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
     proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
 
-    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {}, "code_prefix": CODE_PREFIX}
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
     with pytest.raises(TimeoutError, match="wall-clock cap"):
         b.run_mode(payload, {}, "grpo", deadline_ts=b.time.time() + 100)
     assert proc.killed is True  # the child was killed on the deadline
@@ -1594,7 +1761,14 @@ def test_run_mode_starts_no_subprocess_at_deadline(monkeypatch):
         "Popen",
         lambda *args, **kwargs: pytest.fail("worker process must not start at the deadline"),
     )
-    payload = {"hf_repo": "o/r", "hf_prefix": "sft/run", "env": {}, "code_prefix": CODE_PREFIX}
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
 
     with pytest.raises(TimeoutError, match="wall-clock cap"):
         b.run_mode(payload, {}, "sft", deadline_ts=200.0)
@@ -1611,7 +1785,7 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
-        "code_prefix": CODE_PREFIX,
+        "source_snapshot": SOURCE_SNAPSHOT,
         "run_id": "run",
         "run_created_at": 100.0,
         "run_max_wall_seconds": 400.0,
@@ -1648,11 +1822,46 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
     assert b.main() == 0
     assert events[:4] == [
         ("watchdog", 500.0),
-        "install",
         "code",
+        "install",
         ("training", 500.0),
     ]
     assert events[-2:] == ["deadline_done", "deadline_cancel"]
+
+
+def test_main_source_verification_failure_prevents_pip(monkeypatch):
+    events = []
+    payload = {
+        **_source_payload(),
+        "extra_pip": ["private-package"],
+        "run_created_at": 100.0,
+        "run_max_wall_seconds": 400.0,
+        "deadline_at": 500.0,
+    }
+
+    class _Done:
+        def set(self):
+            return None
+
+    class _Timer:
+        def cancel(self):
+            return None
+
+    monkeypatch.setattr(b.time, "time", lambda: 100.0)
+    monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "arm_deadline_watchdog", lambda *_args: (_Timer(), _Done()))
+    monkeypatch.setattr(
+        b,
+        "fetch_code",
+        lambda _payload: (_ for _ in ()).throw(
+            b._source_snapshot.SourceSnapshotError("source verification failed")
+        ),
+    )
+    monkeypatch.setattr(b, "install_extra_pip", lambda _payload: events.append("pip"))
+    monkeypatch.setattr(b, "write_attempt_marker", lambda *_args, **_kwargs: None)
+
+    assert b.main() == 1
+    assert events == []
 
 
 @pytest.mark.parametrize("boundary", ["run_mode", "remote_confirmation"])
@@ -1669,7 +1878,7 @@ def test_main_accepts_required_completion_artifacts_at_deadline(monkeypatch, bou
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
-        "code_prefix": CODE_PREFIX,
+        "source_snapshot": SOURCE_SNAPSHOT,
         "run_id": "run",
         "run_created_at": 100.0,
         "run_max_wall_seconds": 100.0,
@@ -1768,6 +1977,7 @@ def test_write_attempt_marker_preserves_success_after_deadline(monkeypatch):
         "run_created_at": 100.0,
         "run_max_wall_seconds": 100.0,
         "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
     }
 
     b.write_attempt_marker(payload, ok=True)
@@ -1778,6 +1988,8 @@ def test_write_attempt_marker_preserves_success_after_deadline(monkeypatch):
     assert marker["retriable"] is False
     assert marker["error"] == ""
     assert marker["ts"] == 205.0
+    assert marker["source_attestation"]["sha256"] == SOURCE_SNAPSHOT["sha256"]
+    assert marker["source_attestation"]["attempt"] == 3
 
 
 def test_write_attempt_marker_rejects_noncanonical_deadline(monkeypatch):
@@ -1931,6 +2143,50 @@ def test_run_preload_records_download_failure(tmp_path, monkeypatch):
 _PAYLOAD_SECRET = "wandb-local-9f3ac1d2e4b5f7a8"
 
 
+def test_periodic_console_snapshot_cannot_clobber_the_terminal_one(tmp_path, monkeypatch):
+    """the periodic uploader is reaped at teardown, but reaping is best-effort under deadline
+    pressure: a periodic child killed mid-write must not truncate the terminal scratch file or
+    overwrite the terminal artifact the control plane reads as the failure detail."""
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    uploads: list[tuple] = []
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: uploads.append((path, sub)) or True)
+    console = tmp_path / "console_sft.txt"
+    console.write_text(f"training step 1 {_PAYLOAD_SECRET}\n")
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "attempt": 3,
+        "env": {"WANDB_API_KEY": _PAYLOAD_SECRET},
+    }
+    cap = "\n--- bootstrap: mode 'sft' hit the wall-clock cap; killed ---\n"
+
+    assert b._upload_console_snapshot(payload, str(console), "sft") is True
+    assert b._upload_console_snapshot(payload, str(console), "sft", cap, True) is True
+
+    live_path, live_name = uploads[0]
+    terminal_path, terminal_name = uploads[1]
+    # distinct scratch files and distinct destinations, so neither write can reach the other.
+    assert (live_path, terminal_path) != (terminal_path, terminal_path)
+    assert live_path == str(console) + "_attempt3.tail"
+    assert terminal_path == str(console) + ".tail"
+    # the terminal artifact keeps the canonical name the control plane reads; the live one takes the
+    # attempt-scoped name it reads separately. bootstrap.py cannot import flash, so the inlined
+    # format is pinned against the canonical helper here rather than trusted to stay in step.
+    from flash.adapters.artifacts import attempt_scoped_artifact_name
+
+    assert live_name == attempt_scoped_artifact_name("console", "sft", 3)
+    assert terminal_name == "console_sft.txt"
+    # only the terminal artifact carries the wall-clock-cap evidence, and it survives intact.
+    terminal_tail = (tmp_path / "console_sft.txt.tail").read_text()
+    live_tail = (tmp_path / "console_sft.txt_attempt3.tail").read_text()
+    assert "hit the wall-clock cap" in terminal_tail
+    assert "hit the wall-clock cap" not in live_tail
+    # both are sanitized: the split must not create an unredacted path.
+    assert _PAYLOAD_SECRET not in terminal_tail
+    assert _PAYLOAD_SECRET not in live_tail
+    assert "training step 1 <redacted>" in terminal_tail
+
+
 def test_console_snapshot_redacts_a_payload_env_secret(tmp_path, monkeypatch):
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
     uploads: list[tuple] = []
@@ -1949,13 +2205,13 @@ def test_console_snapshot_redacts_a_payload_env_secret(tmp_path, monkeypatch):
 
     b._upload_console_snapshot(payload, str(console), "sft")
 
-    tail = (tmp_path / "console_sft.txt.tail").read_text()
+    tail = (tmp_path / "console_sft.txt_attempt0.tail").read_text()
     assert _PAYLOAD_SECRET not in tail
     assert "RuntimeError: wandb login rejected <redacted>" in tail
     # the surrounding traceback is the whole point of the upload; redaction must not eat it.
     assert "Traceback (most recent call last):" in tail
     assert '  File "train.py", line 7, in <module>' in tail
-    assert uploads == [(str(console) + ".tail", "console_sft.txt")]
+    assert uploads == [(str(console) + "_attempt0.tail", "console_sft_attempt0.txt")]
 
 
 def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
@@ -2014,6 +2270,65 @@ def test_safe_detail_redacts_overlapping_secrets_longest_first():
     )
 
     assert detail == "rejected: <redacted> and <redacted>"
+
+
+def test_safe_detail_preserves_punctuation_for_wordless_short_secret():
+    assert b._safe_detail("module.py: failed at /tmp/a.py", secrets={"PIN": "."}) == (
+        "module.py: failed at /tmp/a.py"
+    )
+
+
+def test_safe_detail_redacts_wordless_short_secret_in_keyed_syntax():
+    assert b._safe_detail("token=.", secrets={"PIN": "."}) == "token=<redacted>"
+
+
+def test_safe_detail_redacts_declared_wordless_values_by_exact_shape():
+    secrets = {"KEYED_PIN": ";", "BEARER_PIN": "!"}
+
+    assert b._safe_detail("token=;", secrets=secrets) == "token=<redacted>"
+    assert b._safe_detail("Bearer !", secrets=secrets) == "Bearer <redacted>"
+
+
+def test_safe_detail_protects_shape_before_overlapping_values():
+    detail = b._safe_detail("token=;", secrets={"KEY": "token", "PIN": ";"})
+    assert detail == "<redacted>"
+    assert ";" not in detail
+
+    detail = b._safe_detail("Bearer !", secrets={"KEY": "Bearer", "PIN": "!"})
+    assert detail == "<redacted>"
+    assert "!" not in detail
+
+
+def test_safe_detail_redacts_percent_octets_without_folding_literal_case():
+    for secret, encoded in ((".", "%2E"), ("-", "%2D"), ("~", "%7E"), ("/", "%2f")):
+        assert b._safe_detail(f"encoded {encoded}", secrets={"PIN": secret}) == (
+            "encoded <redacted>"
+        )
+
+    secrets = {"PIN": "A/B"}
+    assert b._safe_detail("encoded A%2fB", secrets=secrets) == "encoded <redacted>"
+    assert b._safe_detail("encoded a%2fb", secrets=secrets) == "encoded a%2fb"
+
+    for secret, case_variant in (
+        ("A%2FB", "A%2fB"),
+        ("literal%2Fsecret", "literal%2fsecret"),
+    ):
+        assert b._safe_detail(f"literal {secret}", secrets={"PIN": secret}) == (
+            "literal <redacted>"
+        )
+        assert b._safe_detail(f"literal {case_variant}", secrets={"PIN": secret}) == (
+            f"literal {case_variant}"
+        )
+
+
+def test_safe_detail_redacts_cross_group_encoded_overlap():
+    secrets = {"LONG_TOKEN": "a%2Fb%2B", "SHORT_TOKEN": "a/b+c&d"}
+
+    detail = b._safe_detail("fetch failed for a%2Fb%2Bc%26d", secrets=secrets)
+
+    assert detail == "fetch failed for <redacted>"
+    for secret in ("a%2Fb%2B", "c%26d", "a/b+c&d"):
+        assert secret not in detail
 
 
 def test_safe_detail_redacts_each_line_of_a_multiline_secret():
@@ -2214,7 +2529,7 @@ def test_console_snapshot_drops_the_truncated_first_line_before_redacting(tmp_pa
 
     b._upload_console_snapshot(payload, str(console), "sft")
 
-    tail = (tmp_path / "console_sft.txt.tail").read_text()
+    tail = (tmp_path / "console_sft.txt_attempt0.tail").read_text()
     assert secret not in tail
     for fragment_length in range(6, len(secret)):
         assert secret[-fragment_length:] not in tail
@@ -2238,7 +2553,15 @@ def test_hf_call_retry_log_redacts_payload_secrets(monkeypatch, capsys):
             raise error
         return "ok"
 
-    assert b._hf_call(call, "download spec", secrets=b._payload_secrets(payload)) == "ok"
+    assert (
+        b._hf_call(
+            call,
+            "download spec",
+            deadline_at=time.time() + 3600.0,
+            secrets=b._payload_secrets(payload),
+        )
+        == "ok"
+    )
     printed = capsys.readouterr().out
     assert secret not in printed
     assert "<redacted>" in printed

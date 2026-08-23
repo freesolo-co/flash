@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 from dataclasses import dataclass, field
+from math import ceil
 
 from tests._helpers.profile import satisfy_sft_profile
 
@@ -61,25 +62,122 @@ def test_oversized_catalog_models_carry_disk_floors():
     assert MODELS["Qwen/Qwen3.6-35B-A3B"].min_disk_gb == 200
 
 
-def test_submit_raises_disk_to_model_min(monkeypatch):
-    """submit_job (dry-run) bumps gpu.disk_gb to a catalog model's min_disk_gb."""
+def test_every_catalog_algorithm_gets_the_full_bf16_merge_floor():
+    from flash.core.catalog import MODELS, resolve_model
+
+    for model in MODELS.values():
+        expected = max(model.min_disk_gb, ceil(model.params_b * 2) * 3 + 64)
+        for algorithm in model.algos:
+            assert resolve_model(model.id, algorithm).min_disk_gb == expected
+
+
+def test_merge_floor_covers_the_concurrent_publish_peak():
+    """The floor must fit the three full model copies a publish holds at once.
+
+    Publishing overlaps training, so the container disk carries the checkpoint being merged, the
+    next checkpoint training is writing, and the merger's full-model output -- and verl saves the
+    whole `state_dict`, not the lora delta. Budgeting one copy is what let a 35B run train both of
+    its steps and then die at publish with 24.98 GB free on a 200 GB disk.
+
+    Asserted as an inequality against the modelled peak rather than by restating the formula: a
+    test that recomputes `ceil(p*2)*3+64` passes for any multiplier, including the one that failed.
+    """
+    from flash.core.catalog import MODELS, resolve_model
+
+    for model in MODELS.values():
+        for algorithm in model.algos:
+            resolved = resolve_model(model.id, algorithm)
+            one_copy_gb = ceil(resolved.params_b * 2)
+            # published checkpoint + concurrently-written next checkpoint + merged output.
+            assert resolved.min_disk_gb >= one_copy_gb * 3
+
+
+def test_public_model_rows_report_the_derived_merge_floor():
+    from flash.core.catalog import MODELS, public_model_rows
+
+    rows = {row["id"]: row for row in public_model_rows()}
+    for model in MODELS.values():
+        expected = max(model.min_disk_gb, ceil(model.params_b * 2) * 3 + 64)
+        assert rows[model.id]["min_disk_gb"] == expected
+
+
+def test_fractional_parameter_merge_floor_rounds_up(monkeypatch):
+    from flash.core.catalog import MODELS, ModelInfo, resolve_model
+
+    model = ModelInfo(
+        id="test/fractional-disk",
+        display_name="fractional",
+        params="0.9B",
+        params_b=0.9,
+        algos=("sft",),
+        min_vram_gb=1,
+    )
+    monkeypatch.setitem(MODELS, model.id, model)
+
+    # ceil(0.9 * 2) == 2 rounds up before it is tripled, not after.
+    assert resolve_model(model.id, "sft").min_disk_gb == 70
+
+
+def test_moe_merge_floor_uses_total_parameters(monkeypatch):
+    from flash.core.catalog import MODELS, ModelInfo, resolve_model
+
+    model = ModelInfo(
+        id="test/moe-disk",
+        display_name="moe",
+        params="35B total / 3B active",
+        params_b=35.0,
+        active_params_b=3.0,
+        algos=("sft", "grpo", "opd"),
+        min_vram_gb=1,
+    )
+    monkeypatch.setitem(MODELS, model.id, model)
+
+    # sized on total parameters: the checkpoint and the merged output are dense full-model copies,
+    # so the active-parameter count does not bound what lands on disk.
+    assert resolve_model(model.id, "opd").min_disk_gb == 274
+
+
+def test_revision_geometry_is_applied_before_the_disk_floor(monkeypatch):
+    from flash.core.catalog import MODELS, ModelInfo, resolve_model
+    from flash.engine.plan import vram
+
+    model = ModelInfo(
+        id="test/revision-disk",
+        display_name="revision",
+        params="4B",
+        params_b=4.0,
+        algos=("sft",),
+        min_vram_gb=1,
+    )
+    monkeypatch.setitem(MODELS, model.id, model)
+    monkeypatch.setattr(
+        vram,
+        "_validated_revision_geometry",
+        lambda model_id, revision, info: (50.0, 123456),
+    )
+
+    resolved = resolve_model(model.id, "sft", "commit")
+    assert resolved.params_b == 50.0
+    assert resolved.min_disk_gb == 364
+
+
+def test_submit_applies_derived_model_disk_floor(monkeypatch):
+    """submit_job sends the resolved full-bf16 merge floor to the worker."""
     from flash import runner
     from flash.core.catalog import MODELS, ModelInfo
     from flash.core.spec import JobSpec
 
-    monkeypatch.setitem(
-        MODELS,
-        "test/big-disk",
-        ModelInfo(
-            id="test/big-disk",
-            display_name="x",
-            params="4B",
-            params_b=4.0,
-            algos=("sft",),
-            min_vram_gb=32,
-            min_disk_gb=160,
-        ),
+    model = ModelInfo(
+        id="test/big-disk",
+        display_name="x",
+        params="8B",
+        params_b=8.0,
+        algos=("sft",),
+        min_vram_gb=32,
+        min_disk_gb=0,
     )
+    monkeypatch.setitem(MODELS, model.id, model)
+    expected_floor = ceil(model.params_b * 2) * 3 + 64
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = JobSpec.from_dict(
@@ -92,12 +190,12 @@ def test_submit_raises_disk_to_model_min(monkeypatch):
             }
         )
         # sft submission is profile-gated, and this synthetic catalog model has no hub revision to
-        # resolve. Disk sizing is what is under test, so seed the profile instead.
+        # resolve. disk sizing is what is under test, so seed the profile instead.
         satisfy_sft_profile(runner, monkeypatch, spec)
         status = runner.submit_job(spec, dry_run=True)
         # disk_gb is platform-managed: stripped from the public status.spec, read the sizing the
         # worker executes from the effective-preparation worker spec.
-        assert status.effective_preparation["worker_spec"]["gpu"]["disk_gb"] == 160
+        assert status.effective_preparation["worker_spec"]["gpu"]["disk_gb"] == expected_floor
         # explicit larger user value wins
         spec_big = JobSpec.from_dict(
             {

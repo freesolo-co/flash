@@ -2,7 +2,7 @@
 
 `build_opd_overrides` renders the exact verl 0.8.0 synchronous-PPO and distillation config surface
 the child is launched with; the rest prepare what that child needs on disk and in its environment
-(a sitecustomize shim, the resolved env vars, and the rollout parquet).
+(the resolved env vars and rollout parquet).
 
 Split out of `flash.engine.worker.opd_train` to keep that module under the file-size limit.
 """
@@ -17,13 +17,14 @@ from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
-    render_tf32_shim,
-    render_tilelang_cudart_shim,
     rollout_max_num_seqs,
+    rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
+    shim_marker_file,
     trainer_dtype_overrides,
 )
 from flash.engine.worker.sft_train import _build_verl_child_env, _hydra_val
+from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 
 _REQUIRED_OVERRIDE_KEYS = (
     "train_files",
@@ -40,6 +41,7 @@ _REQUIRED_OVERRIDE_KEYS = (
     "local_dir",
     "save_freq",
     "n_gpus_per_node",
+    "gpu_mem_util",
     "ulysses_sequence_parallel_size",
     "seed",
     "project_name",
@@ -118,6 +120,7 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         f"actor_rollout_ref.model.lora_rank={_hydra_val(config['lora_rank'])}",
         f"actor_rollout_ref.model.lora_alpha={_hydra_val(config['lora_alpha'])}",
         f"actor_rollout_ref.model.target_modules={_hydra_val(config['target_modules'])}",
+        f"actor_rollout_ref.model.exclude_modules={_hydra_val(config.get('exclude_modules'))}",
         *(
             [
                 "++actor_rollout_ref.model.target_parameters="
@@ -178,43 +181,23 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
             if config.get("mm_encoder_attn_backend")
             else []
         ),
-        # turn OFF vllm's multimodal processor cache. this is what makes image opd run at all.
-        #
-        # the cache is split across two processes. a SENDER half in the frontend replaces an image
-        # it has already seen with just its hash; a RECEIVER half in the engine core is supposed to
-        # still hold the item that hash names. correctness depends on the two halves staying
-        # mirrored, and opd's rollout lifecycle breaks that: every sleep/pause reaches
-        # `EngineCore._reset_caches()`, which clears the RECEIVER only. vllm says so in its own
-        # source -- "we don't attempt to re-sync the internal caches (P0 sender, P1 receiver)".
-        # the sender then keeps sending hash-only requests for images the receiver has dropped, and
-        # each one dies on `assert mm_item is not None, f"Expected a cached item for {mm_hash=}"`.
-        #
-        # that assertion kills the request rather than the run, so the failure surfaces nowhere near
-        # the cause: the rollouts come back EMPTY, and verl indexes [-1] into a zero-length reward
-        # tensor, so the visible error is an IndexError with no mention of images.
-        #
-        # 0 is vllm's own disable value -- it assigns exactly this internally -- and it gates BOTH
-        # halves, so no hash-only request can be constructed and there is nothing left to desync.
-        # the cost is re-preprocessing a repeated image, which is the right trade: an opd rollout
-        # batch is small and this is the difference between working and not.
-        #
-        # it stays unconditional, like `data.image_key` and `limit_images` above, because it is
-        # inert on a text job -- with no mm items there is no cache to disable.
-        #
-        # `mm_processor_cache_gb`, NOT the older `disable_mm_preprocessor_cache`: that argument was
-        # removed in vllm 0.13.0, and passing it now aborts server startup as an unknown cli flag.
-        "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0",
+        *rollout_mm_processor_cache_overrides(),
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
         # sleep_unsupported), exactly as the grpo path does. opd is NOT exempt: main_ppo_sync calls
         # checkpoint_manager.sleep_replicas() during init_workers and again around validation, which
         # lands in the same vllm_async_server sleep(). the flagged model declares algos including
         # opd and the parse-time gate admits it, so without this an opd run on it wedges.
         *rollout_resident_overrides(bool(config.get("sleep_unsupported"))),
+        # size the colocated executor budget from this run's geometry, as the grpo path does.
+        # verl's default is 0.5, i.e. half the CARD, claimed on every wake no matter what the
+        # trainer already holds -- and `wake_up` re-acquires released physical pages, so an
+        # overcommit is a hard cumem_allocator OOM rather than a smaller pool.
+        f"actor_rollout_ref.rollout.gpu_memory_utilization={_hydra_val(config['gpu_mem_util'])}",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={_hydra_val(config['n_gpus_per_node'])}",
         f"actor_rollout_ref.rollout.n={_hydra_val(config['group_size'])}",
         # `++`, not a bare key: limit_images is a real RolloutConfig field but is absent from the
         # composed rollout node, so hydra rejects a bare assignment.
-        "++actor_rollout_ref.rollout.limit_images=8",
+        "++actor_rollout_ref.rollout.limit_images=4",
         f"actor_rollout_ref.rollout.max_model_len={_hydra_val(max_tokens)}",
         f"actor_rollout_ref.rollout.temperature={_hydra_val(config.get('temperature', 1.0))}",
         f"actor_rollout_ref.rollout.top_p={_hydra_val(config.get('top_p', 1.0))}",
@@ -230,7 +213,7 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         # whenever that product is not a multiple of 8. size the pool to the batch instead.
         (
             "actor_rollout_ref.rollout.agent.num_workers="
-            f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']))}"
+            f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']), cap=4 if config.get('multimodal') else 8)}"
         ),
         # one opd step submits exactly train_batch_size * group_size student generations. verl's
         # 1024 default makes vllm reserve cuda-graph capture sizes -- and, on a gdn/mamba hybrid,
@@ -370,30 +353,29 @@ def build_opd_overrides(config: dict) -> list[str]:
     return overrides
 
 
-def _render_opd_sitecustomize(*, save_at_steps: tuple[int, ...], total_steps: int) -> str:
-    required_steps = tuple(int(step) for step in save_at_steps)
-    # the tf32 fragment goes first, and above the verl import: it is the child's only opt-in to
-    # tensor-core fp32 matmul, and an import that raises here must not cost the run its throughput.
-    # the cudart fragment follows it and still precedes the verl import: it repoints tilelang's
-    # libcudart stub on disk, which only works while nothing has imported vllm and bound the stub.
-    return f"""# generated flash opd runtime patches for verl 0.8
-{render_tf32_shim()}
-{render_tilelang_cudart_shim()}
-from verl.utils.checkpoint.checkpoint_handler import CheckpointHandler as _FlashCheckpointHandler
-
-_flash_required_save_steps = frozenset({required_steps!r})
-_flash_total_steps = {int(total_steps)}
-_flash_original_save_checkpoint = _FlashCheckpointHandler.save_checkpoint
-
-
-def _flash_save_exact_checkpoint(self, step):
-    if _flash_required_save_steps and step not in _flash_required_save_steps and step != _flash_total_steps:
-        return None
-    return _flash_original_save_checkpoint(self, step)
-
-
-_FlashCheckpointHandler.save_checkpoint = _flash_save_exact_checkpoint
-"""
+def _build_opd_plugin_config(
+    *,
+    shim_dir: str,
+    save_at_steps,
+    total_steps: int,
+    gdn_model_type: str | None,
+    loggers,
+    lora_language_prefix: str = "",
+) -> str:
+    """serialize the non-secret OPD runtime patch configuration."""
+    return json.dumps(
+        {
+            "marker_file": shim_marker_file(shim_dir),
+            "no_signal_attempts": OPD_NO_SIGNAL_ATTEMPTS,
+            "save_at_steps": list(save_at_steps),
+            "total_steps": int(total_steps),
+            **({"lora_language_prefix": lora_language_prefix} if lora_language_prefix else {}),
+            "gdn_model_type": gdn_model_type,
+            "wandb": "wandb" in loggers,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _build_opd_child_env(
@@ -413,9 +395,11 @@ def _build_opd_child_env(
     max_model_len: int = 32768,
     mutation_failure_path: str = "",
     score_delivery_failure_path: str = "",
+    rollout_failure_path: str = "",
     abandonment_failure_path: str = "",
     resample_failure_path: str = "",
     cycle_commit_failure_path: str = "",
+    plugin_config: str = "",
 ) -> dict[str, str]:
     child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
     child.update(
@@ -432,6 +416,8 @@ def _build_opd_child_env(
         child["FLASH_OPD_MUTATION_FAILURE_PATH"] = mutation_failure_path
     if score_delivery_failure_path:
         child["FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH"] = score_delivery_failure_path
+    if rollout_failure_path:
+        child["FLASH_OPD_ROLLOUT_FAILURE_PATH"] = rollout_failure_path
     if abandonment_failure_path:
         child["FLASH_OPD_ABANDONMENT_FAILURE_PATH"] = abandonment_failure_path
     if resample_failure_path:
@@ -464,6 +450,8 @@ def _build_opd_child_env(
                 "FLASH_OPD_THINKING": "1" if thinking else "0",
             }
         )
+    if plugin_config:
+        child["FLASH_OPD_PLUGIN_CONFIG"] = plugin_config
     return child
 
 

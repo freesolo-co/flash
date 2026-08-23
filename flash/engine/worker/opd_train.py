@@ -20,6 +20,7 @@ from flash.engine.profiling.sft_workload import (  # noqa: F401
 from flash.engine.worker.backend_common import (  # noqa: F401
     ChildOutputTail,
     ChildTailStaleness,
+    VerlChildSilenceWatchdog,
     clamp_engine_len,
     fused_ce_backend,
     gdn_probe_module,
@@ -28,14 +29,13 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     parse_verl_metric,
     parse_wandb_link,
     probe_verl_capabilities,
-    render_gdn_varlen_shim,
-    render_shim_marker_prologue,
-    render_wandb_link_shim,
+    render_sitecustomize_bootstrap,
     require_gdn_boundary_resets,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
     resolve_verl_loggers,
     resolve_verl_python,
+    rollout_fp8_kv,
     rollout_sleep_unsupported,
     run_verl_training,
     shim_marker_file,
@@ -43,7 +43,6 @@ from flash.engine.worker.backend_common import (  # noqa: F401
     verify_applied_shim_markers,
     verl_device_capability,
     verl_step_number,
-    wrap_shim_fragment,
 )
 from flash.engine.worker.entry.opd import (  # noqa: F401
     _resolve_opd_knobs,
@@ -57,7 +56,7 @@ from flash.engine.worker.sft_train import (  # noqa: F401
     _export_checkpoint_adapter,
     _NvidiaSmiPeakSampler,
     _probe_gpu_in_subprocess,
-    _processed_resume_steps,
+    _seed_resume_lifecycle,
     _verl_image_message_content,
     _warmstart_adapter_path,
 )
@@ -101,6 +100,7 @@ class _BridgePrompt:
     image_descriptors: tuple[str, ...]
     package_root: str | None
     example: dict | None = None
+    image_digests: tuple[str, ...] = ()
 
 
 class _OpdProgressState:
@@ -117,6 +117,7 @@ class _OpdProgressState:
         self._prev_no_signal_skipped_steps = int(state.get("no_signal_skipped_steps", 0))
         self._train_started_at: float | None = None
         self._step_states: dict[int, dict] = {}
+        self._terminal_error: str = ""
         if resume_state is not None:
             self._step_states[int(state["opt_steps"])] = dict(state)
 
@@ -211,10 +212,31 @@ class _OpdProgressState:
                 max_completion=max_completion,
             )
 
+    def fail(self, reason: str) -> None:
+        """Record that the verl child died, and wake anything waiting on its accounting.
+
+        Without this a crash is indistinguishable from slowness: `checkpoint_state` blocks on a
+        condition only `record_step` notifies, so a child that exits before printing the step's
+        metrics leaves the waiter to burn its full timeout and then blame accounting for a failure
+        that happened elsewhere. Observed on a 27B image OPD run whose real cause was a vLLM
+        `wake_up` CUDA OOM two frames deeper.
+        """
+        with self._condition:
+            # keep the FIRST reason: it is the cause, and later ones are usually its fallout.
+            self._terminal_error = self._terminal_error or str(reason).strip()
+            self._condition.notify_all()
+
     def checkpoint_state(self, step: int, *, timeout_s: float = 300.0) -> dict:
         deadline = time.monotonic() + timeout_s
         with self._condition:
             while step not in self._step_states:
+                # a dead child will never record this step, so report why it died rather than
+                # waiting out a timeout and attributing the failure to accounting.
+                if self._terminal_error:
+                    raise RuntimeError(
+                        f"OPD child exited before accounting for checkpoint step {step}: "
+                        f"{self._terminal_error}"
+                    )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError(
@@ -238,10 +260,7 @@ class _OpdProgressState:
 def _validate_multimodal_opd(request, spec, model_id: str) -> None:
     """Re-check an image-bearing OPD job now that the env class is loaded.
 
-    The submit-time preflight in multimodal.py reads `multi_turn` out of the dataset params, so a
-    multi-turn env that declares itself by CLASS reaches the worker unflagged; `request.multi_turn`
-    here comes from that class and is authoritative. Runs before the GPU probe and weight download
-    so a rejected job costs no paid setup.
+    Runs before the GPU probe and weight download so capability failures cost no paid setup.
     """
     from flash.content.multimodal import validate_multimodal_training
 
@@ -250,8 +269,6 @@ def _validate_multimodal_opd(request, spec, model_id: str) -> None:
         "opd",
         getattr(spec.train, "teacher_model", None),
     )
-    if request.multi_turn:
-        raise ValueError("multi-turn image-bearing opd is not supported")
 
 
 def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[float, list]:
@@ -323,7 +340,7 @@ def run_opd_train(spec=None) -> None:
         gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
         # ONE child answers every independent capability question. each used to cost its own interpreter, and the torch/verl import -- not the question -- was the price.
         caps = probe_verl_capabilities(python_bin, gdn_module)
-    # enable fp8 kv on cc >= 8.9 only for non-gdn models; gdn sleep/wake crashes on hybrid caches. keep this aligned with vram.py, and keep the device probe separate from gdn classification.
+    # enable fp8 kv on cc >= 8.9. a gdn hybrid qualifies only when the catalog pins its rollout engine resident: it is sleep/WAKE that crashes on the hybrid cache, not gdn itself. see rollout_fp8_kv. keep this aligned with vram.py, and keep the device probe separate from gdn classification.
     try:
         import torch as _torch_cc
 
@@ -332,7 +349,7 @@ def run_opd_train(spec=None) -> None:
         )
     except Exception:  # no cuda / probe failure -> conservative bf16 kv
         _cc_ok = False
-    fp8_kv = _cc_ok and not gdn_hybrid
+    fp8_kv = rollout_fp8_kv(_cc_ok, gdn_hybrid, model_id)
     # gdn packing requires child support for seq_idx and cu_seqlens; fallbacks discard both and silently bleed state across examples. record whether the child can reset gdn state because successful runs upload no console and failure here is silent contamination; none means non-gdn. see require_gdn_boundary_resets.
     gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
     # run sm86 eagerly because vllm 0.19.1 graph capture degenerates there. sm89 capture is empirically acceptable; enforce_eager overrides async cudagraph settings last at config/vllm.py:1024.
@@ -353,6 +370,12 @@ def run_opd_train(spec=None) -> None:
                 "attention_backend": attention_backend,
                 "mm_encoder_attn_backend": mm_encoder_attn_backend,
                 "sleep_unsupported": rollout_sleep_unsupported(model_id),
+                # caps the agent-worker fan-out: each is a ray actor with its own processor copy,
+                # and on an image run that fan-out exhausted the grpo worker container's threads.
+                "multimodal": bool(multimodal),
+                "gpu_mem_util": _resolve_opd_gpu_mem_util(
+                    request, prompt_state, workload, runtime, model_id, fp8_kv
+                ),
                 "loggers": runtime.loggers,
                 # resolved from the out-of-process capability probe, never by opening cuda in this parent -- see fused_ce_backend.
                 "fused_ce_backend": fused_ce_backend(caps),
@@ -373,7 +396,8 @@ def run_opd_train(spec=None) -> None:
             "opd_finalizing", progress=lambda: final_step, progress_step=True, keepalive=True
         ):
             adapter_dir = _export_and_upload_adapter(request, workload, runtime, result)
-            # preserve the final checkpoint only when save_at_steps is empty, matching grpo. watcher and final-save paths are disjoint, so processed_steps must not suppress it.
+            # preserve the final checkpoint only when save_at_steps is empty, matching grpo. watcher
+            # and final-save paths are disjoint, so the watcher's lifecycle must not suppress it.
             if final_save_due(final_step, knobs.save_at_steps):
                 _w.publish_deployable_checkpoint(adapter_dir, final_step, _provenance_ready=True)
         setup_seconds = _report_training_complete(result, started_at)
@@ -437,6 +461,7 @@ from flash.engine.worker.opd_train_runner import (  # noqa: E402
     _prepare_workload,
     _render_prompt_rows,
     _report_training_complete,
+    _resolve_opd_gpu_mem_util,
     _run_child,
     _validate_aligned_sequences,
     _validate_teacher_transport,
@@ -460,6 +485,9 @@ from flash.engine.worker.train.opd.batching import (  # noqa: E402,F401
     _validate_text_teacher_batch,
 )
 from flash.engine.worker.train.opd.bridge import _TeacherAlignmentBridge  # noqa: E402
+from flash.engine.worker.train.opd.child.bridge import (  # noqa: E402,F401
+    _read_rollout_failure_fallback,
+)
 
 # failure accounting and resume staging, implemented in `.train.opd.failures`. imported at the
 # BOTTOM because that module reads this one's teacher exit codes, so a top-level import would be
@@ -484,8 +512,8 @@ from flash.engine.worker.train.opd.failures import (  # noqa: E402,F401
 from flash.engine.worker.train.opd.overrides import (  # noqa: E402,F401
     _OPD_PARQUET_WRITE_BATCH_ROWS,
     _build_opd_child_env,
+    _build_opd_plugin_config,
     _opd_multimodal_parquet_features,
-    _render_opd_sitecustomize,
     _write_opd_parquet,
     build_opd_overrides,
 )
@@ -494,6 +522,7 @@ from flash.engine.worker.train.opd.overrides import (  # noqa: E402,F401
 # re-exported because `run_opd_train` above and the opd tests both reach them here.
 from flash.engine.worker.train.opd.prompts import (  # noqa: E402,F401
     _normalize_prompt_ids,
+    _processor_expanded_prompt,
     _processor_expanded_prompt_ids,
     _prompt_pool_fingerprint,
     _trim_response_and_forced,

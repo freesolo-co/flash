@@ -54,9 +54,24 @@ def _generation_eos_ids(model, tok) -> frozenset:
             ids.update(int(x) for x in v if isinstance(x, int) and not isinstance(x, bool))
 
     _add(getattr(tok, "eos_token_id", None))
-    for obj in (getattr(model, "generation_config", None), getattr(model, "config", None)):
+    config = getattr(model, "config", None)
+    for obj in (getattr(model, "generation_config", None), config):
         if obj is not None:
             _add(getattr(obj, "eos_token_id", None))
+    if config is not None:
+        text_configs = []
+        get_text_config = None
+        with contextlib.suppress(Exception):
+            get_text_config = getattr(config, "get_text_config", None)
+        if callable(get_text_config):
+            with contextlib.suppress(Exception):
+                text_configs.append(get_text_config(decoder=True))
+        with contextlib.suppress(Exception):
+            text_configs.append(getattr(config, "text_config", None))
+        for text_config in text_configs:
+            if text_config is not None:
+                with contextlib.suppress(Exception):
+                    _add(getattr(text_config, "eos_token_id", None))
     return frozenset(ids)
 
 

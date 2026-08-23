@@ -20,6 +20,9 @@ import pytest
 
 from flash import runner as _orch
 from flash.server.platform import db as _db_mod
+from tests._helpers.source_snapshot import valid_source_snapshot
+
+_SOURCE_SNAPSHOT = valid_source_snapshot()
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
@@ -197,6 +200,10 @@ def api(tmp_path, monkeypatch):
         lambda **_kwargs: True,
     )
     with TestClient(app_mod.create_app()) as client:
+        # the fake token exists only to satisfy startup preflight. leaving it live for requests makes
+        # submit-time environment pinning call the real GitHub API with `ghp-test`; tokenless planes
+        # deliberately defer that work to the worker. tests that exercise a token set their own.
+        monkeypatch.delenv("GITHUB_TOKEN")
         yield client
 
 
@@ -406,6 +413,68 @@ def test_project_validation_blocks_before_environment_publication(api, monkeypat
     )
     assert response.status_code == 403
     assert response.json()["detail"] == "project denied"
+
+
+def test_canonical_slug_resolution_blocks_before_environment_publication(api, monkeypatch) -> None:
+    import flash.server.domain.environment_registry as registry_mod
+    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.projects as projects_mod
+
+    importlib.reload(projects_mod)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
+    project_id = "11111111-1111-4111-8111-111111111111"
+    key = _login()
+    org_id = f"org-{key.removeprefix(_USER_PREFIX)}"
+    validation_calls: list[str] = []
+    publish_events: list[str] = []
+
+    class _Response:
+        status = 200
+
+        def __init__(self, body: dict):
+            self._body = json.dumps(body).encode()
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout=None):
+        method = request.get_method()
+        validation_calls.append(method)
+        if method == "GET":
+            return _Response({"id": project_id, "name": "Foo Bar"})
+        body = json.loads(request.data)
+        assert body == {"orgId": org_id, "projectId": project_id}
+        return _Response({"ok": True, **body})
+
+    monkeypatch.setattr(projects_mod.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(
+        envs_mod,
+        "publish_package",
+        lambda **_kwargs: publish_events.append("published"),
+    )
+    monkeypatch.setattr(
+        registry_mod,
+        "record_published_environment",
+        lambda **_kwargs: publish_events.append("associated"),
+    )
+
+    response = api.post(
+        "/v1/envs",
+        headers=_bearer(key),
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": project_id},
+    )
+
+    assert publish_events == []
+    assert response.status_code == 502
+    assert "canonical project slug" in response.json()["detail"]
+    assert validation_calls == ["GET", "POST"]
 
 
 def _install_real_internal_project_validation(monkeypatch):
@@ -904,6 +973,35 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
         assert "serving max_model_len=32768" in detail
     else:
         assert response.json()["state"] == "dry_run"
+
+
+def test_grpo_rollout_shape_rejects_before_secrets_persistence_or_submission(
+    api, monkeypatch
+) -> None:
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        runs_route, "_runtime_secrets", lambda *_a, **_k: pytest.fail("secrets inspected")
+    )
+    monkeypatch.setattr(runs_route.db, "record_run", lambda *_a, **_k: pytest.fail("run persisted"))
+    monkeypatch.setattr(
+        runs_route._app, "submit_job", lambda *_a, **_k: pytest.fail("job submitted")
+    )
+    spec = {
+        **SPEC,
+        "train": {
+            **SPEC["train"],
+            "prompts_per_step": 65,
+            "group_size": 8,
+        },
+    }
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": False},
+    )
+    assert response.status_code == 400
+    assert "prompts_per_step * train.group_size must be <= 512" in response.json()["detail"]
 
 
 def test_unknown_authored_train_key_enriches_parser_rejection_once(api, monkeypatch) -> None:
@@ -2609,6 +2707,55 @@ def test_worker_artifacts_prefers_latest_attempt_console(monkeypatch, tmp_path):
     assert "console_rl_attempt0.txt" not in out
 
 
+def test_worker_artifacts_keep_previous_attempt_evidence_until_the_retry_uploads(
+    monkeypatch, tmp_path
+):
+    """A live retry may not have uploaded any attempt-1 artifact yet.
+
+    The highest uploaded attempt is then attempt 0. Keep its console, traceback, and matching ray logs
+    so the CLI can label the historical evidence instead of hiding the OOM that caused the retry.
+    """
+    import types
+
+    import huggingface_hub
+
+    from flash.server.platform.runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl",
+        run_id="r1",
+        train=types.SimpleNamespace(hf_repo="org/repo"),
+    )
+    content = {
+        "rl/r1/console_rl_attempt0.txt": "HEARTBEAT attempt=0 device=NVIDIA H200\n",
+        "rl/r1/error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n",
+        "rl/r1/raylogs_rl_attempt0.txt": "raylet exited after OOM\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        path = tmp_path / filename.replace("/", "_")
+        path.write_text(content[filename])
+        return str(path)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    assert _worker_artifacts(spec) == {
+        "console_rl_attempt0.txt": "HEARTBEAT attempt=0 device=NVIDIA H200\n",
+        "error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n",
+        "raylogs_rl_attempt0.txt": "raylet exited after OOM\n",
+    }
+
+
 def test_local_env_path_rejected(api):
     # Managed runs accept Freesolo environment ids; local [environment] paths are rejected.
     key = _login()
@@ -2696,7 +2843,6 @@ def test_user_key_undeploy_returns_public_persisted_deployment(api, monkeypatch)
         "adapter_revision": revision,
         "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
         "verification_generation": 7,
-        "url": "https://stale.example/v1",
     }
     runner._save_status(status)
     monkeypatch.setattr(
@@ -2817,7 +2963,6 @@ def test_deployment_management_allows_matching_internal_scope_and_redacts_pollin
         "endpoint_name": "https://serve.example",
         "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
         "verification_generation": 7,
-        "url": "https://stale.example/v1",
     }
     runner._save_status(status)
 
@@ -2866,7 +3011,6 @@ def test_deployment_management_allows_matching_internal_scope_and_redacts_pollin
         assert body["state"] == "ready"
         assert "previous_deployment" not in body
         assert "verification_generation" not in body
-        assert "url" not in body
 
     deployed = api.post(
         f"/v1/runs/{run_id}/deploy",
@@ -3096,41 +3240,8 @@ def test_internal_owned_run_still_requires_matching_org_for_deployment_managemen
     assert calls == {"deploy": 1, "undeploy": 1}
 
 
-def test_deploy_rejects_revision_pinned_base_model(api):
-    import flash.runner as runner
-
-    key = _login()
-    run_id = api.post(
-        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
-    ).json()["run_id"]
-    status = runner.get_status(run_id)
-    status.spec["model_revision"] = "a" * 40
-    runner._save_status(status)
-
-    response = api.post(
-        f"/v1/runs/{run_id}/deploy",
-        json={"dry_run": True},
-        headers=_bearer(key),
-    )
-
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert "legacy revision-pinned base model" in detail
-    assert "flash models export" in detail
-
-
 def test_deploy_allows_runner_assigned_revision_pin(api):
-    """An SFT run pinned BY THE RUNNER stays deployable.
-
-    `runner.submit.prepare_job` calls `_resolve_model_revision(required=True)` for every SFT run,
-    so its stored spec always carries a revision the user never authored and cannot opt out of.
-    Rejecting it made every SFT run -- and every adapter warm-started from one -- permanently
-    undeployable, which also blocks `flash models chat` and `flash env eval`.
-
-    The paired control is `test_deploy_rejects_revision_pinned_base_model` above: same route, same
-    revision value, marker absent -> still 400. Only the marker differs, so a pass here with a pass
-    there isolates the change to who chose the pin.
-    """
+    """An SFT run pinned by the runner stays deployable."""
     import flash.runner as runner
     from flash.core.spec import JobSpec
 
@@ -3146,9 +3257,11 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
     # `_validate_effective_spec` rejecting the real one -- a 409 that leaves auto-pinned runs just
     # as undeployable as the 400 did.
     assert "model_revision_auto" not in status.spec, status.spec
+    assert "model_revision_force_pin" not in status.spec, status.spec
     assert not status.spec.get("model_revision"), status.spec
     snapshot = status.effective_preparation
     assert isinstance(snapshot, dict), snapshot
+    assert snapshot["worker_spec"]["model_revision_force_pin"] is False
     snapshot["worker_spec"]["model_revision"] = "a" * 40
     snapshot["worker_spec"]["model_revision_auto"] = True
     # re-digest the way submit does. the marker is a privilege input the deploy guard reads, so it
@@ -3174,24 +3287,7 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
 
 
 def test_deploy_rejects_a_forged_auto_pin_marker(api):
-    """A marker written into the snapshot without re-digesting must not buy deploy privileges.
-
-    The marker is excluded from `_validate_effective_spec`'s structural compare (the public half
-    reads False by construction), so nothing there can catch a forged one. Deploy reads it to
-    decide whether to waive the authored-pin rejection, which makes it a privilege decision taken
-    on an otherwise unverified value -- and the waiver is not the only cost: a run pinned to a
-    revision it never trained on deploys against those base weights.
-
-    The paired control is `test_deploy_allows_runner_assigned_revision_pin` above. Same forged
-    marker, same snapshot surface; the only difference is that the control re-digests the way
-    submit does. It passes, so this test is not merely rejecting everything -- it isolates the
-    forgery from the auto-pin shape itself.
-
-    The revision is written to BOTH halves here so the structural compare cannot be what rejects
-    it: equal values pass that check, and the marker is excluded from it. Verified against the
-    unfixed head -- without the digest check in `effective_spec_from_status` this deploy returns
-    200. That is also the pre-fix on-disk shape, when to_dict() still emitted a runner pin.
-    """
+    """A worker-only pin written without re-digesting fails integrity validation."""
     import flash.runner as runner
 
     key = _login()
@@ -3202,7 +3298,6 @@ def test_deploy_rejects_a_forged_auto_pin_marker(api):
     snapshot = status.effective_preparation
     assert isinstance(snapshot, dict), snapshot
     digest_before = snapshot["preparation_digest"]
-    status.spec["model_revision"] = "a" * 40
     snapshot["worker_spec"]["model_revision"] = "a" * 40
     snapshot["worker_spec"]["model_revision_auto"] = True
     assert snapshot["preparation_digest"] == digest_before  # forged: no re-digest
@@ -3216,6 +3311,31 @@ def test_deploy_rejects_a_forged_auto_pin_marker(api):
 
     assert response.status_code == 409, response.json()
     assert "integrity validation" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("route", "payload"),
+    [
+        ("deploy", {"dry_run": True}),
+        ("export", {"repository": "owner/adapter", "hf_token": "hf-test"}),
+        ("chat", {"messages": [{"role": "user", "content": "hello"}]}),
+    ],
+)
+def test_serving_routes_map_leaked_revision_decode_failures_to_conflict(api, route, payload):
+    import flash.runner as runner
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.spec["model_revision"] = "abc123"
+    runner._save_status(status)
+
+    response = api.post(f"/v1/runs/{run_id}/{route}", json=payload, headers=_bearer(key))
+
+    assert response.status_code == 409, response.text
+    assert "platform-managed model revision key" in response.json()["detail"]
 
 
 def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
@@ -3242,7 +3362,7 @@ def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
     assert runner.get_status(run_id).deployment == status.deployment
 
 
-def test_public_run_routes_redact_private_and_legacy_deployment_fields(api, monkeypatch):
+def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
     import flash.runner as runner
     import flash.serve.deploy as deploy_mod
 
@@ -3256,7 +3376,6 @@ def test_public_run_routes_redact_private_and_legacy_deployment_fields(api, monk
         "state": "ready",
         "endpoint_name": "https://serve.example",
         "openai_base_url": "https://serve.example/v1",
-        "url": "https://stale.example/v1",
         "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
         "adapter_revision": revision,
     }
@@ -3275,13 +3394,11 @@ def test_public_run_routes_redact_private_and_legacy_deployment_fields(api, monk
     for body in responses:
         deployment = body["deployment"]
         assert deployment["openai_base_url"] == "https://serve.example/v1"
-        assert "url" not in deployment
         assert "previous_deployment" not in deployment
 
     persisted = runner.get_status(run_id).deployment
     assert persisted["previous_deployment"]["endpoint_name"] == "https://old.example"
     assert persisted["openai_base_url"] == "https://serve.example/v1"
-    assert persisted["url"] == "https://stale.example/v1"
     assert runner.read_verified_adapter_revisions(run_id) == frozenset({revision})
 
     monkeypatch.setattr(deploy_mod, "undeploy_adapter", lambda target: [target])
@@ -3317,6 +3434,7 @@ def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
     status.effective_preparation = {
         "worker_spec": worker_spec,
         "adapter_identity": identity,
+        "version": 1,
         "preparation_digest": runner._preparation_digest(
             runner.JobSpec.from_dict(public_spec),
             runner.JobSpec.from_dict(worker_spec),
@@ -3496,6 +3614,8 @@ def test_deployment_transitions_report_persisted_states_and_skip_dry_run(api, mo
         "reconciling",
         "ready",
     ]
+    assert calls[-1].deployment["verify_kind"] == "fixed_image"
+    assert calls[-1].deployment["verify_lora_request_adapter"] == revision
 
 
 def test_deployment_reporting_skips_failed_cas_and_reports_failure(api, monkeypatch):
@@ -5494,7 +5614,7 @@ def test_deploy_fails_when_the_activated_alias_serves_no_reasoning(api, monkeypa
             return _smoke_chat_result(
                 revision,
                 run_id,
-                "<think>2+2 is 4</think>4",
+                f"<think>2+2 is 4</think>{_expected_smoke_colour(run_id)}",
                 reasoning_content="2+2 is 4",
             )
         return _smoke_chat_result(revision, run_id, "4")
@@ -5561,7 +5681,7 @@ def test_deploy_persists_ordinary_post_activation_probe_failures(api, monkeypatc
         lambda **_kwargs: _smoke_chat_result(
             revision,
             run_id,
-            "<think>2+2 is 4</think>4",
+            f"<think>2+2 is 4</think>{_expected_smoke_colour(run_id)}",
             reasoning_content="2+2 is 4",
         ),
     )
@@ -5644,7 +5764,7 @@ def test_deploy_records_alias_thinking_on_a_healthy_thinking_deployment(api, mon
         lambda **kwargs: _smoke_chat_result(
             revision,
             run_id,
-            "<think>2+2 is 4</think>4",
+            f"<think>2+2 is 4</think>{_expected_smoke_colour(run_id)}",
             reasoning_content="2+2 is 4",
         ),
     )
@@ -8010,103 +8130,6 @@ def test_mark_checkpoint_deployed_refuses_dry_run(monkeypatch, tmp_path):
     assert out.deployment is None
 
 
-def test_mark_deployed_legacy_finished_at_backfill_only_on_done_transition(monkeypatch, tmp_path):
-    # The legacy finished_at backfill (for runs that went `done` before finished_at existed) must
-    # run ONLY on the done->deployed transition, where updated_at == training teardown. On an
-    # already-`deployed` run (the CAS finalization with expect_state="deployed"), updated_at is the
-    # DEPLOY time, so stamping finished_at from it would reintroduce the instance over-billing this
-    # whole change fixes.
-    import flash.runner as runner
-
-    importlib.reload(runner)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-
-    spec = {
-        "model": "Qwen/Qwen3.5-4B",
-        "project": "11111111-1111-4111-8111-111111111111",
-        "algorithm": "grpo",
-        "run_id": "dep-leg",
-    }
-
-    # (1) done -> deployed: legacy run, finished_at=None, updated_at == teardown -> backfilled.
-    teardown = 1_000.0
-    runner._save_status(
-        runner.RunStatus(
-            run_id="dep-leg",
-            state="done",
-            spec=spec,
-            remote=None,
-            updated_at=teardown,
-            finished_at=None,
-        )
-    )
-    out = runner.mark_deployed(
-        "dep-leg",
-        {
-            "state": "ready",
-            "endpoint_name": "e",
-            "adapter_revision": "dep-leg@final." + "a" * 40,
-        },
-        verification_generation=runner.verified_adapter_revision_generation("dep-leg"),
-    )
-    assert out.state == "deployed"
-    assert out.finished_at == teardown  # frozen to the real teardown time
-    assert out.updated_at > teardown  # the deploy bumped updated_at past teardown
-
-    # (2) already-`deployed` legacy run whose finished_at was never backfilled: a CAS-finalization
-    # re-call must NOT turn the deploy-time updated_at into finished_at.
-    deploy_time = 5_000.0
-    runner._save_status(
-        runner.RunStatus(
-            run_id="dep-leg2",
-            state="deployed",
-            spec={**spec, "run_id": "dep-leg2"},
-            remote=None,
-            updated_at=deploy_time,
-            finished_at=None,
-            deployment={"endpoint_name": "e"},
-        )
-    )
-    out2 = runner.mark_deployed(
-        "dep-leg2",
-        {
-            "state": "ready",
-            "endpoint_name": "e2",
-            "adapter_revision": "dep-leg2@final." + "b" * 40,
-        },
-        expect_state="deployed",
-        verification_generation=runner.verified_adapter_revision_generation("dep-leg2"),
-    )
-    assert out2.state == "deployed"
-    assert out2.finished_at is None  # NOT stamped from the deploy-time updated_at
-
-    # (3) reconciled-then-deployed legacy `done` run: record_realized_cost bumped updated_at to the
-    # reconcile time, so the backfill must NOT freeze that (later) stamp as teardown.
-    runner._save_status(
-        runner.RunStatus(
-            run_id="dep-leg3",
-            state="done",
-            spec={**spec, "run_id": "dep-leg3"},
-            remote=None,
-            updated_at=9_000.0,  # reconcile-time bump, well after teardown
-            finished_at=None,
-            reconciled_at=8_500.0,
-        )
-    )
-    out3 = runner.mark_deployed(
-        "dep-leg3",
-        {
-            "state": "ready",
-            "endpoint_name": "e3",
-            "adapter_revision": "dep-leg3@final." + "c" * 40,
-        },
-        verification_generation=runner.verified_adapter_revision_generation("dep-leg3"),
-    )
-    assert out3.state == "deployed"
-    assert out3.finished_at is None  # not frozen from the reconcile-bumped updated_at
-
-
 def test_deploy_lock_is_usable_and_weakly_cleaned():
     # threading.Lock() isn't weak-referenceable, so the per-run lock must be a wrapper that
     # both works as a context manager AND can live in the WeakValueDictionary (the raw lock
@@ -8127,13 +8150,9 @@ def test_deploy_lock_is_usable_and_weakly_cleaned():
     assert "run-xyz" not in dict(app_mod._DEPLOY_LOCKS)
 
 
-def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
-    # A recoverable run with no persisted handle (crash in the submit->on_handle window,
-    # before any worker was provisioned) must NOT be lost on a control-plane restart: its
-    # reconstructable RunPod endpoint is GC'd (so it doesn't hold worker quota), then the run
-    # is RESUBMITTED from scratch — there is no remote work to reattach to, so a fresh job is
-    # the only way to preserve the session.
-    import threading
+def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
+    # a pre-feature run with neither a handle nor persisted source identity cannot be replaced safely.
+    # recovery still reaps possible provider remnants, then fails it without starting another worker.
 
     import flash.runner as runner
     import flash.server.platform.db as db_mod
@@ -8160,16 +8179,8 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-1"}])
     gced = []
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: gced.append(s.run_id))
-    # Capture the resubmit instead of provisioning a real GPU; recover_runs resolves _run_job
-    # via a function-local `from flash.runner import _run_job`, so patching the package attr wins.
     resubmitted = []
-    done = threading.Event()
-
-    def fake_run_job(s):
-        resubmitted.append(s.run_id)
-        done.set()
-
-    monkeypatch.setattr(runner, "_run_job", fake_run_job)
+    monkeypatch.setattr(runner, "_run_job", lambda s: resubmitted.append(s.run_id))
 
     # a handle-less run may have left a phantom instance from a non-idempotent create (Vast PUT
     # /asks) that surfaces via eventual consistency. Recovery must force-reap the run's label across
@@ -8192,14 +8203,16 @@ def test_recover_runs_resubmits_no_handle_run(monkeypatch, tmp_path):
 
     app_mod.recover_runs()
 
-    assert done.wait(timeout=5), "no-handle recovery must launch a resubmit thread"
-    assert gced == ["nohandle-1"], "no-handle recovery must GC the reconstructable endpoint first"
-    assert resubmitted == ["nohandle-1"], "no-handle run must be resubmitted, not failed"
-    assert reaped == ["nohandle-1"], (
-        "must force-reap the run's instance-provider label before resubmit"
+    assert gced == ["nohandle-1"]
+    assert reaped == ["nohandle-1"]
+    assert resubmitted == []
+    recovered = runner.get_status("nohandle-1")
+    assert recovered.state == "failed"
+    assert recovered.error == (
+        "managed source identity is unavailable; descriptor-less attempts cannot be replaced"
     )
-    # The resubmit GC's the orphaned endpoint and re-runs the job; the run is NOT failed.
-    assert runner.get_status("nohandle-1").state != "failed"
+    assert recovered.source_verified_attempt is None
+    assert "source_provenance" not in recovered.to_dict()
 
 
 def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_path):
@@ -8272,6 +8285,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
             state="provisioning",
             spec=spec.to_dict(),
             created_at=created_at,
+            source_snapshot=_SOURCE_SNAPSHOT,
             # run_id is platform-managed and stripped from the public spec; a provisioned run always
             # carries the internal worker-spec carrier, which is where recovery resolves its identity.
             effective_preparation={
@@ -8446,6 +8460,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
             state="queued",  # never provisioned -> no create attempted -> no phantom possible
             spec=spec,
             remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
             submitted_instance_providers=["vast"],  # Vast configured at submit, creds now gone
         )
     )
@@ -8514,6 +8529,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
             state="provisioning",
             spec=spec,
             remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
             submitted_instance_providers=[],  # no instance provider was available at submit
         )
     )
@@ -8565,6 +8581,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
             state="provisioning",
             spec=spec,
             remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
             submitted_instance_providers=[],
         )
     )
@@ -8622,7 +8639,13 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
         "run_id": "retry-1",
     }
     runner._save_status(
-        runner.RunStatus(run_id="retry-1", state="provisioning", spec=spec, remote=None)
+        runner.RunStatus(
+            run_id="retry-1",
+            state="provisioning",
+            spec=spec,
+            remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "retry-1"}])
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
@@ -8683,7 +8706,13 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
         "run_id": "clear-1",
     }
     runner._save_status(
-        runner.RunStatus(run_id="clear-1", state="provisioning", spec=spec, remote=None)
+        runner.RunStatus(
+            run_id="clear-1",
+            state="provisioning",
+            spec=spec,
+            remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "clear-1"}])
     monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
@@ -8770,9 +8799,11 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
             state="provisioning",
             spec=public_spec,
             remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
             effective_preparation={
                 "worker_spec": worker_spec,
                 "adapter_identity": identity.to_dict(),
+                "version": 1,
                 "preparation_digest": runner._preparation_digest(
                     public_job, worker_job, identity.to_dict()
                 ),
@@ -8854,6 +8885,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
             effective_preparation={
                 "worker_spec": worker_spec,
                 "adapter_identity": original_identity,
+                "version": 1,
                 "preparation_digest": runner._preparation_digest(
                     public_job, worker_job, original_identity
                 ),
@@ -8949,7 +8981,13 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     with open(runner.runs_file_path("bad-1", ".json"), "w") as file:
         json.dump(bad_raw, file)
     runner._save_status(
-        runner.RunStatus(run_id="good-2", state="provisioning", spec=good_spec, remote=None)
+        runner.RunStatus(
+            run_id="good-2",
+            state="provisioning",
+            spec=good_spec,
+            remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
     )
     # Order matters: the bad run is iterated FIRST, so an unguarded parse would abort here.
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}])
@@ -9024,6 +9062,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     """POST /v1/envs publishes an uploaded package to the managed environment hub."""
+    monkeypatch.setenv("GITHUB_TOKEN", "token-for-publish-path")
     import base64
     import io
     import tarfile
@@ -9840,15 +9879,31 @@ _FAKE_CKPTS = [
 _MISSING_SMOKE_REASONING = object()
 
 
+def _expected_smoke_colour(run_id: str) -> str:
+    """The colour this run_id's deployment smoke must answer.
+
+    derived from production rather than hardcoded: the smoke picks one of several trusted colours
+    per run, so a fixed literal here would break whenever the hash landed elsewhere.
+    """
+    from flash.server.routes import serving_smoke
+
+    expected, _messages = serving_smoke._smoke_image_challenge(run_id)
+    return expected
+
+
 def _smoke_chat_result(
     revision: str,
     checkpoint: str,
-    content: str = "4",
+    content: str | None = None,
     *,
     reasoning_content: object = _MISSING_SMOKE_REASONING,
 ) -> dict:
     # a serve_chat response that passes _smoke_provenance for the given immutable revision
     hf_revision = revision.rsplit(".", 1)[-1]
+    if content is None:
+        # answer this run's own colour challenge. a fixed literal would pass only when the hash
+        # happened to land on it, so the default is derived from the revision's run id.
+        content = _expected_smoke_colour(revision.split("@", 1)[0])
     message = {"content": content}
     if reasoning_content is not _MISSING_SMOKE_REASONING:
         message["reasoning_content"] = reasoning_content
@@ -9864,6 +9919,7 @@ def _smoke_chat_result(
             "checkpoint": checkpoint,
             "hf_revision": hf_revision,
         },
+        "_freesolo_lora_request_adapter": revision,
     }
 
 

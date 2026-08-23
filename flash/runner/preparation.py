@@ -15,11 +15,11 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any
 
-from flash.core.catalog import normalize_algorithm, samples_on_policy
 from flash.core.spec import JobSpec
+from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 
 
 def _runner():
@@ -35,29 +35,16 @@ def _runner():
     return runner
 
 
-def _require_supported_adapter_continuation(spec: JobSpec) -> None:
-    if spec.algorithm == "sft" and spec.train.init_from_adapter:
-        raise ValueError(
-            "train.init_from_adapter is supported only for GRPO and OPD continue-in-place runs; "
-            "SFT adapter continuation is not supported"
-        )
-
-
 def _adopted_warmstart_revision(spec: JobSpec, src_spec: JobSpec) -> JobSpec:
-    """Take the warm-start source's pin and preserve who chose it.
-
-    The child must train against the exact immutable base its source adapter used. For an SFT source,
-    the runner chose the pin, so inheriting ``model_revision_auto=True`` keeps the child deployable.
-    A pre-removal source may instead carry an author-supplied pin; the removed public key means the
-    child cannot repeat it, so it inherits that pin with ``model_revision_auto=False`` and remains
-    rejected at deploy for the same reason as its parent.
-    """
+    """Take the warm-start source's runner-managed immutable base-model pin."""
     if spec.model_revision or not src_spec.model_revision:
         return spec
+    if not src_spec.model_revision_auto:
+        raise ValueError("warm-start source has an unsupported unmanaged model revision")
     return replace(
         spec,
         model_revision=src_spec.model_revision,
-        model_revision_auto=src_spec.model_revision_auto,
+        model_revision_auto=True,
     )
 
 
@@ -92,7 +79,7 @@ def _inherit_warmstart_revision(
     """Adopt a warm-start source's pin BEFORE the spec is sized against it.
 
     Sizing reads the revision: ``resolve_model`` re-derives params/vocab/disk from the pinned
-    commit's geometry, and ``min_disk_gb`` becomes ``params_b * 2 + 64``, which for half of today's
+    commit's geometry, and ``min_disk_gb`` becomes ``ceil(2 * params_b) + 64``, which for half of today's
     catalog is strictly larger than the catalog default. Adopting the pin only inside
     ``_prepare_init_from_adapter`` -- which runs after ``resolve_model``, ``_with_model_disk``, and
     ``_assign_weight_cache_volume`` -- would provision the child as if unpinned while training it
@@ -102,6 +89,13 @@ def _inherit_warmstart_revision(
     model, missing artifacts) is diagnosed by ``_prepare_init_from_adapter`` with its own message
     and its own error type. Raising here would report those as generic submission failures instead,
     so an unreadable source simply leaves the spec untouched and the real check speaks.
+
+    Applies to an SFT target too, and that case is the one with no second chance. SFT is the only
+    algorithm ``prepare_job`` force-pins (``_resolve_model_revision(required=True)``), and that call
+    runs immediately after this one. Skipping the inheritance here would let the child resolve its
+    own pin to whatever the base model's hub tip is now, so a source trained before the tip moved
+    fails the equality check in ``_prepare_init_from_adapter_inner``. inheriting first also preserves
+    the source pin's runner-managed provenance.
 
     Two ordering rules this function must not relax, because it now runs BEFORE the code that used
     to enforce them:
@@ -116,7 +110,7 @@ def _inherit_warmstart_revision(
       and inheriting it would silence that guard rather than trip it.
     """
     ref = spec.train.init_from_adapter
-    if spec.model_revision or not ref or spec.algorithm == "sft":
+    if spec.model_revision or not ref:
         return spec
     from flash.schema import parse_checkpoint_ref
 
@@ -169,16 +163,17 @@ def _prepare_init_from_adapter_inner(
     owner_key_id: int | None = None,
     token: str | None = None,
 ) -> tuple[JobSpec, JobSpec, dict | None, int | None]:
-    _runner()._require_supported_adapter_continuation(spec)
     ref = spec.train.init_from_adapter
     if not ref:
         return spec, spec, None, None
+    from flash.adapters.fused_experts import validate_fused_expert_adapter_config
     from flash.adapters.lora_rank import (
         adapter_artifact_identity,
         load_hf_adapter_config,
         preflight_init_adapter_lora_rank,
         resolve_hf_dataset_revision,
     )
+    from flash.adapters.targets import require_modality_marker
     from flash.runner.results.checkpoints import CheckpointListingError, adapter_artifact_exists
     from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
 
@@ -255,6 +250,11 @@ def _prepare_init_from_adapter_inner(
         ),
     )
     config = load_hf_adapter_config(storage, token, revision)
+    # here rather than only in the worker: this is the same config the worker will re-download and
+    # re-check, and an unmarked adapter is unusable by every algorithm, so deciding it now turns a
+    # post-allocation worker failure into a submit-time error and spends no GPU on a doomed run.
+    require_modality_marker(config, source=f"train.init_from_adapter source {ref!r}")
+    validate_fused_expert_adapter_config(config, spec.model)
     metadata = preflight_init_adapter_lora_rank(
         worker_spec, token=token, config_loader=lambda _ref, _token, _revision: config
     )
@@ -296,131 +296,50 @@ def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
         )
 
 
-def _prepared_before_public_alpha(raw_public: object) -> bool:
-    """True when this run's PERSISTED public spec predates ``lora_alpha`` becoming authorable.
-
-    The discriminator is the stored bytes, not this build's serialization: a snapshot prepared
-    before the change hashed a public spec with no alpha key, and its digest can only be reproduced
-    the same way. status.spec is never rewritten, so this answer is stable for the run's life.
-
-    A warm-start spec is excluded even though it also omits alpha -- to_dict() strips rank and alpha
-    for those in every version, so absence there says nothing about when the run was prepared, and
-    treating it as legacy would drop a binding that costs nothing to keep.
-    """
-    if not isinstance(raw_public, dict):
-        return False
-    train = raw_public.get("train")
-    if not isinstance(train, dict) or "lora_alpha" in train:
-        return False
-    return not train.get("init_from_adapter")
-
-
-_ROLLOUT_BATCH_KEYS = ("batch_size", "prompts_per_step")
-
-
-def _stored_rollout_batch_spelling(raw_spec: object) -> dict[str, Any] | None:
-    """How a PERSISTED rollout spec spelled its optimizer batch, or None if it is not one.
-
-    Same discriminator style as ``_prepared_before_public_alpha``: the answer comes from the stored
-    bytes, which are never rewritten, so it is stable for the run's life.
-
-    ``JobSpec.from_dict`` MOVES the pre-1.1.43 ``batch_size`` onto ``prompts_per_step`` when
-    reparsing, so rehashing a persisted spec with today's parse can produce different bytes than
-    were hashed at persist time -- failing integrity validation for exactly the warm-start grpo/opd
-    runs this migration exists to rescue.
-
-    Both keys are reported, rather than just the value there is to migrate. Reporting only the
-    latter conflates snapshots that have nothing to move but still change shape: a mixed-version
-    payload storing both names (the migration drops the old one, so the stored ``batch_size`` still
-    has to be rehashed), one whose legacy value is non-positive (discarded by the parser), and a
-    modern payload (nothing to do). Replaying the stored spelling covers all of them uniformly.
-
-    A key merely holding null reports None; a key genuinely OMITTED is omitted from the reading too,
-    because the two hash differently. Every digest is taken over a serialized ``JobSpec``, which
-    emits both names, so a null was really hashed as null -- while 1.1.40 predates
-    ``prompts_per_step`` entirely and hashed no such key. Each half's reading therefore carries its
-    OWN absence rather than sharing one flag: after a re-persist the worker half is rewritten in the
-    modern shape while ``status.spec`` keeps the legacy one, so the halves genuinely disagree about
-    which keys exist and a single flag would misdescribe one of them.
-
-    This is not a way to forge a batch: the replayed values are the STORED ones, and the digest they
-    are compared against was computed over the ORIGINAL ones, so any tampering still mismatches.
-
-    Only a rollout algorithm is eligible: for sft ``batch_size`` is the current, un-migrated name,
-    which ``from_dict`` leaves alone.
-    """
-    if not isinstance(raw_spec, dict):
-        return None
-    if not samples_on_policy(normalize_algorithm(str(raw_spec.get("algorithm") or ""))):
-        return None
-    train = raw_spec.get("train")
-    if not isinstance(train, dict):
-        return None
-    stored = {key: train.get(key) for key in _ROLLOUT_BATCH_KEYS}
-    # the 1.1.40 shape, read off the bytes themselves: it carried the old name and no new one.
-    # a payload omitting BOTH says nothing about when it was written, and the serializer always
-    # emits both -- so treating that as absence would drop a key that WAS hashed.
-    if "batch_size" in train and "prompts_per_step" not in train:
-        del stored["prompts_per_step"]
-    return stored
-
-
-def _restore_rollout_batch_spelling(payload: dict, stored: dict | None) -> None:
-    """Put the optimizer-batch keys back exactly as the stored payload hashed them.
-
-    A key absent from ``stored`` was absent from the hashed bytes, so it is removed rather than
-    written -- that is the 1.1.40 shape, which predates ``prompts_per_step``.
-    """
-    if stored is None:
-        return
-    train = payload.get("train")
-    if not isinstance(train, dict):
-        return
-    for key in _ROLLOUT_BATCH_KEYS:
-        if key in stored:
-            train[key] = stored[key]
-        else:
-            train.pop(key, None)
-
-
 def _preparation_digest(
     public_spec: JobSpec,
     worker_spec: JobSpec,
     adapter_identity: dict | None,
     *,
-    legacy_keys: dict | None = None,
-    legacy_public_keys: dict | None = None,
-    legacy_public_alpha: bool = False,
-    stored_rollout_batch: dict | None = None,
-    stored_public_rollout_batch: dict | None = None,
+    stored_public: object = None,
 ) -> str:
-    worker_payload = worker_spec.to_internal_dict()
     public_payload = public_spec.to_dict()
-    # the rollout optimizer batch was renamed `batch_size` -> `prompts_per_step`, and from_dict now
-    # MOVES it when reparsing a persisted spec. Rehash under the spelling the snapshot actually
-    # stored -- including a key it did not have -- so a spec written before or across the rename
-    # still reproduces its digest. Same reason as the omissions and restorations below.
+    # `lora_alpha` became user-authorable in 1.1.35, so `to_dict()` now MATERIALIZES it (defaulting
+    # to 2 * lora_rank) where a spec prepared before that stored no key at all. rehashing such a
+    # run with today's serialization hashes bytes it never had, so its digest can only be
+    # reproduced by replaying the omission. `workload_profile` predates the change (1.1.32), so the
+    # digest branch is genuinely reachable for runs in that window.
     #
-    # Each half is restored from ITS OWN stored payload, exactly like legacy_keys vs
-    # legacy_public_keys below. Feeding the worker's spelling to both would overwrite whatever the
-    # public payload held before hashing -- and since the parse DROPS a superseded `batch_size`,
-    # `_validate_effective_spec` cannot see it either, so a tampered public value would be erased
-    # rather than caught. The two halves legitimately differ (the public spec is a stripped view),
-    # so they cannot share one reading -- including which keys they carry at all, which is why each
-    # reading holds its own absence instead of a shared flag. Re-persisting rewrites the worker half
-    # in the modern shape and leaves `status.spec` legacy, so from then on the halves disagree.
-    _restore_rollout_batch_spelling(worker_payload, stored_rollout_batch)
-    _restore_rollout_batch_spelling(public_payload, stored_public_rollout_batch)
-    # ``[environment] pip`` became user-authorable, so to_dict() now emits it where it used to be
-    # stripped, and a pre-upgrade snapshot hashed an environment with no pip key at all. Dropping it
-    # when empty reproduces those bytes without needing to know when the run was prepared: absent
-    # and empty are the same install, so they must hash alike. An authored pip is non-empty and
-    # stays bound, so tampering with the persisted value is still caught.
+    # this cannot forge a value: the omission is read from the STORED public spec, and the digest
+    # it is compared against was computed over the original. a warm start is excluded because
+    # `to_dict()` strips rank and alpha for those in EVERY version, so absence there dates nothing
+    # and dropping the binding would lose real cover -- `_validate_effective_spec` excludes alpha
+    # from its structural comparison, leaving the digest as the only thing tying the two halves.
+    if isinstance(stored_public, Mapping):
+        stored_train = stored_public.get("train")
+        if (
+            isinstance(stored_train, Mapping)
+            and "lora_alpha" not in stored_train
+            and not stored_train.get("init_from_adapter")
+        ):
+            public_payload["train"].pop("lora_alpha", None)
+    worker_payload = worker_spec.to_internal_dict()
+    # NORMALIZATION, not legacy replay: this is the canonical shape `dev` hashes TODAY (1.2.88), and
+    # it is unconditional -- it reads nothing off the stored record and applies to every run this
+    # build prepares. Deleting it as "historical" made the digest depend on which build wrote it, so
+    # a record the DEPLOYED release is writing right now stops verifying here. Measured: a spec
+    # hashed dev's way then recovered on this branch fails `reallocation_spec_from_status`, which
+    # `server/platform/runtime.py:697-710` turns into `unrecoverable` -- retiring in-flight runs on
+    # upgrade. The genuinely historical half (`VersionedPersistedSpecEnvelope.rewind`) stays deleted.
+    #
+    # absent and empty are the same value for all of these, so hashing them alike costs no binding:
+    # a set field is non-empty and stays covered, and every key is derived from the spec rather than
+    # read from the snapshot, so nothing here can be forged by tampering with the stored record.
     if not public_payload["environment"].get("pip"):
         public_payload["environment"].pop("pip", None)
-    # omit empty fields so existing version-1 snapshots keep their historical digest.
     for key in (
         "model_revision_auto",
+        "model_revision_force_pin",
         "gpu_count_auto",
         "workload_profile_input_digest",
         "workload_profile_producer_version",
@@ -428,36 +347,8 @@ def _preparation_digest(
     ):
         if not worker_payload.get(key):
             worker_payload.pop(key, None)
-    # Restore since-removed keys the STORED payload carried, for the same reason as the omissions
-    # above: the digest has to reproduce the bytes that were hashed, not today's serialization. A
-    # pre-upgrade snapshot hashed `model_policy` in (to_internal_dict was asdict, so it emitted the
-    # defaulted value), and the field no longer exists -- so rehashing without it mismatches and a
-    # still-valid warm-start or workload-profile run fails integrity validation on recovery. Only
-    # keys registered as historical public removals are honoured. Any field the dataclass still
-    # defines already comes from worker_spec, so replaying its identical stored value cannot forge it.
-    for key, value in (legacy_keys or {}).items():
-        if key in _runner()._DROPPED_TOP_LEVEL_KEYS:
-            worker_payload[key] = value
-    # a dropped key that was USER-AUTHORABLE was hashed on the public side too, not just the worker
-    # side. model_policy never was, so restoring only the worker payload was enough for it;
-    # model_revision and worker_env were, so a pre-upgrade public_spec carried them and the digest
-    # cannot reproduce without them.
-    for key, value in (legacy_public_keys or {}).items():
-        if key in _runner()._DROPPED_TOP_LEVEL_KEYS:
-            public_payload[key] = value
-    # ``lora_alpha`` became user-authorable, so to_dict() now emits it for non-warm-start runs. A
-    # snapshot prepared BEFORE that change hashed a public spec without alpha, so rehashing it with
-    # alpha would fail a still-valid run's integrity check on recovery -- same reason as the
-    # omissions and restorations above. That omission is scoped to those legacy snapshots only: a
-    # digest created from here on binds the public alpha, so tampering with the persisted public
-    # value is caught. Without that binding the two halves can disagree silently, because
-    # _runner()._validate_effective_spec() excludes lora_alpha from its structural comparison (the worker's
-    # warm-start-inherited alpha legitimately differs from the public one), leaving the digest as
-    # the only thing that could cover it.
-    if legacy_public_alpha:
-        public_payload["train"].pop("lora_alpha", None)
     payload = {
-        "version": 1,
+        "version": PREPARATION_ENVELOPE_VERSION,
         "public_spec": public_payload,
         "worker_spec": worker_payload,
         "adapter_identity": adapter_identity,
@@ -479,6 +370,7 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         # re-parseable by the submission schema), so the reconstructed public spec always reads
         # False while the worker half carries the real value. Comparing them would reject every
         # auto-pinned run here -- the same runs the deploy guard was just relaxed to admit.
+        "model_revision",
         "model_revision_auto",
         "gpu_count_auto",
         "workload_profile_input_digest",
@@ -486,15 +378,6 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         "workload_profile",
     ):
         effective[managed_top] = public.get(managed_top)
-    # the pin value is stripped from every new public spec. a runner-assigned pin is asymmetric by
-    # design, as is an authored pin inherited by a new warm-start child after the public key's removal.
-    # exclude those two cases only. a historical authored source still carries its public revision and
-    # remains structurally compared. both asymmetric shapes are digest-protected: the marker triggers
-    # verification for auto pins, and every warm start verifies its complete preparation snapshot.
-    if not public.get("model_revision") and (
-        worker_spec.model_revision_auto or public.get("train", {}).get("init_from_adapter")
-    ):
-        effective["model_revision"] = public.get("model_revision")
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])
     public_ref = public_train.get("init_from_adapter") or ""
@@ -519,6 +402,21 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     effective["train"] = effective_train
     public_environment = dict(public["environment"])
     effective_environment = dict(effective["environment"])
+    # the staged package is controller-managed: staging writes it onto the worker half only, so the
+    # public half never carries one and comparing the two directly would fail every staged run.
+    # this exclusion cannot be tightened into a tamper check here. `to_internal_dict` OMITS the key
+    # when unset, so a stripped package is byte-identical to a run that simply has not staged yet --
+    # which is the state of every run between submit and allocation, and of every finished run in
+    # the hosted tests. rejecting that shape fails 96 legitimate runs
+    # (tests/test_server_api.py, tests/test_client_server_integration.py), and widening the digest
+    # trigger instead fails ordinary runs whose gpu.type the allocator rewrote at provisioning
+    # (tests/test_server_api.py::test_deploy_ignores_stored_training_gpu).
+    # stripping it is contained at the consumer rather than here: `stage_environment_package` sees
+    # no package and re-stages from the SAME digest-bound `resolved_sha`, and the worker's loader
+    # raises "worker job spec has no staged environment package" rather than importing anything.
+    # a substituted package is the case that must fail closed, and does: it is bound to the pin by
+    # `verify_staged_environment`, which re-derives both digests before any environment code loads.
+    effective_environment.pop("package", None)
     public_sha = public_environment.get("resolved_sha")
     effective_sha = effective_environment.get("resolved_sha")
     if not public_sha and isinstance(effective_sha, str):
@@ -596,32 +494,43 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
 
 
 def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec:
-    # a pin already marked runner-assigned (inherited from a warm-start source) is not authored,
-    # even though it is present. reading presence alone would relabel it as the author's and hand
-    # deploy a pin it refuses -- the exact failure the marker exists to prevent.
-    authored = "" if spec.model_revision_auto else spec.model_revision
-    if not authored and not required:
+    if spec.model_revision and not spec.model_revision_auto:
+        raise ValueError("unmanaged model_revision is unsupported")
+    if not spec.model_revision and not required:
+        return spec
+    # an inherited warm-start pin is already an immutable sha chosen by a previous run, so there is
+    # nothing left to resolve. a forced pin is excluded because it is a one-shot request to verify
+    # that exact immutable commit before clearing the request marker.
+    if (
+        spec.model_revision_auto
+        and not spec.model_revision_force_pin
+        and re.fullmatch(r"[0-9a-f]{40}", spec.model_revision or "")
+    ):
         return spec
     try:
         from huggingface_hub import HfApi
 
         info = HfApi(token=os.environ.get("HF_TOKEN")).model_info(
             spec.model,
-            revision=authored or None,
+            revision=spec.model_revision if spec.model_revision_force_pin else None,
         )
-        resolved = str(getattr(info, "sha", "") or "").strip().lower()
+        reported = str(getattr(info, "sha", "") or "").strip()
+        resolved = reported.lower()
         if re.fullmatch(r"[0-9a-f]{40}", resolved) is None:
             raise ValueError("resolved revision is not an immutable commit")
+        if spec.model_revision_force_pin and reported != spec.model_revision:
+            raise ValueError("resolved revision does not match the forced immutable pin")
     except Exception as exc:
         raise ValueError(
             f"could not resolve model_revision for model {spec.model!r}; "
             "verify that the revision exists and the operator token can access it"
         ) from exc
-    # record WHO chose the pin, not just its value. `authored` is empty exactly when the caller
-    # asked for a pin the user never wrote (SFT, required=True), and that is the only case deploy
-    # may relax: serving resolves the base by name, so an auto pin asks nothing of it, while an
-    # authored one is a request serving cannot honour and must still be refused.
-    return replace(spec, model_revision=resolved, model_revision_auto=not authored)
+    return replace(
+        spec,
+        model_revision=resolved,
+        model_revision_auto=True,
+        model_revision_force_pin=False,
+    )
 
 
 def _profile_producer_version() -> str:

@@ -5,6 +5,7 @@ Split out of ``flash.engine.worker.sft_train`` to keep that module under the fil
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -13,8 +14,11 @@ from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
+from flash.adapters.targets import resolve_lora_targeting
+from flash.core.catalog import get_model
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
 from flash.engine.worker import sft_train as _sft_train
+from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 from flash.providers.base import rentable_gpu_counts
 
@@ -29,19 +33,14 @@ build_sft_overrides = _sft_train.build_sft_overrides
 # taken from the parent like every other name here, so the runner and `sft_train`'s own
 # `sft_data_loading`/`sft_configuring` wraps use one object rather than two imports of it.
 liveness_heartbeat = _sft_train.liveness_heartbeat
-render_flash_qla_shim = _sft_train.render_flash_qla_shim
-render_gdn_varlen_shim = _sft_train.render_gdn_varlen_shim
-render_shim_marker_prologue = _sft_train.render_shim_marker_prologue
-render_wandb_link_shim = _sft_train.render_wandb_link_shim
+render_sitecustomize_bootstrap = _sft_train.render_sitecustomize_bootstrap
 shim_marker_file = _sft_train.shim_marker_file
 verify_applied_shim_markers = _sft_train.verify_applied_shim_markers
-wrap_shim_fragment = _sft_train.wrap_shim_fragment
 SHIM_FRAGMENT_FAILED_EXIT_CODE = _sft_train.SHIM_FRAGMENT_FAILED_EXIT_CODE
 sft_tokens_for_updates = _sft_train.sft_tokens_for_updates
 sft_under_ran = _sft_train.sft_under_ran
 validate_save_steps = _sft_train.validate_save_steps
 _render_sft_dataset_module = _sft_train._render_sft_dataset_module
-_render_sft_sitecustomize = _sft_train._render_sft_sitecustomize
 
 
 @dataclass(frozen=True)
@@ -75,6 +74,7 @@ class _SftOptions:
 class _SftData:
     rows: list[dict]
     multimodal: bool
+    processor: object | None
     profile: object
     max_length: int
     realized_max_length: int
@@ -88,6 +88,7 @@ class _SftModelSetup:
     lora_rank: int
     lora_alpha: int
     target_modules: object
+    exclude_modules: str | None
     warmstart_adapter: str | None
     fused_ce: bool
     train_batch_size: int
@@ -139,8 +140,8 @@ class _SftProgress:
     train_tokens: int
     loraplus_applied: bool
     wandb_link: dict[str, str | None]
-    # what the child's wrapped sitecustomize fragments must prove applied (see
-    # wrap_shim_fragment); verified at the first optimizer step and again at child exit.
+    # what the child plugin must prove applied; verified at the first optimizer step and again at
+    # child exit.
     shim_markers: str = ""
     expected_shims: tuple[str, ...] = ()
     shims_verified: bool = False
@@ -262,20 +263,30 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
     max_length = _sft_train._sft_profile_max_length(realized_profile)
     dropped = realized_profile.dropped_examples
     selected_count = realized_profile.selected_examples
+    retained_count = realized_profile.retained_examples
     sampled_texts = prepared_workload.sampled_texts
     multiturn_targets = prepared_workload.multiturn_targets
     coerced_singleturn_targets = prepared_workload.coerced_singleturn_targets
+    role_aware_multiturn_targets = prepared_workload.role_aware_multiturn_targets
+    fallback_multiturn_targets = prepared_workload.fallback_multiturn_targets
     if dropped:
         print(
             f"[sft] dropped {dropped} rows with no real completion target "
             "(sft_max_len truncated away the whole completion, or it was content-free)"
         )
-    if multiturn_targets:
+    if role_aware_multiturn_targets:
         print(
-            f"[sft] multi-turn SFT: {multiturn_targets}/{selected_count} rows train on a full "
-            "target transcript"
+            f"[sft] multi-turn SFT: {role_aware_multiturn_targets}/{retained_count} rows use "
+            "assistant-body masking; interleaved environment/tool/user observations are masked "
+            "out of the loss"
         )
-    elif getattr(options.env, "multi_turn", False):
+    if fallback_multiturn_targets:
+        print(
+            f"[sft][warn] multi-turn SFT: {fallback_multiturn_targets}/{retained_count} rows use "
+            "completion-only fallback because the rendered transcript was not parseable ChatML; "
+            "interleaved observations are not proven masked"
+        )
+    if not multiturn_targets and getattr(options.env, "multi_turn", False):
         print(
             "[sft][warn] this is a multi-turn environment but no row ships a multi-turn "
             "target completion"
@@ -308,6 +319,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
     return _SftData(
         rows=rows,
         multimodal=prepared_workload.multimodal,
+        processor=prepared_workload.processor,
         profile=profile,
         max_length=max_length,
         realized_max_length=realized_max_length,
@@ -333,12 +345,19 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     # to resolve. same stage name, so the provider's setup-grace classification is unchanged.
     with liveness_heartbeat("sft_model_load"):
         lora_config = _w.make_lora(options.model_id)
+        targeting = resolve_lora_targeting(
+            options.model_id, algorithm="sft", multimodal=data.multimodal
+        )
         lora_rank = int(lora_config.r)
-        target_modules = lora_config.target_modules
+        target_modules = targeting.target_modules
         if isinstance(target_modules, set | frozenset):
             target_modules = sorted(target_modules)
         warmstart_adapter = _sft_train._warmstart_adapter_path(
-            options.model_id, options.model_revision, lora_rank
+            options.model_id,
+            options.model_revision,
+            lora_rank,
+            int(lora_config.lora_alpha),
+            targeting,
         )
         vocab_size = _sft_train._resolve_sft_vocab_size(options.model_id, options.model_revision)
         # hoisted into the span: on a PINNED revision this falls through to a live AutoConfig read
@@ -396,6 +415,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
         lora_rank=lora_rank,
         lora_alpha=int(lora_config.lora_alpha),
         target_modules=target_modules,
+        exclude_modules=targeting.exclude_modules,
         warmstart_adapter=warmstart_adapter,
         fused_ce=fused_ce,
         train_batch_size=train_batch_size,
@@ -535,44 +555,48 @@ def _write_sft_child_shims(
     seed: int,
     loggers: list[str],
     gdn_reset_arch: str | None,
-) -> tuple[str, tuple[str, ...]]:
-    """Write the child's sitecustomize and dataset module; return its marker file and shim names."""
-    core_source = _render_sft_sitecustomize(
-        seed=seed,
-        loraplus_ratio=_SFT_LORAPLUS_RATIO,
-        save_at_steps=options.save_at_steps,
-        total_steps=model.update_horizon,
-        reentrant_gradient_checkpointing=model.reentrant_gradient_checkpointing,
+    multimodal: bool = False,
+) -> tuple[str, tuple[str, ...], str]:
+    """write the SFT plugin bundle, startup bootstrap, and non-secret plugin config."""
+    parent_dir = os.path.dirname(_sft_train.__file__)
+    copies = (
+        ("train/core/child/runtime.py", "flash_verl_runtime.py"),
+        ("train/sft/child/plugin.py", "flash_sft_plugin.py"),
+        ("train/sft/child/entry.py", "flash_sft_entry.py"),
     )
-    # both shims, not either: this one patches DistributedSampler/StatefulDataLoader so the child's
-    # row order matches the profile's byte for byte, and the gdn one patches the model's text
-    # forward to reset linear-attention state at packed example boundaries. different objects,
-    # no interaction -- a gdn hybrid needs both, and dropping either is a silent correctness bug.
-    core_source = _sft_train._append_exact_sft_dataloader_shim(core_source)
-    # every required fragment is wrapped fail-closed (see wrap_shim_fragment): execsitecustomize
-    # would otherwise swallow a fragment's exception and the child would train unpatched (no
-    # seeding, no exact dataloader order, no lora+, no boundary resets) while looking healthy.
-    # the wandb link shim stays unwrapped: it swallows its own failures by design and a logging
-    # link must not be able to abort paid training.
-    required_fragments = [("sft-core", core_source)]
-    if gdn_reset_arch is not None:
-        required_fragments.append(("gdn-varlen", render_gdn_varlen_shim(gdn_reset_arch)))
-        # same gate as the boundary resets (this is a gdn hybrid), and the fragment itself
-        # no-ops off sm90. measured 1.055x end-to-end on an H200; on sm100 flashqla computes
-        # wrong gradients, so render_flash_qla_shim binds nothing there.
-        required_fragments.append(("flashqla-gdn", render_flash_qla_shim(gdn_reset_arch)))
+    for source, target in copies:
+        shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))
     shim_markers = shim_marker_file(shim_dir)
-    # the workdir is wiped per attempt (_resolve_sft_options), so no stale marker can survive here.
-    shim_source = render_shim_marker_prologue(shim_markers) + "".join(
-        wrap_shim_fragment(name, source) for name, source in required_fragments
-    )
-    if "wandb" in loggers:
-        shim_source += render_wandb_link_shim()
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(shim_source)
+        file.write(render_sitecustomize_bootstrap())
     with open(custom_dataset_path, "w", encoding="utf-8") as file:
         file.write(_render_sft_dataset_module())
-    return shim_markers, tuple(name for name, source in required_fragments if source)
+    text_only = bool(getattr(model, "exclude_modules", None))
+    plugin_config = json.dumps(
+        {
+            "marker_file": shim_markers,
+            "seed": int(seed),
+            "loraplus_ratio": float(_SFT_LORAPLUS_RATIO),
+            "loraplus_ready_marker": _LORAPLUS_READY_MARKER,
+            "save_at_steps": list(options.save_at_steps),
+            "total_steps": int(model.update_horizon),
+            "reentrant_gradient_checkpointing": bool(model.reentrant_gradient_checkpointing),
+            "lora_language_prefix": (
+                get_model(options.model_id).lora_language_prefix if text_only else ""
+            ),
+            "multimodal": bool(multimodal),
+            "gdn_model_type": gdn_reset_arch,
+            "wandb": "wandb" in loggers,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected = ("sft-core",)
+    if text_only:
+        expected += (TEXT_LORA_TARGET_SHIM,)
+    if gdn_reset_arch:
+        expected += ("gdn-varlen",)
+    return shim_markers, expected, plugin_config
 
 
 def _prepare_sft_child(
@@ -607,6 +631,7 @@ def _prepare_sft_child(
         "lora_rank": model.lora_rank,
         "lora_alpha": model.lora_alpha,
         "target_modules": model.target_modules,
+        "exclude_modules": None,
         "target_parameters": _w.lora_target_parameters(options.model_id),
         "lora_adapter_path": model.warmstart_adapter,
         "ulysses_sp_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
@@ -642,7 +667,7 @@ def _prepare_sft_child(
         "fused_ce_backend": _sft_train._resolve_sft_fused_ce_backend(capabilities.caps),
     }
     overrides = build_sft_overrides(config)
-    shim_markers, expected_shims = _write_sft_child_shims(
+    shim_markers, expected_shims, plugin_config = _write_sft_child_shims(
         options,
         model,
         shim_dir=shim_dir,
@@ -650,6 +675,7 @@ def _prepare_sft_child(
         seed=config["seed"],
         loggers=loggers,
         gdn_reset_arch=gdn_reset_arch,
+        multimodal=data.multimodal,
     )
 
     # the RESOLVED width, not the allocated card count: it is what becomes --nproc-per-node below,
@@ -664,22 +690,24 @@ def _prepare_sft_child(
         python_bin=capabilities.python_bin,
         model_id=options.model_id,
         model_revision=options.model_revision,
+        exclude_modules=model.exclude_modules,
         required_steps=options.save_at_steps,
+        preprocessor=data.processor,
     )
     # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded
     # watcher re-merges it and re-uploads full state hf already has, holding the resume-upload
     # lock while the first genuinely new checkpoint waits behind it.
-    watcher.processed_steps.update(
-        _sft_train._processed_resume_steps(options.save_at_steps, resume_step)
-    )
+    _sft_train._seed_resume_lifecycle(watcher, options.save_at_steps, resume_step)
     if resume_step >= model.update_horizon:
-        missing = sorted(watcher.required_steps - watcher.processed_steps)
+        missing = watcher.lifecycle.missing_deployables(watcher.required_steps)
         if missing:
             raise RuntimeError(f"required saves were not durably published: {missing}")
     child_env = _sft_train._build_verl_child_env(
         shim_dir=shim_dir,
         wandb_enabled="wandb" in loggers,
     )
+    child_env["VERL_USE_EXTERNAL_MODULES"] = "flash_sft_plugin"
+    child_env["FLASH_SFT_PLUGIN_CONFIG"] = plugin_config
     command = [
         capabilities.python_bin,
         "-m",
@@ -690,7 +718,7 @@ def _prepare_sft_child(
         # every rank torchrun starts, so a rank the batch cannot feed is the `batch_size=0` crash.
         f"--nproc-per-node={world_size}",
         "-m",
-        "verl.trainer.sft_trainer",
+        "flash_sft_entry",
         *overrides,
     ]
     return _SftChild(

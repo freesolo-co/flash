@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
 
 import pytest
@@ -54,7 +53,12 @@ def _raw(**overrides) -> dict:
 
 
 def _job_from_dict(data: dict) -> JobSpec:
-    return JobSpec.from_dict({"project": "11111111-1111-4111-8111-111111111111", **data})
+    payload = {"project": "11111111-1111-4111-8111-111111111111", **data}
+    if "train" not in payload:
+        payload["train"] = {"credit_assignment": "per_episode"}
+    elif isinstance(payload["train"], dict) and "credit_assignment" not in payload["train"]:
+        payload["train"] = {**payload["train"], "credit_assignment": "per_episode"}
+    return JobSpec.from_dict(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -170,90 +174,6 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     } == {"0.2.0"}
 
 
-def test_persisted_rollout_batch_survives_the_prompts_per_step_rename() -> None:
-    """Regression: a run persisted before 1.1.43 carries the batch only as ``batch_size``.
-
-    Production (main, 1.1.40) authors the rollout batch under ``batch_size`` and the workers read
-    it there; dev reads ``prompts_per_step``. Every run in flight across that release therefore
-    reparses through `from_dict` with the new key unset, and the worker falls back to the recipe
-    default -- 64 for an authored 32 on grpo, which OOMs hardware rented for 32, and 8 on opd.
-    `from_dict` is the recovery path (`platform/runtime.py` reattach/resubmit), NOT submission:
-    the schema still rejects an authored `batch_size` on a live rollout spec.
-    """
-    from flash.engine.plan.recipe import RECIPE
-
-    def _train(algorithm: str, train: dict) -> TrainSpec:
-        return _job_from_dict(
-            {
-                "model": "Qwen/Qwen3.5-4B",
-                "algorithm": algorithm,
-                "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {"epochs": 1, "group_size": 4, **train},
-            }
-        ).train
-
-    for algorithm, default in (
-        ("grpo", RECIPE.rl.prompts_per_step),
-        ("opd", RECIPE.opd.prompts_per_step),
-    ):
-        legacy = _train(algorithm, {"batch_size": 32})
-        assert legacy.prompts_per_step == 32, algorithm
-        # the value the broken read resumed on. per-algorithm, so the assertion cannot pass by
-        # short-circuiting on the other one -- and so it fails loudly rather than matching by
-        # coincidence if a recipe default ever becomes 32.
-        assert default != 32, algorithm
-        # the old key is MOVED, not copied: a spec carrying both names is rejected by the schema,
-        # which would break the resubmit that recovery and `flash runs get` perform, and would let
-        # `vram.py::_optimizer_batch_value` (which takes the larger of the two) size a card off the
-        # stale value that ranking ignores.
-        assert legacy.batch_size is None, algorithm
-
-        # every persisted shape, asserted the same way: the migrated value, AND that the old key is
-        # gone. checking only prompts_per_step would miss a retained batch_size, which is what
-        # breaks the round trip below.
-        for stored, expected in (
-            # the pre-1.1.43 spelling, migrated.
-            ({"batch_size": 32}, 32),
-            # the current spelling, untouched.
-            ({"prompts_per_step": 16}, 16),
-            # a payload written mid-upgrade carrying BOTH: prompts_per_step wins, and the
-            # superseded key goes with it rather than being left to re-emit.
-            ({"batch_size": 32, "prompts_per_step": 16}, 16),
-            ({"batch_size": 0, "prompts_per_step": 16}, 16),
-            # a non-positive legacy value is discarded rather than migrated: `minimum=1` would have
-            # rejected it at submission, so carrying it forward only fails later on a rented GPU.
-            # discarded from BOTH names -- retaining it under the old one re-emits a rejected key.
-            ({"batch_size": 0}, None),
-            ({"batch_size": -5}, None),
-        ):
-            train = _train(algorithm, dict(stored))
-            assert (train.prompts_per_step, train.batch_size) == (expected, None), (
-                algorithm,
-                stored,
-            )
-            # and the result must survive a full re-serialize -> reparse, which is what recovery
-            # and `flash runs get` perform. a spec carrying both names raises ConfigError here.
-            roundtrip = spec_from_dict(
-                _job_from_dict(
-                    {
-                        "model": "Qwen/Qwen3.5-4B",
-                        "algorithm": algorithm,
-                        "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                        "train": {"epochs": 1, "group_size": 4, **stored},
-                    }
-                ).to_dict()
-            )
-            assert (roundtrip.train.prompts_per_step, roundtrip.train.batch_size) == (
-                expected,
-                None,
-            ), (algorithm, stored)
-
-    # sft is NOT migrated: there `batch_size` is a different quantity (examples per update, resolved
-    # against a measured workload profile), so copying it into prompts_per_step would be wrong.
-    sft = _train("sft", {"batch_size": 4})
-    assert (sft.batch_size, sft.prompts_per_step) == (4, None)
-
-
 def test_credit_assignment_defaults_accepts_and_roundtrips() -> None:
     default = spec_from_dict(_raw())
     assert default.train.credit_assignment == "per_episode"
@@ -290,7 +210,8 @@ def test_project_id_is_required_canonicalized_and_roundtrips() -> None:
         spec_from_dict(_raw(project="   "), project_required=True)
     with pytest.raises(ConfigError, match="project must be a valid UUID"):
         spec_from_dict(_raw(project="not-a-uuid"))
-    assert JobSpec.from_dict({"model": "Qwen/Qwen3.5-0.8B"}).project == ""
+    persisted = JobSpec(model="Qwen/Qwen3.5-0.8B").to_internal_dict()
+    assert JobSpec.from_dict(persisted).project == ""
 
     synthetic = JobSpec(model="Qwen/Qwen3.5-0.8B")
     assert synthetic.project == ""
@@ -318,17 +239,26 @@ def test_credit_assignment_rejects_invalid_values(invalid: object) -> None:
 
 
 def test_job_spec_from_dict_credit_assignment_validates_worker_boundary() -> None:
-    # the worker-side deserialization boundary must round-trip valid modes, default a missing value,
-    # and reject a malformed persisted/tampered value rather than silently downgrading to per-episode.
     payload = spec_from_dict(_raw(**{"train.credit_assignment": "per_turn"})).to_dict()
     assert _job_from_dict(payload).train.credit_assignment == "per_turn"
 
     payload["train"].pop("credit_assignment", None)
-    assert _job_from_dict(payload).train.credit_assignment == "per_episode"
+    assert JobSpec.from_dict(payload).train.credit_assignment == "per_episode"
 
-    payload["train"]["credit_assignment"] = "per_step"
-    with pytest.raises(ValueError, match="credit_assignment must be one of"):
-        _job_from_dict(payload)
+    for invalid in (None, "", "  ", "per_step"):
+        payload["train"]["credit_assignment"] = invalid
+        with pytest.raises(ValueError, match="credit_assignment must be one of"):
+            JobSpec.from_dict(payload)
+
+
+def test_job_spec_from_dict_rejects_nonpositive_save_every() -> None:
+    payload = spec_from_dict(_raw(**{"train.save_every": 20})).to_dict()
+    assert _job_from_dict(payload).train.save_every == 20
+
+    for invalid in (0, -1, -20):
+        payload["train"]["save_every"] = invalid
+        with pytest.raises(ValueError, match=r"train\.save_every must be positive"):
+            _job_from_dict(payload)
 
 
 def test_train_key_validator_rejects_unknown_names_only() -> None:
@@ -339,19 +269,6 @@ def test_train_key_validator_rejects_unknown_names_only() -> None:
     message = str(excinfo.value)
     assert "unknown key(s): removed_spelling" in message
     assert "allowed:" in message
-
-
-def test_persisted_worker_specs_tolerate_the_removed_platform_profile_kind_without_warning(
-    caplog,
-) -> None:
-    payload = JobSpec().to_internal_dict()
-    payload["workload_profile_kind"] = "sft"
-
-    with caplog.at_level(logging.WARNING, logger="flash.spec"):
-        restored = JobSpec.from_dict(payload)
-
-    assert restored == JobSpec()
-    assert not caplog.records
 
 
 def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None:
@@ -411,9 +328,23 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
         }
 
 
-def test_sft_init_from_adapter_is_rejected_at_parse_time() -> None:
-    with pytest.raises(ConfigError, match="SFT adapter continuation is not supported"):
-        spec_from_dict(_raw(algorithm="sft", **{"train.init_from_adapter": "source-run"}))
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_init_from_adapter_parses_for_every_target_algorithm(algorithm) -> None:
+    """Warm start is target-algorithm agnostic: every algorithm may continue an adapter.
+
+    SFT used to be rejected here. The restriction described the retired trl SFT backend; the verl
+    backend loads a warm-start adapter exactly like GRPO and OPD do, so all nine source/target
+    combinations parse.
+    """
+    raw = _raw(algorithm=algorithm, **{"train.init_from_adapter": "source-run"})
+    # the source adapter's rank/alpha metadata is authoritative for every warm start, so authoring
+    # either alongside init_from_adapter stays rejected; BASE_RAW presets a rank.
+    raw["train"].pop("lora_rank")
+
+    spec = spec_from_dict(raw)
+
+    assert spec.algorithm == algorithm
+    assert spec.train.init_from_adapter == "source-run"
 
 
 @pytest.mark.parametrize(
@@ -494,10 +425,24 @@ def test_internal_from_dict_round_trips_stored_lora_alpha() -> None:
         "model": "Qwen/Qwen3.5-0.8B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
-        "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16, "lora_alpha": 48},
+        "train": {
+            "epochs": 1,
+            "max_examples": 8,
+            "lora_rank": 16,
+            "lora_alpha": 48,
+            "credit_assignment": "per_episode",
+        },
     }
     assert JobSpec.from_dict(base).train.lora_alpha == 48  # present -> round-trip
-    absent = {**base, "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16}}
+    absent = {
+        **base,
+        "train": {
+            "epochs": 1,
+            "max_examples": 8,
+            "lora_rank": 16,
+            "credit_assignment": "per_episode",
+        },
+    }
     assert JobSpec.from_dict(absent).train.lora_alpha == 32  # absent -> derive 2 x rank
 
 
@@ -785,19 +730,6 @@ def test_advantage_clip_is_no_longer_a_config_key() -> None:
     raw["train"]["advantage_clip"] = 1.5
     with pytest.raises(ConfigError, match=r"unknown key\(s\): advantage_clip"):
         spec_from_dict(raw)
-
-
-def test_jobspec_drops_advantage_clip_from_persisted_records() -> None:
-    """A run provisioned before #968 still parses; recovery would otherwise fail it and kill its worker."""
-    original = _job_from_dict({})
-    persisted = original.to_internal_dict()
-    persisted["train"]["advantage_clip"] = 1.5
-
-    restored = JobSpec.from_dict(persisted)
-
-    # dropped, not resurrected: the key is gone from the schema and never reaches a worker.
-    assert restored.train == original.train
-    assert not hasattr(restored.train, "advantage_clip")
 
 
 def test_jobspec_still_rejects_train_keys_that_were_never_tolerated() -> None:
@@ -1094,15 +1026,36 @@ def test_environment_subfields_accept_valid_and_missing() -> None:
     assert spec.environment.secrets == ()
 
 
-def test_jobspec_from_dict_rejects_path() -> None:
-    # Defense-in-depth: a stale worker payload carrying a local path must be rejected.
+@pytest.mark.parametrize("unknown_key", ["path", "pth", "totally_made_up"])
+def test_jobspec_from_dict_rejects_unknown_environment_keys(unknown_key) -> None:
     data = {
         "project": "11111111-1111-4111-8111-111111111111",
         "model": "Qwen/Qwen3-0.6B",
-        "environment": {"id": "gsm8k", "path": "./environment.py"},
+        "environment": {"id": "gsm8k", unknown_key: "./environment.py"},
     }
-    with pytest.raises(ValueError, match="local environment paths are no longer supported"):
+    with pytest.raises(ValueError, match=rf"environment has unknown key\(s\): {unknown_key}"):
         _job_from_dict(data)
+
+
+def test_jobspec_from_dict_keeps_valid_environment_package() -> None:
+    data = {
+        "project": "11111111-1111-4111-8111-111111111111",
+        "model": "Qwen/Qwen3-0.6B",
+        "environment": {
+            "id": "owner/project/gsm8k",
+            "resolved_sha": "d" * 40,
+            "package": {
+                "artifact_revision": "a" * 40,
+                "archive_sha256": "b" * 64,
+                "manifest_sha256": "c" * 64,
+            },
+        },
+    }
+
+    spec = _job_from_dict(data)
+
+    assert spec.environment.package is not None
+    assert spec.environment.package.artifact_revision == "a" * 40
 
 
 # ---------------------------------------------------------------------------
@@ -1226,6 +1179,94 @@ def test_cost_quote_skips_a_preference_this_plane_cannot_provision(monkeypatch) 
     # the same preference is still honored on a plane that can actually provision it.
     monkeypatch.setattr(providers_registry, "available_providers", lambda: ("runpod", "lambda"))
     assert estimate_cost(config).provider == "lambda"
+
+
+def test_cost_quote_refuses_a_shape_no_configured_provider_can_rent(monkeypatch) -> None:
+    """Exhausting the eligible set must raise, not fall through to an unrestricted `auto` quote.
+
+    A vast-only plane cannot rent a B200. Ranking the registered RunPod pool anyway returns a quote
+    for hardware this plane has no credentials for, which then passes the affordability check and
+    only fails once live allocation runs -- after the run is recorded.
+    """
+    import flash.providers as providers_registry
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.spec import runconfig_from_spec
+
+    spec = spec_from_dict(_raw(**{"gpu.providers": ["vast"], "gpu.type": "B200"}))
+    config = runconfig_from_spec(spec)
+
+    monkeypatch.setattr(providers_registry, "available_providers", lambda: ("vast",))
+    with pytest.raises(ValueError, match="vast"):
+        estimate_cost(config)
+
+    # a plane that can actually rent the class still quotes it.
+    monkeypatch.setattr(providers_registry, "available_providers", lambda: ("runpod", "vast"))
+    assert estimate_cost(config).provider == "runpod"
+
+
+def test_cost_quote_prices_the_cheapest_acceptable_gpu_class() -> None:
+    """An ordered `[gpu] type` list must be quoted over the whole acceptable set.
+
+    ``allocate()`` cost-ranks every class ``acceptable_types`` returns, so pricing only the head
+    quotes a shape the run may never be given: a ["B200", "H100"] run is quoted ~3x the H100 the
+    allocator would really rent, and the submit-time affordability precheck can refuse a run the
+    organization can afford.
+    """
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.spec import runconfig_from_spec
+
+    listed = spec_from_dict(_raw(**{"gpu.type": ["B200", "H100"]}))
+    assert listed.gpu.acceptable_types == ("B200", "H100")
+
+    config = runconfig_from_spec(listed)
+    assert config.gpu_type == "B200"
+    assert config.gpu_type_fallbacks == ("H100",)
+
+    head_only = estimate_cost(runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": "B200"}))))
+    fallback_only = estimate_cost(runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": "H100"}))))
+    quoted = estimate_cost(config)
+
+    # the acceptable fallback is genuinely cheaper here, so the head-only quote is an overquote.
+    assert fallback_only.total_usd < head_only.total_usd
+    assert quoted.gpu == "H100"
+    assert quoted.total_usd == pytest.approx(fallback_only.total_usd)
+
+    # authoring order does not change the answer: allocation ranks on cost, not position.
+    reversed_order = estimate_cost(
+        runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": ["H100", "B200"]})))
+    )
+    assert reversed_order.gpu == "H100"
+
+    # a bare pin stays a hard pin -- carrying fallbacks must not widen a single authored class.
+    assert (
+        estimate_cost(runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": "B200"})))).gpu
+        == "B200"
+    )
+
+
+def test_cost_quote_no_fit_error_names_every_acceptable_class() -> None:
+    """The rejection must name the whole declared set, not just the head that happened to be first.
+
+    Built as a RunConfig rather than a spec: the parse gate rejects an unfittable pin before the
+    quote runs, so the spec door cannot reach this branch.
+    """
+    from flash.cost.analytical import estimate_cost
+    from flash.cost.types import RunConfig
+
+    config = RunConfig(
+        model_id="Qwen/Qwen3.6-35B-A3B",
+        method="grpo",
+        steps=10,
+        batch_size=8,
+        group_size=4,
+        gpu_count=1,
+        gpu_type="RTX 4090",
+        gpu_type_fallbacks=("RTX 5090",),
+    )
+    with pytest.raises(ValueError, match="cannot fit this run") as exc:
+        estimate_cost(config)
+    assert "RTX 4090" in str(exc.value)
+    assert "RTX 5090" in str(exc.value)
 
 
 def test_soft_provider_preference_does_not_reject_an_ineligible_gpu_type_pair() -> None:
@@ -1476,32 +1517,19 @@ def test_persisted_gpu_type_is_canonicalized_and_validated() -> None:
         _job_from_dict({"gpu": {"type": "RTX A6000"}})
 
 
-def test_removed_model_revision_config_key_tolerates_only_the_legacy_blank_wire_value() -> None:
-    message = (
-        "config key `model_revision` was removed because Flash-managed serving loads a "
-        "pre-quantized FP8 checkpoint resolved per base model, so it cannot honor an arbitrary "
-        "upstream commit and an authored pin made the run undeployable. Remove the key. "
-        "`flash models export` publishes the adapter, but for a fresh GRPO or OPD run it does not "
-        "turn the moving upstream default into a fixed base revision."
-    )
-
-    for value in ("", "   \t"):
-        assert spec_from_dict(_raw(model_revision=value)).model_revision == ""
-
-    for value in ("main", " refs/pr/123 ", None, 123, False, ["main"], {"revision": "main"}):
-        with pytest.raises(ConfigError) as exc_info:
-            spec_from_dict(_raw(model_revision=value))
-        assert str(exc_info.value) == message
-
-
-def test_model_revision_stays_available_to_internal_round_trips() -> None:
-    persisted = {**JobSpec().to_internal_dict(), "model_revision": "  refs/pr/123  "}
+def test_runner_model_revision_stays_available_to_internal_round_trips() -> None:
+    revision = "a" * 40
+    persisted = {
+        **JobSpec().to_internal_dict(),
+        "model_revision": revision,
+        "model_revision_auto": True,
+    }
 
     spec = JobSpec.from_dict(persisted)
 
-    assert spec.model_revision == "refs/pr/123"
-    assert JobSpec.from_json(spec.to_json()).model_revision == "refs/pr/123"
-    assert spec.to_internal_dict()["model_revision"] == "refs/pr/123"
+    assert spec.model_revision == revision
+    assert JobSpec.from_json(spec.to_json()).model_revision == revision
+    assert spec.to_internal_dict()["model_revision"] == revision
     assert "model_revision" not in spec.to_dict()
 
     for value in (None, 123, False, ["main"], {"revision": "main"}):
@@ -1532,55 +1560,102 @@ def test_model_revision_auto_is_platform_managed_and_stripped_from_the_public_sp
     assert replace(auto, model_revision="").model_revision_auto is False
 
 
-def test_model_revision_auto_does_not_change_pre_existing_preparation_digests() -> None:
-    """A snapshot prepared before this field existed must still rehash to its stored digest.
-
-    `_preparation_digest` has to reproduce the bytes that were hashed, not today's serialization,
-    or a still-valid warm-start or profile-bearing training run fails integrity validation on recovery.
-    """
-    from flash.runner.preparation import _preparation_digest
-
-    unmarked = JobSpec(model="Qwen/Qwen3.5-9B", algorithm="sft", model_revision="c" * 40)
-
-    # rebuild the pre-upgrade bytes: the same payload this build produces, minus the key that did
-    # not exist then. mirrors _preparation_digest's own omission list rather than re-deriving it,
-    # so the control cannot drift from the code under test.
-    worker_payload = unmarked.to_internal_dict()
-    for key in (
-        "workload_profile_input_digest",
-        "workload_profile_producer_version",
-        "workload_profile",
-    ):
-        if not worker_payload.get(key):
-            worker_payload.pop(key, None)
-    worker_payload.pop("model_revision_auto", None)
-    worker_payload.pop("gpu_count_auto", None)
-    worker_payload["gpu"].pop("type_fallbacks", None)
-    public_payload = unmarked.to_dict()  # to_dict() already strips the markers
-    # the old plane popped `[environment] pip` from every public payload, so its bytes carried no
-    # such key. mirrors _preparation_digest's drop-when-empty for the same reason as the list above.
-    if not public_payload["environment"].get("pip"):
-        public_payload["environment"].pop("pip", None)
-
-    payload = json.dumps(
-        {
-            "version": 1,
-            "public_spec": public_payload,
-            "worker_spec": worker_payload,
-            "adapter_identity": None,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
+def test_model_revision_force_pin_is_internal_only_and_round_trips() -> None:
+    revision = "d" * 40
+    forced = replace(
+        spec_from_dict(_raw()),
+        model_revision=revision,
+        model_revision_auto=True,
+        model_revision_force_pin=True,
     )
-    import hashlib
 
-    legacy = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    assert _preparation_digest(unmarked, unmarked, None) == legacy
+    public = forced.to_dict()
+    internal = forced.to_internal_dict()
 
-    # a marked run still binds the marker into its digest, so tampering remains detectable
-    marked = replace(unmarked, model_revision_auto=True)
-    assert _preparation_digest(marked, marked, None) != legacy
+    assert "model_revision_force_pin" not in public
+    assert internal["model_revision_force_pin"] is True
+    assert JobSpec.from_dict(internal) == forced
+    assert JobSpec.from_json(forced.to_json()) == forced
+    with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_revision_force_pin"):
+        spec_from_dict(_raw(model_revision_force_pin=True))
+
+
+@pytest.mark.parametrize("field_name", ["model_revision_auto", "model_revision_force_pin"])
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, 1.0, (), []])
+def test_model_revision_markers_require_bool_for_direct_construction_and_replace(
+    field_name, value
+) -> None:
+    revision = "a" * 40
+    constructor_kwargs = {"model_revision": revision}
+    if field_name == "model_revision_force_pin":
+        constructor_kwargs["model_revision_auto"] = True
+    constructor_kwargs[field_name] = value
+
+    with pytest.raises(TypeError, match=rf"{field_name} must be a boolean"):
+        JobSpec(**constructor_kwargs)
+
+    valid = JobSpec(model_revision=revision, model_revision_auto=True)
+    with pytest.raises(TypeError, match=rf"{field_name} must be a boolean"):
+        replace(valid, **{field_name: value})
+
+
+@pytest.mark.parametrize(
+    ("model_revision_auto", "model_revision_force_pin"),
+    [(True, False), (True, True)],
+)
+def test_model_revision_markers_accept_valid_bool_states(
+    model_revision_auto, model_revision_force_pin
+) -> None:
+    spec = JobSpec(
+        model_revision="a" * 40,
+        model_revision_auto=model_revision_auto,
+        model_revision_force_pin=model_revision_force_pin,
+    )
+
+    assert spec.model_revision_auto is model_revision_auto
+    assert spec.model_revision_force_pin is model_revision_force_pin
+    assert replace(spec) == spec
+
+
+@pytest.mark.parametrize(
+    ("auto_raw", "force_raw", "expected"),
+    [
+        ("true", "false", (True, False)),
+        (1, 0, (True, False)),
+        ("true", "true", (True, True)),
+    ],
+)
+def test_model_revision_marker_from_dict_coercion_and_roundtrip_are_unchanged(
+    auto_raw, force_raw, expected
+) -> None:
+    payload = JobSpec(model_revision="a" * 40).to_internal_dict()
+    payload.update(model_revision_auto=auto_raw, model_revision_force_pin=force_raw)
+
+    restored = JobSpec.from_dict(payload)
+
+    assert (restored.model_revision_auto, restored.model_revision_force_pin) == expected
+    assert JobSpec.from_dict(restored.to_internal_dict()) == restored
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model_revision_force_pin": True},
+        {
+            "model_revision": "main",
+            "model_revision_auto": True,
+            "model_revision_force_pin": True,
+        },
+        {
+            "model_revision": "A" * 40,
+            "model_revision_auto": True,
+            "model_revision_force_pin": True,
+        },
+    ],
+)
+def test_model_revision_force_pin_rejects_invalid_internal_states(overrides) -> None:
+    with pytest.raises(ValueError, match="model_revision_force_pin requires"):
+        _job_from_dict(overrides)
 
 
 def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:
@@ -1631,6 +1706,106 @@ def test_resubmitting_a_public_spec_gets_a_fresh_runner_pin(monkeypatch) -> None
     assert rerun.model_revision_auto is True
 
 
+def test_forced_sft_model_revision_verifies_and_retains_the_exact_pin(monkeypatch) -> None:
+    from flash.runner.preparation import _resolve_model_revision
+
+    exact = "a" * 40
+    moving_head = "b" * 40
+    asked_for = []
+
+    class _Api:
+        def __init__(self, *a, **k) -> None: ...
+
+        def model_info(self, model, revision=None):
+            asked_for.append(revision)
+            return type("_Info", (), {"sha": moving_head if revision is None else revision})
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+    forced = _job_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-9B",
+            "algorithm": "sft",
+            "model_revision": exact,
+            "model_revision_auto": True,
+            "model_revision_force_pin": True,
+        }
+    )
+
+    resolved = _resolve_model_revision(forced, required=True)
+
+    assert asked_for == [exact]
+    assert resolved.model_revision == exact
+    assert resolved.model_revision_auto is True
+    assert resolved.model_revision_force_pin is False
+    assert resolved.to_internal_dict()["model_revision_force_pin"] is False
+
+
+@pytest.mark.parametrize("reported", ["b" * 40, "A" * 40])
+def test_forced_model_revision_rejects_a_mismatched_hub_resolution(monkeypatch, reported) -> None:
+    from flash.runner.preparation import _resolve_model_revision
+
+    class _Api:
+        def __init__(self, *a, **k) -> None: ...
+
+        def model_info(self, model, revision=None):
+            return type("_Info", (), {"sha": reported})
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+    forced = _job_from_dict(
+        {
+            "model_revision": "a" * 40,
+            "model_revision_auto": True,
+            "model_revision_force_pin": True,
+        }
+    )
+
+    with pytest.raises(ValueError, match="could not resolve model_revision"):
+        _resolve_model_revision(forced, required=True)
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algorithm) -> None:
+    from flash.runner.preparation import _resolve_model_revision
+
+    exact = "c" * 40
+    asked_for = []
+
+    class _Api:
+        def __init__(self, *a, **k) -> None: ...
+
+        def model_info(self, model, revision=None):
+            asked_for.append(revision)
+            return type("_Info", (), {"sha": exact})
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+    forced = _job_from_dict(
+        {
+            "algorithm": algorithm,
+            "model_revision": exact,
+            "model_revision_auto": True,
+            "model_revision_force_pin": True,
+        }
+    )
+
+    resolved = _resolve_model_revision(forced, required=False)
+
+    assert asked_for == [exact]
+    assert resolved.model_revision == exact
+    assert resolved.model_revision_auto is True
+    assert resolved.model_revision_force_pin is False
+
+
+def test_unmanaged_model_revision_is_rejected_and_runner_pin_is_unchanged() -> None:
+    from flash.runner.preparation import _resolve_model_revision
+
+    with pytest.raises(ValueError, match="model_revision requires model_revision_auto=True"):
+        _job_from_dict({"model_revision": "release-tag"})
+    runner_pin = _job_from_dict({"model_revision": "d" * 40, "model_revision_auto": True})
+
+    assert _resolve_model_revision(runner_pin, required=False) == runner_pin
+    assert _resolve_model_revision(runner_pin, required=True) == runner_pin
+
+
 def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() -> None:
     from flash.runner.preparation import _preparation_digest
 
@@ -1642,290 +1817,6 @@ def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() ->
     assert _preparation_digest(public, worker, None) == _preparation_digest(
         JobSpec.from_dict(stored), worker, None
     )
-
-
-@pytest.mark.parametrize("revision", ["", "a" * 40])
-def test_pre_removal_public_model_revision_keeps_its_preparation_digest(revision) -> None:
-    """A stored public revision key must rehash under the exact pre-removal payload."""
-    import flash.runner as runner
-
-    stored_public_spec = {
-        **spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft")).to_dict(),
-        "model_revision": revision,
-    }
-    stored_worker_spec = {
-        **JobSpec.from_dict(stored_public_spec).to_internal_dict(),
-        "run_id": "legacy-revision",
-    }
-    public = JobSpec.from_dict(stored_public_spec)
-    worker = JobSpec.from_dict(stored_worker_spec)
-    legacy_digest = runner._preparation_digest(
-        public,
-        worker,
-        None,
-        legacy_public_keys={"model_revision": revision},
-    )
-    status = runner.RunStatus(
-        state="running",
-        run_id="legacy-revision",
-        spec=stored_public_spec,
-        effective_preparation={
-            "worker_spec": stored_worker_spec,
-            "preparation_digest": legacy_digest,
-            "workload_profile": {"legacy": True},
-        },
-    )
-    status.effective_preparation["worker_spec"]["workload_profile_kind"] = "sft"
-    status.effective_preparation["worker_spec"]["workload_profile_input_digest"] = "b" * 64
-    status.effective_preparation["worker_spec"]["workload_profile_producer_version"] = "1.1.55"
-    status.effective_preparation["worker_spec"]["workload_profile"] = {"legacy": True}
-    worker = JobSpec.from_dict(status.effective_preparation["worker_spec"])
-    # the worker payload also carries workload_profile_kind, a dropped key. recovery rebuilds
-    # legacy_keys from the stored worker spec (see runner.status), so the expected digest has to be
-    # derived the same way or the two disagree on what the record contained.
-    status.effective_preparation["preparation_digest"] = runner._preparation_digest(
-        public,
-        worker,
-        None,
-        legacy_keys={"workload_profile_kind": "sft"},
-        legacy_public_keys={"model_revision": revision},
-    )
-
-    recovered = runner.effective_spec_from_status(status)
-
-    assert recovered.model_revision == revision
-    assert recovered.model_revision_auto is False
-
-
-@contextmanager
-def _serializing_without_prompts_per_step():
-    """Serialize `JobSpec` the way 1.1.40 did: with no ``prompts_per_step`` key at all.
-
-    That build predates the field, so its payload carried no such key -- which hashes differently
-    from the explicit null today's dataclass always emits. A digest meant to stand in for a real
-    persisted snapshot has to be taken over those historical bytes, or the test asserts against a
-    shape production never wrote.
-    """
-    original_internal, original_public = JobSpec.to_internal_dict, JobSpec.to_dict
-
-    def _drop(emit):
-        return lambda self: {
-            **emit(self),
-            "train": {k: v for k, v in emit(self)["train"].items() if k != "prompts_per_step"},
-        }
-
-    JobSpec.to_internal_dict, JobSpec.to_dict = _drop(original_internal), _drop(original_public)
-    try:
-        yield
-    finally:
-        JobSpec.to_internal_dict, JobSpec.to_dict = original_internal, original_public
-
-
-def test_migrating_a_legacy_rollout_batch_keeps_its_preparation_digest_valid() -> None:
-    """Recovering a persisted rollout snapshot must not fail integrity validation.
-
-    The digest hashes the bytes that were STORED, and `from_dict` now MOVES the rollout batch from
-    ``batch_size`` onto ``prompts_per_step``. Rehashing a snapshot with today's parse can therefore
-    yield different bytes than were hashed at persist time -- rejecting exactly the warm-start
-    grpo/opd runs this migration exists to rescue.
-
-    Every stored shape is covered, because three of them differ only in ways an assertion about
-    "the legacy value" cannot see: 1.1.40 predates the field and stored NO key, 1.1.43+ stored an
-    explicit null, a mid-upgrade payload stored BOTH names, and a snapshot that authored no batch
-    at all has nothing to migrate yet still changes shape. The last two were regressions found in
-    review after an earlier fix keyed only on "is there a legacy value to move".
-
-    Tamper and modern controls are included, since an assertion that only checked recovery would
-    also pass if the digest stopped binding the batch entirely.
-    """
-    import flash.runner as runner
-
-    def _spec(batch_size, prompts_per_step, *, algorithm="grpo"):
-        spec = replace(
-            JobSpec.from_dict(
-                {
-                    "model": "Qwen/Qwen3.5-4B",
-                    "algorithm": algorithm,
-                    "run_id": "legacy",
-                    "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                    "gpu": {"type": "H100", "count": 1},
-                    "train": {"epochs": 1, "group_size": 4},
-                }
-            ),
-            model_revision="a" * 40,
-            model_revision_auto=True,  # one of the two triggers for the digest check
-        )
-        # force the shape the OLD build parsed, bypassing today's migration.
-        return replace(
-            spec,
-            train=replace(spec.train, batch_size=batch_size, prompts_per_step=prompts_per_step),
-        )
-
-    def _stored(batch_size, prompts_per_step, *, key_absent):
-        """A snapshot as the pre-fix build persisted it, digested over exactly ITS bytes.
-
-        `key_absent` reproduces 1.1.40, which predates ``prompts_per_step`` entirely -- so its
-        payload carried no such key, which hashes differently from an explicit null. Serializing
-        through today's dataclass always emits the key, so the digest has to be taken over the
-        historical bytes or the test would assert against a shape production never wrote.
-        """
-        spec = _spec(batch_size, prompts_per_step)
-        worker, public = spec.to_internal_dict(), spec.to_dict()
-        if key_absent:
-            worker["train"].pop("prompts_per_step", None)
-            public["train"].pop("prompts_per_step", None)
-        with _serializing_without_prompts_per_step() if key_absent else nullcontext():
-            digest = runner._preparation_digest(spec, spec, None)
-        return worker, public, digest
-
-    def _recover(worker, public, digest):
-        return runner.effective_spec_from_status(
-            runner.RunStatus(
-                state="running",
-                run_id="legacy",
-                spec=public,
-                effective_preparation={"worker_spec": worker, "preparation_digest": digest},
-            )
-        )
-
-    # (label, stored batch_size, stored prompts_per_step, key absent, migrated prompts_per_step)
-    for label, batch_size, prompts_per_step, key_absent, expected in (
-        ("1.1.40 authored 32", 32, None, True, 32),
-        # nothing to migrate, but the reparse still emits a key the stored bytes lacked.
-        ("1.1.40 authored nothing", None, None, True, None),
-        ("1.1.43+ authored 32", 32, None, False, 32),
-        ("1.1.43+ authored nothing", None, None, False, None),
-        # mid-upgrade: both names stored. the migration drops the old one, so it still has to be
-        # rehashed under the stored spelling.
-        ("mixed both names", 32, 16, False, 16),
-        ("modern new name only", None, 16, False, 16),
-        # a non-positive legacy value is discarded by the parser, changing the shape again.
-        ("legacy non-positive", 0, None, False, None),
-    ):
-        worker, public, digest = _stored(batch_size, prompts_per_step, key_absent=key_absent)
-        recovered = _recover(worker, public, digest)
-        assert (recovered.train.prompts_per_step, recovered.train.batch_size) == (
-            expected,
-            None,
-        ), label
-
-        # control: the digest still binds both names on BOTH halves. without this, "recovery works"
-        # would also be satisfied by a restore that let any value through.
-        #
-        # each half is tampered ALONE. Changing both together hides a hole in either one, which is
-        # how a public-side gap got through review: the parse DROPS a superseded `batch_size`, so
-        # `_validate_effective_spec` never compares it, and a restore that fed the worker's reading
-        # to the public payload overwrote the tampered value before hashing. Only the public spec
-        # is user-visible, so that half is the one an attacker can reach.
-        for key in ("batch_size", "prompts_per_step"):
-            for half in ("worker", "public"):
-                source = worker if half == "worker" else public
-                if key not in source["train"]:
-                    continue
-                tampered = {**source, "train": {**source["train"], key: 999}}
-                # either rejection is correct: a value the parse KEEPS is caught structurally by
-                # `_validate_effective_spec` (public/worker mismatch) before the digest is even
-                # reached, and one it DROPS reaches the digest. What must never happen is the
-                # tamper being accepted, so both messages are allowed and neither is required.
-                with pytest.raises(
-                    ValueError,
-                    match=r"failed integrity validation|does not match the public run",
-                ):
-                    _recover(
-                        tampered if half == "worker" else worker,
-                        tampered if half == "public" else public,
-                        digest,
-                    )
-
-    # sft authors `batch_size` under its CURRENT name, so from_dict leaves it alone and the digest
-    # must not replay anything for it.
-    sft = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-4B",
-            "algorithm": "sft",
-            "run_id": "sft-digest",
-            "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "gpu": {"type": "H100", "count": 1},
-            "train": {"epochs": 1, "batch_size": 4},
-        }
-    )
-    assert runner._stored_rollout_batch_spelling(sft.to_internal_dict()) is None
-
-
-def test_re_persisting_a_legacy_rollout_run_keeps_it_recoverable(tmp_path, monkeypatch) -> None:
-    """A quote refresh or realloc must not write a digest the next read cannot reproduce.
-
-    `status.spec` is never rewritten, so a legacy rollout run keeps the old batch spelling for life
-    and every READ replays it. The re-persist path rewrites the worker half and rehashes -- so if it
-    hashes without that replay, the run recovers until its first quote refresh and fails afterwards,
-    which is worse than failing outright because it passes every check at submission time.
-
-    Repeated because re-persist has to be idempotent: the second one hashes bytes the first wrote.
-    """
-    import importlib
-
-    import flash.runner as runner
-
-    importlib.reload(runner)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-    from flash.runner.submit import _persist_effective_worker_spec
-
-    for index, (batch_size, prompts_per_step, key_absent) in enumerate(
-        (
-            (32, None, True),  # 1.1.40: old name only, new key absent
-            (None, None, True),  # 1.1.40: nothing authored
-            (32, None, False),  # 1.1.43+: old name, new key null
-            (32, 16, False),  # mid-upgrade: both names stored
-            (None, 16, False),  # modern
-        )
-    ):
-        run_id = f"repersist-{index}"
-        spec = replace(
-            JobSpec.from_dict(
-                {
-                    "model": "Qwen/Qwen3.5-4B",
-                    "algorithm": "grpo",
-                    "run_id": run_id,
-                    "project": "11111111-1111-4111-8111-111111111111",
-                    "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                    "gpu": {"type": "H100", "count": 1},
-                    "train": {"epochs": 1, "group_size": 4, "lora_rank": 16},
-                }
-            ),
-            model_revision="a" * 40,
-            model_revision_auto=True,  # trips the digest gate
-        )
-        spec = replace(
-            spec,
-            train=replace(spec.train, batch_size=batch_size, prompts_per_step=prompts_per_step),
-        )
-        worker, public = spec.to_internal_dict(), spec.to_dict()
-        if key_absent:
-            worker["train"].pop("prompts_per_step", None)
-            public["train"].pop("prompts_per_step", None)
-        with _serializing_without_prompts_per_step() if key_absent else nullcontext():
-            digest = runner._preparation_digest(spec, spec, None)
-        runner._save_status(
-            runner.RunStatus(
-                state="queued",
-                run_id=run_id,
-                spec=public,
-                effective_preparation={"worker_spec": worker, "preparation_digest": digest},
-            )
-        )
-
-        before = runner.effective_spec_from_status(runner.get_status(run_id))
-        for _ in range(2):
-            stored = runner.get_status(run_id).effective_preparation["worker_spec"]
-            _persist_effective_worker_spec(JobSpec.from_dict(stored))
-            after = runner.effective_spec_from_status(runner.get_status(run_id))
-            # recoverable AND unchanged: a digest that merely validates is not enough if the batch
-            # it certifies drifted.
-            assert (after.train.prompts_per_step, after.train.batch_size) == (
-                before.train.prompts_per_step,
-                None,
-            ), (run_id, batch_size, prompts_per_step)
 
 
 def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> None:
@@ -1950,17 +1841,6 @@ def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> No
     assert worker.model_revision == "a" * 40
 
     _validate_effective_spec(reparsed_public, worker)  # raises if the exclusion is missing
-
-    # historical authored pins remain compared on stored public payloads, so changing the worker's
-    # revision still fails closed for already-persisted runs.
-    authored_public = JobSpec.from_dict({**worker.to_dict(), "model_revision": "a" * 40})
-    authored_worker = replace(worker, model_revision_auto=False)
-    for tampered in (
-        replace(authored_worker, model_revision="b" * 40),
-        replace(authored_worker, model_revision="b" * 40, model_revision_auto=True),
-    ):
-        with pytest.raises(ValueError, match="does not match the public run"):
-            _validate_effective_spec(authored_public, tampered)
 
 
 def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
@@ -2065,27 +1945,29 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
         orch.get_status(spec.run_id)
 
 
-def test_programmatic_sft_submit_rejects_adapter_continuation(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_adapter_continuation_preparation_is_target_algorithm_agnostic(
+    tmp_path, monkeypatch, algorithm
+) -> None:
+    """Preparation diagnoses the SOURCE run, never the target algorithm.
+
+    SFT used to be refused outright here. Now all three targets reach the same source resolution,
+    so an unknown source produces one identical message rather than SFT failing earlier and for a
+    different reason.
+    """
     from flash.core.spec import JobSpec, TrainSpec
 
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
-    # offline: sft requires a resolved model_revision, which calls HfApi().model_info(). Stub it
-    # the same way the sibling test above does, so the adapter-continuation rejection this test is
-    # about is what fails -- not an unrelated network lookup on a disconnected runner.
-    monkeypatch.setattr(
-        orch,
-        "_resolve_model_revision",
-        lambda s, **_kw: replace(s, model_revision="a" * 40, model_revision_auto=True),
-    )
     spec = JobSpec(
-        run_id="sft-warmstart",
+        run_id=f"{algorithm}-warmstart",
         model="Qwen/Qwen3.5-0.8B",
-        algorithm="sft",
+        algorithm=algorithm,
         project="11111111-1111-4111-8111-111111111111",
         train=TrainSpec(epochs=1, max_examples=8, init_from_adapter="source-run"),
     )
-    with pytest.raises(ValueError, match="SFT adapter continuation is not supported"):
-        orch.submit_job(spec, dry_run=True)
+
+    with pytest.raises(ValueError, match="references unknown run 'source-run'"):
+        orch._prepare_init_from_adapter(spec)
 
 
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:
@@ -2179,23 +2061,6 @@ def test_removed_worker_environment_table_is_rejected(tmp_path) -> None:
     assert "(allowed tables: environment, train, gpu, wandb)" in message
 
 
-@pytest.mark.parametrize("stored", [{}, {"CUSTOM_FLAG": "value"}])
-def test_a_run_persisted_before_the_worker_env_removal_still_reloads(stored) -> None:
-    """A record written by the OLD plane must survive the upgrade that drops the field.
-
-    Specs were persisted with asdict, so EVERY record the pre-upgrade plane wrote names worker_env,
-    including the defaulted empty one. Stored records are never rewritten and from_dict is strict, so
-    without the dropped-key tolerance the first reload after deploy raises and a still-running job
-    loses its recovery, deploy, and serving paths.
-    """
-    persisted = {**JobSpec().to_internal_dict(), "worker_env": stored}
-
-    spec = JobSpec.from_dict(persisted)
-
-    # tolerated on read, but genuinely gone: the value must not come back as an attribute.
-    assert not hasattr(spec, "worker_env")
-
-
 def test_the_dropped_worker_env_key_is_tolerated_on_read_only_never_authored() -> None:
     """Tolerance must not quietly re-open the table as an authorable one.
 
@@ -2211,65 +2076,6 @@ def test_an_unknown_top_level_key_is_still_rejected_on_read() -> None:
     # accept-anything hole in the persisted-spec reader.
     with pytest.raises(ValueError, match="unknown key"):
         JobSpec.from_dict({**JobSpec().to_internal_dict(), "not_a_real_key": 1})
-
-
-def test_a_pre_upgrade_run_that_authored_overrides_is_told_they_stopped_applying(caplog) -> None:
-    """Tolerating the key must not make the behavior change silent.
-
-    A run submitted with overrides keeps them in its record forever, but nothing forwards them now,
-    so it trains on managed defaults instead of what was authored. Reloading without a word would
-    make that indistinguishable from a run that never set them -- the operator reading logs after an
-    unexpected result would have nothing pointing at the cause.
-    """
-    persisted = {
-        **JobSpec().to_internal_dict(),
-        "run_id": "run-legacy-1",
-        "worker_env": {"FLASH_VERL_PYTHON": "/custom/verl/bin/python"},
-    }
-
-    with caplog.at_level(logging.WARNING, logger="flash.spec"):
-        JobSpec.from_dict(persisted)
-
-    assert "FLASH_VERL_PYTHON" in caplog.text
-    assert "run-legacy-1" in caplog.text
-    assert "NOT" in caplog.text
-
-
-def test_the_warning_names_the_run_or_is_not_emitted_at_all(caplog) -> None:
-    """An unidentified warning is worse than none: it cannot be acted on, and it duplicates.
-
-    The same stored run is read through both shapes -- the internal worker spec (asdict, keeps
-    run_id) and the public spec (to_dict, pops it). Warning on the public read would emit a second
-    line naming no run, which an operator cannot map back to anything, alongside the identified line
-    the worker-spec read already produced.
-    """
-    spec = JobSpec.from_dict(
-        {**JobSpec().to_internal_dict(), "run_id": "run-legacy-1"},
-    )
-    dropped = {"FLASH_VERL_PYTHON": "/custom/verl/bin/python"}
-
-    with caplog.at_level(logging.WARNING, logger="flash.spec"):
-        JobSpec.from_dict({**spec.to_internal_dict(), "worker_env": dropped})
-    assert "run-legacy-1" in caplog.text
-
-    caplog.clear()
-    # the public shape pops run_id, so this read stays quiet rather than saying "run <unknown>".
-    public = spec.to_dict()
-    assert "run_id" not in public
-    with caplog.at_level(logging.WARNING, logger="flash.spec"):
-        JobSpec.from_dict({**public, "worker_env": dropped})
-    assert caplog.text == ""
-
-
-def test_a_record_without_the_dropped_key_says_nothing(caplog) -> None:
-    # every record the pre-upgrade plane wrote names the key, defaulted-empty included. warning on
-    # the empty ones would fire on effectively every reload and train operators to ignore it.
-    persisted = {**JobSpec().to_internal_dict(), "worker_env": {}}
-
-    with caplog.at_level(logging.WARNING, logger="flash.spec"):
-        JobSpec.from_dict(persisted)
-
-    assert caplog.text == ""
 
 
 @pytest.mark.parametrize(
@@ -2395,6 +2201,20 @@ def test_gpu_count_of_reads_spec_and_defaults() -> None:
 # ---------------------------------------------------------------------------
 # the optimizer batch is a different quantity per algorithm, so it has a different name
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_persisted_rl_batch_size_is_rejected_and_names_the_right_key(algorithm) -> None:
+    record = JobSpec(algorithm=algorithm).to_internal_dict()
+    record["train"]["batch_size"] = 16
+    record["train"].pop("prompts_per_step", None)
+
+    with pytest.raises(ValueError, match=r"batch_size.*prompts_per_step") as excinfo:
+        JobSpec.from_dict(record)
+
+    message = str(excinfo.value)
+    assert f"batch_size does not apply to {algorithm}" in message
+    assert "prompts_per_step" in message
 
 
 def test_sft_batch_size_is_rejected_on_rl_and_names_the_right_key() -> None:

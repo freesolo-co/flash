@@ -10,12 +10,24 @@ Split out of `flash.runner` to keep that module under the file-size limit.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from typing import TYPE_CHECKING
 
+from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
+from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 from flash.teacher.retry_contract import OPD_RETRY_CONTRACT_VERSION
+
+logger = logging.getLogger(__name__)
+
+
+class SourceSnapshotPublicationError(RuntimeError):
+    """Managed source publication failed before a provider could be created."""
+
+    plane_fault = True
+
 
 if TYPE_CHECKING:
     # annotation-only: both are defined in `flash.runner` above the point where it imports this
@@ -54,7 +66,6 @@ def prepare_job(
         owner_key_id=owner_key_id,
     )
     spec = _runner()._resolve_model_revision(spec, required=spec.algorithm == "sft")
-    _runner()._require_supported_adapter_continuation(spec)
     if spec.algorithm == "sft":
         spec = _runner()._require_pinned_profile_environment(spec)
         spec = _runner()._require_sft_workload_profile(spec)
@@ -185,6 +196,36 @@ def _reject_managed_volume_removal(snapshot: object, worker_spec: JobSpec) -> No
         raise ValueError("persisted effective preparation drops a non-shared weight-cache volume")
 
 
+def _effective_preparation_snapshot(
+    public_spec: JobSpec,
+    worker_spec: JobSpec,
+    adapter_identity: dict | None,
+    *,
+    stored_public: object = None,
+) -> dict:
+    """Build the current versioned snapshot shape.
+
+    `stored_public` is the public spec as it is ALREADY persisted, and it belongs on every path
+    that REWRITES an existing record. The digest is recomputed here, and `_preparation_digest`
+    reproduces a pre-1.1.35 run only by replaying the `lora_alpha` omission it reads from the
+    stored spec -- but a rewrite reconstructs `public_spec` via `JobSpec.from_dict(status.spec)`,
+    whose `to_dict()` re-MATERIALIZES the key. Omitting the argument therefore stamps a digest
+    over bytes the stored spec still lacks, and since the rewrite never updates `status.spec`,
+    the two halves disagree from that moment on. The create path passes nothing because it
+    writes both halves from the same object, so it has no omission to replay.
+    """
+    return {
+        "version": PREPARATION_ENVELOPE_VERSION,
+        "worker_spec": worker_spec.to_internal_dict(),
+        "workload_profile": worker_spec.workload_profile or None,
+        "adapter_identity": adapter_identity,
+        "preparation_digest": _runner()._preparation_digest(
+            public_spec, worker_spec, adapter_identity, stored_public=stored_public
+        ),
+        "backend": _runner().TRAINER_BACKEND,
+    }
+
+
 def _persist_effective_worker_spec(
     worker_spec: JobSpec, *, estimated_cost_usd: float | None = None
 ) -> bool:
@@ -203,33 +244,9 @@ def _persist_effective_worker_spec(
         adapter_identity = None
     _reject_managed_volume_removal(snapshot, worker_spec)
     _runner()._validate_effective_spec(public_spec, worker_spec)
-    # status.spec is never rewritten, so a pre-upgrade run keeps its dropped keys for life and every
-    # later read rehashes with them restored. re-persisting (quote refresh, realloc) has to hash the
-    # same way or the digest it writes now is one the next integrity check cannot reproduce.
-    raw_public = status.spec if isinstance(status.spec, dict) else {}
-    legacy_public_keys = {
-        k: raw_public[k] for k in _runner()._DROPPED_TOP_LEVEL_KEYS if k in raw_public
-    }
-    # same reason for the rollout optimizer batch: `status.spec` is never rewritten, so a legacy
-    # grpo/opd run keeps the old spelling for life and every read replays it. Hashing without that
-    # replay writes a digest the next integrity check cannot reproduce, so the run recovers until
-    # its first quote refresh or realloc and fails afterwards. Only the public half needs this --
-    # the worker half is rewritten right here, so its stored bytes already match what is hashed.
-    stored_public_rollout_batch = _runner()._stored_rollout_batch_spelling(raw_public)
-    effective_preparation = {
-        "worker_spec": worker_spec.to_internal_dict(),
-        "workload_profile": worker_spec.workload_profile or None,
-        "adapter_identity": adapter_identity,
-        "preparation_digest": _runner()._preparation_digest(
-            public_spec,
-            worker_spec,
-            adapter_identity,
-            legacy_public_keys=legacy_public_keys,
-            legacy_public_alpha=_runner()._prepared_before_public_alpha(raw_public),
-            stored_public_rollout_batch=stored_public_rollout_batch,
-        ),
-        "backend": _runner().TRAINER_BACKEND,
-    }
+    effective_preparation = _effective_preparation_snapshot(
+        public_spec, worker_spec, adapter_identity, stored_public=status.spec
+    )
     fields = {"effective_preparation": effective_preparation}
     if estimated_cost_usd is not None:
         fields["estimated_cost_usd"] = float(estimated_cost_usd)
@@ -261,13 +278,25 @@ def submit_job(
     estimated_cost_usd = prepared.estimated_cost_usd
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
+    source_snapshot = None
     if not dry_run:
-        # Record the warm-start dependency on the SOURCE repo so the artifact GC spares it while this
-        # child is around (best-effort; never blocks submission). A dry-run preview must not mutate
-        # the source repo, so this HF write stays real-submit-only (unlike the read-only preflights
-        # above, which now run in both modes).
+        # record the warm-start dependency on the source repo so artifact gc spares it while this
+        # child is around. source publication is also real-submit-only and completes before status
+        # persistence, so no provider can be created without a durable immutable descriptor.
         _runner()._mark_warmstart_source(worker_spec, public_spec.run_id)
-    # env ref->sha pin is deferred (background) or after status save (sync) — never on creation path.
+        try:
+            source_snapshot = _runner().publish_source_snapshot(worker_spec.train.hf_repo)
+        except Exception as exc:
+            logger.warning(
+                "managed source publication failed for run %s: %s",
+                public_spec.run_id,
+                sanitize_diagnostic(exc, limit=500),
+            )
+            raise SourceSnapshotPublicationError(
+                "managed source publication failed; retry the submission later"
+            ) from None
+    # env ref->sha pin is deferred (background) or after status save (sync), never on creation path.
+    # environment staging runs after status persistence and before provider allocation.
     status = _runner().RunStatus(
         run_id=public_spec.run_id,
         state="queued",
@@ -279,16 +308,11 @@ def submit_job(
         workload_profile_input_digest=worker_spec.workload_profile_input_digest or None,
         workload_profile=worker_spec.workload_profile or None,
         prompt_budget=prepared.prompt_budget,
-        effective_preparation={
-            "worker_spec": worker_spec.to_internal_dict(),
-            "workload_profile": worker_spec.workload_profile or None,
-            "adapter_identity": prepared.adapter_identity,
-            "preparation_digest": _runner()._preparation_digest(
-                public_spec, worker_spec, prepared.adapter_identity
-            ),
-            "backend": _runner().TRAINER_BACKEND,
-        },
-        # Snapshot the instance providers available at submit so a later handle-less recovery can fail
+        effective_preparation=_effective_preparation_snapshot(
+            public_spec, worker_spec, prepared.adapter_identity
+        ),
+        source_snapshot=source_snapshot,
+        # snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
         # Creds-only check (available_providers -> is_configured), no network on the create path.
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
@@ -316,11 +340,9 @@ def submit_job(
         threading.Thread(
             target=_runner()._run_job_background,
             args=(worker_spec, runtime_secrets or {}),
-            kwargs={"resolve_env_sha": True},
             daemon=True,
         ).start()
         return _runner().get_status(public_spec.run_id)
-    worker_spec = _runner()._assign_resolved_env_sha(worker_spec)
     if runtime_secrets:
         _runner()._run_job(worker_spec, runtime_secrets=runtime_secrets)
     else:

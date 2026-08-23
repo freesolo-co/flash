@@ -3,8 +3,8 @@
 Covers the review feedback on both PRs:
   - #209: _urlopen raises the typed GitHubRateLimitError on 429 / rate-limit 403, and a plain
     RuntimeError on a non-rate-limit 403 (so only rate limits are reclassified as retriable).
-  - #214 (comment 1): runner._assign_resolved_env_sha resolves the env ref->sha ONCE and pins it
-    on the spec; failures leave it empty (worker falls back).
+  - #214 (comment 1): runner._assign_resolved_env_sha resolves the env ref->sha once and pins it
+    on the spec; failures leave it empty for authoritative controller staging.
   - #214 (comment 2): registry.load_environment forwards a user [environment.params] entry named
     "resolved_sha" verbatim to the SDK loader and threads the control-plane pin under the reserved
     `pinned_sha` kwarg instead of stripping the user value.
@@ -15,6 +15,8 @@ import urllib.error
 import urllib.request
 
 import pytest
+
+from tests._helpers.source_snapshot import valid_source_snapshot
 
 
 def _http_error(code: int, body: str) -> urllib.error.HTTPError:
@@ -55,20 +57,40 @@ def test_urlopen_raises_typed_error_on_rate_limit_403(monkeypatch):
         _urlopen(urllib.request.Request("https://api.github.com/x"))
 
 
-def test_urlopen_non_rate_limit_403_stays_plain_runtime_error(monkeypatch):
-    # a 403 that is not a rate limit (auth failure, repo not found) must stay a plain runtimeerror
-    # (non-retriable) so the run fails fast instead of looping on a fresh worker forever.
-    from flash.envs.loader import GitHubRateLimitError, _urlopen
+@pytest.mark.parametrize("code", [401, 403])
+def test_urlopen_treats_credential_failure_as_permanent(monkeypatch, code):
+    # a 401, or a 403 that is not a rate limit, is a token this plane cannot fix by waiting. it must
+    # be non-retriable (so the run does not loop on a fresh worker) AND typed permanent, so the
+    # submit-time preflight fails closed instead of deferring the same error past gpu allocation.
+    from flash.envs.loader import GitHubPermanentError, GitHubRateLimitError, _urlopen
 
     _patch_no_sleep(monkeypatch)
     monkeypatch.setattr(
         urllib.request,
         "urlopen",
-        lambda *a, **k: (_ for _ in ()).throw(_http_error(403, '{"message": "Bad credentials"}')),
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(code, '{"message": "Bad credentials"}')),
     )
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(GitHubPermanentError) as exc:
         _urlopen(urllib.request.Request("https://api.github.com/x"))
     assert not isinstance(exc.value, GitHubRateLimitError)
+
+
+def test_urlopen_rate_limit_403_stays_transient_not_permanent(monkeypatch):
+    # the rate-limit 403 is claimed before the credential branch: it is a quota to wait out, not a
+    # bad token, so widening the permanent set must not swallow it.
+    from flash.envs.loader import GitHubPermanentError, GitHubRateLimitError, _urlopen
+
+    _patch_no_sleep(monkeypatch)
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            _http_error(403, '{"message": "API rate limit exceeded"}')
+        ),
+    )
+    with pytest.raises(GitHubRateLimitError) as exc:
+        _urlopen(urllib.request.Request("https://api.github.com/x"))
+    assert not isinstance(exc.value, GitHubPermanentError)
 
 
 @pytest.mark.parametrize("code", [404, 422])
@@ -204,8 +226,8 @@ def test_assign_resolved_env_sha_pins_when_resolver_succeeds(monkeypatch):
 
 
 def test_assign_resolved_env_sha_uses_fast_no_retry_resolver(monkeypatch):
-    # The control-plane pin must never block run creation on GitHub retries: it resolves with a
-    # short timeout and zero rate-limit retries (the worker keeps the full retry budget).
+    # the control-plane preflight must never block run creation on github retries: it resolves with a
+    # short timeout and zero rate-limit retries before authoritative controller staging.
     import flash.envs.loader as adapter
     from flash import runner
     from flash.core.spec import EnvironmentSpec, JobSpec
@@ -234,7 +256,7 @@ def test_assign_resolved_env_sha_best_effort_on_failure(monkeypatch):
     monkeypatch.setattr(adapter, "_resolve_ref_sha", boom)
     spec = JobSpec(environment=EnvironmentSpec(id=_GH_ENV))
     out = runner._assign_resolved_env_sha(spec)
-    assert out.environment.resolved_sha == ""  # submission never blocks; worker resolves itself
+    assert out.environment.resolved_sha == ""  # controller staging resolves before allocation
 
 
 def test_assign_resolved_env_sha_noop_without_env_or_already_pinned(monkeypatch):
@@ -254,11 +276,7 @@ def test_assign_resolved_env_sha_noop_without_env_or_already_pinned(monkeypatch)
     assert runner._assign_resolved_env_sha(pinned).environment.resolved_sha == "c" * 40
 
 
-def test_background_submit_defers_env_sha_off_creation_path(monkeypatch, tmp_path):
-    """#217: submit_job(background=True) (the managed API path) must NOT resolve the env ref->sha
-    synchronously — the GitHub commits API is on a thread, so a slow/rate-limited resolve cannot
-    block or delay run creation. The status is saved + reported FIRST, then the pin is deferred into
-    the background run thread."""
+def test_background_submit_keeps_environment_staging_off_creation_path(monkeypatch, tmp_path):
     import threading
 
     from flash import runner
@@ -268,19 +286,24 @@ def test_background_submit_defers_env_sha_off_creation_path(monkeypatch, tmp_pat
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
     main_thread = threading.current_thread().ident
-    resolve_threads: list[int | None] = []
+    staging_threads: list[int | None] = []
     ran = threading.Event()
 
-    def fake_resolve(spec):
-        # Record WHICH thread asked for the env-sha pin (creation path vs background thread).
-        resolve_threads.append(threading.current_thread().ident)
+    def fake_stage(spec, **_kwargs):
+        staging_threads.append(threading.current_thread().ident)
         return spec
 
-    def fake_run_job(spec, **kwargs):
+    def fake_run_job(spec, **_kwargs):
+        runner.stage_environment_package(spec)
         ran.set()
 
-    monkeypatch.setattr(runner, "_assign_resolved_env_sha", fake_resolve)
+    monkeypatch.setattr(runner, "stage_environment_package", fake_stage)
     monkeypatch.setattr(runner, "_run_job", fake_run_job)
+    monkeypatch.setattr(
+        runner,
+        "publish_source_snapshot",
+        lambda _repo=None: valid_source_snapshot(),
+    )
     # the submit-time 404 gate resolves the ref too, and this spec names a placeholder repo that
     # really does 404. its subject is WHICH THREAD pins, so stub the gate out rather than let a live
     # GitHub lookup decide whether the test runs. pass the spec through unpinned: the gate returns
@@ -301,13 +324,9 @@ def test_background_submit_defers_env_sha_off_creation_path(monkeypatch, tmp_pat
     )
     status = runner.submit_job(spec, background=True)
 
-    # Run creation returned immediately with a persisted queued record...
     assert status.run_id == "flash-bg-resolve"
     assert runner.get_status("flash-bg-resolve").state == "queued"
-    # ...and the env-sha resolve had NOT run on the creating (request) thread by the time we returned.
-    assert main_thread not in resolve_threads
-
-    # The background thread resolves the pin (off the critical path) and then runs the job.
+    assert main_thread not in staging_threads
     assert ran.wait(timeout=5.0)
-    assert resolve_threads, "background thread must resolve the env ref->sha"
-    assert all(tid != main_thread for tid in resolve_threads)
+    assert staging_threads
+    assert all(thread_id != main_thread for thread_id in staging_threads)

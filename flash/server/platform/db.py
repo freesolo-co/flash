@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from flash._internal.paths import data_dir
+from flash.teacher.provider_status import validated_provider_status
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -124,18 +125,6 @@ def _database_file_identity(path: str) -> tuple[int, int] | None:
     return stat.st_dev, stat.st_ino
 
 
-def _migrate_schema(conn: sqlite3.Connection) -> None:
-    columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(teacher_score_requests)").fetchall()
-    }
-    if "response_body" not in columns:
-        try:
-            conn.execute("ALTER TABLE teacher_score_requests ADD COLUMN response_body BLOB")
-        except sqlite3.OperationalError as exc:
-            if "duplicate column" not in str(exc).lower():
-                raise
-
-
 def _initialize_database(path: str) -> None:
     database = (os.getpid(), path)
     identity = _database_file_identity(path)
@@ -158,7 +147,6 @@ def _initialize_database(path: str) -> None:
                 conn = sqlite3.connect(path, timeout=remaining)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.executescript(_SCHEMA)
-                _migrate_schema(conn)
                 conn.commit()
                 # Record the identity of the file the schema actually ran on while
                 # the connection is still open, so a file replaced at the same path
@@ -410,10 +398,17 @@ def all_runs() -> list[dict]:
 
 
 class TeacherLedgerError(RuntimeError):
-    def __init__(self, code: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        retryable: bool = False,
+        provider_status: int | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+        self.provider_status = validated_provider_status(provider_status)
 
 
 def _immediate(conn: sqlite3.Connection) -> None:
@@ -539,9 +534,9 @@ def revoke_teacher_capabilities_for_run(run_id: str, *, now: float | None = None
 def _readmit_teacher_request(conn, capability, existing, *, admitted_at, charge_tokens) -> dict:
     """Re-open one existing ledger row as 'reserved' inside the caller's transaction.
 
-    ``charge_tokens`` is True only for 'retryable' rows, whose token reservation was released
-    before dispatch. Transient terminal rows completed after dispatch, so their reservation is
-    still held and only in_flight is re-acquired.
+    ``charge_tokens`` is True only for failures proven to precede provider dispatch, whose token
+    reservation was released. A provider 429 keeps its existing reservation because the provider
+    rejected it before execution and only in_flight must be re-acquired.
     """
     if existing["upstream_attempt_count"] >= capability["max_upstream_attempts"]:
         # the upstream budget is spent, so readmission is refused before any counter moves: a
@@ -585,14 +580,10 @@ def _resume_existing_teacher_request(conn, capability, existing, *, admitted_at)
         )
     if state in {"reserved", "started"}:
         raise TeacherLedgerError("request_in_progress", retryable=True)
-    # transient terminal rows readmit for another upstream attempt, bounded by
-    # mark_teacher_request_started. 'provider_rejected' readmits only with the broker's
-    # error_class 'transient' (429/5xx); genuine 4xx stays terminal. 'outcome_unknown'
-    # always readmits, and billed usage lands only on the terminal 'succeeded'
-    # completion, so readmission cannot double-bill.
-    if state == "outcome_unknown" or (
-        state == "provider_rejected" and existing["error_class"] == "transient"
-    ):
+    # only a provider rejection proven to precede execution may dispatch again. currently that is a
+    # conventional 429 recorded as transient. outcome_unknown is terminal because flash has no
+    # upstream idempotency key and internal ledger accounting cannot prevent duplicate provider work.
+    if state == "provider_rejected" and existing["error_class"] == "transient":
         return _readmit_teacher_request(
             conn, capability, existing, admitted_at=admitted_at, charge_tokens=False
         )
@@ -610,7 +601,10 @@ def _resume_existing_teacher_request(conn, capability, existing, *, admitted_at)
             "request": dict(existing),
             "response_body": response_body,
         }
-    raise TeacherLedgerError(state)
+    raise TeacherLedgerError(
+        state,
+        provider_status=existing["provider_status"] if state == "provider_rejected" else None,
+    )
 
 
 def reserve_teacher_request(

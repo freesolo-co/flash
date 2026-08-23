@@ -10,6 +10,7 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -19,9 +20,17 @@ import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler
 
+from flash.content.multimodal import normalize_environment_reply
 from flash.engine.worker.backend_common import BoundedThreadingHTTPServer
 from flash.engine.worker.score_batcher import ScoreBatcher
+from flash.engine.worker.train.core.child.glue import (
+    dedup_seam_terminator,
+    parent_environment_glue,
+    parent_image_digests,
+    validate_structured_messages,
+)
 from flash.engine.worker.train.rl.scoring import RolloutScoreRequest, score_rollouts
+from flash.engine.worker.verl.parent_work import ParentWorkGauge
 
 # how many concurrently-finished episodes the multi-turn bridge scores in ONE env call. a whole
 # generation is prompts_per_step * group_size episodes and they finish at different turn counts,
@@ -67,6 +76,17 @@ class _BadSession(_BadRequest, KeyError):
         return self.args[0] if self.args else ""
 
 
+class _BadEnvReply(_BadRequest, ValueError):
+    """A reply the environment produced that this transcript cannot carry. Also a ValueError.
+
+    The property the handler splits on is PERMANENT versus TRANSIENT, and this is permanent: the
+    environment will produce the same unrepresentable block on every retry, so it belongs with the
+    deliberate rejections rather than with the capacity faults. A bare ValueError here would fall
+    to the 503 branch and tell the reader the bridge had a resource problem, when the fix is to
+    change the environment's reply -- the same misdirection the 400/503 split exists to prevent.
+    """
+
+
 def _request_field(payload: dict, key: str):
     """Read one required payload field, or reject the request.
 
@@ -96,12 +116,49 @@ def request_session_id(payload: dict) -> str:
     return str(_request_field(payload, "session_id"))
 
 
+def _authentication_prompts_equal(expected: list[dict], actual: list[dict]) -> bool:
+    """compare prompts after only the text concatenation performed by chat templates."""
+
+    def content_parts(content) -> list[tuple[str, object]]:
+        if isinstance(content, str):
+            return [("text", content)] if content else []
+        parts: list[tuple[str, object]] = []
+        text_parts: list[str] = []
+        for block in content:
+            if block.get("type") == "text":
+                text_parts.append(block["text"])
+                continue
+            text = "".join(text_parts)
+            if text:
+                parts.append(("text", text))
+            text_parts = []
+            parts.append(("block", block))
+        text = "".join(text_parts)
+        if text:
+            parts.append(("text", text))
+        return parts
+
+    if len(expected) != len(actual):
+        return False
+    for expected_message, actual_message in zip(expected, actual, strict=True):
+        expected_metadata = {
+            key: value for key, value in expected_message.items() if key != "content"
+        }
+        actual_metadata = {key: value for key, value in actual_message.items() if key != "content"}
+        if expected_metadata != actual_metadata:
+            return False
+        if content_parts(expected_message["content"]) != content_parts(actual_message["content"]):
+            return False
+    return True
+
+
 # ONLY the bridge's own deliberate rejections are client errors. classifying by exception TYPE
 # instead cannot work: a user env raising IndexError/KeyError deep inside its own scoring would be
 # reported as a malformed request -- the same "blame the caller for this side's failure" bug this
 # module's 503 split exists to fix, one layer down. so the rejecting code raises _BadRequest itself
 # and anything else reaching the handler is this side failing to serve a well-formed request.
 _BAD_REQUEST_ERRORS = (_BadRequest,)
+
 
 # size the listen backlog for the full prompts_per_step * group_size connection burst.
 # socketserver's default of 5 resets overflowed clients, and bridge_post intentionally does not retry.
@@ -129,24 +186,66 @@ class MultiTurnBridge:
         *,
         env_prompts: list[list[dict]],
         max_turns: int,
+        prompt_ids: list[list[int]] | None = None,
+        prompt_descriptors: list[list[str] | tuple[str, ...]] | None = None,
+        package_root: str | None = None,
+        processor=None,
+        tokenizer=None,
+        thinking: bool = False,
         per_turn_credit: bool = False,
         on_episode_scored: Callable[[object, object, float], None] | None = None,
+        parent_work: ParentWorkGauge | None = None,
+        identity_ledger=None,
         score_batch_size: int = _MULTI_TURN_SCORE_BATCH_SIZE,
         score_flush_wait_s: float = _MULTI_TURN_SCORE_FLUSH_WAIT_S,
         session_lease_s: float = _MULTI_TURN_SESSION_LEASE_S,
     ) -> None:
         if len(env_prompts) != len(examples):
             raise ValueError("multi-turn env prompts must align one-to-one with examples")
+        if prompt_ids is not None and len(prompt_ids) != len(examples):
+            raise ValueError("multi-turn prompt ids must align one-to-one with examples")
+        prompt_descriptors = prompt_descriptors or [()] * len(examples)
+        if len(prompt_descriptors) != len(examples):
+            raise ValueError("multi-turn image descriptors must align one-to-one with examples")
         self._env = env
         self._examples = examples
-        self._env_prompts = env_prompts
+        self._env_prompts = [
+            validate_structured_messages(messages, source="frozen environment prompt")
+            for messages in env_prompts
+        ]
+        self._prompt_ids = (
+            None
+            if prompt_ids is None
+            else [tuple(int(token_id) for token_id in ids) for ids in prompt_ids]
+        )
+        self._prompt_descriptors = [tuple(values) for values in prompt_descriptors]
+        self._processor = processor
+        self._prompt_digests = [
+            tuple(parent_image_digests(processor, values, package_root))
+            for values in self._prompt_descriptors
+        ]
+        self._package_root = package_root
+        self._tokenizer = tokenizer
+        self._thinking = bool(thinking)
         self._max_turns = int(max_turns)
         self._per_turn_credit = bool(per_turn_credit)
         self._on_episode_scored = on_episode_scored
+        self._parent_work = parent_work or ParentWorkGauge()
+        self._identity_ledger = identity_ledger
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every stateful episode touch below happens under this lock.
         self._lock = threading.Lock()
         self._warned_missing_turn_rewards = False
+        # per-run turn totals, published through `turn_accounting`. guarded by the same lock as
+        # every other mutable bridge state.
+        self._scored_episodes = 0
+        # counted from the parent's own `next_turn`, NOT from the child's `turn_count`. these
+        # counters exist to prove the child's turn loop really iterated, so deriving them from a
+        # number the child reports about itself would make a child that collapsed to one turn
+        # report whatever it liked -- the one failure they are here to catch. `step` validates
+        # every ordinal against `next_turn` before incrementing it, so the parent's count is exact.
+        self._scored_turns = 0
+        self._max_observed_turns = 0
         self._sessions: dict[str, dict] = {}
         self._session_lease_s = float(session_lease_s)
         # score many episodes under one lock-held env call so judge work can use the env's own
@@ -164,11 +263,46 @@ class MultiTurnBridge:
         )
 
     def routes(self) -> dict:
+        def start(payload: dict) -> dict:
+            for key in ("raw_prompt", "prompt_ids", "image_count", "image_digests"):
+                _request_field(payload, key)
+            return self.start(payload)
+
+        def step(payload: dict) -> dict:
+            for key in (
+                "turn_ordinal",
+                "accepted_prefix",
+                "response_ids",
+                "image_count",
+                "image_digests",
+            ):
+                _request_field(payload, key)
+            return self.step(payload)
+
         return {
-            "/multiturn/start": self.start,
-            "/multiturn/step": self.step,
+            "/multiturn/start": start,
+            "/multiturn/step": step,
             "/multiturn/score": self.score,
             "/multiturn/close": self.close,
+        }
+
+    def turn_accounting(self) -> dict[str, int | float | None]:
+        """Bounded per-run turn totals, for proving the multi-turn loop actually iterated.
+
+        A regression that ended every episode after one turn still produces finite gradients, a
+        nonzero adapter delta, and complete artifacts -- every existing gate stays green while the
+        environment's multi-turn contract is silently dead. These counters make that visible.
+        OPD already publishes the same pair as `episodes_seen` / `mt_turn_records`.
+        """
+        with self._lock:
+            episodes = self._scored_episodes
+            turns = self._scored_turns
+            maximum = self._max_observed_turns
+        return {
+            "episodes_scored": episodes,
+            "turn_records": turns,
+            "max_turns_observed": maximum,
+            "mean_turns_per_episode": (turns / episodes if episodes else None),
         }
 
     def shutdown(self) -> None:
@@ -200,6 +334,22 @@ class MultiTurnBridge:
             self._sessions.pop(session_id, None)
         return stale
 
+    def _env_call(self, method: str, *args):
+        with self._parent_work.busy():
+            return getattr(self._env, method)(*args)
+
+    @staticmethod
+    def _payload_media_identity(payload: dict, *, required: bool) -> tuple[int, tuple[str, ...]]:
+        if not required and "image_count" not in payload and "image_digests" not in payload:
+            return 0, ()
+        image_count = request_int(payload, "image_count")
+        digests = _request_field(payload, "image_digests")
+        if not isinstance(digests, list) or any(not isinstance(value, str) for value in digests):
+            raise _BadRequest("field 'image_digests' must be a list of strings")
+        if image_count != len(digests):
+            raise _BadRequest("image count does not match ordered media digests")
+        return image_count, tuple(digests)
+
     def start(self, payload: dict) -> dict:
         index = request_int(payload, "index")
         if index < 0 or index >= len(self._examples):
@@ -208,6 +358,31 @@ class MultiTurnBridge:
             )
         session_id = request_session_id(payload)
         example = self._examples[index]
+        identity = (
+            self._identity_ledger.require_registered(payload.get("identity"), index)
+            if self._identity_ledger is not None
+            else None
+        )
+        expected_prompt = self._env_prompts[index]
+        expected_digests = self._prompt_digests[index]
+        if "raw_prompt" in payload:
+            raw_prompt = validate_structured_messages(
+                payload["raw_prompt"], source="child initial prompt"
+            )
+            if not _authentication_prompts_equal(expected_prompt, raw_prompt):
+                raise _BadRequest(
+                    "multi-turn child prompt does not match the frozen environment prompt"
+                )
+        image_count, image_digests = self._payload_media_identity(
+            payload, required="raw_prompt" in payload
+        )
+        if image_count != len(expected_digests) or image_digests != expected_digests:
+            raise _BadRequest("multi-turn child media does not match the frozen environment prompt")
+        prompt_ids = [int(token_id) for token_id in payload.get("prompt_ids", [])]
+        if self._prompt_ids is not None and tuple(prompt_ids) != self._prompt_ids[index]:
+            raise _BadRequest(
+                "multi-turn child prompt ids do not match the frozen processor prompt"
+            )
         with self._lock:
             # swept here rather than on a timer thread: a session is only ever abandoned by an
             # actor that stopped calling, and the actors that replace it announce themselves
@@ -215,16 +390,17 @@ class MultiTurnBridge:
             reaped = self._reap_abandoned_sessions()
             if session_id in self._sessions:
                 raise _BadSession(f"duplicate multi-turn session {session_id}")
-            state = self._env.new_rollout_state(example)
-            # new_rollout_state calls start_episode again after dataset preparation. adopt the dataset's
-            # prompt so randomized envs do not generate for episode a and score episode b; keep the
-            # remaining state created by the env.
-            env_prompt = [dict(message) for message in self._env_prompts[index]]
-            state["prompt"] = env_prompt
-            state["messages"] = [dict(message) for message in env_prompt]
+            state = self._env_call("new_rollout_state", example, expected_prompt)
             self._sessions[session_id] = {
                 "example": example,
                 "state": state,
+                "identity": identity,
+                "messages": copy.deepcopy(expected_prompt),
+                "descriptors": list(self._prompt_descriptors[index]),
+                "image_digests": list(expected_digests),
+                "required_prefix": prompt_ids,
+                "next_turn": 0,
+                "turns": [],
                 "touched_at": time.monotonic(),
             }
         if reaped:
@@ -240,35 +416,130 @@ class MultiTurnBridge:
         turns = self._max_turns if episode_turns is None else int(episode_turns)
         return {"max_turns": max(1, min(self._max_turns, turns))}
 
+    @staticmethod
+    def _step_response(
+        session: dict,
+        *,
+        terminal: bool,
+        messages: list[dict],
+        image_data_uris: tuple[str, ...] = (),
+        authenticated: bool,
+    ) -> dict:
+        response = {"terminal": terminal, "messages": messages}
+        if authenticated:
+            response.update(
+                {
+                    "image_data_uris": list(image_data_uris),
+                    "image_count": len(session["image_digests"]),
+                    "image_digests": list(session["image_digests"]),
+                }
+            )
+        return response
+
     def step(self, payload: dict) -> dict:
         with self._lock:
             session = self._session(payload)
             state = session["state"]
-            # an unusable turn is terminal and must NOT be shown to the env: recording it would
-            # append a truncated or empty assistant message to the transcript that gets scored.
-            # the child stops on the same condition, so this only decides what the env sees.
+            turn_ordinal = int(payload.get("turn_ordinal", session["next_turn"]))
+            if turn_ordinal != session["next_turn"]:
+                raise _BadRequest(
+                    f"multi-turn rollout expected turn {session['next_turn']}, got {turn_ordinal}"
+                )
+            authenticated = "accepted_prefix" in payload
+            accepted_prefix = [
+                int(token_id)
+                for token_id in payload.get("accepted_prefix", session["required_prefix"])
+            ]
+            if accepted_prefix != session["required_prefix"]:
+                raise _BadRequest(
+                    "multi-turn rollout prompt does not exactly match the authenticated environment context"
+                )
+            image_count, image_digests = self._payload_media_identity(
+                payload, required=authenticated
+            )
+            if authenticated and (
+                image_count != len(session["image_digests"])
+                or image_digests != tuple(session["image_digests"])
+            ):
+                raise _BadRequest(
+                    "multi-turn rollout media does not match the authenticated context"
+                )
+            response_ids = [int(token_id) for token_id in payload.get("response_ids", [])]
+            completion_text = str(payload.get("completion_text") or "")
+            session["next_turn"] += 1
+            # an unusable turn is terminal and must not be shown to the env or teacher.
             if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
-                # it is still the turn the model generated and the child trained on, so it is kept
-                # for the DIAGNOSTIC transcript. dropping it entirely would publish an empty
-                # completion for a first-turn truncation -- the one sample worth reading, since it
-                # is the failure being diagnosed.
                 session["aborted_turn"] = {
                     "role": "assistant",
-                    "content": str(payload.get("completion_text") or ""),
+                    "content": completion_text,
                 }
-                return {"terminal": True, "messages": []}
-            self._env.record_model_turn(state, str(payload.get("completion_text") or ""))
-            if self._env.rollout_done(state, self._max_turns):
-                return {"terminal": True, "messages": []}
-            replies = self._env.env_reply(list(state.get("messages") or ()), state)
-            terminal = bool(self._env.rollout_done(state, self._max_turns))
-        return {
-            "terminal": terminal,
-            "messages": [
-                {"role": str(message.get("role", "")), "content": str(message.get("content", ""))}
-                for message in replies
-            ],
-        }
+                return self._step_response(
+                    session,
+                    terminal=True,
+                    messages=[],
+                    authenticated=authenticated,
+                )
+            self._env_call("record_model_turn", state, completion_text)
+            session["messages"].append({"role": "assistant", "content": completion_text})
+            next_prefix = [*accepted_prefix, *response_ids]
+            if self._env_call("rollout_done", state, self._max_turns):
+                session["required_prefix"] = next_prefix
+                return self._step_response(
+                    session,
+                    terminal=True,
+                    messages=[],
+                    authenticated=authenticated,
+                )
+            replies = self._env_call("env_reply", list(state.get("messages") or ()), state)
+            terminal = bool(self._env_call("rollout_done", state, self._max_turns))
+            if terminal:
+                # terminal replies remain available to environment scoring but are never actor or
+                # teacher context, so their media is deliberately neither normalized nor transported.
+                session["required_prefix"] = next_prefix
+                return self._step_response(
+                    session,
+                    terminal=True,
+                    messages=[],
+                    authenticated=authenticated,
+                )
+            try:
+                normalized = normalize_environment_reply(
+                    replies,
+                    self._package_root,
+                    session["descriptors"],
+                )
+                if authenticated or normalized.descriptors:
+                    glue_ids, new_digests = parent_environment_glue(
+                        self._processor,
+                        self._tokenizer,
+                        normalized.messages,
+                        normalized.descriptors,
+                        self._package_root,
+                        thinking=self._thinking,
+                    )
+                else:
+                    glue_ids, new_digests = [], []
+            except ValueError as error:
+                raise _BadEnvReply(str(error)) from error
+            glue_ids = dedup_seam_terminator(response_ids, glue_ids)
+            session["messages"].extend(normalized.messages)
+            session["descriptors"].extend(normalized.descriptors)
+            session["image_digests"].extend(new_digests)
+            session["required_prefix"] = [*next_prefix, *glue_ids]
+            session["turns"].append(
+                {
+                    "messages": copy.deepcopy(session["messages"]),
+                    "descriptors": tuple(session["descriptors"]),
+                    "image_digests": tuple(session["image_digests"]),
+                }
+            )
+            return self._step_response(
+                session,
+                terminal=False,
+                messages=normalized.messages,
+                image_data_uris=normalized.data_uris,
+                authenticated=authenticated,
+            )
 
     def _score_batch(self, requests: list) -> list:
         """score a whole batch of terminal episodes in ONE env call. runs on the batcher thread.
@@ -276,7 +547,7 @@ class MultiTurnBridge:
         takes the same lock every other env touch takes, so scoring never overlaps a concurrent
         episode's ``env_reply``. the win is that one lock acquisition now covers a whole batch.
         """
-        with self._lock:
+        with self._lock, self._parent_work.busy():
             return score_rollouts(self._env, requests)
 
     def score(self, payload: dict) -> dict:
@@ -284,6 +555,15 @@ class MultiTurnBridge:
         with self._lock:
             session = self._session(payload)
             state = session["state"]
+            expected_identity = session.get("identity")
+        if self._identity_ledger is not None:
+            identity = self._identity_ledger.validate_for_index(
+                payload.get("identity"),
+                expected_identity.sample_index,
+            )
+            if identity != expected_identity:
+                raise ValueError("multi-turn GRPO score identity does not match its session")
+            self._identity_ledger.record(payload.get("identity"), expected_identity.sample_index)
         # queued OUTSIDE the lock so concurrent episodes can coalesce into one env call; the
         # batcher thread reacquires it to do the scoring. safe to read this session's state
         # unlocked because the episode is terminal -- the child sends /score only after its turn
@@ -296,6 +576,28 @@ class MultiTurnBridge:
             )
         )
         with self._lock:
+            # counted here, AFTER identity validation and a scorer reply, so the accounting only
+            # ever describes episodes that were really scored. counting on entry let a request the
+            # checks below reject -- a mismatched or duplicate identity -- or a scorer failure
+            # still inflate the totals, and `turn_accounting()` is published from the runner's
+            # `finally` path, so those inflated numbers reach the durable notes of a run that
+            # failed. that is the opposite of what the counters exist to prove.
+            #
+            # one /score call per terminal episode, so this counts episodes exactly once. recorded
+            # in `score` rather than in `step` because a truncated turn returns terminal without
+            # ever reaching the env, and it is still a turn the model generated and trained on.
+            #
+            # `next_turn`, not the payload's `turn_count`: they are different quantities on purpose.
+            # `turn_count` is the SCOREABLE turn total the child derives from `turn_spans`, which
+            # deliberately omits an unusable turn because the env never saw it and returns no reward
+            # for it -- that is the scoring contract and it stays as it is. the counters here want
+            # the GENERATED total, which is what the sentence above says they mean, and taking it
+            # from the parent's own validated ordinal also stops the child from self-reporting the
+            # very number that would expose it collapsing to one turn per episode.
+            generated_turns = int(session["next_turn"])
+            self._scored_episodes += 1
+            self._scored_turns += generated_turns
+            self._max_observed_turns = max(self._max_observed_turns, generated_turns)
             # snapshot under the same lock that guards the session: `step` mutates this list in
             # place, and a concurrent episode's turn would otherwise be read mid-append.
             prompt = list(state.get("prompt") or ())
@@ -354,24 +656,22 @@ class MultiTurnBridge:
             return len(self._sessions)
 
 
-# the three stdlib-only modules the child needs beside its shim, mapped to the flat names it
-# imports them under. flat and `flash_`-prefixed because the child imports them as top-level
-# modules, not as a package: flash itself is NOT importable in the verl interpreter (incompatible
-# torch/vllm pins), which is why they are copied rather than imported. same mechanism the opd verl
-# path uses for its own loop.
-# (path relative to flash/engine/worker/, flat name the child imports it under). the child code
-# lives under train/, so these are package-relative paths rather than bare siblings.
-MULTI_TURN_CHILD_MODULES = (
+# every GRPO child receives one complete flat plugin bundle. copying the multi-turn module even for
+# single-turn runs keeps the bundle shape invariant while the plugin decides whether to register it.
+GRPO_CHILD_MODULES = (
+    (os.path.join("train", "core", "child", "runtime.py"), "flash_verl_runtime.py"),
     (os.path.join("train", "core", "child", "glue.py"), "flash_multiturn_glue.py"),
+    (os.path.join("train", "rl", "child", "patches.py"), "flash_grpo_patches.py"),
     (os.path.join("train", "rl", "child", "multiturn.py"), "flash_grpo_multiturn.py"),
     (os.path.join("train", "rl", "child", "plugin.py"), "flash_grpo_plugin.py"),
+    (os.path.join("train", "rl", "child", "entry.py"), "flash_grpo_entry.py"),
 )
 
 
-def copy_multi_turn_child_modules(shim_dir: str) -> tuple[str, ...]:
-    """copy the child-side agent loop next to the shim; returns the paths written."""
+def copy_grpo_child_modules(shim_dir: str) -> tuple[str, ...]:
+    """copy the complete GRPO plugin bundle and return the paths written."""
     written = []
-    for source_name, child_name in MULTI_TURN_CHILD_MODULES:
+    for source_name, child_name in GRPO_CHILD_MODULES:
         target = os.path.join(shim_dir, child_name)
         shutil.copy2(os.path.join(_WORKER_DIR, source_name), target)
         written.append(target)
@@ -385,10 +685,6 @@ def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[
     turn limits, halting, and glue rendering into strings.
     """
     return {
-        # verl imports this at the end of `verl/__init__` (import_external_libs), which is what
-        # registers the loop under the name the agent-loop override selects. without it the
-        # override names a loop that was never registered and the child dies at rollout build.
-        "VERL_USE_EXTERNAL_MODULES": "flash_grpo_plugin",
         "FLASH_VERL_MULTITURN_URL": reward_url,
         "FLASH_VERL_MAX_TURNS": str(int(inp["max_turns"])),
         "FLASH_VERL_MAX_MODEL_LEN": str(int(inp["engine_len"])),
@@ -412,6 +708,7 @@ def start_reward_server(
     multi_turn_bridge=None,
     rollout_batch: int = 0,
     score_batch=None,
+    identity_ledger=None,
 ):
     """start the localhost reward server and return ``(server, base_url)``.
 
@@ -434,17 +731,28 @@ def start_reward_server(
         else None
     )
 
+    def _register_identities(payload: dict) -> dict:
+        if identity_ledger is None:
+            raise RuntimeError("GRPO identity registration is not configured")
+        identities = _request_field(payload, "identities")
+        if not isinstance(identities, list):
+            raise _BadRequest("field 'identities' must be a list")
+        step = identity_ledger.register(identities)
+        return {"optimizer_step": step, "registered": len(identities)}
+
     def _score_route(payload: dict) -> dict:
         index = request_int(payload, "index")
         if index < 0 or index >= example_count:
             raise _BadIndex(f"reward example index {index} is outside [0, {example_count})")
         solution_str = payload.get("solution_str", "")
+        if identity_ledger is not None:
+            identity_ledger.record(payload.get("identity"), index)
         if score_batcher is not None:
             return {"score": float(score_batcher.submit((index, solution_str)))}
         with score_lock:
             return {"score": float(score_by_index(index, solution_str))}
 
-    routes = {"/score": _score_route}
+    routes = {"/identity/register": _register_identities, "/score": _score_route}
     if multi_turn_bridge is not None:
         routes.update(multi_turn_bridge.routes())
 

@@ -14,6 +14,11 @@ import pytest
 
 import flash.cli as cli
 from flash.cli.commands.env.push import _human_bytes, _UploadProgress
+from flash.envs.package.direct_tokens import (
+    _CHUNK_SIZE,
+    _OVERLAP,
+    package_contains_direct_token,
+)
 
 
 def _fake_client(capture: dict, *, slug: str = "acme/environment"):
@@ -49,6 +54,199 @@ def _args(
     path, *, name: str = "my-env", project: str | None = "11111111-1111-4111-8111-111111111111"
 ):
     return argparse.Namespace(path=str(path), name=name, project=project)
+
+
+def _token_body(prefix: str, length: int) -> str:
+    seed = (
+        "aB3_dE5-fG7hJ9kL2mN4pQ6rS8tUvW0xY1zC"
+        if prefix == "fslo_"
+        else "aB3dE5fG7hJ9kL2mN4pQ6rS8tUvW0xY1zC"
+    )
+    return (seed * 2)[:length]
+
+
+def _issued_token(prefix: str) -> str:
+    body_length = {"fslo_": 45, "hf_": 34, "pit_": 64}[prefix]
+    body = _token_body(prefix, body_length)
+    if prefix == "fslo_":
+        assert {"_", "-"} <= set(body)
+    return prefix + body
+
+
+def _deny_archive_and_upload(monkeypatch, calls: list[str]) -> None:
+    def deny_archive(_pkg):
+        calls.append("archive")
+        raise AssertionError("archive must not be created")
+
+    monkeypatch.setattr("flash.cli.commands.env.push._tar_b64", deny_archive)
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: calls.append("upload") or pytest.fail("upload must not start"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "relative", "content"),
+    [
+        ("fslo_", "scripts/launch.sh", lambda token: f"#!/bin/sh\nexport API_KEY={token}\n"),
+        ("hf_", "helper.py", lambda token: f"TOKEN = {token!r}\n"),
+        ("pit_", "environment.py", lambda token: f"TOKEN = {token!r}\n"),
+    ],
+    ids=["freesolo-shell", "hugging-face-python", "prime-entrypoint"],
+)
+def test_push_rejects_direct_tokens_before_archive_or_upload(
+    monkeypatch, tmp_path, capsys, prefix, relative, content
+):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    target = env_dir / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    token = _issued_token(prefix)
+    target.write_text(content(token))
+    calls: list[str] = []
+    _deny_archive_and_upload(monkeypatch, calls)
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+
+    error = capsys.readouterr().err
+    assert "direct access token" in error
+    assert token not in error
+    assert relative not in error
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("prefix", "body_length"),
+    [("fslo_", 45), ("hf_", 34), ("pit_", 64)],
+    ids=["freesolo", "hugging-face", "prime"],
+)
+@pytest.mark.parametrize("delta", [-1, 1], ids=["minus-one", "plus-one"])
+def test_direct_token_neighbor_body_lengths_are_clean(tmp_path, prefix, body_length, delta):
+    package = tmp_path / "package"
+    package.mkdir()
+    value = prefix + _token_body(prefix, body_length + delta)
+    (package / "data.bin").write_bytes(b" " + value.encode() + b" ")
+
+    assert package_contains_direct_token(package) is False
+
+
+@pytest.mark.parametrize(
+    "token_start",
+    [_CHUNK_SIZE - 3, _CHUNK_SIZE - _OVERLAP - 3],
+    ids=["read-boundary", "overlap-cutoff"],
+)
+def test_push_rejects_direct_token_across_chunk_boundary(
+    monkeypatch, tmp_path, capsys, token_start
+):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    token = _issued_token("hf_").encode()
+    (env_dir / "opaque.bin").write_bytes(b" " * token_start + token + b"\x00" * 256)
+    calls: list[str] = []
+    _deny_archive_and_upload(monkeypatch, calls)
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+
+    error = capsys.readouterr().err
+    assert "direct access token" in error
+    assert token.decode() not in error
+    assert "opaque.bin" not in error
+    assert calls == []
+
+
+def test_push_allows_clean_binary_placeholders_and_embedded_direct_token_shapes(
+    monkeypatch, tmp_path
+):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    embedded = _issued_token("pit_")
+    placeholders = [
+        "fslo_" + "your_api_token_here".ljust(45, "_"),
+        "hf_" + "x" * 34,
+        "pit_" + "0" * 64,
+    ]
+    (env_dir / "environment.py").write_text(
+        "def load_environment(**k):\n    return None\n" + "\n".join(placeholders)
+    )
+    (env_dir / "notes.txt").write_text(
+        "ordinary text without credentials\n"
+        "hf_resume_checkpoint\n"
+        "fslo_retry_after_close\n"
+        "pit_environment_identifier\n"
+    )
+    (env_dir / "opaque.bin").write_bytes(b"\x00\xffclean\x80binary\x00")
+    (env_dir / "embedded-left.bin").write_bytes(("left" + embedded + " ").encode())
+    (env_dir / "overlong.bin").write_bytes((" pit_" + "aB3" * 22 + " ").encode())
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    assert cap["package_b64"]
+
+
+def test_push_allows_direct_token_shape_with_invalid_left_at_retained_boundary(
+    monkeypatch, tmp_path
+):
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    token = _issued_token("pit_").encode()
+    prefix_padding = b" " * (_CHUNK_SIZE - _OVERLAP - 1)
+    payload = prefix_padding + b"z" + token + b"\x00" + b"next chunk"
+    (env_dir / "retained-boundary.bin").write_bytes(payload)
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_dir)) == 0
+    assert cap["package_b64"]
+
+
+def test_direct_token_scan_error_drops_oserror_details(tmp_path):
+    from flash.envs.package.direct_tokens import DirectTokenScanError, package_contains_direct_token
+
+    missing = tmp_path / "sensitive-package-path"
+    with pytest.raises(DirectTokenScanError) as excinfo:
+        package_contains_direct_token(missing)
+
+    assert str(excinfo.value) == "package scan failed"
+    assert excinfo.value.__context__ is None
+    assert str(missing) not in str(excinfo.value)
+
+
+def test_push_fails_closed_when_direct_token_scan_sees_unexpected_member(
+    monkeypatch, tmp_path, capsys
+):
+    from flash.cli.commands.env import push as envpush
+
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
+    outside = tmp_path / "outside"
+    outside.write_text("clean\n")
+    real_copy = envpush._copy_env_sidecars
+
+    def copy_with_link(env_root, dest, *, entrypoint, include_full_tree):
+        real_copy(
+            env_root,
+            dest,
+            entrypoint=entrypoint,
+            include_full_tree=include_full_tree,
+        )
+        (dest / "unexpected-link").symlink_to(outside)
+
+    monkeypatch.setattr(envpush, "_copy_env_sidecars", copy_with_link)
+    calls: list[str] = []
+    _deny_archive_and_upload(monkeypatch, calls)
+
+    assert cli.cmd_env_push(_args(env_dir)) == 1
+
+    error = capsys.readouterr().err
+    assert "could not be scanned safely" in error
+    assert "unexpected-link" not in error
+    assert str(outside) not in error
+    assert calls == []
 
 
 def test_push_single_py_module_is_packaged(monkeypatch, tmp_path, capsys):
@@ -525,7 +723,7 @@ def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monke
     locally and raised ModuleNotFoundError once published. The alias rebinds sys.modules so both
     names give one module object rather than two copies of its state.
     """
-    env_dir = tmp_path / "legacy-env"
+    env_dir = tmp_path / "single-file-env"
     env_dir.mkdir()
     (env_dir / "custom.py").write_text(
         "SCORER = 'gold'\n\ndef load_environment(**k):\n    return None\n"
@@ -536,7 +734,10 @@ def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monke
     cap: dict = {}
     monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
 
-    assert cli.cmd_env_push(_args(env_dir, name="legacy-env")) == 0
+    # the exact .py file, which is the supported way to publish an entrypoint not named
+    # environment.py. that push still renames, so the alias is still what keeps `import custom`
+    # resolving to the same module object the runner loaded.
+    assert cli.cmd_env_push(_args(env_dir / "custom.py", name="single-file-env")) == 0
     files = _members(cap["package_b64"])
     assert "custom.py" in files
     # the published tree must import cleanly, with both names bound to ONE module object
@@ -563,23 +764,24 @@ def test_push_keeps_a_noncanonical_entrypoint_importable_by_its_local_name(monke
     assert result.stdout.strip() == "gold"
 
 
-def test_push_dir_infers_entrypoint_ignoring_the_evaluations_sidecar(monkeypatch, tmp_path):
-    # a legacy package whose sole module is custom.py resolved fine before evaluations.py
-    # existed. counting the sidecar as a candidate entrypoint makes adding one turn that
-    # directory into "multiple top-level .py modules" and reject it before either file loads.
-    env_dir = tmp_path / "legacy-env"
+def test_push_dir_without_the_canonical_entrypoint_is_refused(monkeypatch, tmp_path, capsys):
+    # a directory package names its entrypoint environment.py. inferring it from "the sole
+    # top-level module" made the answer depend on which OTHER files were present, so adding a
+    # second module turned a working push into a rejection. the directory is refused outright
+    # now, and the message names both fixes rather than leaving the user to guess.
+    env_dir = tmp_path / "no-entrypoint-env"
     env_dir.mkdir()
     (env_dir / "custom.py").write_text("def load_environment(**k):\n    return None\n")
     (env_dir / "evaluations.py").write_text("def load_evaluations(environment=None): return []\n")
-    cap: dict = {}
-    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
 
-    assert cli.cmd_env_push(_args(env_dir, name="legacy-env")) == 0
-    files = _members(cap["package_b64"])
-    # packaging canonicalizes the inferred entrypoint to environment.py, so the assertion is
-    # that custom.py was chosen and published at all -- before the fix this raised instead.
-    assert "return None" in files["environment.py"]
-    assert "evaluations.py" in files
+    assert cli.cmd_env_push(_args(env_dir, name="no-entrypoint-env")) == 1
+    # the message must name the canonical entrypoint AND the single-file escape hatch, or the
+    # user is told only that the push failed.
+    out = capsys.readouterr()
+    message = out.err + out.out
+    assert "environment.py" in message
+    assert ".py file" in message
 
 
 def test_push_dir_with_pyproject_uses_explicit_name(monkeypatch, tmp_path):
@@ -1495,13 +1697,13 @@ def test_push_single_py_ships_its_evaluations_sidecar(monkeypatch, tmp_path):
     assert "helper.py" not in files
 
 
-def test_push_directory_infers_its_entrypoint_past_an_evaluations_sidecar(monkeypatch, tmp_path):
-    # a directory whose only module is `custom.py` is a supported layout. counting evaluations.py as
-    # a second top-level module made adding one reject the directory outright, so the very sidecar
-    # that enables evaluation disabled the push and the eval alike.
+def test_push_directory_carries_an_evaluations_sidecar(monkeypatch, tmp_path):
+    # the sidecar rides along with the canonical entrypoint rather than being mistaken for a rival
+    # one. (a directory whose only module is `custom.py` is no longer a supported layout: see
+    # test_push_dir_without_the_canonical_entrypoint_is_refused.)
     env_dir = tmp_path / "env"
     env_dir.mkdir()
-    (env_dir / "custom.py").write_text("def load_environment(**k):\n    return None\n")
+    (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
     (env_dir / "evaluations.py").write_text(
         "from flash.envs.evaluations import BaseEvalSuite\n"
         "class Suite(BaseEvalSuite):\n"
@@ -1515,9 +1717,7 @@ def test_push_directory_infers_its_entrypoint_past_an_evaluations_sidecar(monkey
     assert cli.cmd_env_push(_args(env_dir)) == 0
 
     files = _members(cap["package_b64"])
-    # custom.py was resolved as the entrypoint and published under the canonical name...
     assert "load_environment" in files["environment.py"]
-    # ...and the sidecar rode along rather than being mistaken for a rival entrypoint.
     assert "held-out" in files["evaluations.py"]
 
 

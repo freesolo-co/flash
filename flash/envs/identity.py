@@ -46,7 +46,7 @@ class GitHubUnavailableError(GitHubTransientError):
 
 
 class GitHubPermanentError(RuntimeError):
-    """GitHub answered, and the answer will not change on a retry: a 404 or a 422.
+    """GitHub answered, and the answer will not change on a retry: 401, 403, 404, or 422.
 
     Deliberately NOT a GitHubTransientError. Waiting is the right response to a blip and the wrong
     response to a typo, and the two are indistinguishable once both are a bare RuntimeError -- which
@@ -57,6 +57,10 @@ class GitHubPermanentError(RuntimeError):
     read, rather than leaking its existence with a 403. Both are permanent for this caller: no
     amount of retrying makes an unreadable ref resolvable, and the fix (check the name, or grant the
     token access) is the user's either way. The message carries GitHub's own text so it names which.
+
+    The credential codes reach here only after the rate-limit shapes (429, and the 403 that says
+    rate limit) have been claimed as transient, so a 401 or a surviving 403 is a token this plane
+    cannot fix by waiting: invalid, expired, or missing the scope. Same user-side fix as a typo.
     """
 
 
@@ -85,6 +89,18 @@ def is_managed_environment_slug(value: str) -> bool:
 
 def is_freesolo_environment_id(value: str) -> bool:
     return is_managed_environment_slug(value) or is_github_environment_ref(value)
+
+
+def canonical_environment_id(value: str) -> str:
+    """Return the stable identity spelling for a managed slug or GitHub reference."""
+    text = (value or "").strip()
+    managed = canonical_managed_environment_slug(text)
+    if managed is not None:
+        return managed
+    parsed = _parse_github_environment_ref(text)
+    if parsed is None:
+        raise ValueError(f"not a Freesolo environment id: {value!r}")
+    return parsed.canonical()
 
 
 def managed_slug_to_github_ref(value: str) -> str:
@@ -239,3 +255,13 @@ def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
 def is_commit_sha(value: str) -> bool:
     """True when value is a full 40-hex-char git commit id (an immutable ref)."""
     return _COMMIT_SHA_RE.fullmatch(value) is not None
+
+
+def github_environment_ref_is_pinned(value: str) -> bool:
+    """True when a ``github:`` environment id names an immutable commit.
+
+    Only the SHA case is decidable from the id. Branches and tags share one string shape, so callers
+    must give symbolic-ref advice that is valid for either rather than assuming the ref is movable.
+    """
+    parsed = _parse_github_environment_ref(value)
+    return parsed is not None and is_commit_sha(parsed.ref)

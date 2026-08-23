@@ -12,13 +12,47 @@ import base64
 import io
 import itertools
 import json
+import re
 import time
 
 import pytest
 
 from flash.core.spec import JobSpec
+from tests._helpers.source_snapshot import valid_source_snapshot
 
-CODE_PREFIX = "code/0123456789abcdef0123456789abcdef/flash"
+SOURCE_SNAPSHOT = valid_source_snapshot()
+
+
+def _capsule_member(member: str) -> str:
+    """The source of one member as it is SHIPPED, read back out of the built capsule archive.
+
+    These host helpers run as standalone programs on a rented box, so their behaviour is only worth
+    asserting against the bytes that actually travel. Reading the repository file instead would keep
+    passing if the profile stopped shipping the module, or shipped a different one.
+    """
+    from flash.providers._lifecycle.instance import INSTANCE_BOOTSTRAP_PROFILE
+    from flash.runtime_capsule import build_capsule, read_capsule
+
+    archive, _manifest = build_capsule(INSTANCE_BOOTSTRAP_PROFILE)
+    _shipped_manifest, contents = read_capsule(archive)
+    return contents[member].decode()
+
+
+def _run_capsule_member(member: str, namespace: dict) -> dict:
+    """RUN a shipped host program the way the capsule runs it, and return its namespace.
+
+    The host helpers keep their work under a ``__main__`` guard so that merely importing one is
+    inert, and the capsule reaches the work with ``runpy.run_module(run_name="__main__")``. A plain
+    ``exec`` does not: ``__name__`` falls through to builtins rather than raising, so the guard is
+    simply false and the program body never runs. Two tests here caught that by failing; a third
+    asserted that no upload happened and would have passed for the wrong reason.
+
+    So every site that means "run this program" goes through here, and nowhere else sets the name by
+    hand. Library members (bootstrap_secrets) are a different case and are exec'd as imports.
+    """
+    namespace["__name__"] = "__main__"
+    exec(_capsule_member(member), namespace)  # controlled run of the shipped host program
+    return namespace
 
 
 def _spec(gpu_type="A10", **gpu_kw) -> JobSpec:
@@ -42,18 +76,21 @@ def _deadline_at() -> float:
 def _build_payload(builders, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
+    kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
     return builders.build_payload(*args, **kwargs)
 
 
 def _launch(jobs, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
+    kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
     return jobs.launch_and_submit(*args, **kwargs)
 
 
 def _submit(jobs, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
+    kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
     return jobs.submit_run_lambda(*args, **kwargs)
 
 
@@ -118,27 +155,40 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     assert payload["hf_repo"] == "org/repo"
     # The worker env's HF_REPO is sourced from the run's [train] hf_repo (not an operator default).
     assert payload["env"]["HF_REPO"] == "org/repo"
-    assert (
-        _build_payload(builders, _spec(), seed=0, attempt=1, code_prefix=CODE_PREFIX)["code_prefix"]
-        == CODE_PREFIX
-    )
+    assert payload["source_snapshot"] == SOURCE_SNAPSHOT
+    assert "code_prefix" not in payload
 
     script = builders.build_user_data(payload)
     # payload travels base64-encoded inside a quoted heredoc, byte-exact
     b64 = script.split("FLASH_PAYLOAD_EOF")[1].strip()
     assert json.loads(base64.b64decode(b64)) == payload
-    # the self-contained bootstrap is embedded, with its redaction sibling next to it
-    assert "FLASH_BOOTSTRAP_EOF" in script
-    assert "FLASH_BOOTSTRAP_SECRETS_EOF" in script
-    assert "/opt/flash/bootstrap_secrets.py" in script
-    assert "metrics.json" in script
-    # runs the prebuilt WORKER_IMAGE via Docker with the GPU + the bootstrap as the command
+    # the bootstrap travels as a VERIFIED capsule, not as raw source text: the expected digest is
+    # rendered by the control plane and checked before the first execution, so a payload rewritten
+    # in flight fails closed instead of running.
+    from flash.providers._lifecycle.instance import _instance_capsule
+    from flash.runtime_capsule import sha256_bytes
+
+    capsule_b64, capsule_sha256 = _instance_capsule()
+    assert capsule_sha256 in script
+    assert sha256_bytes(base64.b64decode(capsule_b64)) == capsule_sha256
+    assert "sha256sum -c" in script
+    # no module crosses the boundary as a bare source heredoc any more.
+    assert "cat > /opt/flash/bootstrap.py" not in script
+    assert not re.search(r"cat > \S+\.py", script)
+    # the worker still signals completion through metrics.json. That contract now lives INSIDE the
+    # shipped bootstrap rather than in the launch text (the capsule is compressed, so a substring
+    # check against the script would be vacuous), and the siblings it imports must ride with it.
+    shipped = _capsule_member("bootstrap.py")
+    assert "metrics.json" in shipped
+    for sibling in ("bootstrap_secrets.py", "bootstrap_console.py", "bootstrap_pip.py"):
+        assert sibling.removesuffix(".py") in shipped, sibling
+    # runs the prebuilt WORKER_IMAGE via Docker with the GPU + the capsule bootstrap as the command
     from flash.providers.runpod.serverless import WORKER_IMAGE
 
     assert WORKER_IMAGE in script
     assert "docker run -d" in script
     assert "--gpus all" in script
-    assert "/root/flash/bootstrap.py" in script
+    assert "/root/flash/capsule.pyz bootstrap" in script
     # waits for docker + gpu before launching (cloud-init can beat them to ready)
     assert "waiting for docker+gpu" in script
     # every host-side polling/retry delay is capped by the canonical run deadline.
@@ -200,7 +250,7 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True, extra_pip=()):
             "env": {},
             "extra_pip": list(extra_pip),
             "hf_prefix": "sft/x",
-            "code_prefix": CODE_PREFIX,
+            "source_snapshot": SOURCE_SNAPSHOT,
             "deadline_at": created_at + 60.0,
             "run_created_at": created_at,
             "run_max_wall_seconds": 60.0,
@@ -226,9 +276,23 @@ def test_build_worker_env_exports_attempt():
     # rejected as mismatched, potentially losing valid retriable evidence.
     from flash.providers._lifecycle import bootstrap as lb
 
-    payload = {"phase": "sft", "seed": 0, "flash_arm": "vast", "attempt": 2, "job_spec_json": "{}"}
+    payload = {
+        "phase": "sft",
+        "seed": 0,
+        "flash_arm": "vast",
+        "attempt": 2,
+        "run_id": "run-1",
+        "job_spec_json": "{}",
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "env": {
+            "GITHUB_TOKEN": "ghp-private-vcs",
+            "GIT_ASKPASS": "/tmp/payload-askpass",
+        },
+    }
     env = lb.build_worker_env(payload)
     assert env["ATTEMPT"] == "2"  # exported from the payload attempt, as a str (worker reads a str)
+    assert "GITHUB_TOKEN" not in env
+    assert "GIT_ASKPASS" not in env
     payload.pop("attempt")
     with pytest.raises(RuntimeError, match="attempt identity is invalid"):
         lb.build_worker_env(payload)
@@ -275,14 +339,14 @@ def test_bootstrap_fetch_code_failure_is_retriable(monkeypatch):
     lb, calls, markers = _bootstrap_env(monkeypatch)
 
     def boom(_payload):
-        raise RuntimeError("HF 503 storm")
+        raise lb.RetriableBootstrapError("failed to fetch the pinned flash source snapshot")
 
     monkeypatch.setattr(lb, "fetch_code", boom)
     assert lb.main() == 1
     assert calls == []  # crashed before launching the worker subprocess
     ok, error, retriable = markers[0]
     assert not ok
-    assert error == "RetriableBootstrapError: failed to fetch run code from HF"
+    assert error == "RetriableBootstrapError: failed to fetch the pinned flash source snapshot"
     assert retriable is True
 
 
@@ -299,14 +363,20 @@ def test_bootstrap_sets_lambda_arm():
             "attempt": 0,
             "env": {},
             "flash_arm": "lambda",
-            "code_prefix": CODE_PREFIX,
+            "run_id": "run-1",
+            "source_snapshot": SOURCE_SNAPSHOT,
         }
     )
     assert env["FLASH_ARM"] == "lambda"
     # And Lambda's build_payload is what sets flash_arm='lambda'.
     from flash.providers.lambda_.jobs.builders import build_payload
 
-    assert build_payload(_spec(), 0, 0, deadline_at=_deadline_at())["flash_arm"] == "lambda"
+    assert (
+        build_payload(_spec(), 0, 0, source_snapshot=SOURCE_SNAPSHOT, deadline_at=_deadline_at())[
+            "flash_arm"
+        ]
+        == "lambda"
+    )
 
 
 class _FakePipProc:
@@ -321,9 +391,17 @@ class _FakePipProc:
 
 
 def _pip_payload(**extra) -> dict:
+    created_at = time.time()
     return {
-        "env": {"GITHUB_TOKEN": "ghp-secret", "PYTHONPATH": ""},
+        "env": {
+            "GITHUB_TOKEN": "ghp-secret",
+            "GIT_ASKPASS": "/tmp/payload-askpass",
+            "PYTHONPATH": "",
+        },
         "extra_pip": ["git+https://github.com/example/some-env-pkg.git@abc123"],
+        "deadline_at": created_at + 3600.0,
+        "run_created_at": created_at,
+        "run_max_wall_seconds": 3600.0,
         **extra,
     }
 
@@ -345,7 +423,7 @@ def _wire_pip(monkeypatch, results):
     return lb, calls
 
 
-def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch):
+def test_bootstrap_private_vcs_pip_uses_temporary_askpass(monkeypatch):
     import os
     from pathlib import Path
 
@@ -363,7 +441,9 @@ def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch
         calls.append({"cmd": cmd, "env": env})
         return _FakePipProc()
 
-    monkeypatch.setattr(lb.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("GITHUB_TOKEN", "operator-secret")
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/operator-askpass")
+    monkeypatch.setattr(lb.bootstrap_pip.subprocess, "Popen", fake_popen)
     lb.install_extra_pip(_pip_payload())
 
     assert len(calls) == 1
@@ -371,7 +451,7 @@ def test_bootstrap_extra_pip_uses_payload_env_credentials_and_cleans(monkeypatch
     assert env["GITHUB_TOKEN"] == "ghp-secret"
     assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert askpass_paths
-    assert all(not p.exists() for p in askpass_paths)
+    assert all(not path.exists() for path in askpass_paths)
 
 
 def test_bootstrap_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
@@ -385,15 +465,15 @@ def test_bootstrap_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
         askpass_paths.append(Path(env["GIT_ASKPASS"]))
         return _FakePipProc()
 
-    original_remove = lb.os.remove
+    original_remove = lb.bootstrap_pip.os.remove
 
     def fake_remove(path):
         if Path(path) in askpass_paths:
             raise PermissionError("locked askpass helper")
         return original_remove(path)
 
-    monkeypatch.setattr(lb.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(lb.os, "remove", fake_remove)
+    monkeypatch.setattr(lb.bootstrap_pip.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(lb.bootstrap_pip.os, "remove", fake_remove)
 
     try:
         lb.install_extra_pip(_pip_payload())
@@ -790,71 +870,57 @@ def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
         "seed": 0,
         "env": {},
         "flash_arm": "lambda",
-        "code_prefix": CODE_PREFIX,
+        "run_id": "run-1",
+        "source_snapshot": SOURCE_SNAPSHOT,
     }
     assert lb.build_worker_env({**base, "attempt": 3})["ATTEMPT"] == "3"
     assert lb.build_worker_env({**base, "attempt": 0})["ATTEMPT"] == "0"
     with pytest.raises(RuntimeError, match="attempt identity is invalid"):
         lb.build_worker_env(base)
     # And the producer end actually carries the launched attempt into the payload bootstrap reads.
-    assert build_payload(_spec(), seed=0, attempt=2, deadline_at=_deadline_at())["attempt"] == 2
+    assert (
+        build_payload(
+            _spec(),
+            seed=0,
+            attempt=2,
+            source_snapshot=SOURCE_SNAPSHOT,
+            deadline_at=_deadline_at(),
+        )["attempt"]
+        == 2
+    )
 
 
-def test_bootstrap_fetch_code_uses_prefix_tree(monkeypatch, tmp_path):
-    import types
-
+def test_bootstrap_fetch_code_uses_pinned_verified_archive(monkeypatch, tmp_path):
     import huggingface_hub
 
     from flash.providers._lifecycle import bootstrap as lb
 
     monkeypatch.setattr(lb, "CODE_ROOT", str(tmp_path))
-    list_calls = []
-    download_calls = []
-    sleeps = []
+    archive_path = tmp_path / "source.zip"
+    archive_path.write_bytes(b"archive")
+    events = []
 
-    class _FakeApi:
-        def __init__(self, token=None):
-            pass
+    def fake_download(**kwargs):
+        events.append(("download", kwargs))
+        return str(archive_path)
 
-        def list_repo_tree(self, **kw):
-            list_calls.append(kw)
-            return [
-                types.SimpleNamespace(path=f"{CODE_PREFIX}/__init__.py", size=0),
-                types.SimpleNamespace(path=f"{CODE_PREFIX}/runner.py", size=10),
-                types.SimpleNamespace(path=f"{CODE_PREFIX}", tree_id="folder"),
-            ]
+    def fake_materialize(path, descriptor, destination):
+        events.append(("verify-materialize", path, descriptor.to_dict(), destination))
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
-    monkeypatch.setattr(lb.time, "sleep", sleeps.append)
-
-    class _Response:
-        status_code = 429
-
-        def __init__(self) -> None:
-            self.headers = {"Retry-After": "3"}
-
-    class _RateLimited(Exception):
-        response = _Response()
-
-    def fake_hf_hub_download(*, filename, local_dir, **kw):
-        download_calls.append({"filename": filename, "local_dir": local_dir, **kw})
-        if (
-            filename.endswith("runner.py")
-            and len([call for call in download_calls if call["filename"] == filename]) == 1
-        ):
-            raise _RateLimited("slow down")
-        target = tmp_path / filename
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("")
-        return str(target)
-
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(
+        lb._source_snapshot,
+        "materialize_verified_archive_file",
+        fake_materialize,
+    )
     created_at = time.time()
 
     lb.fetch_code(
         {
             "hf_repo": "org/repo",
-            "code_prefix": CODE_PREFIX,
+            "source_snapshot": SOURCE_SNAPSHOT,
+            "run_id": "run-1",
+            "attempt": 2,
             "env": {"HF_TOKEN": "tok"},
             "deadline_at": created_at + 3600.0,
             "run_created_at": created_at,
@@ -862,22 +928,22 @@ def test_bootstrap_fetch_code_uses_prefix_tree(monkeypatch, tmp_path):
         }
     )
 
-    assert list_calls == [
+    assert events[0] == (
+        "download",
         {
             "repo_id": "org/repo",
             "repo_type": "dataset",
-            "path_in_repo": CODE_PREFIX,
-            "recursive": True,
+            "filename": SOURCE_SNAPSHOT["archive_path"],
+            "revision": SOURCE_SNAPSHOT["revision"],
             "token": "tok",
-        }
-    ]
-    assert [call["filename"] for call in download_calls] == [
-        f"{CODE_PREFIX}/__init__.py",
-        f"{CODE_PREFIX}/runner.py",
-        f"{CODE_PREFIX}/runner.py",
-    ]
-    assert all(call["local_dir"] == str(tmp_path) for call in download_calls)
-    assert sleeps == [3.0]
+        },
+    )
+    assert events[1] == (
+        "verify-materialize",
+        str(archive_path),
+        SOURCE_SNAPSHOT,
+        str(tmp_path / "run-1-attempt-2"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1618,6 +1684,7 @@ def test_cache_payload_points_base_model_prefetch_at_the_bind(monkeypatch):
         0,
         0,
         cache_host_mount="/lambda/nfs/flash-weights",
+        source_snapshot=SOURCE_SNAPSHOT,
         deadline_at=_deadline_at(),
     )
     assert payload["env"]["FLASH_WEIGHT_CACHE_DIR"] == "/weight-cache/hf-cache/hub"
@@ -2305,15 +2372,20 @@ def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
     monkeypatch.setenv("LAMBDA_API_KEY", "lk")
     monkeypatch.setenv("HF_TOKEN", "hf")
     payload = _build_payload(builders, _spec(), seed=0, attempt=2)
-    assert payload["code_prefix"].startswith("code/")
-    assert payload["code_prefix"].endswith("/flash")
+    assert payload["source_snapshot"] == SOURCE_SNAPSHOT
+    assert "code_prefix" not in payload
     script = builders.build_user_data(payload)
     # the uploader INVOCATION precedes the image pull
-    assert "python3 /opt/flash/hostlog.py" in script
+    uploader = "python3 /opt/flash/capsule.pyz hostlog"
+    assert uploader in script
     assert "docker pull" in script
-    assert script.index("python3 /opt/flash/hostlog.py") < script.index("docker pull")
-    # attempt-scoped boot.log path is emitted by the embedded uploader
-    assert '_attempt" + str(att) + "_boot.log' in script
+    assert script.index(uploader) < script.index("docker pull")
+    # ...and it precedes the capsule verification failure path as little as it must: the digest check
+    # gates EVERY capsule invocation, uploader included, so an unverified capsule uploads nothing.
+    assert script.index("sha256sum -c") < script.index(uploader)
+    # attempt-scoped boot.log path, asserted against the SHIPPED uploader rather than the launch
+    # text (the path is built inside the member now, not interpolated into the shell).
+    assert '_attempt" + str(att) + "_boot.log' in _capsule_member("hostlog.py")
 
 
 def test_poll_recovery_seeds_load_clock_from_launch(monkeypatch):
@@ -3500,7 +3572,8 @@ def test_bootstrap_fetches_spilled_spec_from_hf(monkeypatch):
             "attempt": 0,
             "env": {},
             "flash_arm": "lambda",
-            "code_prefix": CODE_PREFIX,
+            "run_id": "run-1",
+            "source_snapshot": SOURCE_SNAPSHOT,
         }
     )
     # A >96k spec is passed via file, mirroring the inline-large path.
@@ -3564,7 +3637,7 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
             "env": {},
             "extra_pip": [],
             "hf_prefix": "sft/x",
-            "code_prefix": CODE_PREFIX,
+            "source_snapshot": SOURCE_SNAPSHOT,
             "deadline_at": created_at + 60.0,
             "run_created_at": created_at,
             "run_max_wall_seconds": 60.0,
@@ -3587,79 +3660,38 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
     assert retriable is True
 
 
-def test_shipped_bootstrap_secrets_is_stripped_but_behaves_identically():
-    """user_data is a hard-capped budget shared with the payload's runtime secrets, so the embedded
-    sources carry code, not prose. Stripping must be behaviour-preserving: the box imports this
-    text, so a stripper that broke a body or changed a redactor would leak or crash at launch."""
+def test_shipped_bootstrap_secrets_is_byte_identical_to_the_repository_module():
+    """The redactors that ship must BE the redactors under test, byte for byte.
+
+    This file previously travelled as docstring-stripped source text, and the stripper was its own
+    failure class: it rewrote a module nothing imports before launch, so a mangled body or an
+    altered redactor first surfaced as a leak or a crash on a rented box. The capsule ships the file
+    unmodified, which retires that class -- but only while it stays unmodified, so assert it rather
+    than assume it. Byte identity is also what lets every other test in this suite exercise the
+    importable module and still describe what the box runs.
+    """
     from pathlib import Path
 
     from flash.providers._lifecycle import bootstrap_secrets
-    from flash.providers._lifecycle import instance as inst
 
-    source = Path(bootstrap_secrets.__file__).read_text()
-    stripped = inst._strip_docstrings(source)
+    shipped = _capsule_member("bootstrap_secrets.py")
+    assert shipped == Path(bootstrap_secrets.__file__).read_text()
 
-    assert len(stripped) < len(source)
-    assert '"""' not in stripped
-    # comments stay: they sit next to the line they explain, which is what a reader debugging ON
-    # the box needs.
-    assert "# a multiline secret" in stripped
-
-    shipped: dict = {}
-    exec(compile(stripped, "<shipped>", "exec"), shipped)
+    # and it is genuinely the redaction module, not an empty or wrong member that would satisfy a
+    # comparison against the wrong file.
+    namespace: dict = {}
+    exec(compile(shipped, "<shipped>", "exec"), namespace)
     for name in ("_safe_detail", "_read_console_tail", "_payload_secrets"):
-        assert name in shipped, f"stripping dropped {name}"
-    # the redactors behave exactly as the unstripped module does.
+        assert name in namespace, f"the shipped member is missing {name}"
     for text, secrets in (
         ("worker rejected pin ati", {"PIN": "ati"}),
         ("trainer crashed after validation", {"PIN": "ati"}),
         ("https://host/a/repo", {"S": "/a"}),
         ("boto3 failed with sk-live-abc123456789", {"K": "sk-live-abc123456789"}),
     ):
-        assert shipped["_safe_detail"](text, 1000, secrets) == bootstrap_secrets._safe_detail(
+        assert namespace["_safe_detail"](text, 1000, secrets) == bootstrap_secrets._safe_detail(
             text, 1000, secrets=secrets
         )
-
-
-def test_strip_docstrings_preserves_code_sharing_a_docstrings_line():
-    """A docstring is a character span, not a set of lines.
-
-    It can share its line with the ``def`` that owns it or with a statement that follows it. A
-    line-based stripper strands the indentation in the first case and DELETES the neighbouring
-    statement in the second -- and the result still parses, so nothing catches it before the box
-    imports the shipped module.
-    """
-    from flash.providers._lifecycle import instance as inst
-
-    # a statement sharing the docstring's line must survive.
-    stripped = inst._strip_docstrings('def f():\n    """doc"""; x = 1\n    return x\n')
-    namespace: dict = {}
-    exec(compile(stripped, "<t>", "exec"), namespace)
-    assert namespace["f"]() == 1, "the statement after the docstring was dropped"
-
-    # a docstring on the def/class line itself must leave something parseable behind.
-    for source, name in (('def f(): "doc"\n', "f"), ('class C: "doc"\n', "C")):
-        namespace = {}
-        exec(compile(inst._strip_docstrings(source), "<t>", "exec"), namespace)
-        assert name in namespace
-
-    # ast reports columns in utf-8 bytes: a non-ascii character before a docstring shifts every
-    # later byte offset, and slicing the str by those numbers would cut mid-docstring.
-    stripped = inst._strip_docstrings('s = "café — naïve"\ndef f():\n    """d"""\n    return s\n')
-    namespace = {}
-    exec(compile(stripped, "<t>", "exec"), namespace)
-    assert namespace["f"]() == "café — naïve"
-    assert '"""' not in stripped
-
-    # the module docstring is DELETED, not substituted: `from __future__` must stay the first
-    # statement in the file, and a `pass` standing where the docstring was would displace it.
-    # bootstrap_secrets.py has both, so getting this wrong makes the shipped module unimportable.
-    stripped = inst._strip_docstrings(
-        '"""mod"""\n\nfrom __future__ import annotations\n\ndef f():\n    """d"""\n    return 1\n'
-    )
-    namespace = {}
-    exec(compile(stripped, "<t>", "exec"), namespace)
-    assert namespace["f"]() == 1
 
 
 def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
@@ -3723,36 +3755,82 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     assert uploaded == {}
 
     # The threshold is only as good as the framing it was chosen against, and that framing grows
-    # every time the heredoc'd bootstrap sources do (embedding bootstrap_secrets.py alone added
-    # ~5,900 bytes). Pin the WORST inline case - a spec of exactly the threshold size - against the
-    # cap, so a future bootstrap that grows past the remaining budget fails here instead of at a
-    # provider's launch call. The margin is asserted too: the real payload also carries env,
-    # deadline, and cache fields this minimal one does not.
+    # every time the fixed template or the embedded runtime capsule does. Pin the WORST inline case
+    # - a spec of exactly the threshold size - against the cap, so a future capsule that grows past
+    # the remaining budget fails here instead of at a provider's launch call. The margin is asserted
+    # too: the real payload also carries env, deadline, and cache fields this minimal one does not.
     uploaded.clear()
-    worst = inst.build_user_data(
-        {**payload, "job_spec_json": "x" * inst._SPEC_SPILL_THRESHOLD}, image="img:latest"
+    representative = inst.build_payload(
+        _spec(),
+        seed=0,
+        attempt=7,
+        arm="lambda",
+        cache_host_mount="/mnt/cache",
+        source_snapshot=SOURCE_SNAPSHOT,
+        deadline_at=_deadline_at(),
     )
+    spec_document = json.loads(representative["job_spec_json"])
+    spec_document["_threshold_padding"] = ""
+    compact = json.dumps(spec_document, separators=(",", ":"))
+    padding = inst._SPEC_SPILL_THRESHOLD - len(compact)
+    assert padding >= 0
+    spec_document["_threshold_padding"] = "x" * padding
+    representative["job_spec_json"] = json.dumps(spec_document, separators=(",", ":"))
+    assert len(representative["job_spec_json"]) == inst._SPEC_SPILL_THRESHOLD
+
+    worst = inst.build_user_data(representative, image="img:latest")
+    embedded_worst = json.loads(base64.b64decode(worst.split("FLASH_PAYLOAD_EOF")[1].strip()))
     assert uploaded == {}
-    assert len(worst) < 64_000 - 2_000
+    assert embedded_worst["job_spec_json"] == representative["job_spec_json"]
+    assert "job_spec_in_hf" not in embedded_worst
+    assert len(worst.encode()) < 62_000
 
     # The spec does not ride alone: runtime secrets (a multiline PEM is a valid one) share the same
     # user_data. A spec UNDER the threshold plus a big secret must still spill, because the binding
     # check is the complete encoded payload rather than the spec component.
+    #
+    # The secret is sized from MEASURED headroom rather than a hardcoded constant: the fixed framing
+    # is what decides how big a secret it takes to overflow, and a hardcoded size silently stops
+    # reaching the force-spill branch whenever that framing shrinks (the capsule freed ~22KB doing
+    # exactly that, and a 4,000-byte PEM no longer overflowed anything). Measure the inline floor,
+    # then overshoot it by 1,000 bytes; base64 inflates a secret ~4/3 on the way in.
     uploaded.clear()
-    pem = "-----BEGIN PRIVATE KEY-----\n" + "k" * 4_000 + "\n-----END PRIVATE KEY-----"
-    heavy = inst.build_user_data(
-        {
-            **payload,
-            "job_spec_json": "x" * (inst._SPEC_SPILL_THRESHOLD - 1),
-            "env": {"HF_TOKEN": "t", "DEPLOY_KEY": pem},
-        },
-        image="img:latest",
+    inline_floor = len(
+        inst.build_user_data(
+            {**payload, "job_spec_json": "x" * (inst._SPEC_SPILL_THRESHOLD - 1)},
+            image="img:latest",
+        ).encode()
     )
+    assert uploaded == {}, "the probe render must stay under the budget, or it is not a floor"
+    secret_len = (inst._USER_DATA_BUDGET - inline_floor + 1_000) * 3 // 4
+    pem = "-----BEGIN PRIVATE KEY-----\n" + "k" * secret_len + "\n-----END PRIVATE KEY-----"
+    heavy_payload = {
+        **payload,
+        "job_spec_json": "x" * (inst._SPEC_SPILL_THRESHOLD - 1),
+        "env": {"HF_TOKEN": "t", "DEPLOY_KEY": pem},
+    }
+    # unspilled, this payload genuinely overflows -- otherwise the assertions below would pass
+    # without the force-spill branch ever running.
+    assert (
+        len(inst._render_user_data(dict(heavy_payload), image="img:latest").encode())
+        > inst._USER_DATA_BUDGET
+    )
+    heavy = inst.build_user_data(heavy_payload, image="img:latest")
     assert uploaded["path"] == "sft/x/job_spec.json"
     emb3 = json.loads(base64.b64decode(heavy.split("FLASH_PAYLOAD_EOF")[1].strip()))
     assert emb3["job_spec_in_hf"] is True
     assert emb3["job_spec_json"] == ""
     assert len(heavy) < 64_000 - 2_000
+    # this is the tightest real launch, and it clears by a margin measured in bytes. the three
+    # bootstrap modules are embedded as SOURCE, and _strip_docstrings drops docstrings but keeps
+    # comments -- so a comment added to any of them spends launch budget exactly like code does.
+    # report the slack rather than only the pass/fail, so the next author who lands here sees how
+    # much room is actually left instead of an opaque ValueError.
+    slack = (64_000 - 2_000) - len(heavy.encode())
+    assert slack >= 0, (
+        f"the heavy-secret launch is {-slack} bytes over budget. the bootstrap modules ship as "
+        "source text (comments included); shrink them rather than raising the cap."
+    )
 
 
 def test_build_user_data_rejects_a_payload_that_stays_oversized_after_spilling(monkeypatch):
@@ -3821,47 +3899,57 @@ def test_build_user_data_starts_no_spec_upload_at_deadline(monkeypatch):
 
 
 def test_host_artifact_helpers_start_no_hf_request_at_deadline(monkeypatch):
+    """At/after the deadline both helpers must abandon the upload BEFORE constructing HfApi.
+
+    This asserts an absence, so it needs a positive control: a helper that never ran also touches
+    HF zero times. The same clock is therefore replayed one second BEFORE the deadline, where each
+    helper must reach HfApi -- so the empty result at the deadline is the guard, not a no-op.
+    """
     import math
     import sys
     import types
 
-    from flash.providers._lifecycle import instance as inst
+    def run_at(now: float) -> list:
+        calls = []
 
-    calls = []
+        class FakeApi:
+            def __init__(self, token=None):
+                calls.append("init")
 
-    class FakeApi:
-        def __init__(self, token=None):
-            calls.append("init")
+            def file_exists(self, **kwargs):
+                return True  # worker marker present: stop failmark before any upload
 
-    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeApi))
-    monkeypatch.setattr(time, "time", lambda: 200.0)
-    payload = {
-        "flash_arm": "lambda",
-        "attempt": 0,
-        "run_id": "x",
-        "hf_prefix": "sft/x",
-        "hf_repo": "o/r",
-        "env": {},
-        "deadline_at": 200.0,
-        "run_created_at": 100.0,
-        "run_max_wall_seconds": 100.0,
-    }
+        monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeApi))
+        monkeypatch.setattr(time, "time", lambda: now)
+        payload = {
+            "flash_arm": "lambda",
+            "attempt": 0,
+            "run_id": "x",
+            "hf_prefix": "sft/x",
+            "hf_repo": "o/r",
+            "env": {},
+            "deadline_at": 200.0,
+            "run_created_at": 100.0,
+            "run_max_wall_seconds": 100.0,
+        }
 
-    def fake_open(path, *args, **kwargs):
-        return io.StringIO(json.dumps(payload) if path == "/opt/flash/payload.json" else "")
+        def fake_open(path, *args, **kwargs):
+            return io.StringIO(json.dumps(payload) if path == "/opt/flash/payload.json" else "")
 
-    namespace = {"json": json, "math": math, "time": time, "open": fake_open}
-    exec(inst._HOSTLOG_PY, namespace)
-    exec(inst._FAILMARK_PY, namespace)
-    assert calls == []
+        for member in ("hostlog.py", "failmark.py"):
+            _run_capsule_member(
+                member, {"json": json, "math": math, "time": time, "open": fake_open}
+            )
+        return calls
+
+    assert run_at(200.0) == []
+    assert run_at(199.0) == ["init", "init"]
 
 
 def test_failmark_uses_truthful_detection_timestamp(monkeypatch):
     import math
     import sys
     import types
-
-    from flash.providers._lifecycle import instance as inst
 
     uploaded = []
     written = {}
@@ -3900,8 +3988,9 @@ def test_failmark_uses_truthful_detection_timestamp(monkeypatch):
             return io.StringIO(json.dumps(payload))
         return _Capture()
 
-    namespace = {"json": json, "math": math, "time": time, "open": fake_open}
-    exec(inst._FAILMARK_PY, namespace)
+    _run_capsule_member(
+        "failmark.py", {"json": json, "math": math, "time": time, "open": fake_open}
+    )
 
     assert len(uploaded) == 1
     assert json.loads(written["marker"])["ts"] == 150.0
@@ -3919,8 +4008,6 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
     import sys
     import types
 
-    from flash.providers._lifecycle import instance as inst
-
     created_at = time.time()
     payload = {
         "flash_arm": "lambda",
@@ -3935,7 +4022,7 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
     }
 
     def run_failmark(exists_seq=(False,), read_raises=False):
-        """Execute the embedded host _FAILMARK_PY against a fake HfApi + payload, return uploads.
+        """Execute the shipped host failmark member against a fake HfApi + payload, return uploads.
 
         ``exists_seq`` is the sequence of file_exists() return values across the (up to two) checks
         the script makes; the last value repeats once exhausted."""
@@ -3962,12 +4049,14 @@ def test_failmark_skips_when_worker_marker_exists(monkeypatch):
         def fake_open(path, *a, **k):
             return io.StringIO(json.dumps(payload) if path == "/opt/flash/payload.json" else "")
 
-        glb = {
-            "json": json,
-            "sys": types.SimpleNamespace(argv=["failmark.py", "boom"]),
-            "open": fake_open,
-        }
-        exec(inst._FAILMARK_PY, glb)  # controlled test of the embedded host script
+        _run_capsule_member(
+            "failmark.py",
+            {
+                "json": json,
+                "sys": types.SimpleNamespace(argv=["failmark.py", "boom"]),
+                "open": fake_open,
+            },
+        )
         return uploaded
 
     # Worker already wrote its marker -> host must NOT clobber it.

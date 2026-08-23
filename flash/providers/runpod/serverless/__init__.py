@@ -4,14 +4,11 @@ from __future__ import annotations
 
 from flash.providers._lifecycle.worker import (  # noqa: F401
     DEFAULT_EXECUTION_TIMEOUT_MS,
-    WORKER_DEPS,
     WORKER_IMAGE,
-    WORKER_SYSTEM_DEPS,
     _hf_call,
     build_worker_env,
     logger,
-    resolve_worker_deps,
-    upload_code,
+    publish_source_snapshot,
     worker_image_for_gpu,
 )
 from flash.providers.runpod.serverless.endpoints import (  # noqa: F401

@@ -455,9 +455,9 @@ def test_settled_cost_states_cover_every_runner_terminal_state() -> None:
     instead of importing them. If the runner ever adds a terminal state, this fails here rather
     than silently showing a settled charge as an estimate forever.
     """
-    from flash.runner import _FINISHED_AT_PRESERVED_STATES
+    from flash.runner import TERMINAL_STATES
 
-    assert render.SETTLED_COST_STATES == _FINISHED_AT_PRESERVED_STATES
+    assert TERMINAL_STATES | {"deployed"} == render.SETTLED_COST_STATES
 
 
 def test_run_cost_prefers_the_quote_while_a_run_is_live() -> None:

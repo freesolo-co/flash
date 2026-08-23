@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -17,7 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.profiling.sft_workload import _serialize_multimodal_inputs
+from flash.content.multimodal import message_content_text
+from flash.engine.profiling.sft_image_rows import _serialize_multimodal_inputs
 from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.entry.sft import _pretokenize_completion_only
 from flash.engine.worker.sft_train import (
@@ -27,12 +29,11 @@ from flash.engine.worker.sft_train import (
     _VERL_OPTIMIZER_NAME,
     _build_verl_child_env,
     _render_sft_dataset_module,
-    _render_sft_sitecustomize,
     _write_sft_parquet,
     build_sft_overrides,
-    render_exact_sft_dataloader_shim,
-    render_loraplus_shim,
 )
+from flash.engine.worker.train.core.checkpoint_lifecycle import CheckpointLedger
+from flash.engine.worker.train.sft.child import plugin as sft_plugin
 
 # distinct from `flash.__version__` on purpose: the worker resolves that to "0+unknown" (no flash
 # distribution is installed there), so a fixture built from it could not catch a worker that
@@ -54,6 +55,7 @@ def _cfg(**over):
         "lora_rank": 16,
         "lora_alpha": 32,
         "target_modules": "all-linear",
+        "exclude_modules": None,
         "ulysses_sp_size": 2,
         "lr": 1e-4,
         "warmup_ratio": 0.03,
@@ -98,6 +100,7 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
         "model.lora_rank": "16",
         "model.lora_alpha": "32",
         "model.target_modules": "all-linear",
+        "model.exclude_modules": "null",
         "model.lora_adapter_path": "null",
         "model.use_remove_padding": "true",
         "model.use_liger": "false",
@@ -132,6 +135,22 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
     assert "optim.eps" not in overrides
     assert "optim.lr_scheduler_type" not in overrides
     assert "data.messages_key" not in overrides
+
+
+def test_overrides_point_verl_at_a_warm_start_adapter():
+    """A warm-started SFT run hands verl the staged source adapter.
+
+    verl's SFT engine only continues an existing LoRA when ``model.lora_adapter_path`` is a real
+    path -- it builds a fresh adapter otherwise -- so this override IS the warm start. SFT was
+    rejected as a warm-start target for long enough that only the fresh (``null``) shape was
+    covered; the matching GRPO assertion is
+    ``test_build_verl_overrides_warmstart_adapter_path`` in tests/test_rl_train.py.
+    """
+    fresh = _as_map(build_sft_overrides(_cfg()))
+    assert fresh["model.lora_adapter_path"] == "null"
+
+    warm = _as_map(build_sft_overrides(_cfg(lora_adapter_path="/w/source_adapter")))
+    assert warm["model.lora_adapter_path"] == "/w/source_adapter"
 
 
 def test_overrides_carry_fused_expert_target_parameters():
@@ -534,22 +553,880 @@ def test_steps_xor_epochs_is_enforced():
 
 class _ExactTokenizer:
     eos_token = "!"
-    all_special_ids = (0,)
+    all_special_ids = (0, ord("!"))
 
     def __call__(self, texts, *, truncation=False, max_length=None):
         ids = [[ord(char) for char in text] for text in texts]
-        # the uncapped encode is how a truncated row reports its real size rather than the cap.
         if not truncation:
             return {"input_ids": ids}
         assert max_length is not None, "truncation=True requires an explicit max_length"
         return {"input_ids": [row[:max_length] for row in ids]}
 
 
+class _ExactChatMlTokenizer(_ExactTokenizer):
+    IM_START = 0x110000
+    IM_END = 0x110001
+    chat_template = (
+        "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
+        "{% if message['role'] == 'assistant' %}{{ message['reasoning_content'] }}{% endif %}"
+        "{{ message['content'] }}<|im_end|>\n{% endfor %}"
+    )
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        enable_thinking=False,
+        **_kwargs,
+    ):
+        assert not tokenize
+        rendered = _render_chatml_messages(messages)
+        if add_generation_prompt:
+            rendered += "<|im_start|>assistant\n"
+        return rendered
+
+    def convert_tokens_to_ids(self, token):
+        return {"<|im_start|>": self.IM_START, "<|im_end|>": self.IM_END}.get(token)
+
+    def decode(self, ids):
+        pieces = []
+        for token_id in ids:
+            if token_id == self.IM_START:
+                pieces.append("<|im_start|>")
+            elif token_id == self.IM_END:
+                pieces.append("<|im_end|>")
+            else:
+                pieces.append(chr(token_id))
+        return "".join(pieces)
+
+    def __call__(self, texts, *, truncation=False, max_length=None):
+        rows = []
+        for text in texts:
+            row = []
+            index = 0
+            while index < len(text):
+                if text.startswith("<|im_start|>", index):
+                    row.append(self.IM_START)
+                    index += len("<|im_start|>")
+                elif text.startswith("<|im_end|>", index):
+                    row.append(self.IM_END)
+                    index += len("<|im_end|>")
+                else:
+                    row.append(ord(text[index]))
+                    index += 1
+            rows.append(row)
+        if not truncation:
+            return {"input_ids": rows}
+        assert max_length is not None, "truncation=True requires an explicit max_length"
+        return {"input_ids": [row[:max_length] for row in rows]}
+
+
+class _ConfigurableChatMlTokenizer(_ExactChatMlTokenizer):
+    def __init__(
+        self,
+        *,
+        reasoning="assistant",
+        body_mode="content",
+        assistant_scaffold="",
+        separator="",
+        plain=False,
+    ):
+        self.reasoning = reasoning
+        self.body_mode = body_mode
+        self.assistant_scaffold = assistant_scaffold
+        self.separator = separator
+        self.plain = plain
+        self.chat_template = self._template()
+
+    def _template(self):
+        if self.plain:
+            return "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}"
+        reasoning = {
+            "none": "",
+            "assistant": (
+                "{% if message['role'] == 'assistant' %}"
+                "{{ message['reasoning_content'] }}{% endif %}"
+            ),
+            "all": "{{ message['reasoning_content'] }}",
+        }[self.reasoning]
+        body = {
+            "content": "{{ message['content'] }}",
+            "constant": "constant",
+            "tool_parenthesized": (
+                "{{ message['content'] }}{{ message['tool_calls'][0]['function']['name'] }}("
+                "{{ message['tool_calls'][0]['function']['arguments'] }})"
+            ),
+            "tool_adjacent": (
+                "{{ message['content'] }}{{ message['tool_calls'][0]['function']['name'] }}"
+                "{{ message['tool_calls'][0]['function']['arguments'] }}"
+            ),
+            "tool_truthy": (
+                "{% if message['content'] %}{{ message['content'] }}{% else %}"
+                "{{ message['tool_calls'][0]['function']['name'] }}"
+                "{{ message['tool_calls'][0]['function']['arguments'] }}{% endif %}"
+            ),
+        }[self.body_mode]
+        scaffold = (
+            f"{{% if message['role'] == 'assistant' %}}{self.assistant_scaffold}{{% endif %}}"
+            if self.assistant_scaffold
+            else ""
+        )
+        return (
+            "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
+            f"{reasoning}{scaffold}{body}<|im_end|>\n{self.separator}{{% endfor %}}"
+        )
+
+    def _body(self, message):
+        content = message_content_text(message.get("content"))
+        if self.body_mode == "constant":
+            body = "constant"
+        elif self.body_mode == "tool_truthy" and content:
+            body = content
+        elif self.body_mode.startswith("tool_"):
+            calls = []
+            for call in message.get("tool_calls", []):
+                if call.get("type") != "function":
+                    continue
+                function = call.get("function", {})
+                name = function.get("name", "")
+                arguments = function.get("arguments", "")
+                if self.body_mode == "tool_parenthesized":
+                    calls.append(f"{name}({arguments})")
+                else:
+                    calls.append(f"{name}{arguments}")
+            body = content + "".join(calls)
+        else:
+            body = content
+        reasoning = message.get("reasoning_content")
+        role = str(message.get("role"))
+        if isinstance(reasoning, str) and (
+            self.reasoning == "all"
+            or (self.reasoning == "assistant" and role.strip().lower() == "assistant")
+        ):
+            body = f"{reasoning}{body}"
+        if self.assistant_scaffold and role.strip().lower() == "assistant":
+            body = f"{self.assistant_scaffold}{body}"
+        return body
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **_kwargs):
+        assert not tokenize
+        if self.plain:
+            rendered = "".join(
+                f"{message.get('role')}: {self._body(message)}\n" for message in messages
+            )
+            if add_generation_prompt:
+                rendered += "assistant: "
+            return rendered
+        rendered = "".join(
+            f"{_chatml(str(message.get('role')), self._body(message))}{self.separator}"
+            for message in messages
+        )
+        if add_generation_prompt:
+            # the generation prompt carries the same assistant scaffold the body opens with, which
+            # is what puts a pre-opened `<think>` inside the shared prompt prefix.
+            rendered += f"<|im_start|>assistant\n{self.assistant_scaffold}"
+        return rendered
+
+
+class _QwenInlineThinkingChatMlTokenizer(_ExactChatMlTokenizer):
+    chat_template = (
+        "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
+        "{{ message['prefix'] }}{{ message['content'] }}<|im_end|>\n{% endfor %}"
+    )
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **_kwargs):
+        assert not tokenize
+        rendered = []
+        for message in messages:
+            role = str(message.get("role"))
+            content = message_content_text(message.get("content"))
+            prefix = message.get("prefix", "")
+            if role.strip().lower() == "assistant" and "</think>" in content:
+                before_end, answer = content.split("</think>", 1)
+                reasoning = before_end.rsplit("<think>", 1)[-1]
+                body = f"{prefix}<think>{reasoning}</think>{answer}"
+            else:
+                body = f"{prefix}{content}"
+            rendered.append(_chatml(role, body))
+        if add_generation_prompt:
+            rendered.append("<|im_start|>assistant\n")
+        return "".join(rendered)
+
+
+class _QwenToolChatMlTokenizer(_ExactChatMlTokenizer):
+    chat_template = (
+        "{% for message in messages %}<|im_start|>"
+        "{% if message['role'] == 'tool' %}user{% else %}{{ message['role'] }}{% endif %}\n"
+        "{{ message['content'] }}<|im_end|>\n{% endfor %}"
+    )
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **_kwargs):
+        assert not tokenize
+        rendered = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            if message.get("role") != "tool":
+                rendered.append(
+                    _chatml(str(message.get("role")), message_content_text(message.get("content")))
+                )
+                index += 1
+                continue
+            tool_bodies = []
+            while index < len(messages) and messages[index].get("role") == "tool":
+                tool_bodies.append(message_content_text(messages[index].get("content")))
+                index += 1
+            tool_body = "\n".join(tool_bodies)
+            rendered.append(_chatml("user", f"<tool_response>\n{tool_body}\n</tool_response>"))
+        if add_generation_prompt:
+            rendered.append("<|im_start|>assistant\n")
+        return "".join(rendered)
+
+
+class _PreparedSourceProcessor:
+    def __init__(self, tokenizer, prepared_image):
+        self.tokenizer = tokenizer
+        self.prepared_image = prepared_image
+        self.prepared_renders = 0
+        self.probe_renders = 0
+        self.chat_template = (
+            "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
+            "{{ message['content'] }}{{ message['tool_calls'][0]['function']['name'] }}"
+            "{{ message['tool_calls'][0]['function']['arguments'] }}<|im_end|>\n{% endfor %}"
+        )
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        return_dict=False,
+        return_tensors=None,
+        enable_thinking=False,
+    ):
+        assert enable_thinking is False
+        prepared = any(
+            isinstance(message.get("content"), list)
+            and any(
+                isinstance(block, dict) and block.get("image") is self.prepared_image
+                for block in message["content"]
+            )
+            for message in messages
+        )
+        if prepared:
+            self.prepared_renders += 1
+            if "flashchatmlfieldprobe" in repr(messages):
+                self.probe_renders += 1
+        rendered = []
+        for message in messages:
+            body = message_content_text(message.get("content"))
+            if prepared:
+                for call in message.get("tool_calls", []):
+                    function = call.get("function", {})
+                    body += f"{function.get('name', '')}{function.get('arguments', '')}"
+            rendered.append(_chatml(str(message.get("role")), body))
+        if add_generation_prompt:
+            rendered.append("<|im_start|>assistant\n")
+        text = "".join(rendered)
+        if not tokenize:
+            return text
+        assert return_dict is True
+        assert return_tensors == "pt"
+        input_ids = self.tokenizer([text])["input_ids"]
+        return {"input_ids": input_ids, "attention_mask": [[1] * len(input_ids[0])]}
+
+
+def _chatml(role: str, content: str) -> str:
+    return f"<|im_start|>{role}\n{content}<|im_end|>\n"
+
+
+def _render_chatml_messages(messages: list[dict]) -> str:
+    rendered = []
+    for message in messages:
+        content = message_content_text(message.get("content"))
+        reasoning = message.get("reasoning_content")
+        if str(message.get("role")).strip().lower() == "assistant" and isinstance(reasoning, str):
+            content = f"<think>\n{reasoning.strip()}\n</think>\n\n{content}"
+        rendered.append(_chatml(str(message.get("role")), content))
+    return "".join(rendered)
+
+
+def _arrange_mask(
+    tokenizer,
+    target_messages,
+    *,
+    prompt_messages=None,
+    max_length=4096,
+    prompt_text=None,
+    full_text=None,
+):
+    prompt_messages = prompt_messages or [{"role": "user", "content": "q"}]
+    source_messages = [*prompt_messages, *target_messages]
+    if prompt_text is None:
+        prompt_text = tokenizer.apply_chat_template(
+            prompt_messages, tokenize=False, add_generation_prompt=True
+        )
+    if full_text is None:
+        full_text = tokenizer.apply_chat_template(
+            source_messages, tokenize=False, add_generation_prompt=False
+        )
+    texts = [
+        {
+            "text": full_text,
+            "prompt_text": prompt_text,
+            "target_messages": target_messages,
+            "source_messages": source_messages,
+            "template_kwargs": {},
+        }
+    ]
+    kept, rows, dropped = _pretokenize_completion_only(texts, tokenizer, max_length=max_length)
+    assert kept == texts
+    assert dropped == 0
+    return tokenizer, rows[0]
+
+
+def _selected_text(tokenizer, row):
+    return tokenizer.decode(
+        [
+            token
+            for token, selected in zip(row["input_ids"], row["completion_mask"], strict=True)
+            if selected
+        ]
+    )
+
+
+def _assert_selected_text(tokenizer, row, expected):
+    assert _selected_text(tokenizer, row) == expected
+    assert len(row["input_ids"]) == len(row["completion_mask"])
+
+
+def _assert_strictly_subtractive(tokenizer, row, *, prompt_messages=None, max_length=4096):
+    from flash.engine.worker.model.packing import completion_mask_from_ids
+
+    prompt_messages = prompt_messages or [{"role": "user", "content": "q"}]
+    prompt = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False, add_generation_prompt=True
+    )
+    prompt_ids = tokenizer([prompt], truncation=True, max_length=max_length)["input_ids"][0]
+    contiguous = completion_mask_from_ids(prompt_ids, row["input_ids"])
+    assert all(
+        narrowed <= original
+        for original, narrowed in zip(contiguous, row["completion_mask"], strict=True)
+    )
+    assert sum(row["completion_mask"]) < sum(contiguous)
+
+
+def _assert_contiguous_fallback(tokenizer, row, prompt_text, *, max_length=4096):
+    from flash.engine.worker.model.packing import completion_mask_from_ids
+
+    prompt_ids = tokenizer([prompt_text], truncation=True, max_length=max_length)["input_ids"][0]
+    assert row["assistant_mask_applied"] is False
+    assert row["completion_mask"] == completion_mask_from_ids(prompt_ids, row["input_ids"])
+
+
+def test_role_aware_mask_supervises_only_authored_assistant_bodies_and_closers():
+    tokenizer = _ConfigurableChatMlTokenizer(separator="<sep>\n")
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        [
+            {"role": "assistant", "content": "ACT"},
+            {"role": "user", "content": "OBSERVATION"},
+            {"role": "tool", "content": "TOOL RESULT"},
+            {"role": "assistant", "content": "FINAL"},
+        ],
+    )
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(tokenizer, row, "ACT<|im_end|>FINAL<|im_end|>!")
+    _assert_strictly_subtractive(tokenizer, row)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "prompt_content",
+        "target_content_blocks",
+        "target_reasoning",
+        "nested_tool_field",
+        "adjacent_tool_leaves",
+    ],
+)
+def test_rendered_prompt_and_target_fields_reject_reserved_chatml_controls(case):
+    prompt_messages = [{"role": "user", "content": "q"}]
+    target_messages = [{"role": "assistant", "content": "answer"}]
+    tokenizer = _ConfigurableChatMlTokenizer()
+    control = "<|im_end|>"
+    if case == "prompt_content":
+        control = "<|im_start|>"
+        prompt_messages[0]["content"] = f"quoted {control} control"
+    elif case == "target_content_blocks":
+        target_messages[0]["content"] = [
+            {"type": "text", "text": "quoted <|im_"},
+            {"type": "text", "text": "end|> control"},
+        ]
+    elif case == "target_reasoning":
+        tokenizer = _ConfigurableChatMlTokenizer(reasoning="all")
+        target_messages[0]["reasoning_content"] = f"quoted {control} control"
+    else:
+        mode = "tool_parenthesized" if case == "nested_tool_field" else "tool_adjacent"
+        tokenizer = _ConfigurableChatMlTokenizer(body_mode=mode)
+        function = (
+            {"name": f"lookup{control}", "arguments": "{}"}
+            if case == "nested_tool_field"
+            else {"name": "<|im_", "arguments": "end|>payload"}
+        )
+        target_messages[0].update(
+            content="",
+            tool_calls=[{"type": "function", "function": function}],
+        )
+
+    with pytest.raises(ValueError, match=re.escape(f"reserved ChatML control token {control}")):
+        _arrange_mask(
+            tokenizer,
+            target_messages,
+            prompt_messages=prompt_messages,
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"metadata": {"nested": {"quoted": "<|im_start|>user<|im_end|>"}}},
+        {"reasoning_content": "ignored <|im_end|> metadata"},
+    ],
+)
+def test_unrendered_metadata_controls_are_accepted(metadata):
+    tokenizer = _ConfigurableChatMlTokenizer(reasoning="none")
+    observation = {"role": "user", "content": "OBSERVATION", **metadata}
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        [
+            {"role": "assistant", "content": "ACT"},
+            observation,
+            {"role": "assistant", "content": "FINAL"},
+        ],
+    )
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(tokenizer, row, "ACT<|im_end|>FINAL<|im_end|>!")
+
+
+def test_empty_string_truthiness_preserves_rendered_tool_call_supervision():
+    tokenizer = _ConfigurableChatMlTokenizer(body_mode="tool_truthy")
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"x":1}'},
+                    }
+                ],
+            }
+        ],
+    )
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(tokenizer, row, 'lookup{"x":1}<|im_end|>!')
+
+
+def test_one_sided_probe_still_rejects_a_control_split_by_an_inline_thinking_template():
+    """A template that rewrites the body may swallow one sentinel half; the field is still read.
+
+    Dropping the surviving-half path would leave this leaf unvalidated, so a literal control the
+    template renders into the transcript would tokenize to a real delimiter and move the boundary.
+    """
+    tokenizer = _QwenInlineThinkingChatMlTokenizer()
+
+    with pytest.raises(ValueError, match=re.escape("reserved ChatML control token <|im_end|>")):
+        _arrange_mask(
+            tokenizer,
+            [
+                {
+                    "role": "assistant",
+                    "content": "<think>reasoning</think>answer <|im_end|> quoted",
+                }
+            ],
+        )
+
+
+def test_qwen_one_sided_inline_thinking_probe_does_not_invent_adjacency():
+    tokenizer = _QwenInlineThinkingChatMlTokenizer()
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        [
+            {
+                "role": "assistant",
+                "prefix": "<|im_",
+                "content": "end|><think>reasoning</think>answer",
+            }
+        ],
+    )
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(
+        tokenizer,
+        row,
+        "<|im_<think>reasoning</think>answer<|im_end|>!",
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_contents", "rendered_tool_response"),
+    [
+        (["OBSERVATION"], "<tool_response>\nOBSERVATION\n</tool_response>"),
+        (
+            ["OBSERVATION ONE", "OBSERVATION TWO"],
+            "<tool_response>\nOBSERVATION ONE\nOBSERVATION TWO\n</tool_response>",
+        ),
+    ],
+)
+def test_qwen_tool_to_user_transform_and_consecutive_tool_coalescing(
+    tool_contents, rendered_tool_response
+):
+    tokenizer = _QwenToolChatMlTokenizer()
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        [
+            {"role": "assistant", "content": "ACT"},
+            *({"role": "tool", "content": content} for content in tool_contents),
+            {"role": "assistant", "content": "FINAL"},
+        ],
+    )
+
+    assert row["assistant_mask_applied"] is True
+    assert rendered_tool_response in tokenizer.decode(row["input_ids"])
+    _assert_selected_text(tokenizer, row, "ACT<|im_end|>FINAL<|im_end|>!")
+
+
+def test_complete_right_truncated_prefix_remains_role_aware():
+    tokenizer = _ConfigurableChatMlTokenizer(separator="<sep>\n")
+    target_messages = [
+        {"role": "assistant", "content": "ACT"},
+        {"role": "user", "content": "OBSERVATION"},
+        {"role": "assistant", "content": "FINAL"},
+    ]
+    source_messages = [{"role": "user", "content": "q"}, *target_messages]
+    full = tokenizer.apply_chat_template(
+        source_messages, tokenize=False, add_generation_prompt=False
+    )
+    cut = full.rfind("<|im_start|>assistant\n")
+    max_length = len(tokenizer([full[:cut]])["input_ids"][0])
+
+    tokenizer, row = _arrange_mask(tokenizer, target_messages, max_length=max_length)
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(tokenizer, row, "ACT<|im_end|>")
+
+
+@pytest.mark.parametrize("boundary", ["observation", "assistant_header", "assistant_body"])
+def test_incomplete_right_truncated_spans_preserve_contiguous_fallback(boundary):
+    tokenizer = _ConfigurableChatMlTokenizer(separator="<sep>\n")
+    target_messages = [
+        {"role": "assistant", "content": "ACT"},
+        {"role": "user", "content": "OBSERVATION"},
+        {"role": "assistant", "content": "FINAL"},
+    ]
+    prompt_messages = [{"role": "user", "content": "q"}]
+    source_messages = [*prompt_messages, *target_messages]
+    prompt = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False, add_generation_prompt=True
+    )
+    full = tokenizer.apply_chat_template(
+        source_messages, tokenize=False, add_generation_prompt=False
+    )
+    if boundary == "observation":
+        cut = full.index("OBSERVATION") + len("OBS")
+    elif boundary == "assistant_header":
+        cut = full.rfind("<|im_start|>assistant\n") + len("<|im_start|>assistant\n")
+    else:
+        cut = full.rfind("FINAL") + len("FI")
+    max_length = len(tokenizer([full[:cut]])["input_ids"][0])
+
+    tokenizer, row = _arrange_mask(tokenizer, target_messages, max_length=max_length)
+
+    _assert_contiguous_fallback(tokenizer, row, prompt, max_length=max_length)
+
+
+@pytest.mark.parametrize(
+    ("separator", "target_messages", "expected"),
+    [
+        ("", [{"role": "assistant", "content": "FINAL"}], "FINAL<|im_end|>!"),
+        (
+            "",
+            [
+                {"role": "assistant", "content": "ACT"},
+                {"role": "user", "content": "OBSERVATION"},
+            ],
+            "ACT<|im_end|>",
+        ),
+        ("<sep>!", [{"role": "assistant", "content": "FINAL"}], "FINAL<|im_end|>"),
+        ("<sep>!x\n", [{"role": "assistant", "content": "FINAL"}], "FINAL<|im_end|>!"),
+    ],
+    ids=[
+        "appended-after-assistant",
+        "appended-after-observation",
+        "template-terminal-eos",
+        "template-internal-eos-plus-appended-eos",
+    ],
+)
+def test_eos_requires_explicit_provenance_after_final_authored_assistant(
+    separator, target_messages, expected
+):
+    tokenizer = _ConfigurableChatMlTokenizer(separator=separator)
+    tokenizer, row = _arrange_mask(tokenizer, target_messages)
+
+    assert row["assistant_mask_applied"] is True
+    _assert_selected_text(tokenizer, row, expected)
+
+
+def test_empty_assistant_scaffold_is_not_an_authored_target():
+    tokenizer = _ConfigurableChatMlTokenizer(assistant_scaffold="<think>\n</think>\n\n")
+    prompt_messages = [{"role": "user", "content": "q"}]
+    target_messages = [{"role": "assistant", "content": ""}]
+    source_messages = [*prompt_messages, *target_messages]
+    prompt = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False, add_generation_prompt=True
+    )
+    full = tokenizer.apply_chat_template(
+        source_messages, tokenize=False, add_generation_prompt=False
+    )
+
+    kept, rows, dropped = _pretokenize_completion_only(
+        [
+            {
+                "text": full,
+                "prompt_text": prompt,
+                "target_messages": target_messages,
+                "source_messages": source_messages,
+                "template_kwargs": {},
+            }
+        ],
+        tokenizer,
+        max_length=4096,
+    )
+
+    assert "<think>\n</think>\n\n" in full
+    assert kept == []
+    assert rows == []
+    assert dropped == 1
+
+
+def test_a_chatml_template_that_renders_plain_text_reports_fallback_not_role_aware():
+    """The template names ChatML but the render carries no delimiters, so no span is parseable.
+
+    ``assistant_mask_applied`` feeds the runner's disclosure, so returning true here would report
+    rows as observation-masked while they still train on the whole contiguous target.
+    """
+    tokenizer = _ConfigurableChatMlTokenizer()
+    prompt_messages = [{"role": "user", "content": "q"}]
+    target_messages = [
+        {"role": "assistant", "content": "ACT"},
+        {"role": "user", "content": "OBSERVATION"},
+    ]
+    plain = _ConfigurableChatMlTokenizer(plain=True)
+    prompt = plain.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+    full = plain.apply_chat_template(
+        [*prompt_messages, *target_messages], tokenize=False, add_generation_prompt=False
+    )
+
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        target_messages,
+        prompt_messages=prompt_messages,
+        prompt_text=prompt,
+        full_text=full,
+    )
+
+    _assert_contiguous_fallback(tokenizer, row, prompt)
+
+
+def test_role_aware_mask_never_supervises_a_token_the_prompt_prefix_owns():
+    """The narrowed mask is an intersection, so a token the prompt already covers stays masked.
+
+    The thinking template pre-opens the assistant scaffold inside the generation prompt, so those
+    tokens sit in the shared prefix. Writing literal ``1`` bits over the assistant body instead of
+    intersecting would supervise them and undo the completion boundary.
+    """
+    tokenizer = _ConfigurableChatMlTokenizer(assistant_scaffold="<think>\n</think>\n\n")
+    prompt_messages = [{"role": "user", "content": "q"}]
+    target_messages = [{"role": "assistant", "content": "FINAL"}]
+
+    tokenizer, row = _arrange_mask(tokenizer, target_messages, prompt_messages=prompt_messages)
+    prompt = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False, add_generation_prompt=True
+    )
+    prompt_ids = tokenizer([prompt], truncation=True, max_length=4096)["input_ids"][0]
+
+    assert row["assistant_mask_applied"] is True
+    assert prompt.endswith("<think>\n</think>\n\n")
+    assert all(row["completion_mask"][position] == 0 for position in range(len(prompt_ids)))
+    _assert_selected_text(tokenizer, row, "FINAL<|im_end|>!")
+
+
+@pytest.mark.parametrize("case", ["non_chatml", "ambiguous_constant_body"])
+def test_non_chatml_and_ambiguous_renders_keep_contiguous_fallback(case):
+    prompt_messages = [{"role": "user", "content": "q"}]
+    if case == "non_chatml":
+        tokenizer = _ConfigurableChatMlTokenizer(plain=True)
+        target_messages = [
+            {"role": "assistant", "content": "ACT"},
+            {"role": "user", "content": "OBSERVATION"},
+        ]
+    else:
+        tokenizer = _ConfigurableChatMlTokenizer(body_mode="constant")
+        target_messages = [{"role": "user", "content": "OBSERVATION"}]
+    prompt = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False, add_generation_prompt=True
+    )
+
+    tokenizer, row = _arrange_mask(
+        tokenizer,
+        target_messages,
+        prompt_messages=prompt_messages,
+    )
+
+    _assert_contiguous_fallback(tokenizer, row, prompt)
+
+
+def test_multimodal_probe_uses_exact_prepared_source_messages(monkeypatch):
+    from flash.engine.profiling import sft_image_rows
+
+    tokenizer = _ExactChatMlTokenizer()
+    # closed in the row function's finally block, which owns the decoded images' lifetime.
+    prepared_image = SimpleNamespace(close=lambda: None)
+    processor = _PreparedSourceProcessor(tokenizer, prepared_image)
+    # the row function decodes descriptors itself, so the sentinel image is supplied through the
+    # decode boundary rather than passed in. it must reach the template as the prepared block.
+    monkeypatch.setattr(
+        sft_image_rows, "decode_image_descriptors", lambda descriptors, root: [prepared_image]
+    )
+
+    with pytest.raises(ValueError, match="reserved ChatML control token <\\|im_end\\|>"):
+        sft_image_rows.process_sft_image_row(
+            processor,
+            [{"role": "user", "content": [{"type": "image"}]}],
+            [
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {"name": "<|im_", "arguments": "end|>payload"},
+                        }
+                    ],
+                }
+            ],
+            ["descriptor"],
+            package_root=None,
+            max_length=4096,
+            thinking=False,
+        )
+
+    assert processor.prepared_renders >= 3
+
+
+def test_image_pad_probe_uses_exact_prepared_source_messages(monkeypatch):
+    from flash.content.multimodal import IMAGE_PAD_TOKEN
+    from flash.engine.profiling import sft_image_rows
+    from flash.engine.worker.model.chatml_mask import reject_rendered_message_token
+
+    tokenizer = _ExactChatMlTokenizer()
+    prepared_image = SimpleNamespace(close=lambda: None)
+    processor = _PreparedSourceProcessor(tokenizer, prepared_image)
+    monkeypatch.setattr(
+        sft_image_rows, "decode_image_descriptors", lambda descriptors, root: [prepared_image]
+    )
+    prompt = [{"role": "user", "content": [{"type": "image"}]}]
+    completion = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "<|image_", "arguments": "pad|>payload"},
+                }
+            ],
+        }
+    ]
+
+    # the processor deliberately omits tool fields until image blocks contain prepared objects.
+    reject_rendered_message_token(
+        processor,
+        [*prompt, *completion],
+        IMAGE_PAD_TOKEN,
+        template_kwargs={"enable_thinking": False},
+    )
+    with pytest.raises(ValueError, match="reserved image marker"):
+        sft_image_rows.process_sft_image_row(
+            processor,
+            prompt,
+            completion,
+            ["descriptor"],
+            package_root=None,
+            max_length=4096,
+            thinking=False,
+        )
+
+    assert processor.prepared_renders == 1
+
+
+def test_clean_multimodal_row_reuses_the_validated_prepared_probe(monkeypatch):
+    from flash.engine.profiling import sft_image_rows
+
+    tokenizer = _ExactChatMlTokenizer()
+    prepared_image = SimpleNamespace(close=lambda: None)
+    processor = _PreparedSourceProcessor(tokenizer, prepared_image)
+    monkeypatch.setattr(
+        sft_image_rows, "decode_image_descriptors", lambda descriptors, root: [prepared_image]
+    )
+
+    sft_image_rows.process_sft_image_row(
+        processor,
+        [{"role": "user", "content": [{"type": "image"}]}],
+        [
+            {
+                "role": "assistant",
+                "content": "answer",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"city":"london"}'},
+                    }
+                ],
+            }
+        ],
+        ["descriptor"],
+        package_root=None,
+        max_length=4096,
+        thinking=False,
+    )
+
+    assert processor.prepared_renders == 3
+    assert processor.probe_renders == 1
+
+
 def test_exact_mask_keeps_prompt_assistant_history_masked_and_full_target_active():
     tokenizer = _ExactTokenizer()
     prompt = "<user>q</user><assistant>history</assistant><assistant>"
     full = prompt + "first</assistant><user>tool</user><assistant>second</assistant>"
-    texts = [{"text": full, "prompt_text": prompt}]
+    texts = [
+        {
+            "text": full,
+            "prompt_text": prompt,
+            "target_messages": [],
+            "source_messages": [],
+            "template_kwargs": {},
+        }
+    ]
 
     kept, rows, dropped = _pretokenize_completion_only(texts, tokenizer, max_length=512)
 
@@ -565,8 +1442,15 @@ def test_exact_mask_drops_right_truncated_completion_and_handles_thinking_prefix
     tokenizer = _ExactTokenizer()
     prompt = "<think>prompt<assistant>"
     full = "<think>prompt<assistant>answer"
+    row = {
+        "text": full,
+        "prompt_text": prompt,
+        "target_messages": [],
+        "source_messages": [],
+        "template_kwargs": {},
+    }
     kept, rows, dropped = _pretokenize_completion_only(
-        [{"text": full, "prompt_text": prompt}],
+        [row],
         tokenizer,
         max_length=len(prompt),
     )
@@ -575,7 +1459,7 @@ def test_exact_mask_drops_right_truncated_completion_and_handles_thinking_prefix
     assert dropped == 1
 
     kept, rows, dropped = _pretokenize_completion_only(
-        [{"text": full, "prompt_text": prompt}],
+        [row],
         tokenizer,
         max_length=512,
     )
@@ -790,6 +1674,65 @@ def _module(name, **attrs):
     return module
 
 
+@pytest.mark.parametrize(
+    "original_error",
+    [RuntimeError("original failure"), AttributeError("original failure")],
+)
+def test_seeded_dataloader_handles_missing_and_present_validation_sampler(
+    monkeypatch, original_error
+):
+    missing = object()
+
+    class FakeTrainer:
+        def __init__(self, val_sampler=missing, error=None):
+            self._val_sampler = val_sampler
+            self._error = error
+
+        def _build_dataloader(self):
+            if self._error is not None:
+                raise self._error
+            self.train_sampler = SimpleNamespace(seed=None)
+            if self._val_sampler is not missing:
+                self.val_sampler = self._val_sampler
+            return "loader"
+
+    probe = FakeTrainer()
+    assert FakeTrainer._build_dataloader(probe) == "loader"
+    with pytest.raises(AttributeError, match="val_sampler"):
+        _ = probe.val_sampler
+
+    fake_sft_module = _module("verl.trainer.sft_trainer", SFTTrainer=FakeTrainer)
+    monkeypatch.setitem(sys.modules, "torch", _module("torch", manual_seed=lambda seed: None))
+    monkeypatch.setitem(
+        sys.modules,
+        "numpy",
+        _module("numpy", random=SimpleNamespace(seed=lambda seed: None)),
+    )
+    monkeypatch.setitem(sys.modules, "verl", _module("verl"))
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.trainer",
+        _module("verl.trainer", sft_trainer=fake_sft_module),
+    )
+
+    sft_plugin._install_seeded_dataloader(43)
+
+    trainer_without_validation = FakeTrainer()
+    assert trainer_without_validation._build_dataloader() == "loader"
+    assert trainer_without_validation.train_sampler.seed == 43
+    assert not hasattr(trainer_without_validation, "val_sampler")
+
+    validation_sampler = SimpleNamespace(seed=None)
+    trainer_with_validation = FakeTrainer(val_sampler=validation_sampler)
+    assert trainer_with_validation._build_dataloader() == "loader"
+    assert trainer_with_validation.train_sampler.seed == 43
+    assert validation_sampler.seed == 43
+
+    with pytest.raises(type(original_error), match="original failure") as exc_info:
+        FakeTrainer(error=original_error)._build_dataloader()
+    assert exc_info.value is original_error
+
+
 def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus(
     monkeypatch, capsys
 ):
@@ -875,14 +1818,9 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    source = _render_sft_sitecustomize(
-        seed=43,
-        loraplus_ratio=16,
-        save_at_steps=(3, 7),
-        total_steps=9,
-        reentrant_gradient_checkpointing=False,
-    )
-    exec(compile(source, "sitecustomize.py", "exec"), {})
+    sft_plugin._install_seeded_dataloader(43)
+    sft_plugin._install_linear_scheduler()
+    sft_plugin._install_loraplus(16, "CUSTOM_LORAPLUS_READY")
 
     engine = FakeEngine()
     engine.optimizer_config = SimpleNamespace(
@@ -897,10 +1835,31 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
         total_training_steps=20,
     )
     assert engine._build_optimizer(SimpleNamespace()) == "lora+"
-    assert _LORAPLUS_READY_MARKER in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "CUSTOM_LORAPLUS_READY ratio=16 optimizer=AdamW" in output
+    assert _LORAPLUS_READY_MARKER not in output
     assert optimizer_calls[0]["optimizer_kwargs"]["eps"] == 1e-8
     assert engine._build_lr_scheduler("optimizer") == "linear"
     assert scheduler_calls == [("optimizer", {"num_warmup_steps": 2, "num_training_steps": 20})]
+
+
+def test_sft_plugin_config_carries_the_canonical_loraplus_marker(tmp_path):
+    from flash.engine.worker import sft_train_runner
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    _, _, raw_config = sft_train_runner._write_sft_child_shims(
+        SimpleNamespace(save_at_steps=(3,)),
+        SimpleNamespace(update_horizon=7, reentrant_gradient_checkpointing=False),
+        shim_dir=str(shim_dir),
+        custom_dataset_path=str(shim_dir / "dataset.py"),
+        seed=42,
+        loggers=[],
+        gdn_reset_arch=None,
+        multimodal=False,
+    )
+
+    assert json.loads(raw_config)["loraplus_ready_marker"] == _LORAPLUS_READY_MARKER
 
 
 def _exec_dataloader_shim(monkeypatch):
@@ -931,8 +1890,14 @@ def _exec_dataloader_shim(monkeypatch):
         "torchdata.stateful_dataloader",
         _module("torchdata.stateful_dataloader", StatefulDataLoader=FakeStatefulDataLoader),
     )
+    sft_trainer = _module("verl.trainer.sft_trainer", StatefulDataLoader=FakeStatefulDataLoader)
+    monkeypatch.setitem(sys.modules, "verl", _module("verl"))
+    monkeypatch.setitem(
+        sys.modules, "verl.trainer", _module("verl.trainer", sft_trainer=sft_trainer)
+    )
+    monkeypatch.setitem(sys.modules, "verl.trainer.sft_trainer", sft_trainer)
 
-    exec(compile(render_exact_sft_dataloader_shim(), "sitecustomize.py", "exec"), {})
+    sft_plugin._install_exact_dataloaders()
     return FakeDistributedSampler, FakeStatefulDataLoader, sampler_calls, loader_calls
 
 
@@ -983,8 +1948,16 @@ def test_dataloader_shim_patches_the_classes_verl_imports(monkeypatch):
 
     assert DistributedSampler is sampler
     assert StatefulDataLoader is loader
-    assert DistributedSampler.__init__.__name__ == "_flash_exact_sampler_init"
-    assert StatefulDataLoader.__init__.__name__ == "_flash_exact_loader_init"
+    assert DistributedSampler.__init__.__name__ == "exact_sampler_init"
+    assert StatefulDataLoader.__init__.__name__ == "exact_loader_init"
+
+    # the class __init__ patch above is the whole mechanism, so the trainer attribute must stay
+    # the original class. an extra function wrapper there would force drop_last a second time and
+    # hide the fact that verl constructs the loader through the shared class.
+    from verl.trainer import sft_trainer
+
+    assert sft_trainer.StatefulDataLoader is loader
+    assert isinstance(sft_trainer.StatefulDataLoader, type)
 
 
 def test_shipped_shim_carries_the_exact_dataloader_patch(monkeypatch):
@@ -997,18 +1970,17 @@ def test_shipped_shim_carries_the_exact_dataloader_patch(monkeypatch):
 
     import flash.engine.worker.sft_train as sft_train_module
 
-    fragment = render_exact_sft_dataloader_shim()
-    source = "".join(pathlib.Path(sft_train_module.__file__).read_text().split())
-    assert "shim_source+=render_exact_sft_dataloader_shim()" in source
-    assert "shuffle" in fragment
-    assert "drop_last" in fragment
+    plugin_source = pathlib.Path(sft_plugin.__file__).read_text()
+    runner_source = (
+        pathlib.Path(sft_train_module.__file__).with_name("sft_train_runner.py").read_text()
+    )
+    assert "_install_exact_dataloaders()" in plugin_source
+    assert "flash_sft_plugin.py" in runner_source
+    assert 'kwargs["shuffle"] = False' in plugin_source
+    assert 'kwargs["drop_last"] = False' in plugin_source
 
 
-def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointing():
-    """GRAD-001: lora freezes the embeddings, so nothing entering the first checkpointed layer
-    requires grad and reentrant checkpointing returns no gradient at all. the shim must call
-    enable_input_require_grads() BEFORE gradient_checkpointing_enable(), or every sft run
-    trains nothing while reporting done and billing."""
+def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointing(monkeypatch):
     calls = []
 
     class FakeModule:
@@ -1022,35 +1994,78 @@ def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointi
         def _build_module(self):
             return FakeModule()
 
-    source = _render_sft_sitecustomize(
-        seed=1,
-        loraplus_ratio=16,
-        save_at_steps=(),
-        total_steps=4,
-        reentrant_gradient_checkpointing=True,
-    )
-    # execute only the reentrant block: the surrounding shim imports verl/torch at module scope.
-    block = source[source.index("def _flash_build_reentrant_module") :]
-    block = block[: block.index("_FlashFSDPEngine._build_module = _flash_build_reentrant_module")]
-    namespace = {"_flash_original_build_module": FakeEngine._build_module}
-    exec(compile(block, "shim.py", "exec"), namespace)
+    transformer_impl = _module("verl.workers.engine.fsdp.transformer_impl", FSDPEngine=FakeEngine)
+    for name, module in {
+        "verl": _module("verl"),
+        "verl.workers": _module("verl.workers"),
+        "verl.workers.engine": _module("verl.workers.engine"),
+        "verl.workers.engine.fsdp": _module("verl.workers.engine.fsdp"),
+        "verl.workers.engine.fsdp.transformer_impl": transformer_impl,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
 
-    namespace["_flash_build_reentrant_module"](FakeEngine())
+    sft_plugin._install_reentrant_checkpointing(multimodal=False)
+    FakeEngine()._build_module()
 
-    # order matters: enabling checkpointing first would capture the graph before any input
-    # requires grad, so asserting mere presence would pass on a broken shim.
     assert calls[0] == "require_grads"
-    assert calls[1] == ("gc_enable", {"gradient_checkpointing_kwargs": {"use_reentrant": True}})
-
-    # the non-reentrant path never patches _build_module at all, so it must not appear.
-    non_reentrant = _render_sft_sitecustomize(
-        seed=1,
-        loraplus_ratio=16,
-        save_at_steps=(),
-        total_steps=4,
-        reentrant_gradient_checkpointing=False,
+    assert calls[1] == (
+        "gc_enable",
+        {"gradient_checkpointing_kwargs": {"use_reentrant": True}},
     )
-    assert "enable_input_require_grads" not in non_reentrant
+
+
+@pytest.mark.parametrize("multimodal", [True, False])
+def test_reentrant_checkpointing_installs_vision_grads_only_when_multimodal(
+    monkeypatch, multimodal
+):
+    """a reentrant-checkpointed vision tower gets ZERO gradient without this hook.
+
+    ``enable_input_require_grads()`` only reaches the text embedding, so pixel values stay
+    grad-free and every ``visual.blocks.*`` lora pair stays exactly at its init value while the
+    language model trains normally. that leaves the aggregate adapter delta large and the deployed
+    red/blue probe passing, so this seam is the only place the regression is observable.
+    """
+    installed = []
+
+    class FakeModule:
+        def enable_input_require_grads(self):
+            pass
+
+        def gradient_checkpointing_enable(self, **kwargs):
+            pass
+
+    class FakeEngine:
+        def _build_module(self):
+            return FakeModule()
+
+    transformer_impl = _module("verl.workers.engine.fsdp.transformer_impl", FSDPEngine=FakeEngine)
+    for name, module in {
+        "verl": _module("verl"),
+        "verl.workers": _module("verl.workers"),
+        "verl.workers.engine": _module("verl.workers.engine"),
+        "verl.workers.engine.fsdp": _module("verl.workers.engine.fsdp"),
+        "verl.workers.engine.fsdp.transformer_impl": transformer_impl,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(
+        sft_plugin.runtime, "install_vision_input_grads", lambda module: installed.append(module)
+    )
+
+    sft_plugin._install_reentrant_checkpointing(multimodal=multimodal)
+    FakeEngine()._build_module()
+
+    assert len(installed) == (1 if multimodal else 0)
+
+
+def test_sft_plugin_config_carries_multimodal_for_the_vision_hook():
+    """the child cannot see the workload, so the parent must ship the multimodal flag."""
+    import inspect
+
+    from flash.engine.worker import sft_train_runner
+
+    writer = inspect.getsource(sft_train_runner._write_sft_child_shims)
+    assert '"multimodal": bool(multimodal),' in writer
+    assert "multimodal=data.multimodal," in inspect.getsource(sft_train_runner._prepare_sft_child)
 
 
 class _TolerantWatcher:
@@ -1062,7 +2077,7 @@ class _TolerantWatcher:
     """
 
     def __init__(self, **kwargs):
-        self.processed_steps = set()
+        self.lifecycle = CheckpointLedger()
 
     def start(self):
         return None
@@ -1186,12 +2201,13 @@ def test_step_gate_admits_a_line_a_tqdm_bar_was_flushed_in_front_of():
     assert parse_verl_metric(glued, "train/lr") == 5e-05
 
 
-def test_loraplus_shim_has_no_plain_lora_fallback():
-    source = render_loraplus_shim(16)
-    assert _LORAPLUS_READY_MARKER in source
+def test_loraplus_installer_has_no_plain_lora_fallback():
+    source = inspect.getsource(sft_plugin._install_loraplus)
+    assert "ready_marker" in source
+    assert not hasattr(sft_plugin, "_LORAPLUS_READY_MARKER")
     assert "falling back" not in source
-    assert "_flash_original_build_optimizer" not in source
-    assert render_loraplus_shim(1) == ""
+    assert "original_build_optimizer" not in source
+    assert "if ratio <= 1" in source
 
 
 def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypatch, tmp_path):
@@ -1223,6 +2239,74 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypat
     assert with_wandb["WANDB_API_KEY"] == "wandb-secret"
 
 
+def test_shared_child_environment_scrubs_declared_prefixed_secrets(monkeypatch, tmp_path):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+
+    declared_secrets = (
+        "CUDA_SECRET",
+        "NCCL_CREDENTIAL",
+        "TORCH_PRIVATE_TOKEN",
+        "PYTORCH_AUTH",
+        "VERL_USER_SECRET",
+        "FLA_CREDENTIAL",
+        "PYTHONPATH",
+        "WANDB_USER_SECRET",
+        "CUSTOM_USER_SECRET",
+        "WANDB_API_KEY",
+    )
+    runtime_controls = {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "NCCL_DEBUG": "WARN",
+        "TORCH_LOGS": "+dynamo",
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:256",
+        "VERL_LOGGING_LEVEL": "INFO",
+        "FLA_TILELANG": "0",
+        "OMP_NUM_THREADS": "4",
+        "MKL_NUM_THREADS": "4",
+        "OPENBLAS_NUM_THREADS": "4",
+        "LC_ALL": "C.UTF-8",
+        "HF_HOME": "/cache/hf",
+        "FLASH_VERL_PYTHON": "/verl/python",
+    }
+    for name in declared_secrets:
+        monkeypatch.setenv(name, f"synthetic-{name.lower()}")
+    for name, value in runtime_controls.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv(
+        SECRET_ENV_KEYS_ENV,
+        f"  {','.join(declared_secrets[:4])},, {','.join(declared_secrets[4:])}  ",
+    )
+
+    without_wandb = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=False)
+    for name, value in runtime_controls.items():
+        assert without_wandb[name] == value
+    for name in declared_secrets:
+        if name != "PYTHONPATH":
+            assert name not in without_wandb
+    assert without_wandb["PYTHONPATH"] == str(tmp_path)
+    assert "WANDB_MODE" not in without_wandb
+    assert SECRET_ENV_KEYS_ENV not in without_wandb
+
+    with_wandb = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=True)
+    for name, value in runtime_controls.items():
+        assert with_wandb[name] == value
+    for name in declared_secrets:
+        if name not in {"PYTHONPATH", "WANDB_API_KEY"}:
+            assert name not in with_wandb
+    assert with_wandb["PYTHONPATH"] == str(tmp_path)
+    assert "WANDB_API_KEY" in with_wandb
+    assert with_wandb["WANDB_MODE"] == "offline"
+    assert SECRET_ENV_KEYS_ENV not in with_wandb
+
+    monkeypatch.setenv(
+        SECRET_ENV_KEYS_ENV,
+        ",".join(name for name in declared_secrets if name != "PYTHONPATH"),
+    )
+    inherited = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=False)
+    assert inherited["PYTHONPATH"] == os.pathsep.join((str(tmp_path), "synthetic-pythonpath"))
+
+
 def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_path):
     import flash.engine.worker as worker
     from flash.engine.worker import sft_train
@@ -1242,12 +2326,17 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
     monkeypatch.setattr(
         worker,
         "publish_deployable_checkpoint",
-        lambda adapter, step, **kwargs: published.append((adapter, step, kwargs)),
+        # a subfolder, as the real transport returns; None means nothing was published.
+        lambda adapter, step, **kwargs: (
+            published.append((adapter, step, kwargs)),
+            f"sft/run/checkpoints/step-{step}/adapter",
+        )[1],
     )
 
     def fake_upload(step, checkpoint, **kwargs):
         kwargs["before_upload"]()
         uploaded.append((step, checkpoint))
+        kwargs["after_upload"]()
         return True
 
     monkeypatch.setattr(worker, "upload_resume_checkpoint", fake_upload)
@@ -1269,7 +2358,10 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
     assert published[0][1] == 5
     assert published[0][2]["required"] is True
     assert [step for step, _ in uploaded] == [5]
-    assert watcher.processed_steps == {5}
+    # a required step is durable on both trees, and the ledger records each fact separately.
+    assert watcher.lifecycle.facts(5).deployable_published
+    assert watcher.lifecycle.facts(5).resume_uploaded
+    assert watcher.lifecycle.missing_deployables(watcher.required_steps) == []
 
 
 def test_checkpoint_watcher_exports_the_sft_layout(monkeypatch, tmp_path):
@@ -1371,7 +2463,7 @@ def test_a_required_save_survives_verl_pruning_it_mid_publish(monkeypatch, tmp_p
         "the upload lost its source when verl pruned the checkpoint, so a required save would fail "
         "an otherwise successful paid run"
     )
-    assert watcher.processed_steps == {2}
+    assert watcher.lifecycle.discovered_steps == {2}
     # the staging links are transient: they must not outlive the publish and accumulate on the pod.
     assert not os.path.exists(os.path.join(str(tmp_path / "exports"), "_staging", "global_step_2"))
 
@@ -1389,11 +2481,24 @@ def test_resume_credits_only_required_saves_that_are_durable(monkeypatch):
     monkeypatch.setattr(worker, "hf_api", Api)
 
     assert sft_train._durable_required_save_steps((3, 5, 9), 5) == {3}
+
     # a resume step that is itself a required save is credited only when its adapter is on hf, so
     # step 5 stays publishable while the already-durable step 3 does not.
-    assert sft_train._processed_resume_steps((3, 5, 9), 5) == {3}
-    # a resume step that is not a required save is always credited: hf already holds its state.
-    assert sft_train._processed_resume_steps((3, 9), 5) == {3, 5}
+    required = types.SimpleNamespace(lifecycle=CheckpointLedger())
+    sft_train._seed_resume_lifecycle(required, (3, 5, 9), 5)
+    assert required.lifecycle.discovered_steps == {3}
+    assert required.lifecycle.deployable_published_steps == {3}
+    # its resume state is durable regardless: this attempt restored from it.
+    assert required.lifecycle.facts(5).resume_uploaded
+    assert not required.lifecycle.facts(5).deployable_published
+
+    # a resume step that is not a required save is always claimed: hf already holds its state and
+    # nothing further is owed for it.
+    optional = types.SimpleNamespace(lifecycle=CheckpointLedger())
+    sft_train._seed_resume_lifecycle(optional, (3, 9), 5)
+    assert optional.lifecycle.discovered_steps == {3, 5}
+    # claimed is not published: no adapter was ever confirmed for step 5.
+    assert optional.lifecycle.deployable_published_steps == {3}
 
 
 def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypatch, tmp_path):
@@ -1430,13 +2535,16 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
     def fake_upload(step, checkpoint, **kwargs):
         kwargs["before_upload"]()
         uploaded.append(step)
+        kwargs["after_upload"]()
         return True
 
     monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
     monkeypatch.setattr(
         worker,
         "publish_deployable_checkpoint",
-        lambda adapter, step, **kwargs: published.append(step),
+        # returns a subfolder like the real transport: it returns None when a best-effort publish
+        # fails or finds no adapter, and the watcher must not credit those.
+        lambda adapter, step, **kwargs: (published.append(step), f"sft/run/step-{step}")[1],
     )
     monkeypatch.setattr(worker, "upload_resume_checkpoint", fake_upload)
     watcher = sft_train._VerlCheckpointWatcher(
@@ -1447,7 +2555,7 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
         model_revision="commit",
         required_steps=(),
     )
-    watcher.processed_steps.update(sft_train._processed_resume_steps((), resume_step))
+    sft_train._seed_resume_lifecycle(watcher, (), resume_step)
 
     watcher.start()
     watcher.stop(require_complete=True)
@@ -1456,7 +2564,11 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
     assert [os.path.basename(path) for path in exported] == ["global_step_2"]
     assert published == [2]
     assert uploaded == [2]
-    assert watcher.processed_steps == {1, 2}
+    assert watcher.lifecycle.discovered_steps == {1, 2}
+    # the seeded step's resume state is durable because this attempt restored from it, but this
+    # worker published nothing for it.
+    assert watcher.lifecycle.facts(1).resume_uploaded
+    assert watcher.lifecycle.deployable_published_steps == {2}
 
 
 def _stub_sft_run(
@@ -1643,7 +2755,7 @@ def _stub_sft_run(
     class _DefaultWatcher:
         def __init__(self, **kwargs):
             self.required_steps = frozenset(kwargs["required_steps"])
-            self.processed_steps = set()
+            self.lifecycle = CheckpointLedger()
 
         def start(self):
             return None
@@ -1813,8 +2925,37 @@ def test_sft_collapse_warning_stays_quiet_for_structured_multiturn_targets(monke
     sft_train_runner._prepare_sft_data(options)
 
     output = capsys.readouterr().out
-    assert "[sft] multi-turn SFT: 2/2 rows" in output
+    assert "2/2 rows use completion-only fallback" in output
+    assert "observations are not proven masked" in output
     assert "bare assistant target coerced" not in output
+
+
+def test_sft_runner_logs_role_aware_and_fallback_multiturn_counts_separately(monkeypatch, capsys):
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    real_prepare = sft_train.prepare_sft_workload
+
+    def prepare_with_mixed_masking(*args, **kwargs):
+        prepared = real_prepare(*args, **kwargs)
+        return replace(
+            prepared,
+            multiturn_targets=2,
+            role_aware_multiturn_targets=1,
+            fallback_multiturn_targets=1,
+        )
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", prepare_with_mixed_masking)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+
+    options = sft_train_runner._resolve_sft_options(spec)
+    sft_train_runner._prepare_sft_data(options)
+
+    output = capsys.readouterr().out
+    assert "1/2 rows use assistant-body masking" in output
+    assert "observations are masked out of the loss" in output
+    assert "1/2 rows use completion-only fallback" in output
+    assert "observations are not proven masked" in output
 
 
 def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monkeypatch, capsys):
@@ -1838,8 +2979,11 @@ def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monk
 
 
 def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
+    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.engine.worker import sft_train
 
+    monkeypatch.setenv("PYTHONPATH", "synthetic-sft-parent-path")
+    monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PYTHONPATH")
     spec, captured = _stub_sft_run(monkeypatch)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
@@ -1863,14 +3007,15 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     assert "--nproc-per-node=1" in captured["command"]
     assert "trainer.n_gpus_per_node=1" in captured["command"]
     assert "engine.ulysses_sequence_parallel_size=1" in captured["command"]
-    assert "verl.trainer.sft_trainer" in captured["command"]
+    assert "flash_sft_entry" in captured["command"]
+    assert captured["child_env"]["VERL_USE_EXTERNAL_MODULES"] == "flash_sft_plugin"
     custom_path = next(
         value.split("=", 1)[1]
         for value in captured["command"]
         if value.startswith("data.custom_cls.path=")
     )
     assert os.path.isfile(custom_path)
-    assert captured["child_env"]["PYTHONPATH"].split(os.pathsep)[0].endswith("/shim")
+    assert captured["child_env"]["PYTHONPATH"] == os.path.dirname(captured["child"].shim_markers)
     assert captured["child_env"]["HF_HUB_OFFLINE"] == "1"
     assert captured["uploads"][0][1:] == ("adapter", True)
     assert captured["published"][0][1] == 2
@@ -1893,6 +3038,158 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     )
 
 
+def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monkeypatch):
+    """the final export must carry the same text-only policy as both step checkpoints."""
+    from flash.engine.worker import sft_train
+
+    exports = []
+
+    class TwoCheckpointWatcher:
+        def __init__(self, **kwargs):
+            self.local_dir = kwargs["local_dir"]
+            self.export_root = kwargs["export_root"]
+            self.python_bin = kwargs["python_bin"]
+            self.model_id = kwargs["model_id"]
+            self.model_revision = kwargs["model_revision"]
+            self.exclude_modules = kwargs["exclude_modules"]
+            self.preprocessor = kwargs["preprocessor"]
+            self.required_steps = frozenset(kwargs["required_steps"])
+            self.lifecycle = CheckpointLedger()
+
+        def start(self):
+            return None
+
+        def stop(self, *, require_complete):
+            assert require_complete is True
+            for step in (1, 2):
+                sft_train._export_checkpoint_adapter(
+                    os.path.join(self.local_dir, f"global_step_{step}"),
+                    os.path.join(self.export_root, f"step-{step}"),
+                    model_id=self.model_id,
+                    model_revision=self.model_revision,
+                    exclude_modules=self.exclude_modules,
+                    python_bin=self.python_bin,
+                    preprocessor=self.preprocessor,
+                )
+                self.lifecycle.mark_deployable_published(step)
+
+        def raise_if_failed(self):
+            return None
+
+    spec, captured = _stub_sft_run(
+        monkeypatch,
+        save_at_steps=(1, 2),
+        watcher_cls=TwoCheckpointWatcher,
+    )
+    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
+
+    def strict_export(
+        actor_dir,
+        adapter_dir,
+        *,
+        model_id,
+        model_revision,
+        exclude_modules,
+        python_bin,
+        preprocessor,
+    ):
+        exports.append(
+            {
+                "actor_dir": actor_dir,
+                "adapter_dir": adapter_dir,
+                "model_id": model_id,
+                "model_revision": model_revision,
+                "exclude_modules": exclude_modules,
+                "python_bin": python_bin,
+                "preprocessor": preprocessor,
+            }
+        )
+        os.makedirs(adapter_dir, exist_ok=True)
+
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", strict_export)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        captured["command"] = command
+        captured["child_env"] = env
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:1 - train/loss:1.1 - train/global_tokens:4\n")
+        on_step(1)
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        heartbeat()
+        return 0
+
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
+
+    assert len(exports) == 3
+    assert [os.path.basename(export["actor_dir"]) for export in exports] == [
+        "global_step_1",
+        "global_step_2",
+        "global_step_2",
+    ]
+    assert [os.path.basename(export["adapter_dir"]) for export in exports] == [
+        "step-1",
+        "step-2",
+        "adapter",
+    ]
+    expected_exclusion = r"^(?!model\.language_model(?:\.|$)).*$"
+    assert {export["exclude_modules"] for export in exports} == {expected_exclusion}
+    assert {export["model_id"] for export in exports} == {spec.model}
+    assert {export["model_revision"] for export in exports} == {spec.model_revision}
+    assert {export["python_bin"] for export in exports} == {"/venv/bin/python"}
+    assert {export["preprocessor"] for export in exports} == {None}
+
+
+@pytest.mark.parametrize("multimodal", [True, False])
+def test_sft_runner_carries_the_prepared_processor_to_every_export(monkeypatch, multimodal):
+    from flash.engine.worker import sft_train
+
+    captured = {}
+
+    class Watcher:
+        def __init__(self, **kwargs):
+            captured["watcher_preprocessor"] = kwargs["preprocessor"]
+            self.required_steps = frozenset(kwargs["required_steps"])
+            self.lifecycle = CheckpointLedger()
+
+        def start(self):
+            return None
+
+        def stop(self, *, require_complete):
+            assert require_complete is True
+
+        def raise_if_failed(self):
+            return None
+
+    spec, _run_capture = _stub_sft_run(monkeypatch, watcher_cls=Watcher)
+    processor = object() if multimodal else None
+    prepare_workload = sft_train.prepare_sft_workload
+
+    def prepare_with_processor(*args, **kwargs):
+        prepared = prepare_workload(*args, **kwargs)
+        return replace(prepared, multimodal=multimodal, processor=processor)
+
+    def fake_export(_actor_dir, _adapter_dir, **kwargs):
+        captured["final_preprocessor"] = kwargs["preprocessor"]
+
+    def fake_training(_command, *, env, on_step, on_line, heartbeat):
+        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        return 0
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", prepare_with_processor)
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", fake_export)
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+
+    sft_train.run_sft_train(spec)
+
+    assert captured["watcher_preprocessor"] is processor
+    assert captured["final_preprocessor"] is processor
+
+
 def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypatch):
     """the seed has to happen in the runner, before the watcher's thread takes its first sweep."""
     from flash.engine.worker import sft_train
@@ -1902,10 +3199,10 @@ def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypa
     class Watcher:
         def __init__(self, **kwargs):
             self.required_steps = frozenset(kwargs["required_steps"])
-            self.processed_steps = set()
+            self.lifecycle = CheckpointLedger()
 
         def start(self):
-            seeded["at_start"] = set(self.processed_steps)
+            seeded["at_start"] = set(self.lifecycle.discovered_steps)
 
         def stop(self, *, require_complete):
             assert require_complete is True
@@ -1983,6 +3280,7 @@ def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
     data = sft_train_runner._SftData(
         rows=[{}] * 800,
         multimodal=False,
+        processor=None,
         profile=SimpleNamespace(examples_per_update=64, authoritative_steps=horizon),
         max_length=1024,
         realized_max_length=128,
@@ -2103,6 +3401,25 @@ def test_the_child_caps_at_the_quoted_horizon_without_an_authored_max_steps(monk
     assert "trainer.total_training_steps=null" not in child.command
 
 
+def test_text_sft_keeps_export_policy_out_of_the_frozen_verl_runtime_config(monkeypatch):
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    spec, _captured = _stub_sft_run(monkeypatch)
+    monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
+    options = sft_train_runner._resolve_sft_options(spec)
+    data = sft_train_runner._prepare_sft_data(options)
+    model = sft_train_runner._prepare_sft_model(options, data)
+    assert model.exclude_modules is not None
+    capabilities = sft_train_runner._SftCapabilities(
+        python_bin="/venv/bin/python", caps={}, gdn_hybrid=False, gdn_module=""
+    )
+
+    child = sft_train_runner._prepare_sft_child(options, data, model, capabilities, True, None)
+
+    assert "model.exclude_modules=null" in child.command
+    assert child.expected_shims.count("text-lora-targeting") == 1
+
+
 def test_a_packed_quote_fails_closed_when_environment_filtering_leaves_less_than_one_batch(
     monkeypatch,
 ):
@@ -2219,7 +3536,7 @@ def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monke
 
     class Watcher:
         def __init__(self, **kwargs):
-            self.processed_steps = set()
+            self.lifecycle = CheckpointLedger()
             self.required_steps = frozenset(kwargs.get("required_steps", ()))
 
         def start(self):
@@ -2231,7 +3548,7 @@ def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monke
         def stop(self, *, require_complete):
             stopped.append(require_complete)
             if require_complete:
-                missing = sorted(self.required_steps - self.processed_steps)
+                missing = self.lifecycle.missing_deployables(self.required_steps)
                 if missing:
                     raise RuntimeError(f"required saves were not durably published: {missing}")
 
@@ -3064,99 +4381,6 @@ def test_a_failed_upload_still_frees_the_exported_adapter(monkeypatch, tmp_path)
     )
 
 
-def test_merge_is_refused_when_its_output_cannot_fit_beside_the_checkpoint(monkeypatch, tmp_path):
-    """`verl.model_merger merge` writes the FULL model, so it needs room for a second copy.
-
-    `save_hf_model_and_tokenizer` calls `model.save_pretrained(target_dir, state_dict=...)`, so
-    exporting one 35b checkpoint materializes ~70 GB into `<adapter>_merge` beside the ~60 GB
-    checkpoint it reads. When that does not fit, the merger dies partway through with ENOSPC and
-    takes down a run whose training already succeeded.
-
-    Asserts the subprocess is never launched: the value of the guard is failing BEFORE the
-    expensive write, with a message naming the shortfall.
-    """
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    actor_dir = tmp_path / "global_step_9"
-    (actor_dir / "huggingface").mkdir(parents=True)
-    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
-
-    launched = []
-    monkeypatch.setattr(
-        verl_checkpoints.subprocess, "run", lambda *a, **kw: launched.append(a) or None
-    )
-    monkeypatch.setattr(
-        verl_checkpoints.shutil,
-        "disk_usage",
-        lambda path: SimpleNamespace(total=1 << 40, used=1 << 40, free=1024),
-    )
-
-    with pytest.raises(verl_checkpoints.MergeDiskHeadroomError, match=r"only 0\.0 GB is free"):
-        verl_checkpoints.export_peft_adapter(
-            str(actor_dir),
-            str(tmp_path / "adapter"),
-            base_model_id="org/model",
-            python_bin="/verl/python",
-        )
-    assert not launched, "the merger ran even though its output could not fit"
-
-
-def test_merge_sizing_ignores_shards_nested_below_the_checkpoint(tmp_path):
-    """the estimate must count only the shards the merger actually opens.
-
-    `_load_and_merge_state_dicts` reads exact top-level paths -- `Path(local_dir) /
-    f"model_world_size_{W}_rank_{r}.pt"`, one per rank -- and never recurses. A nested directory
-    that happens to hold shard-named files (a staging tree, a partially copied checkpoint) is not
-    merge input, so adding its bytes would inflate the requirement and refuse a merge that fits.
-
-    That is the same over-estimate the optimizer-state exclusion exists to prevent, in a different
-    form, and it matters in the same direction: a guard that refuses a valid merge is a regression
-    this PR would have introduced, whereas one that underestimates merely leaves today's behavior.
-    """
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    actor_dir = tmp_path / "ckpt"
-    nested = actor_dir / "staged"
-    nested.mkdir(parents=True)
-    (actor_dir / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 8192)
-    (nested / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 8192)
-
-    assert verl_checkpoints._model_shard_bytes(str(actor_dir)) == 8192
-
-
-def test_merge_headroom_allows_the_merge_when_there_is_room(monkeypatch, tmp_path):
-    """paired control: the guard must not block a merge that fits.
-
-    Without this, a guard that always raised would pass the refusal test above.
-    """
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    actor_dir = tmp_path / "global_step_9"
-    (actor_dir / "huggingface").mkdir(parents=True)
-    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
-
-    launched = []
-    monkeypatch.setattr(
-        verl_checkpoints.subprocess,
-        "run",
-        lambda *a, **kw: launched.append(a) or SimpleNamespace(returncode=0),
-    )
-    monkeypatch.setattr(
-        verl_checkpoints.shutil,
-        "disk_usage",
-        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
-    )
-    # the merger is faked, so it produces no adapter; only reaching that error proves it ran.
-    with pytest.raises(RuntimeError, match="did not produce a peft adapter"):
-        verl_checkpoints.export_peft_adapter(
-            str(actor_dir),
-            str(tmp_path / "adapter"),
-            base_model_id="org/model",
-            python_bin="/verl/python",
-        )
-    assert launched, "the merger was refused even though its output fits"
-
-
 def test_worker_disables_xet_upload_staging_before_importing_hf(monkeypatch):
     """uploads must stream from the checkpoint, not stage a second copy beside it.
 
@@ -3194,7 +4418,7 @@ def test_an_adapter_is_freed_even_when_before_upload_never_ran(monkeypatch, tmp_
     that argument -- so it is deliberately not claimed here.
 
     Retaining the adapter on either reachable path looks protective, but nothing in the sft watcher
-    ever reads `export_root` again -- the step joins `processed_steps` and `_pending` filters it out
+    ever reads `export_root` again -- the step is marked discovered and `_pending` filters it out
     forever -- so the directory would simply accumulate. The busy-slot branch is the one that fires
     on EVERY step once an upload is slow enough to hold the slot, which is exactly the busy-disk case
     this PR exists for, so that is the one simulated below.
@@ -3269,96 +4493,6 @@ def test_importing_the_worker_package_does_not_freeze_the_xet_default(monkeypatc
     assert result.returncode == 0, result.stderr
 
 
-def test_optimizer_state_is_not_counted_against_the_merge(tmp_path):
-    """the estimate must cover what the merger WRITES, not what the checkpoint holds.
-
-    `_load_and_merge_state_dicts` loads only `model_world_size_*_rank_*.pt`, and that merged dict is
-    what `save_pretrained` writes back out. The `optim_*` and `extra_state_*` files beside it are
-    read by resume and never materialized by the merger, so charging them to the merge inflates the
-    requirement by the whole optimizer state -- about 7.6 GB of adam moments on a 35b rank-32 run.
-
-    That direction of error is the dangerous one. Underestimating just lets the merger hit ENOSPC
-    the way it already does today; overestimating fails a run that had room, which is a regression
-    the guard itself would have introduced.
-    """
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    source = tmp_path / "global_step_9"
-    source.mkdir()
-    (source / "model_world_size_2_rank_0.pt").write_bytes(b"x" * 4096)
-    (source / "model_world_size_2_rank_1.pt").write_bytes(b"x" * 4096)
-    (source / "optim_world_size_2_rank_0.pt").write_bytes(b"x" * 65536)
-    (source / "extra_state_world_size_2_rank_0.pt").write_bytes(b"x" * 2048)
-
-    assert verl_checkpoints._model_shard_bytes(str(source)) == 8192, (
-        "optimizer or extra state was charged to the merge, which can refuse a merge that fits"
-    )
-
-
-def test_the_adapter_is_moved_out_of_the_merge_tree_not_copied(monkeypatch, tmp_path):
-    """the export must never hold two copies of the adapter at once.
-
-    `export_peft_adapter` deletes `<adapter>_merge` only AFTER placing the adapter in its final
-    directory. Copying the files there would put a second copy of every adapter file on the disk
-    while the whole merge tree is still present, and that transient peak is not what
-    `require_merge_headroom` reserved space for -- it is the same class of overshoot the guard
-    exists to prevent.
-
-    Both directories are siblings under one parent, hence one filesystem, so the placement can be a
-    rename that transfers no bytes.
-
-    The assertion has to be made at the moment `rmtree` runs, not after the call returns: by then
-    the merge tree is gone under either implementation, so a post-hoc check cannot tell a move from
-    a copy. What distinguishes them is whether the source files are still occupying space when the
-    final adapter already exists.
-    """
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    actor_dir = tmp_path / "global_step_5"
-    (actor_dir / "huggingface").mkdir(parents=True)
-    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 512)
-    out_adapter = tmp_path / "adapter"
-    merge_out = tmp_path / "adapter_merge"
-    lora_dir = merge_out / "lora_adapter"
-
-    def fake_merge(*args, **kwargs):
-        lora_dir.mkdir(parents=True)
-        (lora_dir / "adapter_config.json").write_text("{}")
-        (lora_dir / "adapter_model.safetensors").write_bytes(b"weights")
-        return SimpleNamespace(returncode=0)
-
-    duplicated: list[str] = []
-    real_rmtree = verl_checkpoints.shutil.rmtree
-
-    def watching_rmtree(path, *args, **kwargs):
-        if str(path) == str(merge_out) and lora_dir.is_dir():
-            duplicated.extend(sorted(os.listdir(lora_dir)))
-        return real_rmtree(path, *args, **kwargs)
-
-    monkeypatch.setattr(verl_checkpoints.subprocess, "run", fake_merge)
-    monkeypatch.setattr(verl_checkpoints.shutil, "rmtree", watching_rmtree)
-    monkeypatch.setattr(
-        verl_checkpoints.shutil,
-        "disk_usage",
-        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
-    )
-
-    verl_checkpoints.export_peft_adapter(
-        str(actor_dir),
-        str(out_adapter),
-        base_model_id="org/model",
-        python_bin="/verl/python",
-    )
-
-    assert (out_adapter / "adapter_model.safetensors").read_bytes() == b"weights"
-    assert (out_adapter / "adapter_config.json").read_text() == "{}"
-    assert duplicated == [], (
-        f"the merge tree still held {duplicated} after the adapter was placed, "
-        "so both copies were on disk at once"
-    )
-    assert not merge_out.exists()
-
-
 def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypatch, tmp_path):
     """the swallowed-failure path, asserted as an accumulation rather than a single free.
 
@@ -3415,12 +4549,271 @@ def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypa
     assert left == [], f"8 failed saves left {len(left)} adapters on disk: {left}"
 
 
+def _publishing_watcher(monkeypatch, tmp_path, *, steps, required_steps):
+    """an sft watcher over `steps` completed checkpoints that records what it publishes."""
+    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+
+    local_dir = tmp_path / "ckpts"
+    local_dir.mkdir()
+    for step in steps:
+        (local_dir / f"global_step_{step}" / "huggingface").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text(str(max(steps)))
+
+    published: list[int] = []
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        sft_checkpoints._w,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (
+            published.append(step),
+            kwargs["before_upload"](),
+            kwargs["after_upload"](),
+            True,
+        )[3],
+    )
+    # returns the published subfolder the way the real transport does: it returns None for a
+    # best-effort publish that failed or found no adapter, and the watcher must not credit those.
+    monkeypatch.setattr(
+        sft_checkpoints._w,
+        "publish_deployable_checkpoint",
+        lambda adapter, step, **kw: f"sft/run/checkpoints/step-{step}/adapter",
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=required_steps,
+    )
+    return watcher, published
+
+
+def test_a_failed_optional_publish_is_not_credited_as_a_durable_deployable(monkeypatch, tmp_path):
+    """returning None must not become a published fact.
+
+    `publish_deployable_checkpoint` returns None for a best-effort publish that failed and for a
+    directory holding no adapter; it raises instead of returning None when the save is required. So
+    the only way to credit an artifact that was never written is an optional publish, and the ledger
+    has to gate on the returned subfolder rather than on the call having returned at all.
+
+    The consequence is not cosmetic: `sft_train` suppresses the end-of-run final publish for any
+    step in `deployable_published_steps` (sft_train.py:633). Crediting a failed optional publish of
+    the final step therefore SKIPS the final publish, and a run ends with no servable adapter while
+    reporting success.
+
+    The sibling coalescing test cannot catch this -- its publish mock returns a subfolder, so the
+    guard is never exercised with a falsy return. Verified by mutation: deleting the `if published:`
+    guard leaves the whole sft/grpo/opd suite green and fails only this test.
+    """
+    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+
+    local_dir = tmp_path / "ckpt"
+    checkpoint_dir = local_dir / "global_step_7"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    # the best-effort failure shape: swallowed the error and published nothing.
+    monkeypatch.setattr(
+        sft_checkpoints._w, "publish_deployable_checkpoint", lambda adapter, step, **kw: None
+    )
+    monkeypatch.setattr(
+        sft_checkpoints._w,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (
+            kwargs["before_upload"](),
+            kwargs["after_upload"](),
+            True,
+        )[2],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+    )
+    watcher._publish(7, str(checkpoint_dir))
+
+    assert watcher.lifecycle.deployable_published_steps == set(), (
+        "a publish that returned None was credited as a durable deployable"
+    )
+    # the resume state genuinely landed, so that fact stays true: the two artifacts are independent
+    # trees and a failed adapter publish says nothing about the full-state upload.
+    assert watcher.lifecycle.facts(7).resume_uploaded
+    assert watcher.lifecycle.facts(7).discovered
+
+
+def test_watcher_run_coalesces_an_optional_backlog(monkeypatch, tmp_path):
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(350, 400, 450), required_steps=()
+    )
+
+    watcher._stop.set()
+    watcher._run()
+
+    assert watcher._error is None
+    assert published == [450]
+    # all three are claimed so the next sweep skips them, but the two that were coalesced away must
+    # not look identical to the one that was actually published. that conflation is what the
+    # lifecycle ledger exists to remove: a superseded step has no durable artifact behind it.
+    assert watcher.lifecycle.discovered_steps == {350, 400, 450}
+    assert watcher.lifecycle.deployable_published_steps == {450}
+    assert not watcher.lifecycle.facts(350).deployable_published
+    assert not watcher.lifecycle.facts(400).staged
+
+
+def test_a_required_save_without_an_artifact_repo_fails_instead_of_passing_silently(
+    monkeypatch, tmp_path
+):
+    """a required save is owed a servable adapter, so no repository means the run failed.
+
+    upload_resume_checkpoint returns True at `if not _w.HF_REPO` BEFORE running before_upload, so
+    the required publish that would have raised is never reached. checking completeness against the
+    steps this watcher handled therefore passed a run that published nothing at all. the completeness
+    check reads the published-adapter fact instead, which no-repo can never set.
+    """
+    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+
+    local_dir = tmp_path / "ckpts"
+    (local_dir / "global_step_5" / "huggingface").mkdir(parents=True)
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("5")
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    # the real no-repo path: returns True without running either callback.
+    monkeypatch.setattr(
+        sft_checkpoints._w, "upload_resume_checkpoint", lambda step, ckpt, **kwargs: True
+    )
+    monkeypatch.setattr(
+        sft_checkpoints._w,
+        "publish_deployable_checkpoint",
+        lambda *a, **kw: pytest.fail("no repository, so nothing can be published"),
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(5,),
+    )
+    watcher._publish(5, str(local_dir / "global_step_5"))
+
+    assert watcher.lifecycle.facts(5).discovered
+    assert not watcher.lifecycle.facts(5).deployable_published
+    assert watcher.lifecycle.missing_deployables(watcher.required_steps) == [5]
+
+
+def test_a_publisher_keeping_up_still_publishes_every_periodic_save(monkeypatch, tmp_path):
+    """a singleton sweep remains publishable."""
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(50, 100), required_steps=()
+    )
+
+    # one sweep per checkpoint, which is what "keeping up" means.
+    for step in (50, 100):
+        pathlib.Path(watcher.local_dir, "latest_checkpointed_iteration.txt").write_text(str(step))
+        for pending_step, checkpoint_dir in watcher._publishable(watcher._pending()):
+            watcher._publish(pending_step, checkpoint_dir)
+
+    assert published == [50, 100], "a publisher that was keeping up still lost a checkpoint"
+
+
+def test_required_saves_are_never_skipped_even_when_the_publisher_lags(monkeypatch, tmp_path):
+    """required saves remain lossless across a backlog."""
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(350, 400, 450), required_steps=(350, 450)
+    )
+
+    for step, checkpoint_dir in watcher._publishable(watcher._pending()):
+        watcher._publish(step, checkpoint_dir)
+
+    assert published == [350, 450], f"a required save was dropped as superseded: {published}"
+
+
+def test_a_required_backlog_still_drops_its_superseded_optional_saves(monkeypatch, tmp_path):
+    """The coalescing must survive `save_at_steps`, which is when the disk is tightest.
+
+    Each export writes a full model copy to the container disk while training writes the next
+    checkpoint to the same disk, which is the whole reason superseded periodic saves are skipped.
+    Gating that on `required_steps` being EMPTY disabled it for every run that authored
+    `save_at_steps` -- so the runs most likely to lag were the ones that kept every copy.
+    """
+    watcher, published = _publishing_watcher(
+        monkeypatch, tmp_path, steps=(350, 400, 450), required_steps=(350,)
+    )
+
+    selected = [step for step, _ in watcher._publishable(watcher._pending())]
+    # 400 is superseded by the newer 450 and is dropped before any export runs. it is the export,
+    # not the sweep, that writes a full model copy beside the checkpoint training is still saving.
+    assert selected == [350, 450], f"a superseded optional save survived selection: {selected}"
+    assert watcher.lifecycle.facts(400).discovered, "the skipped step was not claimed"
+    assert not watcher.lifecycle.facts(400).deployable_published, (
+        "a skipped step must gain no durability fact"
+    )
+
+    for step, checkpoint_dir in watcher._publishable(watcher._pending()):
+        watcher._publish(step, checkpoint_dir)
+
+    # `_should_publish` still governs what is actually exported: with required steps authored, only
+    # those get an artifact. selection bounds the disk; publication honours the authored contract.
+    assert published == [350], (
+        f"an optional save was exported alongside a required one: {published}"
+    )
+
+
+def test_the_opd_watcher_publishes_every_step_despite_the_sft_bound(monkeypatch, tmp_path):
+    """opd keeps all pending retry states."""
+    from flash.engine.worker.train.opd import failures as opd_failures
+
+    watcher = opd_failures._OpdVerlCheckpointWatcher(
+        local_dir=str(tmp_path / "ckpts"),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(),
+        seed=0,
+        prompt_pool_fingerprint="fp",
+        prompts_per_step=1,
+        group_size=1,
+        accounting_state=lambda step: None,
+    )
+    pending = [(1, "/ckpts/global_step_1"), (2, "/ckpts/global_step_2")]
+
+    assert watcher._publishable(pending) == pending, (
+        "the opd watcher inherited the sft backlog skip, dropping a resume point"
+    )
+    assert watcher.lifecycle.discovered_steps == set(), (
+        "opd claimed a step during backlog selection without publishing it"
+    )
+
+
 def test_the_opd_watcher_still_keeps_its_export(monkeypatch, tmp_path):
     """the sft cleanup must not be generalized to the siblings that have a reader.
 
     `_OpdVerlCheckpointWatcher` subclasses the sft watcher, so a cleanup placed in a shared method
     would silently reach it. Both siblings hand their export to something that runs LATER -- rl
-    republishes from `staged_steps` on a subsequent sweep, opd passes `adapter_dir` into
+    republishes from `staged_adapters` on a subsequent sweep, opd passes `adapter_dir` into
     `_stage_retry_contract` -- so for them the directory is live state, not garbage. The sft path is
     safe to clear precisely because it has no such consumer.
 
@@ -3490,7 +4883,7 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     """the rl half of the same contract, driven across the two sweeps that actually span it.
 
     The rl uploader stages an adapter on the sweep a checkpoint appears and publishes it on a LATER
-    one, once the gradient gate opens -- `staged_steps` carries the path between them. That gap is
+    one, once the gradient gate opens -- `staged_adapters` carries the path between them. That gap is
     the whole reason the sft deletion cannot be lifted into shared code.
 
     The gate is what opens the gap, so the test has to close it. An earlier version passed
@@ -3548,13 +4941,14 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     # sweep one, gate SHUT: the step is staged because verl may prune its checkpoint at any time,
     # but nothing may be published yet. this is the window the adapter has to survive.
     for step, path in uploader._pending():
-        if step in uploader.required_steps and step not in uploader.staged_steps:
-            uploader.staged_steps[step] = uploader._stage_deployable(step, path)
+        if step in uploader.required_steps and step not in uploader.staged_adapters:
+            uploader.staged_adapters[step] = uploader._stage_deployable(step, path)
+            uploader.lifecycle.mark_staged(step)
             uploader._publish_ready()
-        uploader.processed_steps.add(step)
+        uploader.lifecycle.mark_discovered(step)
     uploader._publish_ready()
 
-    adapter_dir = uploader.staged_steps[4]
+    adapter_dir = uploader.staged_adapters[4]
     assert published == [], "the gradient gate was shut, so nothing may have been published"
     assert os.path.exists(os.path.join(adapter_dir, "adapter_model.safetensors")), (
         "the rl watcher discarded a staged adapter while the gradient gate was still shut"
@@ -3563,7 +4957,8 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     # verl is free to prune its own checkpoint now; only `export_root` carries the step forward.
     shutil.rmtree(checkpoint_dir)
 
-    # sweep two, gate OPEN: the surviving directory is read back out of `staged_steps` and published.
+    # sweep two, gate OPEN: the surviving directory is read back out of the staged adapters and
+    # published.
     gate_open = True
     uploader._publish_ready()
 
@@ -3571,49 +4966,6 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     assert os.path.exists(os.path.join(adapter_dir, "adapter_model.safetensors")), (
         "the rl watcher lost the adapter weights between staging and publication"
     )
-
-
-def test_a_failed_merge_does_not_strand_the_merge_tree(monkeypatch, tmp_path):
-    """the largest transient on the disk must not survive its own failure.
-
-    `merge_out` holds the full merged model, tens of gb on a real run. If the merger dies partway
-    through -- or writes a layout this code refuses -- deleting it only on the success path would
-    leave that tree behind on exactly the disk this module exists to protect, and the next save
-    would start with less room than this one had. Cleanup has to cover the resource's whole
-    lifetime, not just the happy path.
-    """
-    import subprocess
-
-    from flash.engine.worker.verl import checkpoints as verl_checkpoints
-
-    actor_dir = tmp_path / "global_step_3"
-    (actor_dir / "huggingface").mkdir(parents=True)
-    (actor_dir / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 512)
-    out_adapter = tmp_path / "adapter"
-    merge_out = tmp_path / "adapter_merge"
-
-    def dying_merge(*args, **kwargs):
-        # the merger writes most of the model, then fails: the exact shape of a disk-full death.
-        (merge_out / "model-00001-of-00002.safetensors").parent.mkdir(parents=True, exist_ok=True)
-        (merge_out / "model-00001-of-00002.safetensors").write_bytes(b"w" * 65536)
-        raise subprocess.CalledProcessError(1, "verl.model_merger")
-
-    monkeypatch.setattr(verl_checkpoints.subprocess, "run", dying_merge)
-    monkeypatch.setattr(
-        verl_checkpoints.shutil,
-        "disk_usage",
-        lambda path: SimpleNamespace(total=1 << 40, used=0, free=1 << 40),
-    )
-
-    with pytest.raises(subprocess.CalledProcessError):
-        verl_checkpoints.export_peft_adapter(
-            str(actor_dir),
-            str(out_adapter),
-            base_model_id="org/model",
-            python_bin="/verl/python",
-        )
-
-    assert not merge_out.exists(), "a failed merge left its partial model tree on the disk"
 
 
 def test_a_failed_export_does_not_strand_a_partial_adapter(monkeypatch, tmp_path):
@@ -3769,3 +5121,129 @@ def test_sft_result_records_the_micro_batch_that_ran_not_the_one_requested():
     from flash.engine.worker import sft_train_runner
 
     assert "micro_batch" in sft_train_runner._SftChild.__dataclass_fields__
+
+
+def test_an_unuploadable_resume_checkpoint_does_not_fail_a_published_required_save(
+    monkeypatch, tmp_path
+):
+    """a required step whose adapter IS durable must survive a resume upload that cannot succeed.
+
+    the reproducer is a real one. verl saves the whole model state dict with no trainable-only
+    filtering, so a lora run of a 27.59B model writes ~55 GB into ONE `model_world_size_*.pt`, over
+    the artifact store's 50 GB per-file ceiling. the upload fails at every retry, deterministically.
+    before this fix that raised and killed a run whose two steps had converged and whose adapter was
+    already published -- destroying finished work over internal restart state nothing would read.
+
+    `uploaded=False` with `before_upload` having run is exactly that shape: the deployable landed,
+    the full-state member did not.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    export_root = tmp_path / "exports"
+    checkpoint_dir = local_dir / "global_step_1"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        worker,
+        "publish_deployable_checkpoint",
+        lambda adapter, step, **kwargs: f"sft/run/checkpoints/step-{step}/adapter",
+    )
+    # the adapter publishes, then the oversized full-state member is rejected.
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), False)[1],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(export_root),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(1,),
+    )
+
+    watcher._publish(1, str(checkpoint_dir))
+
+    # the product artifact is durable, so the run continues.
+    assert watcher.lifecycle.facts(1).deployable_published
+    assert watcher.lifecycle.missing_deployables(watcher.required_steps) == []
+    # and the loss of restart state is recorded rather than hidden.
+    assert watcher.lifecycle.facts(1).failed
+    assert not watcher.lifecycle.facts(1).resume_uploaded
+
+
+def test_a_required_save_whose_adapter_never_published_still_fails_the_run(monkeypatch, tmp_path):
+    """the guarantee that must NOT be weakened: no deployable adapter is still fatal.
+
+    the sibling test above stops a missing RESUME upload from failing the run. this one pins the
+    other half -- a required step that never became servable must still raise -- so that relaxation
+    can never be widened into "required saves are best effort" without turning this red.
+    """
+    import flash.engine.worker as worker
+    from flash.engine.worker import sft_train
+
+    local_dir = tmp_path / "checkpoints"
+    checkpoint_dir = local_dir / "global_step_1"
+    (checkpoint_dir / "huggingface").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        sft_train,
+        "_export_checkpoint_adapter",
+        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
+    )
+    # None is what the real transport returns when nothing was published.
+    monkeypatch.setattr(
+        worker, "publish_deployable_checkpoint", lambda adapter, step, **kwargs: None
+    )
+    monkeypatch.setattr(
+        worker,
+        "upload_resume_checkpoint",
+        lambda step, ckpt, **kwargs: (kwargs["before_upload"](), True)[1],
+    )
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(1,),
+    )
+    watcher._publish(1, str(checkpoint_dir))
+
+    assert watcher.lifecycle.missing_deployables(watcher.required_steps) == [1]
+    # stop() is where the run learns about it, and it must still raise.
+    watcher.start()
+    with pytest.raises(RuntimeError, match="required saves were not durably published"):
+        watcher.stop(require_complete=True)
+
+
+def test_resume_upload_unavailable_reports_the_oversized_member(tmp_path, capsys):
+    """the operator message must name the file that blew the limit, not just say "not uploaded".
+
+    without the size the log is indistinguishable from a transient network failure, and the real
+    cause -- one member over a hard per-file ceiling, which no retry can fix -- stays invisible.
+    """
+    from flash.engine.worker.verl.checkpoints import resume_upload_unavailable
+
+    ckpt = tmp_path / "global_step_1"
+    (ckpt / "nested").mkdir(parents=True)
+    (ckpt / "model_world_size_1_rank_0.pt").write_bytes(b"x" * 4096)
+    (ckpt / "nested" / "small.pt").write_bytes(b"x" * 8)
+
+    resume_upload_unavailable(1, str(ckpt), job_label="sft")
+
+    out = capsys.readouterr().out
+    assert "step 1 resume checkpoint was not confirmed uploaded" in out
+    assert "largest member" in out, "the size that caused the failure must be reported"
+    # the deepest file must be walked, not just the top level, or a sharded layout reports 0.
+    assert "0.0 GB" in out

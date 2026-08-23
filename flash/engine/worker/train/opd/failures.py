@@ -25,10 +25,12 @@ from flash.engine.worker.sft_train import (
     _VerlCheckpointWatcher,
 )
 from flash.engine.worker.train.opd.bridge import _TeacherAlignmentBridge
+from flash.engine.worker.train.opd.child.bridge import _render_rollout_failure
 from flash.engine.worker.verl.checkpoints import (
     checkpoint_world_size,
     resume_checkpoint_is_loadable,
     resume_topology_matches,
+    resume_upload_unavailable,
 )
 from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 from flash.teacher.retry_contract import (
@@ -167,6 +169,7 @@ def _raise_verl_failure(
     no_signal_failure: tuple[str, str] | None = None,
     score_delivery_failure: tuple[str, str] | None = None,
     *,
+    rollout_failure: dict[str, str] | None = None,
     truncation_window: _TruncationWindow | None = None,
 ) -> None:
     if return_code == 0:
@@ -198,6 +201,11 @@ def _raise_verl_failure(
                 f"transient teacher failure after bounded retries: {message}"
             )
         raise RuntimeError(f"permanent teacher failure: {message}")
+    if rollout_failure is not None:
+        detail = _render_rollout_failure(rollout_failure)
+        if rollout_failure["classification"] == "transient":
+            raise _w.RetriableInfraError(f"transient multi-turn OPD rollout failure: {detail}")
+        raise RuntimeError(f"permanent multi-turn OPD rollout failure: {detail}")
     if return_code == _TRANSIENT_TEACHER_EXIT:
         raise _w.RetriableInfraError("transient teacher bridge failure")
     if return_code == _PERMANENT_TEACHER_EXIT:
@@ -291,15 +299,25 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
     def _should_publish(self, step: int) -> bool:
         return True
 
+    def _publishable(self, pending: list[tuple[int, str]]) -> list[tuple[int, str]]:
+        """keep every pending retry state because each checkpoint carries distinct accounting."""
+        return pending
+
     def _publish(self, step: int, checkpoint_dir: str) -> None:
         actor_dir = os.path.join(checkpoint_dir, "actor")
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
+        # claimed before the work: `_pending` filters on the discovered set, so leaving a step
+        # unclaimed while its export or retry-contract staging raises hands it straight back to the
+        # next sweep.
+        self.lifecycle.mark_discovered(step)
         _export_checkpoint_adapter(
             actor_dir,
             adapter_dir,
             model_id=self.model_id,
             model_revision=self.model_revision,
+            exclude_modules=self.exclude_modules,
             python_bin=self.python_bin,
+            preprocessor=self.preprocessor,
         )
         _stage_retry_contract(
             checkpoint_dir,
@@ -311,22 +329,33 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
             adapter_dir=adapter_dir,
             accounting_state=self.accounting_state(step),
         )
+        # the adapter and its retry contract are both on disk; opd keeps the export because
+        # `_stage_retry_contract` above has already copied from it and the resume state references it.
+        self.lifecycle.mark_staged(step)
 
         def publish_required_adapter() -> None:
             if step in self.required_steps:
+                # opd publishes only required steps, and a required publish raises rather than
+                # returning None, so reaching the next line IS the durable fact. sft needs a
+                # returned-subfolder check because its `required` varies per step.
                 _w.publish_deployable_checkpoint(
                     adapter_dir,
                     step,
                     required=True,
                     _provenance_ready=True,
                 )
+                self.lifecycle.mark_deployable_published(step)
 
         uploaded = _w.upload_resume_checkpoint(
-            step, checkpoint_dir, before_upload=publish_required_adapter
+            step,
+            checkpoint_dir,
+            before_upload=publish_required_adapter,
+            # the callback, not the return value: see mark_resume_uploaded's contract.
+            after_upload=lambda: self.lifecycle.mark_resume_uploaded(step),
         )
         if step in self.required_steps and not uploaded:
-            raise RuntimeError(f"required save step {step} full-state checkpoint was not published")
-        self.processed_steps.add(step)
+            self.lifecycle.mark_failed(step)
+            resume_upload_unavailable(step, checkpoint_dir, job_label="opd")
 
 
 def _restore_verl_resume(

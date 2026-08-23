@@ -1,7 +1,7 @@
 """Bootstrap shared by instance-based providers (e.g. Lambda). Runs inside the worker container.
 
 Stdlib + huggingface_hub only — never import flash here. Reads payload from ``/root/flash/payload.json``.
-Launch scripts must ship ``bootstrap_secrets.py`` (credential redaction) next to this file.
+Launch scripts must ship ``bootstrap_console.py``, ``bootstrap_secrets.py`` and ``bootstrap_pip.py``.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 if __package__:
+    from flash import source_snapshot as _source_snapshot
+    from flash.providers._lifecycle import bootstrap_console as _bootstrap_console
     from flash.providers._lifecycle import bootstrap_pip
     from flash.providers._lifecycle.bootstrap_secrets import (
         _payload_secrets,
@@ -29,7 +31,9 @@ if __package__:
 else:
     # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
     # same directory, and the script directory leads sys.path.
+    import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
+    import source_snapshot as _source_snapshot  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
         _read_console_tail,
@@ -38,12 +42,11 @@ else:
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
-_CONSOLE_UPLOAD_INTERVAL_S = 3600.0
+_CONSOLE_UPLOAD_INTERVAL_S = _bootstrap_console._CONSOLE_UPLOAD_INTERVAL_S
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
 _CONSOLE_UPLOAD_REAP_RESERVE_S = 2 * _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S
-_HF_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
 _TERMINAL_MARKER_GRACE_S = 0.25
@@ -134,41 +137,28 @@ def load_payload() -> dict:
 
 
 def _arm(payload: dict) -> str:
-    return str(payload.get("flash_arm") or "instance")
+    arm = payload.get("flash_arm")
+    if not isinstance(arm, str) or not arm:
+        raise ValueError("bootstrap payload is missing flash_arm")
+    return arm
 
 
-def _code_prefix(payload: dict) -> str:
-    raw = payload.get("code_prefix")
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("missing code_prefix")
-    prefix = raw.strip().strip("/")
-    parts = prefix.split("/")
-    digest = parts[1] if len(parts) == 3 else ""
-    if (
-        len(parts) != 3
-        or parts[0] != "code"
-        or parts[2] != "flash"
-        or len(digest) != 32
-        or any(c not in "0123456789abcdef" for c in digest)
-    ):
-        raise ValueError(f"invalid code_prefix: {prefix!r}")
-    return prefix
+def _source_descriptor(payload: dict):
+    return _source_snapshot.parse_descriptor(payload.get("source_snapshot"))
 
 
 def _code_dir(payload: dict) -> str:
-    raw = payload.get("code_prefix")
-    if not isinstance(raw, str) or not raw.strip():
-        return os.path.join(CODE_ROOT, "code")
-    return os.path.join(CODE_ROOT, os.path.dirname(_code_prefix(payload)))
+    return str(
+        _source_snapshot.attempt_materialization_path(
+            CODE_ROOT,
+            payload.get("run_id"),
+            payload.get("attempt"),
+        )
+    )
 
 
 def _hf_status_code(exc: BaseException) -> int | None:
-    response = getattr(exc, "response", None)
-    code = getattr(response, "status_code", None)
-    try:
-        return int(code)
-    except (TypeError, ValueError):
-        return None
+    return _source_snapshot.response_status_code(exc)
 
 
 def _hf_retry_after(exc: BaseException) -> float | None:
@@ -195,28 +185,26 @@ def _hf_retry_after(exc: BaseException) -> float | None:
     return min(_HF_RETRY_AFTER_MAX_S, max(0.0, seconds))
 
 
-def _hf_call(call, label: str, *, deadline_at: float | None = None, secrets: dict | None = None):
+def _hf_call(call, label: str, *, deadline_at: float, secrets: dict | None = None):
     """``secrets`` must carry the run's payload secrets whenever the wrapped call takes a payload
     credential (the retried error message can echo it, and it is absent from ``os.environ``)."""
     for attempt in range(len(_HF_RETRY_DELAYS_S) + 1):
-        if deadline_at is not None:
-            remaining = deadline_at - _finite_positive_number(time.time(), "current clock")
-            if remaining <= 0:
-                raise TimeoutError(f"{label} exceeded the run wall deadline")
+        remaining = deadline_at - _finite_positive_number(time.time(), "current clock")
+        if remaining <= 0:
+            raise TimeoutError(f"{label} exceeded the run wall deadline")
         try:
             return call()
         except Exception as exc:
-            if _hf_status_code(exc) not in _HF_TRANSIENT_STATUS_CODES or attempt >= len(
+            if not _source_snapshot.is_transient_fetch_error(exc) or attempt >= len(
                 _HF_RETRY_DELAYS_S
             ):
                 raise
             retry_after = _hf_retry_after(exc)
             delay = retry_after if retry_after is not None else _HF_RETRY_DELAYS_S[attempt]
-            if deadline_at is not None:
-                remaining = deadline_at - _finite_positive_number(time.time(), "current clock")
-                if remaining <= 0:
-                    raise TimeoutError(f"{label} exceeded the run wall deadline") from None
-                delay = min(delay, remaining)
+            remaining = deadline_at - _finite_positive_number(time.time(), "current clock")
+            if remaining <= 0:
+                raise TimeoutError(f"{label} exceeded the run wall deadline") from None
+            delay = min(delay, remaining)
             print(
                 f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
                 f"{_safe_detail(exc, 500, secrets=secrets)}",
@@ -233,12 +221,12 @@ def hf_upload(
     repo_subpath: str,
     *,
     enforce_deadline: bool = True,
-) -> None:
+) -> bool:
     """Upload one artifact under the run's HF prefix; never raises."""
     try:
         from huggingface_hub import HfApi
 
-        if enforce_deadline and "deadline_at" in payload:
+        if enforce_deadline:
             require_deadline_at(payload)
         HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
             path_or_fileobj=local_path,
@@ -246,22 +234,40 @@ def hf_upload(
             repo_id=payload["hf_repo"],
             repo_type="dataset",
         )
+        return True
     except Exception as exc:
         print(
             f"hf upload warn ({repo_subpath}): {_safe_detail(exc, secrets=_payload_secrets(payload))}",
             flush=True,
         )
+        return False
 
 
-def _upload_console_snapshot(payload: dict, console: str, mode: str, extra: str = "") -> None:
-    """Upload one console snapshot from an isolated process."""
-    tail_path = console + ".tail"
+def _upload_console_snapshot(
+    payload: dict, console: str, mode: str, extra: str = "", final: bool = False
+) -> bool:
+    """Upload one console snapshot from an isolated process.
+
+    The periodic snapshot and the terminal one never share a scratch file or a repo destination.
+    Reaping the periodic child at teardown is best-effort, so one killed mid-write would otherwise
+    truncate the scratch file the terminal snapshot is uploading, or overwrite the terminal artifact
+    itself -- losing the failure detail the control plane reads, including the wall-clock-cap marker.
+
+    The terminal snapshot keeps the canonical ``console_<mode>.txt`` the control plane reads; the
+    periodic one takes the attempt-scoped name it reads separately, matching the serverless handler,
+    so a retry cannot overwrite the attempt that reproduced the failure. This module can never
+    import flash, so the format is spelled out here and pinned against
+    ``flash.adapters.artifacts.attempt_scoped_artifact_name`` by test rather than by coincidence --
+    a name the reader does not expect looks exactly like a worker that uploaded nothing.
+    """
+    kind = "" if final else f"_attempt{payload.get('attempt', 0)}"
+    tail_path = f"{console}{kind}.tail"
     tail = _read_console_tail(console, 64_000, secrets=_payload_secrets(payload))
     if extra:
         tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
         f.write(_safe_detail(tail, 64_000, secrets=_payload_secrets(payload)))
-    hf_upload(payload, tail_path, f"console_{mode}.txt")
+    return hf_upload(payload, tail_path, f"console_{mode}{kind}.txt")
 
 
 def _console_upload_loop(
@@ -271,14 +277,17 @@ def _console_upload_loop(
     interval_s: float,
     stop_upload,
 ) -> None:
-    while not stop_upload.wait(interval_s):
+    def upload() -> bool:
         try:
-            _upload_console_snapshot(payload, console, mode)
+            return _upload_console_snapshot(payload, console, mode)
         except Exception as exc:
             print(
                 f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
                 flush=True,
             )
+            return False
+
+    _bootstrap_console._run_console_upload_loop(console, interval_s, stop_upload, upload=upload)
 
 
 def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
@@ -446,7 +455,7 @@ def _upload_console_tail_bounded(
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_upload_console_snapshot,
-        args=(payload, console, mode, extra),
+        args=(payload, console, mode, extra, True),
         daemon=True,
     )
     process.start()
@@ -463,8 +472,7 @@ def hf_file_exists(payload: dict, repo_subpath: str) -> bool:
     """True iff ``<hf_prefix>/<repo_subpath>`` exists in the run's HF dataset repo. Raises on API error."""
     from huggingface_hub import HfApi
 
-    if "deadline_at" in payload:
-        require_deadline_at(payload)
+    require_deadline_at(payload)
     api = HfApi(token=(payload.get("env") or {}).get("HF_TOKEN"))
     return api.file_exists(
         repo_id=payload["hf_repo"],
@@ -509,6 +517,8 @@ def fetch_spec_from_hf(payload: dict) -> str:
 def build_worker_env(payload: dict) -> dict:
     env = dict(os.environ)
     env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
+    env.pop("GITHUB_TOKEN", None)
+    env.pop("GIT_ASKPASS", None)
     spec_json = payload.get("job_spec_json")
     if not spec_json and payload.get("job_spec_in_hf"):
         # Pre-worker fetch; failure is infra-shaped → raise RetriableBootstrapError so poller retries.
@@ -557,45 +567,36 @@ def install_extra_pip(payload: dict) -> None:
 
 
 def fetch_code(payload: dict) -> None:
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import hf_hub_download
 
     deadline_at = require_deadline_at(payload)
-    prefix = _code_prefix(payload)
+    descriptor = _source_descriptor(payload)
     token = (payload.get("env") or {}).get("HF_TOKEN")
-    api = HfApi(token=token)
-    files = [
-        entry.path
-        for entry in _hf_call(
-            lambda: list(
-                api.list_repo_tree(
-                    repo_id=payload["hf_repo"],
-                    repo_type="dataset",
-                    path_in_repo=prefix,
-                    recursive=True,
-                    token=token,
-                )
-            ),
-            f"list flash code under {payload['hf_repo']}:{prefix}",
-            deadline_at=deadline_at,
-            secrets=_payload_secrets(payload),
-        )
-        if getattr(entry, "path", None) and getattr(entry, "size", None) is not None
-    ]
-    if not files:
-        raise RuntimeError(f"no flash code files found under {payload['hf_repo']}:{prefix}")
-    for filename in files:
-        _hf_call(
-            lambda filename=filename: hf_hub_download(
+    try:
+        archive_path = _hf_call(
+            lambda: hf_hub_download(
                 repo_id=payload["hf_repo"],
                 repo_type="dataset",
-                filename=filename,
-                local_dir=CODE_ROOT,
+                filename=descriptor.archive_path,
+                revision=descriptor.revision,
                 token=token,
             ),
-            f"download flash code file {payload['hf_repo']}:{filename}",
+            "download pinned flash source snapshot",
             deadline_at=deadline_at,
             secrets=_payload_secrets(payload),
         )
+    except Exception as exc:
+        error_type = (
+            RetriableBootstrapError
+            if _source_snapshot.is_transient_fetch_error(exc)
+            else RuntimeError
+        )
+        raise error_type("failed to fetch the pinned flash source snapshot") from None
+    _source_snapshot.materialize_verified_archive_file(
+        archive_path,
+        descriptor,
+        _code_dir(payload),
+    )
 
 
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
@@ -641,22 +642,16 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         pump_secrets = _payload_secrets(payload)
 
         def pump():
+            """tee sanitized output to the provider log and raw output to the console file.
+
+            only this process knows payload secret values. keep the end of oversized lines because
+            native stacks and json diagnostics place the root cause there.
+            """
             try:
                 for line in proc.stdout:
                     with pump_write_lock:
                         if not pump_writes_enabled:
                             return
-                        # this process's stdout is the instance's container log, which the control
-                        # plane pulls as the failure detail (vast holds the box after a non-zero
-                        # exit precisely so it can). only this process knows the run's secret
-                        # VALUES, so each echoed child line is sanitized here at the source -- the
-                        # control-plane sanitizer downstream cannot value-redact a runtime secret
-                        # whose name it never sees. mirrors the runpod serverless handler. the
-                        # console FILE keeps the raw line; its upload path sanitizes the tail.
-                        # the bound keeps the END of an oversized line: the root cause sits at the
-                        # end of a native stack or json blob, and the control plane's failure
-                        # detail reads the provider's instance log rather than the uploaded
-                        # console, so a prefix cut here loses it everywhere.
                         print(
                             _safe_detail(line, 100_000, secrets=pump_secrets, keep="end"),
                             end="",
@@ -763,6 +758,12 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
         "run_id": run_id,
         "ts": now,
     }
+    if ok:
+        marker["source_attestation"] = _source_snapshot.source_attestation(
+            _source_descriptor(payload),
+            run_id=run_id,
+            attempt=attempt,
+        )
     p = "/tmp/attempt_marker.json"
     with open(p, "w") as f:
         json.dump(marker, f)
@@ -907,13 +908,9 @@ def main() -> int:
             error = "model preload failed" if not ok else ""
             return 0 if ok else 1
         deadline_watchdog = arm_deadline_watchdog(deadline, payload)
+        # fetch and verify the pinned archive before pip, downloaded imports, path mutation, or child.
+        fetch_code(payload)
         install_extra_pip(payload)
-        # Pre-worker HF fetch of the run's own code (control plane uploaded it before submit), same
-        # infra-shaped class as fetch_spec_from_hf above: a transient HF blip must retry, not fail.
-        try:
-            fetch_code(payload)
-        except Exception:
-            raise RetriableBootstrapError("failed to fetch run code from HF") from None
         env = build_worker_env(payload)
         phase = payload["phase"]
         for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):

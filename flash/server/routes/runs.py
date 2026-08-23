@@ -11,6 +11,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 import flash.runner as _runner
+from flash.engine.profiling.image_tokens import ImageGeometryUnavailable
 from flash.runner import (
     DeploymentRevocationError,
     DeploymentStatePersistenceError,
@@ -242,12 +243,15 @@ def _record_environment_use(
 def _submit_failure_http_error(exc: Exception) -> HTTPException:
     """Classify a failed submission as the submitter's fault or the plane's.
 
-    Everything reaching here was a bad request by default, which is right for a spec the user must
-    change and wrong for the half of the managed-teacher gate they cannot act on: an unset
-    plane-side credential is an outage they can only wait out. Calling that a bad request would
-    re-create, one layer up, the very conflation the gate was hoisted to submit time to end.
+    Everything reaching here is a bad request by default. Submit-time errors may opt into 503 with
+    a truthy ``plane_fault`` attribute when the submitter cannot fix the failure by changing the spec.
     """
-    if isinstance(exc, TeacherBrokerConfigurationError) and exc.plane_fault:
+    if isinstance(exc, _runner.SourceSnapshotPublicationError):
+        return HTTPException(status_code=503, detail=str(exc))
+    if (
+        isinstance(exc, (ImageGeometryUnavailable, TeacherBrokerConfigurationError))
+        and exc.plane_fault
+    ):
         return HTTPException(status_code=503, detail=str(exc))
     return HTTPException(status_code=400, detail=str(exc))
 
@@ -475,12 +479,13 @@ def run_logs(
                     status_code=400, detail=f"invalid log offset {offset}: {exc}"
                 ) from exc
             end = f.tell()
+    public_status = status.to_dict()
     return {
         "run_id": run_id,
         "logs": chunk,
         "offset": end,
         "state": status.state,
-        "last_heartbeat": status.last_heartbeat,
+        "last_heartbeat": public_status.get("last_heartbeat"),
         "gpu_status": status.gpu_status,
     }
 
