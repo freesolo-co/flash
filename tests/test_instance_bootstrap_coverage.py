@@ -2164,17 +2164,21 @@ def test_periodic_console_snapshot_cannot_clobber_the_terminal_one(tmp_path, mon
     assert b._upload_console_snapshot(payload, str(console), "sft", cap, True) is True
 
     live_path, live_name = uploads[0]
-    terminal_path, terminal_name = uploads[1]
-    # distinct scratch files and distinct destinations, so neither write can reach the other.
-    assert (live_path, terminal_path) != (terminal_path, terminal_path)
+    terminal_scoped_path, terminal_scoped_name = uploads[1]
+    terminal_path, terminal_name = uploads[2]
+    # distinct scratch files, so a periodic child killed mid-write cannot truncate the terminal one.
     assert live_path == str(console) + "_attempt3.tail"
-    assert terminal_path == str(console) + ".tail"
-    # the terminal artifact keeps the canonical name the control plane reads; the live one takes the
-    # attempt-scoped name it reads separately. bootstrap.py cannot import flash, so the inlined
-    # format is pinned against the canonical helper here rather than trusted to stay in step.
+    assert terminal_scoped_path == terminal_path == str(console) + ".tail"
+    # the terminal tail lands on THIS attempt's scoped name FIRST and on the canonical alias second.
+    # scoped-first matters twice: the reader ranks by the attempt in the filename and scores the
+    # unsuffixed canonical -1, so a terminal tail uploaded only as canonical loses to this attempt's
+    # own mid-run snapshot; and if the alias upload fails, the authoritative copy is already there.
+    # bootstrap.py cannot import flash, so the inlined format is pinned against the canonical helper
+    # here rather than trusted to stay in step.
     from flash.adapters.artifacts import attempt_scoped_artifact_name
 
     assert live_name == attempt_scoped_artifact_name("console", "sft", 3)
+    assert terminal_scoped_name == attempt_scoped_artifact_name("console", "sft", 3)
     assert terminal_name == "console_sft.txt"
     # only the terminal artifact carries the wall-clock-cap evidence, and it survives intact.
     terminal_tail = (tmp_path / "console_sft.txt.tail").read_text()

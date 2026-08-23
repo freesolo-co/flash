@@ -2756,6 +2756,62 @@ def test_worker_artifacts_keep_previous_attempt_evidence_until_the_retry_uploads
     }
 
 
+def test_worker_artifacts_surface_the_terminal_tail_not_the_mid_run_snapshot(monkeypatch, tmp_path):
+    """The crash evidence lives in the terminal tail, so the attempt's own stale snapshot must lose.
+
+    Both files are 64 KB tails of the same child console taken at different times. The periodic one
+    stops wherever the last upload happened to land; the terminal one is written after the child
+    exits. On a real 27B crash the periodic snapshot ended mid cudagraph capture and the terminal
+    tail continued 56k further, holding the entire CUDA traceback.
+
+    The selector ranks by the attempt in the filename and scores the unsuffixed canonical -1, so a
+    terminal tail written ONLY to ``console_<phase>.txt`` can never outrank ``_attempt<N>`` and the
+    traceback is unreachable. The writer therefore uploads the terminal tail to the attempt-scoped
+    name too, which is what this asserts: same attempt, terminal content wins.
+    """
+    import types
+
+    import huggingface_hub
+
+    from flash.server.platform.runtime import _worker_artifacts
+
+    spec = types.SimpleNamespace(
+        phase="rl",
+        run_id="r1",
+        train=types.SimpleNamespace(hf_repo="org/repo"),
+    )
+    terminal = "Traceback (most recent call last):\nCUDA error: an illegal memory access\n"
+    content = {
+        # the terminal upload overwrote this attempt's periodic snapshot, so the scoped name now
+        # holds the complete tail rather than the capture bar it stopped at mid-run.
+        "rl/r1/console_rl_attempt0.txt": terminal,
+        "rl/r1/console_rl.txt": terminal,
+        "rl/r1/error_rl_attempt0.txt": "verl.trainer.main_ppo exited 1\n",
+    }
+
+    def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
+        if filename not in content:
+            raise FileNotFoundError(filename)
+        path = tmp_path / filename.replace("/", "_")
+        path.write_text(content[filename])
+        return str(path)
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def list_repo_files(self, repo_id, repo_type):
+            return list(content)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+
+    out = _worker_artifacts(spec)
+    # attempt-scoped, so `flash runs log` can still label its provenance and tag its heartbeats.
+    assert "illegal memory access" in out["console_rl_attempt0.txt"]
+    assert "console_rl.txt" not in out
+
+
 def test_local_env_path_rejected(api):
     # Managed runs accept Freesolo environment ids; local [environment] paths are rejected.
     key = _login()
