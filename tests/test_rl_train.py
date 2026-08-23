@@ -1122,6 +1122,30 @@ def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
     assert not any("drop_last" in override for override in o)
 
 
+def test_build_verl_overrides_sizes_max_num_seqs_to_the_rollout_batch():
+    """The rollout engine must be provisioned for the batch the step submits, not verl's default.
+
+    verl leaves ``rollout.max_num_seqs`` at 1024 (rollout.yaml:79). vllm derives
+    ``max_cudagraph_capture_size = min(max_num_seqs * 2, 512)`` over the ladder
+    ``[1,2,4] + range(8,256,8) + range(256,513,16)`` -- 51 sizes at the default, doubled to 102
+    graphs under the FULL_AND_PIECEWISE cudagraph mode verl requests -- and a gdn/mamba hybrid
+    additionally reserves one recurrent state block per decode slot. Both are paid up front, inside
+    the gpu_memory_utilization budget, so a 32-sequence run died at graph capture on 234, 358 and
+    460 GB alike.
+    """
+    o = rl_train.build_verl_overrides(_overrides_cfg(prompts_per_step=8, group_size=4))
+    assert "actor_rollout_ref.rollout.max_num_seqs=32" in o
+    # and never verl's default, which is what made the reservation fixed rather than proportional.
+    assert not any(override == "actor_rollout_ref.rollout.max_num_seqs=1024" for override in o)
+
+
+def test_build_verl_overrides_floors_max_num_seqs_for_a_tiny_rollout_batch():
+    # a batch of 1 would otherwise capture a single graph size and push every wider decode step
+    # onto the eager path.
+    o = rl_train.build_verl_overrides(_overrides_cfg(prompts_per_step=1, group_size=1))
+    assert "actor_rollout_ref.rollout.max_num_seqs=16" in o
+
+
 def test_build_verl_overrides_sizes_agent_loop_workers_to_the_rollout_batch():
     # verl chunks prompts_per_step * group_size across agent.num_workers and asserts exact
     # divisibility; its default of 8 aborts before the first step on e.g. 2 x 2 = 4.

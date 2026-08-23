@@ -19,6 +19,7 @@ from flash.engine.worker.backend_common import (
     ray_num_cpus,
     render_tf32_shim,
     render_tilelang_cudart_shim,
+    rollout_max_num_seqs,
     rollout_resident_overrides,
     trainer_dtype_overrides,
 )
@@ -230,6 +231,15 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         (
             "actor_rollout_ref.rollout.agent.num_workers="
             f"{agent_loop_workers(int(config['train_batch_size']) * int(config['group_size']))}"
+        ),
+        # one opd step submits exactly train_batch_size * group_size student generations. verl's
+        # 1024 default makes vllm reserve cuda-graph capture sizes -- and, on a gdn/mamba hybrid,
+        # one recurrent state block per decode slot -- for a batch this run never submits. both are
+        # allocated before the first token, so the over-provisioning OOMs a card that stays mostly
+        # free. `rollout.max_num_seqs` is a real verl field, so this is a plain override.
+        (
+            "actor_rollout_ref.rollout.max_num_seqs="
+            f"{rollout_max_num_seqs(int(config['train_batch_size']) * int(config['group_size']))}"
         ),
     ]
 

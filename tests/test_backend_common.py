@@ -56,6 +56,36 @@ def test_agent_loop_workers_rejects_a_nonpositive_batch():
         vc.agent_loop_workers(0)
 
 
+@pytest.mark.parametrize(
+    ("rollout_batch", "expected"),
+    [(1, 16), (4, 16), (16, 16), (32, 32), (64, 64), (512, 512)],
+)
+def test_rollout_max_num_seqs_tracks_the_rollout_batch_above_the_floor(rollout_batch, expected):
+    assert vc.rollout_max_num_seqs(rollout_batch) == expected
+
+
+def test_rollout_max_num_seqs_never_returns_verls_default_for_a_small_batch():
+    # the regression this exists for: verl leaves rollout.max_num_seqs at 1024, and vllm sizes
+    # cuda-graph capture (min(max_num_seqs * 2, 512) over a 51-rung ladder, doubled under
+    # FULL_AND_PIECEWISE) and per-slot gdn/mamba recurrent state from it, both before the first
+    # rollout token. a 32-sequence grpo step paid a 1024-sequence reservation and OOMed during
+    # capture with ~80% of the card free.
+    for batch in (8, 32, 64, 128):
+        assert vc.rollout_max_num_seqs(batch) < 1024
+
+
+def test_rollout_max_num_seqs_is_never_below_the_batch_it_must_serve():
+    # provisioning FEWER slots than the step submits would queue sequences instead of running them,
+    # turning one rollout into several scheduler passes.
+    for batch in range(1, 600):
+        assert vc.rollout_max_num_seqs(batch) >= batch
+
+
+def test_rollout_max_num_seqs_rejects_a_nonpositive_batch():
+    with pytest.raises(ValueError, match="rollout_batch must be positive"):
+        vc.rollout_max_num_seqs(0)
+
+
 def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
     # the exact failure that killed both real-gpu arms: a 1x4090 pod on a 48-core host. the quota is
     # the container's truth, so a large affinity mask must NOT win over it.

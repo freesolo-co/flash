@@ -322,6 +322,39 @@ def agent_loop_workers(rollout_batch: int, *, cap: int = 8) -> int:
     return workers
 
 
+# never provision fewer slots than this, however small the batch. vllm derives its cuda-graph
+# ladder from max_num_seqs, so a batch of 1 would capture a single size and force every wider
+# decode step onto the eager path; 16 keeps a few rungs at negligible cost.
+_MIN_ROLLOUT_MAX_NUM_SEQS = 16
+
+
+def rollout_max_num_seqs(rollout_batch: int) -> int:
+    """concurrent sequence slots to provision the rollout engine for.
+
+    verl leaves ``rollout.max_num_seqs`` at its yaml default of 1024 (rollout.yaml:79), and vllm
+    sizes two up-front, fixed allocations from it -- neither of which shrinks to the batch actually
+    submitted:
+
+    * cuda-graph capture. ``max_cudagraph_capture_size = min(max_num_seqs * 2, 512)``
+      (vllm config/vllm.py:1668-1682) over the ladder ``[1,2,4] + range(8,256,8) +
+      range(256,513,16)``. at 1024 that is 51 sizes, doubled to 102 graphs under the
+      ``FULL_AND_PIECEWISE`` cudagraph mode verl requests.
+    * recurrent state. a gdn/mamba hybrid needs ONE state block per decode slot
+      (vllm config/compilation.py:1453), a dense reservation that -- unlike paged kv -- cannot be
+      shared, paged out, or grown on demand.
+
+    both are paid before the first rollout token, inside the ``gpu_memory_utilization`` budget. a
+    grpo/opd step submits exactly ``prompts_per_step * group_size`` sequences, so a run with 32
+    concurrent generations was provisioning for 1024 and dying at graph capture with ~80% of the
+    card free -- on 234, 358, and 460 GB alike, since the cost is fixed rather than proportional.
+
+    the floor keeps small runs on a usable capture ladder rather than collapsing it to one size.
+    """
+    if rollout_batch <= 0:
+        raise ValueError("rollout_batch must be positive")
+    return max(_MIN_ROLLOUT_MAX_NUM_SEQS, int(rollout_batch))
+
+
 # worker threads each bridge serves requests from. the bridges are pure i/o relays (parse json,
 # hand the payload to a callback, write json back), so this bounds concurrency, not throughput:
 # requests beyond the pool wait in the listen backlog instead of each spawning an os thread.

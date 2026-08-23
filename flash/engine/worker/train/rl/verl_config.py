@@ -17,6 +17,7 @@ from flash.engine.profiling.sft_workload import _multimodal_messages_with_images
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
+    rollout_max_num_seqs,
     rollout_resident_overrides,
     rollout_sleep_unsupported,
     trainer_dtype_overrides,
@@ -309,6 +310,11 @@ def _rollout_overrides(cfg: dict) -> list[str]:
         # (agent_loop.py:1111 -> protocol.py:874). choose the largest divisor of
         # prompts_per_step * group_size up to 8, so small or final short batches cannot abort.
         f"actor_rollout_ref.rollout.agent.num_workers={agent_loop_workers(int(cfg['prompts_per_step']) * int(cfg['group_size']))}",
+        # one grpo step submits exactly prompts_per_step * group_size sequences. left unset verl
+        # keeps its 1024 default, and vllm sizes cuda-graph capture and (on a gdn/mamba hybrid)
+        # per-slot recurrent state from that number, both up front -- so a 32-sequence run paid a
+        # 1024-sequence reservation and OOMed during capture with most of the card still free.
+        f"actor_rollout_ref.rollout.max_num_seqs={rollout_max_num_seqs(int(cfg['prompts_per_step']) * int(cfg['group_size']))}",
         # multi-turn runs flash's own agent loop, registered in the child by flash_grpo_plugin. the
         # stock single_turn_agent generates once and returns; it has no notion of an environment
         # reply, so a multi-turn env on the default loop would train on first turns only.
