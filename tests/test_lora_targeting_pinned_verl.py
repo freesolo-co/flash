@@ -23,7 +23,7 @@ from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 from flash.engine.worker.backend_common import VERL_REQUIREMENT_URL
 from flash.engine.worker.train.core.child import runtime as child_runtime
 
-_PINNED_COMMIT = "32d6200de81dc484893baf8b9cf30297ebe7fa49"
+_PINNED_COMMIT = "f71a02ddb32a9c6a6915f7519bda6dede92e9dd0"
 _PINNED_BLOBS = {
     "base_config.py": (BaseConfig, "f425dd1464b0f13c83a0944249cd84d55903f120"),
     "model.py": (HFModelConfig, "95814663dcaa91f7e2984b1d4c39ca042712c485"),
