@@ -2756,18 +2756,15 @@ def test_worker_artifacts_keep_previous_attempt_evidence_until_the_retry_uploads
     }
 
 
-def test_worker_artifacts_surface_the_terminal_tail_not_the_mid_run_snapshot(monkeypatch, tmp_path):
-    """The crash evidence lives in the terminal tail, so the attempt's own stale snapshot must lose.
+def test_worker_artifacts_surface_the_terminal_console_tail_not_only_the_snapshot(
+    monkeypatch, tmp_path
+):
+    """The crash lands in the canonical console, which the attempt ranking scores -1.
 
-    Both files are 64 KB tails of the same child console taken at different times. The periodic one
-    stops wherever the last upload happened to land; the terminal one is written after the child
-    exits. On a real 27B crash the periodic snapshot ended mid cudagraph capture and the terminal
-    tail continued 56k further, holding the entire CUDA traceback.
-
-    The selector ranks by the attempt in the filename and scores the unsuffixed canonical -1, so a
-    terminal tail written ONLY to ``console_<phase>.txt`` can never outrank ``_attempt<N>`` and the
-    traceback is unreachable. The writer therefore uploads the terminal tail to the attempt-scoped
-    name too, which is what this asserts: same attempt, terminal content wins.
+    The periodic snapshot is written mid-run to the attempt-scoped name; the terminal tail is written
+    at teardown to ``console_<phase>.txt``. They are separate destinations on purpose, so the newest
+    NAME is not the newest CONTENT: ranking by attempt picks the scoped snapshot and stops, hiding
+    the tail that actually holds the traceback. Fetch both so the failure is reachable.
     """
     import types
 
@@ -2780,13 +2777,11 @@ def test_worker_artifacts_surface_the_terminal_tail_not_the_mid_run_snapshot(mon
         run_id="r1",
         train=types.SimpleNamespace(hf_repo="org/repo"),
     )
-    terminal = "Traceback (most recent call last):\nCUDA error: an illegal memory access\n"
     content = {
-        # the terminal upload overwrote this attempt's periodic snapshot, so the scoped name now
-        # holds the complete tail rather than the capture bar it stopped at mid-run.
-        "rl/r1/console_rl_attempt0.txt": terminal,
-        "rl/r1/console_rl.txt": terminal,
-        "rl/r1/error_rl_attempt0.txt": "verl.trainer.main_ppo exited 1\n",
+        # mid-run snapshot: healthy, and the highest-ranked name.
+        "rl/r1/console_rl_attempt0.txt": "HEARTBEAT attempt=0 step=3\n",
+        # terminal tail: the same stream, 56k further on, ending in the crash.
+        "rl/r1/console_rl.txt": ("HEARTBEAT attempt=0 step=3\nCUDA error: an illegal memory access\n"),
     }
 
     def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
@@ -2807,9 +2802,10 @@ def test_worker_artifacts_surface_the_terminal_tail_not_the_mid_run_snapshot(mon
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
     out = _worker_artifacts(spec)
-    # attempt-scoped, so `flash runs log` can still label its provenance and tag its heartbeats.
-    assert "illegal memory access" in out["console_rl_attempt0.txt"]
-    assert "console_rl.txt" not in out
+    assert "illegal memory access" in out["console_rl.txt"]
+    # the snapshot stays: on a retry whose terminal upload never ran, the canonical name can belong
+    # to an OLDER attempt, and the scoped one is then the only evidence for the live attempt.
+    assert out["console_rl_attempt0.txt"] == "HEARTBEAT attempt=0 step=3\n"
 
 
 def test_local_env_path_rejected(api):
