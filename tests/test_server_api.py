@@ -2781,7 +2781,9 @@ def test_worker_artifacts_surface_the_terminal_console_tail_not_only_the_snapsho
         # mid-run snapshot: healthy, and the highest-ranked name.
         "rl/r1/console_rl_attempt0.txt": "HEARTBEAT attempt=0 step=3\n",
         # terminal tail: the same stream, 56k further on, ending in the crash.
-        "rl/r1/console_rl.txt": ("HEARTBEAT attempt=0 step=3\nCUDA error: an illegal memory access\n"),
+        "rl/r1/console_rl.txt": (
+            "HEARTBEAT attempt=0 step=3\nCUDA error: an illegal memory access\n"
+        ),
     }
 
     def fake_dl(repo_id, repo_type, filename, token=None, force_download=False):
