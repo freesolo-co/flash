@@ -348,13 +348,19 @@ def _write_all(fd: int, value: str) -> None:
 def _secret_descriptor(value: str):
     read_fd, write_fd = os.pipe()
     errors: list[BaseException] = []
+    value_holder = [value]
+    del value
 
     def populate() -> None:
+        secret = value_holder.pop()
         try:
-            _write_all(write_fd, value)
+            _write_all(write_fd, secret)
         except BaseException as exc:
             errors.append(exc)
         finally:
+            # the writer may block until a large value is consumed, so drop its final raw reference
+            # as soon as the write finishes rather than retaining it for the long-lived with-body.
+            del secret
             with contextlib.suppress(OSError):
                 os.close(write_fd)
 
@@ -546,12 +552,13 @@ def _prepare_explicit_secrets(
     return _run_with_secrets(environment, inference, artifact)
 
 
-def _run_prepared(
-    prepared: tuple[str, SimpleNamespace, Any], startup_signals: _StartupSignalGuard
-) -> None:
-    inference_token, args, manifest = prepared
+def _run_prepared(prepared: list[Any], startup_signals: _StartupSignalGuard) -> None:
+    inference_token = prepared.pop(0)
+    args, manifest = prepared
     emit_boot_progress("entering-serve", host=args.host, port=args.port)
     with _secret_descriptor(inference_token) as inference_fd:
+        # the descriptor owns the write now, so this frame must not retain the raw token while serving.
+        del inference_token
         asyncio.run(
             _serve(
                 args,
@@ -563,7 +570,7 @@ def _run_prepared(
 
 
 def run_launcher_with_secrets(
-    inference_token: str,
+    inference_token_holder: list[str],
     artifact_token_holder: list[str | None],
     *,
     environment: MutableMapping[str, str] | None = None,
@@ -575,12 +582,16 @@ def run_launcher_with_secrets(
     with _StartupSignalGuard() as startup_signals:
         if previous_signal_guard is not None:
             startup_signals.adopt_previous(previous_signal_guard)
+        if type(inference_token_holder) is not list or len(inference_token_holder) != 1:
+            raise LaunchError("inference token holder is invalid")
         if type(artifact_token_holder) is not list or len(artifact_token_holder) != 1:
             raise LaunchError("artifact token holder is invalid")
+        inference_token = inference_token_holder.pop()
         artifact_token = artifact_token_holder.pop()
-        prepared = _prepare_explicit_secrets(environment, inference_token, artifact_token)
-        # strings cannot be zeroed, so the only meaningful boundary is removing the last live
-        # reference after hydration returns and before the long-lived server frame exists.
+        prepared = list(_prepare_explicit_secrets(environment, inference_token, artifact_token))
+        # strings cannot be zeroed, so the only meaningful boundary is removing every live
+        # bootstrap reference before the long-lived server frame exists.
+        del inference_token
         del artifact_token
         _run_prepared(prepared, startup_signals)
 

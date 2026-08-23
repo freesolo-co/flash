@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import inspect
 import os
 import subprocess
 import sys
+import time
 import types
 import uuid
+import weakref
 from pathlib import Path
 
 import pytest
@@ -44,7 +47,7 @@ def _environment(tmp_path: Path, *, artifact: bool = True) -> dict[str, str]:
 def _run_with_environment(environment: dict[str, str]) -> None:
     inference_token = environment.pop("FLASH_INFERENCE_TOKEN")
     artifact_token = environment.pop("FLASH_ARTIFACT_TOKEN", None)
-    launch.run_launcher_with_secrets(inference_token, [artifact_token], environment=environment)
+    launch.run_launcher_with_secrets([inference_token], [artifact_token], environment=environment)
 
 
 @pytest.fixture(autouse=True)
@@ -140,7 +143,7 @@ def test_bootstrap_handoff_installs_inner_guard_before_restoring_outer(
     monkeypatch.setattr(launch, "_serve", _successful_serve({}))
 
     launch.run_launcher_with_secrets(
-        INFERENCE_TOKEN,
+        [INFERENCE_TOKEN],
         [None],
         environment=environment,
         previous_signal_guard=PreviousGuard(),
@@ -273,9 +276,19 @@ def _value_contains_secret(value: object, fingerprint: bytes, seen: set[int]) ->
     return False
 
 
-def _secret_reachability_probe(fingerprint: bytes, expected_frames: set[str]):
+def _secret_reachability_probe(
+    fingerprint: bytes,
+    expected_frames: set[str],
+    *,
+    inference_fingerprint: bytes | None = None,
+):
     async def serve(_args, _manifest, *, inference_token_fd: int, on_signals_installed):
-        assert read_artifact_token_fd(inference_token_fd) == INFERENCE_TOKEN
+        inference_token = read_artifact_token_fd(inference_token_fd)
+        if inference_fingerprint is None:
+            assert inference_token == INFERENCE_TOKEN
+        else:
+            assert hashlib.sha256(inference_token.encode()).digest() == inference_fingerprint
+        del inference_token
         frames: dict[str, object] = {}
         frame = inspect.currentframe()
         while frame is not None:
@@ -308,6 +321,42 @@ def _unpredictable_artifact_token() -> tuple[str, bytes]:
     return token, hashlib.sha256(token.encode()).digest()
 
 
+def test_secret_descriptor_releases_its_source_after_the_consumer_reads() -> None:
+    class WeakToken(str):
+        __slots__ = ("__weakref__",)
+
+    expected = f"inference-{uuid.uuid4().hex}"
+    token = WeakToken(expected)
+    token_reference = weakref.ref(token)
+
+    with launch._secret_descriptor(token) as token_fd:
+        del token
+        assert read_artifact_token_fd(token_fd) == expected
+        deadline = time.monotonic() + 1
+        while token_reference() is not None and time.monotonic() < deadline:
+            gc.collect()
+            time.sleep(0.001)
+        assert token_reference() is None
+
+
+def test_secret_descriptor_chains_the_original_write_failure(monkeypatch) -> None:
+    failure = OSError("write failed")
+
+    def fail_write(_fd: int, _value: str) -> None:
+        raise failure
+
+    monkeypatch.setattr(launch, "_write_all", fail_write)
+    with (
+        pytest.raises(
+            launch.LaunchError, match=r"^secret descriptor could not be populated$"
+        ) as exc_info,
+        launch._secret_descriptor(INFERENCE_TOKEN) as token_fd,
+    ):
+        assert os.read(token_fd, 1) == b""
+
+    assert exc_info.value.__cause__ is failure
+
+
 def test_explicit_launcher_drops_the_artifact_token_before_the_server_loop(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -323,7 +372,37 @@ def test_explicit_launcher_drops_the_artifact_token_before_the_server_loop(
 
     holder = [artifact_token]
     del artifact_token
-    launch.run_launcher_with_secrets(INFERENCE_TOKEN, holder, environment=environment)
+    launch.run_launcher_with_secrets([INFERENCE_TOKEN], holder, environment=environment)
+
+
+def test_root_bootstrap_drops_the_inference_token_before_the_server_loop(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import runpy
+
+    inference_token = f"inference-{uuid.uuid4().hex}"
+    fingerprint = hashlib.sha256(inference_token.encode()).digest()
+    environment = _environment(tmp_path, artifact=False)
+    environment["FLASH_INFERENCE_TOKEN"] = inference_token
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    del inference_token
+    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(
+        launch,
+        "_serve",
+        _secret_reachability_probe(
+            fingerprint,
+            {"_run", "run_launcher_with_secrets", "_run_prepared"},
+            inference_fingerprint=fingerprint,
+        ),
+    )
+    bootstrap = runpy.run_path(
+        Path(__file__).resolve().parents[1] / "serve_launch.py",
+        run_name="serve_launch_inference_retention_probe",
+    )
+
+    bootstrap["_run"]()
 
 
 def test_root_bootstrap_drops_the_artifact_token_before_the_server_loop(
@@ -680,7 +759,7 @@ launch._serve = serve
 try:
     inference_token = environment.pop("FLASH_INFERENCE_TOKEN")
     artifact_token = environment.pop("FLASH_ARTIFACT_TOKEN", None)
-    launch.run_launcher_with_secrets(inference_token, [artifact_token], environment=environment)
+    launch.run_launcher_with_secrets([inference_token], [artifact_token], environment=environment)
 except launch.StartupTerminated:
     pass
 else:
@@ -749,7 +828,7 @@ launch._serve = app_main._serve
 try:
     inference_token = environment.pop("FLASH_INFERENCE_TOKEN")
     artifact_token = environment.pop("FLASH_ARTIFACT_TOKEN", None)
-    launch.run_launcher_with_secrets(inference_token, [artifact_token], environment=environment)
+    launch.run_launcher_with_secrets([inference_token], [artifact_token], environment=environment)
 except launch.StartupTerminated as exc:
     assert exc.exit_code == 128 + launch.signal.SIGTERM
 else:
