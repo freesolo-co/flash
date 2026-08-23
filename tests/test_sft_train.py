@@ -22,6 +22,7 @@ from flash.content.multimodal import message_content_text
 from flash.engine.profiling.sft_image_rows import _serialize_multimodal_inputs
 from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.entry.sft import _pretokenize_completion_only
+from flash.engine.worker.runtime.kernel_warmup import KERNEL_CACHE_ENV_SUBDIRS
 from flash.engine.worker.sft_train import (
     _CHILD_ENV_PREFIXES,
     _LORAPLUS_READY_MARKER,
@@ -2308,21 +2309,16 @@ def test_shared_child_environment_scrubs_declared_prefixed_secrets(monkeypatch, 
     assert inherited["PYTHONPATH"] == os.pathsep.join((str(tmp_path), "synthetic-pythonpath"))
 
 
-def test_child_env_carries_the_baked_kernel_cache_dirs(monkeypatch, tmp_path):
+def test_child_env_carries_every_baked_kernel_cache_dir(monkeypatch, tmp_path):
     """the child is the interpreter that trains, so it must inherit the baked cache locations.
 
-    Dockerfile.worker sets these five image-wide to /opt/flash/kernelcache. they are the ONLY way to
-    address the baked per-sm cache, so dropping them makes the child re-JIT what the bake already
-    built. TORCHINDUCTOR_CACHE_DIR is pinned explicitly because it does NOT match the "TORCH_"
-    prefix -- its sixth character is "I" -- so a prefix-based fix would silently miss it.
+    driven off KERNEL_CACHE_ENV_SUBDIRS rather than a hardcoded list, so a var added to the cache
+    layout later is covered here automatically instead of silently going un-inherited.
     """
     baked = {
-        "TRITON_CACHE_DIR": "/opt/flash/kernelcache/triton",
-        "TORCHINDUCTOR_CACHE_DIR": "/opt/flash/kernelcache/inductor",
-        "FLASHINFER_CUBIN_DIR": "/opt/flash/kernelcache/flashinfer_cubin",
-        "FLASHINFER_CACHE_DIR": "/opt/flash/kernelcache/flashinfer",
-        "FLASHINFER_WORKSPACE_BASE": "/opt/flash/kernelcache/flashinfer",
+        var: f"/opt/flash/kernelcache/{subdir}" for var, subdir in KERNEL_CACHE_ENV_SUBDIRS.items()
     }
+    assert baked, "the cache layout must not be empty, or this test proves nothing"
     for name, value in baked.items():
         monkeypatch.setenv(name, value)
 
