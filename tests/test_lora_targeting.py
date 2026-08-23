@@ -755,3 +755,26 @@ def test_multimodal_export_publishes_when_only_the_language_stack_trained(tmp_pa
     stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", exclude_modules=None)
     saved = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["exclude_modules"] is None
+
+
+def test_config_targets_images_reads_only_an_explicit_null_marker():
+    """The smoke reader must not treat an UNMARKED config as multimodal.
+
+    `flash/engine/worker/model/adapter.py` spells the same question
+    `config.get("exclude_modules") is None`, which answers True for an absent key. That is right for
+    a warm start, where an unmarked source is rejected by `require_modality_marker` before this ever
+    matters and a mismatch raises. It is wrong for the deployment smoke: claiming multimodal on an
+    unmarked adapter asks a text-only adapter an image question and fails the deploy. Pin the
+    divergence so neither spelling drifts into the other.
+    """
+    from flash.adapters.targets import config_targets_images
+
+    assert config_targets_images({"exclude_modules": None}) is True
+    assert config_targets_images({"exclude_modules": r"^(?!model)(?:\.|$).*$"}) is False
+
+    unmarked = {"r": 32}
+    assert config_targets_images(unmarked) is False
+    assert (unmarked.get("exclude_modules") is None) is True, (
+        "the warm-start spelling still reads unmarked as multimodal; the two readers are "
+        "deliberately different and this test exists to keep that difference visible"
+    )

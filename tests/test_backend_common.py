@@ -4813,6 +4813,39 @@ def test_rollout_max_num_seqs_is_never_below_the_batch_it_must_serve():
         assert rollout_max_num_seqs(batch) >= batch
 
 
+def test_rollout_layered_summon_is_on_for_fused_expert_targets():
+    # the regression this exists for: verl's collect_lora_params default branch opens
+    # FSDP.summon_full_params over the WHOLE model, so every layer's fused expert stack is
+    # unsharded at once. on Qwen3.6-35B-A3B one layer's mlp.experts.gate_up_proj is
+    # [128, 2048, 2048] bf16 = exactly 1024 MiB, which is the contiguous allocation that OOMed at
+    # step 0 on a 180 GB B200 across every card count and context tested.
+    from flash.engine.worker.verl.capabilities import rollout_layered_summon_overrides
+
+    assert rollout_layered_summon_overrides(
+        ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
+    ) == ["actor_rollout_ref.rollout.layered_summon=true"]
+
+
+@pytest.mark.parametrize("empty", [None, [], (), ""])
+def test_rollout_layered_summon_stays_off_for_dense_models(empty):
+    # the layered walk summons one submodule at a time and empty_cache()s between, which is slower.
+    # a dense model's per-tensor gathers are small, so it keeps verl's default.
+    from flash.engine.worker.verl.capabilities import rollout_layered_summon_overrides
+
+    assert rollout_layered_summon_overrides(empty) == []
+
+
+def test_rollout_layered_summon_uses_a_bare_override_not_an_append():
+    # layered_summon is declared in verl's rollout.yaml (rollout.yaml:98) AND the generated trainer
+    # config, so hydra already has the key. a '+' prefix -- required for dataclass-only fields like
+    # enable_sleep_mode -- would be an append to an existing key and fail the config merge.
+    from flash.engine.worker.verl.capabilities import rollout_layered_summon_overrides
+
+    (override,) = rollout_layered_summon_overrides(["mlp.experts.gate_up_proj"])
+    assert not override.startswith("+")
+    assert override.startswith("actor_rollout_ref.rollout.layered_summon=")
+
+
 def test_rollout_max_num_seqs_rejects_a_nonpositive_batch():
     from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
 

@@ -17,6 +17,7 @@ from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
+    rollout_layered_summon_overrides,
     rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
     shim_marker_file,
@@ -181,6 +182,9 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
             if config.get("mm_encoder_attn_backend")
             else []
         ),
+        # fused-expert lora models gather the weight sync one submodule at a time, as the grpo path
+        # does; opd shares verl's collect_lora_params. requires load_format=safetensors above.
+        *rollout_layered_summon_overrides(config.get("target_parameters")),
         *rollout_mm_processor_cache_overrides(),
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
         # sleep_unsupported), exactly as the grpo path does. opd is NOT exempt: main_ppo_sync calls

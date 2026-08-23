@@ -93,9 +93,40 @@ def test_deploy_dry_run_has_no_user_facing_mode():
     assert "est_idle_cost_usd_per_day" not in data
 
 
+@pytest.mark.parametrize(
+    ("marker", "targets_images"),
+    [(None, True), (r"^(?!model)(?:\.|$).*$", False), (pytest.param(..., False, id="missing"))],
+)
+def test_adapter_artifact_metadata_reads_the_exported_modality_marker(
+    monkeypatch, marker, targets_images
+):
+    from flash.serve import adapter_check
+
+    config = {"r": 32}
+    if marker is not ...:
+        config["exclude_modules"] = marker
+    monkeypatch.setattr(
+        adapter_check,
+        "_load_adapter_config",
+        lambda *_args, **_kwargs: (config, "run/adapter/adapter_config.json"),
+    )
+    monkeypatch.setattr(adapter_check, "_verify_adapter_artifact_tensors", lambda *a, **k: None)
+
+    metadata = adapter_check.adapter_artifact_metadata(
+        "org/repo", "run/adapter", hf_revision="a" * 40
+    )
+
+    assert metadata.lora_rank == 32
+    assert metadata.targets_images is targets_images
+
+
 def _stub_deploy_preconditions(monkeypatch, deploy_mod) -> None:
     monkeypatch.setattr(deploy_mod, "resolve_hf_revision", lambda repo: "a" * 40)
-    monkeypatch.setattr(deploy_mod, "adapter_artifact_lora_rank", lambda *a, **k: 32)
+    monkeypatch.setattr(
+        deploy_mod,
+        "adapter_artifact_metadata",
+        lambda *a, **k: types.SimpleNamespace(lora_rank=32, targets_images=False),
+    )
     monkeypatch.setattr(
         deploy_mod,
         "_require_serving_capabilities",
@@ -342,12 +373,12 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
 
     monkeypatch.setattr(deploy, "resolve_hf_revision", lambda repo: events.append("sha") or sha)
 
-    def artifact_rank(repo, subfolder, *, hf_revision):
+    def artifact_metadata(repo, subfolder, *, hf_revision):
         assert hf_revision == sha
         events.append("verify")
-        return 32
+        return types.SimpleNamespace(lora_rank=32, targets_images=True)
 
-    monkeypatch.setattr(deploy, "adapter_artifact_lora_rank", artifact_rank)
+    monkeypatch.setattr(deploy, "adapter_artifact_metadata", artifact_metadata)
 
     def _caps(**_kwargs):
         events.append("capabilities")
@@ -394,13 +425,20 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
 
     monkeypatch.setattr(deploy, "_wait_revision_ready", wait_ready)
 
-    def smoke(adapter_revision, checkpoint, *, advertised_capabilities=None):
+    def smoke(
+        adapter_revision,
+        checkpoint,
+        *,
+        advertised_capabilities=None,
+        adapter_targets_images=None,
+    ):
         assert adapter_revision == revision
         assert checkpoint == "flash-1-abc/step-20"
-        # deploy_adapter gated on the capability set BEFORE registration; the smoke has to be
-        # handed that same set rather than re-asking a backend that may have rolled since.
+        # deploy_adapter gated on the capability set and read adapter metadata before registration;
+        # the smoke receives those exact facts rather than repeating either request after gpu startup.
         assert advertised_capabilities is not None
         assert "immutable_adapter_revisions" in advertised_capabilities
+        assert adapter_targets_images is True
         events.append("smoke")
 
     previous = "flash-1-abc@step-10." + "c3" * 20

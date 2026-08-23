@@ -19,6 +19,7 @@ from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
+    rollout_layered_summon_overrides,
     rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
     rollout_sleep_unsupported,
@@ -350,6 +351,10 @@ def _rollout_overrides(cfg: dict) -> list[str]:
         ),
         # safetensors load format is required for lora rollout on vllm.
         "actor_rollout_ref.rollout.load_format=safetensors",
+        # fused-expert lora models gather the weight sync one submodule at a time; the whole-model
+        # summon materializes every layer's expert stack at once. requires load_format=safetensors
+        # above, which verl checks as base_sync_done before allowing the layered walk.
+        *rollout_layered_summon_overrides(cfg.get("target_parameters")),
         *rollout_mm_processor_cache_overrides(),
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
         # sleep_unsupported). shared with the opd driver, which runs the same verl sleep path.

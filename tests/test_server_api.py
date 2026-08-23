@@ -3614,8 +3614,12 @@ def test_deployment_transitions_report_persisted_states_and_skip_dry_run(api, mo
         "reconciling",
         "ready",
     ]
-    assert calls[-1].deployment["verify_kind"] == "fixed_image"
-    assert calls[-1].deployment["verify_lora_request_adapter"] == revision
+    # this fixture's SPEC is a text-only grpo run, so no multimodal targeting is recorded and the
+    # smoke falls back to the text challenge. verify_kind follows the adapter's recorded modality,
+    # not the base model's image capability, and lora-request attestation is collected only on the
+    # image path -- so the text smoke records no attested revision.
+    assert calls[-1].deployment["verify_kind"] == "fixed_prompt"
+    assert "verify_lora_request_adapter" not in calls[-1].deployment
 
 
 def test_deployment_reporting_skips_failed_cas_and_reports_failure(api, monkeypatch):
