@@ -1276,9 +1276,7 @@ def test_build_verl_overrides_enables_layered_summon_for_fused_expert_targets():
     # weight-sync gather, and must keep load_format=safetensors, which verl requires as
     # base_sync_done before it will allow the layered walk (fsdp_utils.py:684 raises otherwise).
     o = rl_train.build_verl_overrides(
-        _overrides_cfg(
-            target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
-        )
+        _overrides_cfg(target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
     )
     assert "actor_rollout_ref.rollout.layered_summon=true" in o
     assert "actor_rollout_ref.rollout.load_format=safetensors" in o
