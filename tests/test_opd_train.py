@@ -9255,3 +9255,26 @@ def test_opd_accounting_gate_keeps_the_first_failure_reason():
     state.fail("bridge shutdown")
     with pytest.raises(RuntimeError, match="exited with code 1"):
         state.checkpoint_state(1, timeout_s=600.0)
+
+
+def test_overrides_size_max_num_seqs_to_the_opd_rollout_batch():
+    """OPD colocates the student engine with the trainer, so a wasted reservation is fatal.
+
+    Left unset, verl passes its 1024 default to vllm, which sizes cuda-graph capture and (on a
+    gdn/mamba hybrid) one recurrent state block per decode slot from it -- both before the first
+    student generation and inside the same gpu_memory_utilization budget the resident trainer
+    already shares.
+    """
+    overrides = dict(
+        value.split("=", 1)
+        for value in build_opd_overrides(_config(train_batch_size=8, group_size=4))
+    )
+    assert overrides["actor_rollout_ref.rollout.max_num_seqs"] == "32"
+
+
+def test_overrides_floor_max_num_seqs_for_a_tiny_opd_rollout_batch():
+    overrides = dict(
+        value.split("=", 1)
+        for value in build_opd_overrides(_config(train_batch_size=1, group_size=1))
+    )
+    assert overrides["actor_rollout_ref.rollout.max_num_seqs"] == "16"
