@@ -1271,6 +1271,24 @@ def _overrides_cfg(**over):
     return cfg
 
 
+def test_build_verl_overrides_enables_layered_summon_for_fused_expert_targets():
+    # end-to-end through the real builder: a fused-expert model must reach verl with the layered
+    # weight-sync gather, and must keep load_format=safetensors, which verl requires as
+    # base_sync_done before it will allow the layered walk (fsdp_utils.py:684 raises otherwise).
+    o = rl_train.build_verl_overrides(
+        _overrides_cfg(
+            target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
+        )
+    )
+    assert "actor_rollout_ref.rollout.layered_summon=true" in o
+    assert "actor_rollout_ref.rollout.load_format=safetensors" in o
+
+
+def test_build_verl_overrides_omits_layered_summon_for_dense_models():
+    o = rl_train.build_verl_overrides(_overrides_cfg(target_parameters=None))
+    assert not [x for x in o if "layered_summon" in x]
+
+
 def test_build_verl_overrides_carries_dr_grpo_recipe():
     o = rl_train.build_verl_overrides(_overrides_cfg())
     assert "algorithm.adv_estimator=grpo" in o

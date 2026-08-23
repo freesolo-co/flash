@@ -828,6 +828,38 @@ def rollout_resident_overrides(sleep_unsupported: bool) -> list[str]:
     ]
 
 
+def rollout_layered_summon_overrides(target_parameters: object) -> list[str]:
+    """gather the fsdp weight sync one submodule at a time for fused-expert lora models.
+
+    the rollout weight sync collects lora params through ``collect_lora_params``
+    (verl ``utils/fsdp_utils.py:673``). its default branch opens
+    ``FSDP.summon_full_params(module)`` over the WHOLE model, so every layer's expert stack is
+    unsharded and resident simultaneously. ``layered_summon`` takes
+    ``layered_summon_lora_params`` instead, which summons one submodule at a time and calls
+    ``empty_cache()`` between layers, so the peak is a single layer's slab.
+
+    that difference only matters when a target tensor is large. a non-empty ``target_parameters``
+    is exactly the fused-moe case (``lora_target_parameters`` resolves it from the catalog id, not
+    the snapshot path), and there ``mlp.experts.gate_up_proj`` is a fused bf16
+    slab of ``lora_expert_count x 2048 x 1024 x 2`` bytes -- on Qwen3.6-35B-A3B
+    (``lora_expert_count=256``) that is 1,073,741,824 bytes, i.e. EXACTLY 1024 MiB, which is
+    precisely the contiguous request that OOM'd at step 0 on a 180 GB B200 across every card count
+    and context tested. dense models keep verl's
+    default: their per-tensor gathers are small and the layered walk is slower.
+
+    verl gates the layered path on the base weights already living in vllm
+    (``fsdp_utils.py:684``: it raises unless ``base_sync_done``, which
+    ``engine_workers.py:614`` derives as ``"dummy" not in load_format``). the rl and opd drivers
+    both already pin ``load_format=safetensors``, so that precondition holds wherever this
+    applies. ``layered_summon`` is a rollout dataclass field
+    (``workers/config/rollout.py:261``) that is also declared in ``rollout.yaml:98``, so it takes
+    a bare override.
+    """
+    if not target_parameters:
+        return []
+    return ["actor_rollout_ref.rollout.layered_summon=true"]
+
+
 def rollout_mm_processor_cache_overrides() -> list[str]:
     """disable vllm's split multimodal processor cache for every verl rollout.
 
