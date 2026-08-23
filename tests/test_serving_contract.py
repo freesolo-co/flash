@@ -394,9 +394,13 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
 
     monkeypatch.setattr(deploy, "_wait_revision_ready", wait_ready)
 
-    def smoke(adapter_revision, checkpoint):
+    def smoke(adapter_revision, checkpoint, *, advertised_capabilities=None):
         assert adapter_revision == revision
         assert checkpoint == "flash-1-abc/step-20"
+        # deploy_adapter gated on the capability set BEFORE registration; the smoke has to be
+        # handed that same set rather than re-asking a backend that may have rolled since.
+        assert advertised_capabilities is not None
+        assert "immutable_adapter_revisions" in advertised_capabilities
         events.append("smoke")
 
     previous = "flash-1-abc@step-10." + "c3" * 20

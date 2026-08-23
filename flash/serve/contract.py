@@ -9,6 +9,10 @@ IMMUTABLE_ADAPTER_REVISIONS_CAPABILITY = "immutable_adapter_revisions"
 ALIAS_COMPARE_AND_SWAP_CAPABILITY = "alias_compare_and_swap"
 REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
+# the serving backend echoes back WHICH LoRA answered a request. like revision provenance
+# this is produced by the serving image, not by the run, so a client cannot make it appear
+# by changing the adapter, the config, or the training.
+LORA_REQUEST_ATTESTATION_CAPABILITY = "lora_request_attestation"
 # 16 mib of compressed images expands below 22 mib in base64, leaving over 2 mib for json and text.
 MAX_CHAT_REQUEST_BYTES = 24 * 1024 * 1024
 
