@@ -526,17 +526,19 @@ def _run_deployment_smoke(
     *,
     serving_model: str,
     expected_checkpoint: str,
-    # the capability set deploy_adapter already gated this deployment on. see
-    # `_lora_attestation_advertised` for why this is handed down instead of re-fetched.
+    # these facts were captured before the smoke; re-fetching inside the paid deadline can disagree
+    # with the deployment that was actually registered or consume its verification budget.
     advertised_capabilities: frozenset[str] | None = None,
+    adapter_targets_images: bool | None = None,
     budget_s: float = _SMOKE_BUDGET_SECONDS,
 ) -> dict:
     started = time.monotonic()
     deadline = started + budget_s
     constraint, max_tokens, stop_sequences = _smoke_request_settings(spec)
-    from flash.core.catalog import supports_image_training
-
-    image_capable = supports_image_training(spec.model)
+    # only an explicit multimodal targeting marker enables the image challenge. unavailable metadata
+    # falls back to the weaker text smoke: it gives up vision-path verification, but cannot strand a
+    # working text adapter by asking a task it was never trained for.
+    use_image_challenge = adapter_targets_images is True
     attestation_advertised = _lora_attestation_advertised(advertised_capabilities)
     expected_colour, image_messages = _smoke_image_challenge(run_id)
     result = _bounded_smoke_chat(
@@ -544,8 +546,8 @@ def _run_deployment_smoke(
         thinking=spec.thinking,
         expected_checkpoint=expected_checkpoint,
         expected_adapter_revision=serving_model,
-        messages=image_messages if image_capable else None,
-        structured_outputs={} if image_capable and constraint is not None else None,
+        messages=image_messages if use_image_challenge else None,
+        structured_outputs={} if use_image_challenge and constraint is not None else None,
         max_tokens=max_tokens,
         stop_sequences=stop_sequences,
         deadline=deadline,
@@ -559,7 +561,7 @@ def _run_deployment_smoke(
     )
     verify_turns = 1
     attested_adapter_revision: str | None = None
-    if image_capable:
+    if use_image_challenge:
         attested_adapter_revision = _smoke_lora_request_adapter(
             result, serving_model, attestation_advertised=attestation_advertised
         )
@@ -602,7 +604,7 @@ def _run_deployment_smoke(
         raise _smoke_timeout_error(budget_s)
     smoke_result = {
         "verified_at": time.time(),
-        "verify_kind": "fixed_image" if image_capable else "fixed_prompt",
+        "verify_kind": "fixed_image" if use_image_challenge else "fixed_prompt",
         "verify_turns": verify_turns,
         "verify_latency_s": time.monotonic() - started,
         "verify_finish_reason": finish,

@@ -44,6 +44,23 @@ def require_modality_marker(config: Mapping[str, Any], *, source: str) -> None:
         )
 
 
+def config_targets_images(config: Mapping[str, Any]) -> bool:
+    """Whether an exported adapter targeted the image stack, per its own modality marker.
+
+    Homed beside `resolve_lora_targeting`, which WRITES the marker, so producer and consumer stay
+    one definition. `require_modality_marker` rejects an absent key wherever the answer must be
+    trustworthy -- a warm start trains the wrong module surface if it guesses. This reader is for
+    callers that must stay non-fatal instead, so it answers False for an absent or non-null marker
+    and reserves True for the producer's explicit json null.
+
+    That asymmetry is deliberate and is why this is not `config.get("exclude_modules") is None`:
+    that spelling reads an UNMARKED config as multimodal, which is the safe default for a warm
+    start (mismatch raises) but the unsafe one for a deployment smoke, where claiming multimodal
+    asks a text-only adapter an image question it was never trained for and fails the deploy.
+    """
+    return "exclude_modules" in config and config["exclude_modules"] is None
+
+
 def resolve_lora_targeting(model_id: str, *, algorithm: str, multimodal: bool) -> LoraTargeting:
     """Resolve fresh-training targets without changing an authored warm-start adapter."""
     model = validate_model_for_algorithm(model_id, algorithm)

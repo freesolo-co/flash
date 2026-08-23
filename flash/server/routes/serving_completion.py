@@ -266,6 +266,7 @@ def _finish_deployment_unlocked(
         checkpoint: str,
         *,
         advertised_capabilities: frozenset[str] | None = None,
+        adapter_targets_images: bool | None = None,
     ) -> None:
         nonlocal activation_target, current
         _assert_activation_fence()
@@ -287,6 +288,7 @@ def _finish_deployment_unlocked(
                 serving_model=adapter_revision,
                 expected_checkpoint=checkpoint,
                 advertised_capabilities=advertised_capabilities,
+                adapter_targets_images=adapter_targets_images,
             )
         )
         current = _deployment_state(

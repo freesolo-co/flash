@@ -12,15 +12,23 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 
 from flash.adapters.artifacts import has_loadable_adapter_weights, is_adapter_weight_filename
 from flash.adapters.lora_rank import rank_from_adapter_config
+from flash.adapters.targets import config_targets_images
 from flash.serve.errors import AdapterConfigMissing, AdapterTensorMissing, ServingError
 
 # The accepted weight-file shapes live beside the filenames themselves so serving validation and
 # `flash.serve.export` cannot drift apart. The alias name is load-bearing: `flash.serve.deploy`
 # re-exports it and the serving tests resolve it there.
 _is_adapter_tensor_filename = is_adapter_weight_filename
+
+
+@dataclass(frozen=True)
+class AdapterArtifactMetadata:
+    lora_rank: int
+    targets_images: bool
 
 
 def _is_hf_not_found_error(exc: Exception) -> bool:
@@ -127,8 +135,7 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str, *, hf_revisio
         )
 
 
-def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str) -> int:
-    """Read rank metadata and verify the adapter has tensor weights."""
+def _load_adapter_config(hf_repo: str, subfolder: str, *, hf_revision: str) -> tuple[dict, str]:
     filename = f"{subfolder.rstrip('/')}/adapter_config.json"
     try:
         from huggingface_hub import hf_hub_download
@@ -160,5 +167,18 @@ def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str
         raise ValueError(
             f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
         )
+    return config, filename
+
+
+def adapter_artifact_metadata(
+    hf_repo: str, subfolder: str, *, hf_revision: str
+) -> AdapterArtifactMetadata:
+    """Read adapter metadata and verify that tensor weights exist."""
+    config, filename = _load_adapter_config(hf_repo, subfolder, hf_revision=hf_revision)
     _verify_adapter_artifact_tensors(hf_repo, subfolder, hf_revision=hf_revision)
-    return rank_from_adapter_config(config, source=f"{hf_repo}:{filename}")
+    return AdapterArtifactMetadata(
+        lora_rank=rank_from_adapter_config(config, source=f"{hf_repo}:{filename}"),
+        # non-fatal by construction: an unmarked or malformed marker reads as text-only, so modality
+        # uncertainty weakens the smoke rather than stranding an otherwise usable deployment.
+        targets_images=config_targets_images(config),
+    )

@@ -299,27 +299,27 @@ def deployment_record(
 
 
 def _call_before_activate(
-    callback: Callable[..., None], revision: str, checkpoint: str, advertised: frozenset[str]
+    callback: Callable[..., None],
+    revision: str,
+    checkpoint: str,
+    advertised: frozenset[str],
+    *,
+    adapter_targets_images: bool,
 ) -> None:
-    """Invoke the pre-activation callback, passing the advertised capability set when it takes one.
-
-    The capability set is a KEYWORD so a callback that does not care keeps its two-argument
-    signature. Introspected rather than try/except-TypeError, because swallowing a TypeError would
-    also swallow one raised from INSIDE the callback and silently skip the smoke.
-    """
+    """Invoke the pre-activation callback with the deployment facts it declares."""
     import inspect
 
     try:
         parameters = inspect.signature(callback).parameters
     except (TypeError, ValueError):  # builtins and C callables are not introspectable
         parameters = {}
-    accepts = "advertised_capabilities" in parameters or any(
-        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
-    )
-    if accepts:
-        callback(revision, checkpoint, advertised_capabilities=advertised)
-    else:
-        callback(revision, checkpoint)
+    accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+    kwargs = {}
+    if accepts_kwargs or "advertised_capabilities" in parameters:
+        kwargs["advertised_capabilities"] = advertised
+    if accepts_kwargs or "adapter_targets_images" in parameters:
+        kwargs["adapter_targets_images"] = adapter_targets_images
+    callback(revision, checkpoint, **kwargs)
 
 
 def deploy_adapter(
@@ -335,11 +335,9 @@ def deploy_adapter(
     org_id: str | None = None,
     checkpoint_step: int | None = None,
     expected_adapter_revision: str | None = None,
-    # called as (adapter_revision, checkpoint, advertised_capabilities=...). the capability set is
-    # the one THIS deployment already gated on above, handed down rather than re-fetched: a second
-    # /healthz call can hit a different replica mid-rollout, or fail transiently, and answer a
-    # question this deployment has already settled. passed as a KEYWORD so a callback that does
-    # not need it keeps its two-argument signature.
+    # called with the immutable target plus keyword-only deployment facts already read here. handing
+    # them down avoids re-fetching either health or adapter metadata from inside the paid smoke path.
+    # keywords preserve two-argument callbacks that do not need those facts.
     before_activate: Callable[..., None] | None = None,
 ) -> Deployment:
     """Register, verify, and atomically activate one immutable adapter revision.
@@ -360,9 +358,10 @@ def deploy_adapter(
         return dep
 
     hf_revision = resolve_hf_revision(hf_repo)
+    artifact_metadata = adapter_artifact_metadata(hf_repo, subfolder, hf_revision=hf_revision)
     validate_serving_lora_rank(
         model,
-        adapter_artifact_lora_rank(hf_repo, subfolder, hf_revision=hf_revision),
+        artifact_metadata.lora_rank,
         rank_source="adapter artifact",
     )
     revision = format_adapter_revision(run_id, checkpoint_step, hf_revision)
@@ -428,7 +427,13 @@ def deploy_adapter(
         budget_s=revision_ready_budget_seconds(model),
     )
     if before_activate is not None:
-        _call_before_activate(before_activate, revision, checkpoint, frozenset(advertised))
+        _call_before_activate(
+            before_activate,
+            revision,
+            checkpoint,
+            frozenset(advertised),
+            adapter_targets_images=artifact_metadata.targets_images,
+        )
     activation = _activate_revision(
         run_id,
         revision,
@@ -916,7 +921,7 @@ from flash.serve.adapter_check import (  # noqa: E402,F401
     _is_adapter_tensor_filename,
     _is_hf_not_found_error,
     _verify_adapter_artifact_tensors,
-    adapter_artifact_lora_rank,
+    adapter_artifact_metadata,
     validate_serving_lora_rank,
 )
 
