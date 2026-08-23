@@ -34,7 +34,6 @@ DeploymentErrorCode: TypeAlias = Literal[
     "not_found",
     "provider_rejected",
     "readiness_failed",
-    "readiness_timeout",
     "resource_ambiguous",
     "transport_failed",
 ]
@@ -74,7 +73,6 @@ _DEPLOYMENT_ERROR_CODES = frozenset(
         "not_found",
         "provider_rejected",
         "readiness_failed",
-        "readiness_timeout",
         "resource_ambiguous",
         "transport_failed",
     }
