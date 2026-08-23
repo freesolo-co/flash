@@ -204,6 +204,8 @@ jobs:
         if: github.event_name == 'workflow_dispatch' || steps.changes.outputs.package_changed == 'true'
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
+          # pin the installed binary as well as the action implementation.
+          version: "0.12.5"
           python-version: "3.11"
 
       - name: Build distributions

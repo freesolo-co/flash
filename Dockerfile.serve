@@ -1,6 +1,7 @@
 # immutable flash serving runtime. the cuda major version is set by the serve-runtime vllm pin,
 # whose compiled extension links libcudart.so.13 -- see the assertion below.
-FROM pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel
+# digest-pinned so serving rebuilds reuse the exact cuda and torch base image bytes.
+FROM pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel@sha256:6e8a7a6dedf900096f90190f66f988e7e658cda4f1e6cbc7c17e3a38980a4f89
 
 # PIP_BREAK_SYSTEM_PACKAGES matches Dockerfile.worker, which shares this base image. The base
 # ships a Debian-style PEP 668 marker (/usr/lib/python3.12/EXTERNALLY-MANAGED), so the pinned-uv

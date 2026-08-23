@@ -6375,6 +6375,27 @@ def test_overrides_omit_layered_summon_for_dense_models():
     ]
 
 
+def test_overrides_keep_fused_expert_params_addressable_under_fsdp1():
+    # opd pins `actor.strategy=fsdp` explicitly, so it flattens by default exactly like grpo and
+    # needs the same flag for PEFT's forward-time parametrization to find the expert tensor.
+    overrides = dict(
+        value.split("=", 1)
+        for value in build_opd_overrides(
+            _config(target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
+        )
+    )
+    assert overrides["actor_rollout_ref.actor.fsdp_config.use_orig_params"] == "true"
+    assert overrides["actor_rollout_ref.actor.strategy"] == "fsdp"
+
+
+def test_overrides_omit_orig_params_for_dense_models():
+    assert not [
+        value
+        for value in build_opd_overrides(_config(target_parameters=None))
+        if "use_orig_params" in value
+    ]
+
+
 def test_overrides_match_verl_0_8_sync_distillation_contract():
     overrides = dict(value.split("=", 1) for value in build_opd_overrides(_config()))
     assert overrides["distillation._target_"] == "flash_opd_plugin.FlashRemoteDistillationConfig"
