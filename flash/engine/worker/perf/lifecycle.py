@@ -24,10 +24,19 @@ _CUDA_OOM_TORCH_RE = re.compile(
 # much the card had. carried SEPARATELY from the classification token above, because
 # `is_cuda_oom` re-classifies the evidence string and a wider match there would let an
 # unrelated line re-trigger VRAM escalation.
+#
+# torch prints the capacity and free figures in TWO spellings, and the caller returns the whole
+# matched span -- so a spelling the pattern cannot reach is not merely unparsed, it is dropped from
+# the operator's message entirely, which is the loss this pattern exists to prevent. the newer form
+# puts the phrase first (a total capacity OF n GiB, of which n MiB IS FREE); the classic
+# parenthetical form puts the unit first (n GiB TOTAL CAPACITY; n MiB FREE). each half therefore
+# accepts either order. `test_allocation_detail_keeps_the_figures_in_torchs_classic_parenthetical_spelling`
+# carries both literal strings.
 _CUDA_OOM_ALLOCATION_RE = re.compile(
     r"tried to allocate\s+[\d.]+\s*[kmgt]?ib?"
-    r"(?:.*?(?:total capacity|capacity of)\s+[\d.]+\s*[kmgt]?ib?)?"
-    r"(?:.*?([\d.]+\s*[kmgt]?ib?)\s+is free)?"
+    r"(?:.*?(?:(?:total capacity|capacity of)\s+[\d.]+\s*[kmgt]?ib?"
+    r"|[\d.]+\s*[kmgt]?ib?\s+total capacity))?"
+    r"(?:.*?([\d.]+\s*[kmgt]?ib?)\s+(?:is free|free))?"
 )
 # ray's host-memory monitor kills workers when NODE ram is exhausted. the gpu can be idle at the
 # moment of death, so this is the opposite remedy from a cuda oom: the scarce resource is system ram.
