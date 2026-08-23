@@ -19,6 +19,8 @@ import sys
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parent.parent
 KERNEL_FINGERPRINT_SCRIPT = ROOT / "docker" / "kernel_fingerprint.py"
@@ -207,10 +209,11 @@ def _pyproject_specs(name: str) -> list[str]:
 
 
 def test_huggingface_hub_floor_is_in_lockstep():
-    """The huggingface_hub floor is declared for both halves of a run: Dockerfile.worker bakes it
-    into the per-arch image the GPU runs, and pyproject declares it for the control plane that
-    talks to the same Hub. They must stay equal so both carry the same built-in 429 RateLimit
-    auto-retry floor -- a lower floor on either side reintroduces unretried rate limits there."""
+    """The exact worker pin must satisfy every published huggingface_hub compatibility range.
+
+    Both halves need the built-in 429 retry behavior, but the published package must keep compatible
+    ranges while the deployed image is exact and reproducible.
+    """
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
     docker_hf = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "huggingface_hub"]
     # Exactly one pin per source, else a duplicate/drifted entry could hide behind the first match.
@@ -219,23 +222,23 @@ def test_huggingface_hub_floor_is_in_lockstep():
     )
     project_hf = _pyproject_specs("huggingface_hub")
     assert project_hf, "expected a huggingface-hub requirement in pyproject.toml"
-    # the two files spell the distribution differently (underscore in the Dockerfile, dash in
-    # pyproject), so compare the normalized name plus the version specifier.
-    docker_floor = docker_hf[0].replace("_", "-")
-    assert set(project_hf) == {docker_floor}, (
-        f"huggingface_hub floor drift: Dockerfile.worker={docker_hf[0]!r} vs "
-        f"pyproject={sorted(set(project_hf))}; bump them together so the worker image and the "
-        "control plane share the 429 retry floor"
+    # public metadata remains a compatible range while the deployed image is exact. prove the exact
+    # worker version satisfies every published range instead of requiring byte-identical specifiers.
+    docker_requirement = Requirement(docker_hf[0])
+    exact = [
+        Version(item.version) for item in docker_requirement.specifier if item.operator == "=="
+    ]
+    assert len(exact) == 1, f"worker image must exactly pin huggingface_hub, got {docker_hf[0]!r}"
+    assert all(exact[0] in Requirement(spec).specifier for spec in project_hf), (
+        f"huggingface_hub exact worker pin {exact[0]} falls outside public ranges {project_hf}"
     )
 
 
 def test_freesolo_floor_is_in_lockstep():
-    """Same argument as the huggingface_hub floor, for the Freesolo SDK.
+    """The exact image SDK pin must satisfy the compatible env-packaging range.
 
-    Dockerfile.worker bakes a freesolo floor into the per-arch image the GPU runs, and
-    FREESOLO_WORKER_SPEC is the floor env packaging installs. They must stay equal: the image's
-    floor is the one that actually governs, so a lower floor there means a run can resolve an SDK
-    the env package would have rejected.
+    The image governs the deployed version, while FREESOLO_WORKER_SPEC remains a range for published
+    package compatibility. A worker pin outside that range would make the two paths disagree.
     """
     from flash.envs.base import FREESOLO_WORKER_SPEC
 
@@ -243,10 +246,13 @@ def test_freesolo_floor_is_in_lockstep():
     docker_fs = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "freesolo"]
     # Exactly one pin per source, else a duplicate/drifted entry could hide behind the first match.
     assert len(docker_fs) == 1, f"expected one freesolo pin in Dockerfile.worker, found {docker_fs}"
-    assert docker_fs[0] == FREESOLO_WORKER_SPEC, (
-        f"freesolo floor drift: Dockerfile.worker={docker_fs[0]!r} vs "
-        f"FREESOLO_WORKER_SPEC={FREESOLO_WORKER_SPEC!r}; bump both together so the baked image and "
-        "the env package require the same SDK"
+    docker_requirement = Requirement(docker_fs[0])
+    exact = [
+        Version(item.version) for item in docker_requirement.specifier if item.operator == "=="
+    ]
+    assert len(exact) == 1, f"worker image must exactly pin freesolo, got {docker_fs[0]!r}"
+    assert exact[0] in Requirement(FREESOLO_WORKER_SPEC).specifier, (
+        f"freesolo exact worker pin {exact[0]} falls outside {FREESOLO_WORKER_SPEC!r}"
     )
 
 
