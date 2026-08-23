@@ -1,0 +1,361 @@
+name: Deploy development serving Modal app
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy development serving Modal app
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    # same bound as the production deploy: its own readiness polls plus the remote image build fit
+    # well inside this, and a wedged job releases the runner instead of holding it for 6 hours.
+    timeout-minutes: 30
+    # github can replace a pending run even though a running deploy is preserved. compare against the
+    # sha reported by the deployed app so the replacement repeats every change not actually deployed.
+    concurrency:
+      group: deploy-modal-dev-serving
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    defaults:
+      run:
+        # every step runs from the repo root: modal_app.py imports `flash.serving.src...`, which only
+        # resolves with the repo root on sys.path. it derives its own paths from __file__, so cwd is
+        # free. (in freesolo the app WAS the root of its own tree and used cwd-relative imports.)
+        working-directory: .
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      FREESOLO_INTERNAL_KEY: ${{ secrets.FREESOLO_INTERNAL_KEY }}
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+      SUPABASE_PROJECT_REF_DEV: ${{ secrets.SUPABASE_PROJECT_REF_DEV }}
+      PLATFORM_BACKEND_URL: https://api-dev.freesolo.co
+      SERVING_DEPLOYMENT_MODE: development
+      SERVING_CUSTOM_DOMAIN: serve-dev.freesolo.co
+      FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
+      FREESOLO_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      EXPECTED_MODAL_URL: https://freesolo-dev--freesolo-lora-serving.modal.run
+      EXPECTED_SERVING_URL: https://serve-dev.freesolo.co
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether to deploy development serving
+        id: gate
+        working-directory: .
+        env:
+          EVENT: ${{ github.event_name }}
+          CURRENT_SHA: ${{ github.sha }}
+          DEPLOYED_HEALTH_URL: https://serve-dev.freesolo.co/healthz
+        run: |
+          set -euo pipefail
+          deploy=false
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            deploy=true
+          elif ! last_deployed_sha="$(python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+
+
+          request = urllib.request.Request(
+              os.environ["DEPLOYED_HEALTH_URL"],
+              headers={"Accept": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=15) as response:
+              payload = json.load(response)
+          revision = payload.get("deployment_sha") if isinstance(payload, dict) else None
+          if not isinstance(revision, str) or re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
+              raise ValueError("deployed app returned no valid source revision")
+          print(revision.lower())
+          PY
+          )"; then
+            # a missing deployment or any health, network, or parsing failure must deploy safely.
+            deploy=true
+          elif ! git merge-base --is-ancestor "$last_deployed_sha" "$CURRENT_SHA" 2>/dev/null; then
+            # a missing or rewritten deployed revision cannot safely bound the undeployed changes.
+            deploy=true
+          elif ! changed="$(git diff --name-only "$last_deployed_sha" "$CURRENT_SHA" 2>/dev/null)"; then
+            deploy=true
+          elif grep -qE '^(flash/|pyproject\.toml$|uv\.lock$|\.github/workflows/deploy-modal-dev\.yml$)' <<<"$changed"; then
+            deploy=true
+          fi
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+          echo "Deploy development serving: $deploy"
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        if: steps.gate.outputs.deploy == 'true'
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        if: steps.gate.outputs.deploy == 'true'
+
+      - name: Install Modal client
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          # deploy-time deps only; the app image is built remotely by Modal. flash is deliberately
+          # not installed - modal's CLI puts the working directory on sys.path before importing the
+          # app file, so running from the repo root is what resolves `from flash.serving.src...`.
+          # pinned to the exact client pyproject declares; see deploy-modal.yml for why an
+          # unbounded range is unsafe for the deploy path.
+          uv pip install --system "modal==1.5.4" "python-dotenv>=1.0.0"
+
+      - name: Verify development deployment inputs
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          missing=""
+          for name in MODAL_TOKEN_ID MODAL_TOKEN_SECRET HF_TOKEN FREESOLO_INTERNAL_KEY SUPABASE_ACCESS_TOKEN SUPABASE_PROJECT_REF SUPABASE_PROJECT_REF_DEV; do
+            if [ -z "${!name}" ]; then
+              missing="$missing $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Refusing to deploy development serving: missing required secret(s):${missing}."
+            exit 1
+          fi
+          if [ "$SUPABASE_PROJECT_REF" = "$SUPABASE_PROJECT_REF_DEV" ]; then
+            echo "::error::Refusing to deploy development serving: production and development Supabase refs are equal."
+            exit 1
+          fi
+          printf 'SUPABASE_URL=https://%s.supabase.co\n' "$SUPABASE_PROJECT_REF_DEV" >> "$GITHUB_ENV"
+
+      - name: Ensure development Modal environment
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          environments_file="$(mktemp)"
+          trap 'rm -f "$environments_file"' EXIT
+          modal environment list --json > "$environments_file"
+          environment_status="$(python3 - "$environments_file" <<'PY'
+          import json
+          import sys
+
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              environments = json.load(source)
+          if not isinstance(environments, list):
+              raise SystemExit("Modal environment list returned an invalid payload")
+          names = {item.get("name") for item in environments if isinstance(item, dict)}
+          print("exists" if "dev" in names else "missing")
+          PY
+          )"
+          case "$environment_status" in
+            exists)
+              ;;
+            missing)
+              modal environment create dev
+              ;;
+            *)
+              echo "::error::Could not determine whether the development Modal environment exists."
+              exit 1
+              ;;
+          esac
+          modal environment update dev --set-web-suffix dev
+
+      - name: Load development Supabase server key
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+            --output "$response_file" \
+            "https://api.supabase.com/v1/projects/${SUPABASE_PROJECT_REF_DEV}/api-keys?reveal=true"
+          selected_key="$(python3 - "$response_file" <<'PY'
+          import json
+          import sys
+
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              keys = json.load(source)
+          if not isinstance(keys, list):
+              raise SystemExit("Supabase API returned an invalid API key payload")
+          secret_keys = [
+              item.get("api_key")
+              for item in keys
+              if isinstance(item, dict)
+              and isinstance(item.get("api_key"), str)
+              and item["api_key"].startswith("sb_secret_")
+          ]
+          selected = secret_keys[0] if secret_keys else None
+          if selected is None:
+              raise SystemExit("No sb_secret_* development Supabase server key was returned")
+          print(selected)
+          PY
+          )"
+          echo "::add-mask::$selected_key"
+          printf 'SUPABASE_SERVICE_ROLE_KEY=%s\n' "$selected_key" >> "$GITHUB_ENV"
+          unset selected_key
+
+      - name: Verify development adapter schema readiness
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          # probe the columns the runtime actually reads, not `id` -- which is not even among them.
+          # selecting only `id` proved the TABLE exists while a schema still missing, say,
+          # `deployment_generation` passed this gate and then failed on every read after deploy.
+          # this is the same check the production workflow applies; dev kept the weaker one, so a
+          # pending serving migration could deploy a development router that cannot hydrate its
+          # registry and only fails later at readiness.
+          # import the constants module, not persistence.py: this job installs only modal and
+          # python-dotenv, while persistence.py imports httpx at module scope, so importing it
+          # would raise ModuleNotFoundError and the guard below would block every dev deploy.
+          if ! columns="$(python -c 'from flash.serving.src.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
+            # failing closed matters here: an empty list would degrade the query back to a bare
+            # existence check and this gate would pass while proving nothing.
+            echo "::error::Could not read PERSISTED_COLUMNS; refusing to deploy against an unverified schema."
+            exit 1
+          fi
+          endpoint="${SUPABASE_URL%/}/rest/v1/hosted_lora_adapters?select=${columns}&limit=1"
+          headers=(
+            --header "apikey: $SUPABASE_SERVICE_ROLE_KEY"
+            --header "Accept-Profile: flash"
+          )
+          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --connect-timeout 5 \
+            --max-time 15 \
+            "${headers[@]}" \
+            "$endpoint")"
+          if [ "$status" != "200" ]; then
+            echo "::error::Development Supabase flash.hosted_lora_adapters is not queryable (HTTP ${status})."
+            exit 1
+          fi
+          echo "Development Supabase flash.hosted_lora_adapters is queryable."
+
+      - name: Deploy development serving
+        if: steps.gate.outputs.deploy == 'true'
+        run: modal deploy --env dev flash/serving/modal_app.py
+
+      - name: Verify development serving URL
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          resolved_url="$(python3 - <<'PY'
+          import modal
+
+
+          print(
+              modal.Function.from_name(
+                  "freesolo-lora-serving",
+                  "router",
+                  environment_name="dev",
+              ).get_web_url()
+          )
+          PY
+          )"
+          if [ "$resolved_url" != "$EXPECTED_MODAL_URL" ]; then
+            echo "::error::Development serving resolved to an unexpected generated Modal URL."
+            exit 1
+          fi
+          if [[ "$resolved_url" != *"-dev--"* ]]; then
+            echo "::error::Development serving URL does not carry the development Modal suffix."
+            exit 1
+          fi
+          echo "Development serving URL is isolated in the dev Modal environment."
+
+      - name: Wait for development serving readiness
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          endpoint="${EXPECTED_SERVING_URL}/healthz"
+          expected_deployment_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          deadline=$((SECONDS + 300))
+
+          while true; do
+            remaining=$((deadline - SECONDS))
+            if (( remaining <= 0 )); then
+              echo "::error::Development serving custom domain did not become DNS-, TLS-, and health-ready within 300 seconds."
+              exit 1
+            fi
+
+            request_timeout=10
+            if (( remaining < request_timeout )); then
+              request_timeout=$remaining
+            fi
+
+            response_status=""
+            if response_status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+              --connect-timeout 5 \
+              --max-time "$request_timeout" \
+              "$endpoint")"; then
+              curl_exit=0
+            else
+              curl_exit=$?
+            fi
+
+            status="000"
+            if (( curl_exit == 0 )); then
+              status="$response_status"
+            fi
+
+            if [[ "$status" = "200" ]]; then
+              if python3 - "$response_file" "$GITHUB_SHA" "$expected_deployment_id" <<'PY'
+          import json
+          import sys
+
+
+          def reject_constant(_value: str) -> None:
+              raise ValueError
+
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as response:
+                  payload = json.load(response, parse_constant=reject_constant)
+          except (OSError, UnicodeDecodeError, ValueError):
+              sys.exit(1)
+
+          ready = (
+              isinstance(payload, dict)
+              and payload.get("ok") is True
+              and payload.get("deployment_sha") == sys.argv[2]
+              and payload.get("deployment_id") == sys.argv[3]
+          )
+          sys.exit(0 if ready else 1)
+          PY
+              then
+                echo "Development serving router is ready for deployment ${GITHUB_SHA} (${expected_deployment_id})."
+                break
+              fi
+              echo "Development serving health check returned malformed, unhealthy, or stale deployment JSON; retrying."
+            elif [[ "$status" = "000" ]]; then
+              echo "Development serving health check had a transport error; retrying."
+            else
+              echo "Development serving health check returned HTTP ${status}; retrying."
+            fi
+
+            remaining=$((deadline - SECONDS))
+            if (( remaining <= 0 )); then
+              continue
+            fi
+            sleep_seconds=10
+            if (( remaining < sleep_seconds )); then
+              sleep_seconds=$remaining
+            fi
+            sleep "$sleep_seconds"
+          done
+
+      - name: Nothing to deploy
+        if: steps.gate.outputs.deploy != 'true'
+        working-directory: .
+        run: echo "No development serving changes detected."

@@ -6,6 +6,13 @@ import types
 
 import pytest
 
+from flash.serve.contract import (
+    ADAPTER_REVISION_PATTERN,
+    PREFERRED_SERVING_CAPABILITIES,
+    REQUIRED_SERVING_CAPABILITIES,
+    ServingHealthError,
+    parse_serving_health,
+)
 from flash.serve.deploy import (
     Deployment,
     deploy_adapter,
@@ -24,6 +31,45 @@ def _stub_shared_http_client(monkeypatch):
 
     client = _Client()
     monkeypatch.setattr(deploy, "_http_client", lambda: client)
+
+
+def test_dependency_light_health_parser_normalizes_the_serving_contract():
+    health = parse_serving_health(
+        {
+            "ok": True,
+            "requires_key": False,
+            "base_models": ["Qwen/Qwen3.5-4B"],
+            "capabilities": sorted(REQUIRED_SERVING_CAPABILITIES | PREFERRED_SERVING_CAPABILITIES),
+        }
+    )
+    assert health.ok is True
+    assert health.requires_key is False
+    assert health.base_models == ("Qwen/Qwen3.5-4B",)
+    assert set(health.capabilities) >= REQUIRED_SERVING_CAPABILITIES
+
+
+@pytest.mark.parametrize(
+    ("payload", "code"),
+    [
+        ([], "non_object"),
+        ({}, "capabilities_not_list"),
+        ({"capabilities": [1]}, "capabilities_not_strings"),
+    ],
+)
+def test_dependency_light_health_parser_rejects_malformed_payloads(payload, code):
+    with pytest.raises(ServingHealthError) as exc_info:
+        parse_serving_health(payload)
+    assert exc_info.value.code == code
+
+
+def test_schema_and_generated_backends_share_the_adapter_revision_pattern():
+    import re
+
+    from flash.schema import parse_adapter_revision
+
+    revision = "flash-1@step-2." + "a" * 40
+    assert re.fullmatch(ADAPTER_REVISION_PATTERN, revision)
+    assert parse_adapter_revision(revision) == ("flash-1", 2, "a" * 40)
 
 
 def test_serving_base_url_default_and_override(monkeypatch):
@@ -879,3 +925,53 @@ def test_new_deployment_does_not_duplicate_existing_v1_suffix(monkeypatch):
     assert data["endpoint_name"] == "https://serve.example"
     assert data["openai_base_url"] == "https://serve.example/v1"
     assert "url" not in data
+
+
+def test_the_serving_extra_declares_every_module_scope_import_of_the_serving_app():
+    """The `serving` extra must be able to import the app it exists to run.
+
+    `flash/serving/` is installed into the GPU container by that extra alone. A module-scope import
+    it does not cover makes the container fail on startup, which is the most expensive place to
+    discover a missing bound. CI cannot catch it by running the tests: it installs `server` too,
+    and `server` happens to carry fastapi -- so the app imported fine while the extra was
+    incomplete. fastapi and Pillow were both missing exactly this way.
+
+    Checked statically against the source rather than by installing, so it costs nothing and runs
+    in the offline suite.
+    """
+    import ast
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = {
+        # `pydantic-settings` -> `pydantic_settings`, and a bound like `pillow>=11` -> `pillow`.
+        __import__("re").split(r"[<>=!\[; ]", name, 1)[0].strip().lower().replace("-", "_")
+        for name in pyproject["project"]["optional-dependencies"]["serving"]
+    }
+    # distribution name != import name for these three; nothing else in the extra differs.
+    declared |= {"pil"} if "pillow" in declared else set()
+    declared |= {"dotenv"} if "python_dotenv" in declared else set()
+
+    stdlib = set(__import__("sys").stdlib_module_names)
+    missing: dict[str, set[str]] = {}
+    for path in sorted((root / "flash" / "serving").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            # module scope only: a function-level import is deliberately deferred and may name a
+            # package the extra is not required to carry (vllm, torch).
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.col_offset == 0:
+                top = (node.module or "").split(".")[0]
+            elif isinstance(node, ast.Import) and node.col_offset == 0:
+                top = node.names[0].name.split(".")[0]
+            else:
+                continue
+            key = top.lower()
+            if not top or top == "flash" or key in stdlib or key in declared:
+                continue
+            missing.setdefault(top, set()).add(str(path.relative_to(root)))
+
+    assert not missing, (
+        "these packages are imported at module scope by flash/serving but are not declared by the "
+        f"`serving` extra: { {k: sorted(v)[:2] for k, v in missing.items()} }"
+    )

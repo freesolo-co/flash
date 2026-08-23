@@ -85,7 +85,7 @@ def _worker_sections(client: ApiClient, run_id: str) -> dict[str, str]:
     return {name: text for name, text in (client.get_worker_output(run_id) or {}).items() if text}
 
 
-def _snapshot_live_attempt(client: ApiClient, run_id: str) -> int | str | None:
+def live_attempt_of(run: Mapping[str, object]) -> int | str | None:
     """The live attempt, ``_NO_LIVE_WORKER`` during teardown, or ``None`` when unknown.
 
     ``live_attempt`` answers ``None`` for two opposite situations: an explicitly null ``remote``,
@@ -95,6 +95,19 @@ def _snapshot_live_attempt(client: ApiClient, run_id: str) -> int | str | None:
     reaching ``grep HEARTBEAT | tail -1`` unmarked while replacement capacity was still being
     acquired. Keep the two apart so teardown can be labelled as what it is.
 
+    Takes the status dict rather than fetching it, because ``--follow`` already holds one: the two
+    log paths must derive this from the SAME rule, or a follow that ends mid-teardown prints the
+    unmarked dead heartbeats the non-follow path tags.
+    """
+    attempt = render.live_attempt(run)
+    if attempt is None and run.get("remote", False) is None:
+        return _NO_LIVE_WORKER
+    return attempt
+
+
+def _snapshot_live_attempt(client: ApiClient, run_id: str) -> int | str | None:
+    """``live_attempt_of`` for the non-follow path, which has to fetch the status itself.
+
     A lookup failure stays ``None``: not knowing the live attempt must not make this claim there
     is no live worker.
     """
@@ -102,10 +115,7 @@ def _snapshot_live_attempt(client: ApiClient, run_id: str) -> int | str | None:
         run = client.get_run(run_id) or {}
     except ClientError:
         return None
-    attempt = render.live_attempt(run)
-    if attempt is None and run.get("remote", False) is None:
-        return _NO_LIVE_WORKER
-    return attempt
+    return live_attempt_of(run)
 
 
 def _print_worker_output(

@@ -13,6 +13,7 @@ from typing import ClassVar
 import pytest
 
 import flash.serve.deploy as deploy
+from flash.client.http import ClientError
 
 
 def _sse(*deltas: dict) -> list[str]:
@@ -424,6 +425,19 @@ def test_a_non_thinking_stream_yields_each_delta_as_it_arrives():
     # prints must arrive one at a time, not batched at the end.
     lines = _sse({"content": "a"}, {"content": "b"})
     assert list(deploy._openai_stream_content(iter(lines), thinking=False)) == ["a", "b"]
+
+
+def test_an_engine_error_raises_after_yielding_partial_content():
+    lines = [
+        f"data: {json.dumps({'choices': [{'delta': {'content': 'partial'}}]})}",
+        f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'error'}], 'error': {'message': 'engine stream failed', 'type': 'engine_error', 'code': 500}})}",
+        "data: [DONE]",
+    ]
+    stream = deploy._openai_stream_content(iter(lines), thinking=False)
+
+    assert next(stream) == "partial"
+    with pytest.raises(ClientError, match="engine stream failed"):
+        next(stream)
 
 
 def test_a_split_stream_releases_the_answer_incrementally():

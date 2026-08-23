@@ -359,31 +359,92 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 ## Serving
 
-`flash/serve/` is a **client** for a multi-LoRA serving app (a Modal app that serves every
-adapter on one GPU per base model, scaling to zero when idle). This repository does not
-include that serving backend.
+`flash serve deploy` provisions serving in **your own** Modal or RunPod account, running the
+published worker image against one base model and one run's adapter. Training and export remain
+independent of serving. Catalog serving checkpoint repositories are informational only and are never
+resolved by the training path.
 
-Training, checkpoint streaming, and adapter export are fully self-hostable and do not
-depend on it. Your trained adapters land in your own HuggingFace repos and can be served
-by any stack that loads LoRA adapters - vLLM, TGI, or your own. Point `FREESOLO_SERVING_URL`
-at a compatible deployment if you want `flash models deploy` and `flash models chat` to work
-end to end.
+```bash
+# the `server` extra, not the bare install: `serve deploy` resolves the adapter through
+# huggingface_hub and drives modal's sdk, and `[project].dependencies` is empty by design.
+pip install 'freesolo-flash[server]'
+export HF_TOKEN=hf_...
+export FLASH_SERVING_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
 
-On a standalone plane those three commands **error out** until you point it at a backend
-you operate. Every serving request carries `FREESOLO_INTERNAL_KEY`, and on your plane that
-key is what grants full control of it - so reaching Freesolo's serving app would hand your
-plane's credential to a service you do not run. Export the adapter and serve it yourself if
-you do not have a compatible backend.
+# modal: `modal token new` writes these, or set them directly
+export MODAL_TOKEN_ID=... MODAL_TOKEN_SECRET=...
 
-Setting it to a Freesolo-hosted URL is refused exactly like leaving it unset: a value copied
-from a managed `.env` is the likelier way to end up there, so both paths raise rather than
-only the fallback. Any other host, including `localhost`, is yours to use.
+flash serve deploy \
+  --provider modal \
+  --model Qwen/Qwen3.5-4B \
+  --run <run-id> \
+  --deployment-id my-4b-serving \
+  --image ghcr.io/freesolo-co/freesolo-flash-serve@sha256:<digest> \
+  --artifact-repo <hub-repo> \
+  --artifact-subfolder <path-within-repo> \
+  --lora-rank 32 \
+  --modal-workspace <your-workspace> \
+  --modal-environment main \
+  --modal-region us-east
+```
 
-The catalog reports a `serving.serve_model_id` per model - the pre-quantized FP8 checkpoint
-Freesolo's serving app loads, and most of those repos are private. They are **informational
-only**: nothing in the training path reads them, so they cannot block a run. If you stand up
-your own serving backend, quantize the base model yourself (or serve it unquantized) rather
-than expecting to pull those repo names.
+The three `--modal-*` placement flags are required for `--provider modal` even though `--help`
+lists them as optional: they are optional to _argparse_ because RunPod takes its own pair instead,
+and `placement_for` is what requires exactly one provider's set. Omitting them exits with
+`modal placement requires environment, region, workspace_name`.
+
+For RunPod, export `RUNPOD_API_KEY` instead and swap the placement flags rather than adding to
+them -- `placement_for` rejects the other provider's inputs instead of ignoring them, so keeping
+`--modal-*` alongside `--provider runpod` fails before anything is created:
+
+```bash
+flash serve deploy \
+  --provider runpod \
+  --model Qwen/Qwen3.5-4B \
+  --run <run-id> \
+  --deployment-id my-4b-serving \
+  --image ghcr.io/freesolo-co/freesolo-flash-serve@sha256:<digest> \
+  --artifact-repo <hub-repo> \
+  --artifact-subfolder <path-within-repo> \
+  --lora-rank 32 \
+  --runpod-account <your-account-id> \
+  --runpod-data-center <data-center-id>
+```
+
+Both `--runpod-*` flags are required and must be nonempty, for the same reason the `--modal-*`
+trio is: `--help` lists them as optional only because each provider takes its own set.
+
+Provider credentials are read from the process environment for the duration of a single call and are
+never written to the deployment record, logs, or command arguments — so any later resize or teardown
+requires exporting them again. `--image` must be digest-qualified (`name@sha256:...`) so the
+deployment is pinned to an exact immutable image. Add `--dry-run` to resolve and validate every
+input, including the adapter's provenance, without provisioning anything or incurring cost.
+
+The command prints the endpoint URL. Call it directly with the key you generated, which is scoped to
+that one deployment:
+
+```bash
+curl https://<your-app>.modal.run/v1/chat/completions \
+  -H "Authorization: Bearer $FLASH_SERVING_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<run-id>", "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+Do **not** point `FREESOLO_SERVING_URL` at this endpoint. Those commands authenticate with
+`X-Freesolo-Internal-Key` and carry `FREESOLO_INTERNAL_KEY`, the key that controls your whole plane;
+a customer-owned deployment does not read that header at all, so the request would fail `401` after
+sending a plane-wide credential to a provider endpoint. The deployment serves `/healthz`,
+`/v1/models`, and `/v1/chat/completions` -- it receives its adapters in an immutable manifest at
+boot and has no `/adapters` surface for `flash models deploy` to drive.
+
+The shared runtime supports bounded multimodal preparation. A profile that declares `image_limit`
+loads a processor and accepts image-bearing requests up to that limit; a text profile declares none
+and returns `400` for them.
+
+`FREESOLO_SERVING_URL` belongs to the separate multi-LoRA backend behind `flash models deploy` /
+`chat` / `undeploy`; standalone refuses an unset or Freesolo-hosted value there for the same reason.
+See [docs/serving-contract.md](docs/serving-contract.md) for both credential rules, the normative
+endpoints, and the conformance command.
 
 ## The worker image
 

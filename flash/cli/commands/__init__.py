@@ -605,7 +605,9 @@ def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
 class _LogPollResult(NamedTuple):
     state: str
     printed_any: bool
-    live_attempt: int | None
+    # `str` carries the teardown sentinel (`_NO_LIVE_WORKER`), which is not an attempt number but a
+    # proof there is no live worker -- see `live_attempt_of`.
+    live_attempt: int | str | None
 
 
 def _poll_logs(client: ApiClient, run_id: str, interval: float) -> _LogPollResult:
@@ -628,7 +630,7 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> _LogPollResul
             # from the run status endpoint. The log page's embedded state is only a fallback for
             # older servers or test doubles.
             status = client.get_run(run_id)
-            attempt = render.live_attempt(status) if isinstance(status, dict) else attempt
+            attempt = live_attempt_of(status) if isinstance(status, dict) else attempt
             state, progress = _log_follow_progress(status, str(page.get("state") or ""))
             metric_rows = _log_follow_metric_rows(status, seen_metric_steps)
             if metric_rows:
@@ -985,4 +987,5 @@ from flash.cli.commands.worker_output import (  # noqa: E402,F401
     _snapshot_live_attempt,
     _worker_section_name,
     _worker_sections,
+    live_attempt_of,
 )
