@@ -63,7 +63,7 @@ async def generate_for_adapter(
     adapter_id: str, payload: dict[str, Any], request: Request
 ) -> JSONResponse:
     context = ServingContext.of(request)
-    normalized_adapter_id = adapter_id.strip()
+    normalized_adapter_id = _path_adapter_id(adapter_id)
     caller_org = await context.authorize_inference(request, normalized_adapter_id)
     req = _parse_generate({**payload, "adapter_id": adapter_id})
     requested, target = await context.lookup.resolve(req.adapter_id)
@@ -79,6 +79,14 @@ async def generate_for_adapter(
         ),
     )
     return _inference_json_response(result, target)
+
+
+def _path_adapter_id(adapter_id: str) -> str:
+    """return the stripped path adapter id, rejecting a blank one before the authorizer runs."""
+    stripped = adapter_id.strip()
+    if not stripped:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "adapter_id must not be empty")
+    return stripped
 
 
 def _openai_adapter_id(payload: dict[str, Any]) -> str:

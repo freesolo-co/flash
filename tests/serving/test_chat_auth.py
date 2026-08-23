@@ -216,6 +216,7 @@ def test_chat_auth_precedes_stream_validation() -> None:
 
 
 def test_per_adapter_auth_precedes_payload_validation() -> None:
+    """a valid path id is authenticated before a malformed request body is validated."""
     auth = FakeAuthorizer()
     response = _client(authorizer=auth).post(
         "/adapters/qa/generate",
@@ -224,6 +225,23 @@ def test_per_adapter_auth_precedes_payload_validation() -> None:
 
     assert response.status_code == 401
     assert auth.calls == []
+
+
+@pytest.mark.parametrize("encoded_adapter_id", ["%20", "%09"], ids=["space", "tab"])
+def test_per_adapter_blank_path_id_is_rejected_before_authorization(
+    encoded_adapter_id: str,
+) -> None:
+    """a whitespace-only path id is a local 422 and never reaches the authorizer."""
+    auth = FakeAuthorizer()
+    response = _client(authorizer=auth).post(
+        f"/adapters/{encoded_adapter_id}/generate",
+        json={"prompt": "hi"},
+        headers={"Authorization": "Bearer fs-user-key"},
+    )
+
+    assert response.status_code == 422
+    assert auth.calls == []
+    assert response.json() == {"detail": "adapter_id must not be empty"}
 
 
 def test_generate_authorizes_against_the_normalized_adapter_id() -> None:
