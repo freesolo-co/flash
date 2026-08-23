@@ -512,8 +512,10 @@ def test_get_loading_revision_reloads_status_without_making_it_routable(setup) -
 
 def test_status_lookup_without_targeted_fetch_keeps_bulk_reload_fallback(setup) -> None:
     _, pool, _, _ = setup
-    loading = ImmutableAdapterRegistration.model_validate(_registration()).to_record().model_copy(
-        update={"deployment_generation": "generation-1"}
+    loading = (
+        ImmutableAdapterRegistration.model_validate(_registration())
+        .to_record()
+        .model_copy(update={"deployment_generation": "generation-1"})
     )
     router = AdapterRouter()
     client = TestClient(
@@ -536,8 +538,10 @@ def test_status_lookup_without_targeted_fetch_keeps_bulk_reload_fallback(setup) 
 
 def test_targeted_status_lookup_does_not_replace_ready_routing_registry(setup) -> None:
     _, pool, _, persistence = setup
-    cached_ready = ImmutableAdapterRegistration.model_validate(_registration()).to_record().model_copy(
-        update={"status": "ready"}
+    cached_ready = (
+        ImmutableAdapterRegistration.model_validate(_registration())
+        .to_record()
+        .model_copy(update={"status": "ready"})
     )
     loading_revision = ImmutableAdapterRegistration.model_validate(
         _registration(step=40, sha=SHA_B)
