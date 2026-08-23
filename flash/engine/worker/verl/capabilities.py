@@ -773,6 +773,45 @@ def rollout_fp8_kv(cc_ok: bool, gdn_hybrid: bool, model_id: str) -> bool:
     return rollout_sleep_unsupported(model_id)
 
 
+_MIN_ROLLOUT_MAX_NUM_SEQS = 16
+
+
+def rollout_max_num_seqs(rollout_batch: int) -> int:
+    """concurrent sequence slots to provision the rollout engine for.
+
+    verl leaves ``rollout.max_num_seqs`` at its yaml default of 1024 (rollout.yaml:79) and passes
+    it straight to the vllm engine (vllm_async_server.py:261). vllm sizes two up-front, fixed
+    allocations from that number, neither of which shrinks to the batch actually submitted:
+
+    * cuda-graph capture. ``_set_cudagraph_sizes`` (vllm ``config/vllm.py``, 0.19.1 -- the version
+      ``Dockerfile.worker`` pins) derives a capture ladder from
+      ``max_cudagraph_capture_size = min(max_num_seqs * 2, 512, max_num_batched_tokens)``, taking
+      ``[1,2,4]``, then ``range(8, min(size+1, 256), 8)``, then ``range(256, size+1, 16)`` -- each
+      rung clamped by that ceiling. verl's ``max_num_batched_tokens`` default is 8192
+      (``rollout.yaml:73``), so it does not bind. at 1024 the ceiling is 512 and the ladder is 51
+      sizes; a lora run captures each size twice, since the dispatcher takes
+      ``product(cudagraph_capture_sizes, lora_cases)`` with ``lora_cases == [0, 1]`` when
+      ``cudagraph_specialize_lora`` is on (``v1/cudagraph_dispatcher.py:110-193``, default True) --
+      exactly the ``0/102`` seen in the failing console. the ladder saturates at 512, so 1024, 512
+      and 256 are indistinguishable; only dropping below 256 shortens it, and 32 yields a ceiling
+      of 64, 11 sizes, and 22 graphs. note the prose comment above that function omits the per-rung
+      clamp and predicts 34 sizes for any small value; the implementation is authoritative.
+    * recurrent state. a gdn/mamba hybrid reserves one state block per decode slot, a dense
+      allocation that -- unlike paged kv -- cannot be shared, paged out, or grown on demand.
+
+    both are paid before the first rollout token, inside the ``gpu_memory_utilization`` budget. a
+    grpo/opd step submits exactly ``prompts_per_step * group_size`` sequences, so a run with 32
+    concurrent generations was provisioning for 1024 and dying during graph capture with ~80% of
+    the card free -- on 234, 358, and 460 GB alike, since the cost is fixed rather than
+    proportional to the card.
+
+    the floor keeps small runs on a usable capture ladder rather than collapsing it to one size.
+    """
+    if rollout_batch <= 0:
+        raise ValueError("rollout_batch must be positive")
+    return max(_MIN_ROLLOUT_MAX_NUM_SEQS, int(rollout_batch))
+
+
 def rollout_resident_overrides(sleep_unsupported: bool) -> list[str]:
     """verl overrides that pin the rollout engine resident, or ``[]`` to keep verl's default.
 
