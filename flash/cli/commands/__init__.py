@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import uuid
+from typing import NamedTuple
 
 from flash import __version__
 from flash._internal.channel import BRAND_NAME, CLI_NAME
@@ -601,12 +602,17 @@ def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
     return rows
 
 
-def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bool]:
-    """Stream offset-paged logs until the run reaches a terminal state.
+class _LogPollResult(NamedTuple):
+    state: str
+    printed_any: bool
+    live_attempt: int | None
 
-    Returns (terminal state, whether any log bytes were printed)."""
+
+def _poll_logs(client: ApiClient, run_id: str, interval: float) -> _LogPollResult:
+    """Stream logs until terminal and return the final state, output, and attempt snapshot."""
     offset = 0
     printed_any = False
+    attempt: int | None = None
     last_progress: str | None = None
     seen_metric_steps: set = set()
     spinner = _LogFollowSpinner(run_id)
@@ -622,6 +628,7 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bo
             # from the run status endpoint. The log page's embedded state is only a fallback for
             # older servers or test doubles.
             status = client.get_run(run_id)
+            attempt = render.live_attempt(status) if isinstance(status, dict) else attempt
             state, progress = _log_follow_progress(status, str(page.get("state") or ""))
             metric_rows = _log_follow_metric_rows(status, seen_metric_steps)
             if metric_rows:
@@ -630,7 +637,7 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> tuple[str, bo
                     print(row, file=sys.stderr, flush=True)
             if state in _CLI_DONE_STATES:
                 spinner.clear()
-                return state, printed_any
+                return _LogPollResult(state, printed_any, attempt)
             if not spinner.enabled and progress != last_progress:
                 print(f"status: {progress}", file=sys.stderr, flush=True)
                 last_progress = progress
@@ -679,12 +686,12 @@ def _print_detached_note(run_id: str) -> None:
 def _follow_run(client: ApiClient, run_id: str) -> int:
     """Poll logs until the run reaches a terminal state, then print the final status."""
     try:
-        state, _ = _poll_logs(client, run_id, interval=2.0)
+        result = _poll_logs(client, run_id, interval=2.0)
     except KeyboardInterrupt:
         _print_detached_note(run_id)
         return 130
     print(_render_status(client.get_run(run_id)))
-    return 0 if state in _OK_STATES else 1
+    return 0 if result.state in _OK_STATES else 1
 
 
 def _follow_status(
@@ -712,16 +719,23 @@ def cmd_log(args) -> int:
     client = client_from_config()
     if getattr(args, "follow", False):
         try:
-            state, printed_any = _poll_logs(client, args.run_id, interval=2.0)
+            result = _poll_logs(client, args.run_id, interval=2.0)
         except KeyboardInterrupt:
             _print_detached_note(args.run_id)
             return 130
-        _print_worker_output(client, args.run_id, printed_any=printed_any)
-        return 0 if state in _OK_STATES else 1
+        sections = _worker_sections(client, args.run_id)
+        _print_worker_output(
+            sections,
+            printed_any=result.printed_any,
+            current_attempt=result.live_attempt,
+        )
+        return 0 if result.state in _OK_STATES else 1
     text = str(client.get_logs(args.run_id, offset=0).get("logs") or "")
     if text:
         print(text, end="" if text.endswith("\n") else "\n")
-    _print_worker_output(client, args.run_id, printed_any=bool(text))
+    sections = _worker_sections(client, args.run_id)
+    attempt = _snapshot_live_attempt(client, args.run_id) if sections else None
+    _print_worker_output(sections, printed_any=bool(text), current_attempt=attempt)
     return 0
 
 
@@ -964,9 +978,11 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _warn_if_wandb_requested_without_key,
 )
 
-# re-exported so `commands._print_worker_output(...)` keeps resolving for `cmd_log` and the CLI tests.
+# re-exported because cmd_log and focused cli tests address these through the command package.
 from flash.cli.commands.worker_output import (  # noqa: E402,F401
     _artifact_attempt,
     _print_worker_output,
+    _snapshot_live_attempt,
     _worker_section_name,
+    _worker_sections,
 )
