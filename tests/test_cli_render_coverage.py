@@ -354,6 +354,12 @@ def test_cost_panel_grpo_with_teacher_and_wall_cap(styled_plain) -> None:
         steps=100,
         gpu="RTX 5090",
         gpu_vram_gb=32,
+        # a stub standing in for CostEstimate has to carry the fields the panel reads; one card
+        # offers exactly itself, so offered_vram_gb matches gpu_vram_gb here and the joined width
+        # matches the billed count.
+        offered_vram_gb=32,
+        gpu_count=1,
+        joined_gpu_count=1,
         required_vram_gb=24,
         gpu_hourly_usd=0.99,
         setup_seconds=300.0,
@@ -384,6 +390,9 @@ def test_cost_panel_sft_omits_optional_sections(styled_plain) -> None:
         steps=50,
         gpu="RTX 4090",
         gpu_vram_gb=24,
+        offered_vram_gb=24,
+        gpu_count=1,
+        joined_gpu_count=1,
         required_vram_gb=20,
         gpu_hourly_usd=0.50,
         setup_seconds=120.0,
