@@ -62,6 +62,7 @@ class ChildOutputTail:
         self._last_line: str | None = None
         self._retriable_infra_signature: str | None = None
         self._cuda_oom_evidence: str | None = None
+        self._cuda_oom_allocation_detail: str | None = None
         self._host_ram_kill_evidence: str | None = None
 
     def record(self, line: str) -> None:
@@ -74,6 +75,13 @@ class ChildOutputTail:
             from flash.engine.worker.perf.lifecycle import cuda_oom_message_evidence
 
             self._cuda_oom_evidence = cuda_oom_message_evidence(line)
+        if self._cuda_oom_allocation_detail is None:
+            # latched independently of the classification token: a child can print the class on one
+            # line and the allocation figures on the next, and the tail's ring buffer may evict
+            # either before the run ends.
+            from flash.engine.worker.perf.lifecycle import cuda_oom_allocation_detail
+
+            self._cuda_oom_allocation_detail = cuda_oom_allocation_detail(line)
         if self._host_ram_kill_evidence is None:
             from flash.engine.worker.perf.lifecycle import host_ram_kill_evidence
 
@@ -99,6 +107,11 @@ class ChildOutputTail:
     def cuda_oom_evidence(self) -> str | None:
         """the first authoritative cuda oom message evidence observed in child output."""
         return self._cuda_oom_evidence
+
+    @property
+    def cuda_oom_allocation_detail(self) -> str | None:
+        """how much the first observed cuda oom asked for, and what the card had."""
+        return self._cuda_oom_allocation_detail
 
     @property
     def host_ram_kill_evidence(self) -> str | None:
@@ -159,8 +172,14 @@ def raise_for_classified_verl_exit(return_code: int, tail: ChildOutputTail) -> N
             "capped at 8, so lowering prompts_per_step alone usually leaves it unchanged."
         )
     if oom_evidence is not None:
+        # the allocation figures are what turn "it OOMed" into a sizing decision: a request the
+        # card could never have served points somewhere different from one that missed by a
+        # gigabyte. the classification token alone left an operator with neither number.
+        allocation = tail.cuda_oom_allocation_detail
+        detail = f" ({allocation})" if allocation else ""
         raise RuntimeError(
-            f"verl subprocess exited with status {return_code} after reporting {oom_evidence}"
+            f"verl subprocess exited with status {return_code} after reporting "
+            f"{oom_evidence}{detail}"
         )
     signature = tail.retriable_infra_signature
     if signature is None:
