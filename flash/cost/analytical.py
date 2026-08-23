@@ -689,10 +689,16 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
             # offer-backed (therefore capacity-backed), and Lambda's catalog can blip too. Use the
             # provider's offline static rate here; the lifecycle replaces it from the selected candidate
             # before provisioning, so the persisted/charged quote still carries the exact live rate.
+            # info.hourly_usd is a runpod snapshot. provider-specific tables must price offline
+            # quotes so cost output, ranking, and affordability checks use the selected substrate.
             if provider == "lambda":
                 from flash.providers.lambda_.pricing import static_hourly_rate
 
                 hourly = static_hourly_rate(gpu)
+            elif provider == "modal":
+                from flash.providers.modal.pricing import hourly_rate as modal_hourly_rate
+
+                hourly = modal_hourly_rate(gpu)
             else:
                 hourly = info.hourly_usd
             # `provider` is "auto" here only when the pool being ranked IS the runpod pool (see the

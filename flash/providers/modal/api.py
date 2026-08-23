@@ -46,6 +46,29 @@ def _is_not_found(sdk, exc: Exception) -> bool:
     return isinstance(exc, sdk.exception.NotFoundError)
 
 
+def _create_rejection_is_clean(sdk, exc: BaseException) -> bool:
+    """Return whether Modal definitively refused the create before provisioning a Sandbox."""
+    conflict_error = getattr(sdk.exception, "ConflictError", None)
+    if isinstance(conflict_error, type) and isinstance(exc, conflict_error):
+        return False
+    definitive = tuple(
+        cls
+        for cls in (
+            getattr(sdk.exception, name, None)
+            for name in (
+                "AuthError",
+                "PermissionDeniedError",
+                "NotFoundError",
+                "RequestSizeError",
+                "ImageBuildError",
+                "InvalidError",
+            )
+        )
+        if isinstance(cls, type)
+    )
+    return bool(definitive) and isinstance(exc, definitive)
+
+
 def _list_with_client(sdk, client, *, tags: dict[str, str]) -> list[dict[str, Any]]:
     sandboxes: list[dict[str, Any]] = []
     for sandbox in sdk.Sandbox.list(tags=tags, client=client):
@@ -82,9 +105,16 @@ def create_sandbox(
             if not instance_id:
                 raise ModalApiError("Modal Sandbox create returned no object id")
             return instance_id
-        except sdk.exception.InvalidError as exc:
-            raise ModalApiError("Modal rejected the Sandbox create request") from exc
+        # BaseException, not Exception: a KeyboardInterrupt or a cancellation landing between the
+        # create call and its returned id leaves a Sandbox this process never recorded, which is
+        # exactly the ambiguous case the reconciliation below exists for. Narrowing this to
+        # Exception lets that escape unreconciled and bill until the deadline. lambda_ takes
+        # BaseException at the same boundary for the same reason.
         except BaseException as exc:
+            if _create_rejection_is_clean(sdk, exc):
+                raise ModalApiError(
+                    f"Modal rejected the Sandbox create request ({type(exc).__name__})"
+                ) from exc
             try:
                 matches = _list_with_client(sdk, client, tags={LABEL_TAG: tags[LABEL_TAG]})
             except BaseException:

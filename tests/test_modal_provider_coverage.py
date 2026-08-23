@@ -101,6 +101,176 @@ def test_modal_api_creates_a_mocked_sandbox_with_exact_inputs(monkeypatch) -> No
     assert calls["closed"] is True
 
 
+@pytest.mark.parametrize(
+    "error_name",
+    [
+        "AuthError",
+        "PermissionDeniedError",
+        "NotFoundError",
+        "RequestSizeError",
+        "ImageBuildError",
+        "InvalidError",
+    ],
+)
+def test_modal_create_clean_rejections_remain_retryable(monkeypatch, error_name) -> None:
+    from flash.providers.modal import api, auth
+
+    clean_error = type(error_name, (Exception,), {})
+
+    class _OtherError(Exception):
+        pass
+
+    class _Client:
+        def _close(self):
+            pass
+
+    exception_types = {
+        name: _OtherError
+        for name in (
+            "AuthError",
+            "PermissionDeniedError",
+            "NotFoundError",
+            "RequestSizeError",
+            "ImageBuildError",
+            "ResourceExhaustedError",
+            "InvalidError",
+            "ConflictError",
+        )
+    }
+    exception_types[error_name] = clean_error
+    sdk = SimpleNamespace(
+        Client=SimpleNamespace(from_credentials=lambda *_args: _Client()),
+        App=SimpleNamespace(lookup=lambda *_args, **_kwargs: "app"),
+        Image=SimpleNamespace(from_registry=lambda image: image),
+        Sandbox=SimpleNamespace(
+            create=lambda *_args, **_kwargs: (_ for _ in ()).throw(clean_error()),
+            list=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected reconciliation")),
+        ),
+        exception=SimpleNamespace(**exception_types),
+    )
+    monkeypatch.setattr(auth, "load_credentials", lambda: ("id", "secret"))
+    monkeypatch.setattr(api, "_modal_sdk", lambda: sdk)
+
+    with pytest.raises(api.ModalApiError, match=error_name):
+        api.create_sandbox(
+            "true",
+            image="worker:sm90",
+            gpu="H100!",
+            env={},
+            timeout=60,
+            name="flash-run-s0-a0",
+            tags={api.LABEL_TAG: "flash-run-s0-a0"},
+        )
+
+
+def test_modal_create_ambiguous_empty_reconciliation_stays_terminal(monkeypatch) -> None:
+    from flash.providers.base import UnreconciledCreateError
+    from flash.providers.modal import api, auth
+
+    class _ConnectionError(Exception):
+        pass
+
+    class _OtherError(Exception):
+        pass
+
+    class _Client:
+        def _close(self):
+            pass
+
+    sdk = SimpleNamespace(
+        Client=SimpleNamespace(from_credentials=lambda *_args: _Client()),
+        App=SimpleNamespace(lookup=lambda *_args, **_kwargs: "app"),
+        Image=SimpleNamespace(from_registry=lambda image: image),
+        Sandbox=SimpleNamespace(
+            create=lambda *_args, **_kwargs: (_ for _ in ()).throw(_ConnectionError()),
+            list=lambda **_kwargs: iter(()),
+        ),
+        exception=SimpleNamespace(
+            InvalidError=_OtherError,
+            ConflictError=_OtherError,
+            NotFoundError=_OtherError,
+            ConnectionError=_ConnectionError,
+        ),
+    )
+    monkeypatch.setattr(auth, "load_credentials", lambda: ("id", "secret"))
+    monkeypatch.setattr(api, "_modal_sdk", lambda: sdk)
+
+    with pytest.raises(UnreconciledCreateError, match="did not resolve"):
+        api.create_sandbox(
+            "true",
+            image="worker:sm90",
+            gpu="H100!",
+            env={},
+            timeout=60,
+            name="flash-run-s0-a0",
+            tags={api.LABEL_TAG: "flash-run-s0-a0"},
+        )
+
+
+@pytest.mark.parametrize("error_name", ["ResourceExhaustedError", "ConflictError"])
+def test_modal_create_quota_and_conflict_stay_ambiguous(monkeypatch, error_name) -> None:
+    """A quota refusal or a name conflict must NOT be treated as a settled rejection.
+
+    Modal raises ``ResourceExhaustedError`` (grpc RESOURCE_EXHAUSTED) for a quota or rate limit,
+    which it can do AFTER admitting the work, so a Sandbox may exist with an id this process never
+    saw. ``ConflictError`` subclasses ``InvalidError``, so without an explicit exclusion it would
+    inherit the clean verdict from its base. Calling either one clean authorizes a second create
+    against a resource that may already be billing.
+    """
+    from flash.providers.base import UnreconciledCreateError
+    from flash.providers.modal import api, auth
+
+    ambiguous = type(error_name, (Exception,), {})
+
+    class _OtherError(Exception):
+        pass
+
+    class _Client:
+        def _close(self):
+            pass
+
+    exception_types = {
+        name: _OtherError
+        for name in (
+            "AuthError",
+            "PermissionDeniedError",
+            "NotFoundError",
+            "RequestSizeError",
+            "ImageBuildError",
+            "InvalidError",
+            "ConflictError",
+            "ResourceExhaustedError",
+        )
+    }
+    exception_types[error_name] = ambiguous
+    if error_name == "ConflictError":
+        # the real sdk has ConflictError subclass InvalidError, which is what the exclusion guards.
+        exception_types["InvalidError"] = ambiguous.__mro__[1]
+    sdk = SimpleNamespace(
+        Client=SimpleNamespace(from_credentials=lambda *_args: _Client()),
+        App=SimpleNamespace(lookup=lambda *_args, **_kwargs: "app"),
+        Image=SimpleNamespace(from_registry=lambda image: image),
+        Sandbox=SimpleNamespace(
+            create=lambda *_args, **_kwargs: (_ for _ in ()).throw(ambiguous()),
+            list=lambda **_kwargs: iter(()),
+        ),
+        exception=SimpleNamespace(**exception_types),
+    )
+    monkeypatch.setattr(auth, "load_credentials", lambda: ("id", "secret"))
+    monkeypatch.setattr(api, "_modal_sdk", lambda: sdk)
+
+    with pytest.raises(UnreconciledCreateError):
+        api.create_sandbox(
+            "true",
+            image="worker:sm90",
+            gpu="H100!",
+            env={},
+            timeout=60,
+            name="flash-run-s0-a0",
+            tags={api.LABEL_TAG: "flash-run-s0-a0"},
+        )
+
+
 def test_modal_provider_delegates_credentials_pricing_gc_and_orphan_sweep(monkeypatch) -> None:
     from flash.providers.modal import jobs, preflight, pricing
 
@@ -152,6 +322,20 @@ def test_modal_pricing_uses_only_the_modal_table() -> None:
     assert hourly_rate("B200") == pytest.approx(6.25)
     with pytest.raises(UnsupportedGpuError, match="modal does not offer"):
         hourly_rate("A100 PCIe")
+
+
+def test_modal_pinned_offline_allocation_uses_modal_rate() -> None:
+    from flash.providers.modal.pricing import hourly_rate
+    from flash.runner.costs import _pinned_offline_allocation
+
+    allocation = _pinned_offline_allocation("modal", "H100", 2)
+
+    assert allocation is not None
+    assert (allocation.provider, allocation.gpu_count, allocation.hourly_usd) == (
+        "modal",
+        2,
+        hourly_rate("H100"),
+    )
 
 
 def test_live_candidates_are_static_shapes_without_a_capacity_probe(monkeypatch) -> None:

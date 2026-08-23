@@ -342,6 +342,16 @@ def test_explicit_vast_quote_stays_offline(monkeypatch):
     )
 
 
+def test_explicit_modal_quote_uses_modal_static_rate():
+    from flash.providers.modal.pricing import hourly_rate
+
+    explicit = estimate_cost(
+        RunConfig("Qwen/Qwen3.5-0.8B", "grpo", 10, provider="modal", gpu_type="H100")
+    )
+
+    assert (explicit.provider, explicit.gpu_hourly_usd) == ("modal", hourly_rate("H100"))
+
+
 def test_auto_quote_does_not_require_live_vast_capacity(monkeypatch):
     from flash.providers.vast import jobs as vast
 

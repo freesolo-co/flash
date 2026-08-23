@@ -58,6 +58,10 @@ def _pinned_offline_allocation(provider: str, gpu_type: str, gpu_count: int):
             from flash.providers.lambda_.pricing import static_hourly_rate
 
             hourly = static_hourly_rate(gpu)
+        elif provider == "modal":
+            from flash.providers.modal.pricing import hourly_rate
+
+            hourly = hourly_rate(gpu)
         else:
             hourly = GPU_INFO[gpu].hourly_usd
         return Allocation(
