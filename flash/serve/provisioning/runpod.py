@@ -790,6 +790,7 @@ def _reclaim_runpod_deployment(
 
     mutation_attempted = False
     known: RunPodObservation | None = None
+    discovered: RunPodObservation | None = None
     attempted_deletes: set[tuple[str, str]] = set()
     discovery_deadline_at = min(deadline_at, clock() + _CLEANUP_RESERVE_SECONDS)
     discovery_settled = False
@@ -799,11 +800,23 @@ def _reclaim_runpod_deployment(
             if not discovery_settled:
                 complete = complete_resource_set(plan, observation, allow_duplicates=True)
                 if not complete:
+                    # completeness can lag or never arrive after an ambiguous create, but the call
+                    # above already proved every visible member belongs to this exact deployment.
+                    discovered = (
+                        observation
+                        if discovered is None
+                        else merge_resource_observations(discovered, observation)
+                    )
+                    complete_resource_set(plan, discovered, allow_duplicates=True)
                     if sleep_until_poll(discovery_deadline_at, clock, sleep):
                         continue
-                    return unknown_result(plan, reason="teardown_cleanup_unconfirmed")
-                known = observation
-                discovery_settled = True
+                    if discovered.resource_count == 0:
+                        return unknown_result(plan, reason="teardown_cleanup_unconfirmed")
+                    known = discovered
+                    discovery_settled = True
+                else:
+                    known = observation
+                    discovery_settled = True
             else:
                 complete_resource_set(plan, observation, allow_duplicates=True)
                 assert known is not None

@@ -43,6 +43,7 @@ from flash.serve.provisioning._runpod_protocol import (
 from flash.serve.provisioning._runpod_resources import (
     RunPodResourceConflict,
     _one,
+    complete_resource_set,
     pod_identity_matches,
 )
 from flash.serve.provisioning._runpod_transport import (
@@ -1346,7 +1347,96 @@ def test_create_failure_boundaries_reclaim_only_fully_confirmed_resources(
         )
 
 
-def test_identity_reclaim_preserves_an_incomplete_late_visible_volume() -> None:
+def test_identity_reclaim_deletes_validated_partial_secret_and_volume() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    plan = build_runpod_create_plan(bundle)
+    # model the only durable provider state after an ambiguous create lost its response.
+    transport.secrets = [{"id": "secret01", "name": plan.names.inference_secret}]
+    transport.volumes = [{"id": "volume01", **plan.volume_payload()}]
+
+    reclaimed = teardown_runpod_deployment(
+        bundle,
+        None,
+        RunPodCredentials(PROVIDER_SECRET),
+        deadline_at=transport.clock() + 100.0,
+        transport_factory=_Factory(transport),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert (
+        reclaimed.status,
+        reclaimed.error_reason,
+        [call[1] for call in _mutation_calls(transport)],
+        transport.secrets,
+        transport.volumes,
+    ) == (
+        "absent",
+        None,
+        ["DELETE /networkvolumes/volume01", "secretDelete"],
+        [],
+        [],
+    )
+
+
+def test_identity_reclaim_refuses_identity_mismatched_partial_resource() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    plan = build_runpod_create_plan(bundle)
+    transport.secrets = [{"id": "secret01", "name": plan.names.inference_secret}]
+    transport.volumes = [{"id": "volume01", **plan.volume_payload(), "dataCenterId": "EU-RO-1"}]
+    observation = _observe(plan, transport, deadline_at=100.0)
+
+    with pytest.raises(RunPodResourceConflict, match="network volume does not match"):
+        complete_resource_set(plan, observation, allow_duplicates=True)
+
+    transport.calls.clear()
+    reclaimed = teardown_runpod_deployment(
+        bundle,
+        None,
+        RunPodCredentials(PROVIDER_SECRET),
+        deadline_at=100.0,
+        transport_factory=_Factory(transport),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert reclaimed.status == "failed"
+    assert reclaimed.error_code == "conflict"
+    assert _mutation_calls(transport) == []
+    assert len(transport.secrets) == 1
+    assert len(transport.volumes) == 1
+
+
+def test_identity_reclaim_complete_set_uses_fast_path_without_waiting() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    reclaimed = teardown_runpod_deployment(
+        bundle,
+        None,
+        RunPodCredentials(PROVIDER_SECRET),
+        deadline_at=100.0,
+        transport_factory=_Factory(transport),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert reclaimed.status == "absent"
+    assert transport.clock.now == 0.0
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        f"DELETE /pods/{POD_ID}",
+        "DELETE /templates/template01",
+        "DELETE /networkvolumes/volume01",
+        "secretDelete",
+        "secretDelete",
+    ]
+
+
+def test_identity_reclaim_deletes_an_incomplete_late_visible_volume() -> None:
     bundle = _bundle()
     transport = _LateVisibleAmbiguousVolumeTransport()
     transport.fail_mutation_at = 3
@@ -1372,11 +1462,13 @@ def test_identity_reclaim_preserves_an_incomplete_late_visible_volume() -> None:
         sleep=transport.clock.sleep,
     )
 
-    assert reclaimed.status == "outcome_unknown"
-    assert reclaimed.error_reason == "teardown_cleanup_unconfirmed"
+    assert reclaimed.status == "absent"
     assert transport.hidden_volume_observations == 3
-    assert len(transport.volumes) == 1
-    assert _mutation_calls(transport) == []
+    assert transport.volumes == []
+    assert transport.secrets == []
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        "DELETE /networkvolumes/volume01",
+    ]
 
 
 def test_identity_reclaim_waits_for_complete_visibility_before_any_delete() -> None:
