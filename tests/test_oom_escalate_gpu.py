@@ -889,9 +889,7 @@ def test_host_ram_kill_is_still_not_a_cuda_oom_after_widening():
     """
     from flash.engine.worker.perf.lifecycle import host_ram_kill_evidence, is_cuda_oom
 
-    line = (
-        "ray.exceptions.OutOfMemoryError: Task was killed due to the node running low on memory"
-    )
+    line = "ray.exceptions.OutOfMemoryError: Task was killed due to the node running low on memory"
     assert host_ram_kill_evidence(line) is not None
     assert not is_cuda_oom(RuntimeError(line))
 
