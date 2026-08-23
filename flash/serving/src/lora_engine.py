@@ -111,6 +111,7 @@ class _LoraEngineImpl:
         self._source_locks_guard = asyncio.Lock()
         self._source_paths: dict[tuple[str, str, str, str | None], Path] = {}
         self._lora_requests: dict[str, tuple[tuple[str, str, str, str | None], Any]] = {}
+        self._unconfirmed_loras: set[str] = set()
         self._prompt_token_cache: OrderedDict[tuple[str, str], tuple[int, ...]] = OrderedDict()
         self._prompt_cache_size = cfg.PROMPT_TOKEN_CACHE_SIZE
         base_model_adapters = _load_adapters_for_base(self.settings, self.base_model)
@@ -207,25 +208,22 @@ class _LoraEngineImpl:
             return lock
 
     async def _evict_loaded_lora(self, adapter_id: str) -> None:
-        # Best-effort: drop this id's LoRA from the engine (vLLM caches by int id, so a redeploy
-        # under the same id must evict the old one). Caller holds the per-adapter lock.
-        try:
-            cached = self._lora_requests.get(adapter_id)
-            if cached is None:
-                return
-            remove = getattr(self.engine, "remove_lora", None)
-            if remove is not None:
-                # use only the int id this adapter actually loaded with. recomputing an uncached
-                # alias's hash could remove another tenant's adapter that owns the colliding id.
-                int_id = cached[1].lora_int_id
-                # remove_lora is a coroutine in vllm>=0.11 — must await or it never frees the slot.
-                result = remove(int_id)
-                if inspect.isawaitable(result):
-                    await result
-        except Exception:  # best-effort; not all vLLM versions expose removal
-            pass
-        finally:
-            self._lora_requests.pop(adapter_id, None)
+        # drop this id's lora from the engine before releasing its collision-reserved integer id.
+        cached = self._lora_requests.get(adapter_id)
+        if cached is None:
+            return
+        remove = getattr(self.engine, "remove_lora", None)
+        if remove is None:
+            raise RuntimeError("vLLM cannot confirm LoRA removal")
+        # use only the int id this adapter actually loaded with. recomputing an uncached alias's hash
+        # could remove another tenant's adapter that owns the colliding id.
+        result = remove(cached[1].lora_int_id)
+        if inspect.isawaitable(result):
+            result = await result
+        if result is False:
+            raise RuntimeError("vLLM rejected LoRA removal")
+        self._lora_requests.pop(adapter_id, None)
+        getattr(self, "_unconfirmed_loras", set()).discard(adapter_id)
 
     async def _pin_lora(self, lora_request: Any) -> None:
         pin = getattr(self.engine, "pin_lora", None)
@@ -236,8 +234,16 @@ class _LoraEngineImpl:
             await result
 
     async def _add_lora_locked(self, record: Any, path: Path) -> None:
+        source_ident = _adapter_source_ident(record)
+        cached = self._lora_requests.get(record.adapter_id)
+        already_tracked = cached is not None and cached[0] == source_ident
         lora_request = self._cached_lora_request_locked(record, path)
-        await self.engine.add_lora(lora_request)
+        added = await self.engine.add_lora(lora_request)
+        if added is False and not already_tracked:
+            unconfirmed = getattr(self, "_unconfirmed_loras", set())
+            self._unconfirmed_loras = unconfirmed
+            unconfirmed.add(record.adapter_id)
+            raise RuntimeError("vLLM rejected a new LoRA registration")
         # Pin only when the hot GPU pool covers the deployable CPU pool. Capped-max_loras models leave
         # adapters unpinned so >max_loras adapters can register and LRU-swap in on demand instead of
         # the surplus failing to claim one of the few GPU slots.
@@ -360,9 +366,13 @@ class _LoraEngineImpl:
 
         source_ident = _adapter_source_ident(record)
         adapter_id = record.adapter_id
+        if adapter_id in getattr(self, "_unconfirmed_loras", set()):
+            raise RuntimeError("LoRA registration is unconfirmed on this engine")
         cached = self._lora_requests.get(adapter_id)
-        if cached is not None and cached[0] == source_ident:
-            return cached[1]
+        if cached is not None:
+            if cached[0] == source_ident:
+                return cached[1]
+            raise RuntimeError("previous LoRA removal is unconfirmed on this engine")
 
         # lora_int_id masks a sha1 to 31 bits (int32-fitting positive id vLLM requires), so distinct
         # adapter_ids can collide to the same int id and cross-wire two orgs' LoRAs on one engine.

@@ -154,7 +154,12 @@ def apply_teardown(
         else:
             router.upsert(current)
         cleanup_record = current or candidate
-        cleanup_records.append((cleanup_record, cleanup_record.deployment_generation))
+        expected_generation = cleanup_record.deployment_generation
+        # a loading revision has no persisted deployment generation, but register loaded its original
+        # updated_at. carry that exact generation after fencing so cleanup can evict only that load.
+        if expected_generation is None and candidate.is_revision and candidate.status == "disabled":
+            expected_generation = candidate.updated_at
+        cleanup_records.append((cleanup_record, expected_generation))
     return cleanup_records
 
 

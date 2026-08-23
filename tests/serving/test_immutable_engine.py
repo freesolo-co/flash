@@ -112,6 +112,59 @@ def test_unregister_skips_cleanup_for_a_newer_deployment_generation() -> None:
     assert evicted == [record.adapter_id]
 
 
+@pytest.mark.parametrize("outcome", ["missing", "raises", "false"])
+def test_unconfirmed_lora_removal_retains_collision_reservation(outcome: str) -> None:
+    request = SimpleNamespace(lora_int_id=42)
+    engine = _LoraEngineImpl()
+    engine._lora_requests = {"tenant-a": (("org/a", "model", "sha", None), request)}
+
+    if outcome == "missing":
+        engine.engine = object()
+    else:
+
+        class _Engine:
+            async def remove_lora(self, _int_id: int) -> bool:
+                if outcome == "raises":
+                    raise RuntimeError("worker unavailable")
+                return False
+
+        engine.engine = _Engine()
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(engine._evict_loaded_lora("tenant-a"))
+
+    assert engine._lora_requests["tenant-a"][1] is request
+
+
+def test_new_lora_rejection_is_not_treated_as_loaded(tmp_path: Path) -> None:
+    record = _revision("a" * 40)
+    request = SimpleNamespace(lora_int_id=42)
+    engine = _LoraEngineImpl()
+    engine._lora_requests = {}
+    engine._unconfirmed_loras = set()
+    engine._pin_loras = False
+
+    class _Engine:
+        async def add_lora(self, _request: object) -> bool:
+            return False
+
+    engine.engine = _Engine()
+
+    def _cache(_record: AdapterRecord, _path: Path) -> object:
+        engine._lora_requests[record.adapter_id] = (
+            (record.repo_id, record.repo_type, record.hf_revision or "", record.subfolder),
+            request,
+        )
+        return request
+
+    engine._cached_lora_request_locked = _cache
+
+    with pytest.raises(RuntimeError, match="rejected a new LoRA registration"):
+        asyncio.run(engine._add_lora_locked(record, tmp_path))
+
+    assert record.adapter_id in engine._unconfirmed_loras
+
+
 def test_unregister_tombstones_missing_record_for_expected_generation() -> None:
     stale_record = _revision("a" * 40).model_copy(
         update={

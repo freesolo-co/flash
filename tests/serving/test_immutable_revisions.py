@@ -765,7 +765,7 @@ def test_delete_run_alias_cascades_ready_alias_and_revisions(setup) -> None:
     )
 
 
-def test_delete_run_alias_fences_a_revision_that_is_still_loading(setup) -> None:
+def test_delete_run_alias_evicts_revision_whose_register_result_was_lost(setup) -> None:
     client, pool, _, persistence = setup
     assert _register(client, _registration()).status_code == 200
     assert (
@@ -780,6 +780,8 @@ def test_delete_run_alias_fences_a_revision_that_is_still_loading(setup) -> None
     ).to_record()
     loading = persistence._stamp(loading)
     persistence.rows[REVISION_B] = loading
+    # the remote engine loaded this generation, but its successful result was lost before promotion.
+    pool.loaded_generations[REVISION_B] = loading.updated_at
 
     response = client.delete(f"/adapters/{RUN_ID}")
 
@@ -793,6 +795,8 @@ def test_delete_run_alias_fences_a_revision_that_is_still_loading(setup) -> None
     )
     assert stale_promotion is None, "the loading revision retained authority to become ready"
     assert pool.unregistered == [RUN_ID, REVISION_A, REVISION_B]
+    assert pool.unregistered_generations[-1] == loading.updated_at
+    assert REVISION_B not in pool.loaded_generations, "fenced loading revision stayed gpu-resident"
 
 
 def test_delete_run_alias_disables_revisions_when_alias_already_disabled(setup) -> None:
