@@ -38,7 +38,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Sync (server extra + dev)
-        run: uv sync --extra server --dev
+        run: uv sync --extra server --extra serving --dev
 
       - name: Ruff check
         run: uv run ruff check .
@@ -161,7 +161,7 @@ jobs:
           python-version: "3.11"
 
       - name: Sync (server extra + dev)
-        run: uv sync --extra server --dev
+        run: uv sync --extra server --extra serving --dev
 
       - name: mypy
         run: |

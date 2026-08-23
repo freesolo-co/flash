@@ -261,7 +261,12 @@ def _finish_deployment_unlocked(
     def _assert_activation_fence() -> None:
         _assert_deployment_activation_fence(run_id, deployment, is_checkpoint, prev_state)
 
-    def _before_activate(adapter_revision: str, checkpoint: str) -> None:
+    def _before_activate(
+        adapter_revision: str,
+        checkpoint: str,
+        *,
+        advertised_capabilities: frozenset[str] | None = None,
+    ) -> None:
         nonlocal activation_target, current
         _assert_activation_fence()
         activation_target = (adapter_revision, checkpoint)
@@ -281,6 +286,7 @@ def _finish_deployment_unlocked(
                 spec,
                 serving_model=adapter_revision,
                 expected_checkpoint=checkpoint,
+                advertised_capabilities=advertised_capabilities,
             )
         )
         current = _deployment_state(

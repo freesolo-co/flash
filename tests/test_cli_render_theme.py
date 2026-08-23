@@ -6,6 +6,7 @@ scripts, and the trainer agent depend on.
 
 from __future__ import annotations
 
+import argparse
 import json
 
 import pytest
@@ -454,7 +455,7 @@ def test_invalid_command_suggests_closest_match(monkeypatch, capsys) -> None:
         cli.main(["models", "deploly"])  # a typo of canonical `models deploy`
     assert excinfo.value.code == 2
     err = capsys.readouterr().err
-    assert "did you mean 'deploy'?" in err
+    assert "unknown command 'deploly' (did you mean 'deploy'?)" in err
     assert "choose from" not in err  # the full choice list is gone on a TTY
     assert "--help" in err
 
@@ -465,6 +466,234 @@ def test_invalid_command_suggests_closest_match(monkeypatch, capsys) -> None:
     err = capsys.readouterr().err
     assert "invalid choice" in err  # machine path unchanged
     assert "choose from" in err  # the full argparse list stays on the machine path
+
+
+@pytest.mark.parametrize("bad_args", [["--key", "X"], ["--key=X"]])
+def test_invalid_login_flag_suggests_api_key(monkeypatch, capsys, bad_args) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", *bad_args])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized argument '--key' (did you mean '--api-key'?)" in err
+    assert "--help" in err
+
+
+def test_invalid_flag_machine_path_keeps_argparse_message(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "0")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", "--key", "X"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "error: unrecognized arguments: --key X" in err
+    assert "did you mean" not in err
+
+
+def test_invalid_flag_without_close_match_keeps_original_message(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", "--xyzzy", "X"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: --xyzzy X" in err
+    assert "did you mean" not in err
+
+
+def test_flag_valid_on_another_command_is_not_suggested_to_itself(monkeypatch, capsys) -> None:
+    # --repository is real on `models export`, so the cross-subcommand candidate pool contains it
+    # and the closest match to '--repository' is itself. echoing the rejected token back as its own
+    # correction reads as a bug in the cli, so no suggestion is better than that one.
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", "--repository", "X"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: --repository X" in err
+    assert "did you mean '--repository'" not in err
+
+
+def test_a_root_flag_suggestion_says_where_the_flag_goes(monkeypatch, capsys) -> None:
+    """A correction the user cannot follow is not a correction.
+
+    Root flags parse only before the subcommand, so `flash login --verbos` -> "did you mean
+    '--verbose'?" sends the user to `flash login --verbose`, which fails identically. The suggestion
+    has to carry the position, since that is the actual difference between working and not.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", "--verbos"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "did you mean '--verbose'" in err
+    assert "it goes before the command" in err
+    assert "flash --verbose ..." in err
+
+
+def test_a_subcommand_flag_suggestion_is_not_given_a_reposition_hint(monkeypatch, capsys) -> None:
+    """Only root-only flags need repositioning; a subcommand's own flag is already in place."""
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["runs", "log", "flash-1", "--folow"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "did you mean '--follow'" in err
+    assert "it goes before the command" not in err
+
+
+@pytest.mark.parametrize(
+    ("argv", "absent"),
+    [
+        # --follow is real on `runs log`, not on `login`; --api-key is real on `login`, not here.
+        (["login", "--folow"], "--follow"),
+        (["runs", "log", "flash-1", "--api-ke"], "--api-key"),
+    ],
+)
+def test_a_flag_from_an_unrelated_command_is_not_suggested(
+    monkeypatch, capsys, argv, absent
+) -> None:
+    """A suggestion the user cannot follow is worse than none.
+
+    The candidate pool has to span subcommands for a suggestion to be reachable at all, since
+    argparse reports a subcommand's unknown tokens from the root. Drawing from the WHOLE tree
+    though offers flags that belong to some other command, so the corrected line is rejected
+    exactly like the first one and the hint has cost the user a round trip.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(argv)
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert absent not in err
+    assert "did you mean" not in err
+
+
+def test_a_correctly_spelled_root_flag_is_repositioned_not_respelled(monkeypatch, capsys) -> None:
+    """`--verbose` after a command is a placement error, so there is nothing to correct it to.
+
+    Dropping the exact token from the pool is what keeps a typo from being echoed back as its own
+    fix, but it also removes `--verbose` here and lets the nearest sibling stand in: the answer was
+    "did you mean '--version'?", a different flag with a different meaning.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["train", "x.toml", "--verbose"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "it goes before the command" in err
+    assert "flash --verbose ..." in err
+    assert "--version" not in err
+
+
+def test_nested_flag_typo_is_scoped_to_parser_at_its_position(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["runs", "--folow", "log", "flash-1"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: --folow" in err
+    assert "--follow" not in err
+    assert "did you mean" not in err
+
+
+def test_repeated_short_root_flag_is_repositioned_without_downgrading(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["login", "-vv"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized argument '-vv'" in err
+    assert "it goes before the command" in err
+    assert "flash -vv ..." in err
+    assert "flash -v ..." not in err
+
+
+def test_flag_typo_after_option_terminator_has_no_unusable_suggestion(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["runs", "log", "flash-1", "--", "--folow"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: --folow" in err
+    assert "--follow" not in err
+    assert "did you mean" not in err
+
+
+def test_a_lone_dash_reaches_argparses_own_message(monkeypatch, capsys) -> None:
+    """A bare `-` names no option, so the typo machinery must not answer it with a flag.
+
+    `_get_option_tuples` indexes the token's second character, so asking argparse about a lone dash
+    raised IndexError from inside the handler whose whole job is to improve an error message.
+    """
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["runs", "log", "flash-1", "-"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: -" in err
+    assert "did you mean" not in err
+    assert "-v" not in err
+
+
+@pytest.mark.parametrize("shape", ["tuple3", "tuple4", "list"])
+def test_a_repeated_short_root_flag_is_recognized_under_every_parse_optional_shape(
+    monkeypatch, shape
+) -> None:
+    """`_parse_optional` has three shapes across the interpreters `requires-python` admits.
+
+    A 3-tuple before 3.11.9/3.12.3, a 4-tuple after the separator was inserted, and from 3.12.11
+    a LIST of those tuples. Each one has broken this predicate in a different way: the 4-tuple
+    unpack raised ValueError on the older interpreters, and the arity guard written for both
+    tuples silently rejected the list, which put `-vv` back on the path that downgrades it to `-v`.
+
+    The predicate is exercised directly rather than through `cli.main`, because argparse's own
+    parse loop reads this same value: reshaping it parser-wide fails inside argparse and would
+    prove nothing about our handling.
+    """
+    from flash.cli.errors import _is_repeated_root_short_option
+
+    root = argparse.ArgumentParser()
+    root.add_argument("-v", action="count")
+    original = root._parse_optional
+
+    def reshaped(arg_string):
+        parsed = original(arg_string)
+        if isinstance(parsed, list):  # normalize the interpreter's own shape away first
+            parsed = parsed[0] if len(parsed) == 1 else None
+        if parsed is None:
+            return None
+        if shape == "tuple3":  # drop the separator argparse inserted at index 2
+            return (parsed[0], parsed[1], parsed[3]) if len(parsed) == 4 else parsed
+        if shape == "list":
+            return [parsed]
+        return parsed
+
+    monkeypatch.setattr(root, "_parse_optional", reshaped)
+    assert _is_repeated_root_short_option(root, "-vv", frozenset({"-v"})) is True
+    # a short flag that is not a repeat of itself must not be repositioned as one.
+    assert _is_repeated_root_short_option(root, "-vx", frozenset({"-v"})) is False
 
 
 def test_theme_light_and_dark_use_different_brand_colors(monkeypatch) -> None:
@@ -669,6 +898,30 @@ def test_heartbeat_is_current_attempt_rejects_malformed_identities() -> None:
     # canonical int identities: exact match shows, mismatch suppresses
     assert is_current({"remote": {"attempt": 2}}, {"attempt": 2}) is True
     assert is_current({"remote": {"attempt": 2}}, {"attempt": 1}) is False
+
+
+def test_live_attempt_is_one_rule_for_every_surface_that_names_an_attempt() -> None:
+    """The spinner, the status line, and the worker-artifact labels must not disagree.
+
+    They are read within one screen of each other, so two provenance rules read as a run that is on
+    two attempts at once -- and the artifact labels would call the live attempt's console "previous".
+    """
+    live = render.live_attempt
+
+    # the plane's live attempt wins over the ping, which may be the superseded worker's.
+    assert live({"remote": {"attempt": 2}, "last_heartbeat": {"attempt": 1}}) == 2
+    # `remote` absent entirely (a managed payload that omits it): the ping is all there is.
+    assert live({"last_heartbeat": {"attempt": 3}}) == 3
+    # a `remote` that carries no usable attempt is not an answer either, so the ping still applies.
+    assert live({"remote": {}, "last_heartbeat": {"attempt": 1}}) == 1
+    for bad in ["1", True, 2.7, float("inf"), -1]:
+        assert live({"remote": {"attempt": bad}, "last_heartbeat": {"attempt": 4}}) == 4
+    # explicitly null `remote` is the teardown window: the attached ping belongs to a dead worker,
+    # so there is no live attempt to report rather than that worker's.
+    assert live({"remote": None, "last_heartbeat": {"attempt": 1}}) is None
+    # nothing usable anywhere reads as unknown, never as attempt 0.
+    assert live({}) is None
+    assert live({"last_heartbeat": {"attempt": "1"}}) is None
 
 
 def test_progress_age_always_adds_to_heartbeat_age(monkeypatch):

@@ -476,6 +476,148 @@ def test_warmstart_accepts_omitted_child_rank_with_internal_placeholder() -> Non
     assert spec.train.lora_rank == 32
 
 
+def test_gpu_sizing_consumes_the_canonical_warmstart_reference() -> None:
+    """An invalid reference must not be approximated as an unresolved warm start.
+
+    This intentionally pins the only error-order change from sharing the canonical parse: the bad
+    reference is reported before rank-dependent gpu sizing can reinterpret its non-empty text.
+    """
+    raw = _raw(
+        model="Qwen/Qwen3.6-35B-A3B",
+        **{"gpu.type": "A100 PCIe", "train.init_from_adapter": "not/a/checkpoint/ref"},
+    )
+    raw["train"].pop("lora_rank")
+
+    with pytest.raises(ConfigError, match=r"train\.init_from_adapter must be `<run_id>`"):
+        spec_from_dict(raw)
+
+
+def test_warmstart_placeholder_rank_does_not_reject_a_source_rank_that_fits_b200() -> None:
+    from flash.providers.allocator import required_vram_gb
+
+    train = {
+        "epochs": 1,
+        "max_examples": 10,
+        "prompts_per_step": 8,
+        "group_size": 4,
+        "max_context_tokens": 1536,
+        "max_completion_tokens": 512,
+    }
+    base = _raw(
+        model="Qwen/Qwen3.6-35B-A3B",
+        algorithm="grpo",
+        **{
+            "gpu.type": "B200",
+            **{f"train.{key}": value for key, value in train.items()},
+        },
+    )
+    base["train"].pop("lora_rank")
+
+    warm = spec_from_dict(
+        {
+            **base,
+            "train": {**base["train"], "init_from_adapter": "source-rank-4"},
+        }
+    )
+    cold_rank4 = spec_from_dict({**base, "train": {**base["train"], "lora_rank": 4}})
+
+    assert warm.train.lora_rank == 32
+    assert cold_rank4.train.lora_rank == 4
+    assert (
+        required_vram_gb(warm.model, warm.algorithm, train={**base["train"], "lora_rank": 4}) == 180
+    )
+    assert (
+        required_vram_gb(warm.model, warm.algorithm, train={**base["train"], "lora_rank": 32})
+        == 199
+    )
+    with pytest.raises(ConfigError, match=r"requires at least 199 GB"):
+        spec_from_dict({**base, "train": {**base["train"], "lora_rank": 32}})
+
+
+def test_parse_time_vram_rejection_names_the_wider_shape_that_fits() -> None:
+    """A single-card pin a second card would satisfy is a one-flag fix, not a dead end.
+
+    The allocator ends every fit rejection with ``wider_shape_remedy``; this parse-time check
+    did not, so an authored ``count = 1`` on the largest card Flash manages was rejected with no
+    remedy at all. A user reading it concludes there is nothing left to rent, when ``--gpus 2``
+    admits the same run.
+    """
+    train = {
+        "epochs": 1,
+        "max_examples": 10,
+        "prompts_per_step": 8,
+        "group_size": 4,
+        "max_context_tokens": 1536,
+        "max_completion_tokens": 512,
+        "lora_rank": 32,
+    }
+    raw = _raw(
+        model="Qwen/Qwen3.6-35B-A3B",
+        algorithm="grpo",
+        **{
+            "gpu.type": "B200",
+            "gpu.count": 1,
+            **{f"train.{key}": value for key, value in train.items()},
+        },
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        spec_from_dict(raw)
+    message = str(excinfo.value)
+    assert "requires at least 199 GB" in message
+    assert "--gpus 2" in message, f"rejection gave no remedy: {message}"
+    # and the suggestion has to be true: the same config at that count must parse.
+    widened = spec_from_dict({**raw, "gpu": {**raw["gpu"], "count": 2}})
+    assert widened.gpu.count == 2
+
+    # a HARD provider pin narrows the pool, so a class whose wider shape that provider does not
+    # freely rent must not be advertised. lambda names its card count in the instance type.
+    with pytest.raises(ConfigError) as pinned:
+        spec_from_dict({**raw, "gpu": {**raw["gpu"], "provider": "lambda"}})
+    pinned_message = str(pinned.value)
+    assert "requires at least 199 GB" in pinned_message
+    assert "--gpus" not in pinned_message, (
+        f"a lambda-pinned run was sent to a wider shape its pin may not carry: {pinned_message}"
+    )
+
+
+def test_warmstart_still_rejects_a_shape_impossible_at_the_minimum_rank() -> None:
+    raw = _raw(
+        model="Qwen/Qwen3.6-35B-A3B",
+        **{
+            "gpu.type": "B200",
+            "train.init_from_adapter": "source-run",
+            "train.max_context_tokens": 32768,
+            "train.max_completion_tokens": 512,
+            "train.prompts_per_step": 8,
+            "train.group_size": 4,
+        },
+    )
+    raw["train"].pop("lora_rank")
+
+    # the pinned class is named, because the exact-card gate reaches this shape before the pool-wide
+    # search does. the requirement is the same 216 GB either way.
+    with pytest.raises(ConfigError, match=r"gpu\.type 'B200' .* at least 216 GB"):
+        spec_from_dict(raw)
+
+
+def test_warmstart_still_validates_the_authored_card_at_the_minimum_rank() -> None:
+    """Relaxing the rank must not switch the exact-card gate off.
+
+    That gate is the only parse-time check of an authored `gpu.type`; skipping it let a pin that
+    cannot hold the run at ANY rank parse, because the fallback search ranks the whole pool rather
+    than the pinned class. rank 1 is a true vram lower bound, so a card rejected against it cannot fit
+    whatever rank the source turns out to have.
+    """
+    raw = _raw(
+        model="Qwen/Qwen3.6-35B-A3B",
+        **{"gpu.type": "A100 PCIe", "train.init_from_adapter": "source-run"},
+    )
+    raw["train"].pop("lora_rank")
+
+    with pytest.raises(ConfigError, match=r"gpu\.type 'A100 PCIe' has 80 GB VRAM"):
+        spec_from_dict(raw)
+
+
 def test_public_warmstart_serialization_omits_resolved_internal_fields() -> None:
     spec = _job_from_dict(
         {

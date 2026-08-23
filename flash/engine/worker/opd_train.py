@@ -374,7 +374,7 @@ def run_opd_train(spec=None) -> None:
                 # and on an image run that fan-out exhausted the grpo worker container's threads.
                 "multimodal": bool(multimodal),
                 "gpu_mem_util": _resolve_opd_gpu_mem_util(
-                    request, prompt_state, runtime, model_id, fp8_kv
+                    request, prompt_state, workload, runtime, model_id, fp8_kv
                 ),
                 "loggers": runtime.loggers,
                 # resolved from the out-of-process capability probe, never by opening cuda in this parent -- see fused_ce_backend.

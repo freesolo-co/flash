@@ -661,11 +661,12 @@ def test_self_hosting_docs_do_not_promise_an_endpoint_concurrency_cap() -> None:
 
 
 def test_the_serving_repos_are_not_on_the_training_path() -> None:
-    """The catalog names a serving checkpoint per model, and most FP8 checkpoints are private.
+    """The catalog names a serving checkpoint per model, separate from the trained base model.
 
-    A self-hoster's HF_TOKEN cannot read the private checkpoints, so if anything on the training
-    path resolved `serve_model_id` the run would die on a 401 against a repo they can neither see
-    nor fix. The field is serving metadata; this pins that it stays that way.
+    The FP8 serving checkpoints are public as of 2026-08-20, so this is no longer about a 401.
+    It stays because the field is *serving* metadata: training loads the base model, and a training
+    path that resolved `serve_model_id` would silently train against a quantized checkpoint instead
+    of the model the user asked for. Public repos make that failure quieter, not less wrong.
 
     Asserted against the CODE, not just the doc: a doc-only check keeps passing the moment a
     future caller starts reading the field, which is exactly when the claim stops being true.

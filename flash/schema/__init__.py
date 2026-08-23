@@ -49,16 +49,20 @@ from flash.schema.fields import (
     _train_teacher,
     _wandb_spec,
 )
+from flash.serve.contract import ADAPTER_REVISION_PATTERN
+
+# the smallest rank the parser accepts, and so the smallest a source adapter can turn out to have.
+# unresolved warm starts use it instead of the serialization default for permissive client-side
+# sizing. it is a vram lower bound, not a dollar lower bound because cost-ranked hardware selection
+# is non-monotonic across shapes. keep it aligned with the `lora_rank` parser floor.
+MIN_LORA_RANK = 1
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 # canonical short checkpoint references name a run alias or a saved checkpoint. immutable adapter
 # revisions additionally lock that checkpoint identity to the exact hugging face commit.
 _CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d{{1,18}}))?$")
-_ADAPTER_REVISION_RE = re.compile(
-    rf"^(?P<run_id>{_RUN_ID_RE})@(?:final|step-(?P<step>0|[1-9]\d{{0,17}}))\."
-    r"(?P<hf_revision>[0-9a-f]{40})$"
-)
+_ADAPTER_REVISION_RE = re.compile(ADAPTER_REVISION_PATTERN)
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
@@ -430,6 +434,54 @@ def _authored_gpu_type_entries(raw: Any) -> tuple[str, ...]:
     return entries
 
 
+def _parse_time_wider_shape_remedy(
+    candidate: str,
+    required_vram: int,
+    model: str,
+    algorithm: str,
+    *,
+    train: dict[str, Any],
+    thinking: bool,
+    provider: str,
+) -> str:
+    """The ``--gpus N`` clause for a class this run outgrows on ONE card, or ``""``.
+
+    The allocator already ends every fit rejection this way (``wider_shape_remedy``), but this
+    parse-time check ran without it: an authored single-card pin that a second card would satisfy
+    was rejected as a flat dead end, and the user learned only that the largest rentable card is
+    smaller than the requirement. Routing through the same helper means both boundaries suggest
+    the same flag, searched with the same fit model.
+
+    A hard ``gpu.provider`` pin is what narrows the pool, and it is a DIFFERENT field from the soft
+    ``gpu.providers`` preference list (the two are mutually exclusive, see ``GpuSpec``). Passing
+    only the soft list would advertise RunPod's freedom to rent any card count to a Lambda-pinned
+    run, sending the user to a wider SKU their pin may not carry -- exactly the confusion
+    ``widenable_gpu_names`` exists to prevent. A soft preference is not a pin, so it leaves the
+    pool open.
+
+    Sizing must never be what stops a config from parsing, so a failure here degrades to no
+    remedy -- the rejection itself is already correct and stands on its own.
+    """
+    try:
+        from flash.providers.allocator import _executed_width, geometry_safe_gpu_cap
+        from flash.providers.base import MAX_COMBINATION_CARDS, wider_shape_remedy
+        from flash.providers.fit_errors import widenable_gpu_names
+
+        if not widenable_gpu_names((candidate,), (provider,) if provider else None):
+            return ""
+        return wider_shape_remedy(
+            (get_gpu_info(candidate).vram_gb,),
+            required_vram,
+            # the same ceiling and executed-width rule the allocator searches with, so a count
+            # suggested here is one the submit-time gate would also accept.
+            ceiling=geometry_safe_gpu_cap(model, MAX_COMBINATION_CARDS),
+            above=1,
+            executed_width=_executed_width(algorithm, train, None),
+        )
+    except Exception:
+        return ""
+
+
 def _validate_gpu_section(
     raw: dict[str, Any],
     *,
@@ -437,6 +489,7 @@ def _validate_gpu_section(
     model_revision: str,
     algorithm: str,
     train_raw: dict[str, Any],
+    init_from_adapter: str,
     thinking: bool,
 ) -> tuple[GpuSpec, bool]:
     """Validate the GPU section and return its canonical spec plus auto-sizing provenance."""
@@ -483,10 +536,18 @@ def _validate_gpu_section(
         # provider preferences are soft; configured unnamed providers remain eligible.
 
     requested_gpu_count = authored_gpu_ceiling(gpu_spec.type, gpu_count)
+    unresolved_warmstart_rank = bool(init_from_adapter) and "lora_rank" not in train_raw
+    # the client cannot resolve a run id to the source adapter metadata, so rank 32 is only a
+    # serialization placeholder here. keep geometry checks and reject shapes that cannot fit even at
+    # the minimum valid rank; the server replaces this value from adapter_config.json before its
+    # authoritative allocation-time vram check.
+    preflight_train = (
+        {**train_raw, "lora_rank": MIN_LORA_RANK} if unresolved_warmstart_rank else train_raw
+    )
     preflight_gpu_count = provisional_gpu_count(
         model,
         algorithm,
-        train=train_raw,
+        train=preflight_train,
         thinking=thinking,
         geometry_model_revision=model_revision,
         gpu_count=requested_gpu_count,
@@ -495,10 +556,16 @@ def _validate_gpu_section(
         if gpu_types and preflight_gpu_count <= 1 and not model_revision:
             from flash.providers.allocator import required_vram_gb
 
+            # sized from `preflight_train`, so an unresolved warm start is measured at rank 1 rather
+            # than at the placeholder. that is a true vram lower bound: no source adapter can need
+            # less. a card rejected here therefore cannot fit at any rank the source could turn out to
+            # have, which keeps an impossible pin (an 80 GB A100 for a run needing 180 GB at rank 1)
+            # rejected at parse time. relaxing the rank is not the same as dropping the check --
+            # dropping it would let the authored `gpu.type` go unvalidated entirely.
             required_vram = required_vram_gb(
                 model,
                 algorithm,
-                train=train_raw,
+                train=preflight_train,
                 thinking=thinking,
             )
             # every authored class is checked, not just the head: a fallback too small to hold the
@@ -510,6 +577,15 @@ def _validate_gpu_section(
                     raise ConfigError(
                         f"gpu.type {candidate!r} has {get_gpu_info(candidate).vram_gb} GB VRAM, "
                         f"but this run requires at least {required_vram} GB"
+                        + _parse_time_wider_shape_remedy(
+                            candidate,
+                            required_vram,
+                            model,
+                            algorithm,
+                            train=preflight_train,
+                            thinking=thinking,
+                            provider=gpu_spec.provider,
+                        )
                     )
         # called for its rejection, not its return: it raises when no validated class can hold the
         # run, which is the parse-time "this is unplaceable" gate. every count reaches this boundary
@@ -517,7 +593,7 @@ def _validate_gpu_section(
         provisional_gpu(
             model,
             algorithm=algorithm,
-            train=train_raw,
+            train=preflight_train,
             thinking=thinking,
             geometry_model_revision=model_revision,
             gpu_count=preflight_gpu_count,
@@ -529,7 +605,12 @@ def _validate_gpu_section(
 
 
 def _validate_algorithm_model_consistency(
-    model: str, algorithm: str, thinking: bool, train_raw: dict[str, Any]
+    model: str,
+    algorithm: str,
+    thinking: bool,
+    train_raw: dict[str, Any],
+    *,
+    init_from_adapter: str,
 ) -> tuple[str, int, int]:
     """Validate algorithm and model-info consistency."""
     try:
@@ -547,7 +628,6 @@ def _validate_algorithm_model_consistency(
             f"{model} always emits <think> reasoning and cannot run with thinking "
             f"disabled; set thinking = true"
         )
-    init_from_adapter = _init_from_adapter_ref(train_raw)
     if init_from_adapter and "lora_rank" in train_raw:
         raise ConfigError(
             "train.lora_rank cannot be set with train.init_from_adapter because source adapter "
@@ -558,7 +638,7 @@ def _validate_algorithm_model_consistency(
             "train.lora_alpha cannot be set with train.init_from_adapter because source adapter "
             "alpha metadata is authoritative"
         )
-    lora_rank = _train_int(train_raw, "lora_rank", minimum=1) or 32
+    lora_rank = _train_int(train_raw, "lora_rank", minimum=MIN_LORA_RANK) or 32
     # unset -> the tuned 2 x rank default. authored -> the user's value, which need not be 2 x rank.
     lora_alpha = _train_int(train_raw, "lora_alpha", minimum=1) or 2 * lora_rank
     max_lora_rank = serving_lora_rank_cap(info)
@@ -590,16 +670,22 @@ def spec_from_dict(
             )
         except (TypeError, ValueError) as exc:
             raise ConfigError(str(exc)) from exc
+    init_from_adapter = _init_from_adapter_ref(train_raw)
     gpu_spec, gpu_count_auto = _validate_gpu_section(
         raw,
         model=model,
         model_revision=model_revision,
         algorithm=algorithm,
         train_raw=train_raw,
+        init_from_adapter=init_from_adapter,
         thinking=thinking,
     )
     init_from_adapter, lora_rank, lora_alpha = _validate_algorithm_model_consistency(
-        model, algorithm, thinking, train_raw
+        model,
+        algorithm,
+        thinking,
+        train_raw,
+        init_from_adapter=init_from_adapter,
     )
     wandb_spec = _validate_wandb_section(raw)
 

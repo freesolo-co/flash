@@ -961,6 +961,9 @@ def estimate_cost(
         wall_clock_seconds=wall,
         wall_capped=wall_capped,
         gpu_count=billed_gpu_count,
+        # the width the run LAUNCHES on, which a small batch can bound below the billed count.
+        # billing follows the rented cards; the vram a shape offers follows the ranks that join.
+        executed_gpu_count=executed_gpu_count(config, billed_gpu_count),
         # total_usd is the customer gpu charge. the platform-owned teacher spend is itemized
         # only as a diagnostic and is not passed through to the customer. an n-card job occupies
         # n cards for the billed training wall, so the charge scales linearly with gpu_count.

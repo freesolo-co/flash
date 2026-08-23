@@ -61,21 +61,30 @@ def _cmd_train_cost(args) -> int:
 
 def _cmd_train_cost_offline(spec) -> int:
     """Catalog-only quote for the algorithms that do not need workload evidence yet (grpo, opd)."""
-    from flash.cost import estimate_cost
+    from dataclasses import replace
 
+    from flash.cost import estimate_cost
+    from flash.schema import MIN_LORA_RANK
+
+    config = runconfig_from_spec(spec)
     if spec.train.init_from_adapter:
-        # --cost is offline/catalog-only and cannot read the source adapter, so the rank stays at the
-        # local default. Warm starts train and are priced at the SOURCE adapter's authoritative rank
-        # (resolved server-side at submit/dry-run), which can be higher — so this estimate may
-        # under-quote. stderr keeps stdout clean for machine-readable callers.
+        # --cost is offline/catalog-only and cannot read the source adapter's rank, and the parser
+        # rejects an authored `lora_rank` alongside `init_from_adapter`, so there is never an
+        # authored rank to quote at. stderr keeps stdout clean for machine-readable callers.
+        #
+        # quote at rank 1 rather than at the serialization placeholder. the placeholder is not a
+        # measurement of anything, and `estimate_cost` reads the rank for both the exact-card fit and
+        # cost-ranked hardware selection. rank 1 is a vram lower bound, but not a dollar lower bound:
+        # a higher source rank can move the run onto a cheaper multi-card shape.
+        config = replace(config, lora_rank=MIN_LORA_RANK)
         print(
-            "warning: warm-start (train.init_from_adapter) cost uses the default LoRA rank; the "
-            "source adapter's rank is authoritative and resolved at submit, so a higher-rank source "
-            f"may cost more than this estimate. Run `{_commands().CLI_NAME} train --dry-run` "
-            "for a source-rank quote.",
+            "warning: warm-start (train.init_from_adapter) cost is a provisional rank-1 estimate. "
+            "The authoritative source adapter rank is resolved server-side and can change the "
+            "selected hardware and cost in either direction. Run "
+            f"`{_commands().CLI_NAME} train --dry-run` for a quote using the resolved source rank.",
             file=sys.stderr,
         )
-    estimate = estimate_cost(runconfig_from_spec(spec))
+    estimate = estimate_cost(config)
     if render.styled():
         print(render.cost_panel(estimate))
     else:
@@ -114,8 +123,19 @@ def _client_train_schema(authored_train_keys: frozenset[str]) -> dict:
     }
 
 
+def _has_inline_records(spec) -> bool:
+    """Whether this config supplied its SFT rows inline rather than from the resolved package.
+
+    One predicate for every surface that attributes the counts -- the cost rows and the provenance
+    note sit within a few lines of each other, so disagreeing about where the data came from would
+    print two contradictory answers in one quote.
+    """
+    params = getattr(getattr(spec, "environment", None), "params", None)
+    return isinstance(params, dict) and params.get("records") is not None
+
+
 def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
-    """Rows describing the packaged-dataset estimate behind an SFT quote.
+    """Rows describing the published packaged-dataset estimate behind an SFT quote.
 
     Only aggregates the server actually returned are shown. A field that is absent is dropped
     rather than defaulted, so the panel never reports a count the profile did not compute.
@@ -125,19 +145,34 @@ def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
         value = profile.get(key)
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
+    def text(key: str) -> str:
+        value = profile.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
     steps = count("authoritative_steps")
+    source = count("source_examples")
     retained, selected = count("retained_examples"), count("selected_examples")
     dropped = count("dropped_examples")
     compute, supervised = (
         count("authoritative_compute_tokens"),
         count("authoritative_supervised_tokens"),
     )
-    packing = str(profile.get("packing_mode") or "")
-    architecture = str(profile.get("architecture_mode") or "")
-    digest = str(profile.get("content_digest") or "")
+    packing = text("packing_mode")
+    architecture = text("architecture_mode")
+    environment_id = text("environment_id")
+    environment_revision = text("environment_revision")
+    digest = text("content_digest")
+    # inline `[environment.params] records` supply the rows from the request body, so the resolved
+    # package contributed the environment but not the dataset. labelling those counts "published
+    # copy" names a source they did not come from. one adjective decides all three rows, so they
+    # cannot describe the same quote two different ways.
+    inline_records = _has_inline_records(spec)
+    origin = "inline records" if inline_records else "published copy"
+    resolved = "resolved" if inline_records else "published"
     examples = None
     if retained is not None and selected is not None:
-        examples = f"{retained:,} trained of {selected:,} selected"
+        examples = f"{retained:,} trained of {selected:,} selected from "
+        examples += f"{source:,} source rows in {origin}" if source is not None else origin
         if dropped:
             examples += f" ({dropped:,} dropped)"
     tokens = None
@@ -147,10 +182,15 @@ def _sft_cost_rows(spec, profile: dict) -> list[tuple[str, str | None]]:
             tokens += f", {supervised:,} supervised"
     return [
         ("run", f"{spec.model}  [SFT{f', {steps} steps' if steps is not None else ''}]"),
+        ("env", f"{resolved} environment {environment_id}" if environment_id else None),
+        (
+            "revision",
+            f"{environment_revision[:12]} ({resolved} commit)" if environment_revision else None,
+        ),
         ("workload", f"{packing} ({architecture})" if packing and architecture else None),
         ("examples", examples),
         ("tokens", tokens),
-        ("profile", digest[:12] or None),
+        ("digest", digest[:12] or None),
     ]
 
 
@@ -218,6 +258,71 @@ def _print_reasoning_loss_warning(status: object) -> None:
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
 
 
+def _print_published_sft_environment_note(status: object, spec) -> None:
+    """Warn when SFT counts came from a published managed or GitHub environment."""
+    if _has_inline_records(spec):
+        return
+
+    profile = status.get("workload_profile") if isinstance(status, dict) else None
+    if not isinstance(profile, dict):
+        return
+    environment_id = profile.get("environment_id")
+    revision = profile.get("environment_revision")
+    if not isinstance(environment_id, str) or not environment_id.strip():
+        return
+    if not isinstance(revision, str) or not revision.strip():
+        return
+
+    environment_id = environment_id.strip()
+    advice = _republish_advice(environment_id)
+    if advice is None:
+        return
+
+    source = profile.get("source_examples")
+    source_suffix = (
+        f" ({source:,} source rows)"
+        if isinstance(source, int) and not isinstance(source, bool)
+        else ""
+    )
+    message = (
+        f"published environment: {environment_id} @ {revision.strip()[:12]}{source_suffix}. "
+        "SFT dataset counts come from this resolved published copy, not local files. "
+        f"{advice}"
+    )
+    print(render.note(message) if render.styled() else message, file=sys.stderr)
+
+
+def _republish_advice(environment_id: str) -> str | None:
+    """Return conditional remediation for a managed or GitHub environment id."""
+    from flash.envs.identity import (
+        canonical_managed_environment_slug,
+        github_environment_ref_is_pinned,
+        is_github_environment_ref,
+    )
+
+    prefix = "If you expected local dataset edits to be included, "
+    try:
+        managed_slug = canonical_managed_environment_slug(environment_id)
+    except ValueError:
+        return None
+    if managed_slug is not None:
+        return (
+            f"{prefix}run `{_commands().CLI_NAME} env push --name NAME "
+            "--project PROJECT_UUID [path]` again for this managed environment."
+        )
+    if not is_github_environment_ref(environment_id):
+        return None
+    if github_environment_ref_is_pinned(environment_id):
+        return (
+            f"{prefix}publish the new commit, then update [environment] id to the full new commit "
+            "SHA; the existing immutable SHA cannot move."
+        )
+    return (
+        f"{prefix}make the named remote branch or tag point at the new commit. A tag may instead "
+        "need a new tag and an updated [environment] id rather than moving the existing tag."
+    )
+
+
 def _print_sft_cost(status: dict, spec) -> None:
     total = status.get("estimated_cost_usd") if isinstance(status, dict) else None
     if not isinstance(total, (int, float)) or isinstance(total, bool):
@@ -234,6 +339,7 @@ def _print_sft_cost(status: dict, spec) -> None:
             if value is not None:
                 print(f"{key.ljust(8)}: {value}")
         print(f"{'TOTAL'.ljust(8)}: ${float(total):.2f}")
+    _print_published_sft_environment_note(status, spec)
     print(
         "tokens, retained rows, truncation, and optimizer steps are estimated from packaged "
         "input/output fields plus contract_text, contract_path, or TRAINING_CONTRACT.md. other "
