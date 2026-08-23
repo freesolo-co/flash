@@ -1322,6 +1322,129 @@ def test_train_dry_run_keeps_compatibility_on_stderr(
     assert call[1]["train"] == {"epochs": 1, "max_examples": 2}
 
 
+def test_train_dry_run_attributes_sft_counts_to_the_managed_environment(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    original_create_run = fake_client.create_run
+
+    def create_run_with_profile(*args, **kwargs):
+        response = original_create_run(*args, **kwargs)
+        response["workload_profile"] = {
+            "environment_id": "owner/project/env",
+            "environment_revision": "a" * 40,
+            "source_examples": 125,
+        }
+        return response
+
+    monkeypatch.setattr(fake_client, "create_run", create_run_with_profile)
+
+    assert _run(["train", str(_train_config(tmp_path)), "--dry-run"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["workload_profile"]["environment_id"] == "owner/project/env"
+    assert payload["workload_profile"]["environment_revision"] == "a" * 40
+    assert (
+        "published environment: owner/project/env @ aaaaaaaaaaaa (125 source rows)" in captured.err
+    )
+    assert "dataset counts come from this resolved published copy, not local files" in captured.err
+    assert "If you expected local dataset edits to be included" in captured.err
+    assert (
+        "run `flash env push --name NAME --project PROJECT_UUID [path]` again for this managed "
+        "environment"
+    ) in captured.err
+
+
+def test_train_dry_run_keeps_inline_records_off_the_published_environment_note(
+    fake_client, tmp_path, capsys, monkeypatch
+) -> None:
+    """inline rows are already authoritative, so the published-copy warning does not apply."""
+    original_create_run = fake_client.create_run
+
+    def create_run_with_profile(*args, **kwargs):
+        response = original_create_run(*args, **kwargs)
+        response["workload_profile"] = {
+            "environment_id": "owner/project/env",
+            "environment_revision": "a" * 40,
+            "source_examples": 2,
+        }
+        return response
+
+    monkeypatch.setattr(fake_client, "create_run", create_run_with_profile)
+    config = tmp_path / "inline.toml"
+    config.write_text(
+        'model = "Qwen/Qwen3.5-4B"\n'
+        'project = "11111111-1111-4111-8111-111111111111"\n'
+        'algorithm = "sft"\n'
+        '[environment]\nid = "owner/project/env"\n'
+        '[environment.params]\nrecords = [{ input = "a", output = "b" }]\n'
+        "[train]\nepochs = 1\nmax_examples = 2\n"
+    )
+
+    assert _run(["train", str(config), "--dry-run"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["workload_profile"]["source_examples"] == 2
+    assert "published environment:" not in captured.err
+    assert "SFT dataset counts come from" not in captured.err
+    assert "env push" not in captured.err
+
+
+def test_inline_records_are_not_labelled_a_published_copy_in_cost_rows(monkeypatch) -> None:
+    """The cost panel and the provenance note sit within a few lines of each other.
+
+    If only the note learns that the rows came from the request body, the panel above it still
+    reads "source rows in published copy" and the quote contradicts itself in one screen.
+    """
+    from types import SimpleNamespace
+
+    from flash.cli.commands import train_cost
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    profile = {
+        "environment_id": "owner/project/env",
+        "environment_revision": "d" * 40,
+        "source_examples": 9,
+        "retained_examples": 8,
+        "selected_examples": 9,
+    }
+    spec = SimpleNamespace(
+        model="Qwen/Qwen3.5-4B",
+        environment=SimpleNamespace(params={"records": [{"input": "x"}]}),
+    )
+
+    rows = dict(train_cost._sft_cost_rows(spec, profile))
+
+    assert "inline records" in rows["examples"]
+    assert "published copy" not in rows["examples"]
+    assert rows["env"] == "resolved environment owner/project/env"
+    assert "published" not in rows["revision"]
+
+
+def test_published_rows_keep_their_published_labels(monkeypatch) -> None:
+    """The inline branch must not relabel an ordinary published quote."""
+    from types import SimpleNamespace
+
+    from flash.cli.commands import train_cost
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    profile = {
+        "environment_id": "owner/project/env",
+        "environment_revision": "e" * 40,
+        "source_examples": 9,
+        "retained_examples": 8,
+        "selected_examples": 9,
+    }
+    spec = SimpleNamespace(model="Qwen/Qwen3.5-4B", environment=SimpleNamespace(params={}))
+
+    rows = dict(train_cost._sft_cost_rows(spec, profile))
+
+    assert "source rows in published copy" in rows["examples"]
+    assert rows["env"] == "published environment owner/project/env"
+    assert "(published commit)" in rows["revision"]
+
+
 def test_train_dry_run_sends_declared_runtime_secrets(
     fake_client, tmp_path, capsys, monkeypatch
 ) -> None:
@@ -1413,13 +1536,16 @@ def test_status_runs_and_log_command(fake_client, capsys, monkeypatch) -> None:
             {"run_id": "flash-1", "state": "done"},
         ]
     )
-    monkeypatch.setattr(fake_client, "get_run", lambda _run_id: next(statuses))
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
-    assert _run(["runs", "status", "flash-1", "--follow", "--json"]) == 0
-    assert [json.loads(line)["state"] for line in capsys.readouterr().out.splitlines()] == [
-        "running",
-        "done",
-    ]
+    with monkeypatch.context() as patched:
+        # scoped: this iterator holds exactly the two statuses this one assertion consumes, so
+        # letting it stay installed would starve every later command of a status it needs.
+        patched.setattr(fake_client, "get_run", lambda _run_id: next(statuses))
+        patched.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+        assert _run(["runs", "status", "flash-1", "--follow", "--json"]) == 0
+        assert [json.loads(line)["state"] for line in capsys.readouterr().out.splitlines()] == [
+            "running",
+            "done",
+        ]
 
     assert _run(["runs", "log", "flash-1"]) == 0
     out = capsys.readouterr().out
@@ -1481,6 +1607,104 @@ def test_log_labels_previous_attempt_artifacts_after_the_live_attempt_log(
     )
     assert out.index(live_line) < out.index(previous_header)
     assert 'HEARTBEAT {"stage":"rl_step","step":0,"attempt":0' in out
+
+
+def test_log_still_prints_artifacts_when_the_attempt_lookup_fails(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """A failed status read costs the heading, never the artifacts.
+
+    The artifacts hold the traceback the user ran this command to read. Losing them to a lookup
+    that only decorates a section header would hide the failure behind an unrelated one.
+    """
+    from flash.client import ClientError
+
+    def unavailable(_run_id):
+        raise ClientError("freesolo is unreachable")
+
+    monkeypatch.setattr(fake_client, "get_run", unavailable)
+    monkeypatch.setattr(
+        fake_client,
+        "get_worker_output",
+        lambda _run_id: {"error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n"},
+    )
+
+    assert _run(["runs", "log", "flash-1"]) == 0
+    out = capsys.readouterr().out
+    assert "torch.OutOfMemoryError: CUDA OOM" in out
+    # unlabelled against a live attempt, since none could be established -- but still attributed.
+    assert "----- error_rl_attempt0.txt (attempt=0) -----" in out
+
+
+def test_log_reads_no_status_when_there_are_no_artifacts_to_label(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """The status only names a heading, so with no headings it is never worth a request."""
+    calls: list[str] = []
+
+    def get_run(_run_id):
+        calls.append("get_run")
+        return {"run_id": "flash-1", "state": "running", "remote": {"attempt": 0}}
+
+    monkeypatch.setattr(fake_client, "get_run", get_run)
+    monkeypatch.setattr(fake_client, "get_worker_output", lambda _run_id: {})
+
+    assert _run(["runs", "log", "flash-1"]) == 0
+    capsys.readouterr()
+    assert calls == []
+
+
+def test_log_reads_no_status_and_prints_nothing_when_all_artifacts_are_empty(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """Empty artifact values are not printable sections and must not trigger a status read."""
+    fake_client.log_text = ""
+    calls: list[str] = []
+
+    def get_run(_run_id):
+        calls.append("get_run")
+        return {"run_id": "flash-1", "state": "running", "remote": {"attempt": 1}}
+
+    monkeypatch.setattr(fake_client, "get_run", get_run)
+    monkeypatch.setattr(
+        fake_client,
+        "get_worker_output",
+        lambda _run_id: {
+            "console_rl_attempt1.txt": "",
+            "error_rl_attempt1.txt": "",
+        },
+    )
+
+    assert _run(["runs", "log", "flash-1"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert calls == []
+
+
+def test_log_labels_artifacts_against_a_retry_that_starts_mid_command(
+    fake_client, capsys, monkeypatch
+) -> None:
+    """Artifact acquisition must precede the status snapshot used for its heading."""
+    events: list[str] = []
+
+    def get_worker_output(_run_id):
+        events.append("artifacts")
+        return {"error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n"}
+
+    def get_run(_run_id):
+        events.append("status")
+        return {"run_id": "flash-1", "state": "running", "remote": {"attempt": 1}}
+
+    monkeypatch.setattr(fake_client, "get_worker_output", get_worker_output)
+    monkeypatch.setattr(fake_client, "get_run", get_run)
+
+    assert _run(["runs", "log", "flash-1"]) == 0
+    out = capsys.readouterr().out
+    assert events == ["artifacts", "status"]
+    assert (
+        "----- error_rl_attempt0.txt (attempt=0, previous attempt; current attempt=1) -----" in out
+    )
 
 
 def test_log_prints_partial_log_line_with_newline(fake_client, capsys) -> None:
@@ -1624,7 +1848,7 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
     monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
+    state, printed_any, _ = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
 
     assert state == "done"
     assert printed_any is True
@@ -1633,6 +1857,21 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
     assert "following logs for flash-spin (queued)" in err
     assert "\r" in err
     assert err.endswith("\r")
+
+
+def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> None:
+    class _AttemptClient(_FakeClient):
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            return {"run_id": run_id, "logs": "", "offset": 0, "state": "done"}
+
+        def get_run(self, run_id: str) -> dict:
+            return {"run_id": run_id, "state": "done", "remote": {"attempt": 1}}
+
+    result = cli.commands._poll_logs(_AttemptClient(), "flash-attempt", interval=0)
+
+    assert result == cli.commands._LogPollResult("done", False, 1)
+    assert result.live_attempt == 1
+    assert capsys.readouterr().out == ""
 
 
 def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys) -> None:
@@ -1671,7 +1910,7 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
     monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any = cli.commands._poll_logs(_LaggingLogClient(), "flash-lag", interval=0.2)
+    state, printed_any, _ = cli.commands._poll_logs(_LaggingLogClient(), "flash-lag", interval=0.2)
 
     assert state == "done"
     assert printed_any is False
@@ -1744,7 +1983,7 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
 
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any = cli.commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
+    state, printed_any, _ = cli.commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
 
     assert state == "done"
     assert printed_any is False

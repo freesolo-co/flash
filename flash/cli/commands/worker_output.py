@@ -17,8 +17,11 @@ import re
 from typing import TYPE_CHECKING
 
 from flash.cli.ui import render
+from flash.client import ClientError
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from flash.client import ApiClient
 
 
@@ -42,18 +45,24 @@ def _worker_section_name(name: str, current_attempt: int | None) -> str:
     return f"{name} (attempt={attempt}, current attempt)"
 
 
-def _print_worker_output(client: ApiClient, run_id: str, *, printed_any: bool = False) -> bool:
-    worker_output = client.get_worker_output(run_id) or {}
-    if not worker_output:
-        return printed_any
+def _worker_sections(client: ApiClient, run_id: str) -> dict[str, str]:
+    """Fetch only worker artifacts with printable text."""
+    return {name: text for name, text in (client.get_worker_output(run_id) or {}).items() if text}
+
+
+def _snapshot_live_attempt(client: ApiClient, run_id: str) -> int | None:
+    """Read the live attempt without letting a heading lookup hide diagnostic artifacts."""
     try:
-        current_attempt = render.live_attempt(client.get_run(run_id) or {})
-    except Exception:
-        # artifact text is best-effort diagnostic output; a status refresh failure must not hide it.
-        current_attempt = None
-    for name, text in worker_output.items():
-        if not text:
-            continue
+        return render.live_attempt(client.get_run(run_id) or {})
+    except ClientError:
+        return None
+
+
+def _print_worker_output(
+    sections: Mapping[str, str], *, printed_any: bool = False, current_attempt: int | None = None
+) -> bool:
+    """Print worker artifacts under headings naming the attempt that produced them."""
+    for name, text in sections.items():
         # label provenance from the filename rather than letting the final section, which is merely
         # the last one appended, read as the live attempt's output.
         section_name = _worker_section_name(name, current_attempt)

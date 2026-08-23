@@ -373,6 +373,9 @@ SFT_TOML = (
 )
 
 EXACT_PROFILE = {
+    "environment_id": "github:freesolo-co/envs@main:gsm8k/environment.py",
+    "environment_revision": "a" * 40,
+    "source_examples": 10,
     "authoritative_steps": 7,
     "selected_examples": 10,
     "retained_examples": 8,
@@ -471,6 +474,76 @@ def test_sft_cost_asks_the_server_for_the_quote_without_creating_a_training_run(
     assert not any(key.startswith("workload_profile") for key in call["spec"])
 
 
+@pytest.mark.parametrize(
+    ("environment_id", "expected", "absent"),
+    [
+        (
+            "github:freesolo-co/envs@main:gsm8k/environment.py",
+            "make the named remote branch or tag point at the new commit",
+            "full new commit SHA",
+        ),
+        (
+            "github:freesolo-co/envs@v1.2.3:gsm8k/environment.py",
+            "A tag may instead need a new tag and an updated [environment] id",
+            "full new commit SHA",
+        ),
+        (
+            f"github:freesolo-co/envs@{'c' * 40}:gsm8k/environment.py",
+            "publish the new commit, then update [environment] id to the full new commit SHA",
+            "named remote branch or tag",
+        ),
+    ],
+    ids=("branch", "tag", "sha"),
+)
+def test_github_republish_advice_covers_branch_tag_and_sha(environment_id, expected, absent):
+    from flash.cli.commands import train_cost
+
+    advice = train_cost._republish_advice(environment_id)
+
+    assert expected in advice
+    assert absent not in advice
+
+
+def test_managed_hub_github_ref_uses_env_push_advice():
+    from flash.cli.commands import train_cost
+
+    advice = train_cost._republish_advice(
+        "github:freesolo-co/environment-hub@main:owner/project/env/environment.py"
+    )
+
+    assert "env push" in advice
+    assert "named remote branch or tag" not in advice
+
+
+def test_managed_republish_advice_prints_required_env_push_arguments():
+    from flash.cli.commands import train_cost
+
+    advice = train_cost._republish_advice("owner/project/env")
+
+    assert (
+        f"{train_cost._commands().CLI_NAME} env push --name NAME --project PROJECT_UUID [path]"
+        in advice
+    )
+
+
+def test_published_environment_note_ignores_unknown_environment_ids(monkeypatch, capsys):
+    from flash.cli.commands import train_cost
+
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    train_cost._print_published_sft_environment_note(
+        {
+            "workload_profile": {
+                "environment_id": "local-environment",
+                "environment_revision": "a" * 40,
+                "source_examples": 10,
+            }
+        },
+        types.SimpleNamespace(environment=types.SimpleNamespace(params={})),
+    )
+
+    assert capsys.readouterr().err == ""
+
+
 def test_sft_cost_reports_the_dataset_estimate_and_no_invented_hardware(
     tmp_path, monkeypatch, capsys
 ):
@@ -487,11 +560,18 @@ def test_sft_cost_reports_the_dataset_estimate_and_no_invented_hardware(
     assert rc == 0
     assert "$1.25" in captured.out
     assert "7 steps" in captured.out
-    assert "8 trained of 10 selected" in captured.out
+    assert "github:freesolo-co/envs@main:gsm8k/environment.py" in captured.out
+    assert "aaaaaaaaaaaa" in captured.out
+    assert "published environment github:freesolo-co/envs@main:gsm8k/environment.py" in captured.out
+    assert "aaaaaaaaaaaa (published commit)" in captured.out
+    assert "8 trained of 10 selected from 10 source rows in published copy" in captured.out
     assert "(2 dropped)" in captured.out
     assert "4,096 compute, 2,048 supervised" in captured.out
     assert "packed (pure-attention)" in captured.out
     assert "bbbbbbbbbbbb" in captured.out
+    assert (
+        "SFT dataset counts come from this resolved published copy, not local files" in captured.err
+    )
     for invented in ("/hr", "setup", "per-step", "train_seconds"):
         assert invented not in captured.out
     assert "nothing was charged for training" in captured.err
@@ -853,7 +933,7 @@ def test_sft_cost_omits_aggregates_the_profile_did_not_report(tmp_path, monkeypa
     assert rc == 0
     assert "3 steps" in out
     assert "$0.50" in out
-    for absent in ("examples", "tokens", "workload", "profile"):
+    for absent in ("examples", "tokens", "workload", "digest"):
         assert f"{absent}  " not in out
 
 
@@ -963,6 +1043,9 @@ def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
     assert cmd_train(_sft_args(tmp_path, body)) == 0
     captured = capsys.readouterr()
     assert "TOTAL" in captured.out
+    assert "published environment" not in captured.out
+    assert "source rows in published copy" not in captured.out
+    assert "selected from" not in captured.out
     assert "shadowed!" not in captured.err
 
 

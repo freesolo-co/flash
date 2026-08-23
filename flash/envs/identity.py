@@ -255,3 +255,13 @@ def _is_safe_github_path_parts(parts: list[str] | tuple[str, ...]) -> bool:
 def is_commit_sha(value: str) -> bool:
     """True when value is a full 40-hex-char git commit id (an immutable ref)."""
     return _COMMIT_SHA_RE.fullmatch(value) is not None
+
+
+def github_environment_ref_is_pinned(value: str) -> bool:
+    """True when a ``github:`` environment id names an immutable commit.
+
+    Only the SHA case is decidable from the id. Branches and tags share one string shape, so callers
+    must give symbolic-ref advice that is valid for either rather than assuming the ref is movable.
+    """
+    parsed = _parse_github_environment_ref(value)
+    return parsed is not None and is_commit_sha(parsed.ref)
