@@ -128,19 +128,25 @@ class _OpdProgressState:
         self._train_started_at = time.time()
 
     def record_billing_timing(self, step: int, line: str) -> None:
-        if self.framework_init_seconds is None and self._train_started_at is not None:
+        step_seconds = parse_verl_metric(line, "timing_s/step")
+        if (
+            self.framework_init_seconds is None
+            and self._train_started_at is not None
+            and step_seconds is not None
+        ):
             # opd train_wall starts in start_training, after setup and immediately before the child.
-            # the first parsed optimizer line closes the initialization prefix inside that wall, but
-            # it lands AFTER that step ran, so subtract the step's own duration to end the window
-            # where the step began. leaving it in would fold a whole step into "init" AND subtract
-            # that step's timing_s/reward twice, since reward_seconds is summed separately below.
-            # with no timing_s/step there is nothing to subtract, so claim no init rather than
-            # over-discount the charge.
-            step_seconds = parse_verl_metric(line, "timing_s/step")
-            self.framework_init_seconds = (
-                max(0.0, time.time() - self._train_started_at - step_seconds)
-                if step_seconds is not None
-                else 0.0
+            # the first optimizer line closes the initialization prefix inside that wall, but it
+            # lands AFTER that step ran, so subtract the step's own duration to end the window where
+            # the step began. leaving it in would fold a whole step into "init" AND subtract that
+            # step's timing_s/reward twice, since reward_seconds is summed separately below.
+            #
+            # gated on timing_s/step being PRESENT, not just used when present: this runs on every
+            # step-tagged line, and verl emits step-tagged timer and val lines that carry no metric
+            # summary (the caller skips them a few lines later for having no distillation loss).
+            # settling init to 0.0 on one of those would latch the window shut before the first real
+            # metric line and silently drop the whole init discount.
+            self.framework_init_seconds = max(
+                0.0, time.time() - self._train_started_at - step_seconds
             )
         reward_seconds = parse_verl_metric(line, "timing_s/reward")
         if reward_seconds is not None and step > self._resume_step:

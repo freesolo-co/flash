@@ -53,16 +53,22 @@ def test_init_window_excludes_the_first_steps_own_work(monkeypatch) -> None:
     assert state.framework_init_seconds + state.reward_seconds <= 100.0
 
 
-def test_init_is_zero_when_the_first_step_reports_no_duration(monkeypatch) -> None:
-    """no timing_s/step means the step's share is unknown, so claim no init rather than overcount."""
+def test_a_step_line_without_a_duration_does_not_latch_the_init_window(monkeypatch) -> None:
+    """verl emits step-tagged lines carrying no timing_s/step; one must not close the window.
+
+    Settling init on such a line would fix it before the first line that can actually bound it,
+    permanently dropping the whole init discount. The window stays open until a duration arrives.
+    """
     state = _StepMetricState(train_started_at=0.0, sent_first_metrics=True)
-    inp = {"max_completion": 512, "steps": 1}
-    monkeypatch.setattr(rl_train_runner.time, "time", lambda: 100.0)
+    inp = {"max_completion": 512, "steps": 2}
+    monkeypatch.setattr(rl_train_runner.time, "time", lambda: 130.0)
 
     _ingest_step_metrics("step:1 - critic/rewards/mean:0.4 - timing_s/reward:5.0", inp, state, dict)
+    assert state.framework_init_seconds is None, "a durationless line closed the init window"
 
-    assert state.framework_init_seconds == 0.0
-    assert state.reward_seconds == 5.0
+    _ingest_step_metrics(_line(2, 20.0, reward_seconds=1.0), inp, state, dict)
+    assert state.framework_init_seconds == 110.0
+    assert state.reward_seconds == 6.0
 
 
 def test_sft_records_init_from_its_child_invocation_boundary(monkeypatch) -> None:
@@ -106,6 +112,28 @@ def test_opd_records_init_and_reward_from_its_progress_wall(monkeypatch) -> None
     assert sum(state.reward_seconds_by_step.values()) == 5.5
     assert final["framework_init_seconds"] == 12.0
     assert final["reward_seconds"] == 5.5
+
+
+def test_opd_timer_lines_do_not_latch_the_init_window(monkeypatch) -> None:
+    """record_billing_timing runs on EVERY step-tagged line, before the loss filter drops non-metric ones.
+
+    opd_train_runner calls this ahead of its own `loss is None` skip, so verl's step-tagged timer and
+    val lines reach it. Settling init to 0.0 on one of those would close the window before the first
+    real metric line and silently drop opd's entire init discount.
+    """
+    from flash.engine.worker import opd_train
+
+    now = iter((300.0, 330.0))
+    monkeypatch.setattr(opd_train.time, "time", lambda: next(now))
+    state = opd_train._OpdProgressState()
+    state.start_training()
+
+    state.record_billing_timing(1, "step:1 - timing_s/gen:4.0")
+    assert state.framework_init_seconds is None, "a timer line closed the init window"
+
+    state.record_billing_timing(1, "step:1 - timing_s/step:10.0 - timing_s/reward:3.0")
+    assert state.framework_init_seconds == 20.0
+    assert sum(state.reward_seconds_by_step.values()) == 3.0
 
 
 def test_warmup_is_excluded_and_incident_projects_steady_pace() -> None:

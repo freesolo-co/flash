@@ -821,18 +821,17 @@ def _consume_sft_marker_line(progress: _SftProgress, line: str, *, train_started
         progress.wandb_link.update(link)
     if _sft_train.verl_step_number(line) is None:
         return False
-    if progress.framework_init_seconds is None:
+    step_seconds = _sft_train.parse_verl_metric(line, "timing_s/step")
+    if progress.framework_init_seconds is None and step_seconds is not None:
         # train_wall starts immediately before the child invocation, so the first parsed optimizer
         # step closes the framework/model/fsdp initialization block inside that wall. the line lands
         # AFTER that step ran, so subtract its own duration to end the window where the step began
-        # rather than billing a whole step as "init". with no timing_s/step there is nothing to
-        # subtract, so attribute nothing to init rather than over-discount the charge.
-        step_seconds = _sft_train.parse_verl_metric(line, "timing_s/step")
-        progress.framework_init_seconds = (
-            max(0.0, time.time() - train_started_at - step_seconds)
-            if step_seconds is not None
-            else 0.0
-        )
+        # rather than billing a whole step as "init".
+        #
+        # requiring timing_s/step rather than defaulting to 0.0 matters because this gate is only
+        # verl_step_number: a step-tagged line carrying no duration would otherwise latch the window
+        # shut before the first line that has one, dropping the init discount entirely.
+        progress.framework_init_seconds = max(0.0, time.time() - train_started_at - step_seconds)
     # the marker set first: a skipped sitecustomize also loses the lora+ shim, and "no fragment
     # ran at all" is the root cause worth reporting over its lora+ symptom.
     if progress.expected_shims and not progress.shims_verified:
