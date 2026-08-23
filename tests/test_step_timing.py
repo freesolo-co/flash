@@ -80,6 +80,7 @@ def test_sft_records_init_from_its_child_invocation_boundary(monkeypatch) -> Non
         expected_shims=(),
         shims_verified=True,
         framework_init_seconds=None,
+        resume_step=0,
     )
     monkeypatch.setattr(sft_train_runner.time, "time", lambda: 215.0)
 
@@ -134,6 +135,75 @@ def test_opd_timer_lines_do_not_latch_the_init_window(monkeypatch) -> None:
     state.record_billing_timing(1, "step:1 - timing_s/step:10.0 - timing_s/reward:3.0")
     assert state.framework_init_seconds == 20.0
     assert sum(state.reward_seconds_by_step.values()) == 3.0
+
+
+def test_grpo_resume_replay_does_not_bound_the_init_window(monkeypatch) -> None:
+    """a resumed child replays its resume step first, timed in the PREVIOUS attempt.
+
+    `child_io.append_step_metrics` documents the replay. That line's timing_s/step was spent in an
+    attempt whose wall this settlement never bills, so closing init on it subtracts seconds that are
+    not in the current wall -- understating the init discount or flooring it to zero. Init must wait
+    for the first genuinely new step, the same boundary reward and the advantage seal already use.
+    """
+    state = _StepMetricState(train_started_at=1000.0, sent_first_metrics=True)
+    state.resume_step = 4
+    inp = {"max_completion": 512, "steps": 6}
+    monkeypatch.setattr(rl_train_runner.time, "time", lambda: 1050.0)
+
+    # the replayed step 4 reports a 600s duration from the attempt that died. taking it would floor
+    # init at 0.0 (50 - 600 < 0) and silently drop the whole discount.
+    _ingest_step_metrics(_line(4, 600.0, reward_seconds=90.0), inp, state, dict)
+    assert state.framework_init_seconds is None, "the replayed resume step closed the init window"
+    assert state.reward_seconds == 0.0
+
+    _ingest_step_metrics(_line(5, 20.0, reward_seconds=3.0), inp, state, dict)
+    assert state.framework_init_seconds == 30.0
+    assert state.reward_seconds == 3.0
+
+
+def test_opd_resume_replay_does_not_bound_the_init_window(monkeypatch) -> None:
+    from flash.engine.worker import opd_train
+
+    now = iter((500.0, 540.0))
+    monkeypatch.setattr(opd_train.time, "time", lambda: next(now))
+    state = opd_train._OpdProgressState({"opt_steps": 3, "loss_curve": [0.5, 0.4, 0.3]})
+    state.start_training()
+
+    state.record_billing_timing(3, "step:3 - timing_s/step:400.0 - timing_s/reward:80.0")
+    assert state.framework_init_seconds is None, "the replayed resume step closed the init window"
+    assert state.reward_seconds_by_step == {}
+
+    state.record_billing_timing(4, "step:4 - timing_s/step:15.0 - timing_s/reward:2.0")
+    assert state.framework_init_seconds == 25.0
+    assert sum(state.reward_seconds_by_step.values()) == 2.0
+
+
+def test_sft_resume_replay_does_not_bound_the_init_window(monkeypatch) -> None:
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    progress = SimpleNamespace(
+        loraplus_applied=True,
+        wandb_link={},
+        expected_shims=(),
+        shims_verified=True,
+        framework_init_seconds=None,
+        resume_step=2,
+    )
+    monkeypatch.setattr(sft_train_runner.time, "time", lambda: 260.0)
+
+    assert sft_train._consume_sft_marker_line(
+        progress,
+        "step:2 - train/loss:0.5 - timing_s/step:300.0",
+        train_started_at=200.0,
+    )
+    assert progress.framework_init_seconds is None, "the replayed resume step closed the window"
+
+    assert sft_train._consume_sft_marker_line(
+        progress,
+        "step:3 - train/loss:0.4 - timing_s/step:10.0",
+        train_started_at=200.0,
+    )
+    assert progress.framework_init_seconds == 50.0
 
 
 def test_warmup_is_excluded_and_incident_projects_steady_pace() -> None:

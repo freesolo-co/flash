@@ -456,6 +456,7 @@ def _ingest_step_metrics(
             state.framework_init_seconds is None
             and state.train_started_at is not None
             and step_seconds is not None
+            and step_number > state.resume_step
         ):
             # rl train_wall begins in _announce_training before the verl child launches. the first
             # parsed optimizer metric closes the framework/model/ray initialization prefix in it.
@@ -469,6 +470,11 @@ def _ingest_step_metrics(
             # requiring timing_s/step rather than defaulting to 0.0 keeps a step line that carries no
             # duration from latching the window shut before the first line that does, which would
             # silently drop the entire init discount.
+            #
+            # skipping the replayed resume step is what makes the subtraction coherent on a resumed
+            # run: that line's duration was spent in the PREVIOUS attempt and is absent from this
+            # attempt's wall, so subtracting it undercounts init or floors it to zero. the reward
+            # accumulator below and the advantage seal already gate on the same boundary.
             state.framework_init_seconds = max(
                 0.0, time.time() - state.train_started_at - step_seconds
             )

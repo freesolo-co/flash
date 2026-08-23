@@ -133,6 +133,7 @@ class _OpdProgressState:
             self.framework_init_seconds is None
             and self._train_started_at is not None
             and step_seconds is not None
+            and step > self._resume_step
         ):
             # opd train_wall starts in start_training, after setup and immediately before the child.
             # the first optimizer line closes the initialization prefix inside that wall, but it
@@ -145,6 +146,10 @@ class _OpdProgressState:
             # summary (the caller skips them a few lines later for having no distillation loss).
             # settling init to 0.0 on one of those would latch the window shut before the first real
             # metric line and silently drop the whole init discount.
+            #
+            # the resume boundary is the same one reward uses below. a resumed child replays its
+            # resume step first (`child_io.append_step_metrics`), and that line's duration belongs to
+            # the previous attempt, so subtracting it from this attempt's wall understates init.
             self.framework_init_seconds = max(
                 0.0, time.time() - self._train_started_at - step_seconds
             )
