@@ -124,9 +124,8 @@ def test_modal_create_clean_rejections_remain_retryable(monkeypatch, error_name)
         def _close(self):
             pass
 
-    exception_types = {
-        name: _OtherError
-        for name in (
+    exception_types = dict.fromkeys(
+        (
             "AuthError",
             "PermissionDeniedError",
             "NotFoundError",
@@ -135,8 +134,9 @@ def test_modal_create_clean_rejections_remain_retryable(monkeypatch, error_name)
             "ResourceExhaustedError",
             "InvalidError",
             "ConflictError",
-        )
-    }
+        ),
+        _OtherError,
+    )
     exception_types[error_name] = clean_error
     sdk = SimpleNamespace(
         Client=SimpleNamespace(from_credentials=lambda *_args: _Client()),
@@ -144,7 +144,9 @@ def test_modal_create_clean_rejections_remain_retryable(monkeypatch, error_name)
         Image=SimpleNamespace(from_registry=lambda image: image),
         Sandbox=SimpleNamespace(
             create=lambda *_args, **_kwargs: (_ for _ in ()).throw(clean_error()),
-            list=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected reconciliation")),
+            list=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("unexpected reconciliation")
+            ),
         ),
         exception=SimpleNamespace(**exception_types),
     )
@@ -229,9 +231,8 @@ def test_modal_create_quota_and_conflict_stay_ambiguous(monkeypatch, error_name)
         def _close(self):
             pass
 
-    exception_types = {
-        name: _OtherError
-        for name in (
+    exception_types = dict.fromkeys(
+        (
             "AuthError",
             "PermissionDeniedError",
             "NotFoundError",
@@ -240,8 +241,9 @@ def test_modal_create_quota_and_conflict_stay_ambiguous(monkeypatch, error_name)
             "InvalidError",
             "ConflictError",
             "ResourceExhaustedError",
-        )
-    }
+        ),
+        _OtherError,
+    )
     exception_types[error_name] = ambiguous
     if error_name == "ConflictError":
         # the real sdk has ConflictError subclass InvalidError, which is what the exclusion guards.

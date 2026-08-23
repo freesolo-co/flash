@@ -105,11 +105,7 @@ def create_sandbox(
             if not instance_id:
                 raise ModalApiError("Modal Sandbox create returned no object id")
             return instance_id
-        # BaseException, not Exception: a KeyboardInterrupt or a cancellation landing between the
-        # create call and its returned id leaves a Sandbox this process never recorded, which is
-        # exactly the ambiguous case the reconciliation below exists for. Narrowing this to
-        # Exception lets that escape unreconciled and bill until the deadline. lambda_ takes
-        # BaseException at the same boundary for the same reason.
+        # catch interrupts after create so any unrecorded sandbox still reconciles by exact label.
         except BaseException as exc:
             if _create_rejection_is_clean(sdk, exc):
                 raise ModalApiError(
