@@ -5269,8 +5269,11 @@ def test_follow_gives_up_after_the_retry_window_and_names_the_run(monkeypatch, c
         def get_run(self, run_id: str) -> dict:
             raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
 
+    # the retry budget reads the clock in `log_follow`; patch it there rather than relying on
+    # `cli.commands.time` happening to be the same module object.
     clock = iter([0.0] + [1000.0] * 20)
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cli.commands.log_follow.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cli.commands.log_follow.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
     assert cli.commands._follow_run(_DeadClient(), "flash-dead") == 1
