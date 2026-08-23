@@ -861,18 +861,11 @@ def _handle_failure(
         result.failure == "job_failed" and not ctx.unreconciled_create
     )
     if outcome.chosen is not None and admitted_failure:
-        # these outcomes happen after the class admitted the run, so an older no-capacity refusal no
-        # longer describes the current market. poll_error stays ambiguous because submit and lookup
-        # failures can happen before any capacity was granted.
-        #
-        # job_failed belongs here for the same reason the other three do: the worker reached the box
-        # and died there, which is proof the shape had capacity. leaving the refusal standing kept a
-        # shape demoted plane-wide for the full ttl while it was demonstrably taking work, and it is
-        # the one admitted-and-failed outcome the durable ledger was missing.
-        #
-        # EXCEPT when the create itself was unreconciled: that also reports job_failed, but it fails
-        # at the create boundary before any worker reaches a box, so it proves nothing about
-        # capacity. forgiving it there would clear a real plane-wide refusal for every nearby run.
+        # each of these happens AFTER the class admitted the run, so an older no-capacity refusal no
+        # longer describes the current market. job_failed qualifies only when a worker actually
+        # reached the box: an unreconciled create reports the same category from the create
+        # boundary, and forgiving that would clear a real refusal for every nearby run. poll_error
+        # stays out entirely, since submit and lookup can fail before any capacity was granted.
         admitted_shape = _lifecycle._shape_key(outcome.chosen)
         ctx.capacity_refusals.pop(admitted_shape, None)
         _record_capacity_observation(
