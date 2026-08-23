@@ -81,8 +81,11 @@ def test_preload_cli_entrypoint_runs_as_a_subprocess():
     combined = proc.stdout + proc.stderr
     assert "NameError" not in combined, f"CLI died on a NameError:\n{combined}"
     assert proc.returncode == 0, f"--dry-run exited {proc.returncode}:\n{combined}"
-    # prove it actually reached the planner rather than exiting early for some other reason
-    assert "would warm" in proc.stdout, f"planner never ran:\n{combined}"
+    # prove it reached the RUNPOD planner specifically. a bare "would warm" also matches the Lambda
+    # plan line, which prints from a different branch and would not exercise `catalog_model_ids`.
+    assert "datacenter(s):" in proc.stdout, f"runpod planner never ran:\n{combined}"
+    # the model list is what `catalog_model_ids` produces -- the name that used to NameError.
+    assert "model(s):" in proc.stdout, f"model catalog never resolved:\n{combined}"
 
 
 # ---------------------------------------------------------------------------
