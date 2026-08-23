@@ -10,6 +10,7 @@ import json
 import sys
 from collections.abc import Iterator
 
+from flash.client.http import ClientError
 from flash.serve.thinking import (
     _TAG_CLOSE,
     _TAG_OPEN,
@@ -51,6 +52,18 @@ def _find_delimiter(*args, **kwargs):
     return _deploy()._find_delimiter(*args, **kwargs)
 
 
+def _raise_for_stream_error(chunk: dict) -> None:
+    choices = chunk.get("choices") or []
+    failed = any(
+        isinstance(choice, dict) and choice.get("finish_reason") == "error" for choice in choices
+    )
+    error = chunk.get("error")
+    if not failed and not isinstance(error, dict):
+        return
+    message = error.get("message") if isinstance(error, dict) else None
+    raise ClientError(str(message or "chat stream ended with an engine error"))
+
+
 def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[str]:
     # reasoning arrives on its own delta field (see _balanced_thinking_content). re-open the block
     # around it and close it at the answer boundary, so the streamed text matches the balanced
@@ -86,6 +99,7 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
         if not data:
             continue
         chunk = json.loads(data)
+        _raise_for_stream_error(chunk)
         for choice in chunk.get("choices") or []:
             delta = (choice.get("delta") or {}) if isinstance(choice, dict) else {}
             raw_reasoning = delta.get("reasoning_content")
