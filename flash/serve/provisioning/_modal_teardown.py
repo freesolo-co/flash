@@ -21,18 +21,23 @@ from ._modal_sdk import ModalNamedResource, ModalObservation, ModalSdk, ModalSdk
 def wait_for_terminal_app(
     plan: ModalCreatePlan,
     sdk: ModalSdk,
-    handle: ModalProviderHandle,
+    handle: ModalProviderHandle | None,
     *,
+    app_id: str | None = None,
     deadline_at: float,
     clock: Clock,
     sleep: Sleeper,
 ) -> ModalObservation | None:
+    target_app_id = handle.app_id if handle is not None else app_id
+    if target_app_id is None:
+        raise ValueError("modal teardown requires an exact app id")
     while True:
-        observation = observe(plan, sdk, app_id_hint=handle.app_id)
+        observation = observe(plan, sdk, app_id_hint=target_app_id)
         app, _volume, _inference, _artifact = exact_teardown_resources(
             plan,
             handle,
             observation,
+            app_id_hint=target_app_id if handle is None else None,
         )
         if app is not None and app.state in {"stopped", "failed"}:
             return observation if app.running_containers == 0 else None
@@ -159,8 +164,16 @@ def confirmed_abort_handle(
 def confirm_teardown_absence(
     plan: ModalCreatePlan,
     sdk: ModalSdk,
-    handle: ModalProviderHandle,
+    handle: ModalProviderHandle | None,
+    *,
+    app_id: str | None = None,
 ) -> bool:
-    final = observe(plan, sdk, app_id_hint=handle.app_id)
-    exact_teardown_resources(plan, handle, final)
+    target_app_id = handle.app_id if handle is not None else app_id
+    final = observe(plan, sdk, app_id_hint=target_app_id)
+    exact_teardown_resources(
+        plan,
+        handle,
+        final,
+        app_id_hint=target_app_id if handle is None else None,
+    )
     return resources_are_absent(final, allow_terminal_app=True)

@@ -76,11 +76,12 @@ def _bundle(
     region: str | None = "us-east-1",
     workspace_name: str = "workspace",
     web_suffix: str | None = None,
+    generation: int | None = None,
 ) -> DeploymentBundle:
     original, inputs = _spec_and_inputs()
     spec = DeploymentSpec(
         deployment_id=original.deployment_id,
-        generation=original.generation,
+        generation=original.generation if generation is None else generation,
         provider="modal",
         placement=ModalPlacement(
             workspace_name=workspace_name,
@@ -1603,6 +1604,118 @@ def test_teardown_stops_bootstrap_app_and_deletes_every_attached_resource() -> N
     assert sdk.volumes == []
     assert sdk.inference == []
     assert sdk.artifact == []
+
+
+def test_handleless_teardown_reclaims_exact_deterministic_resources() -> None:
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _FakeSdk(plan)
+    _seed_exact(sdk, artifact=True)
+    clock = _Clock()
+
+    result = teardown_modal_deployment(
+        bundle,
+        None,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "absent"
+    assert [name for name, _value in sdk.calls if name != "observe"] == [
+        "stop_app",
+        "delete_artifact",
+        "delete_inference",
+        "delete_volume",
+    ]
+    assert sdk.apps[0].state == "stopped"
+    assert sdk.volumes == []
+    assert sdk.inference == []
+    assert sdk.artifact == []
+
+
+def test_handleless_teardown_reclaims_partial_resources_without_an_app() -> None:
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _FakeSdk(plan)
+    sdk.inference = [ModalNamedResource(INFERENCE_SECRET_ID, plan.names.inference_secret)]
+    sdk.artifact = [ModalNamedResource(ARTIFACT_SECRET_ID, plan.names.artifact_secret)]
+    sdk.volumes = [ModalNamedResource(VOLUME_ID, plan.names.volume)]
+
+    result = teardown_modal_deployment(
+        bundle,
+        None,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
+        clock=_Clock(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.status == "absent"
+    assert [name for name, _value in sdk.calls if name != "observe"] == [
+        "delete_artifact",
+        "delete_inference",
+        "delete_volume",
+    ]
+    assert sdk.volumes == []
+    assert sdk.inference == []
+    assert sdk.artifact == []
+
+
+def test_handleless_teardown_delete_failure_remains_outcome_unknown() -> None:
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _FakeSdk(plan)
+    sdk.inference = [ModalNamedResource(INFERENCE_SECRET_ID, plan.names.inference_secret)]
+    sdk.artifact = [ModalNamedResource(ARTIFACT_SECRET_ID, plan.names.artifact_secret)]
+    sdk.volumes = [ModalNamedResource(VOLUME_ID, plan.names.volume)]
+    sdk.fail_operation = "delete_artifact"
+
+    result = teardown_modal_deployment(
+        bundle,
+        None,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
+        clock=_Clock(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert result.error_code == "resource_ambiguous"
+    assert [name for name, _value in sdk.calls].count("delete_artifact") == 1
+    assert sdk.artifact
+
+
+def test_handleless_teardown_rejects_foreign_generation_resources() -> None:
+    bundle = _bundle()
+    foreign_bundle = _bundle(generation=bundle.spec.generation + 1)
+    foreign_plan = build_modal_create_plan(foreign_bundle)
+    sdk = _FakeSdk(foreign_plan)
+    sdk.inference = [ModalNamedResource(INFERENCE_SECRET_ID, foreign_plan.names.inference_secret)]
+    sdk.artifact = [ModalNamedResource(ARTIFACT_SECRET_ID, foreign_plan.names.artifact_secret)]
+    sdk.volumes = [ModalNamedResource(VOLUME_ID, foreign_plan.names.volume)]
+
+    result = teardown_modal_deployment(
+        bundle,
+        None,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
+        clock=_Clock(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "conflict"
+    assert [name for name, _value in sdk.calls if name != "observe"] == []
+    assert sdk.apps == []
+    assert sdk.volumes
+    assert sdk.inference
+    assert sdk.artifact
 
 
 def test_teardown_stops_before_secret_and_volume_deletion_then_confirms_absence() -> None:

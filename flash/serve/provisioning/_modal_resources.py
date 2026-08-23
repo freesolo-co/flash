@@ -165,23 +165,71 @@ def build_handle(
     )
 
 
+def _reclaim_app_matches(
+    plan: ModalCreatePlan,
+    app: ModalAppObservation,
+    app_id_hint: str | None,
+) -> bool:
+    if app.state == "deployed":
+        return deployed_app_matches(plan, app) and (
+            app_id_hint is None or app.app_id == app_id_hint
+        )
+    if (
+        app_id_hint is None
+        or not _valid_provider_id(app.app_id, "app")
+        or app.app_id != app_id_hint
+        or app.app_name != plan.names.app_or_pod
+    ):
+        return False
+    if app.state == "lifecycle_pending":
+        return (
+            app.running_containers is None
+            and app.function_id is None
+            and app.function_name is None
+            and app.public_url is None
+        )
+    return (
+        app.state in {"stopped", "failed"}
+        and app.running_containers == 0
+        and app.function_id is None
+        and app.function_name is None
+        and app.public_url is None
+    )
+
+
 def exact_teardown_resources(
     plan: ModalCreatePlan,
-    handle: ModalProviderHandle,
+    handle: ModalProviderHandle | None,
     observation: ModalObservation,
+    *,
+    app_id_hint: str | None = None,
 ) -> tuple[
     ModalAppObservation | None,
     ModalNamedResource | None,
     ModalNamedResource | None,
     ModalNamedResource | None,
 ]:
-    """validate partial teardown resources without readiness-state reuse."""
+    """validate exact handle ids or deterministic identity for handleless reclaim."""
 
     ensure_unique_resources(observation)
     app = observation.apps[0] if observation.apps else None
     volume = observation.volumes[0] if observation.volumes else None
     inference = observation.inference_secrets[0] if observation.inference_secrets else None
     artifact = observation.artifact_secrets[0] if observation.artifact_secrets else None
+    if handle is None:
+        if app is not None and not _reclaim_app_matches(plan, app, app_id_hint):
+            raise ModalResourceConflict("modal app does not match the exact deployment")
+        resources = (
+            (volume, plan.names.volume, "volume"),
+            (inference, plan.names.inference_secret, "secret"),
+            (artifact, plan.names.artifact_secret, "secret"),
+        )
+        if any(
+            value is not None and not _named_matches(value, expected_name, role)
+            for value, expected_name, role in resources
+        ):
+            raise ModalResourceConflict("modal resource does not match the exact deployment")
+        return app, volume, inference, artifact
     if app is not None:
         if app.state == "deployed":
             if not teardown_deployed_app_matches(plan, handle, app):

@@ -469,9 +469,83 @@ def _teardown_plan(
     return finalized_plan
 
 
+def _reclaim_plan(
+    finalized_plan: ModalCreatePlan,
+    bootstrap_plan: ModalCreatePlan,
+    observation: ModalObservation,
+) -> ModalCreatePlan:
+    try:
+        exact_teardown_resources(finalized_plan, None, observation)
+    except ModalResourceConflict:
+        exact_teardown_resources(bootstrap_plan, None, observation)
+        return bootstrap_plan
+    return finalized_plan
+
+
+def _reclaim_modal_deployment(
+    finalized_plan: ModalCreatePlan,
+    bootstrap_plan: ModalCreatePlan,
+    sdk: ModalSdk,
+    *,
+    deadline_at: float,
+    clock: Clock,
+    sleep: Sleeper,
+) -> DeploymentResult:
+    """reclaim deterministic resources after an ambiguous create returned no handle."""
+
+    plan = finalized_plan
+    mutation_attempted = False
+    try:
+        observation = observe(plan, sdk)
+        if observation.apps:
+            plan = _reclaim_plan(finalized_plan, bootstrap_plan, observation)
+        app, volume, inference, artifact = exact_teardown_resources(plan, None, observation)
+        if app is None and observation.resource_count == 0:
+            return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
+        app_id = None if app is None else app.app_id
+        if app is not None and app.state == "deployed":
+            mutation_attempted = True
+            try:
+                mutation(lambda: sdk.stop_app(plan, app.app_id))
+            except ModalSdkFailure as exc:
+                if not exc.outcome_unknown:
+                    return failure_result(plan, from_sdk_failure(exc))
+            terminal = wait_for_terminal_app(
+                plan,
+                sdk,
+                None,
+                app_id=app.app_id,
+                deadline_at=deadline_at,
+                clock=clock,
+                sleep=sleep,
+            )
+            if terminal is None:
+                return unknown_result(plan)
+            _app, volume, inference, artifact = exact_teardown_resources(
+                plan,
+                None,
+                terminal,
+                app_id_hint=app.app_id,
+            )
+        if any(resource is not None for resource in (volume, inference, artifact)):
+            mutation_attempted = True
+        delete_teardown_resources(plan, sdk, volume, inference, artifact)
+        if confirm_teardown_absence(plan, sdk, None, app_id=app_id):
+            return DeploymentResult.from_spec(plan.bundle.spec, status="absent")
+        return unknown_result(plan)
+    except ModalResourceConflict:
+        if mutation_attempted:
+            return unknown_result(plan)
+        return failure_result(plan, LifecycleFailure("conflict"))
+    except ModalSdkFailure as exc:
+        if mutation_attempted:
+            return unknown_result(plan)
+        return failure_result(plan, from_sdk_failure(exc))
+
+
 def teardown_modal_deployment(
     bundle: DeploymentBundle,
-    handle: ModalProviderHandle,
+    handle: ModalProviderHandle | None,
     credentials: ModalCredentials,
     *,
     deadline_at: float,
@@ -479,17 +553,32 @@ def teardown_modal_deployment(
     clock: Clock = time.monotonic,
     sleep: Sleeper = time.sleep,
 ) -> DeploymentResult:
-    """stop one exact app, delete exact resources once, and prove terminal absence."""
+    """stop one exact app, delete exact resources once, and prove terminal absence.
+
+    A provider handle keeps the ordinary path bound to provider-returned ids. ``None`` is reserved
+    for explicit undeploy after an ambiguous create returned no ids: the immutable deployment bundle
+    authorizes reclaim by exact deterministic identity.
+    """
 
     validate_control_inputs(credentials, deadline_at, clock)
     finalized_plan = build_modal_create_plan(bundle, phase="finalized")
     bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
-    _validate_handle(finalized_plan, handle)
+    if handle is not None:
+        _validate_handle(finalized_plan, handle)
     plan = finalized_plan
     sdk: ModalSdk | None = None
     mutation_attempted = False
     try:
         sdk = open_sdk(sdk_factory, credentials, plan, deadline_at, clock)
+        if handle is None:
+            return _reclaim_modal_deployment(
+                finalized_plan,
+                bootstrap_plan,
+                sdk,
+                deadline_at=deadline_at,
+                clock=clock,
+                sleep=sleep,
+            )
         observation = observe(plan, sdk, app_id_hint=handle.app_id)
         if observation.apps and observation.apps[0].state == "deployed":
             plan = _teardown_plan(finalized_plan, bootstrap_plan, handle, observation)

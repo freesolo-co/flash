@@ -269,6 +269,42 @@ def test_undeploy_rejects_mismatched_handle_input_without_a_traceback(
     assert "Traceback" not in captured.err
 
 
+def test_modal_undeploy_without_provider_ids_routes_to_identity_reclaim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _args_with_identity(monkeypatch, "modal")
+    args.modal_app_id = ""
+    args.modal_volume_id = ""
+    args.modal_inference_secret_id = ""
+    _stub_credentials(monkeypatch)
+    handles = []
+
+    def _reclaim(bundle, handle, credentials, *, deadline_at, **_kwargs):
+        handles.append(handle)
+        return _result(bundle, "absent")
+
+    monkeypatch.setattr("flash.serve.provisioning.modal.teardown_modal_deployment", _reclaim)
+
+    assert cmd_serve_undeploy(args) == 0
+    assert handles == [None]
+
+
+def test_modal_undeploy_rejects_partial_provider_ids(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = _args_with_identity(monkeypatch, "modal")
+    args.modal_app_id = ""
+    _stub_credentials(monkeypatch)
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("teardown ran with a partial provider handle")
+
+    monkeypatch.setattr("flash.serve.provisioning.modal.teardown_modal_deployment", _explode)
+
+    assert cmd_serve_undeploy(args) == 1
+    assert "modal provider ids must be supplied together or omitted" in capsys.readouterr().err
+
+
 def test_runpod_undeploy_without_provider_ids_routes_to_identity_reclaim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

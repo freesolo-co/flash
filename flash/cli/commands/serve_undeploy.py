@@ -1,8 +1,8 @@
 """tear down one exact customer-owned serving deployment and prove absence.
 
 The deployment bundle is reconstructed from the immutable identity printed by ``serve deploy``.
-Provider-assigned ids bind ordinary deletion to one exact generation. When an ambiguous RunPod
-create returned no ids, explicit undeploy reclaims exact deterministic identities instead. Provider
+Provider-assigned ids bind ordinary deletion to one exact generation. When an ambiguous create
+returned no ids, explicit undeploy reclaims exact deterministic identities instead. Provider
 credentials remain request-scoped environment values.
 """
 
@@ -46,6 +46,16 @@ def _provider_handle(args, bundle):
             ),
         )
         plan = build_modal_create_plan(bundle, phase="finalized")
+        id_names = (
+            "modal_app_id",
+            "modal_volume_id",
+            "modal_inference_secret_id",
+        )
+        supplied_ids = [name for name in id_names if getattr(args, name, "")]
+        if not supplied_ids:
+            return None
+        if len(supplied_ids) != len(id_names):
+            raise ValueError("modal provider ids must be supplied together or omitted for reclaim")
         return ModalProviderHandle(
             deployment_id=bundle.spec.deployment_id,
             generation=bundle.spec.generation,
@@ -134,9 +144,9 @@ def cmd_serve_undeploy(args) -> int:
             from flash.serve.provisioning.runpod import _validate_handle
 
             plan = build_runpod_create_plan(bundle)
-        # validate user-authored provider ids before teardown. runpod may have none only when an
-        # ambiguous create returned no handle; the immutable deployment identity then authorizes the
-        # bounded exact-name reclaim instead.
+        # validate user-authored provider ids before teardown. either provider may have none only
+        # when an ambiguous create returned no handle; the immutable deployment identity then
+        # authorizes the bounded exact-name reclaim instead.
         if handle is not None:
             _validate_handle(plan, handle)
         credentials = _credentials(provider)
