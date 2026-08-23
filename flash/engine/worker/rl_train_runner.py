@@ -451,16 +451,28 @@ def _ingest_step_metrics(
     step_metrics = parse_verl_step_metrics(line)
     if step_metrics is not None:
         step_number = int(step_metrics["step"])
+        step_seconds = parse_verl_metric(line, "timing_s/step")
         if state.framework_init_seconds is None and state.train_started_at is not None:
             # rl train_wall begins in _announce_training before the verl child launches. the first
             # parsed optimizer metric closes the framework/model/ray initialization prefix in it.
-            state.framework_init_seconds = max(0.0, time.time() - state.train_started_at)
+            #
+            # that line is emitted AFTER step 1 finishes, so the elapsed span also contains step 1's
+            # own generation, grading and update. subtract the step's native duration to end the init
+            # window where step 1 began: leaving it in would fold a whole step into "init" AND double
+            # subtract step 1's timing_s/reward, which is summed separately below. the error is not
+            # small -- rl step 0 measures ~5.6x a steady step. without timing_s/step there is nothing
+            # to subtract, so attribute nothing to init rather than over-discount.
+            state.framework_init_seconds = (
+                max(0.0, time.time() - state.train_started_at - step_seconds)
+                if step_seconds is not None
+                else 0.0
+            )
         reward_seconds = parse_verl_metric(line, "timing_s/reward")
         if reward_seconds is not None and step_number > state.resume_step:
             # keyed by step so a replayed or duplicated metric line cannot discount the same grading
             # latency twice. a missing timing_s/reward contributes zero and never fails the run.
             state.reward_seconds_by_step[step_number] = max(0.0, reward_seconds)
-        state.step_timing.record_duration(parse_verl_metric(line, "timing_s/step"))
+        state.step_timing.record_duration(step_seconds)
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]

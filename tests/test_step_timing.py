@@ -22,13 +22,47 @@ def test_grpo_records_first_step_init_and_sums_reward_latency(monkeypatch) -> No
     inp = {"max_completion": 512, "steps": 3}
     monkeypatch.setattr(rl_train_runner.time, "time", lambda: 112.0)
 
-    _ingest_step_metrics(_line(1, 50.0, reward_seconds=2.5), inp, state, dict)
-    _ingest_step_metrics(_line(1, 50.0, reward_seconds=2.5), inp, state, dict)
+    _ingest_step_metrics(_line(1, 8.0, reward_seconds=2.5), inp, state, dict)
+    _ingest_step_metrics(_line(1, 8.0, reward_seconds=2.5), inp, state, dict)
     _ingest_step_metrics(_line(2, 40.0, reward_seconds=0.0), inp, state, dict)
     _ingest_step_metrics(_line(3, 35.0), inp, state, dict)
 
-    assert state.framework_init_seconds == 12.0
+    # 12s elapsed to the step-1 line minus step 1's own 8s duration. the step is NOT init.
+    assert state.framework_init_seconds == 4.0
     assert state.reward_seconds == 2.5
+
+
+def test_init_window_excludes_the_first_steps_own_work(monkeypatch) -> None:
+    """init must end where step 1 BEGAN, or its reward is subtracted twice at settle.
+
+    the first step's metric line is emitted after that step finished, so a naive
+    `now - train_started_at` spans the step's generation, grading and update. settlement adds
+    `framework_init_seconds` and `reward_seconds` together, so leaving the step inside init
+    discounts its timing_s/reward once through each term. rl step 0 runs ~5.6x a steady step, so
+    the misattribution is large in exactly the case that costs the most.
+    """
+    state = _StepMetricState(train_started_at=0.0, sent_first_metrics=True)
+    inp = {"max_completion": 512, "steps": 1}
+    monkeypatch.setattr(rl_train_runner.time, "time", lambda: 100.0)
+
+    _ingest_step_metrics(_line(1, 90.0, reward_seconds=30.0), inp, state, dict)
+
+    assert state.framework_init_seconds == 10.0
+    assert state.reward_seconds == 30.0
+    # the two terms are additive at settle, so they must never cover the same seconds.
+    assert state.framework_init_seconds + state.reward_seconds <= 100.0
+
+
+def test_init_is_zero_when_the_first_step_reports_no_duration(monkeypatch) -> None:
+    """no timing_s/step means the step's share is unknown, so claim no init rather than overcount."""
+    state = _StepMetricState(train_started_at=0.0, sent_first_metrics=True)
+    inp = {"max_completion": 512, "steps": 1}
+    monkeypatch.setattr(rl_train_runner.time, "time", lambda: 100.0)
+
+    _ingest_step_metrics("step:1 - critic/rewards/mean:0.4 - timing_s/reward:5.0", inp, state, dict)
+
+    assert state.framework_init_seconds == 0.0
+    assert state.reward_seconds == 5.0
 
 
 def test_sft_records_init_from_its_child_invocation_boundary(monkeypatch) -> None:
@@ -45,10 +79,12 @@ def test_sft_records_init_from_its_child_invocation_boundary(monkeypatch) -> Non
 
     assert sft_train._consume_sft_marker_line(
         progress,
-        "step:1 - train/loss:0.5",
+        "step:1 - train/loss:0.5 - timing_s/step:4.0",
         train_started_at=200.0,
     )
-    assert progress.framework_init_seconds == 15.0
+    # 15s elapsed minus step 1's own 4s: sft has no reward term, but billing the step as init would
+    # still discount real training compute.
+    assert progress.framework_init_seconds == 11.0
 
 
 def test_opd_records_init_and_reward_from_its_progress_wall(monkeypatch) -> None:
@@ -59,14 +95,16 @@ def test_opd_records_init_and_reward_from_its_progress_wall(monkeypatch) -> None
     state = opd_train._OpdProgressState()
     state.start_training()
 
-    state.record_billing_timing(1, "step:1 - timing_s/reward:4.0")
+    state.record_billing_timing(1, "step:1 - timing_s/step:6.0 - timing_s/reward:4.0")
     state.record_billing_timing(2, "step:2 - timing_s/reward:1.5")
     state.record_billing_timing(3, "step:3 - actor/distillation/loss:0.2")
     final = state.final_state(SimpleNamespace(accounting_snapshot=dict))
 
-    assert state.framework_init_seconds == 18.0
+    # 18s elapsed minus step 1's own 6s. step 1's 4s of teacher scoring is carried by reward_seconds
+    # alone, never by both terms.
+    assert state.framework_init_seconds == 12.0
     assert sum(state.reward_seconds_by_step.values()) == 5.5
-    assert final["framework_init_seconds"] == 18.0
+    assert final["framework_init_seconds"] == 12.0
     assert final["reward_seconds"] == 5.5
 
 

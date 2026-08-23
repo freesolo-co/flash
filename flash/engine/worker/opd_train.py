@@ -130,8 +130,18 @@ class _OpdProgressState:
     def record_billing_timing(self, step: int, line: str) -> None:
         if self.framework_init_seconds is None and self._train_started_at is not None:
             # opd train_wall starts in start_training, after setup and immediately before the child.
-            # the first parsed optimizer line closes the initialization prefix inside that wall.
-            self.framework_init_seconds = max(0.0, time.time() - self._train_started_at)
+            # the first parsed optimizer line closes the initialization prefix inside that wall, but
+            # it lands AFTER that step ran, so subtract the step's own duration to end the window
+            # where the step began. leaving it in would fold a whole step into "init" AND subtract
+            # that step's timing_s/reward twice, since reward_seconds is summed separately below.
+            # with no timing_s/step there is nothing to subtract, so claim no init rather than
+            # over-discount the charge.
+            step_seconds = parse_verl_metric(line, "timing_s/step")
+            self.framework_init_seconds = (
+                max(0.0, time.time() - self._train_started_at - step_seconds)
+                if step_seconds is not None
+                else 0.0
+            )
         reward_seconds = parse_verl_metric(line, "timing_s/reward")
         if reward_seconds is not None and step > self._resume_step:
             # one value per optimizer step prevents replayed stdout from discounting grading twice.
@@ -313,6 +323,65 @@ def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[f
     return download_seconds, eos_token_ids
 
 
+def _opd_train_notes(
+    *,
+    final_accounting: dict,
+    result,
+    knobs,
+    sections: tuple,
+    update_horizon: int,
+    max_model_len: int,
+    prompts_per_step: int,
+    multimodal: bool,
+    multi_turn: bool,
+    gdn_hybrid,
+) -> dict:
+    """The train_meta notes block for a finished opd run."""
+    initial_notes, accounting_notes, training_notes, backend_notes = sections
+    return {
+        "steps": update_horizon,
+        # optimizer updates that actually produced a distillation loss. record_step enforces loss_curve length == the metric step, and the guard above rejects a curve shorter than final_step, so this is measured, not assumed.
+        "opt_steps": len(final_accounting["loss_curve"]),
+        **initial_notes,
+        # the real alignment-health signal. mean_coverage reads ~1.0 even when the alignment has collapsed every student token onto one group, so it cannot flag that failure mode on its own; this ratio can.
+        "mean_align_granularity": (
+            float(final_accounting["align_group_sum"]) / int(final_accounting["align_group_n"])
+            if final_accounting["align_group_n"]
+            else 0.0
+        ),
+        **accounting_notes,
+        **_failure_accounting_metadata(final_accounting),
+        **training_notes,
+        # the engine length actually handed to vllm (prompt + completion), already clamped to the model's own limit. the prompt filter is carved out of this same number.
+        "vllm_max_model_len": max_model_len,
+        # only single-turn text uses the fixed serial batcher; multimodal and multi-turn use bridge threads. cap the reported batch by samples the step can produce.
+        "opd_teacher_batch_size": (
+            min(OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size))
+            if not multimodal and not multi_turn
+            else None
+        ),
+        "opd_teacher_workers": 1 if not multimodal and not multi_turn else None,
+        **backend_notes[0],
+        "gdn_boundary_resets": gdn_hybrid or None,
+        **backend_notes[1],
+        "wandb_url": result.wandb_url,  # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the child marker emitted by backend_common.render_wandb_link_shim.
+        "wandb_id": result.wandb_id,
+    }
+
+
+def _billing_timing_from(final_accounting: dict) -> dict[str, float | None]:
+    """The measured seconds settlement subtracts from this run's accepted quote.
+
+    A missing init means the child never reported a step duration to bound it, and a missing reward
+    means the run produced no teacher-scoring metric. Neither may fail a finished run, so both
+    degrade to a charge-preserving value rather than raising.
+    """
+    return {
+        "framework_init_seconds": final_accounting.get("framework_init_seconds"),
+        "reward_seconds": float(final_accounting.get("reward_seconds") or 0.0),
+    }
+
+
 def run_opd_train(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
     from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
@@ -428,40 +497,19 @@ def run_opd_train(spec=None) -> None:
             setup_seconds=setup_seconds,
             train_tokens=0,
             generated_tokens=int(final_accounting["generated_tokens"]),
-            framework_init_seconds=final_accounting.get("framework_init_seconds"),
-            reward_seconds=float(final_accounting.get("reward_seconds") or 0.0),
-            notes={
-                "steps": update_horizon,
-                # optimizer updates that actually produced a distillation loss. record_step enforces loss_curve length == the metric step, and the guard above rejects a curve shorter than final_step, so this is measured, not assumed.
-                "opt_steps": len(final_accounting["loss_curve"]),
-                **initial_notes,
-                # the real alignment-health signal. mean_coverage reads ~1.0 even when the alignment has collapsed every student token onto one group, so it cannot flag that failure mode on its own; this ratio can.
-                "mean_align_granularity": (
-                    float(final_accounting["align_group_sum"])
-                    / int(final_accounting["align_group_n"])
-                    if final_accounting["align_group_n"]
-                    else 0.0
-                ),
-                **accounting_notes,
-                **_failure_accounting_metadata(final_accounting),
-                **training_notes,
-                # the engine length actually handed to vllm (prompt + completion), already clamped to the model's own limit. the prompt filter is carved out of this same number.
-                "vllm_max_model_len": max_model_len,
-                # only single-turn text uses the fixed serial batcher; multimodal and multi-turn use bridge threads. cap the reported batch by samples the step can produce.
-                "opd_teacher_batch_size": (
-                    min(
-                        OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size)
-                    )
-                    if not multimodal and not multi_turn
-                    else None
-                ),
-                "opd_teacher_workers": 1 if not multimodal and not multi_turn else None,
-                **backend_notes[0],
-                "gdn_boundary_resets": gdn_hybrid or None,
-                **backend_notes[1],
-                "wandb_url": result.wandb_url,  # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the child marker emitted by backend_common.render_wandb_link_shim.
-                "wandb_id": result.wandb_id,
-            },
+            **_billing_timing_from(final_accounting),
+            notes=_opd_train_notes(
+                final_accounting=final_accounting,
+                result=result,
+                knobs=knobs,
+                sections=(initial_notes, accounting_notes, training_notes, backend_notes),
+                update_horizon=update_horizon,
+                max_model_len=max_model_len,
+                prompts_per_step=prompts_per_step,
+                multimodal=multimodal,
+                multi_turn=multi_turn,
+                gdn_hybrid=gdn_hybrid,
+            ),
         )
     finally:
         runtime.bridge.close()
