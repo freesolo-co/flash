@@ -122,6 +122,13 @@ def _report(result, bundle) -> int:
             "want it.",
             file=sys.stderr,
         )
+    elif result.status == "provisioning" and handle is not None:
+        print(
+            f"\nthe pod {handle.pod_id} did not prove ready before the deadline, but may be live "
+            "and billing. run `flash serve status` to inspect the deployment, then `flash serve "
+            "undeploy` to stop it billing if you do not want it.",
+            file=sys.stderr,
+        )
     elif result.status == "outcome_unknown":
         # the provider may or may not hold live resources. saying "failed" here would invite a
         # retry that double-provisions and bills twice.

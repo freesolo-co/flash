@@ -120,7 +120,9 @@ def test_provider_is_required_and_restricted_to_supported_providers() -> None:
         )
 
 
-def test_deploy_routes_to_the_named_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_deploy_routes_to_the_named_provider(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     calls: list[str] = []
 
     def _fake_modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
@@ -151,6 +153,7 @@ def test_deploy_routes_to_the_named_provider(monkeypatch: pytest.MonkeyPatch) ->
     )
 
     assert calls == ["modal", "runpod"]
+    assert capsys.readouterr().err == ""
 
 
 def test_runpod_storage_precondition_message_reaches_the_user(
@@ -362,6 +365,36 @@ def test_unknown_model_is_refused_before_resolution(monkeypatch: pytest.MonkeyPa
     assert cmd_serve_deploy(_args(model="Qwen/Qwen3.5-0.8B")) == 1
 
 
+def test_runpod_provisioning_warns_that_the_pod_may_be_live_and_billing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from flash.serve.control import DeploymentResult
+
+    def _provisioning(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        ready = _result(bundle)
+        return DeploymentResult.from_spec(
+            bundle.spec,
+            status="provisioning",
+            handle=ready.handle,
+        )
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.runpod.provision_runpod_deployment", _provisioning
+    )
+
+    assert cmd_serve_deploy(_args(provider="runpod")) == 1
+    captured = capsys.readouterr()
+    assert "status      provisioning" in captured.out
+    assert "pod pod1234567890 did not prove ready before the deadline" in captured.err
+    assert "may be live and billing" in captured.err
+    assert "flash serve status" in captured.err
+    assert "flash serve undeploy" in captured.err
+    assert "artifact cleanup did not settle" not in captured.err
+    assert "provider outcome could not be confirmed" not in captured.err
+
+
 def test_outcome_unknown_is_not_reported_as_a_plain_failure(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -467,7 +500,7 @@ def test_artifact_cleanup_timeout_reports_a_live_billing_service(
     # the pod proved ready, so it bills until it is torn down. the earlier wording withheld the
     # teardown command, which left the cost to the user to work out.
     assert "flash serve undeploy" in captured.err
-    assert "readiness did not prove" not in captured.err
+    assert "did not prove ready before the deadline" not in captured.err
 
 
 def test_artifact_cleanup_rejection_warns_that_the_pod_is_live_and_billing(
