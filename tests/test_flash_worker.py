@@ -1223,6 +1223,17 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     assert "create_loraplus_optimizer" in plugin_src
 
 
+@pytest.fixture
+def _serialized_sft_console():
+    import fcntl
+
+    # both parametrizations exercise the production hardcoded /tmp/console_sft.txt path.
+    with open("/tmp/flash-test-sft-console.lock", "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
+
+
+@pytest.mark.usefixtures("_serialized_sft_console")
 @pytest.mark.parametrize(
     ("console_lines", "terminated"),
     [

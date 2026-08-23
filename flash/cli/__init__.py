@@ -56,6 +56,7 @@ from flash.cli.commands.traces import (
     cmd_traces_export,
 )
 from flash.cli.errors import friendly_error
+from flash.cli.serve_parser import _add_serve_commands
 from flash.cli.ui import render
 from flash.client.config import shadowed_login_warning
 from flash.core.catalog import ALGORITHMS
@@ -118,6 +119,14 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
             ("models deployments", "list active serving deployments"),
             ("models undeploy", "tear down a run's endpoint"),
             ("models export", "export an adapter to your HuggingFace repo"),
+        ],
+    ),
+    (
+        "self-hosted serving",
+        [
+            ("serve deploy", "provision a serving deployment in your own provider account"),
+            ("serve status", "show a deployment's state in your own provider account"),
+            ("serve undeploy", "tear down a deployment in your own provider account"),
         ],
     ),
 ]
@@ -255,6 +264,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_train_commands(sub)
     _add_runs_commands(sub)
     _add_deployment_commands(models_sub)
+    _add_serve_commands(sub)
     # The control plane is operator-only and run as a separate one-off service via the
     # `flash-server` console script (flash.server.__main__:main), not a `flash` subcommand.
 

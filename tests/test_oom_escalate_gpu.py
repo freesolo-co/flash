@@ -835,3 +835,131 @@ def test_free_vram_reads_nvml_and_never_starts_cuda(monkeypatch):
 
     assert lc.free_vram_gb() == pytest.approx(3.4, abs=0.05)
     assert lc.total_vram_gb() == pytest.approx(22.5, abs=0.05)
+
+
+def test_cuda_oom_allocation_detail_recovers_the_numbers_the_token_drops():
+    """The classification token alone left an operator with no sizing information.
+
+    ``cuda_oom_message_evidence`` deliberately returns only the matched class, because its result
+    is fed back through ``is_cuda_oom``. That kept retry classification honest but discarded the
+    only figures that say whether the request was hopeless or missed by a gigabyte.
+    """
+    from flash.engine.worker.perf.lifecycle import (
+        cuda_oom_allocation_detail,
+        cuda_oom_message_evidence,
+    )
+
+    line = (
+        "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB. "
+        "GPU 0 has a total capacity of 179.06 GiB of which 1.31 GiB is free."
+    )
+    # the classification token stays narrow -- widening it would re-trigger VRAM escalation
+    assert cuda_oom_message_evidence(line) == "torch.outofmemoryerror"
+    detail = cuda_oom_allocation_detail(line)
+    assert detail is not None
+    assert "2.00 gib" in detail
+    assert "179.06 gib" in detail
+    assert "1.31 gib" in detail
+
+
+def test_allocation_detail_keeps_the_figures_in_torchs_classic_parenthetical_spelling():
+    """Torch prints these figures two ways, and the caller returns the whole matched span.
+
+    A spelling the pattern cannot reach is therefore not merely unparsed -- it is dropped from the
+    operator's message, which is the exact loss this detail exists to prevent. The classic form puts
+    the unit BEFORE the phrase (``79.15 GiB total capacity``, ``18.69 MiB free``), so a pattern
+    anchored only on ``capacity of``/``is free`` stopped after the allocation size and threw away
+    both numbers on a line that carried them.
+    """
+    from flash.engine.worker.perf.lifecycle import (
+        cuda_oom_allocation_detail,
+        host_ram_kill_evidence,
+        is_cuda_oom,
+    )
+
+    classic = (
+        "RuntimeError: CUDA out of memory. Tried to allocate 20.00 MiB "
+        "(GPU 0; 79.15 GiB total capacity; 18.69 MiB free; 2.00 GiB reserved in total by PyTorch)"
+    )
+    detail = cuda_oom_allocation_detail(classic)
+    assert detail is not None
+    assert "20.00 mib" in detail
+    assert "79.15 gib" in detail, f"capacity dropped from the classic spelling: {detail}"
+    assert "18.69 mib" in detail, f"free figure dropped from the classic spelling: {detail}"
+
+    # the capacity-only variant already in this tree must keep its one figure too.
+    capacity_only = (
+        "CUDA out of memory. Tried to allocate 2.00 GiB (GPU 0; 79.15 GiB total capacity)"
+    )
+    capacity_detail = cuda_oom_allocation_detail(capacity_only)
+    assert capacity_detail is not None
+    assert "79.15 gib" in capacity_detail
+
+    # widening must not reach a host-RAM kill, whose remedy is the OPPOSITE of a bigger card.
+    host_kill = (
+        "ray.exceptions.OutOfMemoryError: Task was killed due to the node running low on memory"
+    )
+    assert cuda_oom_allocation_detail(host_kill) is None
+    assert host_ram_kill_evidence(host_kill) is not None
+    assert not is_cuda_oom(RuntimeError(host_kill))
+
+
+def test_cuda_oom_allocation_detail_is_absent_when_the_line_carries_no_numbers():
+    from flash.engine.worker.perf.lifecycle import cuda_oom_allocation_detail
+
+    assert cuda_oom_allocation_detail("RuntimeError: CUDA error: out of memory") is None
+
+
+def test_bare_cuda_error_out_of_memory_is_classified():
+    """``RuntimeError: CUDA error: out of memory`` is a real driver-level OOM spelling.
+
+    It was previously unrecognised, so a run that died this way reported no cause at all and did
+    not escalate VRAM.
+    """
+    from flash.engine.worker.perf.lifecycle import cuda_oom_message_evidence, is_cuda_oom
+
+    line = "RuntimeError: CUDA error: out of memory"
+    assert cuda_oom_message_evidence(line) == "cuda error: out of memory"
+    assert is_cuda_oom(RuntimeError(line))
+
+
+def test_host_ram_kill_is_still_not_a_cuda_oom_after_widening():
+    """The widened pattern must not swallow ray's host-RAM kill, whose remedy is the OPPOSITE.
+
+    A bigger card cannot fix system-memory exhaustion, so misclassifying this would escalate VRAM
+    while the gpu sat idle.
+    """
+    from flash.engine.worker.perf.lifecycle import host_ram_kill_evidence, is_cuda_oom
+
+    line = "ray.exceptions.OutOfMemoryError: Task was killed due to the node running low on memory"
+    assert host_ram_kill_evidence(line) is not None
+    assert not is_cuda_oom(RuntimeError(line))
+
+
+def test_allocation_detail_survives_a_flood_that_evicts_the_oom_line():
+    """The reporter's case: one OOM line, then ~190 PunicaWrapper warnings.
+
+    The bounded child tail evicts the OOM line entirely, so both the cause and its figures have to
+    be latched at record time rather than recovered from the ring buffer.
+    """
+    from flash.engine.worker.verl.diagnostics import (
+        ChildOutputTail,
+        raise_for_classified_verl_exit,
+    )
+
+    tail = ChildOutputTail()
+    tail.record(
+        "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB. "
+        "GPU 0 has a total capacity of 179.06 GiB of which 1.31 GiB is free."
+    )
+    for index in range(190):
+        tail.record(f"WARNING PunicaWrapper padding {index}")
+
+    assert tail.cuda_oom_evidence == "torch.outofmemoryerror"
+    assert tail.cuda_oom_allocation_detail is not None
+
+    with pytest.raises(RuntimeError) as excinfo:
+        raise_for_classified_verl_exit(1, tail)
+    message = str(excinfo.value)
+    assert "2.00 gib" in message
+    assert "179.06 gib" in message

@@ -17,7 +17,27 @@ _CUDA_OOM_CACHE_BLOCKS = "no available memory for the cache blocks"
 # a pattern whose prefixes were both optional degenerated to bare `outofmemoryerror` and matched
 # `ray.exceptions.OutOfMemoryError` -- a HOST-RAM kill -- escalating to a larger card while the gpu
 # sat idle. torch prints `torch.OutOfMemoryError` or `torch.cuda.OutOfMemoryError`, never unqualified.
-_CUDA_OOM_TORCH_RE = re.compile(r"torch\.(?:cuda\.)?outofmemoryerror|cuda out of memory")
+_CUDA_OOM_TORCH_RE = re.compile(
+    r"torch\.(?:cuda\.)?outofmemoryerror|cuda out of memory|cuda error: out of memory"
+)
+# the allocation detail that follows torch's OOM class -- how much was requested against how
+# much the card had. carried SEPARATELY from the classification token above, because
+# `is_cuda_oom` re-classifies the evidence string and a wider match there would let an
+# unrelated line re-trigger VRAM escalation.
+#
+# torch prints the capacity and free figures in TWO spellings, and the caller returns the whole
+# matched span -- so a spelling the pattern cannot reach is not merely unparsed, it is dropped from
+# the operator's message entirely, which is the loss this pattern exists to prevent. the newer form
+# puts the phrase first (a total capacity OF n GiB, of which n MiB IS FREE); the classic
+# parenthetical form puts the unit first (n GiB TOTAL CAPACITY; n MiB FREE). each half therefore
+# accepts either order. `test_allocation_detail_keeps_the_figures_in_torchs_classic_parenthetical_spelling`
+# carries both literal strings.
+_CUDA_OOM_ALLOCATION_RE = re.compile(
+    r"tried to allocate\s+[\d.]+\s*[kmgt]?ib?"
+    r"(?:.*?(?:(?:total capacity|capacity of)\s+[\d.]+\s*[kmgt]?ib?"
+    r"|[\d.]+\s*[kmgt]?ib?\s+total capacity))?"
+    r"(?:.*?([\d.]+\s*[kmgt]?ib?)\s+(?:is free|free))?"
+)
 # ray's host-memory monitor kills workers when NODE ram is exhausted. the gpu can be idle at the
 # moment of death, so this is the opposite remedy from a cuda oom: the scarce resource is system ram.
 _HOST_RAM_KILL_RE = re.compile(
@@ -173,6 +193,22 @@ def cuda_oom_message_evidence(message: str) -> str | None:
     if torch_oom is not None:
         return torch_oom.group(0)
     return None
+
+
+def cuda_oom_allocation_detail(message: str) -> str | None:
+    """How much a cuda OOM asked for, and what the card had, when the message says.
+
+    ``cuda_oom_message_evidence`` deliberately returns only the classification token: its result is
+    fed back through ``is_cuda_oom``, so widening it would let an unrelated line re-match and
+    re-trigger VRAM escalation. That kept the retry logic honest but threw away the only numbers an
+    operator needs -- a torch OOM line says it tried to allocate 2.00 GiB against a 179.06 GiB card
+    with 1.31 GiB free, and all that survived was ``torch.outofmemoryerror``.
+
+    This reads the same line for that detail WITHOUT feeding classification, so the numbers reach
+    the diagnostics while the retry decision stays keyed on the token alone.
+    """
+    match = _CUDA_OOM_ALLOCATION_RE.search(message.lower())
+    return match.group(0) if match is not None else None
 
 
 def host_ram_kill_evidence(message: str) -> str | None:

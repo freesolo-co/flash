@@ -24,8 +24,8 @@ from referencing.exceptions import Unresolvable
 from flash.adapters.lora_rank import serving_completion_token_capacity
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.core.spec import JobSpec
+from flash.serve.contract import LORA_REQUEST_ATTESTATION_CAPABILITY
 from flash.serve.deploy import (
-    LORA_REQUEST_ATTESTATION_CAPABILITY,
     AliasThinkingSilent,
     RetryableServingUnavailable,
     ServingError,
