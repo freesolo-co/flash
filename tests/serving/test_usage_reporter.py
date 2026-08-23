@@ -854,7 +854,7 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
     engine._adapter_locks = {}
     engine._adapter_locks_guard = asyncio.Lock()
     engine._source_paths = {}
-    engine._lora_requests = {}
+    engine._lora_entries = {}
     # _load() normally sets this; the object.__new__ engine here must too, or _add_lora_locked's
     # `if self._pin_loras` raises AttributeError (swallowed by the preload) and pinning never runs.
     engine._pin_loras = True
@@ -867,11 +867,11 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
     assert registry.local_path(missing) is None
 
 
-def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkeypatch):
-    # Two distinct adapters whose sha1 masks collide to the same vLLM int id must NOT share it —
-    # that cross-wires two orgs' LoRAs on one base-model engine. The second one linear-probes to the
-    # next free id.
+def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkeypatch, tmp_path):
+    # two distinct adapters whose sha1 masks collide to the same vllm int id must not share it.
+    # unconfirmed entries still occupy their id because vllm may retain the corresponding weights.
     from flash.serving.src import registry as registry_mod
+    from flash.serving.src.lora_engine import _LoraEntry
     from flash.serving.src.schemas import AdapterRecord
 
     monkeypatch.setattr(registry_mod, "lora_int_id", lambda adapter_id: 42)
@@ -887,20 +887,26 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
         )
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
-    engine._lora_requests = {}
+    assert not hasattr(engine, "_lora_entries")
 
-    req_a = engine._cached_lora_request_locked(_rec("a", "org/a"), Path("/tmp/a"))
-    req_b = engine._cached_lora_request_locked(_rec("b", "org/b"), Path("/tmp/b"))
+    record_a = _rec("a", "org/a")
+    req_a = engine._cached_lora_request_locked(record_a, tmp_path / "a")
+    req_b = engine._cached_lora_request_locked(_rec("b", "org/b"), tmp_path / "b")
 
     assert req_a.lora_int_id == 42
     assert req_b.lora_int_id == 43
     assert req_a.lora_int_id != req_b.lora_int_id
-    # Re-resolving an already-cached adapter (same source) returns the same request/id, unchanged.
-    assert engine._cached_lora_request_locked(_rec("a", "org/a"), Path("/tmp/a")) is req_a
+    # re-resolving an already-cached adapter returns the same request and id.
+    assert engine._cached_lora_request_locked(record_a, tmp_path / "a") is req_a
+    entry_a = engine._lora_entries["a"]
+    engine._lora_entries["a"] = _LoraEntry(entry_a.source_ident, req_a, "unconfirmed")
+    req_c = engine._cached_lora_request_locked(_rec("c", "org/c"), tmp_path / "c")
+    assert req_c.lora_int_id == 44
 
 
 def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_module, monkeypatch):
     from flash.serving.src import registry as registry_mod
+    from flash.serving.src.lora_engine import _LoraEntry
 
     monkeypatch.setattr(registry_mod, "lora_int_id", lambda _adapter_id: 42)
 
@@ -916,12 +922,14 @@ def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_modu
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.engine = _Engine()
-    engine._lora_requests = {"tenant-b": (("org/b", "model", "sha", None), _Request())}
+    engine._lora_entries = {
+        "tenant-b": _LoraEntry(("org/b", "model", "sha", None), _Request(), "loaded")
+    }
 
     asyncio.run(engine._evict_loaded_lora("tenant-a"))
 
     assert engine.engine.removed == []
-    assert "tenant-b" in engine._lora_requests
+    assert "tenant-b" in engine._lora_entries
 
 
 def test_reporter_disabled_when_only_internal_key_is_set(modal_app_module):

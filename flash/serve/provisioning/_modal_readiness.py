@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
-from flash.serve.control import DeploymentResult, ModalProviderHandle
+from flash.serve.control import DeploymentErrorReason, DeploymentResult, ModalProviderHandle
 
 from ._common import (
     Clock,
@@ -96,11 +96,12 @@ def failure_result(
 def unknown_result(
     plan: ModalCreatePlan,
     *,
+    reason: DeploymentErrorReason | None = None,
     handle: ModalProviderHandle | None = None,
 ) -> DeploymentResult:
     return failure_result(
         plan,
-        LifecycleFailure("resource_ambiguous", outcome_unknown=True),
+        LifecycleFailure("resource_ambiguous", outcome_unknown=True, reason=reason),
         handle=handle,
     )
 

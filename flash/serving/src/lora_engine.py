@@ -1,10 +1,8 @@
 """The vLLM multi-LoRA engine implementation for the Modal serving app, plus its pure helpers.
 
-``_LoraEngineImpl`` is the plain (non-Modal) base class that ``modal_app._build_engine`` wraps in
-one ``@app.cls`` per GPU tier; the ``_``-prefixed module functions are the stateless helpers it
-depends on. Kept import-light — no ``modal`` import (so importing this module triggers no Modal
-registration, which all still happens at import of ``modal_app``) and vllm/transformers stay lazy
-inside the engine methods; only ``src.model_config`` (pure stdlib) is imported at module scope.
+``_LoraEngineImpl`` is the non-Modal base that ``modal_app._build_engine`` wraps per GPU tier.
+This stays import-light: importing it triggers no Modal registration, and vllm/transformers remain
+lazy inside engine methods; only pure serving support modules are imported at module scope.
 """
 
 import asyncio
@@ -39,6 +37,7 @@ from flash.serving.src.engine_support import (
     active_checkpoint_ref,
     enforce_expected_checkpoint,
 )
+from flash.serving.src.lora_entries import _LoraEntry, cached_lora_request, entries_for
 from flash.serving.src.model_config import (
     engine_overrides_for,
     gpu_for,
@@ -110,8 +109,7 @@ class _LoraEngineImpl:
         self._source_locks: dict[tuple[str, str, str, str | None], asyncio.Lock] = {}
         self._source_locks_guard = asyncio.Lock()
         self._source_paths: dict[tuple[str, str, str, str | None], Path] = {}
-        self._lora_requests: dict[str, tuple[tuple[str, str, str, str | None], Any]] = {}
-        self._lora_states: dict[str, str] = {}
+        self._lora_entries: dict[str, _LoraEntry] = {}
         self._prompt_token_cache: OrderedDict[tuple[str, str], tuple[int, ...]] = OrderedDict()
         self._prompt_cache_size = cfg.PROMPT_TOKEN_CACHE_SIZE
         base_model_adapters = _load_adapters_for_base(self.settings, self.base_model)
@@ -207,25 +205,26 @@ class _LoraEngineImpl:
                 self._source_locks[ident] = lock
             return lock
 
+    def _entries(self) -> dict[str, _LoraEntry]:
+        return entries_for(self)
+
     async def _evict_loaded_lora(self, adapter_id: str) -> None:
-        if (cached := self._lora_requests.get(adapter_id)) is None:
+        entries = self._entries()
+        if (entry := entries.get(adapter_id)) is None:
             return
-        states = getattr(self, "_lora_states", {})
-        self._lora_states = states
-        if states.get(adapter_id) is None:
-            self._lora_requests.pop(adapter_id, None)
+        if entry.state == "reserved":
+            entries.pop(adapter_id)
             return
-        states[adapter_id] = "unconfirmed"
+        entries[adapter_id] = _LoraEntry(entry.source_ident, entry.lora_request, "unconfirmed")
         remove = getattr(self.engine, "remove_lora", None)
         if remove is None:
             raise RuntimeError("vLLM cannot confirm LoRA removal")
-        result = remove(cached[1].lora_int_id)
+        result = remove(entry.lora_request.lora_int_id)
         if inspect.isawaitable(result):
             result = await result
         if result is False:
             raise RuntimeError("vLLM rejected LoRA removal")
-        self._lora_requests.pop(adapter_id, None)
-        states.pop(adapter_id, None)
+        entries.pop(adapter_id)
 
     async def _pin_lora(self, lora_request: Any) -> None:
         pin = getattr(self.engine, "pin_lora", None)
@@ -237,21 +236,20 @@ class _LoraEngineImpl:
 
     async def _add_lora_locked(self, record: Any, path: Path) -> None:
         adapter_id = record.adapter_id
-        newly_reserved = adapter_id not in self._lora_requests
+        entries = self._entries()
         lora_request = self._cached_lora_request_locked(record, path)
-        states = getattr(self, "_lora_states", {})
-        self._lora_states = states
+        was_reserved = entries[adapter_id].state == "reserved"
         try:
             added = await self.engine.add_lora(lora_request)
         except Exception:
-            if newly_reserved:
-                states[adapter_id] = "unconfirmed"
+            if was_reserved:
+                entries.pop(adapter_id)
             raise
-        if added is False and newly_reserved:
-            self._lora_requests.pop(adapter_id, None)
-            states.pop(adapter_id, None)
+        if added is False and was_reserved:
+            entries.pop(adapter_id)
             raise RuntimeError("vLLM rejected a new LoRA registration")
-        states[adapter_id] = "loaded"
+        entry = entries[adapter_id]
+        entries[adapter_id] = _LoraEntry(entry.source_ident, lora_request, "loaded")
         if self._pin_loras:  # capped pools stay unpinned so surplus adapters can lru-swap
             await self._pin_lora(lora_request)
 
@@ -291,7 +289,7 @@ class _LoraEngineImpl:
         # Stale cached path (source changed) -> evict the old LoRA before re-downloading; check
         # before local_path(), which clears the stale entry.
         if self.registry.local_path_is_stale(record):
-            # _evict_loaded_lora already drops adapter_id from _lora_requests in its finally block.
+            # eviction releases this adapter's single lifecycle entry after confirmed removal.
             await self._evict_loaded_lora(adapter_id)
         path = self.registry.local_path(record)
         if path is not None:
@@ -365,36 +363,7 @@ class _LoraEngineImpl:
             raise last_exc
 
     def _cached_lora_request_locked(self, record: Any, path: Path) -> Any:
-        source_ident = _adapter_source_ident(record)
-        adapter_id = record.adapter_id
-        if getattr(self, "_lora_states", {}).get(adapter_id) == "unconfirmed":
-            raise RuntimeError("LoRA registration is unconfirmed on this engine")
-        cached = self._lora_requests.get(adapter_id)
-        if cached is not None:
-            if cached[0] == source_ident:
-                return cached[1]
-            raise RuntimeError("previous LoRA removal is unconfirmed on this engine")
-
-        from vllm.lora.request import LoRARequest
-
-        from flash.serving.src.registry import lora_int_id
-
-        # distinct adapter ids can collide after lora_int_id's int32 mask. reserve the next free id
-        # while the per-adapter lock keeps this synchronous probe atomic against other adapters.
-        used = {
-            req.lora_int_id: aid
-            for aid, (_ident, req) in self._lora_requests.items()
-            if aid != adapter_id
-        }
-        int_id = lora_int_id(adapter_id)
-        while int_id in used:
-            int_id = int_id + 1 if int_id < 0x7FFFFFFF else 1
-
-        lora_request = LoRARequest(adapter_id, int_id, str(path))
-        self._lora_requests[adapter_id] = (source_ident, lora_request)
-        self._lora_states = getattr(self, "_lora_states", {})
-        self._lora_states[adapter_id] = "reserved"
-        return lora_request
+        return cached_lora_request(self, record, path)
 
     async def _lora_request(
         self, adapter_id: str, record_dict: dict[str, Any] | None = None

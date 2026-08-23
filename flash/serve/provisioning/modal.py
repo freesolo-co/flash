@@ -260,6 +260,24 @@ def provision_modal_deployment(
             sdk.close()
 
 
+def _observed_modal_handle(
+    bootstrap_plan: ModalCreatePlan,
+    finalized_plan: ModalCreatePlan,
+    observation: ModalObservation,
+) -> ModalProviderHandle:
+    for plan in (finalized_plan, bootstrap_plan):
+        try:
+            return phase_proof(
+                plan,
+                observation,
+                artifact_present=bool(observation.artifact_secrets),
+                expected=None,
+            ).handle
+        except ModalResourceConflict:
+            continue
+    raise ModalResourceConflict("modal resources do not match a deployment phase")
+
+
 def reconcile_modal_deployment(
     bundle: DeploymentBundle,
     credentials: ModalCredentials,
@@ -284,7 +302,12 @@ def reconcile_modal_deployment(
         if initial.resource_count == 0:
             return DeploymentResult.from_spec(bundle.spec, status="absent")
         if runtime_secrets is None:
-            return unknown_result(finalized_plan)
+            handle = _observed_modal_handle(bootstrap_plan, finalized_plan, initial)
+            return unknown_result(
+                finalized_plan,
+                reason="readiness_deadline_unproven",
+                handle=handle,
+            )
         inference_token, _artifact_token = runtime_secrets._reveal_for_launch()
         proof = wait_for_phase(
             finalized_plan,

@@ -11,7 +11,7 @@ from flash.serving.src.engine_support import (
     _adapter_source_ident,
     _load_adapters_for_base,
 )
-from flash.serving.src.lora_engine import _LoraEngineImpl
+from flash.serving.src.lora_engine import _LoraEngineImpl, _LoraEntry
 from flash.serving.src.registry import AdapterRegistry
 from flash.serving.src.schemas import AdapterRecord
 
@@ -112,15 +112,72 @@ def test_unregister_skips_cleanup_for_a_newer_deployment_generation() -> None:
     assert evicted == [record.adapter_id]
 
 
-@pytest.mark.parametrize("outcome", ["missing", "raises", "false"])
-def test_confirmed_lora_unconfirmed_removal_retains_reservation(
-    outcome: str, tmp_path: Path
+def test_add_lora_exception_releases_new_entry_for_retry(tmp_path: Path) -> None:
+    record = _revision("a" * 40)
+    engine = _LoraEngineImpl()
+    engine._pin_loras = False
+    calls = 0
+
+    class _Engine:
+        async def add_lora(self, _request: object) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("worker unavailable")
+            return True
+
+    engine.engine = _Engine()
+
+    with pytest.raises(RuntimeError, match="worker unavailable"):
+        asyncio.run(engine._add_lora_locked(record, tmp_path))
+
+    assert record.adapter_id not in engine._entries()
+    asyncio.run(engine._add_lora_locked(record, tmp_path))
+    assert calls == 2
+    assert engine._entries()[record.adapter_id].state == "loaded"
+
+
+def test_rejected_new_lora_releases_entry_and_reaches_engine_on_retry(tmp_path: Path) -> None:
+    record = _revision("a" * 40)
+    engine = _LoraEngineImpl()
+    engine._pin_loras = False
+    outcomes = iter((False, True))
+    calls = 0
+
+    class _Engine:
+        async def add_lora(self, _request: object) -> bool:
+            nonlocal calls
+            calls += 1
+            return next(outcomes)
+
+    engine.engine = _Engine()
+
+    with pytest.raises(RuntimeError, match="vLLM rejected a new LoRA registration"):
+        asyncio.run(engine._add_lora_locked(record, tmp_path))
+
+    assert record.adapter_id not in engine._entries()
+    asyncio.run(engine._add_lora_locked(record, tmp_path))
+    assert calls == 2
+    assert engine._entries()[record.adapter_id].state == "loaded"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "message"),
+    [
+        ("missing", "vLLM cannot confirm LoRA removal"),
+        ("raises", "worker unavailable"),
+        ("false", "vLLM rejected LoRA removal"),
+    ],
+)
+def test_loaded_lora_failed_removal_retains_unconfirmed_entry(
+    outcome: str, message: str, tmp_path: Path
 ) -> None:
     record = _revision("a" * 40)
     request = SimpleNamespace(lora_int_id=42)
     engine = _LoraEngineImpl()
-    engine._lora_requests = {record.adapter_id: (_adapter_source_ident(record), request)}
-    engine._lora_states = {record.adapter_id: "loaded"}
+    engine._lora_entries = {
+        record.adapter_id: _LoraEntry(_adapter_source_ident(record), request, "loaded")
+    }
 
     if outcome == "missing":
         engine.engine = object()
@@ -134,55 +191,55 @@ def test_confirmed_lora_unconfirmed_removal_retains_reservation(
 
         engine.engine = _Engine()
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match=message):
         asyncio.run(engine._evict_loaded_lora(record.adapter_id))
 
-    assert engine._lora_requests[record.adapter_id][1] is request
-    assert engine._lora_states[record.adapter_id] == "unconfirmed"
+    entry = engine._entries()[record.adapter_id]
+    assert entry.lora_request is request
+    assert entry.state == "unconfirmed"
     with pytest.raises(RuntimeError, match="registration is unconfirmed"):
         engine._cached_lora_request_locked(record, tmp_path)
 
 
-def test_rejected_new_lora_releases_reservation_and_registry_for_retry(tmp_path: Path) -> None:
+def test_reserved_lora_evict_releases_without_engine_removal() -> None:
     record = _revision("a" * 40)
     request = SimpleNamespace(lora_int_id=42)
     engine = _LoraEngineImpl()
-    engine.base_model = BASE_MODEL
-    engine.registry = AdapterRegistry()
-    engine._adapter_locks = {}
-    engine._adapter_locks_guard = asyncio.Lock()
-    engine._lora_requests = {}
-    engine._lora_states = {}
-    engine._pin_loras = False
-    outcomes = iter((False, True))
+    engine._lora_entries = {
+        record.adapter_id: _LoraEntry(_adapter_source_ident(record), request, "reserved")
+    }
+    removed: list[int] = []
 
     class _Engine:
-        async def add_lora(self, _request: object) -> bool:
-            return next(outcomes)
+        async def remove_lora(self, int_id: int) -> bool:
+            removed.append(int_id)
+            return True
 
     engine.engine = _Engine()
 
-    async def _local(_record: AdapterRecord) -> Path:
-        return tmp_path
+    asyncio.run(engine._evict_loaded_lora(record.adapter_id))
 
-    def _cache(_record: AdapterRecord, _path: Path) -> object:
-        engine._lora_requests[record.adapter_id] = (
-            (record.repo_id, record.repo_type, record.hf_revision or "", record.subfolder),
-            request,
-        )
-        return request
+    assert record.adapter_id not in engine._entries()
+    assert removed == []
 
-    engine._ensure_adapter_local_locked = _local
-    engine._cached_lora_request_locked = _cache
 
-    with pytest.raises(RuntimeError, match="rejected a new LoRA registration"):
-        asyncio.run(engine._register(record.model_dump()))
+def test_cached_lora_request_enforces_state_and_source_identity(tmp_path: Path) -> None:
+    record = _revision("a" * 40)
+    request = SimpleNamespace(lora_int_id=42)
+    source_ident = _adapter_source_ident(record)
+    engine = _LoraEngineImpl()
+    engine._lora_entries = {record.adapter_id: _LoraEntry(source_ident, request, "loaded")}
 
-    assert record.adapter_id not in engine._lora_requests
-    assert engine.registry.get(record.adapter_id) is None
-    assert asyncio.run(engine._register(record.model_dump()))["ok"] is True
-    assert engine._lora_states[record.adapter_id] == "loaded"
-    assert engine.registry.get(record.adapter_id) is not None
+    assert engine._cached_lora_request_locked(record, tmp_path) is request
+
+    engine._lora_entries[record.adapter_id] = _LoraEntry(source_ident, request, "unconfirmed")
+    with pytest.raises(RuntimeError, match="registration is unconfirmed"):
+        engine._cached_lora_request_locked(record, tmp_path)
+
+    other_ident = ("other/repo", source_ident[1], source_ident[2], source_ident[3])
+    engine._lora_entries[record.adapter_id] = _LoraEntry(other_ident, request, "loaded")
+    with pytest.raises(RuntimeError, match="previous LoRA removal is unconfirmed"):
+        engine._cached_lora_request_locked(record, tmp_path)
 
 
 def test_unregister_tombstones_missing_record_for_expected_generation() -> None:
@@ -234,7 +291,7 @@ def test_snapshot_download_receives_exact_hub_sha(monkeypatch, tmp_path: Path) -
     engine._source_locks = {}
     engine._source_locks_guard = asyncio.Lock()
     engine._source_paths = {}
-    engine._lora_requests = {}
+    engine._lora_entries = {}
 
     path = asyncio.run(engine._ensure_adapter_local_locked(record))
     relative = path.relative_to(tmp_path)
@@ -266,7 +323,7 @@ def test_runtime_containment_rejects_schema_bypass(monkeypatch, tmp_path: Path) 
     engine._source_locks = {}
     engine._source_locks_guard = asyncio.Lock()
     engine._source_paths = {}
-    engine._lora_requests = {}
+    engine._lora_entries = {}
 
     with pytest.raises(ValueError, match="escapes its exact-SHA source cache"):
         asyncio.run(engine._ensure_adapter_local_locked(record))

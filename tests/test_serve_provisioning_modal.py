@@ -1410,6 +1410,32 @@ def test_reconcile_is_read_only_for_ready_absent_and_lingering_artifact() -> Non
     assert all(name == "observe" for name, _value in sdk.calls)
 
 
+def test_tokenless_reconcile_returns_observed_modal_handle() -> None:
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _FakeSdk(plan)
+    handle = _seed_exact(sdk)
+    probe = _Probe(True)
+
+    result = reconcile_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        None,
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
+        probe=probe,
+        clock=_Clock(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert result.handle is not None
+    assert result.handle == handle
+    assert result.error_reason == "readiness_deadline_unproven"
+    assert probe.calls == []
+    assert all(name == "observe" for name, _value in sdk.calls)
+
+
 def test_artifact_cleanup_rejection_reports_the_live_modal_app() -> None:
     bundle = _bundle()
     factory = _Factory()
