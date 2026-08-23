@@ -921,7 +921,6 @@ from flash.serve.adapter_check import (  # noqa: E402,F401
     _is_adapter_tensor_filename,
     _is_hf_not_found_error,
     _verify_adapter_artifact_tensors,
-    adapter_artifact_lora_rank,
     adapter_artifact_metadata,
     validate_serving_lora_rank,
 )

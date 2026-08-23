@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from flash.adapters.artifacts import has_loadable_adapter_weights, is_adapter_weight_filename
 from flash.adapters.lora_rank import rank_from_adapter_config
+from flash.adapters.targets import config_targets_images
 from flash.serve.errors import AdapterConfigMissing, AdapterTensorMissing, ServingError
 
 # The accepted weight-file shapes live beside the filenames themselves so serving validation and
@@ -175,16 +176,9 @@ def adapter_artifact_metadata(
     """Read adapter metadata and verify that tensor weights exist."""
     config, filename = _load_adapter_config(hf_repo, subfolder, hf_revision=hf_revision)
     _verify_adapter_artifact_tensors(hf_repo, subfolder, hf_revision=hf_revision)
-    # only the producer's explicit json null selects the image smoke. a missing or malformed marker
-    # falls back to the text smoke so modality uncertainty cannot strand an otherwise usable deploy;
-    # the tradeoff is that an unmarked multimodal adapter receives the weaker text-only smoke.
-    targets_images = "exclude_modules" in config and config["exclude_modules"] is None
     return AdapterArtifactMetadata(
         lora_rank=rank_from_adapter_config(config, source=f"{hf_repo}:{filename}"),
-        targets_images=targets_images,
+        # non-fatal by construction: an unmarked or malformed marker reads as text-only, so modality
+        # uncertainty weakens the smoke rather than stranding an otherwise usable deployment.
+        targets_images=config_targets_images(config),
     )
-
-
-def adapter_artifact_lora_rank(hf_repo: str, subfolder: str, *, hf_revision: str) -> int:
-    """Read rank metadata and verify the adapter has tensor weights."""
-    return adapter_artifact_metadata(hf_repo, subfolder, hf_revision=hf_revision).lora_rank

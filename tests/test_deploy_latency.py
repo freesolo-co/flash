@@ -292,11 +292,11 @@ def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, 
     )
 
     assert (
-        deploy.adapter_artifact_lora_rank(
+        deploy.adapter_artifact_metadata(
             "org/repo",
             "sft/run-1/seed0/adapter",
             hf_revision="a" * 40,
-        )
+        ).lora_rank
         == 32
     )
     assert calls == ["config", "tensors"]
@@ -323,7 +323,7 @@ def test_adapter_preflight_config_failure_does_not_start_tensor_listing(monkeypa
     )
 
     with pytest.raises(deploy.ServingError, match="failed to read org/repo"):
-        deploy.adapter_artifact_lora_rank(
+        deploy.adapter_artifact_metadata(
             "org/repo",
             "sft/run-1/seed0/adapter",
             hf_revision="a" * 40,
