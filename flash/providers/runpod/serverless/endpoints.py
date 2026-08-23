@@ -582,9 +582,8 @@ def _train_body(input_data: dict) -> dict:
             captured console is then the only root-cause record -- and a crash that exits 0 would
             otherwise skip the upload entirely, leaving the failure opaque.
 
-            ``final`` closes the live path and writes the terminal tail to this attempt's scoped
-            name and then to the canonical ``console_<mode>.txt`` alias; live snapshots are
-            attempt-scoped so a retry cannot overwrite the previous attempt's tail.
+            ``final`` writes the canonical ``console_<mode>.txt`` and closes the live path; live
+            snapshots are attempt-scoped so a retry cannot overwrite the previous attempt's tail.
             """
             console = f"/tmp/console_{mode}.txt"
             if not os.path.exists(console):
@@ -635,26 +634,17 @@ def _train_body(input_data: dict) -> dict:
                 if not final and console_teardown.is_set():
                     return False
                 attempt = int(env.get("ATTEMPT") or 0)
-                scoped = artifact_module.attempt_scoped_artifact_name("console", mode, attempt)
-                # the terminal tail is written to THIS attempt's scoped name first, overwriting the
-                # periodic snapshot it supersedes, and only then to the canonical alias. the reader
-                # ranks consoles by the attempt in the filename and scores the unsuffixed canonical
-                # -1 (server/platform/runtime.py), so a terminal tail uploaded ONLY as canonical can
-                # never win: it loses to this attempt's own mid-run snapshot, which stops wherever
-                # the last periodic upload happened to land. measured on one 27B crash, that
-                # discarded the final 56k of the console -- the whole traceback.
-                # canonical stays as an alias because make_hf_failure_detail_reader reads it by that
-                # exact name (providers/artifacts/hf.py), and scoped-first means a failed alias
-                # upload still leaves the authoritative copy behind.
-                names = [scoped, f"console_{mode}.txt"] if final else [scoped]
-                api = HfApi(token=env.get("HF_TOKEN"))
-                for artifact in names:
-                    api.upload_file(
-                        path_or_fileobj=tail_path,
-                        path_in_repo=f"{prefix}/{artifact}",
-                        repo_id=input_data["hf_repo"],
-                        repo_type="dataset",
-                    )
+                artifact = (
+                    f"console_{mode}.txt"
+                    if final
+                    else artifact_module.attempt_scoped_artifact_name("console", mode, attempt)
+                )
+                HfApi(token=env.get("HF_TOKEN")).upload_file(
+                    path_or_fileobj=tail_path,
+                    path_in_repo=f"{prefix}/{artifact}",
+                    repo_id=input_data["hf_repo"],
+                    repo_type="dataset",
+                )
                 return True
             except Exception as e:
                 print("console upload warn:", _safe_detail(e, env))
