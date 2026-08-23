@@ -276,7 +276,10 @@ def _upload_console_snapshot(
     names = [f"console_{mode}{scoped}.txt"]
     if final:
         names.append(f"console_{mode}.txt")
-    return all([hf_upload(payload, tail_path, name) for name in names])
+    # every name is attempted even after one fails: the scoped copy is authoritative and the
+    # canonical alias is what the ui reads, so a short-circuit here would drop one of the two.
+    results = [hf_upload(payload, tail_path, name) for name in names]
+    return all(results)
 
 
 def _console_upload_loop(
