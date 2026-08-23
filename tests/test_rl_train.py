@@ -31,6 +31,7 @@ import numpy as np
 import pytest
 
 import flash.engine.worker as W
+from flash.core.grpo import SUPPORTED_GRPO_GROUP_SIZES
 from flash.engine.worker import backend_common, rl_train, sft_train
 from flash.engine.worker.entry import rl
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
@@ -1925,7 +1926,7 @@ def test_multigpu_gpu_mem_util_never_exceeds_the_previous_constant():
         for gpu_type in ("H100", "H200", "B200"):
             for tensor_parallel in (2, 4, 8):
                 for engine_len in (1024, 2048, 8192, 32768):
-                    for group_size in (2, 4, 8):
+                    for group_size in SUPPORTED_GRPO_GROUP_SIZES:
                         got = rl_train.resolve_gpu_mem_util(
                             _mem_util_inp(
                                 model_id=model_id,
