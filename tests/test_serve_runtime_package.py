@@ -49,10 +49,10 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
 
     assert project["project"]["dependencies"] == []
     assert extras["serve-runtime"] == [
-        "fastapi",
-        "uvicorn",
+        "fastapi>=0.136,<0.137",
+        "uvicorn>=0.52,<1",
         "huggingface-hub>=1.2.0",
-        "safetensors",
+        "safetensors>=0.8,<1",
         "pillow>=11.0.0",
         TRANSFORMERS_REQUIREMENT,
         "vllm==0.23.0",

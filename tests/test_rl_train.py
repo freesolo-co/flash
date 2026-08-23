@@ -1288,6 +1288,23 @@ def test_build_verl_overrides_omits_layered_summon_for_dense_models():
     assert not [x for x in o if "layered_summon" in x]
 
 
+def test_build_verl_overrides_keeps_fused_expert_params_addressable_under_fsdp1():
+    # end-to-end through the real builder. grpo emits no `actor.strategy`, so it inherits verl's
+    # fsdp1 default (actor/dp_actor.yaml:22-26) -- unlike the sft driver, which pins fsdp2
+    # (train/sft/config.py:138) and therefore never flattens. on fsdp1 the flag is what keeps
+    # `mlp.experts.down_proj` reachable by name for PEFT's forward-time parametrization.
+    o = rl_train.build_verl_overrides(
+        _overrides_cfg(target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
+    )
+    assert "actor_rollout_ref.actor.fsdp_config.use_orig_params=true" in o
+    assert not [x for x in o if x.startswith("actor_rollout_ref.actor.strategy=")]
+
+
+def test_build_verl_overrides_omits_orig_params_for_dense_models():
+    o = rl_train.build_verl_overrides(_overrides_cfg(target_parameters=None))
+    assert not [x for x in o if "use_orig_params" in x]
+
+
 def test_build_verl_overrides_carries_dr_grpo_recipe():
     o = rl_train.build_verl_overrides(_overrides_cfg())
     assert "algorithm.adv_estimator=grpo" in o
