@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import difflib
 import math
-import re
 import shlex
 import sys
 from typing import NoReturn
@@ -57,6 +55,7 @@ from flash.cli.commands.traces import (
     RECORDS_FORMAT,
     cmd_traces_export,
 )
+from flash.cli.errors import friendly_error
 from flash.cli.ui import render
 from flash.client.config import shadowed_login_warning
 from flash.core.catalog import ALGORITHMS
@@ -170,20 +169,6 @@ def _gpu_count_override(value: str) -> str:
         raise argparse.ArgumentTypeError(f"expected a number of gpus, got {value!r}") from None
 
 
-def _friendly_message(message: str) -> str:
-    """Shorten argparse's verbose ``invalid choice: 'x' (choose from a, b, c, ...)`` into a concise
-    ``unknown command 'x' (did you mean 'y'?)`` — the single closest match instead of dumping the
-    whole list. Other messages pass through untouched. Styled path only; the machine path keeps
-    argparse's exact text (scripts and the error tests match on the literal `invalid choice`)."""
-    m = re.search(r"invalid choice: '([^']*)'(?: \(choose from (.*)\))?", message)
-    if not m:
-        return message
-    bad, raw_choices = m.group(1), m.group(2) or ""
-    choices = [c.strip().strip("'\"") for c in raw_choices.split(",") if c.strip()]
-    near = difflib.get_close_matches(bad, choices, n=1)
-    return f"unknown command '{bad}'" + (f" (did you mean '{near[0]}'?)" if near else "")
-
-
 class _ThemedParser(argparse.ArgumentParser):
     """Base parser whose usage errors match the rest of the themed CLI.
 
@@ -201,9 +186,13 @@ class _ThemedParser(argparse.ArgumentParser):
         if not render.styled():
             super().error(message)  # argparse's raw usage + `prog: error: msg`, then exit 2
         # themed twin: the red ✗ error line (same idiom as main()'s catch-all and `flash login`),
-        # then a dimmed pointer at this parser's own --help instead of the raw usage block. An
-        # "invalid choice" becomes a short "did you mean" suggestion (see _friendly_message).
-        print(render.error(_friendly_message(message)), file=sys.stderr)
+        # then a dimmed pointer at this parser's own --help instead of the raw usage block. unknown
+        # commands and flags get a short "did you mean" suggestion (see `friendly_error`). the argv
+        # stash is what tells it which subcommand was selected; only the root parser carries one.
+        print(
+            render.error(friendly_error(message, self, getattr(self, "_flash_argv", None))),
+            file=sys.stderr,
+        )
         # dimmed pointer at THIS parser's own --help (argparse sets prog per parser: `flash --help`
         # for the root, `flash <cmd> --help` for a subcommand) instead of the raw usage block.
         print(render.arrow(f"run `{self.prog} --help` for usage"), file=sys.stderr)
@@ -902,6 +891,12 @@ def _redacted_args(raw_args: list[str]) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     parser = _build_parser()
+    # the tokens this invocation was actually given, for the error hook: argparse reports a
+    # subcommand's unknown flags from the ROOT parser, so scoping the suggestion to the selected
+    # command needs the argv `main` was called with. reading sys.argv there instead would be right
+    # only for the console-script path and wrong for every embedded caller -- including the tests,
+    # where it silently reads pytest's own argv and restores the whole-tree pool.
+    parser._flash_argv = raw_args
     args = parser.parse_args(argv)
     configure_logging(verbosity=getattr(args, "verbose", 0))
     debug = getattr(args, "debug", False)
