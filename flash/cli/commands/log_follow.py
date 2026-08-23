@@ -16,7 +16,7 @@ import time
 
 from flash.cli.ui import render
 from flash.cli.ui.tty import TtyStatusLine
-from flash.client import ApiError, ClientError, RequestTimeoutError
+from flash.client import ApiError, ClientError, RequestTimeoutError, ServiceUnreachableError
 
 
 class FollowInterrupted(ClientError):
@@ -50,9 +50,12 @@ def _follow_transient_reason(exc: BaseException) -> str | None:
         if exc.status in _FOLLOW_TRANSIENT_STATUSES:
             return f"the service answered HTTP {exc.status}"
         return None
-    if isinstance(exc, ClientError):
-        # unreachable host / DNS / reset: the transport never got a verdict from the plane.
+    if isinstance(exc, ServiceUnreachableError):
+        # the transport never got a verdict from the plane: nobody answered.
         return "the service was unreachable"
+    # a bare `ClientError` is the base class, and the client raises it for permanent conditions
+    # too -- a proxy answering 200 text/html, a body of the wrong shape. Retrying those buries the
+    # message that says how to fix them, so anything not proven transient surfaces now.
     return None
 
 

@@ -36,6 +36,15 @@ class RequestTimeoutError(ClientError):
     """A request timed out before the control plane returned a response."""
 
 
+class ServiceUnreachableError(ClientError):
+    """The transport never reached the control plane (DNS, refused connection, reset).
+
+    Distinct from a plain ``ClientError`` because a caller that retries needs to tell "nobody
+    answered" apart from "something answered and it was not a Flash plane". The second is a
+    permanent misconfiguration -- retrying it only hides the hint that would fix it.
+    """
+
+
 class ApiError(ClientError):
     """A non-2xx response from a Flash/freesolo endpoint.
 
@@ -281,7 +290,7 @@ class ApiClient:
                     f"request to the Flash service at {self.api_url} timed out; "
                     "check your network connection and FLASH_API_URL"
                 ) from exc
-            raise ClientError(
+            raise ServiceUnreachableError(
                 f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
                 "check your network connection and FLASH_API_URL"
             ) from exc

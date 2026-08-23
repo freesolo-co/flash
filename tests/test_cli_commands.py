@@ -5379,3 +5379,64 @@ def test_follow_warns_once_per_outage_not_once_per_attempt(monkeypatch, capsys) 
 
     assert cli.commands._poll_logs(_RepeatFlakyClient(), "flash-noisy", interval=0).state == "done"
     assert capsys.readouterr().err.count("retrying") == 1
+
+
+def test_follow_surfaces_a_wrong_api_url_instead_of_retrying_it(monkeypatch, capsys) -> None:
+    """A proxy answering 200 with a non-JSON body is permanent, not a blip.
+
+    `ClientError` is the base class, so classifying every one of them as transient would retry a
+    wrong `--api-url` for five minutes and bury the hint that says how to fix it -- then claim the
+    run "may still be going and still billing". That is the misleading message this fix exists to
+    remove, so it must not reappear here.
+    """
+    from flash.client.http import _unexpected_response
+
+    class _ProxyClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.log_calls = 0
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            self.log_calls += 1
+            raise _unexpected_response(
+                "https://proxy.example", f"/v1/runs/{run_id}/logs", "returned a non-JSON body"
+            )
+
+        def get_run(self, run_id: str) -> dict:
+            return {"run_id": run_id, "state": "running"}
+
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    client = _ProxyClient()
+
+    with pytest.raises(cli.commands.ClientError) as excinfo:
+        cli.commands._poll_logs(client, "flash-proxy", interval=0)
+
+    assert "Check that --api-url points at your Flash control plane" in str(excinfo.value)
+    assert client.log_calls == 1
+    assert "retrying" not in capsys.readouterr().err
+
+
+def test_follow_retries_a_genuinely_unreachable_service(monkeypatch, capsys) -> None:
+    """Nobody answering IS transient: a plane restart mid-run must not end the follow."""
+    from flash.client.http import ServiceUnreachableError
+
+    class _UnreachableClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.log_calls = 0
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            self.log_calls += 1
+            if self.log_calls == 1:
+                raise ServiceUnreachableError(
+                    "cannot reach the Flash service at https://plane.example (Connection refused)"
+                )
+            return {"run_id": run_id, "logs": "trained\n", "offset": 8, "state": "done"}
+
+        def get_run(self, run_id: str) -> dict:
+            return {"run_id": run_id, "state": "done"}
+
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+
+    assert cli.commands._poll_logs(_UnreachableClient(), "flash-down", interval=0).state == "done"
+    assert "the service was unreachable" in capsys.readouterr().err
