@@ -61,21 +61,30 @@ def _cmd_train_cost(args) -> int:
 
 def _cmd_train_cost_offline(spec) -> int:
     """Catalog-only quote for the algorithms that do not need workload evidence yet (grpo, opd)."""
-    from flash.cost import estimate_cost
+    from dataclasses import replace
 
+    from flash.cost import estimate_cost
+    from flash.schema import MIN_LORA_RANK
+
+    config = runconfig_from_spec(spec)
     if spec.train.init_from_adapter:
-        # --cost is offline/catalog-only and cannot read the source adapter, so the rank stays at the
-        # local default. Warm starts train and are priced at the SOURCE adapter's authoritative rank
-        # (resolved server-side at submit/dry-run), which can be higher — so this estimate may
-        # under-quote. stderr keeps stdout clean for machine-readable callers.
+        # --cost is offline/catalog-only and cannot read the source adapter's rank, and the parser
+        # rejects an authored `lora_rank` alongside `init_from_adapter`, so there is never an
+        # authored rank to quote at. stderr keeps stdout clean for machine-readable callers.
+        #
+        # quote at rank 1 rather than at the serialization placeholder. the placeholder is not a
+        # measurement of anything, and `estimate_cost` reads the rank for both the exact-card fit and
+        # cost-ranked hardware selection. rank 1 is a vram lower bound, but not a dollar lower bound:
+        # a higher source rank can move the run onto a cheaper multi-card shape.
+        config = replace(config, lora_rank=MIN_LORA_RANK)
         print(
-            "warning: warm-start (train.init_from_adapter) cost uses the default LoRA rank; the "
-            "source adapter's rank is authoritative and resolved at submit, so a higher-rank source "
-            f"may cost more than this estimate. Run `{_commands().CLI_NAME} train --dry-run` "
-            "for a source-rank quote.",
+            "warning: warm-start (train.init_from_adapter) cost is a provisional rank-1 estimate. "
+            "The authoritative source adapter rank is resolved server-side and can change the "
+            "selected hardware and cost in either direction. Run "
+            f"`{_commands().CLI_NAME} train --dry-run` for a quote using the resolved source rank.",
             file=sys.stderr,
         )
-    estimate = estimate_cost(runconfig_from_spec(spec))
+    estimate = estimate_cost(config)
     if render.styled():
         print(render.cost_panel(estimate))
     else:
