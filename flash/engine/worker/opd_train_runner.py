@@ -677,6 +677,7 @@ def _build_child_callbacks(
         if not shims_verified:
             _opd_train.verify_applied_shim_markers(shim_markers, expected_shims)
             shims_verified = True
+        progress_state.record_billing_timing(step_number, line)
         # use parse_verl_metric because numpy 2 pprint emits np.float64(...); float() would drop
         # every step and leave a trained run with an empty loss curve.
         loss = _opd_train.parse_verl_metric(line, "actor/distillation/loss")

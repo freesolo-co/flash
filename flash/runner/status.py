@@ -359,11 +359,12 @@ def validate_terminal_source_metrics(
 
 
 def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
-    """Write metrics to results/runpod/<phase>/<run_id> and return the customer training cost.
+    """Write metrics to results/runpod/<phase>/<run_id> and return measured training COGS.
 
     The run id keeps concurrent/sequential runs of the same phase from
-    overwriting each other's artifacts. ``metrics["wall_seconds"]`` is the worker's training-loop
-    wall time; setup/cold-start is reported separately and is not included here."""
+    overwriting each other's artifacts. ``metrics["wall_seconds"]`` remains the worker's full
+    training-loop wall for analytics; customer settlement is quote-based and separately removes the
+    measured framework-init and reward windows. setup/cold-start is reported separately."""
     from flash.engine.result.accounting import sanitize_worker_metrics
 
     metrics = sanitize_worker_metrics(metrics)

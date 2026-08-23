@@ -116,6 +116,9 @@ class _OpdProgressState:
         self._prev_samples_seen = int(state.get("samples_seen", 0))
         self._prev_no_signal_skipped_steps = int(state.get("no_signal_skipped_steps", 0))
         self._train_started_at: float | None = None
+        self._resume_step = int(state.get("opt_steps", len(self.loss_curve)))
+        self.framework_init_seconds: float | None = None
+        self.reward_seconds_by_step: dict[int, float] = {}
         self._step_states: dict[int, dict] = {}
         self._terminal_error: str = ""
         if resume_state is not None:
@@ -123,6 +126,16 @@ class _OpdProgressState:
 
     def start_training(self) -> None:
         self._train_started_at = time.time()
+
+    def record_billing_timing(self, step: int, line: str) -> None:
+        if self.framework_init_seconds is None and self._train_started_at is not None:
+            # opd train_wall starts in start_training, after setup and immediately before the child.
+            # the first parsed optimizer line closes the initialization prefix inside that wall.
+            self.framework_init_seconds = max(0.0, time.time() - self._train_started_at)
+        reward_seconds = parse_verl_metric(line, "timing_s/reward")
+        if reward_seconds is not None and step > self._resume_step:
+            # one value per optimizer step prevents replayed stdout from discounting grading twice.
+            self.reward_seconds_by_step[step] = max(0.0, reward_seconds)
 
     def _train_wall_seconds(self) -> float:
         elapsed = 0.0
@@ -250,6 +263,8 @@ class _OpdProgressState:
         snapshot.update(
             {
                 "train_wall_seconds": self._train_wall_seconds(),
+                "framework_init_seconds": self.framework_init_seconds,
+                "reward_seconds": sum(self.reward_seconds_by_step.values()),
                 "loss_curve": list(self.loss_curve),
                 "coverage_curve": list(self.coverage_curve),
             }
@@ -413,6 +428,8 @@ def run_opd_train(spec=None) -> None:
             setup_seconds=setup_seconds,
             train_tokens=0,
             generated_tokens=int(final_accounting["generated_tokens"]),
+            framework_init_seconds=final_accounting.get("framework_init_seconds"),
+            reward_seconds=float(final_accounting.get("reward_seconds") or 0.0),
             notes={
                 "steps": update_horizon,
                 # optimizer updates that actually produced a distillation loss. record_step enforces loss_curve length == the metric step, and the guard above rejects a curve shorter than final_step, so this is measured, not assumed.

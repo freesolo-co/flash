@@ -337,8 +337,9 @@ def _run_training(
     metrics, verified_attempt = validate_terminal_source_metrics(get_status(spec.run_id), metrics)
     # measured wall x $/hr is recorded in metrics.json for analytics, but is not what we charge.
     measured_cost = prior_cost + _persist_metrics(spec, metrics)
-    # The customer is charged the submit-time QUOTE, not measured wall. Legacy runs without a
-    # persisted quote are re-priced from the spec, falling back only for old/unpriceable records.
+    # Settlement starts from the submit-time QUOTE, not measured wall, then removes measured
+    # framework initialization and reward latency. Runs without a persisted quote are re-priced from
+    # the spec, falling back only for unpriceable records.
     charge_usd = _status_estimated_charge(get_status(spec.run_id), spec, fallback=measured_cost)
     # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
     # Re-read before the terminal "done" so a late worker success doesn't resurrect a cancelled run.

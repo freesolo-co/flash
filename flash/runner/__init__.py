@@ -153,8 +153,8 @@ class RunStatus:
     updated_at: float = field(default_factory=time.time)
     report_sequence: int = 0
     cost_usd: float = 0.0
-    # Submit-time flash.cost quote. Successful runs copy this into cost_usd at completion so the
-    # customer is charged exactly what was estimated before paid work started.
+    # Submit-time flash.cost quote. Successful settlement starts here, then subtracts only measured
+    # framework initialization and reward-function latency from the same accepted rate/card basis.
     estimated_cost_usd: float | None = None
     error: str | None = None
     artifacts_dir: str | None = None

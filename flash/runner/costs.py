@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import math
+import os
 import time
 from dataclasses import replace
 
@@ -289,11 +291,102 @@ def cancelled_charge_usd(
     return min(repriced, quote)
 
 
+def _persisted_training_metrics(spec) -> dict | None:
+    """Read the sanitized worker metrics that _persist_metrics wrote before settlement."""
+    try:
+        with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as handle:
+            metrics = json.load(handle)
+    except (OSError, TypeError, ValueError):
+        return None
+    return metrics if isinstance(metrics, dict) else None
+
+
+def _nonnegative_seconds(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    seconds = float(value)
+    return seconds if math.isfinite(seconds) and seconds > 0.0 else 0.0
+
+
+def _completed_quote_charge(status: RunStatus, spec, quote: float) -> float:
+    """Subtract measured unbillable train-wall seconds from a completed run's accepted quote.
+
+    cancellation does not compose through this helper. it already settles once through
+    cancelled_charge_usd using the completed-work fraction, and cancelled workers need not produce
+    terminal metrics. keeping the paths disjoint avoids applying a second discount or clamp to the
+    partial quote.
+    """
+    metrics = _persisted_training_metrics(spec)
+    if metrics is None:
+        return quote
+    measured_keys = ("framework_init_seconds", "reward_seconds")
+    if not any(metrics.get(key) is not None for key in measured_keys):
+        # no measurement means no adjustment. this is the normal outcome for a worker that died
+        # before terminal metrics and for records written before these measurements existed.
+        return quote
+    step = metrics.get("step")
+    if isinstance(step, (int, float)) and not isinstance(step, bool) and step <= 0:
+        return 0.0
+    excluded_seconds = sum(_nonnegative_seconds(metrics.get(key)) for key in measured_keys)
+    if excluded_seconds <= 0.0:
+        return max(0.0, quote)
+
+    remote = status.remote if isinstance(status.remote, dict) else {}
+    provider, gpu_type, gpu_count = _rented_basis(
+        {
+            "provider": remote.get("provider") or metrics.get("allocated_provider"),
+            "allocated_gpu": remote.get("allocated_gpu") or metrics.get("allocated_gpu"),
+            "allocated_gpu_count": remote.get("allocated_gpu_count")
+            or metrics.get("allocated_gpu_count"),
+        }
+    )
+    if not provider or not gpu_type or gpu_count < 1:
+        # never guess a different shape or substrate: the billed train seconds below are only the
+        # ones the quote paid for on THIS shape. absence preserves the accepted charge exactly.
+        return quote
+    whole_instance_rate = remote.get("hourly_usd")
+    if (
+        isinstance(whole_instance_rate, (int, float))
+        and not isinstance(whole_instance_rate, bool)
+        and math.isfinite(float(whole_instance_rate))
+        and float(whole_instance_rate) >= 0.0
+    ):
+        # the handle carries the live rate the quote was REBUILT from: seed submission replaces the
+        # provisional offline quote with `estimate_for_spec(..., hourly_usd=chosen.hourly_usd)`
+        # before provisioning. on vast/lambda that rate differs materially from the static table
+        # (the same trap cancelled_charge_usd documents), so it is the only coherent basis here.
+        # convert to per-card; multiplying by gpu_count below restores the whole-box basis.
+        rate = float(whole_instance_rate) / gpu_count
+    else:
+        allocation = _pinned_offline_allocation(provider, gpu_type, gpu_count)
+        if allocation is None:
+            return quote
+        try:
+            from flash.cost.spec import estimate_for_spec
+
+            basis = estimate_for_spec(spec, allocation=allocation)
+            quoted_count = int(basis.gpu_count)
+            train_seconds = float(basis.train_seconds)
+        except Exception:
+            return quote
+        if quoted_count != gpu_count or not math.isfinite(train_seconds) or train_seconds <= 0.0:
+            return quote
+        # a runpod handle persists no rate. the quote is `train_seconds / 3600 * hourly * count`
+        # (analytical.estimate_cost), so inverting it recovers the per-card rate the customer
+        # actually accepted -- strictly better than reading a static table that may have moved
+        # since, which could discount at a rate the quote never used.
+        rate = quote * 3600.0 / (train_seconds * gpu_count)
+    if not math.isfinite(rate) or rate < 0.0:
+        return quote
+    adjustment = excluded_seconds / 3600.0 * rate * gpu_count
+    return max(0.0, min(quote, quote - adjustment))
+
+
 def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
     quote = getattr(status, "estimated_cost_usd", None)
-    if quote is not None:
-        return float(quote)
-    return runner.charge_usd_for_spec(spec, fallback=fallback)
+    if quote is None:
+        quote = runner.charge_usd_for_spec(spec, fallback=fallback)
+    return _completed_quote_charge(status, spec, float(quote))
 
 
 def actual_steps_run(status: RunStatus) -> int:

@@ -1,5 +1,6 @@
 import json
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,8 +10,64 @@ from flash.engine.worker.rl_train_runner import _ingest_step_metrics, _StepMetri
 from flash.engine.worker.train.core.step_timing import StepTiming
 
 
-def _line(step: int, duration: float, *, reward: float = 0.4) -> str:
-    return f"step:{step} - critic/rewards/mean:{reward} - timing_s/step:{duration}"
+def _line(
+    step: int, duration: float, *, reward: float = 0.4, reward_seconds: float | None = None
+) -> str:
+    timing = f" - timing_s/reward:{reward_seconds}" if reward_seconds is not None else ""
+    return f"step:{step} - critic/rewards/mean:{reward} - timing_s/step:{duration}{timing}"
+
+
+def test_grpo_records_first_step_init_and_sums_reward_latency(monkeypatch) -> None:
+    state = _StepMetricState(train_started_at=100.0, sent_first_metrics=True)
+    inp = {"max_completion": 512, "steps": 3}
+    monkeypatch.setattr(rl_train_runner.time, "time", lambda: 112.0)
+
+    _ingest_step_metrics(_line(1, 50.0, reward_seconds=2.5), inp, state, dict)
+    _ingest_step_metrics(_line(1, 50.0, reward_seconds=2.5), inp, state, dict)
+    _ingest_step_metrics(_line(2, 40.0, reward_seconds=0.0), inp, state, dict)
+    _ingest_step_metrics(_line(3, 35.0), inp, state, dict)
+
+    assert state.framework_init_seconds == 12.0
+    assert state.reward_seconds == 2.5
+
+
+def test_sft_records_init_from_its_child_invocation_boundary(monkeypatch) -> None:
+    from flash.engine.worker import sft_train, sft_train_runner
+
+    progress = SimpleNamespace(
+        loraplus_applied=True,
+        wandb_link={},
+        expected_shims=(),
+        shims_verified=True,
+        framework_init_seconds=None,
+    )
+    monkeypatch.setattr(sft_train_runner.time, "time", lambda: 215.0)
+
+    assert sft_train._consume_sft_marker_line(
+        progress,
+        "step:1 - train/loss:0.5",
+        train_started_at=200.0,
+    )
+    assert progress.framework_init_seconds == 15.0
+
+
+def test_opd_records_init_and_reward_from_its_progress_wall(monkeypatch) -> None:
+    from flash.engine.worker import opd_train
+
+    now = iter((300.0, 318.0, 325.0))
+    monkeypatch.setattr(opd_train.time, "time", lambda: next(now))
+    state = opd_train._OpdProgressState()
+    state.start_training()
+
+    state.record_billing_timing(1, "step:1 - timing_s/reward:4.0")
+    state.record_billing_timing(2, "step:2 - timing_s/reward:1.5")
+    state.record_billing_timing(3, "step:3 - actor/distillation/loss:0.2")
+    final = state.final_state(SimpleNamespace(accounting_snapshot=dict))
+
+    assert state.framework_init_seconds == 18.0
+    assert sum(state.reward_seconds_by_step.values()) == 5.5
+    assert final["framework_init_seconds"] == 18.0
+    assert final["reward_seconds"] == 5.5
 
 
 def test_warmup_is_excluded_and_incident_projects_steady_pace() -> None:

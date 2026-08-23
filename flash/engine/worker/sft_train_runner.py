@@ -145,6 +145,7 @@ class _SftProgress:
     shim_markers: str = ""
     expected_shims: tuple[str, ...] = ()
     shims_verified: bool = False
+    framework_init_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -806,7 +807,7 @@ def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_lin
     )
 
 
-def _consume_sft_marker_line(progress: _SftProgress, line: str) -> bool:
+def _consume_sft_marker_line(progress: _SftProgress, line: str, *, train_started_at: float) -> bool:
     """Fold a child log line's non-metric markers in; answer whether it is an optimizer step.
 
     False means the caller has nothing further to do with the line. A True answer additionally
@@ -820,6 +821,10 @@ def _consume_sft_marker_line(progress: _SftProgress, line: str) -> bool:
         progress.wandb_link.update(link)
     if _sft_train.verl_step_number(line) is None:
         return False
+    if progress.framework_init_seconds is None:
+        # train_wall starts immediately before the child invocation. the first parsed optimizer step
+        # therefore closes exactly the framework/model/fsdp initialization block inside that wall.
+        progress.framework_init_seconds = max(0.0, time.time() - train_started_at)
     # the marker set first: a skipped sitecustomize also loses the lora+ shim, and "no fragment
     # ran at all" is the root cause worth reporting over its lora+ symptom.
     if progress.expected_shims and not progress.shims_verified:
