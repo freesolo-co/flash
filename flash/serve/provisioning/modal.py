@@ -325,7 +325,18 @@ def reconcile_modal_deployment(
             sleep=sleep,
         )
         if proof is None:
-            return unknown_result(finalized_plan)
+            # the probe never converged, but the resources observed above are live and billing.
+            # report them so a teardown has ids to target. a phase mismatch here is not fatal on
+            # its own: an unnamed ambiguous result is still better than losing the outcome.
+            try:
+                handle = _observed_modal_handle(bootstrap_plan, finalized_plan, initial)
+            except ModalResourceConflict:
+                handle = None
+            return unknown_result(
+                finalized_plan,
+                reason="readiness_deadline_unproven",
+                handle=handle,
+            )
         return DeploymentResult.from_spec(bundle.spec, status="ready", handle=proof.handle)
     except ModalResourceConflict:
         return failure_result(finalized_plan, LifecycleFailure("conflict"))

@@ -1436,6 +1436,32 @@ def test_tokenless_reconcile_returns_observed_modal_handle() -> None:
     assert all(name == "observe" for name, _value in sdk.calls)
 
 
+def test_unproven_readiness_reconcile_returns_observed_modal_handle() -> None:
+    # the tokenless path above already reports its ids. this is the same deployment with a key,
+    # where the probe never accepts: the app, volume, and secret are equally live and billing, so
+    # losing the handle here would leave an operator with nothing to name in a teardown.
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+    sdk = _FakeSdk(plan)
+    handle = _seed_exact(sdk)
+    clock = _Clock()
+
+    result = reconcile_modal_deployment(
+        bundle,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=100.0,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
+        probe=_Probe(False),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert result.handle == handle
+    assert result.error_reason == "readiness_deadline_unproven"
+
+
 def test_artifact_cleanup_rejection_reports_the_live_modal_app() -> None:
     bundle = _bundle()
     factory = _Factory()
