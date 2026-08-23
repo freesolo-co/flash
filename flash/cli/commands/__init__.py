@@ -12,8 +12,19 @@ from typing import NamedTuple
 from flash import __version__
 from flash._internal.channel import BRAND_NAME, CLI_NAME
 from flash._internal.logging import get_logger
+
+# the follow loops below stay here; what a transient failure IS, and how long to tolerate one,
+# lives in `log_follow` so this module does not carry the classification too.
+from flash.cli.commands.log_follow import (
+    FollowInterrupted,
+    _follow_transient_reason,
+    _FollowRetry,
+    _log_follow_metric_rows,
+    _LogFollowSpinner,
+    _sleep_with_spinner,
+    _warn_follow_retry,
+)
 from flash.cli.ui import render
-from flash.cli.ui.tty import TtyStatusLine
 from flash.client import (
     ApiClient,
     ClientError,
@@ -54,36 +65,6 @@ _USER_ERRORS = (
 
 _CLI_DONE_STATES = TERMINAL_STATES | {"deployed"}
 _OK_STATES = {"done", "dry_run", "deployed"}
-_SPINNER_FRAMES = "|/-\\"
-_SPINNER_TICK_SECONDS = 0.1
-
-
-class _LogFollowSpinner(TtyStatusLine):
-    def __init__(self, run_id: str):
-        super().__init__()
-        self._run_id = run_id
-        self._frame = 0
-
-    def render(self, progress: str) -> None:
-        if not self._enabled:
-            return
-        frame = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]
-        self._frame += 1
-        message = f"{frame} following logs for {self._run_id} ({progress})"
-        self._write(message)
-
-
-def _sleep_with_spinner(interval: float, spinner: _LogFollowSpinner, progress: str) -> None:
-    if interval <= 0:
-        return
-    if not spinner.enabled:
-        time.sleep(interval)
-        return
-    ticks = max(1, int(interval / _SPINNER_TICK_SECONDS))
-    sleep_for = interval / ticks
-    for _ in range(ticks):
-        spinner.render(progress)
-        time.sleep(sleep_for)
 
 
 def cmd_version(args) -> int:
@@ -548,60 +529,6 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     return state, " ".join(parts)
 
 
-_FOLLOW_METRIC_FIELDS = (
-    ("reward", "reward"),
-    ("reward_std", "reward_std"),
-    ("grad_norm", "grad_norm"),
-    ("kl", "kl"),
-    ("entropy", "entropy"),
-    ("frac_reward_zero_std", "frac_zero_std"),
-    ("mean_completion_tokens", "comp_len"),
-    ("truncation_rate", "trunc"),
-    ("discarded_rollouts", "discarded"),
-    ("max_completion_tokens", "max_comp_tokens"),
-)
-
-
-def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
-    """Return unseen heartbeat-backed RL metric rows, deduplicated by attempt and optimizer step."""
-    heartbeat = (status or {}).get("last_heartbeat")
-    if not isinstance(heartbeat, dict):
-        return []
-    # during a retry, status.remote.attempt can already point at the replacement worker while
-    # last_heartbeat still belongs to the prior attempt; don't render that stale attempt's rows
-    if not render.heartbeat_is_current_attempt(status, heartbeat):
-        return []
-    metrics_last = heartbeat.get("metrics_last")
-    if not isinstance(metrics_last, list):
-        return []
-    rows = []
-    attempt = heartbeat.get("attempt")
-    for metrics in metrics_last:
-        if not isinstance(metrics, dict):
-            continue
-        step = metrics.get("step")
-        if step is None:
-            continue
-        try:
-            step_key = int(step)
-        except (TypeError, ValueError):
-            step_key = str(step)
-        metric_key = (attempt, step_key)
-        if metric_key in seen_steps:
-            continue
-        seen_steps.add(metric_key)
-        parts = [f"step={step_key}"]
-        for key, label in _FOLLOW_METRIC_FIELDS:
-            value = metrics.get(key)
-            if value is None:
-                continue
-            if isinstance(value, float):
-                value = f"{value:.6g}"
-            parts.append(f"{label}={value}")
-        rows.append(" ".join(parts))
-    return rows
-
-
 class _LogPollResult(NamedTuple):
     state: str
     printed_any: bool
@@ -618,18 +545,31 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> _LogPollResul
     last_progress: str | None = None
     seen_metric_steps: set = set()
     spinner = _LogFollowSpinner(run_id)
+    retry = _FollowRetry(run_id)
     try:
         while True:
-            page = client.get_logs(run_id, offset=offset)
+            # A blip on either endpoint is the plane, not the run: the run keeps training and keeps
+            # billing regardless. Retry both under one budget and keep the loop's place, so a 502
+            # storm costs the stream a pause rather than the whole follow.
+            try:
+                page = client.get_logs(run_id, offset=offset)
+                # The log file can lag worker heartbeat/status updates, so lifecycle/progress must
+                # come from the run status endpoint. The log page's embedded state is only a
+                # fallback for older servers or test doubles.
+                status = client.get_run(run_id)
+            # broad by design: `note_failure` re-raises anything it cannot prove transient, so
+            # the classification lives in one place rather than three except clauses.
+            except Exception as exc:
+                delay, reason = retry.note_failure(exc)
+                _warn_follow_retry(spinner, run_id, reason, retry)
+                _sleep_with_spinner(delay, spinner, "reconnecting")
+                continue
+            retry.reset()
             if page["logs"]:
                 spinner.clear()
                 print(page["logs"], end="", flush=True)
                 printed_any = True
             offset = page["offset"]
-            # The log file can lag worker heartbeat/status updates, so lifecycle/progress must come
-            # from the run status endpoint. The log page's embedded state is only a fallback for
-            # older servers or test doubles.
-            status = client.get_run(run_id)
             attempt = live_attempt_of(status) if isinstance(status, dict) else attempt
             state, progress = _log_follow_progress(status, str(page.get("state") or ""))
             metric_rows = _log_follow_metric_rows(status, seen_metric_steps)
@@ -665,24 +605,30 @@ def _render_status(status: dict, *, force_json: bool = False, one_line: bool = F
     )
 
 
-def _print_detached_note(run_id: str) -> None:
-    """Say what ctrl-c actually did: detached the stream, left the paid run running.
+def _print_still_running_note(run_id: str, headline: str) -> None:
+    """Say the stream ended and the paid run did not, then name both commands that act on it.
 
-    The generic handler prints "aborted", which reads as "the run stopped". It did not, so the
-    next thing a user does is re-run `flash train` and pay for a duplicate. Name the run and both
-    commands that act on it.
+    Every way of losing the stream -- ctrl-c, a dead plane -- reports through here, because they
+    share the failure that matters: the user reads "the run stopped", re-runs `flash train`, and
+    pays for a duplicate. What differs is only the first line.
     """
-    detached = f"detached from {run_id}; the run is still going and still billing"
     resume = f"resume with `{CLI_NAME} runs log {run_id} --follow`"
     stop = f"stop it with `{CLI_NAME} runs cancel {run_id}`"
     if render.styled():
-        print(render.warn(detached), file=sys.stderr)
+        print(render.warn(headline), file=sys.stderr)
         print(render.arrow(resume), file=sys.stderr)
         print(render.arrow(stop), file=sys.stderr)
     else:
-        print(f"warning: {detached}", file=sys.stderr)
+        print(f"warning: {headline}", file=sys.stderr)
         print(f"note: {resume}", file=sys.stderr)
         print(f"note: {stop}", file=sys.stderr)
+
+
+def _print_detached_note(run_id: str) -> None:
+    """Say what ctrl-c actually did: detached the stream, left the paid run running."""
+    _print_still_running_note(
+        run_id, f"detached from {run_id}; the run is still going and still billing"
+    )
 
 
 def _follow_run(client: ApiClient, run_id: str) -> int:
@@ -692,7 +638,21 @@ def _follow_run(client: ApiClient, run_id: str) -> int:
     except KeyboardInterrupt:
         _print_detached_note(run_id)
         return 130
-    print(_render_status(client.get_run(run_id)))
+    except FollowInterrupted as exc:
+        # The submit succeeded -- this run exists and is training on a GPU. Surfacing the transport
+        # error alone reads as "the submit failed", and the user's next move is to submit again and
+        # pay for both. Name the run instead, the same way ctrl-c does.
+        _print_still_running_note(run_id, f"{exc}; {run_id} is still going and still billing")
+        return 1
+    try:
+        print(_render_status(client.get_run(run_id)))
+    except Exception as exc:
+        # The run already reached a terminal state; `result.state` is that answer. Only the final
+        # render was lost, so print what is known instead of turning a finished run into an error.
+        if _follow_transient_reason(exc) is None:
+            raise
+        print(f"warning: could not fetch the final status ({exc})", file=sys.stderr)
+        print(f"note: read it with `{CLI_NAME} runs status {run_id}`", file=sys.stderr)
     return 0 if result.state in _OK_STATES else 1
 
 
@@ -701,9 +661,18 @@ def _follow_status(
 ) -> int:
     """Poll run status until terminal, without replaying worker logs."""
     last_rendered: str | None = None
+    retry = _FollowRetry(run_id)
     try:
         while True:
-            status = client.get_run(run_id)
+            try:
+                status = client.get_run(run_id)
+            # broad by design: see `_poll_logs` -- `note_failure` re-raises a real answer.
+            except Exception as exc:
+                delay, reason = retry.note_failure(exc)
+                _warn_follow_retry(None, run_id, reason, retry)
+                time.sleep(delay)
+                continue
+            retry.reset()
             rendered = _render_status(status, force_json=force_json, one_line=force_json)
             if rendered != last_rendered:
                 print(rendered)
@@ -715,6 +684,9 @@ def _follow_status(
     except KeyboardInterrupt:
         _print_detached_note(run_id)
         return 130
+    except FollowInterrupted as exc:
+        _print_still_running_note(run_id, f"{exc}; {run_id} may still be going and still billing")
+        return 1
 
 
 def cmd_log(args) -> int:
@@ -725,6 +697,11 @@ def cmd_log(args) -> int:
         except KeyboardInterrupt:
             _print_detached_note(args.run_id)
             return 130
+        except FollowInterrupted as exc:
+            _print_still_running_note(
+                args.run_id, f"{exc}; {args.run_id} may still be going and still billing"
+            )
+            return 1
         sections = _worker_sections(client, args.run_id)
         _print_worker_output(
             sections,

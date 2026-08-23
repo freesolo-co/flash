@@ -5185,3 +5185,194 @@ def test_unreachable_backend_error_does_not_echo_credentials_from_the_base_url(m
         verify_freesolo_key("fs-key")
     assert "api.example.co" in str(exc.value)
     assert "hunter2" not in str(exc.value)
+
+
+def test_follow_survives_a_transient_502_instead_of_reporting_a_failed_submit(
+    monkeypatch, capsys
+) -> None:
+    """The reported bug: one 502 on the polling endpoints aborted the whole follow.
+
+    `flash train` submits, then follows. The run existed and trained to completion, but the
+    CLI exited nonzero with a bare 502, which reads as "the submit failed" -- so the user
+    submits again and pays for two GPUs.
+    """
+
+    class _FlakyClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.log_calls = 0
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            self.log_calls += 1
+            if self.log_calls == 1:
+                raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+            return {"run_id": run_id, "logs": "trained\n", "offset": 8, "state": "done"}
+
+        def get_run(self, run_id: str) -> dict:
+            return {"run_id": run_id, "state": "done"}
+
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    client = _FlakyClient()
+
+    assert cli.commands._follow_run(client, "flash-502") == 0
+
+    captured = capsys.readouterr()
+    assert "trained" in captured.out
+    # the retry is announced, so a paused stream does not read as a stalled run.
+    assert "retrying" in captured.err
+    assert "the run is unaffected" in captured.err
+
+
+def test_follow_does_not_reprint_the_log_page_it_retried(monkeypatch, capsys) -> None:
+    """A retry must resume at the same offset, not replay bytes already on screen.
+
+    `get_run` fails after `get_logs` already returned a page. If the retry advanced the offset
+    or re-emitted that page, the user sees the same worker output twice.
+    """
+
+    class _StatusFlakyClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.offsets: list[int] = []
+            self.run_calls = 0
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            self.offsets.append(offset)
+            if offset == 0:
+                return {"run_id": run_id, "logs": "step 1\n", "offset": 7, "state": "running"}
+            return {"run_id": run_id, "logs": "", "offset": offset, "state": "done"}
+
+        def get_run(self, run_id: str) -> dict:
+            self.run_calls += 1
+            if self.run_calls == 1:
+                raise cli.commands.ApiError(503, "HTTP Error 503: Service Unavailable")
+            return {"run_id": run_id, "state": "running" if self.run_calls == 2 else "done"}
+
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    client = _StatusFlakyClient()
+
+    result = cli.commands._poll_logs(client, "flash-offset", interval=0)
+
+    assert result.state == "done"
+    assert capsys.readouterr().out.count("step 1") == 1
+    # the failed round re-reads offset 0; it advances only once the pair of calls both land.
+    assert client.offsets == [0, 0, 7]
+
+
+def test_follow_gives_up_after_the_retry_window_and_names_the_run(monkeypatch, capsys) -> None:
+    """A genuinely dead plane must still end -- naming the run, never as a failed submit."""
+
+    class _DeadClient(_FakeClient):
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+
+        def get_run(self, run_id: str) -> dict:
+            raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+
+    clock = iter([0.0] + [1000.0] * 20)
+    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+
+    assert cli.commands._follow_run(_DeadClient(), "flash-dead") == 1
+
+    err = capsys.readouterr().err
+    assert "still going and still billing" in err
+    # both recovery commands, so the next move is never a duplicate submit.
+    assert "runs log flash-dead --follow" in err
+    assert "runs cancel flash-dead" in err
+
+
+def test_follow_surfaces_a_client_error_immediately_without_retrying(monkeypatch) -> None:
+    """A 4xx is a real answer about this request, not a blip. Retrying it just delays the truth."""
+
+    class _UnauthorizedClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.log_calls = 0
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            self.log_calls += 1
+            raise cli.commands.ApiError(401, "invalid or missing API key")
+
+        def get_run(self, run_id: str) -> dict:
+            return {"run_id": run_id, "state": "running"}
+
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    client = _UnauthorizedClient()
+
+    with pytest.raises(cli.commands.ApiError) as excinfo:
+        cli.commands._poll_logs(client, "flash-401", interval=0)
+
+    assert excinfo.value.status == 401
+    assert client.log_calls == 1
+
+
+def test_status_follow_survives_a_transient_502(monkeypatch, capsys) -> None:
+    """`runs status --follow` polls the same endpoint and froze the same way."""
+
+    class _FlakyStatusClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def get_run(self, run_id: str) -> dict:
+            self.calls += 1
+            if self.calls == 1:
+                raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+            return {"run_id": run_id, "state": "done"}
+
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+
+    assert cli.commands._follow_status(_FlakyStatusClient(), "flash-st", interval=0) == 0
+    assert "done" in capsys.readouterr().out
+
+
+def test_follow_reports_a_finished_run_even_if_the_final_status_fetch_blips(
+    monkeypatch, capsys
+) -> None:
+    """The poll already returned the terminal state; a blip on the last render is not a failure."""
+
+    class _FinalBlipClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.run_calls = 0
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            return {"run_id": run_id, "logs": "", "offset": 0, "state": "done"}
+
+        def get_run(self, run_id: str) -> dict:
+            self.run_calls += 1
+            if self.run_calls == 1:
+                return {"run_id": run_id, "state": "done"}
+            raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+
+    assert cli.commands._follow_run(_FinalBlipClient(), "flash-final") == 0
+
+    err = capsys.readouterr().err
+    assert "could not fetch the final status" in err
+    assert "runs status flash-final" in err
+
+
+def test_follow_warns_once_per_outage_not_once_per_attempt(monkeypatch, capsys) -> None:
+    """A five-minute outage must not bury the logs already printed under identical warnings."""
+
+    class _RepeatFlakyClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.log_calls = 0
+
+        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+            self.log_calls += 1
+            if self.log_calls <= 3:
+                raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+            return {"run_id": run_id, "logs": "", "offset": 0, "state": "done"}
+
+        def get_run(self, run_id: str) -> dict:
+            return {"run_id": run_id, "state": "done"}
+
+    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+
+    assert cli.commands._poll_logs(_RepeatFlakyClient(), "flash-noisy", interval=0).state == "done"
+    assert capsys.readouterr().err.count("retrying") == 1
