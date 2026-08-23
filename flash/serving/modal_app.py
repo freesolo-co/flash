@@ -27,18 +27,22 @@ REPO_DIR = SERVING_DIR.parent.parent
 _ALLOWED_SERVING_DEPLOYMENT_MODES = frozenset({"production", "development"})
 _requested_deployment_mode = os.environ.get("SERVING_DEPLOYMENT_MODE", "").strip()
 SERVING_DEPLOYMENT_MODE = _requested_deployment_mode or "production"
-if SERVING_DEPLOYMENT_MODE not in _ALLOWED_SERVING_DEPLOYMENT_MODES:
-    raise ValueError(
-        "SERVING_DEPLOYMENT_MODE must be 'production' or 'development', "
-        f"not {SERVING_DEPLOYMENT_MODE!r}"
-    )
 MODAL_ENVIRONMENT = str(modal.config.config.get("environment") or "").strip()
-if SERVING_DEPLOYMENT_MODE == "development" and MODAL_ENVIRONMENT != "dev":
-    raise ValueError("development serving must target Modal environment 'dev'")
-if SERVING_DEPLOYMENT_MODE == "production" and MODAL_ENVIRONMENT == "dev":
-    raise ValueError("production serving must not target Modal environment 'dev'")
-if load_dotenv is not None and SERVING_DEPLOYMENT_MODE == "production":
-    load_dotenv(REPO_DIR / ".env")
+# modal imports this module in every runtime container; only the local deploy process can be
+# mis-targeted or load deployment wiring.
+_is_deploy_process = modal.is_local()
+if _is_deploy_process:
+    if SERVING_DEPLOYMENT_MODE not in _ALLOWED_SERVING_DEPLOYMENT_MODES:
+        raise ValueError(
+            "SERVING_DEPLOYMENT_MODE must be 'production' or 'development', "
+            f"not {SERVING_DEPLOYMENT_MODE!r}"
+        )
+    if SERVING_DEPLOYMENT_MODE == "development" and MODAL_ENVIRONMENT != "dev":
+        raise ValueError("development serving must target Modal environment 'dev'")
+    if SERVING_DEPLOYMENT_MODE == "production" and MODAL_ENVIRONMENT == "dev":
+        raise ValueError("production serving must not target Modal environment 'dev'")
+    if load_dotenv is not None and SERVING_DEPLOYMENT_MODE == "production":
+        load_dotenv(REPO_DIR / ".env")
 
 APP_NAME = "freesolo-lora-serving"  # hardcoded; no deploy-time knob
 _USAGE_REPORT_RETRY_DELAYS_SECONDS = (0.1, 0.25, 0.5)
@@ -48,37 +52,38 @@ _USAGE_REPORT_RETRY_DELAYS_SECONDS = (0.1, 0.25, 0.5)
 # development deployment fails closed on its isolated public domain.
 _DEVELOPMENT_SERVING_DOMAIN = "serve-dev.freesolo.co"
 SERVING_CUSTOM_DOMAIN = os.environ.get("SERVING_CUSTOM_DOMAIN", "").strip()
-if (
-    SERVING_DEPLOYMENT_MODE == "development"
-    and SERVING_CUSTOM_DOMAIN != _DEVELOPMENT_SERVING_DOMAIN
-):
-    raise ValueError(f"development SERVING_CUSTOM_DOMAIN must be {_DEVELOPMENT_SERVING_DOMAIN}")
-if SERVING_DEPLOYMENT_MODE == "development":
-    required = (
-        "FREESOLO_INTERNAL_KEY",
-        "PLATFORM_BACKEND_URL",
-        "SUPABASE_PROJECT_REF",
-        "SUPABASE_PROJECT_REF_DEV",
-        "SUPABASE_URL",
-        "SUPABASE_SERVICE_ROLE_KEY",
-    )
-    missing = [name for name in required if not os.environ.get(name, "").strip()]
-    if not os.environ.get("HF_TOKEN", "").strip():
-        missing.append("HF_TOKEN")
-    if missing:
-        raise ValueError(
-            "development serving requires explicit environment wiring: " + ", ".join(missing)
+if _is_deploy_process:
+    if (
+        SERVING_DEPLOYMENT_MODE == "development"
+        and SERVING_CUSTOM_DOMAIN != _DEVELOPMENT_SERVING_DOMAIN
+    ):
+        raise ValueError(f"development SERVING_CUSTOM_DOMAIN must be {_DEVELOPMENT_SERVING_DOMAIN}")
+    if SERVING_DEPLOYMENT_MODE == "development":
+        required = (
+            "FREESOLO_INTERNAL_KEY",
+            "PLATFORM_BACKEND_URL",
+            "SUPABASE_PROJECT_REF",
+            "SUPABASE_PROJECT_REF_DEV",
+            "SUPABASE_URL",
+            "SUPABASE_SERVICE_ROLE_KEY",
         )
-    backend_url = os.environ.get("PLATFORM_BACKEND_URL", "").strip().rstrip("/")
-    if backend_url != "https://api-dev.freesolo.co":
-        raise ValueError("development PLATFORM_BACKEND_URL must be https://api-dev.freesolo.co")
-    production_ref = os.environ["SUPABASE_PROJECT_REF"].strip()
-    dev_ref = os.environ["SUPABASE_PROJECT_REF_DEV"].strip()
-    if production_ref == dev_ref:
-        raise ValueError("production and development Supabase project refs must differ")
-    expected_supabase_url = f"https://{dev_ref}.supabase.co"
-    if os.environ["SUPABASE_URL"].strip().rstrip("/") != expected_supabase_url:
-        raise ValueError("development SUPABASE_URL must match SUPABASE_PROJECT_REF_DEV")
+        missing = [name for name in required if not os.environ.get(name, "").strip()]
+        if not os.environ.get("HF_TOKEN", "").strip():
+            missing.append("HF_TOKEN")
+        if missing:
+            raise ValueError(
+                "development serving requires explicit environment wiring: " + ", ".join(missing)
+            )
+        backend_url = os.environ.get("PLATFORM_BACKEND_URL", "").strip().rstrip("/")
+        if backend_url != "https://api-dev.freesolo.co":
+            raise ValueError("development PLATFORM_BACKEND_URL must be https://api-dev.freesolo.co")
+        production_ref = os.environ["SUPABASE_PROJECT_REF"].strip()
+        dev_ref = os.environ["SUPABASE_PROJECT_REF_DEV"].strip()
+        if production_ref == dev_ref:
+            raise ValueError("production and development Supabase project refs must differ")
+        expected_supabase_url = f"https://{dev_ref}.supabase.co"
+        if os.environ["SUPABASE_URL"].strip().rstrip("/") != expected_supabase_url:
+            raise ValueError("development SUPABASE_URL must match SUPABASE_PROJECT_REF_DEV")
 HF_CACHE_VOLUME_NAME = "freesolo-lora-serving-hf-cache"
 HOSTING_CACHE_MOUNT = "/vol/hosting-cache"
 
