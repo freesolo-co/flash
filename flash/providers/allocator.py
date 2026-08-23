@@ -34,6 +34,7 @@ from flash.providers.base import (
     smallest_fitting_gpu_count,
     wider_shape_remedy,
 )
+from flash.providers.capacity_experience import read_capacity_experience, recent_capacity_refusals
 from flash.providers.fit_errors import (
     batch_bound_width_note,
     catalog_check_hint,
@@ -928,27 +929,30 @@ def allocate(
         model_id, algorithm, train, thinking, model_revision, overrides
     )
     provider_rank = {name: rank for rank, name in enumerate(providers)}
+    recent_refusals = recent_capacity_refusals(read_capacity_experience())
     return _cheapest_allocation(
         candidates,
         need=need,
         cost_per_step=cost_per_step,
         provider_rank=provider_rank,
+        recent_refusals=recent_refusals,
     )
 
 
 def _cheapest_allocation(
-    candidates, *, need: float, cost_per_step, provider_rank: dict[str, int]
+    candidates, *, need: float, cost_per_step, provider_rank: dict[str, int], recent_refusals
 ) -> Allocation:
     """The cheapest-JOB shape from a non-empty fitting set, plus the full ranking behind it.
 
     Cheapest job, not cheapest rental: rank on the dollars one step costs on each candidate (rate x
     how long that hardware takes), so a faster card wins whenever it finishes enough sooner to pay
-    for itself. An authored provider preference ranks ahead of every cost key; unnamed providers
-    share the final rank, so they remain eligible and retain their relative cost order. Within one
-    provider rank, ties prefer fewer cards (less inter-card overhead), then combined VRAM, then class
-    name. Sorting is stable, so provider and provider-local order apply only when every explicit key
-    matches. A run the cost model cannot price (``cost_per_step`` is ``None``) falls back to total
-    $/hr.
+    for itself. An authored provider preference ranks ahead of every other key; unnamed providers
+    share the final rank, so they remain eligible. Within one provider rank, a coarse experience tier
+    puts shapes that refused in the last twenty minutes after shapes with no recent refusal, then cost
+    order resumes. Keeping experience binary prevents a hint from silently outweighing cost differences
+    inside either tier. Ties prefer fewer cards, then combined VRAM, then class name. Sorting is stable,
+    so provider and provider-local order apply only when every explicit key matches. A run the cost
+    model cannot price (``cost_per_step`` is ``None``) falls back to total $/hr.
     """
     primary = cost_per_step if cost_per_step is not None else (lambda c: c.total_hourly_usd)
     unnamed_rank = len(provider_rank)
@@ -956,6 +960,7 @@ def _cheapest_allocation(
         candidates,
         key=lambda c: (
             provider_rank.get(c.provider, unnamed_rank),
+            (c.provider, c.gpu, c.gpu_count) in recent_refusals,
             primary(c),
             c.total_hourly_usd,
             c.gpu_count,
@@ -963,6 +968,12 @@ def _cheapest_allocation(
             c.gpu,
         ),
     )
+    demoted = [c for c in candidates if (c.provider, c.gpu, c.gpu_count) in recent_refusals]
+    if demoted:
+        logger.info(
+            "capacity experience deprioritized recently refused shape(s): %s",
+            ", ".join(f"{c.gpu_count}x {c.gpu}@{c.provider}" for c in demoted),
+        )
     best = ranked[0]
     return Allocation(
         provider=best.provider,

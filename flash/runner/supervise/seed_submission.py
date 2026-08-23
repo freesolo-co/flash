@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
+from flash.providers import capacity_experience as _capacity_experience
 from flash.runner.supervise import lifecycle as _lifecycle
 from flash.runner.supervise.retry_decision import (
     _EXHAUSTED_CAPACITY_ACTION,
@@ -797,9 +798,20 @@ def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOut
     )
 
 
+def _record_capacity_observation(record, shape) -> None:
+    # the durable ledger is only an allocation hint. a write failure must never change run outcome.
+    with contextlib.suppress(Exception):
+        record(shape)
+
+
 def _return_success_metrics(ctx: _SubmitContext, outcome: _AttemptOutcome) -> dict:
     # a late worker success must not resurrect a cancelled run.
     ctx.raise_if_cancelled()
+    if outcome.chosen is not None:
+        _record_capacity_observation(
+            _capacity_experience.record_capacity_success,
+            _lifecycle._shape_key(outcome.chosen),
+        )
     ctx.gc_seen_endpoints()
     metrics = outcome.result.metrics
     if outcome.chosen is not None and isinstance(metrics, dict):
@@ -838,7 +850,12 @@ def _handle_failure(
         # these outcomes happen after the class admitted the run, so an older no-capacity refusal no
         # longer describes the current market. poll_error stays ambiguous because submit and lookup
         # failures can happen before any capacity was granted.
-        ctx.capacity_refusals.pop(_lifecycle._shape_key(outcome.chosen), None)
+        admitted_shape = _lifecycle._shape_key(outcome.chosen)
+        ctx.capacity_refusals.pop(admitted_shape, None)
+        _record_capacity_observation(
+            _capacity_experience.record_capacity_success,
+            admitted_shape,
+        )
     oom_shaped = result.failure == "oom"
     if oom_shaped and outcome.chosen is not None:
         # same measure the filter compares against, see _candidate_usable_vram_gb
@@ -876,6 +893,10 @@ def _handle_failure(
         refused_key = _capacity_refusal_key(ctx, outcome)
         if refused_key is not None:
             ctx.capacity_refusals[refused_key] = ctx.capacity_refusals.get(refused_key, 0) + 1
+            _record_capacity_observation(
+                _capacity_experience.record_capacity_refusal,
+                refused_key,
+            )
     retry_target = _retry_target(
         ctx,
         outcome,

@@ -2853,11 +2853,23 @@ def test_a_provisioned_attempt_resets_the_class_capacity_refusals(orch, monkeypa
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import api as runpod_api
     from flash.providers.runpod import jobs as rp_jobs
+    from flash.runner.supervise import seed_submission
 
     candidates = (Candidate("runpod", "H200", 4.0, 141),)
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
     monkeypatch.setattr(runpod_api, "cancel_job", lambda *a, **k: None)
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
+    observations = []
+    monkeypatch.setattr(
+        seed_submission._capacity_experience,
+        "record_capacity_refusal",
+        lambda shape: observations.append(("refusal", shape)),
+    )
+    monkeypatch.setattr(
+        seed_submission._capacity_experience,
+        "record_capacity_success",
+        lambda shape: observations.append(("success", shape)),
+    )
 
     submitted_gpus = []
     failures = ("no_capacity", "stalled", "no_capacity")
@@ -2877,6 +2889,12 @@ def test_a_provisioned_attempt_resets_the_class_capacity_refusals(orch, monkeypa
 
     assert metrics["train_tokens"] == 4096
     assert submitted_gpus == ["H200", "H200", "H200", "H200"]
+    assert observations == [
+        ("refusal", ("runpod", "H200", 1)),
+        ("success", ("runpod", "H200", 1)),
+        ("refusal", ("runpod", "H200", 1)),
+        ("success", ("runpod", "H200", 1)),
+    ]
     assert "has already refused capacity twice" not in log.getvalue()
 
 
