@@ -154,22 +154,39 @@ jobs:
               environments = json.load(source)
           if not isinstance(environments, list):
               raise SystemExit("Modal environment list returned an invalid payload")
-          names = {item.get("name") for item in environments if isinstance(item, dict)}
-          print("exists" if "dev" in names else "missing")
+          dev = next(
+              (
+                  item
+                  for item in environments
+                  if isinstance(item, dict) and item.get("name") == "dev"
+              ),
+              None,
+          )
+          if dev is None:
+              print("missing")
+          else:
+              # the suffix is what pins the app to serve-dev; anything else has to be corrected.
+              print("ready" if dev.get("web_suffix") == "dev" else "wrong-suffix")
           PY
           )"
+          # `environment create` and `environment update` both need workspace MANAGE access, which the
+          # deploy token does not have. run them only when the environment is genuinely wrong -- a
+          # correct environment must cost zero privileged calls, or every steady-state deploy fails.
           case "$environment_status" in
-            exists)
+            ready)
+              ;;
+            wrong-suffix)
+              modal environment update dev --set-web-suffix dev
               ;;
             missing)
               modal environment create dev
+              modal environment update dev --set-web-suffix dev
               ;;
             *)
-              echo "::error::Could not determine whether the development Modal environment exists."
+              echo "::error::Could not determine the state of the development Modal environment."
               exit 1
               ;;
           esac
-          modal environment update dev --set-web-suffix dev
 
       - name: Verify development adapter schema readiness
         if: steps.gate.outputs.deploy == 'true'
