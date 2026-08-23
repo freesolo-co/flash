@@ -16,6 +16,11 @@ from flash._internal.logging import get_logger
 # the follow loops below stay here; what a transient failure IS, and how long to tolerate one,
 # lives in `log_follow` so this module does not carry the classification too.
 from flash.cli.commands.log_follow import (
+    # re-exported, not used here: `test_step_metrics` reads the rendered field set off this
+    # module to assert verl emits nothing the CLI would drop on the floor.
+    _FOLLOW_METRIC_FIELDS as _FOLLOW_METRIC_FIELDS,
+)
+from flash.cli.commands.log_follow import (
     FollowInterrupted,
     _follow_transient_reason,
     _FollowRetry,
