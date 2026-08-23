@@ -13,9 +13,9 @@ HTTP status into the right serving-side HTTPException:
                                  as a 502, which a client/LB may treat as permanent and not retry)
   - transport error           -> 503 (fail closed, never serve unauthorized)
 
-It also caches a SUCCESSFUL authorization per (api_key, adapter_id) for a short TTL and coalesces
-concurrent identical lookups into ONE backend call (single-flight), so an eval's many same-key
-requests don't stampede the backend auth path into transient 5xx failures.
+It also caches a SUCCESSFUL authorization per API-key digest and adapter ID for a short TTL and
+coalesces concurrent identical lookups into ONE backend call (single-flight), so an eval's many
+same-key requests don't stampede the backend auth path into transient 5xx failures.
 
 modal_app imports the `modal` SDK at module top (decorators run at import), which isn't installed
 in the offline test env, so we stub it just enough to import and reach _build_chat_authorizer.
@@ -23,6 +23,7 @@ in the offline test env, so we stub it just enough to import and reach _build_ch
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -429,14 +430,15 @@ def test_expired_key_is_evicted_before_reauthorization(modal_app_module, monkeyp
     )
     authorize = _new_authorizer(modal_app_module)
     cache = inspect.getclosurevars(authorize).nonlocals["_cache"]
-    cache_key = ("synthetic-expired-key", "adapter-1")
+    request_key = ("synthetic-expired-key", "adapter-1")
+    cache_key = (hashlib.sha256(request_key[0].encode("utf-8")).hexdigest(), request_key[1])
 
     async def run() -> None:
-        await authorize(*cache_key)
+        await authorize(*request_key)
         _, org_id = cache[cache_key]
         cache[cache_key] = (float("-inf"), org_id)
         with pytest.raises(HTTPException):
-            await authorize(*cache_key)
+            await authorize(*request_key)
 
     asyncio.run(run())
 
@@ -453,13 +455,21 @@ def test_prune_removes_expired_keys_below_capacity(modal_app_module, monkeypatch
     cache = closure["_cache"]
     clock = [0.0]
     monkeypatch.setattr(closure["time"], "monotonic", lambda: clock[0])
-    expired_key = ("synthetic-expired-key", "adapter-1")
-    current_key = ("synthetic-current-key", "adapter-2")
+    expired_request = ("synthetic-expired-key", "adapter-1")
+    current_request = ("synthetic-current-key", "adapter-2")
+    expired_key = (
+        hashlib.sha256(expired_request[0].encode("utf-8")).hexdigest(),
+        expired_request[1],
+    )
+    current_key = (
+        hashlib.sha256(current_request[0].encode("utf-8")).hexdigest(),
+        current_request[1],
+    )
 
     async def run() -> None:
-        await authorize(*expired_key)
+        await authorize(*expired_request)
         clock[0] = modal_app_module._AUTH_CACHE_TTL_SECONDS + 1
-        await authorize(*current_key)
+        await authorize(*current_request)
 
     asyncio.run(run())
 

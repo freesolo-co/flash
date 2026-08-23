@@ -565,10 +565,11 @@ def _build_chat_authorizer(settings: Any) -> Any:
     real deployment (backend URL + internal key) — when it returns None, non-internal chat fails
     closed (503).
 
-    Successful authorizations are cached per (api_key, adapter_id) for ``_AUTH_CACHE_TTL_SECONDS``
-    and concurrent identical lookups are coalesced into a single backend call, so an eval's many
-    same-key requests don't stampede the backend auth path into transient 5xx failures. Any backend
-    5xx maps to a retryable 503 (never a 502) so it isn't read as a permanent upstream error.
+    Successful authorizations are cached per API-key digest and adapter ID for
+    ``_AUTH_CACHE_TTL_SECONDS`` and concurrent identical lookups are coalesced into a single backend
+    call, so an eval's many same-key requests don't stampede the backend auth path into transient
+    5xx failures. Any backend 5xx maps to a retryable 503 (never a 502) so it isn't read as a
+    permanent upstream error.
     """
     base = (settings.backend_url or "").rstrip("/")
     key = settings.internal_key
@@ -576,6 +577,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
         return None
     url = f"{base}/api/serving/authorize"
 
+    import hashlib
     import time
 
     import httpx
@@ -583,7 +585,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
 
     _client = httpx.AsyncClient(timeout=10.0, headers={"Authorization": f"Bearer {key}"})
 
-    # (api_key, adapter_id) -> (expires_at_monotonic, org_id); populated only on a successful
+    # (api_key_sha256, adapter_id) -> (expires_at_monotonic, org_id); populated only on a successful
     # authorization. Per-router-container in-memory (each container reduces its own backend load).
     _cache: dict[tuple[str, str], tuple[float, str | None]] = {}
     # In-flight single-flight tasks so concurrent identical misses share ONE backend call.
@@ -674,7 +676,8 @@ def _build_chat_authorizer(settings: Any) -> Any:
         return org
 
     async def authorize(api_key: str, adapter_id: str) -> "str | None":
-        ck = (api_key, adapter_id)
+        # do not retain raw user credentials as live dict keys beyond the request that supplied them.
+        ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), adapter_id)
         cached = _cache.get(ck)
         now = time.monotonic()
         if cached is not None:
