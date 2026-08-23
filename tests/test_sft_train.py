@@ -23,6 +23,7 @@ from flash.engine.profiling.sft_image_rows import _serialize_multimodal_inputs
 from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.entry.sft import _pretokenize_completion_only
 from flash.engine.worker.sft_train import (
+    _CHILD_ENV_PREFIXES,
     _LORAPLUS_READY_MARKER,
     _MAX_ZERO_GRAD_STEPS,
     _VERL_OPTIMIZER_IMPL,
@@ -2305,6 +2306,35 @@ def test_shared_child_environment_scrubs_declared_prefixed_secrets(monkeypatch, 
     )
     inherited = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=False)
     assert inherited["PYTHONPATH"] == os.pathsep.join((str(tmp_path), "synthetic-pythonpath"))
+
+
+def test_child_env_carries_the_baked_kernel_cache_dirs(monkeypatch, tmp_path):
+    """the child is the interpreter that trains, so it must inherit the baked cache locations.
+
+    Dockerfile.worker sets these five image-wide to /opt/flash/kernelcache. they are the ONLY way to
+    address the baked per-sm cache, so dropping them makes the child re-JIT what the bake already
+    built. TORCHINDUCTOR_CACHE_DIR is pinned explicitly because it does NOT match the "TORCH_"
+    prefix -- its sixth character is "I" -- so a prefix-based fix would silently miss it.
+    """
+    baked = {
+        "TRITON_CACHE_DIR": "/opt/flash/kernelcache/triton",
+        "TORCHINDUCTOR_CACHE_DIR": "/opt/flash/kernelcache/inductor",
+        "FLASHINFER_CUBIN_DIR": "/opt/flash/kernelcache/flashinfer_cubin",
+        "FLASHINFER_CACHE_DIR": "/opt/flash/kernelcache/flashinfer",
+        "FLASHINFER_WORKSPACE_BASE": "/opt/flash/kernelcache/flashinfer",
+    }
+    for name, value in baked.items():
+        monkeypatch.setenv(name, value)
+
+    child = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=False)
+
+    for name, value in baked.items():
+        assert child.get(name) == value, f"{name} must reach the verl child"
+
+    # the prefix tuple cannot be what carries them: assert the exact-name path is doing the work, or
+    # a later refactor could drop the entries believing "TORCH_" already covers the inductor one.
+    assert not "TORCHINDUCTOR_CACHE_DIR".startswith(_CHILD_ENV_PREFIXES)
+    assert not "TRITON_CACHE_DIR".startswith(_CHILD_ENV_PREFIXES)
 
 
 def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_path):
