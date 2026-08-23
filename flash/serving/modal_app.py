@@ -217,6 +217,28 @@ image = (
         str(REPO_DIR / "pyproject.toml"),
         optional_dependencies=["serve-runtime", "serving"],
     )
+    # Repair the cuTe-DSL install AFTER the resolve above. `nvidia-cutlass-dsl-libs-base` and
+    # `-libs-cu13` both ship into the shared `nvidia_cutlass_dsl/` namespace and write many of the
+    # SAME paths with DIFFERENT content; whichever extracts last wins, and with a parallel installer
+    # the order is racy (NVIDIA/cutlass#3170, #3259). vllm 0.23.0 gates its FlashInfer Blackwell GDN
+    # prefill kernel on `_is_libs_cu13_install_intact()`
+    # (`model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`), which re-hashes every file the
+    # `-libs-cu13` wheel claims and returns False on ANY mismatch.
+    #
+    # Measured 2026-08-23 across four independently-built serving venvs on this vllm pin: 23, 26, 99
+    # and 99 of 200 files mismatched -- i.e. the corruption is the norm, not an edge case. A clean
+    # `--force-reinstall --no-deps` of the cu13 variant scores 0 mismatched.
+    #
+    # Why this matters on Blackwell specifically: the FlashInfer GDN path needs SM10.x +
+    # `linear_key_head_dim == 128` (true for every served Qwen3.5/3.6) + cuda>=13 (torch 2.11.0+cu130
+    # satisfies it) + this intactness check. Only the last one fails, and it fails SILENTLY -- the
+    # resolver falls through to Triton/FLA after a single `warning_once`. A B200 tier would boot,
+    # serve, and bill the Blackwell rate while running the slower kernel. SM90 (H100/H200) is
+    # unaffected: it takes FlashInfer with no further constraints, so this is a no-op for today's
+    # tiers and a prerequisite for any Blackwell one.
+    .run_commands(
+        "pip install --force-reinstall --no-deps nvidia-cutlass-dsl-libs-cu13",
+    )
     # No in-engine kernel-patching hook is installed in this image (see the note at the engine call
     # site): under vLLM V1 the model runs in a separate EngineCore process, so patches applied in THIS
     # process never reach the model, and a prior attempt's extra CUDA context + GPU self-tests stole

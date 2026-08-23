@@ -73,6 +73,52 @@ def test_image_installs_from_a_pyproject_that_exists() -> None:
         assert declared[extra], extra
 
 
+def test_image_repairs_the_cutlass_dsl_install_after_resolving() -> None:
+    """The cuTe-DSL repair must run, and must run AFTER the resolve that corrupts it.
+
+    `nvidia-cutlass-dsl-libs-base` and `-libs-cu13` write many of the same paths under the shared
+    `nvidia_cutlass_dsl/` namespace with different content, so whichever extracts last wins and the
+    order is racy. vllm 0.23.0 gates its FlashInfer Blackwell GDN prefill kernel on
+    `_is_libs_cu13_install_intact()`, which re-hashes every file the cu13 wheel claims -- measured
+    2026-08-23 as 23/26/99/99 of 200 files mismatched across four independently built serving venvs
+    on this pin.
+
+    The failure is SILENT: the backend resolver falls through to Triton/FLA after one
+    `warning_once`, so a Blackwell tier boots, serves, and bills the Blackwell rate while running
+    the slower kernel. Ordering is the whole point -- a repair placed before the resolve is
+    overwritten by it and buys nothing.
+    """
+    tree = _module()
+    steps = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    by_attr = [node.func.attr for node in steps]
+    assert "run_commands" in by_attr, "the image must repair the cuTe-DSL install"
+
+    repair = next(
+        node
+        for node in steps
+        if node.func.attr == "run_commands"
+        and any("nvidia-cutlass-dsl-libs-cu13" in str(ast.literal_eval(a)) for a in node.args)
+    )
+    command = " ".join(str(ast.literal_eval(a)) for a in repair.args)
+    # --force-reinstall is what actually rewrites the files the sibling wheel clobbered; --no-deps
+    # keeps the repair from re-resolving (and re-racing) the rest of the stack.
+    assert "--force-reinstall" in command, command
+    assert "--no-deps" in command, command
+
+    # the repair is only meaningful downstream of the install that corrupts it. `ast.walk` yields
+    # the chained calls outermost-first, so the LATER builder step appears EARLIER in the walk.
+    resolve_at = by_attr.index("pip_install_from_pyproject")
+    repair_at = by_attr.index("run_commands")
+    assert repair_at < resolve_at, (
+        "the cuTe-DSL repair must be chained after pip_install_from_pyproject, "
+        f"got repair at {repair_at} and resolve at {resolve_at} in outermost-first order"
+    )
+
+
 def test_hosted_deploy_docs_and_workflows_point_at_paths_that_exist() -> None:
     """The documented deploy commands and the workflows that run them must match the move.
 
