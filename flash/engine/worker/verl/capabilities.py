@@ -864,6 +864,41 @@ def rollout_layered_summon_overrides(target_parameters: Sequence[str] | None) ->
     return ["actor_rollout_ref.rollout.layered_summon=true"]
 
 
+def fused_expert_orig_params_overrides(target_parameters: Sequence[str] | None) -> list[str]:
+    """keep fsdp1 parameters addressable so peft can parametrize a fused-expert tensor.
+
+    PEFT implements ``target_parameters`` by registering a torch parametrization onto a NAMED
+    TENSOR of the module at forward time (``peft/tuners/lora/layer.py:2463``), unlike
+    ``target_modules``, which swaps in a wrapper layer once at injection. verl injects the adapter
+    BEFORE wrapping in fsdp (``transformer_impl.py:543-565``), so by the time that forward runs the
+    tensor has to still be reachable by name.
+
+    fsdp1 only keeps it reachable under ``use_orig_params=True``. verl passes the config value
+    straight through (``transformer_impl.py:392-404``) and it defaults to False
+    (``workers/config/engine.py:254``), which flattens every parameter into a FlatParameter. The
+    attribute is then gone and ``register_parametrization`` raises ``Module 'Qwen3_5MoeExperts(...)'
+    does not have a parameter, a buffer, or a parametrized element with name 'down_proj'`` -- which
+    is exactly how the first GRPO run to survive the weight sync died, in the log-prob forward.
+
+    the natural control is flash's own sft driver: it pins ``engine.strategy=fsdp2``
+    (``train/sft/config.py:138``), and fsdp2's ``fully_shard`` never flattens, so the same model
+    with the same ``target_parameters`` trains fine there. grpo and opd stay on fsdp1, so they need
+    the flag instead of the strategy switch.
+
+    verl's own fused-expert lora test pins ``use_orig_params=True``
+    (``tests/utils/test_fsdp_lora_merge.py:92``) over these very targets, as does every other
+    lora-bearing fsdp1 test; only the checkpoint and activation-offload tests use False. upstream
+    has no forward-pass regression for this combination, which is why the default was never fixed.
+
+    gated on ``target_parameters`` because that is precisely the set of models whose lora lives on a
+    raw tensor rather than a wrapper module. dense models keep verl's flattened default, which is
+    the cheaper layout.
+    """
+    if not target_parameters:
+        return []
+    return ["actor_rollout_ref.actor.fsdp_config.use_orig_params=true"]
+
+
 def rollout_mm_processor_cache_overrides() -> list[str]:
     """disable vllm's split multimodal processor cache for every verl rollout.
 

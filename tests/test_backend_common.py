@@ -4858,6 +4858,40 @@ def test_rollout_layered_summon_uses_a_bare_override_not_an_append():
     assert override.startswith("actor_rollout_ref.rollout.layered_summon=")
 
 
+def test_fused_expert_orig_params_is_on_for_fused_expert_targets():
+    # the regression this exists for: PEFT applies `target_parameters` by registering a torch
+    # parametrization onto a NAMED TENSOR at forward time (peft/tuners/lora/layer.py:2463). fsdp1
+    # with verl's default use_orig_params=False (workers/config/engine.py:254) flattens that tensor
+    # into a FlatParameter, so the attribute is gone and register_parametrization raises
+    # "Module 'Qwen3_5MoeExperts(...)' does not have a parameter ... with name 'down_proj'" in the
+    # log-prob forward -- which is how the first GRPO run to survive the weight sync died.
+    from flash.engine.worker.verl.capabilities import fused_expert_orig_params_overrides
+
+    assert fused_expert_orig_params_overrides(
+        ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
+    ) == ["actor_rollout_ref.actor.fsdp_config.use_orig_params=true"]
+
+
+@pytest.mark.parametrize("empty", [None, [], (), ""])
+def test_fused_expert_orig_params_stays_off_for_dense_models(empty):
+    # a dense model's lora lives on wrapper MODULES, which fsdp flattening does not remove. it keeps
+    # verl's default, which is the cheaper layout.
+    from flash.engine.worker.verl.capabilities import fused_expert_orig_params_overrides
+
+    assert fused_expert_orig_params_overrides(empty) == []
+
+
+def test_fused_expert_orig_params_uses_a_bare_override_not_an_append():
+    # use_orig_params is declared in verl's fsdp.yaml (fsdp.yaml:36) and in the generated trainer
+    # config (_generated_ppo_trainer.yaml:38), so hydra already has the key. a '+' prefix would be
+    # an append to an existing key and fail the config merge.
+    from flash.engine.worker.verl.capabilities import fused_expert_orig_params_overrides
+
+    (override,) = fused_expert_orig_params_overrides(["mlp.experts.gate_up_proj"])
+    assert not override.startswith("+")
+    assert override.startswith("actor_rollout_ref.actor.fsdp_config.use_orig_params=")
+
+
 def test_rollout_max_num_seqs_rejects_a_nonpositive_batch():
     from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
 
