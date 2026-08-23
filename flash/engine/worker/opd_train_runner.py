@@ -560,6 +560,7 @@ def _resolve_opd_gpu_mem_util(
             "model_id": model_id,
             "model_revision": str(getattr(request, "model_revision", "") or ""),
             "engine_len": int(prompt_state.max_model_len),
+            "lora_rank": int(workload.lora_rank),
             # opd submits prompts_per_step * group_size generations to the rollout engine together.
             # grpo's concurrency is group_size because its resolver receives one prompt group here.
             "group_size": int(workload.prompts_per_step) * int(request.knobs.group_size),

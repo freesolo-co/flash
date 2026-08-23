@@ -9171,7 +9171,7 @@ def test_opd_multigpu_gpu_mem_util_matches_the_shared_tp_aware_resolver():
         spec=SimpleNamespace(gpu=SimpleNamespace(type="H200")),
     )
     prompt_state = SimpleNamespace(max_model_len=2048)
-    workload = SimpleNamespace(prompts_per_step=2)
+    workload = SimpleNamespace(prompts_per_step=2, lora_rank=32)
     runtime = SimpleNamespace(gpu_count=2)
     model_id = "Qwen/Qwen3.6-35B-A3B"
 
@@ -9184,6 +9184,7 @@ def test_opd_multigpu_gpu_mem_util_matches_the_shared_tp_aware_resolver():
             "model_revision": "",
             "engine_len": 2048,
             "group_size": 8,
+            "lora_rank": 32,
         },
         gpu_type="H200",
         n_gpus=2,

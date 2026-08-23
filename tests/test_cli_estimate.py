@@ -1021,8 +1021,8 @@ def test_sft_cost_warns_when_an_env_key_shadows_the_saved_login(tmp_path, monkey
 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "opd"])
-def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
-    """grpo/opd keep the local analytical quote until PR2 profiles their rollouts.
+def test_warm_start_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
+    """warm-start grpo/opd keep the local analytical quote until PR2 profiles their rollouts.
 
     Asserted by making the client constructor itself fatal: a passing quote then proves no
     authenticated request was possible, not merely that none was observed.
@@ -1037,7 +1037,8 @@ def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
     monkeypatch.setenv("FLASH_STYLE", "0")
     # group_size 2 is grpo's floor (advantages are group-relative) and is valid for opd too.
     body = SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"').replace(
-        "batch_size = 8\n", "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
+        "batch_size = 8\n",
+        'prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\ninit_from_adapter = "source-run"\n',
     )
 
     assert cmd_train(_sft_args(tmp_path, body)) == 0
@@ -1047,6 +1048,121 @@ def test_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
     assert "source rows in published copy" not in captured.out
     assert "selected from" not in captured.out
     assert "shadowed!" not in captured.err
+    assert (
+        "warning: warm-start (train.init_from_adapter) cost is a provisional rank-1 estimate. "
+        "The authoritative source adapter rank is resolved server-side and can change the selected "
+        "hardware and cost in either direction. Run `flash train --dry-run` for a quote using the "
+        "resolved source rank.\n" in captured.err
+    )
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_plain_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
+    """Ordinary grpo/opd quotes stay local independently of the warm-start branch."""
+    from flash.cli import commands
+
+    monkeypatch.setattr(
+        commands,
+        "client_from_config",
+        lambda *_a, **_kw: pytest.fail(f"{algorithm} --cost must not contact the control plane"),
+    )
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    body = SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"').replace(
+        "batch_size = 8\n", "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
+    )
+
+    assert cmd_train(_sft_args(tmp_path, body)) == 0
+    captured = capsys.readouterr()
+    assert "TOTAL" in captured.out
+    assert "warm-start" not in captured.err
+
+
+def test_warm_start_cost_quotes_the_card_the_parser_accepts(tmp_path, capsys, monkeypatch):
+    """The quote must not refuse the exact configuration the parser now admits.
+
+    `estimate_cost` reads the rank for both the price and the exact-card fit, so quoting at the
+    serialization placeholder rejected a single B200 as needing 199 GB and advised `--gpus 2`, a
+    shortfall the real source rank may not have. Sized at the rank-1 vram lower bound it fits in 180
+    GB, while the warning accurately labels the dollars as provisional.
+    """
+    from flash.cli import commands
+
+    monkeypatch.setattr(
+        commands,
+        "client_from_config",
+        lambda *_a, **_kw: pytest.fail("offline quote must not contact the plane"),
+    )
+    monkeypatch.setenv("FLASH_STYLE", "0")
+    body = SFT_TOML.replace('algorithm = "sft"', 'algorithm = "grpo"').replace(
+        "batch_size = 8\n",
+        'prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\ninit_from_adapter = "source-run"\n',
+    )
+    # SFT_TOML ends with an empty `[gpu]`, so the pin is appended into that section.
+    body = body.replace('model = "Qwen/Qwen3.5-4B"', 'model = "Qwen/Qwen3.6-35B-A3B"')
+    body += 'type = "B200"\ncount = 1\n'
+
+    assert cmd_train(_sft_args(tmp_path, body)) == 0
+    captured = capsys.readouterr()
+    assert "TOTAL" in captured.out
+    assert "--gpus 2" not in captured.err
+    assert (
+        "warning: warm-start (train.init_from_adapter) cost is a provisional rank-1 estimate. "
+        "The authoritative source adapter rank is resolved server-side and can change the selected "
+        "hardware and cost in either direction. Run `flash train --dry-run` for a quote using the "
+        "resolved source rank.\n" in captured.err
+    )
+
+
+def _warm_start_rank_boundary_config():
+    from flash.cost.spec import runconfig_from_spec
+
+    spec = spec_from_dict(
+        {
+            "project": "00000000-0000-0000-0000-000000000001",
+            "model": "Qwen/Qwen3.6-35B-A3B",
+            "algorithm": "grpo",
+            "environment": {"id": "my-org/my-proj/my-env"},
+            "train": {"prompts_per_step": 8, "max_examples": 40, "group_size": 2},
+        }
+    )
+    return runconfig_from_spec(spec)
+
+
+def test_higher_warm_start_rank_crosses_hardware_shape_boundary():
+    """Catalog geometry, not mutable prices, owns the rank-dependent hardware boundary."""
+    from dataclasses import replace
+
+    from flash.cost import estimate_cost
+    from flash.providers.base import GPU_INFO
+
+    config = _warm_start_rank_boundary_config()
+    rank_1 = estimate_cost(replace(config, lora_rank=1))
+    rank_8 = estimate_cost(replace(config, lora_rank=8))
+
+    assert GPU_INFO["B200"].vram_gb == 180
+    assert GPU_INFO["H200"].vram_gb == 141
+    assert (rank_1.required_vram_gb, rank_1.gpu_count, rank_1.gpu) == (180, 1, "B200")
+    assert (rank_8.required_vram_gb, rank_8.gpu_count, rank_8.gpu) == (182, 2, "H200")
+
+
+def test_higher_warm_start_rank_can_select_cheaper_hardware(monkeypatch):
+    """Controlled prices prove that crossing the shape boundary can lower total cost."""
+    from dataclasses import replace
+
+    from flash.cost import estimate_cost
+    from flash.providers import base
+
+    b200 = replace(base.GPU_INFO["B200"], hourly_usd=5.50)
+    h200 = replace(base.GPU_INFO["H200"], hourly_usd=4.00)
+    monkeypatch.setattr(base, "GPU_INFO", {"B200": b200, "H200": h200})
+
+    config = _warm_start_rank_boundary_config()
+    rank_1 = estimate_cost(replace(config, lora_rank=1))
+    rank_8 = estimate_cost(replace(config, lora_rank=8))
+
+    assert (rank_1.gpu, rank_1.gpu_count, rank_1.gpu_hourly_usd) == ("B200", 1, 5.50)
+    assert (rank_8.gpu, rank_8.gpu_count, rank_8.gpu_hourly_usd) == ("H200", 2, 4.00)
+    assert rank_8.total_usd < rank_1.total_usd
 
 
 def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):

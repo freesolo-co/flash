@@ -555,13 +555,15 @@ def test_fused_expert_config_is_a_noop_for_non_fused_models():
     validate_fused_expert_adapter_config(malformed, "Qwen/Qwen3.5-9B")
 
 
-def _patch_fused_submit_preflight(monkeypatch, config, *, reject_config):
+def _patch_fused_submit_preflight(
+    monkeypatch, config, *, reject_config, child_rank=16, resolved_rank=16
+):
     import flash.adapters.fused_experts as fused_experts
     import flash.adapters.lora_rank as lora_rank
     import flash.runner.preparation as preparation
     import flash.runner.results.checkpoints as checkpoints
 
-    target_spec = _spec(model=_FUSED_MODEL)
+    target_spec = _spec(rank=child_rank, model=_FUSED_MODEL)
     target_spec = replace(
         target_spec,
         train=replace(target_spec.train, init_from_adapter="source-run"),
@@ -598,7 +600,7 @@ def _patch_fused_submit_preflight(monkeypatch, config, *, reject_config):
         seen = config_loader("unused", token, "unused")
         assert seen is config
         events.append(("preflight", seen))
-        return SimpleNamespace(rank=16, alpha=32)
+        return SimpleNamespace(rank=resolved_rank, alpha=2 * resolved_rank)
 
     monkeypatch.setattr(preparation, "_runner", lambda: runner)
     monkeypatch.setattr(preparation, "_adopted_warmstart_revision", lambda spec, _source: spec)
@@ -662,3 +664,26 @@ def test_submit_passes_the_loaded_config_to_validation_then_rank_preflight(monke
         ("validate", config),
         ("preflight", config),
     ]
+
+
+def test_preparation_returns_resolved_source_rank_on_worker_spec(monkeypatch):
+    from flash.providers.allocator import required_vram_gb
+
+    config = _config(target_parameters=list(_FUSED_TARGETS))
+    preparation, target_spec, _events = _patch_fused_submit_preflight(
+        monkeypatch,
+        config,
+        reject_config=False,
+        child_rank=32,
+        resolved_rank=4,
+    )
+
+    _public_spec, worker_spec, _identity, _source_context = (
+        preparation._prepare_init_from_adapter_inner(target_spec)
+    )
+
+    assert target_spec.train.lora_rank == 32
+    assert worker_spec.train.lora_rank == 4
+    assert required_vram_gb(
+        worker_spec.model, worker_spec.algorithm, train=worker_spec.train
+    ) < required_vram_gb(target_spec.model, target_spec.algorithm, train=target_spec.train)

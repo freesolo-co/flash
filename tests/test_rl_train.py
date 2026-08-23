@@ -1698,6 +1698,7 @@ def _mem_util_inp(**over):
         "model_revision": "",
         "engine_len": 2048,
         "group_size": 8,
+        "lora_rank": 32,
     }
     inp.update(over)
     return inp
@@ -1726,6 +1727,7 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
         active_params_b=None,
         fp8_kv=False,
         model_info=info,
+        lora_rank=32,
     )
     got = rl_train.resolve_gpu_mem_util(
         _mem_util_inp(), gpu_type="H100", n_gpus=1, fp8_kv=False, sleep_unsupported=False
@@ -1740,9 +1742,12 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
         fp8_kv=False,
         model_info=info,
         tensor_parallel=1,
+        lora_rank=32,
     )
     assert got == want == explicit_tp_one
-    assert got.hex() == "0x1.11eb851eb851ep-2"
+    # 9.4 gb weights + 12 gb sleep kv + 0.15597568 gb rank-32 adapter, all inside vllm's 80 gb share.
+    assert got * 80 == pytest.approx(21.55597568)
+    assert got.hex() == "0x1.13ea9f00f2d56p-2"
     # and it is genuinely NOT the old constant, so the test cannot pass on an unwired build.
     assert got != rl_train._DEFAULT_GPU_MEM_UTIL
     assert got < rl_train._DEFAULT_GPU_MEM_UTIL
@@ -1812,6 +1817,89 @@ def test_multigpu_gpu_mem_util_shards_only_weights_and_frees_the_observed_shortf
         )
         assert got < default
         assert (default - got) * vram_gb > 1.57
+
+
+def test_multigpu_gpu_mem_util_reserves_rank_local_lora_inside_vllm_without_reducing_kv():
+    from flash.core.catalog import MODELS
+    from flash.engine.plan.vram import _lora_weight_memory_gb, colocate_kv_util
+    from flash.providers.base import get_gpu_info
+
+    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    card_gb = float(get_gpu_info("B200").vram_gb)
+    adapter_gb = _lora_weight_memory_gb(64, info, tensor_parallel=2)
+    assert adapter_gb == pytest.approx(6.591276032)
+
+    without_adapter = colocate_kv_util(
+        float(info.params_b),
+        2048,
+        card_gb,
+        sleep_mode=False,
+        num_generations=4,
+        active_params_b=float(info.active_params_b),
+        model_info=info,
+        tensor_parallel=2,
+    )
+    got = rl_train.resolve_gpu_mem_util(
+        _mem_util_inp(
+            model_id=info.id,
+            group_size=4,
+            lora_rank=64,
+        ),
+        gpu_type="B200",
+        n_gpus=2,
+        fp8_kv=False,
+        sleep_unsupported=True,
+    )
+
+    # tp2 gives each rank 35 gb of weights. the resident short-context pool is the 8 gb floor, and
+    # the default tp lora layout adds 6.591276032 gb on that same rank.
+    assert got * card_gb == pytest.approx(49.591276032)
+    assert got == pytest.approx(without_adapter + adapter_gb / card_gb)
+    assert got * card_gb - 35.0 - adapter_gb == pytest.approx(8.0)
+
+
+def test_gpu_mem_util_preserves_current_budget_without_catalog_lora_shapes(monkeypatch):
+    from flash.core.catalog import MODELS
+    from flash.engine.plan.vram import _lora_weight_memory_gb, colocate_kv_util
+    from flash.providers.base import get_gpu_info
+
+    model_id = "test/shape-less-model"
+    info = SimpleNamespace(
+        id=model_id,
+        params_b=4.0,
+        active_params_b=0.0,
+        lora_target_shapes=(),
+    )
+    monkeypatch.setitem(MODELS, model_id, info)
+    card_gb = float(get_gpu_info("H100").vram_gb)
+    assert _lora_weight_memory_gb(64, info) is None
+    got = rl_train.resolve_gpu_mem_util(
+        _mem_util_inp(model_id=model_id, lora_rank=64),
+        gpu_type="H100",
+        n_gpus=1,
+        fp8_kv=False,
+        sleep_unsupported=False,
+    )
+    current = colocate_kv_util(
+        info.params_b,
+        2048,
+        card_gb,
+        sleep_mode=True,
+        num_generations=8,
+        model_info=info,
+    )
+
+    assert got == current
+
+
+def test_multigpu_gpu_mem_util_caps_the_sizer_at_the_previous_constant(monkeypatch):
+    monkeypatch.setattr("flash.engine.plan.vram.colocate_kv_util", lambda *_args, **_kwargs: 0.55)
+
+    got = rl_train.resolve_gpu_mem_util(
+        _mem_util_inp(), gpu_type="H100", n_gpus=2, fp8_kv=False, sleep_unsupported=False
+    )
+
+    assert got == rl_train._DEFAULT_GPU_MEM_UTIL == 0.5
 
 
 def test_multigpu_gpu_mem_util_never_exceeds_the_previous_constant():
