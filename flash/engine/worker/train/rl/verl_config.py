@@ -18,7 +18,7 @@ from flash.content.multimodal import messages_with_decoded_images
 from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
-    fused_expert_orig_params_overrides,
+    fused_expert_strategy_overrides,
     ray_num_cpus,
     rollout_layered_summon_overrides,
     rollout_mm_processor_cache_overrides,
@@ -301,9 +301,9 @@ def _actor_overrides(cfg: dict) -> list[str]:
         # absent -> True, verl's own default: a cfg built without the gate must render the
         # lower-memory strategy, never fall into zero-2 by omission.
         f"actor_rollout_ref.actor.fsdp_config.reshard_after_forward={_hydra_val(bool(cfg.get('reshard_after_forward', True)))}",
-        # fused-expert lora is a parametrization on a named tensor, so fsdp1 must not flatten it
-        # away. shared with the opd driver; sft is on fsdp2 and never flattens.
-        *fused_expert_orig_params_overrides(cfg.get("target_parameters")),
+        # fused-expert lora is a parametrization on a named tensor, which only fsdp2 can host.
+        # shared with the opd driver; sft has always been on fsdp2 for the same reason.
+        *fused_expert_strategy_overrides(cfg.get("target_parameters")),
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the opd driver.
         *trainer_dtype_overrides(),
     ]
