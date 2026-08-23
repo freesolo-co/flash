@@ -22,19 +22,17 @@ on:
     # deliberately no trigger-level ``paths`` filter, for the same reason deploy-modal.yml omits
     # one: github evaluates path filters against only the first 300 changed files of a push, so a
     # large merge that touches an image input beyond that window would never start this workflow
-    # and the tags would keep pointing at old code. the in-job gate below uses a full ``git diff``
-    # (fetch-depth: 0), so it cannot miss a relevant change; an irrelevant push just runs the cheap
-    # gate and skips the expensive build.
+    # and the tags would keep pointing at old code. the in-job gate below diffs the full history since
+    # the revision actually published to ghcr, so it cannot miss a relevant change; an irrelevant push
+    # just runs the cheap gate and skips the expensive build.
   workflow_dispatch:
 
 concurrency:
   group: publish-serving-image-${{ github.ref }}
-  # NOT cancel-in-progress, unlike publish-image.yml, because the publish gate below diffs only
-  # `github.event.before..github.sha`. Cancelling a relevant push A for an irrelevant push B means
-  # B's gate sees only A..B, decides `publish=false`, and exits -- so A's serving code never gets a
-  # digest and the tags keep pointing at pre-A code until some later relevant change happens.
-  # deploy-modal.yml already sets false for the same reason: the run has a side effect that a
-  # replacement run does not repeat.
+  # keep a running publish alive, but do not rely on concurrency to preserve a pending run: github
+  # replaces an older pending run even when cancel-in-progress is false. the gate therefore compares
+  # against the revision stamped into the image currently published under this branch's tag, so a
+  # replacement run repeats every relevant change that has not actually reached ghcr.
   cancel-in-progress: false
 
 jobs:
@@ -62,8 +60,26 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # the publish gate diffs against the push predecessor, which a shallow clone cannot reach.
+          # the publish gate diffs against the revision currently stamped in the published image.
           fetch-depth: 0
+
+      # this is a best-effort metadata reader, not a publication prerequisite. any download,
+      # checksum, or execution failure is ignored here and makes the gate publish safely below.
+      - name: Install crane for published revision lookup
+        continue-on-error: true
+        env:
+          CRANE: ${{ runner.temp }}/serving-publish-tools/crane
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/crane.tar.gz"
+          mkdir -p "$(dirname "$CRANE")"
+          curl --fail --silent --show-error --location --output "$archive" \
+            https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz
+          printf '%s  %s\n' \
+            c14340087103ba9dadf61d45acd20675490fd0ccbd56ac7901fc1b502137f44b \
+            "$archive" | sha256sum --check --status
+          tar -xzf "$archive" -C "$(dirname "$CRANE")" crane
+          "$CRANE" version
 
       # the image inputs Dockerfile.serve reads: a change to any of them changes the published image
       # while the tags keep pointing at the old one. that is the whole COPY set -- `flash`, the
@@ -75,17 +91,41 @@ jobs:
         working-directory: .
         env:
           EVENT: ${{ github.event_name }}
-          BEFORE_SHA: ${{ github.event.before }}
           CURRENT_SHA: ${{ github.sha }}
+          PUBLISHED_IMAGE: ${{ env.IMAGE }}:${{ github.ref_name }}
+          CRANE: ${{ runner.temp }}/serving-publish-tools/crane
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           publish=false
           if [ "$EVENT" = "workflow_dispatch" ]; then
             publish=true
-          elif [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
-            # brand-new branch with no comparable predecessor: publish to be safe.
+          elif [ ! -x "$CRANE" ] || ! printf '%s' "$GHCR_TOKEN" | "$CRANE" auth login \
+            ghcr.io --username "$GHCR_ACTOR" --password-stdin >/dev/null 2>&1; then
+            # a missing reader or any registry authentication failure must publish safely.
             publish=true
-          elif ! changed="$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" 2>/dev/null)"; then
-            # before sha unreachable (e.g. force push): publish to be safe.
+          elif ! image_config="$("$CRANE" config "$PUBLISHED_IMAGE" 2>/dev/null)"; then
+            # a missing tag or any registry, network, or metadata failure must publish safely.
+            publish=true
+          elif ! last_published_sha="$(python3 -c '
+          import json
+          import re
+          import sys
+
+          payload = json.load(sys.stdin)
+          revision = payload.get("config", {}).get("Labels", {}).get(
+              "org.opencontainers.image.revision"
+          )
+          if not isinstance(revision, str) or re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
+              raise SystemExit(1)
+          print(revision.lower())
+          ' <<< "$image_config" 2>/dev/null)"; then
+            # an image without a valid source label cannot safely bound the unpublished changes.
+            publish=true
+          elif ! git merge-base --is-ancestor "$last_published_sha" "$CURRENT_SHA" 2>/dev/null; then
+            # a missing or rewritten published revision cannot safely bound the unpublished changes.
+            publish=true
+          elif ! changed="$(git diff --name-only "$last_published_sha" "$CURRENT_SHA" 2>/dev/null)"; then
             publish=true
           elif grep -qE "^(flash/|Dockerfile\.serve$|\.dockerignore$|serve_launch\.py$|pyproject\.toml$|uv\.lock$|README\.md$|LICENSE$|NOTICE$|\.github/workflows/publish-serving-image\.yml$)" <<< "$changed"; then
             publish=true
@@ -151,6 +191,8 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=min
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
 
       # The digest is the whole point of this workflow: it is the one value a deployment can
       # pin that cannot be moved under it later. Surface it in the job summary so the exact

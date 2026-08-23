@@ -24,9 +24,9 @@ on:
       - main
     # deliberately no trigger-level ``paths`` filter. github evaluates path filters against only the
     # first 300 changed files of a push, so a large merge to main that touches serving/ beyond that
-    # window would not start the workflow and prod would silently drift. the in-job deploy gate uses
-    # a full ``git diff`` (fetch-depth: 0), so it cannot miss a relevant change; an irrelevant push
-    # just runs the cheap gate and skips the deploy.
+    # window would not start the workflow and prod would silently drift. the in-job deploy gate diffs
+    # the full history since the revision reported by the deployed app, so it cannot miss a relevant
+    # change; an irrelevant push just runs the cheap gate and skips the deploy.
   workflow_dispatch:
 
 jobs:
@@ -43,7 +43,9 @@ jobs:
     # minutes clears that with room while keeping a wedged deploy from holding the runner for
     # GitHub's 6-hour default.
     timeout-minutes: 30
-    # serialize serving deploys across runs because each deploy mutates the live app.
+    # serialize serving deploys across runs because each deploy mutates the live app. github can still
+    # replace a pending run, so the gate compares against the sha reported by the deployed app rather
+    # than assuming every push predecessor was deployed.
     concurrency:
       group: deploy-modal-serving
       cancel-in-progress: false
@@ -73,7 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          # Need history so the change check can diff this push against its predecessor.
+          # the deploy gate diffs against the revision reported by the currently deployed app.
           fetch-depth: 0
 
       - name: Decide whether to deploy serving
@@ -81,17 +83,37 @@ jobs:
         working-directory: .
         env:
           EVENT: ${{ github.event_name }}
-          BEFORE_SHA: ${{ github.event.before }}
           CURRENT_SHA: ${{ github.sha }}
+          DEPLOYED_HEALTH_URL: https://serve.freesolo.co/healthz
         run: |
           deploy=false
           if [ "$EVENT" = "workflow_dispatch" ]; then
             deploy=true
-          elif [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
-            # Brand-new branch / no comparable predecessor: deploy to be safe.
+          elif ! last_deployed_sha="$(python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+
+
+          request = urllib.request.Request(
+              os.environ["DEPLOYED_HEALTH_URL"],
+              headers={"Accept": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=15) as response:
+              payload = json.load(response)
+          revision = payload.get("deployment_sha") if isinstance(payload, dict) else None
+          if not isinstance(revision, str) or re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
+              raise ValueError("deployed app returned no valid source revision")
+          print(revision.lower())
+          PY
+          )"; then
+            # a missing deployment or any health, network, or parsing failure must deploy safely.
             deploy=true
-          elif ! changed="$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" 2>/dev/null)"; then
-            # before sha not reachable (e.g. force push): deploy to be safe.
+          elif ! git merge-base --is-ancestor "$last_deployed_sha" "$CURRENT_SHA" 2>/dev/null; then
+            # a missing or rewritten deployed revision cannot safely bound the undeployed changes.
+            deploy=true
+          elif ! changed="$(git diff --name-only "$last_deployed_sha" "$CURRENT_SHA" 2>/dev/null)"; then
             deploy=true
           # any `flash/` change, not just `flash/serving/`: the image ships the whole package via
           # `add_local_python_source("flash")`, so a change anywhere under flash/ can alter what runs
