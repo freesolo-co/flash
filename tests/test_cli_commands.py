@@ -1606,7 +1606,10 @@ def test_log_labels_previous_attempt_artifacts_after_the_live_attempt_log(
         in out
     )
     assert out.index(live_line) < out.index(previous_header)
-    assert 'HEARTBEAT {"stage":"rl_step","step":0,"attempt":0' in out
+    # the dead attempt's heartbeat is still printed -- it explains why a retry exists -- but it
+    # carries its provenance inline, because a section heading does not survive
+    # `grep HEARTBEAT | tail -1`.
+    assert 'HEARTBEAT [superseded attempt=0; current attempt=1] {"stage":"rl_step"' in out
 
 
 def test_log_still_prints_artifacts_when_the_attempt_lookup_fails(
