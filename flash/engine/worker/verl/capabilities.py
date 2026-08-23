@@ -773,6 +773,39 @@ def rollout_fp8_kv(cc_ok: bool, gdn_hybrid: bool, model_id: str) -> bool:
     return rollout_sleep_unsupported(model_id)
 
 
+_MIN_ROLLOUT_MAX_NUM_SEQS = 16
+
+
+def rollout_max_num_seqs(rollout_batch: int) -> int:
+    """concurrent sequence slots to provision the rollout engine for.
+
+    verl leaves ``rollout.max_num_seqs`` at its yaml default of 1024 (rollout.yaml:79) and passes
+    it straight to the vllm engine (vllm_async_server.py:261). vllm sizes two up-front, fixed
+    allocations from that number, neither of which shrinks to the batch actually submitted:
+
+    * cuda-graph capture. ``max_graph_size = min(max_num_seqs * 2, 512)`` over the ladder
+      ``[1,2,4] + range(8,256,8) + range(256, max_graph_size+1, 16)`` (vllm config/vllm.py, 0.12.x).
+      at 1024 that is 51 sizes, and a lora run captures each size twice -- vllm takes
+      ``product(batch_sizes, [True, False])`` over lora-active/inactive when
+      ``cudagraph_specialize_lora`` is on (gpu_model_runner.py) -- for exactly the ``0/102``
+      seen in the failing console. note the ladder saturates at 512, so 1024, 512 and 256 are
+      indistinguishable; only dropping below 256 shortens it, and 32 gives 11 sizes / 22 graphs.
+    * recurrent state. a gdn/mamba hybrid reserves one state block per decode slot, a dense
+      allocation that -- unlike paged kv -- cannot be shared, paged out, or grown on demand.
+
+    both are paid before the first rollout token, inside the ``gpu_memory_utilization`` budget. a
+    grpo/opd step submits exactly ``prompts_per_step * group_size`` sequences, so a run with 32
+    concurrent generations was provisioning for 1024 and dying during graph capture with ~80% of
+    the card free -- on 234, 358, and 460 GB alike, since the cost is fixed rather than
+    proportional to the card.
+
+    the floor keeps small runs on a usable capture ladder rather than collapsing it to one size.
+    """
+    if rollout_batch <= 0:
+        raise ValueError("rollout_batch must be positive")
+    return max(_MIN_ROLLOUT_MAX_NUM_SEQS, int(rollout_batch))
+
+
 def rollout_resident_overrides(sleep_unsupported: bool) -> list[str]:
     """verl overrides that pin the rollout engine resident, or ``[]`` to keep verl's default.
 

@@ -9273,3 +9273,26 @@ def test_resumed_grpo_seeds_the_dump_watermark_at_the_resume_boundary():
     ledger = RolloutIdentityLedger(1, 2)
     with pytest.raises(ValueError, match="no registered rollout identity set"):
         ledger.seal(2)
+
+
+def test_build_verl_overrides_sizes_max_num_seqs_to_the_rollout_batch():
+    """The rollout engine must be provisioned for the batch the step submits, not verl's default.
+
+    verl leaves ``rollout.max_num_seqs`` at 1024 (rollout.yaml:79). vllm derives
+    ``max_cudagraph_capture_size = min(max_num_seqs * 2, 512)`` over the ladder
+    ``[1,2,4] + range(8,256,8) + range(256,513,16)`` -- 51 sizes at the default, captured twice
+    when lora specialization is on -- and a gdn/mamba hybrid additionally reserves one recurrent
+    state block per decode slot. Both are paid up front, inside the gpu_memory_utilization budget,
+    so a 32-sequence run died at graph capture on 234, 358 and 460 GB alike.
+    """
+    o = rl_train.build_verl_overrides(_overrides_cfg(prompts_per_step=8, group_size=4))
+    assert "actor_rollout_ref.rollout.max_num_seqs=32" in o
+    # and never verl's default, which is what made the reservation fixed rather than proportional.
+    assert not any(override == "actor_rollout_ref.rollout.max_num_seqs=1024" for override in o)
+
+
+def test_build_verl_overrides_floors_max_num_seqs_for_a_tiny_rollout_batch():
+    # a batch of 1 would otherwise capture a single graph size and push every wider decode step
+    # onto the eager path.
+    o = rl_train.build_verl_overrides(_overrides_cfg(prompts_per_step=1, group_size=1))
+    assert "actor_rollout_ref.rollout.max_num_seqs=16" in o

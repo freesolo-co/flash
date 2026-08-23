@@ -4779,3 +4779,41 @@ def test_the_lora_rollout_guard_does_not_wrap_itself_twice(monkeypatch):
 
     assert module.vLLMHttpServer.generate is first
     assert asyncio.run(module.vLLMHttpServer().generate([1], {}, "req-3"))[0] == "generated"
+
+
+@pytest.mark.parametrize(
+    ("rollout_batch", "expected"),
+    [(1, 16), (4, 16), (16, 16), (32, 32), (64, 64), (512, 512)],
+)
+def test_rollout_max_num_seqs_tracks_the_rollout_batch_above_the_floor(rollout_batch, expected):
+    from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
+
+    assert rollout_max_num_seqs(rollout_batch) == expected
+
+
+def test_rollout_max_num_seqs_never_returns_verls_default_for_a_small_batch():
+    # the regression this exists for: verl leaves rollout.max_num_seqs at 1024, and vllm sizes
+    # cuda-graph capture (min(max_num_seqs * 2, 512) over a 51-rung ladder, doubled when lora
+    # specialization is on) and per-slot gdn/mamba recurrent state from it, both before the first
+    # rollout token. a 32-sequence grpo step paid a 1024-sequence reservation and OOMed during
+    # capture with ~80% of the card free.
+    from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
+
+    for batch in (8, 32, 64, 128):
+        assert rollout_max_num_seqs(batch) < 1024
+
+
+def test_rollout_max_num_seqs_is_never_below_the_batch_it_must_serve():
+    # provisioning FEWER slots than the step submits would queue sequences instead of running them,
+    # turning one rollout into several scheduler passes.
+    from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
+
+    for batch in range(1, 600):
+        assert rollout_max_num_seqs(batch) >= batch
+
+
+def test_rollout_max_num_seqs_rejects_a_nonpositive_batch():
+    from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
+
+    with pytest.raises(ValueError, match="rollout_batch must be positive"):
+        rollout_max_num_seqs(0)
