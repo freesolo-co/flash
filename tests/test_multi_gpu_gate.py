@@ -1,7 +1,7 @@
 """CPU tests for multi-gpu parity: every provider rents n cards on one machine, none is special.
 
 There is no submit-time multi-gpu gate any more. Every phase shards (sft, grpo and opd all delegate
-to verl, whose workers launch nproc-per-node == gpu.count ranks) and all three providers can reach a
+to verl, whose workers launch nproc-per-node == gpu.count ranks) and all four providers can reach a
 real n-card box, so a rejection would have nothing left to reject. What replaces the gate is a
 contract each provider must hold up, and that is what these tests pin:
 
@@ -24,9 +24,9 @@ from tests._helpers.profile import satisfy_sft_profile
 from tests._helpers.source_snapshot import valid_source_snapshot
 from tests._helpers.teacher import configure_managed_teacher
 
-_PROVIDERS = ("runpod", "lambda", "vast")
+_PROVIDERS = ("runpod", "lambda", "vast", "modal")
 _SOURCE_SNAPSHOT = valid_source_snapshot()
-# the only managed class all three providers stock. a parity test needs one class every provider can
+# the only managed class all four providers stock. a parity test needs one class every provider can
 # actually provision, or the spec is rejected on catalog grounds before parity is ever exercised.
 _TRI_PROVIDER_GPU = "H100"
 
@@ -72,9 +72,9 @@ def _fake_vast_row(cards: int) -> dict:
 
 @pytest.fixture
 def all_providers_configured(monkeypatch):
-    """Enable lambda/vast AND stub their markets so a parity assertion really covers all three.
+    """Enable lambda/vast AND stub their markets so a parity assertion really covers all four.
 
-    Two separate problems, both of which would otherwise turn a three-way parity test into a
+    Two separate problems, both of which would otherwise turn a four-way parity test into a
     runpod-only one. ``is_configured`` is keyed on an operator API key and this box carries only
     RunPod's, so lambda/vast would fail on credentials. But a key alone sends the real client at the
     network, which a CPU test must never do (and which fails here as a 404). So the catalog/market
@@ -86,6 +86,8 @@ def all_providers_configured(monkeypatch):
 
     monkeypatch.setenv("LAMBDA_API_KEY", "test-key-not-used")
     monkeypatch.setenv("VAST_API_KEY", "test-key-not-used")
+    monkeypatch.setenv("MODAL_TOKEN_ID", "test-id-not-used")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "test-secret-not-used")
     monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _fake_lambda_types())
     monkeypatch.setattr(
         vast_api,
@@ -130,7 +132,7 @@ def test_no_multi_gpu_gate_survives_anywhere():
 def test_submit_accepts_multi_gpu_on_every_provider(
     monkeypatch, all_providers_configured, provider, algorithm
 ):
-    """No provider is special: a multi-gpu spec reaches preparation on all three.
+    """No provider is special: a multi-gpu spec reaches preparation on all four.
 
     dry_run stops before provisioning, so this asserts only that nothing rejects the shape up front.
     """
@@ -194,7 +196,7 @@ def test_single_card_constraint_yields_only_single_card_offers(all_providers_con
         checked.append(name)
     # without this the loop would pass on a box where no provider is enabled, reporting coverage of
     # three providers while having checked none.
-    assert checked == list(_PROVIDERS), f"expected all three providers enabled, checked {checked}"
+    assert checked == list(_PROVIDERS), f"expected all four providers enabled, checked {checked}"
 
 
 def test_lambda_names_the_card_count_in_the_instance_type():
@@ -610,7 +612,7 @@ def test_vast_capacity_refresh_keeps_the_allocated_card_count():
     assert handle.instance_id == 4242
 
 
-@pytest.mark.parametrize("provider", ["lambda", "vast"])
+@pytest.mark.parametrize("provider", ["lambda", "vast", "modal"])
 def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
     """The handle's ``hourly_usd`` is billed against wall-clock ONCE, so it must cover every card.
 
@@ -648,7 +650,7 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
             )
         finally:
             monkey.undo()
-    else:
+    elif provider == "vast":
         from flash.providers.vast import api as vast_api
         from flash.providers.vast import jobs as vj
         from flash.providers.vast.jobs.builders import VastOffer
@@ -674,6 +676,29 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
                 spec,
                 seed=spec.seed,
                 offers=[offer],
+                source_snapshot=_SOURCE_SNAPSHOT,
+                deadline_at=9_999_999_999.0,
+            )
+        finally:
+            monkey.undo()
+    else:
+        from flash.providers.modal import api as modal_api
+        from flash.providers.modal import jobs as mj
+        from flash.providers.modal import pricing as modal_pricing
+
+        spec = _submittable("grpo", count=cards, provider="modal")
+        monkey = pytest.MonkeyPatch()
+        try:
+            monkey.setattr(modal_api, "create_sandbox", lambda *_a, **_kw: "sb-1")
+            monkey.setattr(
+                modal_api,
+                "sandbox_gpu_names",
+                lambda _instance_id: ["NVIDIA H100 80GB HBM3"] * cards,
+            )
+            monkey.setattr(modal_pricing, "hourly_rate", lambda _gpu: per_card)
+            handle = mj.deploy_and_submit(
+                spec,
+                seed=spec.seed,
                 source_snapshot=_SOURCE_SNAPSHOT,
                 deadline_at=9_999_999_999.0,
             )

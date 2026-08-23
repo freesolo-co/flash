@@ -13,6 +13,7 @@ def test_canonical_gpu_aliases():
     for alias in ("RTX 4090", "rtx4090", "4090", "RTX_4090"):
         assert canonical_gpu(alias) == "RTX 4090"
     assert canonical_gpu("NVIDIA A100-SXM4-40GB") == "A100 SXM 40GB"
+    assert canonical_gpu("a100 pcie") == "A100 PCIe"
 
 
 def test_ambiguous_provider_aliases_are_not_user_canonicalizable():
@@ -39,17 +40,17 @@ def test_unknown_gpu_rejected():
 def test_providers_for():
     from flash.providers.base import providers_for
 
-    # Consumer GeForce cards are RunPod + Vast (Vast's verified-datacenter market carries GeForce;
-    # Lambda's datacenter fleet does not). Order follows the registry: runpod, lambda, vast.
+    # consumer geforce cards are runpod + vast; order follows the provider registry.
     assert providers_for("RTX 4090") == ("runpod", "vast")
     assert providers_for("RTX 5090") == ("runpod", "vast")
     # Datacenter cards span the instance-based complements where the hardware exists.
-    assert providers_for("H100") == ("runpod", "lambda", "vast")
+    assert providers_for("H100") == ("runpod", "lambda", "vast", "modal")
+    assert providers_for("H200") == ("runpod", "modal")
     assert providers_for("A100 PCIe") == ("runpod", "vast")
-    assert providers_for("RTX Pro 6000") == ("runpod",)  # no vast_name (RunPod-only)
-    # Provider-exclusive / mixed instance classes.
-    assert providers_for("A10") == ("lambda",)  # Lambda-only (no RunPod A10, no Vast A10)
-    assert providers_for("A100 SXM 40GB") == ("lambda", "vast")  # instance-only 40 GB SXM4
+    assert providers_for("A100 SXM") == ("runpod", "vast", "modal")
+    assert providers_for("RTX Pro 6000") == ("runpod",)
+    assert providers_for("A10") == ("lambda", "modal")
+    assert providers_for("A100 SXM 40GB") == ("lambda", "vast", "modal")
 
 
 def test_vast_gpu_for_offer_accepts_h100_pcie_alias():

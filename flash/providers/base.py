@@ -28,6 +28,7 @@ class GpuClass:
     validated: bool = False
     lambda_name: str | None = None  # None -> not on Lambda; priced from Lambda live rates
     vast_name: str | None = None  # None -> not on Vast; priced from Vast live/static rates
+    modal_name: str | None = None  # none -> not on modal; priced from modal's own static table
     vast_aliases: tuple[str, ...] = ()
 
 
@@ -55,7 +56,17 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         vast_name="RTX 5090",
     ),
     # Lambda-only; RunPod has no A10. Allocator reaches it only after cheaper RunPod classes exhaust.
-    GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10", validated=True),
+    GpuClass(
+        "A10",
+        None,
+        24,
+        "a10",
+        "sm86",
+        1.29,
+        lambda_name="gpu_1x_a10",
+        modal_name="A10G",
+        validated=True,
+    ),
     # Lambda-only 40 GB A100; fills the 32->80 GB gap on Lambda.
     GpuClass(
         "A100 SXM 40GB",
@@ -67,6 +78,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         lambda_name="gpu_1x_a100_sxm4",
         validated=True,
         vast_name="A100 SXM4",
+        modal_name="A100-40GB",
         vast_aliases=("A100 PCIE",),
     ),
     GpuClass(
@@ -88,6 +100,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         1.49,
         validated=True,
         vast_name="A100 SXM4",
+        modal_name="A100-80GB",
     ),
     GpuClass(
         "H100",
@@ -99,6 +112,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         validated=True,
         lambda_name="gpu_1x_h100_pcie",
         vast_name="H100 SXM",
+        modal_name="H100",
         # Vast lists PCIe H100s separately as "H100 PCIE"; accept them as H100 capacity (same sm90 / 80
         # GB; for our single-GPU runs the SXM-vs-PCIe interconnect gap doesn't apply). Priced live off
         # the actual offer, so a cheaper PCIe board just makes the class more available.
@@ -112,6 +126,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         "sm90",
         4.39,
         validated=True,
+        modal_name="H200",
     ),
     GpuClass(
         "RTX Pro 6000",
@@ -134,6 +149,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
         min_cuda_modern="13.0",
         validated=True,
         lambda_name="gpu_1x_b200_sxm6",
+        modal_name="B200",
     ),
 )
 
@@ -270,7 +286,8 @@ def get_gpu_info(name: str) -> GpuClass:
 
 def gpu_classes_for(identity_attr: str) -> list[GpuClass]:
     """Managed GPU classes a provider can provision: those whose per-provider identity field is set
-    (``enum_member`` for RunPod, ``lambda_name`` for Lambda, ``vast_name`` for Vast). One catalog query
+    (``enum_member`` for RunPod, ``lambda_name`` for Lambda, ``vast_name`` for Vast, ``modal_name``
+    for Modal). One catalog query
     shared by every provider's ``gpu_classes()`` so the "which classes do I offer" rule can't drift."""
     return [g for g in GPU_INFO.values() if getattr(g, identity_attr)]
 
@@ -317,6 +334,8 @@ def providers_for(name: str) -> tuple[str, ...]:
         out.append("lambda")
     if info.vast_name:
         out.append("vast")
+    if info.modal_name:
+        out.append("modal")
     return tuple(out)
 
 

@@ -25,7 +25,7 @@ GPU_COMPUTE_TFLOPS: dict[str, float] = {
     # vendor spec.
     "A100 SXM": 264.0,
     # A100 SXM 40GB: same SMs/tensor cores as the 80GB A100 SXM, less HBM only, so it inherits the
-    # measured SXM rate. Without an entry, 33-40 GB Lambda/Vast quotes fall back to _DEFAULT_TFLOPS.
+    # measured sxm rate. without an entry, 33-40 gb lambda/vast/modal quotes fall back to _DEFAULT_TFLOPS.
     "A100 SXM 40GB": 264.0,
     # MEASURED on a rented RunPod H100 PCIe (sm90, torch 2.10+cu128): 490-504 TFLOPS sustained
     # across repeated trials at full clocks (1755 MHz), 310 W board. The 990 figure is the SXM
@@ -68,8 +68,8 @@ _NVLINK_CLASSES: frozenset[str] = frozenset(
 # providers that sell a canonical class as a market rather than a pinned board, so an nvlink
 # class membership cannot be trusted for a multi-card combination there. vast lists pcie parts under
 # aliases that normalize into nvlink-classed entries and its offers carry no interconnect field.
-# runpod is absent because it pins an exact gpu id per class; lambda is absent because it has no
-# multi-card path at all, so no scaling question arises.
+# runpod and modal are absent because both pin exact sxm product identities for these classes; lambda
+# is absent because it has no multi-card path at all, so no scaling question arises.
 _PCIE_AMBIGUOUS_PROVIDERS: frozenset[str] = frozenset({"vast"})
 
 

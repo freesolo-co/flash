@@ -30,7 +30,7 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
-@pytest.mark.parametrize("arm", ["lambda", "vast"])
+@pytest.mark.parametrize("arm", ["lambda", "vast", "modal"])
 def test_arm_accepts_current_provider_identity(arm):
     assert b._arm({"flash_arm": arm}) == arm
 

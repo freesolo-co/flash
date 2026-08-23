@@ -2,7 +2,7 @@
 
 The rule is "enough to run a job", not "everything Freesolo runs in production". A
 self-hosted plane picks its own GPU substrate, so the provider check is a floor (at
-least ONE of RunPod/Lambda/Vast configured), not a roll call. Configuration that only
+least ONE of RunPod/Lambda/Vast/Modal configured), not a roll call. Configuration that only
 degrades an optional capability warns instead of refusing to boot - a plane that cannot
 fail over between RunPod accounts still trains runs, and refusing to start teaches the
 operator nothing it could not learn from a log line.
@@ -36,6 +36,7 @@ _PROVIDER_SETUP = (
     ("runpod", "RUNPOD_API_KEY", "one or more comma-separated RunPod account keys"),
     ("lambda", "LAMBDA_API_KEY", "a Lambda Cloud API key"),
     ("vast", "VAST_API_KEY", "a Vast.ai API key"),
+    ("modal", "MODAL_TOKEN_ID + MODAL_TOKEN_SECRET", "a Modal token pair"),
 )
 
 

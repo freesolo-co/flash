@@ -145,16 +145,16 @@ def test_a_non_integer_gpus_is_refused_at_parse_time(bad, capsys):
     assert "--gpus" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
+@pytest.mark.parametrize("provider", ["runpod", "lambda", "vast", "modal"])
 def test_gpus_is_accepted_on_every_provider(tmp_path, provider):
-    """The flag carries no provider special-casing: 4 cards is a legal ask on all three.
+    """The flag carries no provider special-casing: 4 cards is a legal ask on all four.
 
     This replaces a test of the old RunPod-only submit gate. That gate existed because Lambda and
     Vast ignored the count and would have landed 4 ranks on one rented card while billing for four;
     both now rent the allocated shape (Lambda names the count in the instance type, Vast filters
     offers by num_gpus), so rejecting the ask is no longer correct for any provider.
 
-    H100 rather than the shared BASE's B200: it is the one managed class all three stock, so the
+    H100 rather than the shared BASE's B200: it is the one managed class all four stock, so the
     spec is not rejected on catalog grounds before the count is ever considered.
     """
     config = BASE.replace('type = "B200"', 'type = "H100"').replace('"runpod"', f'"{provider}"')

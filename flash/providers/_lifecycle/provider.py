@@ -1,6 +1,6 @@
 """Shared template for rent-a-box (instance) providers.
 
-Lambda and Vast are ~identical thin delegators over the shared ``base.Provider`` interface: they
+Lambda, Vast, and Modal are ~identical thin delegators over the shared ``base.Provider`` interface: they
 provision a GPU instance, boot it, and detect completion from the worker's HF artifacts. The only
 differences are per-substrate details (which auth/pricing/jobs module to call, the handle class, the
 reattach deadline formula, and how a reattached instance is torn down).
@@ -26,7 +26,7 @@ from flash.providers.base import GpuClass, JobHandle, PollResult
 
 
 class InstanceProvider(abc.ABC):
-    """Shared ``base.Provider`` template for rent-a-box instance substrates (Lambda, Vast).
+    """Shared ``base.Provider`` template for rent-a-box instance substrates (Lambda, Vast, Modal).
 
     The hooks below are ``@abstractmethod``, so the ABC refuses to instantiate a subclass that
     forgets one — a mis-wired new provider fails at construction, not at a billing-critical teardown.
@@ -40,7 +40,8 @@ class InstanceProvider(abc.ABC):
 
     # --- subclass contract: class attrs + abstract hooks each substrate supplies ---
     name: str
-    _gpu_identity_attr: str  # ``GpuClass`` identity field: "vast_name" / "lambda_name".
+    # ``gpuclass`` identity field: "vast_name" / "lambda_name" / "modal_name".
+    _gpu_identity_attr: str
 
     @property
     @abc.abstractmethod

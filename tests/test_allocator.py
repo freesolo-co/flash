@@ -2485,8 +2485,8 @@ def test_fit_remedy_is_withheld_when_only_fixed_count_sku_providers_remain():
     """A width is only PROMISED when a provider in play rents card counts freely.
 
     Lambda names the count in the instance type and Vast bakes it into the offer, so a wider shape
-    exists only if their live catalog lists one -- unknowable here. RunPod takes the count as a
-    launch parameter, so its remedy stays. The distinction is what the message CLAIMS: RunPod gets
+    exists only if their live catalog lists one -- unknowable here. RunPod and Modal take the count
+    as a launch parameter, so their remedies stay. The distinction is what the message CLAIMS: they get
     "it fits on N cards" because the fit was proved offline, while a fixed-count provider is only
     offered the width to ask its catalog for. Naming a width to check beats a bare shortfall the
     user cannot act on; asserting one exists would send them to buy a shape that may not be sold.
@@ -2877,6 +2877,7 @@ def test_rents_arbitrary_card_counts_splits_providers_by_how_counts_are_sold():
     from flash.providers.fit_errors import rents_arbitrary_card_counts
 
     assert rents_arbitrary_card_counts(("runpod",)) is True
+    assert rents_arbitrary_card_counts(("modal",)) is True
     assert rents_arbitrary_card_counts(("lambda",)) is False
     assert rents_arbitrary_card_counts(("vast",)) is False
     assert rents_arbitrary_card_counts(("lambda", "vast")) is False

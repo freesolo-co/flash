@@ -1271,7 +1271,7 @@ def test_gpu_provider_preferences_reject_invalid_authoring() -> None:
         GpuSpec(providers=[])
     with pytest.raises(ConfigError, match="must name at least one provider"):
         spec_from_dict(_raw(**{"gpu.providers": []}))
-    with pytest.raises(ConfigError, match=r"one of runpod, lambda, vast"):
+    with pytest.raises(ConfigError, match=r"one of runpod, lambda, vast, modal"):
         spec_from_dict(_raw(**{"gpu.providers": ["aws"]}))
     with pytest.raises(ConfigError, match=r"gpu\.provider and gpu\.providers cannot both be set"):
         spec_from_dict(_raw(**{"gpu.provider": "runpod", "gpu.providers": ["vast"]}))
@@ -1421,7 +1421,7 @@ def test_soft_provider_preference_does_not_reject_an_ineligible_gpu_type_pair() 
 def test_persisted_gpu_provider_preferences_reject_invalid_values() -> None:
     with pytest.raises(ValueError, match="must name at least one provider"):
         _job_from_dict({"gpu": {"providers": []}})
-    with pytest.raises(ValueError, match=r"one of runpod, lambda, vast"):
+    with pytest.raises(ValueError, match=r"one of runpod, lambda, vast, modal"):
         _job_from_dict({"gpu": {"providers": ["aws"]}})
     with pytest.raises(ValueError, match=r"gpu\.provider and gpu\.providers cannot both be set"):
         _job_from_dict({"gpu": {"provider": "runpod", "providers": ["vast"]}})

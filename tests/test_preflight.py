@@ -16,7 +16,13 @@ _ALWAYS_REQUIRED = (
     "FREESOLO_INTERNAL_KEY",
 )
 # Any ONE of these enables a GPU provider and satisfies the substrate floor.
-_PROVIDER_KEYS = ("RUNPOD_API_KEY", "LAMBDA_API_KEY", "VAST_API_KEY")
+_PROVIDER_KEYS = (
+    "RUNPOD_API_KEY",
+    "LAMBDA_API_KEY",
+    "VAST_API_KEY",
+    "MODAL_TOKEN_ID",
+    "MODAL_TOKEN_SECRET",
+)
 
 
 def _set_runpod(monkeypatch, value: str) -> None:
@@ -68,29 +74,29 @@ def test_preflight_passes_with_minimal_config(clean_env, monkeypatch):
     pf.check_run_preflight()  # no raise
 
 
-@pytest.mark.parametrize("provider_var", _PROVIDER_KEYS)
-def test_preflight_accepts_any_single_provider(clean_env, monkeypatch, provider_var):
-    """A self-hosted plane picks its own substrate: ONE configured provider is enough.
-
-    This is the whole point of the floor - requiring RunPod AND Lambda locked self-hosters out of
-    a working single-provider deployment.
-    """
+@pytest.mark.parametrize(
+    ("expected", "provider_vars"),
+    [
+        ("runpod", ("RUNPOD_API_KEY",)),
+        ("lambda", ("LAMBDA_API_KEY",)),
+        ("vast", ("VAST_API_KEY",)),
+        ("modal", ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET")),
+    ],
+)
+def test_preflight_accepts_any_single_provider(clean_env, monkeypatch, expected, provider_vars):
+    """A self-hosted plane picks its own substrate: ONE configured provider is enough."""
     monkeypatch.setenv("HF_TOKEN", "hf")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fsk")
-    if provider_var == "RUNPOD_API_KEY":
-        _set_runpod(monkeypatch, "rp-a")
-    else:
-        monkeypatch.setenv(provider_var, "key")
+    for provider_var in provider_vars:
+        if provider_var == "RUNPOD_API_KEY":
+            _set_runpod(monkeypatch, "rp-a")
+        else:
+            monkeypatch.setenv(provider_var, "key")
     _clear_provider_cache()
-    pf.check_run_preflight()  # no raise
+    pf.check_run_preflight()
 
     from flash.providers import available_providers
 
-    expected = {
-        "RUNPOD_API_KEY": "runpod",
-        "LAMBDA_API_KEY": "lambda",
-        "VAST_API_KEY": "vast",
-    }[provider_var]
     assert available_providers() == (expected,)
 
 

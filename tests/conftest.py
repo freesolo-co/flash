@@ -351,7 +351,7 @@ def _offline(monkeypatch):
         import runpod_flash  # noqa: F401
 
     # scrub automatically forwarded secrets from the production key set so operator credentials
-    # never enter fixtures. lambda/vast keys enable live providers, FREESOLO_API_KEY changes org
+    # never enter fixtures. lambda/vast/modal keys enable live providers, freesolo_api_key changes org
     # identity, and FLASH_STANDALONE/FLASH_HF_NAMESPACE change global mode. tests opt in after this
     # fixture; see tests/test_server_standalone.py.
     from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
@@ -360,6 +360,8 @@ def _offline(monkeypatch):
         "FREESOLO_API_KEY",
         "LAMBDA_API_KEY",
         "VAST_API_KEY",
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
         "PARASAIL_API_KEY",
         "FLASH_PUBLIC_URL",
         "FLASH_TEACHER_CAPABILITY",

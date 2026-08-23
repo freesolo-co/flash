@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 import flash.providers.lambda_.preflight as lambda_preflight
+import flash.providers.modal.preflight as modal_preflight
 import flash.providers.runpod.preflight as runpod_preflight
 import flash.providers.vast.preflight as vast_preflight
 
@@ -29,6 +30,20 @@ def test_vast_preflight_ignores_hf_and_reports_only_its_api_key(monkeypatch, req
     ]
     monkeypatch.setattr(vast_preflight, "load_api_key", lambda: "vast-key")
     assert vast_preflight.missing_credentials(require_hf=require_hf) == []
+
+
+@pytest.mark.parametrize("require_hf", [False, True])
+def test_modal_preflight_ignores_hf_and_reports_the_token_pair(monkeypatch, require_hf) -> None:
+    """Modal preflight must require both token values and leave shared HF checks central."""
+    monkeypatch.setattr(modal_preflight, "load_credentials", lambda: None)
+    assert modal_preflight.missing_credentials(require_hf=require_hf) == [
+        (
+            "  - MODAL_TOKEN_ID / MODAL_TOKEN_SECRET: the operator's Modal token pair "
+            "(for the modal provider)"
+        )
+    ]
+    monkeypatch.setattr(modal_preflight, "load_credentials", lambda: ("id", "secret"))
+    assert modal_preflight.missing_credentials(require_hf=require_hf) == []
 
 
 @pytest.mark.parametrize(

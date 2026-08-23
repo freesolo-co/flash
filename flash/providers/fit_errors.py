@@ -105,9 +105,10 @@ def rents_arbitrary_card_counts(providers: Iterable[str]) -> bool:
     """Whether some provider here sells a card count that no live catalog has to confirm.
 
     Providers differ in KIND on this, as ``AllocationConstraints.max_gpu_count`` records: RunPod
-    takes the count as a launch parameter, so any rentable count is purchasable from the static
-    table alone, while Lambda names it in the instance type and Vast has it baked into the offer,
-    so an N-card shape only exists if their live catalog happens to list one. ``live_capacity`` is
+    and Modal take the count as a launch parameter, so any supported rentable count is purchasable
+    from the static table alone, while Lambda names it in the instance type and Vast has it baked
+    into the offer, so an N-card shape only exists if their live catalog happens to list one.
+    ``live_capacity`` is
     the signal that separates the two -- a provider stocking from a live market is exactly the one
     whose per-count SKUs cannot be confirmed offline. A new provider that sells fixed counts from a
     static table would need its own flag rather than this proxy.

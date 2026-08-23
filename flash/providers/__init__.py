@@ -7,12 +7,14 @@ owns pricing, provisioning, polling, cancellation, and teardown.
   runpod      serverless Flash endpoints (always on)
   lambda      Lambda Cloud GPU instances (instance-based complement; iff LAMBDA_API_KEY set)
   vast        Vast.ai verified-datacenter containers (live-market complement; iff VAST_API_KEY set)
+  modal       Modal GPU Sandboxes (instance-based complement; iff both Modal token vars are set)
 
 this module is the registry: ``get_provider(name)`` / ``PROVIDER_NAMES``.
 ``allocator.allocate`` iterates providers enabled by ``available_providers()`` in registered
 ``PROVIDER_NAMES`` order. ``Provider.is_configured()`` controls control-plane enablement; preflight
 separately checks required credentials and configuration. neither check implies network reachability
-or live capacity. Lambda/Vast opt in with operator keys; RunPod reports missing credentials at preflight.
+or live capacity. Lambda/Vast/Modal opt in with operator credentials; RunPod reports missing
+credentials at preflight.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from flash.providers.base import Provider
 
 # registry order is not a primary selection preference. it affects only exact full-key allocation
 # ties through Python's stable sort.
-PROVIDER_NAMES: tuple[str, ...] = ("runpod", "lambda", "vast")
+PROVIDER_NAMES: tuple[str, ...] = ("runpod", "lambda", "vast", "modal")
 
 
 def validated_provider_preferences(value, *, allow_empty: bool = False) -> tuple[str, ...]:
@@ -51,8 +53,8 @@ def validated_provider_preferences(value, *, allow_empty: bool = False) -> tuple
 # Instance-billed providers: they rent a VM/container that BILLS UNTIL TERMINATED, so they need the
 # generic instance-cleanup paths (retry teardown, gc-by-label) that endpoint-based RunPod doesn't.
 # Single source of truth — keep cleanup/realization sites pointed here so a new instance provider is
-# wired into every reaper by adding ONE name (not by hunting hardcoded ("lambda", "vast") tuples).
-INSTANCE_PROVIDERS: tuple[str, ...] = ("lambda", "vast")
+# wired into every reaper by adding one name rather than hunting provider-specific tuples.
+INSTANCE_PROVIDERS: tuple[str, ...] = ("lambda", "vast", "modal")
 
 
 def get_provider(name: str) -> Provider:
@@ -72,6 +74,10 @@ def _get_provider(key: str) -> Provider:
         return PROVIDER
     if key == "vast":
         from flash.providers.vast import PROVIDER
+
+        return PROVIDER
+    if key == "modal":
+        from flash.providers.modal import PROVIDER
 
         return PROVIDER
     raise KeyError(f"unknown provider {key!r} (known: {', '.join(PROVIDER_NAMES)})")

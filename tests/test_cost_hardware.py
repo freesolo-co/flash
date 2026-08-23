@@ -67,6 +67,9 @@ def test_nvlink_classification_is_by_form_factor():
     assert has_nvlink("A100 SXM")
     assert has_nvlink("A100 SXM 40GB")
     assert has_nvlink("H100")
+    assert has_nvlink("H100", provider="modal")
+    assert has_nvlink("H200", provider="modal")
+    assert has_nvlink("B200", provider="modal")
     # geforce parts do not; the 4090 dropped the nvlink connector entirely. l40s is a pcie board.
     assert not has_nvlink("RTX 4090")
     assert not has_nvlink("L40S")

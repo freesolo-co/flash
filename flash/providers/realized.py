@@ -23,7 +23,7 @@ def realized_cost_for_remote(
     """Return realized cost from the persisted provider handle, or None if unattributable.
 
     ``end`` is the settle-padded billing-query bound for RunPod; ``run_end`` is the true teardown
-    time for instance providers (Lambda/Vast) -- using ``end`` there would overbill by the settle
+    time for instance providers (Lambda/Vast/Modal) -- using ``end`` there would overbill by the settle
     padding.
     """
     if not remote:
@@ -36,7 +36,7 @@ def realized_cost_for_remote(
     from flash.providers import INSTANCE_PROVIDERS
 
     if provider in INSTANCE_PROVIDERS:
-        # Both instance-billed providers: realized COGS == wall-clock x the instance's flat $/hr
+        # instance-billed providers: realized cogs == wall-clock x the instance's flat $/hr
         # (Vast's $/hr is the offer's live rate stamped on the handle as ``hourly_usd``).
         return _instance_realized_cost(remote, end=run_end if run_end is not None else end)
     return None

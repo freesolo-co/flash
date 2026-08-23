@@ -46,8 +46,8 @@ _HOST_HELPER_SOURCES = (
 )
 
 PROFILES: dict[str, Profile] = {
-    # rented-box providers (Lambda, Vast): the shared bootstrap plus the host helpers the launch
-    # script runs directly. one profile, because both providers execute the same programs.
+    # rented-box providers (lambda, vast, modal): the shared bootstrap plus the host helpers the launch
+    # script runs directly. one profile, because all three providers execute the same programs.
     "instance-bootstrap": Profile(
         name="instance-bootstrap",
         version=2,

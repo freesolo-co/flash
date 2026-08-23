@@ -10,7 +10,7 @@ from flash.core.spec import JobSpec
 from flash.runner import RunStatus
 
 # the provider-allocated identifier that names the billable resource itself, per provider handle
-# above: runpod carries `endpoint_id`, lambda and vast carry `instance_id`. a record holding one of
+# above: runpod carries `endpoint_id`; lambda, vast, and modal carry `instance_id`. a record holding one of
 # these still has something to delete even when the rest of it fails strict validation.
 _RESOURCE_ID_FIELDS = ("endpoint_id", "instance_id")
 

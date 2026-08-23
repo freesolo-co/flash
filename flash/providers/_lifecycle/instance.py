@@ -1,4 +1,4 @@
-"""Shared building blocks for the instance-based providers (Lambda, Vast)."""
+"""Shared building blocks for the instance-based providers (Lambda, Vast, Modal)."""
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ def instance_label(run_id: str, seed: int, attempt: int) -> str:
 
 @dataclass
 class InstanceJobHandle:
-    """Fields + (de)serialization common to every rent-a-box provider handle (Lambda, Vast).
+    """Fields + (de)serialization common to every rent-a-box provider handle (Lambda, Vast, Modal).
 
     Persisted in `RunStatus.remote` for reattach and cancellation. Subclasses add locator fields;
     `instance_id` has no safe default because it is the poll/destroy target.

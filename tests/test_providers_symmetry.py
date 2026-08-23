@@ -36,21 +36,22 @@ PROVIDER_METHODS = (
 )
 
 
-_PKG = {"runpod": "runpod", "lambda": "lambda_", "vast": "vast"}
+_PKG = {"runpod": "runpod", "lambda": "lambda_", "vast": "vast", "modal": "modal"}
 
 
 def test_registry_lists_all_providers():
     from flash.providers import PROVIDER_NAMES, get_provider
 
-    assert PROVIDER_NAMES == ("runpod", "lambda", "vast")
+    assert PROVIDER_NAMES == ("runpod", "lambda", "vast", "modal")
     assert get_provider("RunPod ").name == "runpod"
     assert get_provider(" Lambda ").name == "lambda"  # case/space-insensitive
     assert get_provider(" Vast ").name == "vast"
+    assert get_provider(" Modal ").name == "modal"
     with pytest.raises(KeyError):
         get_provider("hyperstack")  # removed; not registered
 
 
-@pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
+@pytest.mark.parametrize("provider", ["runpod", "lambda", "vast", "modal"])
 def test_provider_implements_the_interface(provider):
     from flash.providers import get_provider
     from flash.providers.base import Provider
@@ -61,7 +62,7 @@ def test_provider_implements_the_interface(provider):
         assert callable(getattr(prov, meth)), f"{provider} missing {meth}"
 
 
-@pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
+@pytest.mark.parametrize("provider", ["runpod", "lambda", "vast", "modal"])
 def test_module_layout(provider):
     """Every provider subpackage exposes the SAME public module set (the symmetry contract)."""
     for mod in PROVIDER_MODULES:
@@ -70,7 +71,7 @@ def test_module_layout(provider):
     assert hasattr(pkg, "PROVIDER")
 
 
-@pytest.mark.parametrize("provider", ["lambda", "vast"])
+@pytest.mark.parametrize("provider", ["lambda", "vast", "modal"])
 def test_method_signatures_match_runpod(provider):
     """The interface methods take the same parameters on every provider (swappable)."""
     import inspect
@@ -196,12 +197,14 @@ def test_static_pricing():
     assert pricing.hourly_rate("RTX 5090") == pytest.approx(0.99)
 
 
-def _stub_candidates(monkeypatch, *, runpod=(), lambda_=(), vast=()):
-    """Pin allocate()'s three provider candidate lists so ranking can be tested in isolation."""
+def _stub_candidates(monkeypatch, *, runpod=(), lambda_=(), vast=(), modal=()):
+    """Pin every provider candidate list so ranking can be tested in isolation."""
     from flash.providers import allocator, get_provider
     from flash.providers.base import Candidate
 
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
+    monkeypatch.setattr(
+        allocator, "available_providers", lambda: ("runpod", "lambda", "vast", "modal")
+    )
     # allocate() sources candidates via provider.live_candidates(need, constraints); pin each provider's.
     monkeypatch.setattr(
         get_provider("runpod"),
@@ -217,6 +220,11 @@ def _stub_candidates(monkeypatch, *, runpod=(), lambda_=(), vast=()):
         get_provider("vast"),
         "live_candidates",
         lambda need, constraints: [Candidate(*c) for c in vast],
+    )
+    monkeypatch.setattr(
+        get_provider("modal"),
+        "live_candidates",
+        lambda need, constraints: [Candidate(*c) for c in modal],
     )
 
 
