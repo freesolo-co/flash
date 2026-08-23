@@ -11,6 +11,8 @@ from flash.engine.plan.vram import (
     _architecture_kv_raw_gb,
     _legacy_lora_floor_gb,
     _lora_memory_gb,
+    _lora_parameter_count,
+    _lora_weight_memory_gb,
     model_required_vram_gb,
 )
 
@@ -45,6 +47,43 @@ def test_curated_architecture_geometry_covers_every_loaded_lora_target():
             in_features > 0 and out_features > 0 and count > 0
             for in_features, out_features, count in info.lora_target_shapes
         )
+
+
+@pytest.mark.parametrize(
+    ("rank", "expected_params", "expected_bf16_gb"),
+    [
+        (16, 953_178_240, 1.90635648),
+        (32, 1_906_356_480, 3.81271296),
+        (64, 3_812_712_960, 7.62542592),
+    ],
+)
+def test_qwen36_moe_lora_footprint_matches_fused_expert_geometry(
+    rank: int, expected_params: int, expected_bf16_gb: float
+):
+    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    fused_count = info.num_layers * info.lora_expert_count
+
+    assert info.lora_expert_count == 256
+    assert (
+        sum(count == fused_count for _input_dim, _output_dim, count in info.lora_target_shapes) == 2
+    )
+    assert _lora_parameter_count(rank, info) == expected_params
+    assert _lora_weight_memory_gb(rank, info) == pytest.approx(expected_bf16_gb)
+
+
+def test_qwen36_moe_tp2_lora_footprint_keeps_one_projection_factor_replicated():
+    info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    full_params = _lora_parameter_count(64, info)
+    rank_params = _lora_parameter_count(64, info, tensor_parallel=2)
+
+    # vllm keeps the shared-expert gate's min-dim-1 factor whole on every rank. the gate shape costs
+    # 5,245,440 parameters rather than the fractional-shard result of 5,244,160.
+    gate_shape_params = 64 * 40 * (2048 + 1)
+    assert gate_shape_params == 5_245_440
+    assert full_params == 3_812_712_960
+    assert rank_params == 3_295_638_016
+    assert rank_params > full_params / 2
+    assert _lora_weight_memory_gb(64, info, tensor_parallel=2) == pytest.approx(6.591276032)
 
 
 @pytest.mark.parametrize("model_id", tuple(MODELS))
