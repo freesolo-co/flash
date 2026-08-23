@@ -354,8 +354,9 @@ fail() {{ echo "FLASH: $1" >&2; python3 /opt/flash/capsule.pyz failmark "$1" >/d
 deadline_sleep() {{ python3 /opt/flash/capsule.pyz deadline_sleep "$1"; }}
 # huggingface_hub on the host for the boot-log + failure-marker uploaders (best-effort).
 deadline_sleep 0 || exit 124
-pip3 install -q huggingface_hub >/dev/null 2>&1 \\
-  || python3 -m pip install -q --break-system-packages huggingface_hub >/dev/null 2>&1 || true
+# exact-pinned so host bootstrap retries cannot resolve different uploader behavior.
+pip3 install -q huggingface_hub==1.28.0 >/dev/null 2>&1 \\
+  || python3 -m pip install -q --break-system-packages huggingface_hub==1.28.0 >/dev/null 2>&1 || true
 # upload the host log while docker and the worker image start.
 ( for i in $(seq 1 15); do
     python3 /opt/flash/capsule.pyz hostlog >/dev/null 2>&1 || true

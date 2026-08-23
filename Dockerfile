@@ -14,7 +14,8 @@
 # also mount its own volume at the new location — otherwise state lands on the container's
 # writable layer and disappears when the container is replaced.
 
-FROM python:3.12-slim
+# digest-pinned so control-plane rebuilds reuse the exact reviewed base image bytes.
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
 
 WORKDIR /app
 COPY . .

@@ -197,6 +197,8 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
+          # pin the installed binary as well as the action implementation.
+          version: "0.12.5"
           # no cache: the post-run cache-prune calls `uv`, but the "Free disk space" step deletes
           # /opt/hostedtoolcache (where setup-uv put uv), so the post step fails ("uv not found") and
           # marks the whole job red even though the bake + push already succeeded.

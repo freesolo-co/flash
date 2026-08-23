@@ -101,10 +101,23 @@ def test_tilelang_pin_satisfies_flash_qla_hard_requirement():
 
 
 def test_worker_stack_pins_qwen35_capable_versions():
-    joined = " ".join(_worker_image_specs())
-    assert "vllm==0.19" in joined  # first transformers-5-compatible vllm line
-    assert "transformers>=5" in joined  # qwen3_5 model types need transformers 5.x
-    assert "bitsandbytes" in joined  # 8-bit paged AdamW optimizer state (LoRA+ coexists)
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+
+    requirements = {
+        requirement.name: requirement
+        for spec in _worker_image_specs()
+        if " @ " not in spec
+        for requirement in (Requirement(spec),)
+    }
+    exact_versions = {
+        name: [Version(item.version) for item in requirement.specifier if item.operator == "=="]
+        for name, requirement in requirements.items()
+    }
+    assert exact_versions["vllm"] == [Version("0.19.1")]
+    assert len(exact_versions["transformers"]) == 1
+    assert exact_versions["transformers"][0].major == 5  # qwen3_5 model types need transformers 5.x
+    assert exact_versions["bitsandbytes"] == [Version("0.50.1")]  # 8-bit paged AdamW state
 
 
 def _import_worker(monkeypatch):
@@ -1009,8 +1022,8 @@ def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
     assert touched == [], "non-Hopper must be a no-op (don't install or disable fla)"
 
 
-def test_verl_venv_pins_transformers_to_the_main_interpreters_range():
-    """The verl venv must carry the SAME transformers ceiling as the main interpreter.
+def test_verl_venv_pins_transformers_to_the_main_interpreters_version():
+    """The verl venv must carry the same exact transformers version as the main interpreter.
 
     /opt/verl-venv is built without --system-site-packages, so the main interpreter's pin does not
     reach it. The venv is the interpreter that TRAINS, and transformers owns the gdn modelling code
@@ -1030,21 +1043,21 @@ def test_verl_venv_pins_transformers_to_the_main_interpreters_range():
     root = pathlib.Path(__file__).resolve().parent.parent
     dockerfile = (root / "Dockerfile.worker").read_text()
 
-    main_pin = re.search(r'"(transformers>=[\d.]+,<[\d.]+)"[^\n]*\\\n\s+"peft', dockerfile)
-    assert main_pin, "could not find the main interpreter's transformers pin"
+    main_pin = re.search(r'"(transformers==[\d.]+)"[^\n]*\\\n\s+"peft', dockerfile)
+    assert main_pin, "could not find the main interpreter's exact transformers pin"
 
     overrides = re.search(r"printf '%s\\n'(.*?)> /tmp/verl-overrides\.txt", dockerfile)
     assert overrides, "could not find the verl-overrides.txt line"
     assert main_pin.group(1) in overrides.group(1), (
-        "the verl venv override file must pin transformers to the same range as the main "
+        "the verl venv override file must pin transformers to the same exact version as the main "
         f"interpreter ({main_pin.group(1)}); verl and vllm both depend on transformers, so without "
-        "the override a transitive requirement re-widens it"
+        "the exact override a transitive requirement can re-widen it"
     )
 
     venv_block = dockerfile[dockerfile.index("uv venv --seed /opt/verl-venv") :]
     venv_block = venv_block[: venv_block.index("uv cache clean")]
     assert f'"{main_pin.group(1)}"' in venv_block, (
-        "the verl venv install list must also name the same transformers pin directly"
+        "the verl venv install list must also name the same exact transformers pin directly"
     )
 
 
