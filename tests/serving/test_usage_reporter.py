@@ -96,7 +96,11 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
 
     cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
     assert len(cls_calls) == len(modal_app_module.ENGINE_BY_KEY)
-    assert all("min_containers" not in kwargs for kwargs in cls_calls)
+    # asserted on the kwargs modal is actually CALLED with, not on the constant: the floor is only
+    # real if it reaches `app.cls`. `AutoscalerSettings.min_containers` is an `optional` proto field
+    # (has_presence), so omitting it and sending 0 are distinguishable on the wire -- an omitted
+    # field leaves the floor to whatever the server defaults to, which is not ours to assume.
+    assert all(kwargs["min_containers"] == modal_app_module.MIN_CONTAINERS for kwargs in cls_calls)
     # Each engine class is pinned to ITS gpu tier's window, not one flat value.
     assert {kwargs["gpu"]: kwargs["scaledown_window"] for kwargs in cls_calls} == {
         gpu: modal_app_module.scaledown_window_for(gpu)

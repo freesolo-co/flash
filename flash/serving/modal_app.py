@@ -396,6 +396,7 @@ def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int
         scaledown_window=scaledown_window_for(gpu),
         startup_timeout=STARTUP_TIMEOUT_SECONDS,
         timeout=TIMEOUT_SECONDS,
+        min_containers=MIN_CONTAINERS,
         max_containers=MAX_CONTAINERS,
     )(modal.concurrent(max_inputs=max_inputs, target_inputs=target_inputs)(_Engine))
     # Rebind the module name to the decorated handle, matching the normal ``@app.cls class X`` pattern

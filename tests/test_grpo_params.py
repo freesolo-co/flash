@@ -11,8 +11,11 @@ exercised by the live smokes).
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
+from flash.core.grpo import SUPPORTED_GRPO_GROUP_SIZES
 from flash.core.spec import JobSpec
 from flash.schema import ConfigError, spec_from_dict
 
@@ -520,7 +523,12 @@ def test_grpo_rejects_single_generation_group_before_paid_worker() -> None:
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
 
-    with pytest.raises(ConfigError, match=r"group_size.*one of \{2, 4, 8\}.*GRPO"):
+    # derived from the contract, not spelled out: widening `SUPPORTED_GRPO_GROUP_SIZES` must not
+    # leave this asserting wording that only held for the old tuple.
+    allowed = ", ".join(str(value) for value in SUPPORTED_GRPO_GROUP_SIZES)
+    with pytest.raises(
+        ConfigError, match=rf"group_size.*{re.escape(f'one of {{{allowed}}}')}.*GRPO"
+    ):
         spec_from_dict(
             {**base, "train": {"epochs": 1, "max_examples": 8, "group_size": 1}}, run_id="bad"
         )
