@@ -783,13 +783,19 @@ def rollout_max_num_seqs(rollout_batch: int) -> int:
     it straight to the vllm engine (vllm_async_server.py:261). vllm sizes two up-front, fixed
     allocations from that number, neither of which shrinks to the batch actually submitted:
 
-    * cuda-graph capture. ``max_graph_size = min(max_num_seqs * 2, 512)`` over the ladder
-      ``[1,2,4] + range(8,256,8) + range(256, max_graph_size+1, 16)`` (vllm config/vllm.py, 0.12.x).
-      at 1024 that is 51 sizes, and a lora run captures each size twice -- vllm takes
-      ``product(batch_sizes, [True, False])`` over lora-active/inactive when
-      ``cudagraph_specialize_lora`` is on (gpu_model_runner.py) -- for exactly the ``0/102``
-      seen in the failing console. note the ladder saturates at 512, so 1024, 512 and 256 are
-      indistinguishable; only dropping below 256 shortens it, and 32 gives 11 sizes / 22 graphs.
+    * cuda-graph capture. ``_set_cudagraph_sizes`` (vllm ``config/vllm.py``, 0.19.1 -- the version
+      ``Dockerfile.worker`` pins) derives a capture ladder from
+      ``max_cudagraph_capture_size = min(max_num_seqs * 2, 512, max_num_batched_tokens)``, taking
+      ``[1,2,4]``, then ``range(8, min(size+1, 256), 8)``, then ``range(256, size+1, 16)`` -- each
+      rung clamped by that ceiling. verl's ``max_num_batched_tokens`` default is 8192
+      (``rollout.yaml:73``), so it does not bind. at 1024 the ceiling is 512 and the ladder is 51
+      sizes; a lora run captures each size twice, since the dispatcher takes
+      ``product(cudagraph_capture_sizes, lora_cases)`` with ``lora_cases == [0, 1]`` when
+      ``cudagraph_specialize_lora`` is on (``v1/cudagraph_dispatcher.py:110-193``, default True) --
+      exactly the ``0/102`` seen in the failing console. the ladder saturates at 512, so 1024, 512
+      and 256 are indistinguishable; only dropping below 256 shortens it, and 32 yields a ceiling
+      of 64, 11 sizes, and 22 graphs. note the prose comment above that function omits the per-rung
+      clamp and predicts 34 sizes for any small value; the implementation is authoritative.
     * recurrent state. a gdn/mamba hybrid reserves one state block per decode slot, a dense
       allocation that -- unlike paged kv -- cannot be shared, paged out, or grown on demand.
 
