@@ -534,6 +534,52 @@ def test_warmstart_placeholder_rank_does_not_reject_a_source_rank_that_fits_b200
         spec_from_dict({**base, "train": {**base["train"], "lora_rank": 32}})
 
 
+def test_parse_time_vram_rejection_names_the_wider_shape_that_fits() -> None:
+    """A single-card pin a second card would satisfy is a one-flag fix, not a dead end.
+
+    The allocator ends every fit rejection with ``wider_shape_remedy``; this parse-time check
+    did not, so an authored ``count = 1`` on the largest card Flash manages was rejected with no
+    remedy at all. A user reading it concludes there is nothing left to rent, when ``--gpus 2``
+    admits the same run.
+    """
+    train = {
+        "epochs": 1,
+        "max_examples": 10,
+        "prompts_per_step": 8,
+        "group_size": 4,
+        "max_context_tokens": 1536,
+        "max_completion_tokens": 512,
+        "lora_rank": 32,
+    }
+    raw = _raw(
+        model="Qwen/Qwen3.6-35B-A3B",
+        algorithm="grpo",
+        **{
+            "gpu.type": "B200",
+            "gpu.count": 1,
+            **{f"train.{key}": value for key, value in train.items()},
+        },
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        spec_from_dict(raw)
+    message = str(excinfo.value)
+    assert "requires at least 199 GB" in message
+    assert "--gpus 2" in message, f"rejection gave no remedy: {message}"
+    # and the suggestion has to be true: the same config at that count must parse.
+    widened = spec_from_dict({**raw, "gpu": {**raw["gpu"], "count": 2}})
+    assert widened.gpu.count == 2
+
+    # a HARD provider pin narrows the pool, so a class whose wider shape that provider does not
+    # freely rent must not be advertised. lambda names its card count in the instance type.
+    with pytest.raises(ConfigError) as pinned:
+        spec_from_dict({**raw, "gpu": {**raw["gpu"], "provider": "lambda"}})
+    pinned_message = str(pinned.value)
+    assert "requires at least 199 GB" in pinned_message
+    assert "--gpus" not in pinned_message, (
+        f"a lambda-pinned run was sent to a wider shape its pin may not carry: {pinned_message}"
+    )
+
+
 def test_warmstart_still_rejects_a_shape_impossible_at_the_minimum_rank() -> None:
     raw = _raw(
         model="Qwen/Qwen3.6-35B-A3B",

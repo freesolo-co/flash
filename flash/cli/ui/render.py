@@ -17,6 +17,10 @@ from flash.cli.ui.cost import (  # noqa: F401
     run_cost,
 )
 
+# one spelling of the VRAM clause for both quote renderers: the themed panel and
+# `CostEstimate.breakdown()` must not be able to describe the same shape differently.
+from flash.cost.types import vram_clause
+
 _ROWS = (
     ("email", "account"),
     ("org_id", "org"),
@@ -619,9 +623,10 @@ def cost_panel(est) -> str:
         (
             "gpu",
             (
-                f"{est.gpu}  "
-                f"{_dim(f'({est.gpu_vram_gb} GB; needs >= {est.required_vram_gb} GB)')}  "
+                f"{f'{est.gpu_count}x ' if est.gpu_count > 1 else ''}{est.gpu}  "
+                f"{_dim(f'({vram_clause(est.gpu_vram_gb, est.offered_vram_gb, est.joined_gpu_count)}; needs >= {est.required_vram_gb} GB)')}  "
                 f"@ {money(est.gpu_hourly_usd, 2)}/hr"
+                f"{' per card' if est.gpu_count > 1 else ''}"
             ),
         ),
         (

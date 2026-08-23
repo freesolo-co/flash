@@ -434,6 +434,54 @@ def _authored_gpu_type_entries(raw: Any) -> tuple[str, ...]:
     return entries
 
 
+def _parse_time_wider_shape_remedy(
+    candidate: str,
+    required_vram: int,
+    model: str,
+    algorithm: str,
+    *,
+    train: dict[str, Any],
+    thinking: bool,
+    provider: str,
+) -> str:
+    """The ``--gpus N`` clause for a class this run outgrows on ONE card, or ``""``.
+
+    The allocator already ends every fit rejection this way (``wider_shape_remedy``), but this
+    parse-time check ran without it: an authored single-card pin that a second card would satisfy
+    was rejected as a flat dead end, and the user learned only that the largest rentable card is
+    smaller than the requirement. Routing through the same helper means both boundaries suggest
+    the same flag, searched with the same fit model.
+
+    A hard ``gpu.provider`` pin is what narrows the pool, and it is a DIFFERENT field from the soft
+    ``gpu.providers`` preference list (the two are mutually exclusive, see ``GpuSpec``). Passing
+    only the soft list would advertise RunPod's freedom to rent any card count to a Lambda-pinned
+    run, sending the user to a wider SKU their pin may not carry -- exactly the confusion
+    ``widenable_gpu_names`` exists to prevent. A soft preference is not a pin, so it leaves the
+    pool open.
+
+    Sizing must never be what stops a config from parsing, so a failure here degrades to no
+    remedy -- the rejection itself is already correct and stands on its own.
+    """
+    try:
+        from flash.providers.allocator import _executed_width, geometry_safe_gpu_cap
+        from flash.providers.base import MAX_COMBINATION_CARDS, wider_shape_remedy
+        from flash.providers.fit_errors import widenable_gpu_names
+
+        if not widenable_gpu_names((candidate,), (provider,) if provider else None):
+            return ""
+        return wider_shape_remedy(
+            (get_gpu_info(candidate).vram_gb,),
+            required_vram,
+            # the same ceiling and executed-width rule the allocator searches with, so a count
+            # suggested here is one the submit-time gate would also accept.
+            ceiling=geometry_safe_gpu_cap(model, MAX_COMBINATION_CARDS),
+            above=1,
+            executed_width=_executed_width(algorithm, train, None),
+        )
+    except Exception:
+        return ""
+
+
 def _validate_gpu_section(
     raw: dict[str, Any],
     *,
@@ -529,6 +577,15 @@ def _validate_gpu_section(
                     raise ConfigError(
                         f"gpu.type {candidate!r} has {get_gpu_info(candidate).vram_gb} GB VRAM, "
                         f"but this run requires at least {required_vram} GB"
+                        + _parse_time_wider_shape_remedy(
+                            candidate,
+                            required_vram,
+                            model,
+                            algorithm,
+                            train=preflight_train,
+                            thinking=thinking,
+                            provider=gpu_spec.provider,
+                        )
                     )
         # called for its rejection, not its return: it raises when no validated class can hold the
         # run, which is the parse-time "this is unplaceable" gate. every count reaches this boundary
