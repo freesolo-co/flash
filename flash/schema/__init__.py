@@ -444,7 +444,7 @@ def _parse_time_wider_shape_remedy(
     *,
     train: dict[str, Any],
     thinking: bool,
-    providers: tuple[str, ...] | None,
+    provider: str,
 ) -> str:
     """The ``--gpus N`` clause for a class this run outgrows on ONE card, or ``""``.
 
@@ -454,6 +454,13 @@ def _parse_time_wider_shape_remedy(
     smaller than the requirement. Routing through the same helper means both boundaries suggest
     the same flag, searched with the same fit model.
 
+    A hard ``gpu.provider`` pin is what narrows the pool, and it is a DIFFERENT field from the soft
+    ``gpu.providers`` preference list (the two are mutually exclusive, see ``GpuSpec``). Passing
+    only the soft list would advertise RunPod's freedom to rent any card count to a Lambda-pinned
+    run, sending the user to a wider SKU their pin may not carry -- exactly the confusion
+    ``widenable_gpu_names`` exists to prevent. A soft preference is not a pin, so it leaves the
+    pool open.
+
     Sizing must never be what stops a config from parsing, so a failure here degrades to no
     remedy -- the rejection itself is already correct and stands on its own.
     """
@@ -462,7 +469,7 @@ def _parse_time_wider_shape_remedy(
         from flash.providers.base import MAX_COMBINATION_CARDS, wider_shape_remedy
         from flash.providers.fit_errors import widenable_gpu_names
 
-        if not widenable_gpu_names((candidate,), providers):
+        if not widenable_gpu_names((candidate,), (provider,) if provider else None):
             return ""
         return wider_shape_remedy(
             (get_gpu_info(candidate).vram_gb,),
@@ -579,7 +586,7 @@ def _validate_gpu_section(
                             algorithm,
                             train=preflight_train,
                             thinking=thinking,
-                            providers=gpu_spec.providers or None,
+                            provider=gpu_spec.provider,
                         )
                     )
         # called for its rejection, not its return: it raises when no validated class can hold the

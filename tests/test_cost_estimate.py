@@ -904,3 +904,62 @@ def test_themed_panel_and_breakdown_agree_on_the_vram_clause():
             os.environ.pop("NO_COLOR", None)
         else:
             os.environ["NO_COLOR"] = prior
+
+
+def test_remedy_pool_is_narrowed_by_a_hard_provider_pin_not_a_soft_preference():
+    """A hard ``gpu.provider`` pin must narrow which classes can be widened.
+
+    ``gpu.provider`` and ``gpu.providers`` are different, mutually-exclusive fields: the first is
+    a hard pin, the second a soft preference. Passing only the soft list let a Lambda-pinned run
+    borrow RunPod's freedom to rent arbitrary card counts and get sent to a wider SKU its pin may
+    not carry.
+    """
+    from flash.providers.fit_errors import widenable_gpu_names
+
+    assert widenable_gpu_names(("B200",), None) == ("B200",)
+    assert widenable_gpu_names(("B200",), ("runpod",)) == ("B200",)
+    # lambda names its card count in the instance type, so no wider B200 shape is freely rentable.
+    assert widenable_gpu_names(("B200",), ("lambda",)) == ()
+
+
+def test_offered_vram_credits_only_the_ranks_that_join_the_run():
+    """A rented card that never enters the fsdp group contributes no memory.
+
+    The allocator values a shape at its EXECUTED width (``_executed_width``), so quoting the
+    billed count would advertise capacity the run does not have: an sft job whose one-row batch
+    launches a single rank on two rented cards was told it had 130 GB when the gate valued 80.
+    """
+    from flash.cost.analytical import executed_gpu_count
+    from flash.providers.base import Candidate
+    from flash.providers.sharding import combined_vram_gb
+
+    narrow = RunConfig("Qwen/Qwen3.5-4B", "sft", 10, batch_size=1, sft_retained_examples=1)
+    est = estimate_cost(narrow, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
+    assert est.gpu_count == 2, "the job is still billed for both rented cards"
+    assert executed_gpu_count(narrow, 2) == 1, "a one-row batch launches one rank"
+    assert est.executed_gpu_count == 1
+    # the quote must state the ONE card's memory the fit gate actually valued.
+    assert est.offered_vram_gb == int(combined_vram_gb(80, 1)) == 80
+    line = next(ln for ln in est.breakdown().splitlines() if ln.startswith("GPU"))
+    assert "80 GB; run needs >=" in line
+    assert "usable across" not in line, f"claimed pooled memory one rank cannot use: {line}"
+
+    # a genuinely wide run is unaffected: both ranks join, so both cards are credited.
+    wide = RunConfig("Qwen/Qwen3.5-4B", "grpo", 50, gpu_count=2)
+    wide_est = estimate_cost(wide, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
+    assert wide_est.executed_gpu_count == 2
+    assert wide_est.offered_vram_gb == int(combined_vram_gb(80, 2))
+    assert "usable across 2x 80 GB" in wide_est.breakdown()
+
+
+def test_unstamped_executed_count_falls_back_to_the_billed_count():
+    """A hand-built estimate that never stamped the width must not read as a single rank."""
+    from flash.providers.base import Candidate
+
+    est = estimate_cost(
+        RunConfig("Qwen/Qwen3.5-4B", "grpo", 50, gpu_count=2),
+        allocation=Candidate("runpod", "H100", 3.29, 80, 2),
+    )
+    unstamped = dataclasses.replace(est, executed_gpu_count=0)
+    assert unstamped.joined_gpu_count == unstamped.gpu_count == 2
+    assert unstamped.offered_vram_gb == est.offered_vram_gb

@@ -281,6 +281,12 @@ class CostEstimate:
     # diagnostic line only.
     teacher_api_usd: float = 0.0
     notes: tuple[str, ...] = ()
+    # ranks that actually JOIN the run, which a small batch can bound below the billed gpu_count
+    # (``analytical.executed_gpu_count``). The fit gate values a shape at this width, not the
+    # rented one, so it is what ``offered_vram_gb`` has to quote. APPENDED with a default for the
+    # same positional-constructor reason as RunConfig's trailing fields; 0 means "not stamped",
+    # which falls back to gpu_count rather than claiming a width nobody computed.
+    executed_gpu_count: int = 0
 
     @property
     def wall_clock_hours(self) -> float:
@@ -291,6 +297,11 @@ class CostEstimate:
         return self.train_seconds / 3600.0
 
     @property
+    def joined_gpu_count(self) -> int:
+        """Ranks that actually join the run: the stamped executed width, else the billed count."""
+        return max(1, self.executed_gpu_count or self.gpu_count)
+
+    @property
     def offered_vram_gb(self) -> int:
         """VRAM this SHAPE offers the run, valued the way the allocator's fit gate valued it.
 
@@ -299,10 +310,16 @@ class CostEstimate:
         pooled capacity then renders as "180 GB; needs >= 199 GB" and reads as a rejection of
         the shape it just recommended. ``combined_vram_gb`` is the allocator's own fit model,
         so quoting through it makes the two numbers comparable on every count.
+
+        Valued at the EXECUTED width, not the billed one. A card that never joins the fsdp group
+        contributes no memory, so crediting a rented-but-idle card would claim capacity the run
+        does not have -- the same mistake ``_executed_width`` exists to stop on the allocator
+        side. An sft job whose one-row batch launches a single rank on two rented cards is
+        offered one card's memory, and the quote has to say so.
         """
         from flash.providers.sharding import combined_vram_gb
 
-        return int(combined_vram_gb(self.gpu_vram_gb, max(1, self.gpu_count)))
+        return int(combined_vram_gb(self.gpu_vram_gb, self.joined_gpu_count))
 
     def breakdown(self) -> str:
         """Multi-line itemized breakdown for CLI output."""
@@ -310,7 +327,7 @@ class CostEstimate:
             f"Run        : {self.model_id}  [{self.method.upper()}, {self.steps} steps]",
             (
                 f"GPU        : {f'{self.gpu_count}x ' if self.gpu_count > 1 else ''}{self.gpu} "
-                f"({vram_clause(self.gpu_vram_gb, self.offered_vram_gb, self.gpu_count)}; "
+                f"({vram_clause(self.gpu_vram_gb, self.offered_vram_gb, self.joined_gpu_count)}; "
                 f"run needs >= {self.required_vram_gb} GB) "
                 f"@ ${self.gpu_hourly_usd:.2f}/hr{' per card' if self.gpu_count > 1 else ''}"
             ),
