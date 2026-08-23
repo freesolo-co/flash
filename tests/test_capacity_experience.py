@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import multiprocessing
 from pathlib import Path
@@ -331,6 +332,37 @@ def test_stale_refusal_after_success_keeps_the_entry_consistent(monkeypatch, tmp
     assert shape not in capacity_experience.recent_capacity_refusals(experience, now=210.0)
 
 
+def test_stale_success_under_an_active_refusal_keeps_the_entry_consistent(monkeypatch, tmp_path):
+    """The mirror case: a success OLDER than the standing refusal must not zero its count.
+
+    The success branch zeroes `refusal_count` while keeping `last_refusal_at`. If the success
+    sample predates that refusal, the entry claims an active refusal with a zero count -- the
+    exact disagreement `_entry_from_json` rejects, which drops the shape's hint on the next read.
+    """
+    import flash.runner as runner
+    from flash.providers import capacity_experience
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    shape = ("runpod", "H100", 1)
+    other = ("vast", "B200", 8)
+
+    capacity_experience.record_capacity_refusal(other, now=150.0)
+    capacity_experience.record_capacity_refusal(shape, now=2000.0)
+    # the stale success: predates the refusal that is still standing.
+    capacity_experience.record_capacity_success(shape, now=1000.0)
+
+    experience = capacity_experience.read_capacity_experience()
+    assert other in experience, "an unrelated shape must not be collateral damage"
+    assert shape in experience, "the entry must remain readable rather than being dropped"
+    entry = experience[shape]
+    active = entry.last_refusal_at is not None and (
+        entry.last_success_at is None or entry.last_refusal_at > entry.last_success_at
+    )
+    assert active == (entry.refusal_count > 0)
+    # the standing refusal is newer than the stale success, so the demotion must survive.
+    assert shape in capacity_experience.recent_capacity_refusals(experience, now=2010.0)
+
+
 def test_one_unreadable_entry_does_not_discard_the_others(monkeypatch, tmp_path):
     """A single corrupt ENTRY costs that shape's hint, never every other shape's."""
     import flash.runner as runner
@@ -355,7 +387,7 @@ def test_one_unreadable_entry_does_not_discard_the_others(monkeypatch, tmp_path)
     assert ("vast", "B200", 8) not in experience
 
 
-def _forgiven_shapes_after_failure(monkeypatch, tmp_path, failure):
+def _forgiven_shapes_after_failure(monkeypatch, tmp_path, failure, *, unreconciled_create=False):
     """Drive the real _handle_failure and return the shapes it forgave on the durable ledger."""
     import flash.runner as runner
     from flash.providers.base import Candidate, PollResult
@@ -402,6 +434,7 @@ def _forgiven_shapes_after_failure(monkeypatch, tmp_path, failure):
         log=None,
         raise_if_cancelled=lambda: None,
         return_completed_runpod_metrics=lambda metrics: metrics,
+        unreconciled_create=unreconciled_create,
     )
     seed_submission._handle_failure(ctx, SimpleNamespace(attempt=0), outcome)
     return forgiven, ctx.capacity_refusals
@@ -420,3 +453,55 @@ def test_unadmitted_failure_does_not_forgive(monkeypatch, tmp_path, failure):
     """no_capacity and poll_error can both precede admission, so neither clears a refusal."""
     forgiven, _in_run = _forgiven_shapes_after_failure(monkeypatch, tmp_path, failure)
     assert forgiven == [], f"{failure} is ambiguous and must not forgive"
+
+
+def test_unreconciled_create_job_failed_does_not_forgive(monkeypatch, tmp_path):
+    """An ambiguous create reports job_failed without any worker reaching a box."""
+    # _submit_provider maps UnreconciledCreateError to job_failed at the create boundary. treating
+    # that as proof of capacity would clear a real plane-wide refusal for every nearby run.
+    forgiven, in_run = _forgiven_shapes_after_failure(
+        monkeypatch, tmp_path, "job_failed", unreconciled_create=True
+    )
+    assert forgiven == [], "an unreconciled create proves nothing about capacity"
+    assert in_run == {("runpod", "H100", 1): 1}, "the standing refusal must survive"
+
+
+def test_unreconciled_create_flag_is_set_only_at_the_create_boundary(monkeypatch, tmp_path):
+    """The flag the forgive branch reads is really raised by an UnreconciledCreateError."""
+    import flash.runner as runner
+    from flash.providers.base import UnreconciledCreateError
+    from flash.runner.supervise import seed_submission
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    ctx = SimpleNamespace(
+        spec=SimpleNamespace(run_id="cap-exp"),
+        log=None,
+        on_handle=lambda _handle: None,
+        source_snapshot=None,
+        seed=0,
+        unreconciled_create=False,
+    )
+    candidate = SimpleNamespace(provider="runpod", gpu="H100", gpu_count=1)
+    plan = SimpleNamespace(
+        chosen=candidate,
+        run_spec=SimpleNamespace(gpu=SimpleNamespace(network_volume=None)),
+        on_last_gpu=False,
+        candidates=(candidate,),
+    )
+    prepared = SimpleNamespace(attempt=0, runtime_secrets={})
+
+    provider = SimpleNamespace(
+        submit_run=lambda *a, **k: (_ for _ in ()).throw(UnreconciledCreateError("ambiguous"))
+    )
+    monkeypatch.setattr("flash.providers.get_provider", lambda _name: provider)
+    monkeypatch.setattr(runner, "_load_run_deadline_at", lambda _run_id: 1e12)
+    monkeypatch.setattr(runner, "_worker_deadline_at", lambda *a, **k: 1e12)
+    monkeypatch.setattr(
+        "flash.server.domain.teacher_broker.teacher_attempt_transport",
+        lambda *a, **k: contextlib.nullcontext({}),
+    )
+
+    result, _quote_refresh_failed = seed_submission._submit_provider(ctx, prepared, plan)
+
+    assert result.failure == "job_failed"
+    assert ctx.unreconciled_create is True

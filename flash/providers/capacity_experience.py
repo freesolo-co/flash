@@ -289,11 +289,20 @@ def _record(shape: CapacityShape, *, success: bool, now: float | None) -> None:
                 # backwards past a refusal already recorded after it, which would leave the entry
                 # claiming an active refusal with a zero count.
                 last_success = max(observed_at, previous.last_success_at or observed_at)
-                entries[shape] = CapacityExperience(
-                    previous.last_refusal_at,
-                    0,
-                    last_success,
-                )
+                if previous.last_refusal_at is not None and last_success < previous.last_refusal_at:
+                    # a success older than the standing refusal describes a market that has since
+                    # refused this shape, so it says nothing new. zeroing the count here would
+                    # persist an active refusal with a zero count -- the exact disagreement
+                    # `_entry_from_json` rejects, which drops the entry on the next read. this is
+                    # the mirror of the refusal branch below; both keep count and latest
+                    # observation agreeing.
+                    entries[shape] = previous
+                else:
+                    entries[shape] = CapacityExperience(
+                        previous.last_refusal_at,
+                        0,
+                        last_success,
+                    )
             else:
                 # a refusal older than the last success describes a market that has since admitted
                 # this shape, so it says nothing new. keeping the newer success (rather than

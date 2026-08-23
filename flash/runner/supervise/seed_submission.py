@@ -52,6 +52,12 @@ class _SubmitContext:
     last_detail: str | None = None
     # sticky: once dropped stays dropped so all remaining attempts run on the unrestricted all-dc pool.
     drop_weight_cache: bool = False
+    # set when THIS attempt died at the create boundary, before any worker could reach a box.
+    # `job_failed` covers both that and a worker that crashed after the class admitted it, and only
+    # the latter proves the shape had capacity. carried as state rather than sniffed out of
+    # `result.detail`, which is a human-facing string that would drift away from this reader.
+    # reset per attempt by `_submit_provider`, the one place that raises the distinction.
+    unreconciled_create: bool = False
 
     def on_handle(self, handle: dict) -> None:
         from flash.runner import (
@@ -645,6 +651,7 @@ def _submit_provider(
     from flash.server.domain.teacher_broker import teacher_attempt_transport
 
     provider = get_provider(plan.chosen.provider)
+    ctx.unreconciled_create = False
     try:
         with teacher_attempt_transport(
             plan.run_spec,
@@ -671,6 +678,10 @@ def _submit_provider(
         raise
     except Exception as exc:
         if isinstance(exc, UnreconciledCreateError):
+            # the create itself was ambiguous, so no worker ever reached a box. this is reported as
+            # job_failed, but unlike a worker crash it is NOT evidence the class had capacity --
+            # see the admitted-failure branch in `_handle_failure`.
+            ctx.unreconciled_create = True
             return (
                 PollResult(
                     False,
@@ -846,12 +857,10 @@ def _handle_failure(
         return _FailureDecision(ctx.return_completed_runpod_metrics(completed_metrics), False)
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
-    if outcome.chosen is not None and result.failure in (
-        "stalled",
-        "job_preempted",
-        "oom",
-        "job_failed",
-    ):
+    admitted_failure = result.failure in ("stalled", "job_preempted", "oom") or (
+        result.failure == "job_failed" and not ctx.unreconciled_create
+    )
+    if outcome.chosen is not None and admitted_failure:
         # these outcomes happen after the class admitted the run, so an older no-capacity refusal no
         # longer describes the current market. poll_error stays ambiguous because submit and lookup
         # failures can happen before any capacity was granted.
@@ -860,6 +869,10 @@ def _handle_failure(
         # and died there, which is proof the shape had capacity. leaving the refusal standing kept a
         # shape demoted plane-wide for the full ttl while it was demonstrably taking work, and it is
         # the one admitted-and-failed outcome the durable ledger was missing.
+        #
+        # EXCEPT when the create itself was unreconciled: that also reports job_failed, but it fails
+        # at the create boundary before any worker reaches a box, so it proves nothing about
+        # capacity. forgiving it there would clear a real plane-wide refusal for every nearby run.
         admitted_shape = _lifecycle._shape_key(outcome.chosen)
         ctx.capacity_refusals.pop(admitted_shape, None)
         _record_capacity_observation(
