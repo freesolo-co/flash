@@ -788,10 +788,11 @@ def rollout_max_num_seqs(rollout_batch: int) -> int:
 
     * cuda-graph capture. ``max_graph_size = min(max_num_seqs * 2, 512)`` over the ladder
       ``[1,2,4] + range(8,256,8) + range(256, max_graph_size+1, 16)`` (vllm config/vllm.py, 0.12.x).
-      at 1024 that is 51 sizes, doubled to 102 graphs under the ``FULL_AND_PIECEWISE`` cudagraph
-      mode verl requests -- exactly the ``0/102`` seen in the failing console. note the ladder
-      saturates at 512, so 1024, 512 and 256 are indistinguishable; only dropping below 256
-      shortens it, and 32 gives 11 sizes / 22 graphs.
+      at 1024 that is 51 sizes, and a lora run captures each size twice -- vllm takes
+      ``product(batch_sizes, [True, False])`` over lora-active/inactive when
+      ``cudagraph_specialize_lora`` is on (gpu_model_runner.py) -- for exactly the ``0/102``
+      seen in the failing console. note the ladder saturates at 512, so 1024, 512 and 256 are
+      indistinguishable; only dropping below 256 shortens it, and 32 gives 11 sizes / 22 graphs.
     * recurrent state. a gdn/mamba hybrid reserves one state block per decode slot, a dense
       allocation that -- unlike paged kv -- cannot be shared, paged out, or grown on demand.
 
