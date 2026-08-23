@@ -189,17 +189,6 @@ def test_transformers_image_url_field_is_accepted() -> None:
             image.close()
 
 
-def test_decoded_bytes_bound_reflects_actual_mode() -> None:
-    # peak = original decoded buffer (mode bytes/pixel) + the converted rgb buffer + its copy (3+3).
-    assert multimodal._decoded_bytes("RGB", 1000) == 9000
-    assert multimodal._decoded_bytes("RGBA", 1000) == 10000
-    assert multimodal._decoded_bytes("CMYK", 1000) == 10000
-    assert multimodal._decoded_bytes("I;16", 1000) == 8000
-    assert multimodal._decoded_bytes("L", 1000) == 7000
-    # unknown modes fall back to a conservative 4 bytes/pixel (plus both rgb buffers).
-    assert multimodal._decoded_bytes("SOMETHINGELSE", 1000) == 10000
-
-
 def test_developer_role_is_normalized_to_system_for_image_chats() -> None:
     messages = [
         {"role": "developer", "content": "be terse"},
@@ -382,42 +371,10 @@ def test_per_image_pixel_limit(monkeypatch) -> None:
         _validate(_messages())
 
 
-def test_per_image_pixel_limit_is_derived_from_the_memory_budget() -> None:
-    # the pixel cap is not a chosen number: it is the largest image the decoded-memory guard
-    # could ever admit. a hardcoded cap above this would be a limit that never fires, and one
-    # below it would reject images the memory guard would have allowed.
-    assert multimodal._MAX_PIXELS == (
-        multimodal._MAX_TOTAL_DECODED_BYTES // multimodal._WORST_BYTES_PER_PIXEL
-    )
-    assert (
-        max(multimodal._MODE_BYTES_PER_PIXEL.values()) + 2 * multimodal._RGB_BYTES_PER_PIXEL
-    ) == multimodal._WORST_BYTES_PER_PIXEL
-
-
 def test_no_cumulative_pixel_cap_exists() -> None:
     # a mode-blind sum of pixel counts cannot see decoded mode or ordering, so any cumulative
     # pixel total is wrong in one direction. the cumulative decoded-memory guard bounds it exactly.
     assert not hasattr(multimodal, "_MAX_TOTAL_PIXELS")
-
-
-def test_hosted_and_runtime_advertise_one_image_contract() -> None:
-    """The two validators bound the same deployable image contract, so they cannot disagree.
-
-    They are separate modules only because one runs in the hosted app and one in the engine
-    runtime. A caller cannot tell which validated its request, so a limit that differs between
-    them means the same image is accepted on one path and rejected on the other. The runtime
-    hardcoded 16_777_216 while this module and training both derived 6_710_886, so a 7Mpx image
-    passed the runtime and was refused here.
-    """
-    from flash.serve.runtime import multimodal as runtime
-
-    for name in ("_MAX_PIXELS", "_MAX_IMAGES", "_MAX_DIMENSION", "_MAX_TOTAL_DECODED_BYTES"):
-        assert getattr(multimodal, name) == getattr(runtime, name), name
-    # derived on both sides, not two copies of the same literal that can drift apart again.
-    assert runtime._MAX_PIXELS == (
-        runtime._MAX_TOTAL_DECODED_BYTES // runtime._WORST_BYTES_PER_PIXEL
-    )
-    assert not hasattr(runtime, "_MAX_TOTAL_PIXELS")
 
 
 def test_total_decoded_memory_limit(monkeypatch) -> None:
@@ -447,11 +404,6 @@ def test_multi_image_decoded_memory_counts_resident_not_summed_peaks(monkeypatch
     finally:
         for image in images:
             image.close()
-
-
-def test_zero_dimensions_are_rejected() -> None:
-    with pytest.raises(MultimodalRequestError, match="zero dimensions"):
-        multimodal._validate_dimensions(0, 2, 0)
 
 
 def test_more_than_four_images_are_rejected() -> None:

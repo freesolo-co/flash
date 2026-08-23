@@ -12,15 +12,7 @@ _MAX_TOTAL_COMPRESSED_BYTES = _shared.MAX_TOTAL_COMPRESSED_BYTES
 _MAX_DIMENSION = _shared.MAX_DIMENSION
 _MAX_TOTAL_DECODED_BYTES = _shared.MAX_TOTAL_DECODED_BYTES
 _MAX_SOURCE_CHARS = _shared.MAX_SOURCE_CHARS
-_MODE_BYTES_PER_PIXEL = _shared.MODE_BYTES_PER_PIXEL
-_RGB_BYTES_PER_PIXEL = _shared.RGB_BYTES_PER_PIXEL
-_WORST_BYTES_PER_PIXEL = _shared.WORST_BYTES_PER_PIXEL
 _MAX_PIXELS = _shared.MAX_PIXELS
-_IMAGE_TYPES = _shared.IMAGE_TYPES
-_TEXT_TYPES = _shared.TEXT_TYPES
-_ALLOWED_ROLES = _shared.ALLOWED_ROLES
-_MIME_TO_FORMAT = _shared.MIME_TO_FORMAT
-_DATA_URI_RE = _shared.DATA_URI_RE
 
 
 class MultimodalRequestError(ValueError):
@@ -83,29 +75,5 @@ def _decode_images(sources: list[str], *, image_limit: int | None) -> list[Any]:
         max_dimension=_MAX_DIMENSION,
         max_pixels=_MAX_PIXELS,
         max_total_decoded_bytes=_MAX_TOTAL_DECODED_BYTES,
-        error_type=MultimodalRequestError,
-    )
-
-
-def _decode_data_uri(source: str, index: int) -> tuple[bytes, str]:
-    return _shared.decode_data_uri(
-        source,
-        index,
-        max_compressed_bytes=_MAX_COMPRESSED_BYTES,
-        error_type=MultimodalRequestError,
-    )
-
-
-def _decoded_bytes(mode: str, pixels: int) -> int:
-    return _shared.decoded_bytes(mode, pixels)
-
-
-def _validate_dimensions(width: int, height: int, index: int) -> int:
-    return _shared.validate_dimensions(
-        width,
-        height,
-        index,
-        max_dimension=_MAX_DIMENSION,
-        max_pixels=_MAX_PIXELS,
         error_type=MultimodalRequestError,
     )
