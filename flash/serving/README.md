@@ -72,8 +72,8 @@ is checked by the deployment workflow only to prove that the router belongs to t
 environment. Development backend, Flash, readiness checks, and user traffic use the custom domain.
 
 The dev workflow `.github/workflows/deploy-modal-dev.yml` creates the Modal environment idempotently,
-sets its web suffix to `dev`, fetches the development project server key from the Supabase management
-API, verifies `flash.hosted_lora_adapters`, and deploys only with `--env dev`.
+sets its web suffix to `dev`, reads the repository secret `SUPABASE_SERVICE_ROLE_KEY_DEV` and forwards it
+as `SUPABASE_SERVICE_ROLE_KEY`, verifies `flash.hosted_lora_adapters`, and deploys only with `--env dev`.
 
 The custom domain requires one-time setup before the first deployment:
 
