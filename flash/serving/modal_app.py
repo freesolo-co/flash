@@ -226,8 +226,16 @@ image = (
     # `-libs-cu13` wheel claims and returns False on ANY mismatch.
     #
     # Measured 2026-08-23 across four independently-built serving venvs on this vllm pin: 23, 26, 99
-    # and 99 of 200 files mismatched -- i.e. the corruption is the norm, not an edge case. A clean
-    # `--force-reinstall --no-deps` of the cu13 variant scores 0 mismatched.
+    # and 99 of 200 files mismatched -- i.e. the corruption is the norm, not an edge case. Verified
+    # end to end against vllm's OWN `_is_libs_cu13_install_intact()` on a copy of the real serving
+    # venv: False before this step, True after.
+    #
+    # The reinstall pins to the version already resolved above rather than naming one. Unpinned,
+    # `--no-deps` ignores the resolved pin and takes the newest release (observed: the resolve gives
+    # the whole cuTe-DSL stack 4.5.2, and a bare reinstall pulled `-libs-cu13` 4.7.0 while
+    # `nvidia-cutlass-dsl` and `-libs-base` stayed at 4.5.2). That still satisfies the intactness
+    # check -- it re-hashes `-libs-cu13` against its OWN RECORD, so a uniformly-newer variant looks
+    # intact -- which is exactly why the check cannot catch the skew this would introduce.
     #
     # Why this matters on Blackwell specifically: the FlashInfer GDN path needs SM10.x +
     # `linear_key_head_dim == 128` (true for every served Qwen3.5/3.6) + cuda>=13 (torch 2.11.0+cu130
@@ -237,7 +245,8 @@ image = (
     # unaffected: it takes FlashInfer with no further constraints, so this is a no-op for today's
     # tiers and a prerequisite for any Blackwell one.
     .run_commands(
-        "pip install --force-reinstall --no-deps nvidia-cutlass-dsl-libs-cu13",
+        'pip install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==$('
+        "pip show nvidia-cutlass-dsl-libs-cu13 | awk '/^Version:/{print $2}')\"",
     )
     # No in-engine kernel-patching hook is installed in this image (see the note at the engine call
     # site): under vLLM V1 the model runs in a separate EngineCore process, so patches applied in THIS

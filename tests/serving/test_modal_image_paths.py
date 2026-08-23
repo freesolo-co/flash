@@ -109,6 +109,16 @@ def test_image_repairs_the_cutlass_dsl_install_after_resolving() -> None:
     assert "--force-reinstall" in command, command
     assert "--no-deps" in command, command
 
+    # the reinstall must pin to the version the resolve already chose. `--no-deps` ignores the
+    # resolved pin, so an unpinned reinstall silently takes the NEWEST release: observed pulling
+    # `-libs-cu13` 4.7.0 into a stack whose `nvidia-cutlass-dsl` and `-libs-base` are 4.5.2. the
+    # intactness check re-hashes `-libs-cu13` against its own RECORD, so that skew still reads as
+    # intact -- the check cannot catch it, which is why the pin has to be asserted here.
+    assert "==" in command, (
+        "the cuTe-DSL repair must pin the reinstall to the resolved version; an unpinned "
+        f"--no-deps reinstall takes the newest release and skews the stack, got: {command}"
+    )
+
     # the repair is only meaningful downstream of the install that corrupts it. `ast.walk` yields
     # the chained calls outermost-first, so the LATER builder step appears EARLIER in the walk.
     resolve_at = by_attr.index("pip_install_from_pyproject")
