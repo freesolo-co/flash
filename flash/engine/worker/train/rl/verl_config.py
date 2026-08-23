@@ -25,8 +25,8 @@ from flash.engine.worker.backend_common import (
     trainer_dtype_overrides,
 )
 from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
 from flash.engine.worker.sft_train import _hydra_val, _verl_image_message_content
+from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
     resolve_reshard_after_forward,
