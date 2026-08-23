@@ -624,7 +624,7 @@ def cost_panel(est) -> str:
             "gpu",
             (
                 f"{f'{est.gpu_count}x ' if est.gpu_count > 1 else ''}{est.gpu}  "
-                f"{_dim(f'({vram_clause(est.gpu_vram_gb, est.offered_vram_gb, est.gpu_count)}; needs >= {est.required_vram_gb} GB)')}  "
+                f"{_dim(f'({vram_clause(est.gpu_vram_gb, est.offered_vram_gb, est.joined_gpu_count)}; needs >= {est.required_vram_gb} GB)')}  "
                 f"@ {money(est.gpu_hourly_usd, 2)}/hr"
                 f"{' per card' if est.gpu_count > 1 else ''}"
             ),

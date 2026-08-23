@@ -906,6 +906,44 @@ def test_themed_panel_and_breakdown_agree_on_the_vram_clause():
             os.environ["NO_COLOR"] = prior
 
 
+def test_panel_and_breakdown_agree_when_executed_width_is_below_the_billed_count():
+    """The agreement must hold on the shape that can actually break it.
+
+    The clause is computed from ``offered_vram_gb``, which values the EXECUTED width. Rendering it
+    beside the billed count states a pooled figure the named cards do not add up to: three rented
+    cards carrying a two-rank run read as "160 GB usable across 3x 80 GB". The twin above cannot
+    catch this because both widths are 2 there, so the two spellings coincide.
+    """
+    import os
+
+    from flash.cli.ui import render
+    from flash.providers.base import Candidate
+
+    narrow = RunConfig(
+        "Qwen/Qwen3.5-4B", "sft", 10, gpu_count=3, batch_size=2, sft_retained_examples=2
+    )
+    est = estimate_cost(narrow, allocation=Candidate("runpod", "H100", 3.29, 80, 3))
+    assert est.gpu_count == 3, "billed for all three rented cards"
+    assert est.executed_gpu_count == 2, "only two ranks join the fsdp group"
+
+    clause = f"{est.offered_vram_gb} GB usable across 2x {est.gpu_vram_gb} GB"
+    assert clause in est.breakdown()
+    prior = os.environ.get("NO_COLOR")
+    os.environ["NO_COLOR"] = "1"
+    try:
+        panel = render.cost_panel(est)
+    finally:
+        if prior is None:
+            os.environ.pop("NO_COLOR", None)
+        else:
+            os.environ["NO_COLOR"] = prior
+    assert clause in panel, f"panel credited a width the pooled figure does not cover: {panel}"
+    assert "across 3x" not in panel
+    # the BILLED count still drives price: you pay for the idle card even though it holds nothing.
+    assert "3x H100" in panel
+    assert "per card" in panel
+
+
 def test_remedy_pool_is_narrowed_by_a_hard_provider_pin_not_a_soft_preference():
     """A hard ``gpu.provider`` pin must narrow which classes can be widened.
 
