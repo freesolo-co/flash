@@ -733,7 +733,7 @@ def _base_model_records() -> list:
 )
 def router():
     from flash.serving.src import settings as cfg
-    from flash.serving.src.persistence import load_adapters
+    from flash.serving.src.persistence import get_adapter, load_adapters
     from flash.serving.src.router import AdapterRouter, build_serving_app
     from flash.serving.src.settings import Settings
 
@@ -750,6 +750,7 @@ def router():
         deployment_id=settings.deployment_id,
         # Reload on a routing miss so a stale router still resolves a just-registered adapter.
         reload_records=lambda: load_adapters(settings) + _base_model_records(),
+        lookup_record=lambda adapter_id: get_adapter(adapter_id, settings),
         reload_interval_seconds=cfg.RELOAD_INTERVAL_SECONDS,
         # Meter each generation to the backend (fire-and-forget); None disables it.
         usage_reporter=_build_usage_reporter(settings),

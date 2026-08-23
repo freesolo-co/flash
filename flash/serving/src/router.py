@@ -45,6 +45,7 @@ def build_serving_app(
     deployment_sha: str = "",
     deployment_id: str = "",
     reload_records: Callable[[], list[AdapterRecord]] | None = None,
+    lookup_record: Callable[[str], AdapterRecord | None] | None = None,
     reload_interval_seconds: float = 30.0,
     usage_reporter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     chat_authorizer: Callable[[str, str], Awaitable["str | None"]] | None = None,
@@ -52,6 +53,9 @@ def build_serving_app(
     """Front-door FastAPI app. ``reload_records`` re-reads persisted ready adapters so a router
     that missed a (un)registration on another container still resolves it: reload once on a miss
     before 404-ing, and at most once per ``reload_interval_seconds`` on a hit.
+
+    ``lookup_record`` reads one persisted adapter regardless of lifecycle status for control-plane
+    status requests. Its result is never inserted into the ready-only routing registry.
 
     ``usage_reporter`` (optional) is called fire-and-forget after each successful generation with
     a usage dict (adapterId, baseModel, promptTokens, completionTokens, cachedTokens, gpuSeconds,
@@ -69,7 +73,12 @@ def build_serving_app(
     context = ServingContext(
         pool,
         router,
-        AdapterLookup(router, reload_records, reload_interval_seconds=reload_interval_seconds),
+        AdapterLookup(
+            router,
+            reload_records,
+            lookup_record=lookup_record,
+            reload_interval_seconds=reload_interval_seconds,
+        ),
         UsageReporter(
             usage_reporter,
             deployment_id=deployment_id,
@@ -77,6 +86,7 @@ def build_serving_app(
         ),
         internal_key=internal_key,
         reload_records=reload_records,
+        lookup_record=lookup_record,
         chat_authorizer=chat_authorizer,
     )
 

@@ -34,6 +34,7 @@ class ServingContext:
         *,
         internal_key: str | None,
         reload_records: Callable[[], list[AdapterRecord]] | None,
+        lookup_record: Callable[[str], AdapterRecord | None] | None,
         chat_authorizer: Callable[[str, str], Awaitable[str | None]] | None,
     ) -> None:
         self.pool = pool
@@ -42,6 +43,7 @@ class ServingContext:
         self.usage = usage
         self.internal_key = internal_key
         self.reload_records = reload_records
+        self.lookup_record = lookup_record
         self.chat_authorizer = chat_authorizer
         # the shared internal key lets a trusted server-to-server caller skip external chat auth: it
         # guards /adapters and is presented by the flash control plane (registration) and the backend

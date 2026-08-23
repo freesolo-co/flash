@@ -10,6 +10,7 @@ background.
 
 import asyncio
 import time
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -25,10 +26,12 @@ class AdapterLookup:
         router: AdapterRouter,
         reload_records: Any = None,
         *,
+        lookup_record: Callable[[str], AdapterRecord | None] | None = None,
         reload_interval_seconds: float = 30.0,
     ) -> None:
         self._router = router
         self._reload_records = reload_records
+        self._lookup_record = lookup_record
         self._reload_interval_seconds = reload_interval_seconds
         # `at` is when the last fetch COMPLETED and drives the ttl. `fetched_at` is when that
         # fetch STARTED, which is what decides whether a waiting caller may reuse its result.
@@ -101,7 +104,11 @@ class AdapterLookup:
         cached_ready = record is not None and record.status == "ready"
         if cached_ready and self._is_stale() and self._reload_records is not None:
             self._schedule_reload()
-        if not cached_ready and self._reload_records is not None:
+        if not cached_ready and self._lookup_record is not None:
+            # lifecycle reads need disabled rows, but routing hydration must stay ready-only. fetch
+            # this id without mutating the registry so visibility never makes it routable.
+            record = await asyncio.to_thread(self._lookup_record, adapter_id)
+        elif not cached_ready and self._reload_records is not None:
             await self.reload()
             record = self._router.get(adapter_id)
         if record is None:

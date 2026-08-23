@@ -488,7 +488,10 @@ def test_get_loading_revision_reloads_status_without_making_it_routable(setup) -
             pool,
             router,
             internal_key="secret",
-            reload_records=lambda: list(persistence.rows.values()),
+            reload_records=lambda: [
+                record for record in persistence.rows.values() if record.status == "ready"
+            ],
+            lookup_record=lambda adapter_id: persistence.get(adapter_id, object()),
         ),
         headers=INTERNAL_HEADERS,
     )
@@ -501,10 +504,76 @@ def test_get_loading_revision_reloads_status_without_making_it_routable(setup) -
     assert record["status"] == "loading"
     assert record["lifecycle_state"] == "loading"
     assert "deployment_generation" not in record
-    assert router.get(REVISION_A) == loading
+    assert router.get(REVISION_A) is None
     assert router.resolve(REVISION_A) is None
     inference = client.post("/generate", json={"adapter_id": REVISION_A, "prompt": "hello"})
     assert inference.status_code == 404
+
+
+def test_status_lookup_without_targeted_fetch_keeps_bulk_reload_fallback(setup) -> None:
+    _, pool, _, _ = setup
+    loading = ImmutableAdapterRegistration.model_validate(_registration()).to_record().model_copy(
+        update={"deployment_generation": "generation-1"}
+    )
+    router = AdapterRouter()
+    client = TestClient(
+        build_serving_app(
+            pool,
+            router,
+            internal_key="secret",
+            reload_records=lambda: [loading],
+        ),
+        headers=INTERNAL_HEADERS,
+    )
+
+    response = client.get(f"/adapters/{quote(REVISION_A, safe='')}")
+
+    assert response.status_code == 200
+    assert response.json()["adapter"]["lifecycle_state"] == "loading"
+    assert router.get(REVISION_A) == loading
+    assert router.resolve(REVISION_A) is None
+
+
+def test_targeted_status_lookup_does_not_replace_ready_routing_registry(setup) -> None:
+    _, pool, _, persistence = setup
+    cached_ready = ImmutableAdapterRegistration.model_validate(_registration()).to_record().model_copy(
+        update={"status": "ready"}
+    )
+    loading_revision = ImmutableAdapterRegistration.model_validate(
+        _registration(step=40, sha=SHA_B)
+    ).to_record()
+    stored = persistence.insert(loading_revision, object())
+    loading = persistence.replace(
+        stored.model_copy(update={"deployment_generation": stored.updated_at}),
+        expected_updated_at=stored.updated_at,
+        settings=object(),
+    )
+    assert loading is not None
+    reloads = {"count": 0}
+
+    def _reload_ready() -> list[AdapterRecord]:
+        reloads["count"] += 1
+        return [record for record in persistence.rows.values() if record.status == "ready"]
+
+    router = AdapterRouter([cached_ready])
+    client = TestClient(
+        build_serving_app(
+            pool,
+            router,
+            internal_key="secret",
+            reload_records=_reload_ready,
+            lookup_record=lambda adapter_id: persistence.get(adapter_id, object()),
+        ),
+        headers=INTERNAL_HEADERS,
+    )
+
+    response = client.get(f"/adapters/{quote(REVISION_B, safe='')}")
+
+    assert response.status_code == 200
+    assert response.json()["adapter"]["lifecycle_state"] == "loading"
+    assert reloads["count"] == 0
+    assert router.get(REVISION_B) is None
+    assert router.resolve(REVISION_A) == (cached_ready, cached_ready)
 
 
 def test_get_revision_reports_disabled_until_ready_then_returns_full_identity(setup) -> None:
