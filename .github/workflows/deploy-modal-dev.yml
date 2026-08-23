@@ -32,7 +32,6 @@ jobs:
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       FREESOLO_INTERNAL_KEY: ${{ secrets.FREESOLO_INTERNAL_KEY }}
-      SUPABASE_SERVICE_ROLE_KEY_DEV: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY_DEV }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY_DEV }}
       SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
       SUPABASE_PROJECT_REF_DEV: ${{ secrets.SUPABASE_PROJECT_REF_DEV }}
@@ -118,7 +117,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=""
-          for name in MODAL_TOKEN_ID MODAL_TOKEN_SECRET HF_TOKEN FREESOLO_INTERNAL_KEY SUPABASE_SERVICE_ROLE_KEY_DEV SUPABASE_PROJECT_REF SUPABASE_PROJECT_REF_DEV; do
+          for name in MODAL_TOKEN_ID MODAL_TOKEN_SECRET HF_TOKEN FREESOLO_INTERNAL_KEY SUPABASE_SERVICE_ROLE_KEY SUPABASE_PROJECT_REF SUPABASE_PROJECT_REF_DEV; do
             if [ -z "${!name}" ]; then
               missing="$missing $name"
             fi
@@ -165,31 +164,20 @@ jobs:
           if dev is None:
               print("missing")
           else:
-              # the suffix is what pins the app to serve-dev; anything else has to be corrected.
               print("ready" if dev.get("web_suffix") == "dev" else "wrong-suffix")
           PY
           )"
-          # `environment create` and `environment update` both need workspace MANAGE access, which the
-          # deploy token does not have. run them only when the environment is genuinely wrong -- a
-          # correct environment must cost zero privileged calls, or every steady-state deploy fails.
+          # create and update need workspace manage access, which the deploy token lacks. skip both in
+          # steady state so a ready environment does not fail every deploy.
           case "$environment_status" in
             ready)
               ;;
             wrong-suffix)
-              modal environment update dev --set-web-suffix dev || {
-                echo "::error::A Modal workspace admin must run: modal environment update dev --set-web-suffix dev"
-                exit 1
-              }
+              modal environment update dev --set-web-suffix dev
               ;;
             missing)
-              modal environment create dev || {
-                echo "::error::A Modal workspace admin must run: modal environment create dev"
-                exit 1
-              }
-              modal environment update dev --set-web-suffix dev || {
-                echo "::error::A Modal workspace admin must run: modal environment update dev --set-web-suffix dev"
-                exit 1
-              }
+              modal environment create dev
+              modal environment update dev --set-web-suffix dev
               ;;
             *)
               echo "::error::Could not determine the state of the development Modal environment."

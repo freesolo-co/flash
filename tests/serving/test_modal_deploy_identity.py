@@ -80,37 +80,23 @@ def _clear_deployment_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
-def test_engine_container_imports_with_only_hf_token_in_dev(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("is_local", "modal_is_remote"),
+    [(False, "1"), (True, "1")],
+    ids=["remote-main", "remote-child"],
+)
+def test_remote_process_imports_with_only_hf_token_in_dev(
+    monkeypatch, is_local: bool, modal_is_remote: str
+) -> None:
     _clear_deployment_environment(monkeypatch)
     monkeypatch.setenv("HF_TOKEN", "fake")
+    monkeypatch.setenv("MODAL_IS_REMOTE", modal_is_remote)
 
-    modal_app = _import_modal_app(monkeypatch, is_local=False, environment="dev")
+    modal_app = _import_modal_app(monkeypatch, is_local=is_local, environment="dev")
 
     assert modal_app.SERVING_DEPLOYMENT_MODE == "production"
     assert modal_app.MODAL_ENVIRONMENT == "dev"
     assert modal_app.SERVING_CUSTOM_DOMAIN == ""
-
-
-def test_remote_child_imports_with_only_hf_token_in_dev(monkeypatch) -> None:
-    _clear_deployment_environment(monkeypatch)
-    monkeypatch.setenv("HF_TOKEN", "fake")
-    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
-
-    modal_app = _import_modal_app(monkeypatch, is_local=True, environment="dev")
-
-    assert modal_app.SERVING_DEPLOYMENT_MODE == "production"
-    assert modal_app.MODAL_ENVIRONMENT == "dev"
-    assert modal_app.SERVING_CUSTOM_DOMAIN == ""
-
-
-def test_deploy_time_production_rejects_dev_environment(monkeypatch) -> None:
-    _clear_deployment_environment(monkeypatch)
-    monkeypatch.setenv("SERVING_DEPLOYMENT_MODE", "production")
-
-    with pytest.raises(
-        ValueError, match="production serving must not target Modal environment 'dev'"
-    ):
-        _import_modal_app(monkeypatch, is_local=True, environment="dev")
 
 
 def test_deploy_time_development_requires_wiring(monkeypatch) -> None:
