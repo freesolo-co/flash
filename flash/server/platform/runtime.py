@@ -313,6 +313,7 @@ def _start_resubmit(
 
 
 def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
+    from flash.providers import INSTANCE_PROVIDERS
     from flash.runner import _latest_reserved_attempt
     from flash.runner.supervise.lifecycle import _completed_attempt_metrics
 
@@ -322,7 +323,7 @@ def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | No
     providers = {
         str(name)
         for name in (getattr(status, "submitted_instance_providers", None) or [])
-        if name in {"vast", "lambda"}
+        if name in INSTANCE_PROVIDERS
     }
     for provider in sorted(providers):
         metrics = _completed_attempt_metrics(

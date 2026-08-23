@@ -2394,6 +2394,36 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
     assert handles[0]["attempt"] == 2
 
 
+def test_handleless_completed_metrics_checks_modal_attempt(monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.runner as runner
+    import flash.runner.supervise.lifecycle as lifecycle
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+
+    spec = JobSpec(run_id="modal-handleless", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    status = SimpleNamespace(created_at=100.0, submitted_instance_providers=["modal"])
+    seen = []
+    monkeypatch.setattr(runner, "_latest_reserved_attempt", lambda _run_id: 2)
+
+    def completed(_spec, **kwargs):
+        seen.append(kwargs)
+        return {"wall_seconds": 5.0}
+
+    monkeypatch.setattr(lifecycle, "_completed_attempt_metrics", completed)
+
+    assert runtime._handleless_completed_metrics(spec, status, 500.0) == {"wall_seconds": 5.0}
+    assert seen == [
+        {
+            "provider": "modal",
+            "attempt": 2,
+            "launch_floor": 100.0,
+            "deadline_at": 500.0,
+        }
+    ]
+
+
 def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, tmp_path):
     import flash.runner as runner
     import flash.server.platform.runtime as runtime
