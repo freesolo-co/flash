@@ -1702,24 +1702,61 @@ def test_reconcile_is_read_only_and_reports_ready_or_absent() -> None:
     assert _mutation_calls(transport) == []
 
 
-def test_reconcile_without_inference_key_reports_provider_pending_state() -> None:
+def test_reconcile_without_inference_key_reports_running_as_unproven_without_polling() -> None:
     bundle = _bundle()
     transport = _FakeTransport()
-    handle = _seed_exact(transport, bundle, status="STARTING")
+    handle = _seed_exact(transport, bundle)
+    sleep_calls: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        transport.clock.sleep(seconds)
 
     result = reconcile_runpod_deployment(
         bundle,
         RunPodCredentials(PROVIDER_SECRET),
         None,
-        deadline_at=2.0,
+        deadline_at=100.0,
         transport_factory=_Factory(transport),
         probe=_Probe(True),
         clock=transport.clock,
-        sleep=transport.clock.sleep,
+        sleep=sleep,
+    )
+
+    assert result.status == "outcome_unknown"
+    assert result.error_code == "resource_ambiguous"
+    assert result.error_reason == "readiness_deadline_unproven"
+    assert result.handle == handle
+    assert sleep_calls == []
+    assert transport.clock.now == 0.0
+    assert _mutation_calls(transport) == []
+
+
+def test_reconcile_without_inference_key_reports_provider_pending_state() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, status="STARTING")
+    sleep_calls: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        transport.clock.sleep(seconds)
+
+    result = reconcile_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        None,
+        deadline_at=100.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(True),
+        clock=transport.clock,
+        sleep=sleep,
     )
 
     assert result.status == "provisioning"
     assert result.handle == handle
+    assert sleep_calls == []
+    assert transport.clock.now == 0.0
     assert _mutation_calls(transport) == []
 
 

@@ -256,7 +256,9 @@ def read_only_reconcile(
                     handle=last_handle,
                 )
             continue
-        if not sleep_until_poll(deadline_at, clock, sleep):
+        # a missing local environment variable cannot change through provider observation, so
+        # polling would only burn wall clock before returning the identical unproven result.
+        if inference_token is None or not sleep_until_poll(deadline_at, clock, sleep):
             if state == "pending":
                 return DeploymentResult.from_spec(
                     plan.bundle.spec,
