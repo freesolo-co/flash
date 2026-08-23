@@ -44,6 +44,3 @@ class MutationLedger:
             if entry.kind == kind:
                 return entry.resource_id
         return None
-
-    def reversed(self) -> tuple[ConfirmedMutation, ...]:
-        return tuple(reversed(self._confirmed))

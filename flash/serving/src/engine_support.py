@@ -110,13 +110,9 @@ def _adapter_cache_ready(path: Path) -> bool:
         return False
 
 
-def _stream_text_delta(
-    text: str, previous_text: str, *, cumulative_output: bool | None
-) -> tuple[str, str]:
+def _stream_text_delta(text: str, previous_text: str) -> tuple[str, str]:
     if not text:
         return "", previous_text
-    if cumulative_output is not False and text.startswith(previous_text):
-        return text[len(previous_text) :], text
     return text, previous_text + text
 
 

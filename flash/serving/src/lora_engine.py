@@ -34,7 +34,6 @@ from flash.serving.src.engine_support import (
     _num_prompt_tokens,
     _safe_chat_template_kwargs,
     _stream_text_delta,
-    active_checkpoint_ref,
     enforce_expected_checkpoint,
 )
 from flash.serving.src.lora_entries import _LoraEntry, cached_lora_request, entries_for
@@ -644,9 +643,6 @@ class _LoraEngineImpl:
             raise RuntimeError("immutable adapter resolved to a mismatched LoRARequest")
         return lora_request.lora_name
 
-    def _active_checkpoint_ref(self, record: Any) -> str:
-        return active_checkpoint_ref(record)
-
     def _enforce_expected_checkpoint(self, record: Any, expected_checkpoint: str | None) -> str:
         return enforce_expected_checkpoint(record, expected_checkpoint)
 
@@ -839,9 +835,7 @@ class _LoraEngineImpl:
                         completion_token_ids.extend(token_ids)
                     delta = ""
                     if text:
-                        delta, previous_text = _stream_text_delta(
-                            text, previous_text, cumulative_output=False
-                        )
+                        delta, previous_text = _stream_text_delta(text, previous_text)
                     yield {
                         "type": "delta",
                         "text": delta,

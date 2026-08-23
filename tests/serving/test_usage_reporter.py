@@ -83,30 +83,11 @@ def test_stream_text_delta_keeps_native_delta_chunks(modal_app_module):
     deltas = []
 
     for text in ("Hel", "lo", " hello"):
-        delta, previous = engine_support._stream_text_delta(text, previous, cumulative_output=False)
+        delta, previous = engine_support._stream_text_delta(text, previous)
         deltas.append(delta)
 
     assert deltas == ["Hel", "lo", " hello"]
     assert previous == "Hello hello"
-
-
-def test_stream_text_delta_diffs_cumulative_chunks_without_token_ids(modal_app_module):
-    previous = ""
-    deltas = []
-
-    for text in ("Hel", "Hello", "Hello", "Hello!"):
-        delta, previous = engine_support._stream_text_delta(text, previous, cumulative_output=None)
-        deltas.append(delta)
-
-    assert deltas == ["Hel", "lo", "", "!"]
-    assert previous == "Hello!"
-
-
-def test_stream_text_delta_keeps_text_when_cumulative_hint_is_not_a_prefix(modal_app_module):
-    delta, previous = engine_support._stream_text_delta("world", "hello ", cumulative_output=True)
-
-    assert delta == "world"
-    assert previous == "hello world"
 
 
 def test_lora_engine_scales_to_zero_by_default(modal_app_module):

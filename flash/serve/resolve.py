@@ -295,7 +295,6 @@ def resolve_adapter(
     checkpoint_step: int | None = None,
     thinking_default: bool = False,
     structured_outputs_default_json: str | None = None,
-    activate_alias: bool = True,
     artifact_repo_type: str = "dataset",
 ) -> ResolvedDeploymentInputs:
     """resolve one owned run into its control adapter and execution file table."""
@@ -372,7 +371,7 @@ def resolve_adapter(
         thinking_default=thinking_default,
         structured_outputs_default_json=structured_outputs_default_json,
         alias_intent=AdapterAliasIntent(
-            activate=activate_alias,
+            activate=True,
             expected_adapter_revision=None,
         ),
     )
