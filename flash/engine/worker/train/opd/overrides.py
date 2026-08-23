@@ -16,6 +16,7 @@ import os
 from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.worker.backend_common import (
     agent_loop_workers,
+    fused_expert_orig_params_overrides,
     ray_num_cpus,
     rollout_layered_summon_overrides,
     rollout_mm_processor_cache_overrides,
@@ -149,6 +150,9 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         # absent -> True, verl's own default: a config built without the gate must render the
         # lower-memory strategy, never fall into zero-2 by omission.
         f"actor_rollout_ref.actor.fsdp_config.reshard_after_forward={_hydra_val(bool(config.get('reshard_after_forward', True)))}",
+        # fused-expert lora is a parametrization on a named tensor, so fsdp1 must not flatten it
+        # away. shared with the rl driver; this path pins `strategy=fsdp` above.
+        *fused_expert_orig_params_overrides(config.get("target_parameters")),
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the rl driver.
         *trainer_dtype_overrides(),
         "actor_rollout_ref.rollout.name=vllm",
