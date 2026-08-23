@@ -263,7 +263,7 @@ def provision_modal_deployment(
 def reconcile_modal_deployment(
     bundle: DeploymentBundle,
     credentials: ModalCredentials,
-    runtime_secrets: ServingRuntimeSecrets,
+    runtime_secrets: ServingRuntimeSecrets | None,
     *,
     deadline_at: float,
     sdk_factory: ModalSdkFactory = create_modal_sdk,
@@ -273,7 +273,7 @@ def reconcile_modal_deployment(
 ) -> DeploymentResult:
     """read and prove one finalized modal deployment without provider mutation."""
 
-    validate_runtime_inputs(credentials, runtime_secrets, deadline_at, clock)
+    validate_control_inputs(credentials, deadline_at, clock)
     bootstrap_plan = build_modal_create_plan(bundle, phase="bootstrap")
     finalized_plan = build_modal_create_plan(bundle, phase="finalized")
     sdk: ModalSdk | None = None
@@ -283,6 +283,8 @@ def reconcile_modal_deployment(
         ensure_unique_resources(initial)
         if initial.resource_count == 0:
             return DeploymentResult.from_spec(bundle.spec, status="absent")
+        if runtime_secrets is None:
+            return unknown_result(finalized_plan)
         inference_token, _artifact_token = runtime_secrets._reveal_for_launch()
         proof = wait_for_phase(
             finalized_plan,

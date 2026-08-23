@@ -1399,7 +1399,7 @@ def test_reconcile_is_read_only_for_ready_absent_and_lingering_artifact() -> Non
     absent = reconcile_modal_deployment(
         bundle,
         ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
-        ServingRuntimeSecrets(INFERENCE_SECRET),
+        None,
         deadline_at=100.0,
         sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
         probe=_Probe(True),

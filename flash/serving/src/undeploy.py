@@ -31,7 +31,7 @@ class DisableResult:
     disabled_aliases: list[str]
     disabled_revisions: list[str]
     stuck_ready: list[str]
-    pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None]]
+    pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None, str | None]]
     storage_unavailable: bool = False
 
     def failure_response(
@@ -62,7 +62,7 @@ async def _cas_row_to_disabled(
     candidate: AdapterRecord,
     *,
     get_authoritative: Callable[[str], Awaitable[AdapterRecord | None]],
-) -> AdapterRecord | None:
+) -> tuple[AdapterRecord | None, str | None]:
     """CAS one row to "disabled", returning the terminal row it was last observed as.
 
     Storage outages propagate rather than being handled per call site: every read and write here
@@ -73,22 +73,25 @@ async def _cas_row_to_disabled(
     """
 
     current: AdapterRecord | None = candidate
+    expected_generation = candidate.deployment_generation
     for _ in range(_CAS_ATTEMPTS):
         if current.updated_at is None:
             current = await get_authoritative(candidate.adapter_id)
             if current is None or current.updated_at is None:
-                return current
-
+                return current, expected_generation
+        expected_generation = current.deployment_generation or expected_generation
         committed = await _replace_stored_cas(
-            current.model_copy(update={"status": "disabled"}),
+            current.model_copy(update={"status": "disabled", "deployment_generation": None}),
             expected_updated_at=current.updated_at,
         )
         if committed is not None:
-            return committed
+            return committed, expected_generation
         current = await get_authoritative(candidate.adapter_id)
-        if current is None or current.status != "ready":
-            return current
-    return current
+        if current is None or (
+            current.status == "disabled" and current.deployment_generation is None
+        ):
+            return current, expected_generation
+    return current, expected_generation
 
 
 async def disable_matched(
@@ -108,21 +111,25 @@ async def disable_matched(
     disabled_aliases: list[str] = []
     disabled_revisions: list[str] = []
     stuck_ready: list[str] = []
-    pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None]] = []
+    pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None, str | None]] = []
     storage_unavailable = False
 
     for candidate in matches:
         try:
-            current = await _cas_row_to_disabled(candidate, get_authoritative=get_authoritative)
+            current, expected_generation = await _cas_row_to_disabled(
+                candidate, get_authoritative=get_authoritative
+            )
         except HTTPException as exc:
             if exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
                 raise
             storage_unavailable = True
             break
-        if current is not None and current.status == "ready":
+        if current is not None and (
+            current.status == "ready" or current.deployment_generation is not None
+        ):
             stuck_ready.append(candidate.adapter_id)
             continue
-        pending_teardown.append((candidate, current))
+        pending_teardown.append((candidate, current, expected_generation))
         if candidate.is_alias:
             disabled_aliases.append(candidate.adapter_id)
         else:
@@ -139,7 +146,7 @@ async def disable_matched(
 
 def apply_teardown(
     router: AdapterRouter,
-    pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None]],
+    pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None, str | None]],
 ) -> list[tuple[AdapterRecord, str | None]]:
     """Remove every durably disabled row from routing, returning the rows still to evict.
 
@@ -148,18 +155,12 @@ def apply_teardown(
     make undeploy callers time out.
     """
     cleanup_records: list[tuple[AdapterRecord, str | None]] = []
-    for candidate, current in pending_teardown:
+    for candidate, current, expected_generation in pending_teardown:
         if current is None:
             router.remove(candidate.adapter_id)
         else:
             router.upsert(current)
-        cleanup_record = current or candidate
-        expected_generation = cleanup_record.deployment_generation
-        # a loading revision has no persisted deployment generation, but register loaded its original
-        # updated_at. carry that exact generation after fencing so cleanup can evict only that load.
-        if expected_generation is None and candidate.is_revision and candidate.status == "disabled":
-            expected_generation = candidate.updated_at
-        cleanup_records.append((cleanup_record, expected_generation))
+        cleanup_records.append((current or candidate, expected_generation))
     return cleanup_records
 
 
@@ -216,15 +217,14 @@ async def resolve_undeploy_target(
         or (candidate.is_revision and candidate.run_id == run_id)
     ]
     persisted = await list_authoritative_run(run_id)
-    # a disabled revision with no deployment generation is the durable row an in-flight load still
-    # holds cas authority for. settled disabled rows already carry their former loaded generation.
+    # only a claimed disabled revision has an in-flight generation to fence and evict.
     loading = [
         candidate
         for candidate in persisted
         if candidate.is_revision
         and candidate.run_id == run_id
         and candidate.status == "disabled"
-        and candidate.deployment_generation is None
+        and candidate.deployment_generation is not None
     ]
     ready_ids = {candidate.adapter_id for candidate in ready}
     matches = ready + [candidate for candidate in loading if candidate.adapter_id not in ready_ids]

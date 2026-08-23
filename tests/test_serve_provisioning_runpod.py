@@ -1599,7 +1599,7 @@ def test_reconcile_is_read_only_and_reports_ready_or_absent() -> None:
     absent = reconcile_runpod_deployment(
         bundle,
         RunPodCredentials(PROVIDER_SECRET),
-        ServingRuntimeSecrets(INFERENCE_SECRET),
+        None,
         deadline_at=100.0,
         transport_factory=factory,
         probe=_Probe(True),
@@ -1607,6 +1607,27 @@ def test_reconcile_is_read_only_and_reports_ready_or_absent() -> None:
         sleep=clock.sleep,
     )
     assert absent.status == "absent"
+    assert _mutation_calls(transport) == []
+
+
+def test_reconcile_without_inference_key_reports_provider_pending_state() -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, status="STARTING")
+
+    result = reconcile_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        None,
+        deadline_at=2.0,
+        transport_factory=_Factory(transport),
+        probe=_Probe(True),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert result.status == "provisioning"
+    assert result.handle == handle
     assert _mutation_calls(transport) == []
 
 
@@ -1696,6 +1717,51 @@ def test_adoption_rechecks_for_an_artifact_that_appears_after_readiness() -> Non
         f"PATCH /pods/{POD_ID}",
         "secretDelete",
     ]
+
+
+def test_post_ready_artifact_reread_refuses_replacement_generation() -> None:
+    class _ReplacementGenerationTransport(_FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.account_reads = 0
+
+        def graphql(self, document, variables, *, mutation: bool, deadline_at: float):
+            if not mutation:
+                self.account_reads += 1
+                if self.account_reads == 3:
+                    self.secrets[0]["id"] = "secret99"
+                    self.secrets[1]["id"] = "artifact99"
+                    self.templates[0]["id"] = "template99"
+                    self.volumes[0]["id"] = "volume99"
+                    self.pods[0]["id"] = "replacement1234"
+                    self.pods[0]["templateId"] = "template99"
+                    self.pods[0]["networkVolume"] = {"id": "volume99"}
+            response = super().graphql(
+                document,
+                variables,
+                mutation=mutation,
+                deadline_at=deadline_at,
+            )
+            if not mutation and self.account_reads <= 2:
+                response["data"]["myself"]["secrets"] = [
+                    item
+                    for item in response["data"]["myself"]["secrets"]
+                    if item["name"] != self.plan_names.artifact_secret
+                ]
+            return response
+
+    bundle = _bundle()
+    transport = _ReplacementGenerationTransport()
+    transport.plan_names = _names(bundle)
+    _seed_exact(transport, bundle, artifact_secret=True)
+    transport.calls.clear()
+
+    result, _factory, _probe = _provision(bundle, transport, artifact_token=None)
+
+    assert result.status == "outcome_unknown"
+    assert result.error_reason == "artifact_cleanup_conflict"
+    assert _mutation_calls(transport) == [], "replacement generation resources were mutated"
+    assert any(item["id"] == "artifact99" for item in transport.secrets)
 
 
 def test_adoption_deletes_one_lingering_artifact_only_after_endpoint_proof() -> None:

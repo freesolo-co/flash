@@ -111,7 +111,7 @@ class _LoraEngineImpl:
         self._source_locks_guard = asyncio.Lock()
         self._source_paths: dict[tuple[str, str, str, str | None], Path] = {}
         self._lora_requests: dict[str, tuple[tuple[str, str, str, str | None], Any]] = {}
-        self._unconfirmed_loras: set[str] = set()
+        self._lora_states: dict[str, str] = {}
         self._prompt_token_cache: OrderedDict[tuple[str, str], tuple[int, ...]] = OrderedDict()
         self._prompt_cache_size = cfg.PROMPT_TOKEN_CACHE_SIZE
         base_model_adapters = _load_adapters_for_base(self.settings, self.base_model)
@@ -208,22 +208,24 @@ class _LoraEngineImpl:
             return lock
 
     async def _evict_loaded_lora(self, adapter_id: str) -> None:
-        # drop this id's lora from the engine before releasing its collision-reserved integer id.
-        cached = self._lora_requests.get(adapter_id)
-        if cached is None:
+        if (cached := self._lora_requests.get(adapter_id)) is None:
             return
+        states = getattr(self, "_lora_states", {})
+        self._lora_states = states
+        if states.get(adapter_id) is None:
+            self._lora_requests.pop(adapter_id, None)
+            return
+        states[adapter_id] = "unconfirmed"
         remove = getattr(self.engine, "remove_lora", None)
         if remove is None:
             raise RuntimeError("vLLM cannot confirm LoRA removal")
-        # use only the int id this adapter actually loaded with. recomputing an uncached alias's hash
-        # could remove another tenant's adapter that owns the colliding id.
         result = remove(cached[1].lora_int_id)
         if inspect.isawaitable(result):
             result = await result
         if result is False:
             raise RuntimeError("vLLM rejected LoRA removal")
         self._lora_requests.pop(adapter_id, None)
-        getattr(self, "_unconfirmed_loras", set()).discard(adapter_id)
+        states.pop(adapter_id, None)
 
     async def _pin_lora(self, lora_request: Any) -> None:
         pin = getattr(self.engine, "pin_lora", None)
@@ -234,20 +236,23 @@ class _LoraEngineImpl:
             await result
 
     async def _add_lora_locked(self, record: Any, path: Path) -> None:
-        source_ident = _adapter_source_ident(record)
-        cached = self._lora_requests.get(record.adapter_id)
-        already_tracked = cached is not None and cached[0] == source_ident
+        adapter_id = record.adapter_id
+        newly_reserved = adapter_id not in self._lora_requests
         lora_request = self._cached_lora_request_locked(record, path)
-        added = await self.engine.add_lora(lora_request)
-        if added is False and not already_tracked:
-            unconfirmed = getattr(self, "_unconfirmed_loras", set())
-            self._unconfirmed_loras = unconfirmed
-            unconfirmed.add(record.adapter_id)
+        states = getattr(self, "_lora_states", {})
+        self._lora_states = states
+        try:
+            added = await self.engine.add_lora(lora_request)
+        except Exception:
+            if newly_reserved:
+                states[adapter_id] = "unconfirmed"
+            raise
+        if added is False and newly_reserved:
+            self._lora_requests.pop(adapter_id, None)
+            states.pop(adapter_id, None)
             raise RuntimeError("vLLM rejected a new LoRA registration")
-        # Pin only when the hot GPU pool covers the deployable CPU pool. Capped-max_loras models leave
-        # adapters unpinned so >max_loras adapters can register and LRU-swap in on demand instead of
-        # the surplus failing to claim one of the few GPU slots.
-        if self._pin_loras:
+        states[adapter_id] = "loaded"
+        if self._pin_loras:  # capped pools stay unpinned so surplus adapters can lru-swap
             await self._pin_lora(lora_request)
 
     async def _preload_cached_loras(self) -> None:
@@ -360,13 +365,9 @@ class _LoraEngineImpl:
             raise last_exc
 
     def _cached_lora_request_locked(self, record: Any, path: Path) -> Any:
-        from vllm.lora.request import LoRARequest
-
-        from flash.serving.src.registry import lora_int_id
-
         source_ident = _adapter_source_ident(record)
         adapter_id = record.adapter_id
-        if adapter_id in getattr(self, "_unconfirmed_loras", set()):
+        if getattr(self, "_lora_states", {}).get(adapter_id) == "unconfirmed":
             raise RuntimeError("LoRA registration is unconfirmed on this engine")
         cached = self._lora_requests.get(adapter_id)
         if cached is not None:
@@ -374,11 +375,12 @@ class _LoraEngineImpl:
                 return cached[1]
             raise RuntimeError("previous LoRA removal is unconfirmed on this engine")
 
-        # lora_int_id masks a sha1 to 31 bits (int32-fitting positive id vLLM requires), so distinct
-        # adapter_ids can collide to the same int id and cross-wire two orgs' LoRAs on one engine.
-        # Detect a collision against a DIFFERENT adapter already loaded here and linear-probe to the
-        # next free id. Runs under the per-adapter lock and (asyncio) atomically vs other adapters'
-        # sync sections, so the used-set is a consistent snapshot.
+        from vllm.lora.request import LoRARequest
+
+        from flash.serving.src.registry import lora_int_id
+
+        # distinct adapter ids can collide after lora_int_id's int32 mask. reserve the next free id
+        # while the per-adapter lock keeps this synchronous probe atomic against other adapters.
         used = {
             req.lora_int_id: aid
             for aid, (_ident, req) in self._lora_requests.items()
@@ -390,6 +392,8 @@ class _LoraEngineImpl:
 
         lora_request = LoRARequest(adapter_id, int_id, str(path))
         self._lora_requests[adapter_id] = (source_ident, lora_request)
+        self._lora_states = getattr(self, "_lora_states", {})
+        self._lora_states[adapter_id] = "reserved"
         return lora_request
 
     async def _lora_request(
@@ -651,8 +655,8 @@ class _LoraEngineImpl:
                 self.registry.upsert(record, revive=True)
                 return {"ok": True, "adapter_id": record.adapter_id, "base_model": self.base_model}
             path = await self._ensure_adapter_local_locked(record)
-            self.registry.upsert(record, revive=True)  # explicit (re)deploy clears a tombstone
             await self._add_lora_locked(record, path)
+            self.registry.upsert(record, revive=True)
         return {"ok": True, "adapter_id": record.adapter_id, "base_model": self.base_model}
 
     @staticmethod

@@ -183,6 +183,31 @@ def test_status_uses_deploy_time_identity_after_the_model_tip_advances(
     assert seen == [deployed_name]
 
 
+def test_status_without_inference_key_reports_provider_observable_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, object]] = []
+
+    def _modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        observed.append(("modal", secrets))
+        return _result(bundle, "absent")
+
+    def _runpod(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        observed.append(("runpod", secrets))
+        return _result(bundle, "provisioning")
+
+    _stub_environment(monkeypatch)
+    monkeypatch.delenv(serve_deploy.INFERENCE_KEY_ENV)
+    modal_args = _args_with_identity(monkeypatch, "modal")
+    runpod_args = _args_with_identity(monkeypatch, "runpod")
+    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _modal)
+    monkeypatch.setattr("flash.serve.provisioning.runpod.reconcile_runpod_deployment", _runpod)
+
+    assert cmd_serve_status(modal_args) == 0
+    assert cmd_serve_status(runpod_args) == 0
+    assert observed == [("modal", None), ("runpod", None)]
+
+
 def test_status_routes_to_the_named_read_only_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 

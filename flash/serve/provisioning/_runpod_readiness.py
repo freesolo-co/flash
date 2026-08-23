@@ -152,7 +152,7 @@ def probe_with_deadline(
 def read_only_reconcile(
     plan: RunPodCreatePlan,
     observe: Observe,
-    inference_token: str,
+    inference_token: str | None,
     *,
     deadline_at: float,
     probe: EndpointProbe,
@@ -232,6 +232,7 @@ def read_only_reconcile(
             )
         if (
             state == "running"
+            and inference_token is not None
             and (not observation.artifact_secrets or allow_transient_artifact)
             and probe_with_deadline(
                 probe,
@@ -635,7 +636,15 @@ def await_ready_and_reclaim(
     if artifact is None:
         try:
             observation = observe(plan)
-            ensure_unique_resources(observation)
+            secret, template, volume, pod = exact_core_resources(plan, observation)
+            handle = cast("RunPodProviderHandle", ready.handle)
+            if (secret.id, template.id, volume.id, pod.id) != (
+                handle.inference_secret_id,
+                handle.template_id,
+                handle.network_volume_id,
+                handle.pod_id,
+            ):
+                raise RunPodResourceConflict("proved generation changed before artifact cleanup")
         except RunPodTransportFailure:
             return unknown_result(
                 plan,

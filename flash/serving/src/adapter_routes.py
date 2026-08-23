@@ -44,6 +44,20 @@ async def list_adapters(request: Request) -> dict[str, Any]:
     return {"ok": True, "adapters": context.router.ready_adapters()}
 
 
+async def _claim_loading_generation(stored: AdapterRecord) -> tuple[AdapterRecord, bool]:
+    """Persist the exact generation before dispatching a disabled revision load."""
+
+    if stored.status == "ready" or stored.updated_at is None:
+        return stored, False
+    claimed = await _replace_stored_cas(
+        stored.model_copy(update={"deployment_generation": stored.updated_at}),
+        expected_updated_at=stored.updated_at,
+    )
+    if claimed is not None:
+        return claimed, True
+    return (await get_authoritative(stored.adapter_id) or stored), False
+
+
 @adapter_router.post("/adapters")
 async def add_adapter(
     registration: ImmutableAdapterRegistration,
@@ -56,11 +70,13 @@ async def add_adapter(
     revision = registration.to_record()
 
     alias, stored = await persist_revision(context.router, revision)
+    stored, claimed = await _claim_loading_generation(stored)
 
     context.router.upsert(alias, revive=True)
     context.router.upsert(stored, revive=True)
 
-    background.add_task(_register_revision, context, stored)
+    if claimed:
+        background.add_task(_register_revision, context, stored)
     return stored
 
 
@@ -107,7 +123,7 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
             if expected_updated_at is None:
                 return
             fenced = await _replace_stored_cas(
-                current,
+                current.model_copy(update={"deployment_generation": None}),
                 expected_updated_at=expected_updated_at,
             )
             if fenced is None:
@@ -145,9 +161,9 @@ async def _register_revision(context: ServingContext, stored: AdapterRecord) -> 
     """
     if stored.status == "ready" or stored.updated_at is None:
         return
-    # the disabled row's cas timestamp is the lifecycle generation. concurrent registration
-    # attempts for this same row share it; a later disable writes a new timestamp.
-    registration = stored.model_copy(update={"deployment_generation": stored.updated_at})
+    if stored.deployment_generation is None:
+        return
+    registration = stored
     try:
         await context.pool.register(registration.base_model, registration)
     except Exception:  # a failed load leaves the revision disabled

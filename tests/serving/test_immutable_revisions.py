@@ -319,7 +319,7 @@ def test_new_registration_creates_disabled_revision_and_alias_then_marks_only_re
     assert committed.status == "ready"
     generation = committed.deployment_generation
     assert generation is not None
-    assert persistence.replacements == [REVISION_A]
+    assert persistence.replacements == [REVISION_A, REVISION_A]
     assert pool.registered == [REVISION_A]
     assert pool.registered_generations == [generation]
     assert pool.unregistered == []
@@ -399,20 +399,15 @@ def test_registration_reconciliation_preserves_concurrent_promotion_winner(
 ) -> None:
     client, pool, router, persistence = setup
     promotion_missed = False
+    replace = adapter_routes._replace_stored_cas
 
     async def concurrent_winner(record: AdapterRecord, *, expected_updated_at: str):
         nonlocal promotion_missed
         if record.status == "ready" and not promotion_missed:
             promotion_missed = True
-            return
-        assert record.status == "disabled"
-        winner = record.model_copy(
-            update={
-                "status": "ready",
-                "deployment_generation": expected_updated_at,
-            }
-        )
-        persistence.rows[record.adapter_id] = persistence._stamp(winner)
+            persistence.rows[record.adapter_id] = persistence._stamp(record)
+            return None
+        return await replace(record, expected_updated_at=expected_updated_at)
 
     monkeypatch.setattr(adapter_routes, "_replace_stored_cas", concurrent_winner)
 
@@ -765,6 +760,36 @@ def test_delete_run_alias_cascades_ready_alias_and_revisions(setup) -> None:
     )
 
 
+def test_undeploy_fences_retried_disabled_revision_with_prior_generation(setup) -> None:
+    client, pool, _, persistence = setup
+    assert _register(client, _registration()).status_code == 200
+    previous = persistence.rows[REVISION_A]
+    disabled = persistence._stamp(previous.model_copy(update={"status": "disabled"}))
+    persistence.rows[REVISION_A] = disabled
+
+    async def _fail_register(_base_model: str, _record: AdapterRecord) -> None:
+        raise RuntimeError("still loading")
+
+    pool.register = _fail_register
+    assert _register(client, _registration()).status_code == 200
+    loading = persistence.rows[REVISION_A]
+    assert loading.status == "disabled"
+    assert loading.deployment_generation == disabled.updated_at
+
+    response = client.delete(f"/adapters/{RUN_ID}")
+
+    assert response.status_code == 200
+    assert response.json()["disabled_revisions"] == [REVISION_A]
+    assert persistence.rows[REVISION_A].deployment_generation is None
+    stale_promotion = persistence.replace(
+        loading.model_copy(update={"status": "ready"}),
+        expected_updated_at=loading.updated_at,
+        settings=object(),
+    )
+    assert stale_promotion is None, "the retried load retained promotion authority"
+    assert pool.unregistered_generations[-1] == loading.deployment_generation
+
+
 def test_delete_run_alias_evicts_revision_whose_register_result_was_lost(setup) -> None:
     client, pool, _, persistence = setup
     assert _register(client, _registration()).status_code == 200
@@ -779,6 +804,7 @@ def test_delete_run_alias_evicts_revision_whose_register_result_was_lost(setup) 
         _registration(step=40, sha=SHA_B)
     ).to_record()
     loading = persistence._stamp(loading)
+    loading = loading.model_copy(update={"deployment_generation": loading.updated_at})
     persistence.rows[REVISION_B] = loading
     # the remote engine loaded this generation, but its successful result was lost before promotion.
     pool.loaded_generations[REVISION_B] = loading.updated_at
@@ -928,7 +954,7 @@ def test_delete_cleans_up_generation_reloaded_after_cas_miss(setup) -> None:
 
     assert response.status_code == 200
     assert persistence.rows[REVISION_A].status == "disabled"
-    assert persistence.rows[REVISION_A].deployment_generation == redeployed_generation
+    assert persistence.rows[REVISION_A].deployment_generation is None
     assert pool.unregistered_generations[-1] == redeployed_generation
 
 
@@ -944,7 +970,9 @@ def test_delete_disabled_revision_id_cascades_remaining_ready_siblings(setup) ->
         == 200
     )
     persistence.rows[REVISION_A] = persistence._stamp(
-        persistence.rows[REVISION_A].model_copy(update={"status": "disabled"})
+        persistence.rows[REVISION_A].model_copy(
+            update={"status": "disabled", "deployment_generation": None}
+        )
     )
     router.remove(REVISION_A)
 

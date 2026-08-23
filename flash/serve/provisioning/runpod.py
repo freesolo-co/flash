@@ -255,7 +255,7 @@ def _bind_delete_secret(transport: RunPodTransport, *, deadline_at: float) -> De
 def reconcile_runpod_deployment(
     bundle: DeploymentBundle,
     credentials: RunPodCredentials,
-    runtime_secrets: ServingRuntimeSecrets,
+    runtime_secrets: ServingRuntimeSecrets | None,
     *,
     deadline_at: float,
     transport_factory: TransportFactory = StdlibRunPodTransport,
@@ -265,9 +265,11 @@ def reconcile_runpod_deployment(
 ) -> DeploymentResult:
     """read and prove one deterministic deployment without mutating provider state."""
 
-    validate_runtime_inputs(credentials, runtime_secrets, deadline_at, clock)
+    validate_control_inputs(credentials, deadline_at, clock)
     plan = build_runpod_create_plan(bundle)
-    inference_token, _artifact_token = runtime_secrets._reveal_for_launch()
+    inference_token = (
+        runtime_secrets._reveal_for_launch()[0] if runtime_secrets is not None else None
+    )
     try:
         transport = open_transport(transport_factory, credentials)
         return read_only_reconcile(

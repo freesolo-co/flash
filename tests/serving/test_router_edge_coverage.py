@@ -287,7 +287,7 @@ def test_teardown_drops_a_row_that_vanished_from_persistence() -> None:
     router = AdapterRouter([revision, _alias(revision)])
     assert router.get(revision.adapter_id) is not None
 
-    cleanup = apply_teardown(router, [(revision, None)])
+    cleanup = apply_teardown(router, [(revision, None, revision.deployment_generation)])
 
     assert router.get(revision.adapter_id) is None
     assert [record.adapter_id for record, _ in cleanup] == [revision.adapter_id]
@@ -301,7 +301,7 @@ def test_teardown_keeps_the_authoritative_row_when_one_came_back() -> None:
     disabled = revision.model_copy(update={"status": "disabled"})
     router = AdapterRouter([revision, _alias(revision)])
 
-    cleanup = apply_teardown(router, [(revision, disabled)])
+    cleanup = apply_teardown(router, [(revision, disabled, revision.deployment_generation)])
 
     assert router.get(revision.adapter_id) is not None
     assert router.get(revision.adapter_id).status == "disabled"

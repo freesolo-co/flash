@@ -11,11 +11,12 @@ import sys
 import time
 
 from flash.cli.commands.serve_deploy import (
+    INFERENCE_KEY_ENV,
     _build_provider_plan,
     _credentials,
     _err,
+    _optional_env,
     _report_handle,
-    _runtime_secrets,
 )
 from flash.cli.commands.serve_identity import existing_deployment_bundle
 
@@ -66,13 +67,18 @@ def cmd_serve_status(args) -> int:
 
     try:
         credentials = _credentials(provider)
-        runtime_secrets = _runtime_secrets()
+        inference_token = _optional_env(INFERENCE_KEY_ENV)
     except (ValueError, TypeError) as exc:
         return _err(
             f"{exc}. credentials are read from the environment for this one request and are never "
             f"stored"
         )
 
+    from flash.serve.provisioning import ServingRuntimeSecrets
+
+    runtime_secrets = (
+        ServingRuntimeSecrets(inference_token) if inference_token is not None else None
+    )
     deadline_at = time.monotonic() + float(args.timeout)
     if provider == "modal":
         from flash.serve.provisioning.modal import reconcile_modal_deployment
