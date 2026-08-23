@@ -365,3 +365,72 @@ def test_chat_keeps_stdout_empty_when_a_styled_stream_carries_no_text(monkeypatc
     assert result == 1
     assert captured.out == ""
     assert "no response text from flash-1" in captured.err
+
+
+def test_superseded_attempt_heartbeats_are_tagged_in_the_log_stream(capsys) -> None:
+    """`runs log | grep HEARTBEAT | tail -1` must not silently return a dead attempt's heartbeat.
+
+    The plane appends the highest UPLOADED attempt after the chronological log, so during a retry
+    the last heartbeat on screen belongs to the attempt that just died. The section heading says
+    so, but a heading does not survive a pipe: the reporter's monitor read
+    ``step 0, 0 completions, device H200`` for twenty minutes while the run was live on B200,
+    because H200 was the card that had already OOMed and been torn down.
+    """
+    commands._print_worker_output(
+        {
+            "console_rl_attempt0.txt": (
+                'HEARTBEAT {"stage":"rl_step","step":76,"attempt":0,"device_name":"H200"}\n'
+                "Traceback (most recent call last):\n"
+            )
+        },
+        printed_any=True,
+        current_attempt=1,
+    )
+
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if "HEARTBEAT" in line]
+    assert lines, "the dead attempt's console dump must still be printed"
+    # the stale line carries its own provenance, so it cannot be mistaken for the live attempt
+    assert "[superseded attempt=0; current attempt=1]" in lines[-1]
+    # and the failure dump itself is preserved -- it is why the retry exists
+    assert "Traceback (most recent call last):" in out
+
+
+def test_filtering_superseded_heartbeats_leaves_the_live_attempt_last(capsys) -> None:
+    """A consumer that drops tagged lines gets the LIVE attempt's heartbeat, not the dead one."""
+    print('HEARTBEAT {"stage":"rl_step","step":1,"attempt":1,"device_name":"B200"}')
+    commands._print_worker_output(
+        {
+            "console_rl_attempt0.txt": (
+                'HEARTBEAT {"stage":"rl_step","step":76,"attempt":0,"device_name":"H200"}\n'
+            )
+        },
+        printed_any=True,
+        current_attempt=1,
+    )
+
+    heartbeats = [line for line in capsys.readouterr().out.splitlines() if "HEARTBEAT" in line]
+    live = [line for line in heartbeats if "[superseded" not in line]
+    assert live[-1].endswith('{"stage":"rl_step","step":1,"attempt":1,"device_name":"B200"}')
+
+
+def test_current_attempt_heartbeats_are_left_untouched(capsys) -> None:
+    """Only a SUPERSEDED attempt is tagged; the live attempt's own artifact must read normally."""
+    commands._print_worker_output(
+        {"console_rl_attempt1.txt": 'HEARTBEAT {"stage":"rl_step","step":4,"attempt":1}\n'},
+        printed_any=True,
+        current_attempt=1,
+    )
+
+    out = capsys.readouterr().out
+    assert "[superseded" not in out
+
+
+def test_heartbeat_tagging_is_idempotent() -> None:
+    """Re-printing an already-tagged dump must not stack a second marker onto the line."""
+    from flash.cli.commands.worker_output import _mark_superseded_heartbeats
+
+    once = _mark_superseded_heartbeats('HEARTBEAT {"step":1}\n', 0, 1)
+    twice = _mark_superseded_heartbeats(once, 0, 1)
+    assert once == twice
+    assert once.count("[superseded") == 1
