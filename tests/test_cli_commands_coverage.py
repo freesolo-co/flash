@@ -455,6 +455,51 @@ def test_teardown_window_still_tags_the_dead_workers_heartbeat(capsys) -> None:
     assert "worker torn down; no live attempt" in out, "the heading must say so too"
 
 
+def test_follow_also_tags_a_teardown_it_ends_inside(capsys) -> None:
+    """``--follow`` must derive the live attempt by the same rule the one-shot path uses.
+
+    The two log paths reach ``_print_worker_output`` differently: the one-shot path snapshots the
+    status through ``_snapshot_live_attempt``, while ``--follow`` carries the attempt it saw while
+    streaming. When that stream ends mid-teardown, the raw ``live_attempt`` is ``None`` -- so the
+    follow printed the dead worker's heartbeats unmarked, which is the exact failure the tagging
+    exists to prevent, reachable through the more common of the two commands.
+    """
+    terminal = {
+        "state": "failed",
+        "remote": None,
+        "last_heartbeat": {"attempt": 0},
+    }
+
+    class _Client:
+        def get_logs(self, _run_id, offset=0):
+            return {"logs": "", "offset": 0, "state": "failed"}
+
+        def get_run(self, _run_id):
+            return terminal
+
+        def get_worker_output(self, _run_id):
+            return {
+                "console_rl_attempt0.txt": (
+                    'HEARTBEAT {"stage":"rl_step","step":76,"attempt":0,"device_name":"H200"}\n'
+                )
+            }
+
+    result = commands._poll_logs(_Client(), "flash-1", interval=0.0)
+    assert result.live_attempt == commands.live_attempt_of(terminal)
+
+    commands._print_worker_output(
+        _Client().get_worker_output("flash-1"),
+        printed_any=result.printed_any,
+        current_attempt=result.live_attempt,
+    )
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if "HEARTBEAT" in line]
+    assert lines, "the dead attempt's console dump must still be printed"
+    assert "[superseded attempt=0; worker torn down]" in lines[-1], (
+        f"a follow that ended mid-teardown leaked an unmarked dead heartbeat: {lines[-1]}"
+    )
+
+
 def test_snapshot_distinguishes_teardown_from_an_unknown_attempt() -> None:
     """``remote: null`` means torn down; a failed lookup means unknown. They are not the same."""
     from flash.cli.commands.worker_output import _NO_LIVE_WORKER, _snapshot_live_attempt
