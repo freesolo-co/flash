@@ -94,7 +94,9 @@ def test_deploy_time_production_rejects_dev_environment(monkeypatch) -> None:
     _clear_deployment_environment(monkeypatch)
     monkeypatch.setenv("SERVING_DEPLOYMENT_MODE", "production")
 
-    with pytest.raises(ValueError, match="production serving must not target Modal environment 'dev'"):
+    with pytest.raises(
+        ValueError, match="production serving must not target Modal environment 'dev'"
+    ):
         _import_modal_app(monkeypatch, is_local=True, environment="dev")
 
 
