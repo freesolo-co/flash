@@ -159,6 +159,6 @@ def _drop_fully_forced_groups(groups, forced):
 
 def run_opd():
     """Run OPD. verl is the only backend; this module keeps the knob and prompt helpers it shares."""
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import run_opd_train
 
     run_opd_train()

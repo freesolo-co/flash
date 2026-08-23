@@ -16,9 +16,9 @@ import os
 import time
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.engine.huggingface import hub_error_transience, model_revision_kwargs
+from flash.engine.support.huggingface import hub_error_transience, model_revision_kwargs
 from flash.engine.worker.perf import RetriableInfraError
-from flash.envs.loader import is_commit_sha
+from flash.envs.loading.loader import is_commit_sha
 
 
 def _hf():

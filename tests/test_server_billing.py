@@ -263,7 +263,7 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.auth as runpod_keys
+    import flash.providers.runpod.client.auth as runpod_keys
 
     runpod_keys.reset()
     import flash.runner as runner
@@ -278,14 +278,14 @@ def api(tmp_path, monkeypatch):
     # Keep submit offline: validate + record, but the GPU job body is a no-op.
     monkeypatch.setattr(runner, "_run_job", lambda *a, **k: None)
 
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
     # configured provider keys would trigger orphan sweeps and status reporting. stub both because
     # these billing tests assert only on the API response and must remain network-free.
     import flash.providers as providers_mod
-    import flash.server.domain.projects as projects_mod
-    import flash.server.domain.run_registry as run_registry
+    import flash.server.domain.registry.projects as projects_mod
+    import flash.server.domain.registry.run_registry as run_registry
 
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(
@@ -296,7 +296,7 @@ def api(tmp_path, monkeypatch):
     # A hub environment is validated against the Freesolo backend at submit. These are BILLING
     # tests, so stub it to a pass the same way `require_project_access` is stubbed above; without
     # it every submit here 4xxs on environment authorization before reaching any billing code.
-    import flash.server.domain.environment_registry as environment_registry_mod
+    import flash.server.domain.registry.environment_registry as environment_registry_mod
 
     monkeypatch.setattr(
         environment_registry_mod,
@@ -404,9 +404,9 @@ def test_a_nonexistent_environment_is_refused_before_the_402(api, monkeypatch):
     balance" for a typo'd environment -- sending the user to top up, for a run no balance can buy.
     Both faults are live here at once, and the spec's own defect has to win.
     """
-    import flash.envs.loader as env_loader
+    import flash.envs.loading.loader as env_loader
     import flash.server.billing.charges as billing_mod
-    from flash.envs.identity import GitHubPermanentError
+    from flash.envs.meta.identity import GitHubPermanentError
 
     def _block(**k):
         raise billing_mod.BillingError(402, "insufficient balance")
@@ -427,8 +427,8 @@ def test_a_nonexistent_environment_is_refused_before_the_402(api, monkeypatch):
 
 def test_transient_environment_resolve_is_attempted_once_per_request(api, monkeypatch):
     """packaged opd defers after one bounded request-side attempt on a transient failure."""
-    import flash.envs.loader as env_loader
-    from flash.envs.identity import GitHubUnavailableError
+    import flash.envs.loading.loader as env_loader
+    from flash.envs.meta.identity import GitHubUnavailableError
 
     calls = []
 
@@ -439,7 +439,7 @@ def test_transient_environment_resolve_is_attempted_once_per_request(api, monkey
     monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", _transient)
     monkeypatch.setattr(
-        "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
+        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
         lambda _spec: None,
     )
     spec = {
@@ -461,8 +461,8 @@ def test_transient_environment_resolve_is_attempted_once_per_request(api, monkey
 
 def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monkeypatch):
     """a tokenless plane must not turn a private packaged opd environment into a false 404."""
-    import flash.envs.loader as env_loader
-    from flash.envs.identity import GitHubPermanentError
+    import flash.envs.loading.loader as env_loader
+    from flash.envs.meta.identity import GitHubPermanentError
 
     calls = []
 
@@ -473,7 +473,7 @@ def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monk
     monkeypatch.setattr(env_loader, "_github_token", lambda: None)
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", _anonymous_404)
     monkeypatch.setattr(
-        "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
+        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
         lambda _spec: None,
     )
     spec = {
@@ -739,7 +739,7 @@ def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch
 
 def test_submit_failure_records_nothing(api, monkeypatch):
     """If submit_job fails, no run row is left behind and no billing reversal is needed."""
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     def failing_submit(spec, dry_run=False, background=True, **kwargs):
         raise RuntimeError("provider out of capacity")
@@ -754,7 +754,7 @@ def test_submit_failure_records_nothing(api, monkeypatch):
 
 def test_record_run_failure_does_not_submit(api, monkeypatch):
     """If ``db.record_run`` fails (e.g. SQLite locked/full), submit_job is not reached."""
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     import flash.server.platform.db as db_mod
 
     def failing_record(run_id, key_id):
@@ -851,7 +851,7 @@ def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
 def test_route_blames_the_adapter_only_for_tagged_failures(api, monkeypatch):
     # a genuine adapter-resolution failure keeps the actionable 400 that names the source.
     import flash.runner as runner_mod
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     # raise the class off the reloaded module: the api fixture reloads flash.runner, so a symbol
     # imported at module scope here would be a different object than the route's.
@@ -871,7 +871,7 @@ def test_route_blames_the_adapter_only_for_tagged_failures(api, monkeypatch):
 def test_route_does_not_blame_the_adapter_for_unrelated_failures(api, monkeypatch):
     # prepare_job also performs gpu, budget, and environment checks. with init_from_adapter set,
     # unrelated failures must retain their own attribution.
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     def _prepare(*args, **kwargs):
         raise ValueError("no gpu class satisfies the requested memory")

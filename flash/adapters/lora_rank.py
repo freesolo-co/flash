@@ -16,7 +16,7 @@ from flash.core.catalog import lora_expert_count, serving_context_cap, serving_l
 
 class ServingPreflightError(ValueError):
     """Serving-path preflight rejection. Homed here (dependency-light) so unstructured
-    preparation can raise/catch it without importing the heavy flash.serve.preflight module."""
+    preparation can raise/catch it without importing the heavy flash.serve.deployment.preflight module."""
 
 
 if TYPE_CHECKING:

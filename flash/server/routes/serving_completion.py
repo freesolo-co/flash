@@ -18,13 +18,13 @@ from flash.runner import (
     mark_checkpoint_deployed,
     verified_adapter_revision_generation,
 )
-from flash.serve.deploy import (
+from flash.serve.deployment.deploy import (
     ActivationOutcomeUnknown,
     AdapterConfigMissing,
     AliasThinkingSilent,
     ServingError,
 )
-from flash.server import app as _app
+from flash.server.asgi import app as _app
 from flash.server.platform import db
 
 # resolved through `serving` rather than imported from `flash.runner`: a serving test patches

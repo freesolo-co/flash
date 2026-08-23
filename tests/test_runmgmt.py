@@ -734,10 +734,10 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
     import io
 
     import flash.providers as providers
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
@@ -814,10 +814,10 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
     import io
 
     import flash.providers as providers
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
@@ -888,10 +888,10 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     import io
 
     import flash.providers as providers
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
@@ -979,10 +979,10 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
     import io
 
     import flash.providers as providers
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
@@ -1454,7 +1454,7 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
 ):
     import flash.runner as runner
     from flash.core.spec import JobSpec
-    from flash.server.domain import reconcile
+    from flash.server.domain.ops import reconcile
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id=f"recovered-{terminal_state}", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1558,7 +1558,7 @@ def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
 
     import flash.runner as runner
     from flash.core.spec import JobSpec
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-legacy", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1615,7 +1615,7 @@ def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
 def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypatch, tmp_path):
     import flash.runner as runner
     from flash.core.spec import JobSpec
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-absent", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1721,7 +1721,7 @@ def test_handleless_state_without_next_attempt_is_rejected(monkeypatch, tmp_path
 def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatch, tmp_path):
     import io
 
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec
     from flash.runner.supervise import lifecycle
@@ -1796,7 +1796,7 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
     import flash.providers as providers
     import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec
-    from flash.providers.base import PollResult
+    from flash.providers.core.base import PollResult
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
@@ -2009,7 +2009,7 @@ def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
     from types import SimpleNamespace
 
     import flash.runner.supervise.attach as attach
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
 
     remote = _vast_remote(allocated_gpu="RTX 4090", allocated_gpu_count=4)
     context = attach._AttachContext(
@@ -2096,8 +2096,8 @@ def test_completed_attempt_metrics_rereads_a_marker_that_is_not_visible_yet(monk
     """
     import io
 
-    import flash.providers._lifecycle.poll_instance as instance_poll
-    import flash.providers._lifecycle.terminal_artifacts as ta
+    import flash.providers._lifecycle.instances.poll_instance as instance_poll
+    import flash.providers._lifecycle.instances.terminal_artifacts as ta
     import flash.providers.artifacts.hf as hf_artifacts
     import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import JobSpec, TrainSpec
@@ -2356,10 +2356,10 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
 
 
 def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monkeypatch):
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.execution.jobs as jobs
     import flash.providers.runpod.serverless as train
     from flash.core.spec import JobSpec
-    from flash.providers.base import PollResult
+    from flash.providers.core.base import PollResult
 
     spec = JobSpec(run_id="worker-attempt", model="Qwen/Qwen3.5-4B", algorithm="sft")
     payloads = []
@@ -2874,7 +2874,7 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
 
 @pytest.mark.parametrize(("now", "pending"), [(201.0, True), (321.0, False)])
 def test_completed_attempt_metrics_bounds_success_marker_metrics_grace(monkeypatch, now, pending):
-    import flash.providers._lifecycle.poll_instance as instance_poll
+    import flash.providers._lifecycle.instances.poll_instance as instance_poll
     import flash.providers.artifacts.hf as hf_artifacts
     import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import JobSpec, TrainSpec
@@ -2967,10 +2967,10 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
     import io
 
     import flash.providers as providers
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
@@ -3062,10 +3062,10 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
     import io
 
     import flash.providers as providers
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 

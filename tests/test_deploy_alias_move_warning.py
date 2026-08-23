@@ -17,8 +17,8 @@ from types import SimpleNamespace
 import pytest
 
 import flash.cli.commands as commands
-import flash.cli.commands.deploy as deploy_module
-from flash.cli.commands.deploy import _alias_move_warning, cmd_deploy
+import flash.cli.commands.ops.deploy as deploy_module
+from flash.cli.commands.ops.deploy import _alias_move_warning, cmd_deploy
 from flash.client import ApiError, ClientError
 
 

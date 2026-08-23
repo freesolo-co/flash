@@ -11,8 +11,8 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.http.router import AdapterRouter, build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 SHA = "a" * 40
@@ -281,7 +281,7 @@ def test_teardown_drops_a_row_that_vanished_from_persistence() -> None:
     serving an adapter that no longer exists in persistence, and the next reload would not
     correct it: a reload only hydrates rows that ARE present, so it cannot remove one that is not.
     """
-    from flash.serving.src.undeploy import apply_teardown
+    from flash.serving.src.store.undeploy import apply_teardown
 
     revision = _revision()
     router = AdapterRouter([revision, _alias(revision)])
@@ -295,7 +295,7 @@ def test_teardown_drops_a_row_that_vanished_from_persistence() -> None:
 
 def test_teardown_keeps_the_authoritative_row_when_one_came_back() -> None:
     """The disabled row returned by the CAS replaces the enumerated one in routing."""
-    from flash.serving.src.undeploy import apply_teardown
+    from flash.serving.src.store.undeploy import apply_teardown
 
     revision = _revision()
     disabled = revision.model_copy(update={"status": "disabled"})

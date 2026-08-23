@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Any, Literal
 
-from flash.serve.contract import ADAPTER_REVISION_PATTERN
+from flash.serve.contract.contract import ADAPTER_REVISION_PATTERN
 from flash.serve.control import DeploymentSpec, EngineIdentity
 from flash.serve.control._canonical import (
     canonical_json,

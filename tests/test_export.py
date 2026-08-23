@@ -151,7 +151,7 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
 
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     url = export_adapter(
         source_repo="org/test-runs",
@@ -237,7 +237,7 @@ def test_export_adapter_normalizes_safetensors_keys_for_vanilla_peft(monkeypatch
             uploaded["weights"] = (Path(folder_path) / "adapter_model.safetensors").read_bytes()
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     export_adapter(
         source_repo="org/test-runs",
@@ -308,8 +308,8 @@ def test_export_adapter_key_collision_fails_the_export(monkeypatch):
             uploaded["weights"] = (Path(folder_path) / "adapter_model.safetensors").read_bytes()
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.errors import ServingError
-    from flash.serve.export import export_adapter
+    from flash.serve.contract.errors import ServingError
+    from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ServingError, match="collides"):
         export_adapter(
@@ -325,7 +325,7 @@ def test_export_adapter_key_collision_fails_the_export(monkeypatch):
 
 
 def test_export_adapter_normalizes_lm_keys_with_inert_vision_weights(tmp_path):
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     lm_a = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
     lm_b = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_B.default.weight"
@@ -356,7 +356,7 @@ def test_export_adapter_normalizes_lm_keys_with_inert_vision_weights(tmp_path):
 
 
 def test_text_namespace_export_drops_the_training_only_language_exclusion(tmp_path):
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     config_path = tmp_path / "adapter_config.json"
     exclusion = r"^(?!model\.language_model(?:\.|$)).*$"
@@ -419,7 +419,7 @@ def test_export_adapter_with_vision_keys_leaves_safetensors_unchanged(monkeypatc
             uploaded["weights"] = (Path(folder_path) / "adapter_model.safetensors").read_bytes()
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     export_adapter(
         source_repo="org/test-runs",
@@ -435,7 +435,7 @@ def test_export_adapter_with_vision_keys_leaves_safetensors_unchanged(monkeypatc
 
 def test_export_adapter_normalizes_only_the_representation_peft_loads(tmp_path):
     """the single safetensors file wins over stale same-suffix shards from an earlier save."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     infixed = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
     stale_visual = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"
@@ -520,7 +520,7 @@ def test_export_adapter_normalizes_sharded_safetensors_and_index(monkeypatch):
             )
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     export_adapter(
         source_repo="org/test-runs",
@@ -556,7 +556,7 @@ def test_stale_shards_left_by_a_shorter_retry_are_not_scanned(tmp_path):
     it would let its dead visual tensor pin the live text-only shards to the multimodal namespace,
     exporting keys peft loads as a no-op.
     """
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     live_a = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
     live_b = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_B.default.weight"
@@ -592,8 +592,8 @@ def test_export_adapter_with_out_of_bounds_non_lm_offsets_is_refused(tmp_path):
 
     The weights stay untouched on disk, but the caller gets an error instead of a silent copy of an
     adapter whose keys may never bind to anything."""
-    from flash.serve import export
-    from flash.serve.errors import ServingError
+    from flash.serve.deployment import export
+    from flash.serve.contract.errors import ServingError
 
     lm_key = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
     vision_b = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"
@@ -613,7 +613,7 @@ def test_export_adapter_with_out_of_bounds_non_lm_offsets_is_refused(tmp_path):
 
 
 def test_export_adapter_with_unrecognized_non_lm_tensor_is_unchanged(tmp_path):
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     lm_key = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
     vision_saved = "base_model.model.model.visual.proj.modules_to_save.default.weight"
@@ -679,7 +679,7 @@ def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
             uploaded["readme"] = (folder / "README.md").read_text()
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     export_adapter(
         source_repo="org/test-runs",
@@ -697,7 +697,7 @@ def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
 
 
 def test_export_adapter_config_validates_and_preserves_revision(tmp_path):
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     revision = "a" * 40
     path = tmp_path / "adapter_config.json"
@@ -724,7 +724,7 @@ def test_export_adapter_config_validates_and_preserves_revision(tmp_path):
 
 
 def test_export_metadata_repair_skips_non_utf8_files(tmp_path):
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     (tmp_path / "adapter_config.json").write_bytes(b"\xff")
     (tmp_path / "README.md").write_bytes(b"\xfe")
@@ -734,7 +734,7 @@ def test_export_metadata_repair_skips_non_utf8_files(tmp_path):
 
 
 def test_export_readme_base_model_replacement_is_literal(tmp_path):
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     temp_base = "/tmp/flash_sft_merged_abcd1234"
     literal_base_model = r"org\1/model"
@@ -787,7 +787,7 @@ def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeyp
             calls["delete_patterns"] = delete_patterns
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     export_adapter(
         source_repo="org/test-runs",
@@ -836,7 +836,7 @@ def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
             order.append(("upload", None))
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     export_adapter(
         source_repo="org/test-runs",
@@ -881,7 +881,7 @@ def test_export_private_is_enforced_before_upload(monkeypatch):
             order.append(("upload", None))
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     export_adapter(
         source_repo="org/test-runs",
@@ -925,7 +925,7 @@ def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
             pass
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     export_adapter(
         source_repo="org/test-runs",
@@ -947,7 +947,7 @@ def test_export_adapter_raises_value_error_when_source_is_empty(monkeypatch):
             pass
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ValueError, match="no loadable LoRA adapter"):
         export_adapter(
@@ -984,7 +984,7 @@ def test_export_rejects_source_with_config_but_no_adapter_weight(monkeypatch):
             uploaded["called"] = True
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ValueError, match="no loadable LoRA adapter"):
         export_adapter(
@@ -1021,7 +1021,7 @@ def test_export_refuses_adapter_whose_tensors_contradict_its_declared_rank(tmp_p
     so an unloadable adapter published a Hub URL while the identical artifact failed to deploy. A
     successful export then read as evidence the artifact worked.
     """
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
     header.update(
@@ -1039,7 +1039,7 @@ def test_export_accepts_fused_moe_experts_when_target_parameters_declares_them(t
     module into `lora.ParamWrapper` -- the one path that builds `nn.Linear(in_features,
     r * num_experts)`. With it declared, an r=32 adapter over 256 experts really does carry an
     8192-long axis, and refusing it would break adapters that load."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
     header.update(
@@ -1067,7 +1067,7 @@ def test_export_requires_the_cataloged_expert_count_for_fused_parameters(tmp_pat
     """Qwen3.6 35B has 256 routed experts, so an r=32 target-parameter tensor must carry exactly
     8192 on its stacked rank axis. Divisibility alone accepts every value here even though none can
     bind to PEFT's r * num_experts layer."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(
         stacked_rank,
@@ -1093,7 +1093,7 @@ def test_export_limits_the_fused_rank_allowance_to_target_parameter_modules(tmp_
     """PEFT permits one config to target ordinary modules and parameters together. The expert
     tensor may stack its rank across experts, but that cannot make a rank-64 q_proj valid under
     r=32; granting the allowance config-wide would recreate the false-success bug for q_proj."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(64, 64, prefix="base_model.model.model.layers.0.self_attn.q_proj")
     header.update(
@@ -1124,7 +1124,7 @@ def test_export_refuses_the_reported_35b_artifact_with_no_target_parameters(tmp_
 
     This is the case a plain "any multiple of r" rule would wave through, because 8192 = 32 x 256.
     The fused allowance has to be gated on `target_parameters` or the original bug survives."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
     header.update(
@@ -1152,7 +1152,7 @@ def test_export_refuses_an_ordinary_module_at_an_exact_multiple_of_the_declared_
     """For ordinary `target_modules` the axis must EQUAL the module's rank: loading a rank-64
     tensor into a rank-32 LoRA layer is a size mismatch. An exact multiple is the case an
     "any multiple" rule accepts and a serving engine still rejects."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(64, 64, prefix="base_model.model.model.layers.0.self_attn.q_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
@@ -1166,7 +1166,7 @@ def test_export_refuses_an_ordinary_module_at_an_exact_multiple_of_the_declared_
 
 def test_export_rank_mismatch_reaches_the_caller_as_itself(tmp_path):
     """Not reported as an unnormalizable key namespace: that is a different defect and remedy."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(24, 24, prefix="base_model.model.model.layers.0.mlp.up_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
@@ -1202,7 +1202,7 @@ def test_export_refuses_rank_mismatch_before_touching_the_destination_repo(monke
             touched["called"] = True
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ValueError, match="do not carry the rank configured"):
         export_adapter(
@@ -1218,7 +1218,7 @@ def test_export_refuses_rank_mismatch_before_touching_the_destination_repo(monke
 
 def test_export_accepts_an_adapter_whose_tensors_match_its_declared_rank(tmp_path):
     """The check must not cost a good export: matching shapes pass straight through."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(16, 16, prefix="base_model.model.model.layers.0.mlp.up_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
@@ -1230,7 +1230,7 @@ def test_export_accepts_an_adapter_whose_tensors_match_its_declared_rank(tmp_pat
 def test_export_reads_rank_pattern_overrides_rather_than_refusing_them(tmp_path):
     """PEFT records per-module ranks in `rank_pattern`. A module legitimately trained at the
     overridden rank must still export."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(80, 80, prefix="base_model.model.model.layers.0.mlp.up_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
@@ -1242,7 +1242,7 @@ def test_export_reads_rank_pattern_overrides_rather_than_refusing_them(tmp_path)
 
 
 def test_export_preserves_overlapping_rank_pattern_first_match(tmp_path):
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(16, 16, prefix="base_model.model.model.layers.0.mlp.up_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
@@ -1258,7 +1258,7 @@ def test_export_accepts_modules_the_rank_pattern_did_not_override(tmp_path):
     module at the `r: 32` default. Checking against one summary number (the max, which is what
     serving-capacity questions want) refuses every module that number did not come from -- so the
     tensors are checked against the SET of declared ranks."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
     header.update(
@@ -1277,7 +1277,7 @@ def test_export_matches_rank_pattern_only_on_module_boundaries(tmp_path):
     entry only ever governs a whole dot-delimited suffix. A bare `proj` override therefore does NOT
     govern `q_proj`, which keeps its `r: 32` default -- matching on any substring instead would read
     a correct rank-32 q_proj as contradicting the pattern's 64 and refuse a valid adapter."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
     header.update(
@@ -1295,7 +1295,7 @@ def test_export_ignores_shapes_that_cannot_report_a_rank(tmp_path):
     """`modules_to_save` copies, biases and stacked 3-D fused layouts are not [r, in] / [out, r].
     None of them can answer the question, and reading a rank out of them anyway would refuse
     adapters that are fine -- so they are skipped rather than guessed at."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = {
         "base_model.model.model.layers.0.mlp.up_proj.lora_A.default.weight": {
@@ -1328,7 +1328,7 @@ def test_export_ignores_shapes_that_cannot_report_a_rank(tmp_path):
 
 
 def test_export_rejects_tensors_without_a_resolved_declared_rank(tmp_path):
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(16, 16, prefix="base_model.model.model.layers.0.mlp.up_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
@@ -1340,7 +1340,7 @@ def test_export_rejects_tensors_without_a_resolved_declared_rank(tmp_path):
 
 @pytest.mark.parametrize("value", [0, -1, True, 16.0, "16"])
 def test_export_strictly_rejects_invalid_scalar_rank_declarations(tmp_path, value):
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(16, 16, prefix="base_model.model.model.layers.0.mlp.up_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
@@ -1351,7 +1351,7 @@ def test_export_strictly_rejects_invalid_scalar_rank_declarations(tmp_path, valu
 
 
 def test_export_strictly_rejects_malformed_rank_pattern_regex(tmp_path):
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     header = _lora_pair_header(16, 16, prefix="base_model.model.model.layers.0.mlp.up_proj")
     (tmp_path / "adapter_model.safetensors").write_bytes(_safetensors_bytes(header, b"\x01" * 4))
@@ -1364,7 +1364,7 @@ def test_export_strictly_rejects_malformed_rank_pattern_regex(tmp_path):
 def test_export_checks_ranks_across_every_shard_not_just_the_first(tmp_path):
     """Sharding splits one key namespace over several files, so a bad expert tensor can sit in a
     shard the first-file-only reading never opens."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     good = _lora_pair_header(32, 32, prefix="base_model.model.model.layers.0.self_attn.q_proj")
     bad = _lora_pair_header(100, 100, prefix="base_model.model.model.layers.1.mlp.up_proj")
@@ -1391,7 +1391,7 @@ def test_export_checks_ranks_across_every_shard_not_just_the_first(tmp_path):
 
 
 def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
-    from flash.serve.deploy import ServingError
+    from flash.serve.deployment.deploy import ServingError
 
     def fake_snapshot_download(**kw):
         raise RuntimeError("401 Unauthorized")
@@ -1401,7 +1401,7 @@ def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
             pass
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ServingError, match="could not download adapter"):
         export_adapter(
@@ -1415,7 +1415,7 @@ def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
 
 
 def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch):
-    from flash.serve.deploy import ServingError
+    from flash.serve.deployment.deploy import ServingError
 
     message = "You don't have the rights to download this repository"
 
@@ -1427,7 +1427,7 @@ def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch)
             pass
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ServingError) as exc_info:
         export_adapter(
@@ -1443,7 +1443,7 @@ def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch)
 
 
 def test_export_adapter_propagates_local_download_oserror(monkeypatch):
-    from flash.serve.deploy import ServingError
+    from flash.serve.deployment.deploy import ServingError
 
     def fake_snapshot_download(**kw):
         raise PermissionError("local export directory is not writable")
@@ -1453,7 +1453,7 @@ def test_export_adapter_propagates_local_download_oserror(monkeypatch):
             pass
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(PermissionError) as exc_info:
         export_adapter(
@@ -1469,7 +1469,7 @@ def test_export_adapter_propagates_local_download_oserror(monkeypatch):
 
 
 def test_export_adapter_wraps_hub_create_repo_oserror_in_serving_error(monkeypatch):
-    from flash.serve.deploy import ServingError
+    from flash.serve.deployment.deploy import ServingError
 
     message = "You don't have the rights to create a model under the namespace me"
 
@@ -1488,7 +1488,7 @@ def test_export_adapter_wraps_hub_create_repo_oserror_in_serving_error(monkeypat
             raise _FakeHfHubHTTPError(message)
 
     _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
-    from flash.serve.export import export_adapter
+    from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ServingError) as exc_info:
         export_adapter(
@@ -1538,8 +1538,8 @@ def test_hf_api_missing_extra_raises_runtime_error_not_serving_error(monkeypatch
     # route lets it surface as a 500 rather than a misleading 502.
     import builtins
 
-    from flash.serve import export
-    from flash.serve.deploy import ServingError
+    from flash.serve.deployment import export
+    from flash.serve.deployment.deploy import ServingError
 
     real_import = builtins.__import__
 
@@ -1561,8 +1561,8 @@ def test_export_missing_operator_token_raises_runtime_error_not_serving_error(mo
     # misconfiguration (-> 500), NOT an upstream auth failure (ServingError -> 502). export_adapter
     # must raise a plain RuntimeError BEFORE snapshot_download, rather than passing token=None and
     # wrapping the resulting auth error as ServingError.
-    from flash.serve import export
-    from flash.serve.deploy import ServingError
+    from flash.serve.deployment import export
+    from flash.serve.deployment.deploy import ServingError
 
     monkeypatch.delenv("HF_TOKEN", raising=False)
 

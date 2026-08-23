@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from flash.providers._lifecycle.poll import (
+from flash.providers._lifecycle.instances.poll import (
     _attempt_int,
     _format_heartbeat,
     heartbeat_progress_ts,

@@ -174,7 +174,7 @@ def _untrusted_tmpdir_ancestor(base):
     """The first ancestor of ``base`` that the env cache's trust checks will refuse, if any.
 
     Mirrors the group/other-writable-without-sticky-bit rule in
-    ``flash.envs.cache_security.validate_cache_root_ancestors``, including the chain it walks:
+    ``flash.envs.meta.cache_security.validate_cache_root_ancestors``, including the chain it walks:
     raw parents AND resolved ones. A symlinked temp root makes those two different sets, and the
     exception names whichever one it found -- so walking only the raw chain returns a path that
     never appears in the message, and the caller's causality check silently drops the diagnostic
@@ -302,7 +302,7 @@ def _rebind_worker_submodule_attributes():
     test sees.
 
     That breaks any later test patching a dotted string target such as
-    ``flash.engine.worker.train.opd.validation._resolve_structured_model_metadata``, because
+    ``flash.engine.worker.train.opd.orchestration.validation._resolve_structured_model_metadata``, because
     monkeypatch resolves a dotted target by walking getattr from the parent package. Alphabetical
     file order hides it today -- the re-importing file sorts after its victims -- so the suite is
     green by accident, and any reordering (``-n`` sharding, ``-p randomly``, a renamed file) turns
@@ -335,7 +335,7 @@ def _offline(monkeypatch):
     # RunPod endpoint listing -> offline: the idle-endpoint sweep (deploy-time quota reclaim
     # and the startup/post-run orphan sweep) lists account endpoints. Default to "no endpoints"
     # so a sweep never reaches the real API; sweep tests monkeypatch it after this fixture.
-    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.client.api as runpod_api
 
     monkeypatch.setattr(runpod_api, "list_endpoints", list, raising=False)
 
@@ -389,7 +389,7 @@ def _offline(monkeypatch):
     # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing
     # it to a single active key never loses the rest of the pool). Reset it around every
     # test so a key set/collapsed by one test can't leak into the next.
-    import flash.providers.runpod.auth as rp_keys
+    import flash.providers.runpod.client.auth as rp_keys
 
     rp_keys.reset()
 
@@ -415,7 +415,7 @@ def _offline(monkeypatch):
     # Always-on artifact GC: the control-plane lifespan sweeps ONCE on startup (when an operator
     # HF_TOKEN is set). Stub it to a no-op so offline TestClient startups never reach HF/serving;
     # tests/test_repo_cleanup.py restores the real function to exercise the genuine sweep.
-    import flash.server.domain.repo_cleanup as _rc
+    import flash.server.domain.ops.repo_cleanup as _rc
 
     monkeypatch.setattr(_rc, "run_scheduled_cleanup", lambda *a, **k: 0, raising=False)
 
@@ -463,7 +463,7 @@ def _child_subreaper_does_not_leak_between_tests():
         yield
     finally:
         libc.prctl(36, previous, 0, 0, 0)
-        import flash.engine.worker.backend_common as _vc
+        import flash.engine.worker.train.entry.backend_common as _vc
 
         _vc._ADOPTS_ORPHANS = bool(previous)
 
@@ -471,7 +471,7 @@ def _child_subreaper_does_not_leak_between_tests():
 @pytest.fixture(autouse=True)
 def _fast_serving_readback(monkeypatch):
     """Zero the deploy read-back backoff so verification polls don't slow the suite."""
-    import flash.serve.deploy as _deploy
+    import flash.serve.deployment.deploy as _deploy
 
     monkeypatch.setattr(_deploy, "READBACK_DELAY_SECONDS", 0.0)
     monkeypatch.setattr(_deploy, "ACTIVATION_READBACK_DELAY_SECONDS", 0.0)
@@ -483,7 +483,7 @@ def stub_serving_registry(monkeypatch):
     """Patch GET /adapters to return the given records (deploy read-back verification)."""
 
     def _stub(*records: dict):
-        import flash.serve.deploy as _deploy
+        import flash.serve.deployment.deploy as _deploy
 
         class _RegistryResp:
             status_code = 200

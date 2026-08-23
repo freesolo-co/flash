@@ -326,7 +326,7 @@ class TestServerPreflightFailure:
         return code, capsys.readouterr()
 
     def test_missing_operator_config_exits_3_with_the_message_on_stderr(self, monkeypatch, capsys):
-        from flash.providers.preflight import PreflightError
+        from flash.providers.core.preflight import PreflightError
 
         message = (
             "the Flash control plane is missing required operator configuration:\n"
@@ -342,7 +342,7 @@ class TestServerPreflightFailure:
         assert captured.err.startswith("error: ")
 
     def test_the_failure_is_not_reported_as_a_traceback(self, monkeypatch, capsys):
-        from flash.providers.preflight import PreflightError
+        from flash.providers.core.preflight import PreflightError
 
         _, captured = self._run(
             monkeypatch, capsys, PreflightError("missing FREESOLO_INTERNAL_KEY")

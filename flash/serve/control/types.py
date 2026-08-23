@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import PurePosixPath
 from typing import Literal, TypeAlias
 
-from flash.serve.contract import ADAPTER_REVISION_PATTERN
+from flash.serve.contract.contract import ADAPTER_REVISION_PATTERN
 
 from ._canonical import canonical_json
 from ._urls import validate_modal_public_url, validate_runpod_pod_id, validate_runpod_public_url

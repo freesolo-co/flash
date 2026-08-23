@@ -635,7 +635,7 @@ def test_download_env_package_percent_encodes_reserved_chars(stub):
 
 
 def test_download_env_package_caps_response_body(stub, monkeypatch):
-    from flash.envs import loader as adapter
+    from flash.envs.loading import loader as adapter
 
     url, _seen = stub
     monkeypatch.setattr(adapter, "_MAX_ARCHIVE_BYTES", 5)

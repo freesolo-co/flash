@@ -13,18 +13,18 @@ import urllib.error
 
 import pytest
 
-from flash.providers.runpod.api import list_endpoints as _real_list_endpoints
+from flash.providers.runpod.client.api import list_endpoints as _real_list_endpoints
 
 
 def _reset_pool(monkeypatch, value):
     monkeypatch.setenv("RUNPOD_API_KEY", value)
-    from flash.providers.runpod import auth
+    from flash.providers.runpod.client import auth
 
     auth.reset()
 
 
 def test_key_fingerprint_is_stable_and_non_revealing():
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     secret = "rpk-supersecret-value-123"
     fp = api.key_fingerprint(secret)
@@ -44,7 +44,7 @@ def test_the_prefix_form_is_what_a_deployed_release_writes_not_history():
     therefore persists this shape, and a cleanup record whose owner cannot be resolved leaves a
     live RunPod endpoint billing with nothing able to tear it down.
     """
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     deployed_shape = api.key_fingerprint("some-pool-key")[:16]
     assert api._is_prefix_key_fingerprint(deployed_shape)
@@ -52,7 +52,7 @@ def test_the_prefix_form_is_what_a_deployed_release_writes_not_history():
 
 
 def test_key_lookup_rejects_unknown_fingerprint_without_leaking_credentials(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     keys = ["secretA", "secretB"]
     monkeypatch.setattr(api._keys, "keys", lambda: keys)
@@ -64,7 +64,7 @@ def test_key_lookup_rejects_unknown_fingerprint_without_leaking_credentials(monk
 
 
 def test_key_lookup_rejects_colliding_configured_fingerprints(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     keys = ["secretA", "secretB"]
     fingerprint = "rpk-" + "a" * 64
@@ -84,7 +84,7 @@ def test_repeated_identical_pool_key_still_resolves_its_fingerprint(monkeypatch)
     exact fingerprint matches. Ownership is still unambiguous (equal sha256 => equal key),
     and refusing to resolve it would break submit/poll/cancel/delete for that account.
     """
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     _reset_pool(monkeypatch, "secretA,secretB,secretA")
 
@@ -93,7 +93,7 @@ def test_repeated_identical_pool_key_still_resolves_its_fingerprint(monkeypatch)
 
 
 def test_prefix_fingerprint_owner_listing_deletes_through_authenticated_path(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
     from flash.runner.supervise.recovery import _delete_runpod_endpoint
 
     key = "legacy-owner"
@@ -125,7 +125,7 @@ def test_prefix_fingerprint_owner_listing_deletes_through_authenticated_path(mon
 
 
 def test_prefix_fingerprint_already_gone_retires_cleanup_record(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
     from flash.runner.supervise.recovery import _delete_runpod_endpoint
 
     key = "legacy-owner"
@@ -147,7 +147,7 @@ def test_prefix_fingerprint_already_gone_retires_cleanup_record(monkeypatch):
 
 
 def test_prefix_fingerprint_rejects_ambiguous_prefix_owners(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     keys = ["owner-a", "owner-b"]
     fingerprints = {
@@ -167,7 +167,7 @@ def test_prefix_fingerprint_rejects_ambiguous_prefix_owners(monkeypatch):
 
 
 def test_prefix_fingerprint_rejects_endpoint_live_under_other_account(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     key = "legacy-owner"
     other_key = "other-account"
@@ -189,7 +189,7 @@ def test_prefix_fingerprint_rejects_endpoint_live_under_other_account(monkeypatc
 
 
 def test_rotated_sole_replacement_with_same_48_bit_prefix_cannot_confirm_absence(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     digests = {
         b"secretA": "a" * 12 + "1" * 52,
@@ -224,8 +224,8 @@ def test_rotated_sole_replacement_with_same_48_bit_prefix_cannot_confirm_absence
 
 
 def test_strict_handle_rejects_truncated_owner_identity(monkeypatch):
-    from flash.providers.runpod import api
-    from flash.providers.runpod.jobs import JobHandle
+    from flash.providers.runpod.client import api
+    from flash.providers.runpod.execution.jobs import JobHandle
 
     monkeypatch.setattr(api._keys, "keys", list)
     payload = {
@@ -244,7 +244,7 @@ def test_strict_handle_rejects_truncated_owner_identity(monkeypatch):
 
 
 def test_list_endpoints_by_key_returns_fingerprints_not_raw_keys(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     _reset_pool(monkeypatch, "secretA,secretB")
 
@@ -266,7 +266,7 @@ def test_list_endpoints_by_key_returns_fingerprints_not_raw_keys(monkeypatch):
 
 
 def test_fingerprint_helpers_resolve_to_the_owning_key(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     _reset_pool(monkeypatch, "secretA,secretB")
     seen = {}
@@ -305,7 +305,7 @@ def test_fingerprint_helpers_resolve_to_the_owning_key(monkeypatch):
     ],
 )
 def test_submit_job_rejects_invalid_id_without_exposing_provider_response(monkeypatch, job_id):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     key = "secretA"
     private_canary = "provider-private-response-canary"
@@ -334,7 +334,7 @@ def test_submit_job_rejects_invalid_id_without_exposing_provider_response(monkey
 
 
 def test_submit_job_returns_nonempty_string_id(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     key = "secretA"
     monkeypatch.setattr(api._keys, "keys", lambda: [key])
@@ -356,7 +356,7 @@ def test_submit_job_returns_nonempty_string_id(monkeypatch):
 
 
 def test_submit_status_cancel_and_delete_keep_owning_key_after_rotation(monkeypatch):
-    from flash.providers.runpod import api, auth
+    from flash.providers.runpod.client import api, auth
 
     _reset_pool(monkeypatch, "secretA,secretB")
     owner = api.key_fingerprint("secretA")

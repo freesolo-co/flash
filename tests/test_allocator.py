@@ -6,8 +6,8 @@ import pytest
 
 
 def test_required_vram_catalog_and_open():
-    from flash.providers import allocator
-    from flash.providers.allocator import required_vram_gb
+    from flash.providers.core import allocator
+    from flash.providers.core.allocator import required_vram_gb
 
     # MEASURED: tiny-model GRPO OOMs a 20 GB card (vLLM-colocate engine overhead the param
     # estimate missed); floored to the 24 GB vLLM-colocate minimum (_VLLM_COLOCATE_FLOOR_GB).
@@ -25,8 +25,8 @@ def test_required_vram_catalog_and_open():
 
 
 def test_allocation_restricted_to_validated_pool():
-    from flash.providers import allocator
-    from flash.providers.base import VALIDATED
+    from flash.providers.core import allocator
+    from flash.providers.core.base import VALIDATED
 
     # The deployed control plane rejects a submit for any non-validated class, so client-side
     # allocation must only ever pick a class in the validated pool — across ALL candidates,
@@ -46,8 +46,8 @@ def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
     deployed control plane accepts the submit). The managed catalog is now fully validated, so
     inject a synthetic unvalidated RunPod class cheaper than any real one and confirm it is
     excluded from the candidate set."""
-    from flash.providers import allocator
-    from flash.providers.base import GPU_INFO, VALIDATED, GpuClass
+    from flash.providers.core import allocator
+    from flash.providers.core.base import GPU_INFO, VALIDATED, GpuClass
 
     fake = GpuClass("FAKE Cheap", "NVIDIA_FAKE", 24, "fakecheap", "sm80", 0.10)
     assert not fake.validated
@@ -69,7 +69,7 @@ def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
 
 def test_runpod_allocation_lands_on_full_validated_cards():
     """Allocation lands on the card with the cheapest dollars-per-step among validated classes."""
-    from flash.providers import allocator
+    from flash.providers.core import allocator
 
     # ranking is on cost per step rather than $/hr, but on MEASURED throughput the RTX 4090 is also
     # the best value in the pool (~4.2 $/PFLOP-hr vs the H100 PCIe's ~6.6), so a small SFT run stays
@@ -158,15 +158,15 @@ def test_default_max_retries():
 def test_cheapest_gpu_picks_cheapest_validated_runpod_class():
     """cheapest_gpu (the RunPod-static, parse-time provisional) picks the cheapest VALIDATED
     RunPod-provisionable class that fits, matching what the RunPod allocator path provisions."""
-    from flash.providers.base import cheapest_gpu
+    from flash.providers.core.base import cheapest_gpu
 
     assert cheapest_gpu(24) == "RTX 4090"  # cheapest validated RunPod class that fits 24 GB
     assert cheapest_gpu(80) == "A100 PCIe"  # cheapest validated 80 GB RunPod class
 
 
 def test_offline_allocates_static_cheapest():
-    from flash.providers import allocator
-    from flash.providers.base import cheapest_gpu
+    from flash.providers.core import allocator
+    from flash.providers.core.base import cheapest_gpu
 
     # RunPod-only static rates: allocation matches cheapest_gpu.
     a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
@@ -175,8 +175,8 @@ def test_offline_allocates_static_cheapest():
 
 
 def test_nothing_fits_names_constraint(monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core import allocator
+    from flash.providers.core.base import UnsupportedGpuError
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 4096)
     with pytest.raises(UnsupportedGpuError, match="4096 GB"):
@@ -184,8 +184,8 @@ def test_nothing_fits_names_constraint(monkeypatch):
 
 
 def test_allocate_provider_constraint_never_falls_through(monkeypatch):
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import Candidate
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
@@ -212,8 +212,8 @@ def test_allocate_provider_constraint_never_falls_through(monkeypatch):
 
 
 def test_soft_provider_preference_ranks_ahead_of_cost_without_dropping_fallbacks(monkeypatch):
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import Candidate
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("vast", "runpod", "lambda"))
@@ -245,8 +245,8 @@ def test_soft_provider_preference_ranks_ahead_of_cost_without_dropping_fallbacks
 
 
 def test_soft_provider_preference_preserves_cost_order_within_one_rank(monkeypatch):
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import Candidate
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
@@ -277,8 +277,8 @@ def test_soft_provider_preference_preserves_cost_order_within_one_rank(monkeypat
 
 
 def test_allocate_rejects_provider_pin_with_preferences():
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core import allocator
+    from flash.providers.core.base import UnsupportedGpuError
 
     with pytest.raises(UnsupportedGpuError, match="provider and providers cannot both be set"):
         allocator.allocate(
@@ -292,8 +292,8 @@ def test_allocate_rejects_provider_pin_with_preferences():
 
 
 def test_allocate_rejects_unconfigured_provider(monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core import allocator
+    from flash.providers.core.base import UnsupportedGpuError
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     with pytest.raises(UnsupportedGpuError, match="not configured"):
@@ -301,8 +301,8 @@ def test_allocate_rejects_unconfigured_provider(monkeypatch):
 
 
 def test_allocate_gpu_type_never_widens_or_escalates(monkeypatch):
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import Candidate
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
@@ -335,8 +335,8 @@ def test_allocate_gpu_type_fallbacks_widen_the_search_without_dictating_the_winn
     pinned run somewhere to go when its first class is out of capacity. Order is preference, not
     priority: the survivors still compete on cost, so naming a class first does not make the run pay
     more for it."""
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import Candidate
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
@@ -364,8 +364,8 @@ def test_allocate_gpu_type_fallbacks_widen_the_search_without_dictating_the_winn
 
 
 def test_allocate_rejects_an_unsatisfiable_fallback(monkeypatch):
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import Candidate, UnsupportedGpuError
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import Candidate, UnsupportedGpuError
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
@@ -386,8 +386,8 @@ def test_allocate_rejects_an_unsatisfiable_fallback(monkeypatch):
 
 
 def test_allocate_ordered_lambda_pin_classifies_impossible_shapes_as_unsupported(monkeypatch):
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import Candidate, UnsupportedGpuError
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import Candidate, UnsupportedGpuError
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda",))
@@ -414,8 +414,8 @@ def test_allocate_ordered_lambda_pin_classifies_impossible_shapes_as_unsupported
 
 
 def test_allocate_gpu_type_enforces_vram_and_provider_support(monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core import allocator
+    from flash.providers.core.base import UnsupportedGpuError
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
@@ -438,8 +438,8 @@ def test_allocate_gpu_type_enforces_vram_and_provider_support(monkeypatch):
 
 @pytest.mark.parametrize("provider", ["lambda", "vast"])
 def test_exact_dynamic_provider_empty_capacity_is_retryable(monkeypatch, provider):
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import CapacityLookupError
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import CapacityLookupError
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: (provider,))
@@ -467,8 +467,8 @@ def test_sft_width_that_never_fits_is_terminal_not_a_capacity_retry(monkeypatch,
 
     Parametrized over both branches because a pin and an unpinned search classify separately.
     """
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import Candidate, CapacityLookupError, UnsupportedGpuError
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import Candidate, CapacityLookupError, UnsupportedGpuError
 
     # 200 GB does not fit one H100 card, and the clamp means one card is all that ever launches.
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
@@ -510,8 +510,8 @@ def test_lookup_blip_is_only_retryable_when_a_launchable_shape_exists(monkeypatc
     Both halves are asserted: the blip must STILL be retryable when a launchable shape does exist, or
     this guard would trade a retry bug for an outage that kills every run.
     """
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import CapacityLookupError, UnsupportedGpuError
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import CapacityLookupError, UnsupportedGpuError
 
     def _blip(need, constraints):
         raise CapacityLookupError("lambda live capacity lookup failed")
@@ -535,8 +535,8 @@ def test_lookup_blip_is_only_retryable_when_a_launchable_shape_exists(monkeypatc
 
 
 def test_exact_runpod_empty_capacity_stays_terminal(monkeypatch):
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import UnsupportedGpuError
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
@@ -552,8 +552,8 @@ def test_exact_runpod_empty_capacity_stays_terminal(monkeypatch):
 
 
 def test_allocate_gpu_type_ignores_ineligible_provider_blip(monkeypatch):
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import CapacityLookupError, UnsupportedGpuError
+    from flash.providers.core import allocator, get_provider
+    from flash.providers.core.base import CapacityLookupError, UnsupportedGpuError
 
     calls: list[str] = []
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
@@ -582,13 +582,13 @@ def test_allocate_gpu_type_ignores_ineligible_provider_blip(monkeypatch):
 
 
 def _raise_capacity_blip(*a, **k):
-    from flash.providers.base import CapacityLookupError
+    from flash.providers.core.base import CapacityLookupError
 
     raise CapacityLookupError("vast live capacity lookup failed") from RuntimeError("market blip")
 
 
 def _stub_alloc(monkeypatch, *, runpod, lambda_, vast):
-    from flash.providers import allocator, get_provider
+    from flash.providers.core import allocator, get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
@@ -611,8 +611,8 @@ def test_transient_capacity_blip_is_retryable_not_terminal(monkeypatch):
     """A live capacity-lookup outage that is the SOLE reason nothing fits raises the RETRYABLE
     CapacityLookupError, NOT the terminal UnsupportedGpuError — so the runner infra-retries the blip
     (isinstance check must stay False, since lifecycle terminal-fails only on UnsupportedGpuError)."""
-    from flash.providers import allocator
-    from flash.providers.base import CapacityLookupError, UnsupportedGpuError
+    from flash.providers.core import allocator
+    from flash.providers.core.base import CapacityLookupError, UnsupportedGpuError
 
     _stub_alloc(
         monkeypatch,
@@ -627,8 +627,8 @@ def test_transient_capacity_blip_is_retryable_not_terminal(monkeypatch):
 
 def test_capacity_blip_degrades_to_fitting_provider(monkeypatch):
     """A Vast blip must NOT abort allocation when another provider has a fitting class — degrade to it."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate
 
     _stub_alloc(
         monkeypatch,
@@ -642,8 +642,8 @@ def test_capacity_blip_degrades_to_fitting_provider(monkeypatch):
 
 def test_genuine_no_fit_without_blip_stays_terminal(monkeypatch):
     """No blip, just nothing fits -> terminal UnsupportedGpuError (unchanged contract)."""
-    from flash.providers import allocator
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core import allocator
+    from flash.providers.core.base import UnsupportedGpuError
 
     _stub_alloc(
         monkeypatch,
@@ -914,7 +914,7 @@ def test_opd_sizes_on_the_authored_prompts_per_step():
 def test_vram_headroom_consistent_across_sizing_paths():
     """provisional_gpu (parse-time) and required_vram_gb (submit-time) must size with the SAME
     headroom (a validated constant), so they never disagree."""
-    from flash.providers import allocator
+    from flash.providers.core import allocator
 
     assert allocator.vram_headroom() == 1.1
     # both paths feed model_required_vram_gb the same headroom -> identical sizing
@@ -933,8 +933,8 @@ def test_allocate_never_selects_below_matrix_need():
     """The core anti-OOM invariant: the GPU the allocator picks ALWAYS has >= the matrix's
     required VRAM, across a sweep of model x algo x seq x group x batch. If this ever fails,
     auto-allocation could provision a too-small card and OOM a paid worker."""
-    from flash.providers.allocator import allocate, required_vram_gb
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.allocator import allocate, required_vram_gb
+    from flash.providers.core.base import get_gpu_info
 
     grid = [
         ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
@@ -965,9 +965,9 @@ def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
     after the HF/PEFT student is already resident and requires its executor budget to be free. Keep
     this observed shape off consumer 32 GB cards and 40 GB fallback classes."""
     from flash.cost import RunConfig, estimate_cost
-    from flash.providers import allocator
-    from flash.providers.allocator import required_vram_gb
-    from flash.providers.base import get_gpu_info, provisional_gpu
+    from flash.providers.core import allocator
+    from flash.providers.core.allocator import required_vram_gb
+    from flash.providers.core.base import get_gpu_info, provisional_gpu
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     train = {"epochs": 1, "max_completion_tokens": 128, "lora_rank": 32}
@@ -1080,9 +1080,9 @@ def test_observed_qwen2_opd_sweep_never_downroutes_to_32_or_40gb(
     agree on a >40 GB requirement and a fitting non-consumer GPU before any paid worker is created.
     """
     from flash.cost import RunConfig, estimate_cost
-    from flash.providers import allocator
-    from flash.providers.allocator import required_vram_gb
-    from flash.providers.base import get_gpu_info, provisional_gpu
+    from flash.providers.core import allocator
+    from flash.providers.core.allocator import required_vram_gb
+    from flash.providers.core.base import get_gpu_info, provisional_gpu
     from flash.schema import spec_from_dict
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
@@ -1102,7 +1102,7 @@ def test_observed_qwen2_opd_sweep_never_downroutes_to_32_or_40gb(
 
     assert need > 40
     if expected_gpu is None:
-        from flash.providers.base import GPU_INFO, UnsupportedGpuError
+        from flash.providers.core.base import GPU_INFO, UnsupportedGpuError
 
         assert need > max(g.vram_gb for g in GPU_INFO.values() if g.validated)
         with pytest.raises(UnsupportedGpuError):
@@ -1144,9 +1144,9 @@ def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch
     consider the 40 GB A100 class viable even though the rollout token budget is intentionally small.
     """
     from flash.cost import RunConfig, estimate_cost
-    from flash.providers import allocator
-    from flash.providers.allocator import required_vram_gb
-    from flash.providers.base import get_gpu_info, provisional_gpu
+    from flash.providers.core import allocator
+    from flash.providers.core.allocator import required_vram_gb
+    from flash.providers.core.base import get_gpu_info, provisional_gpu
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     train = {
@@ -1187,9 +1187,9 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
     """opd configs auto-size unpinned shapes while exact type pins keep single-card validation."""
     from flash.core.catalog import MODELS
     from flash.cost import RunConfig, estimate_cost
-    from flash.providers import allocator
-    from flash.providers.allocator import required_vram_gb
-    from flash.providers.base import (
+    from flash.providers.core import allocator
+    from flash.providers.core.allocator import required_vram_gb
+    from flash.providers.core.base import (
         GPU_INFO,
         MAX_COMBINATION_CARDS,
         UnsupportedGpuError,
@@ -1350,8 +1350,8 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
     meets the shared VRAM requirement across schema preview, submit allocation, and cost estimate."""
     from flash.core.catalog import ALGORITHMS, MODELS
     from flash.cost import RunConfig, estimate_cost
-    from flash.providers import allocator
-    from flash.providers.base import GPU_INFO, combined_vram_gb, get_gpu_info, provisional_gpu
+    from flash.providers.core import allocator
+    from flash.providers.core.base import GPU_INFO, combined_vram_gb, get_gpu_info, provisional_gpu
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     expected = {
@@ -1421,8 +1421,8 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
 def test_catalog_model_algorithm_config_gpu_matrix_enforces_pins(monkeypatch):
     """Every active validated GPU pin is preserved when it fits and rejected when it does not."""
     from flash.core.catalog import ALGORITHMS, MODELS
-    from flash.providers import allocator
-    from flash.providers.base import GPU_INFO, get_gpu_info, providers_for
+    from flash.providers.core import allocator
+    from flash.providers.core.base import GPU_INFO, get_gpu_info, providers_for
     from flash.schema import ConfigError, spec_from_dict
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
@@ -1522,7 +1522,7 @@ def test_required_vram_qwen_chunked_nll_drops_big_vocab_logits():
 
     from flash.core.catalog import MODELS, vocab_size_for
     from flash.engine.plan.vram import estimate_vram_gb
-    from flash.providers.allocator import required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb
 
     model_id = "Qwen/Qwen3.5-0.8B"
     info = MODELS[model_id]
@@ -1546,9 +1546,9 @@ def test_required_vram_qwen_chunked_nll_drops_big_vocab_logits():
 def test_qwen4b_sft_8192_chunked_nll_routes_to_32gb_card(monkeypatch):
     """chunked nll removes the dense-logit term that previously forced this shape onto 80 gb."""
     from flash.cost import RunConfig, estimate_cost
-    from flash.providers import allocator
-    from flash.providers.allocator import required_vram_gb
-    from flash.providers.base import get_gpu_info, provisional_gpu
+    from flash.providers.core import allocator
+    from flash.providers.core.allocator import required_vram_gb
+    from flash.providers.core.base import get_gpu_info, provisional_gpu
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     train = {"epochs": 1, "max_examples": 4020, "max_context_tokens": 8192, "lora_rank": 32}
@@ -1584,8 +1584,8 @@ def test_sft_equation_covers_honest_peak_across_seq_boundary():
     from flash.core.catalog import MODELS, vocab_size_for
     from flash.engine.plan import vram
     from flash.engine.plan.vram import sft_chunked_nll_enabled, sft_per_device
-    from flash.providers.allocator import required_vram_gb
-    from flash.providers.base import GPU_INFO
+    from flash.providers.core.allocator import required_vram_gb
+    from flash.providers.core.base import GPU_INFO
 
     validated = [g.vram_gb for g in GPU_INFO.values() if getattr(g, "validated", False)]
 
@@ -1751,7 +1751,7 @@ def test_vast_candidates_searches_at_effective_disk(monkeypatch):
     # capacity that only exists at the 60 GB floor and then can't actually rent (an impossible
     # attempt a max_retries=0 run never escapes).
     from flash.providers import get_provider
-    from flash.providers.base import AllocationConstraints
+    from flash.providers.core.base import AllocationConstraints
     from flash.providers.vast import jobs as vast_jobs
 
     captured = {}
@@ -1777,7 +1777,7 @@ def test_vast_candidates_threads_max_wall_seconds(monkeypatch):
     # the duration floor — else the allocator advertises Vast classes whose only live offers expire
     # before the run finishes (fatal for a max_retries=0 run).
     from flash.providers import get_provider
-    from flash.providers.base import AllocationConstraints
+    from flash.providers.core.base import AllocationConstraints
     from flash.providers.vast import jobs as vast_jobs
 
     captured = {}
@@ -1808,7 +1808,7 @@ def _stub_provider(monkeypatch, allocator, candidates_by_need):
     """
     from dataclasses import replace
 
-    from flash.providers.base import Candidate, rentable_gpu_counts
+    from flash.providers.core.base import Candidate, rentable_gpu_counts
 
     class _P:
         name = "runpod"
@@ -1828,8 +1828,8 @@ def _stub_provider(monkeypatch, allocator, candidates_by_need):
 
 def test_combo_default_single_gpu_behavior_unchanged(monkeypatch):
     # max_gpu_count=1 (default): identical to classic cheapest single-class allocation.
-    from flash.providers import allocator
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate
 
     cands = [
         Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.5, vram_gb=80),
@@ -1842,8 +1842,8 @@ def test_combo_default_single_gpu_behavior_unchanged(monkeypatch):
 
 
 def test_unset_count_auto_sizes_the_27b_grpo_run_to_two_cards(monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate
 
     cands = [
         Candidate(provider="runpod", gpu="H200", hourly_usd=4.39, vram_gb=141),
@@ -1868,8 +1868,8 @@ def test_a_pinned_gpu_type_without_a_count_stays_one_card_in_allocate(monkeypatc
     cards for an 80 GB run and would have rented them. Auto-sizing applies only when NEITHER the
     class nor the count is authored.
     """
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, UnsupportedGpuError
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, UnsupportedGpuError
 
     cands = [Candidate(provider="runpod", gpu="RTX 4090", hourly_usd=0.69, vram_gb=24)]
     _stub_provider(monkeypatch, allocator, cands)
@@ -1890,7 +1890,7 @@ def test_every_boundary_reads_the_authored_ceiling_from_one_predicate():
     definition; this pins its truth table so a future edit to any one caller cannot quietly
     reintroduce a fourth dialect.
     """
-    from flash.providers.base import authored_gpu_ceiling
+    from flash.providers.core.base import authored_gpu_ceiling
 
     # nothing authored -> auto-size (the only case that may widen)
     assert authored_gpu_ceiling("", None) is None
@@ -1919,8 +1919,8 @@ def test_unset_count_quote_prices_the_auto_sized_shape():
 
 
 def test_explicit_two_card_pin_never_escalates_to_four(monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, UnsupportedGpuError
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, UnsupportedGpuError
 
     cands = [Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.39, vram_gb=80)]
     _stub_provider(monkeypatch, allocator, cands)
@@ -1942,8 +1942,8 @@ def test_explicit_two_card_pin_never_escalates_to_four(monkeypatch):
 
 def test_combo_two_cheap_cards_beat_one_expensive(monkeypatch):
     # 2 x A100 ($3.00 total, 160 GB * 0.85 = 136 GB effective) beats 1 x H200 ($4.00) for a 100 GB need.
-    from flash.providers import allocator
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate
 
     cands = [
         Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.5, vram_gb=80),
@@ -1959,8 +1959,8 @@ def test_combo_two_cheap_cards_beat_one_expensive(monkeypatch):
 
 def test_combo_single_kept_when_cheaper_than_combination(monkeypatch):
     # 1 x H200 ($2.00) beats 2 x A100 ($3.00): combinations only win on total cost.
-    from flash.providers import allocator
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate
 
     cands = [
         Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.5, vram_gb=80),
@@ -1985,8 +1985,8 @@ def test_combo_uses_smallest_fitting_count_and_shard_margin(monkeypatch):
     the gap between the discounted 2-card capacity (130.4) and the undiscounted one (152), so an
     allocator that forgot to discount would rent 2 cards and OOM on a run that needs 4.
     """
-    from flash.providers import allocator
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate
 
     cands = [Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.5, vram_gb=80)]
     _stub_provider(monkeypatch, allocator, cands)
@@ -2001,8 +2001,8 @@ def test_combo_uses_smallest_fitting_count_and_shard_margin(monkeypatch):
 
 def test_combo_replicated_floor_excludes_tiny_cards(monkeypatch):
     # cards at/below the replicated floor can never combine, regardless of count.
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, UnsupportedGpuError
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, UnsupportedGpuError
 
     cands = [Candidate(provider="runpod", gpu="TINY 8GB", hourly_usd=0.1, vram_gb=8)]
     _stub_provider(monkeypatch, allocator, cands)
@@ -2012,8 +2012,8 @@ def test_combo_replicated_floor_excludes_tiny_cards(monkeypatch):
 
 
 def test_combo_summary_shows_count_and_total(monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate
 
     cands = [
         Candidate(provider="runpod", gpu="A100 PCIe", hourly_usd=1.5, vram_gb=80),
@@ -2066,8 +2066,8 @@ def test_pinned_gpu_fit_failure_names_the_card_count_that_fixes_it():
     unsatisfiable run apart from one that fits on two cards -- the difference between abandoning
     the run and passing `--gpus 2`.
     """
-    from flash.providers.allocator import _resolve_exact_gpu
-    from flash.providers.base import GPU_INFO, UnsupportedGpuError
+    from flash.providers.core.allocator import _resolve_exact_gpu
+    from flash.providers.core.base import GPU_INFO, UnsupportedGpuError
 
     need = GPU_INFO["H200"].vram_gb + 40  # fits on 2 cards, never on 1
     with pytest.raises(UnsupportedGpuError, match=r"--gpus 2") as single:
@@ -2103,8 +2103,8 @@ def test_pinned_gpu_fit_failure_stays_a_dead_end_when_no_width_fits():
     would trade one dead end for a second, slower one -- so the suggestion is searched, not
     assumed, and absent when nothing fits.
     """
-    from flash.providers.allocator import _resolve_exact_gpu
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core.allocator import _resolve_exact_gpu
+    from flash.providers.core.base import UnsupportedGpuError
 
     with pytest.raises(UnsupportedGpuError) as exc:
         _resolve_exact_gpu(
@@ -2128,7 +2128,7 @@ def test_wider_shape_remedy_is_bounded_by_the_geometry_cap():
     three algorithms now, but grpo and opd still hand the rented width to the rollout engine as
     `tensor_model_parallel_size`, so head divisibility is still load-bearing.)
     """
-    from flash.providers.base import GPU_INFO, wider_shape_remedy
+    from flash.providers.core.base import GPU_INFO, wider_shape_remedy
 
     vram = GPU_INFO["H200"].vram_gb
     need = vram + 40
@@ -2147,7 +2147,7 @@ def test_wider_shape_remedy_names_the_cheapest_fitting_width():
 
     Suggesting 8 cards for a run that fits on 2 would quadruple the bill to fix a fit error.
     """
-    from flash.providers.base import GPU_INFO, wider_shape_remedy
+    from flash.providers.core.base import GPU_INFO, wider_shape_remedy
 
     vram = GPU_INFO["H200"].vram_gb
     assert "--gpus 2" in wider_shape_remedy((vram,), vram + 40, ceiling=8, above=1)
@@ -2163,7 +2163,7 @@ def test_remedy_never_names_a_width_the_run_will_not_launch_on():
 
     Codex's shape exactly: a batch-1 4B at 32k needs 28 GB and does not fit a 24 GB card.
     """
-    from flash.providers.base import wider_shape_remedy
+    from flash.providers.core.base import wider_shape_remedy
 
     need, card = 28.0, 24
     assert (
@@ -2188,8 +2188,8 @@ def test_pin_rejection_names_the_width_it_actually_credited():
     hit the identical failure. The real limiter is the batch that bounds the rank count, so the
     message has to name the width it credited and why it is smaller than the one allowed.
     """
-    from flash.providers.allocator import _resolve_exact_gpu
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core.allocator import _resolve_exact_gpu
+    from flash.providers.core.base import UnsupportedGpuError
 
     def reject(executed_width):
         with pytest.raises(UnsupportedGpuError) as ei:
@@ -2231,7 +2231,7 @@ def test_width_search_credits_only_the_ranks_that_join():
     Fixing the shared helper rather than each caller is what makes the ceiling search, the pinned
     precheck, and the `--gpus N` advice answer one question.
     """
-    from flash.providers.base import GPU_INFO, smallest_fitting_gpu_count
+    from flash.providers.core.base import GPU_INFO, smallest_fitting_gpu_count
 
     need = GPU_INFO["H100"].vram_gb + 40.0  # fits on 2 rented cards, never on 1
 
@@ -2265,7 +2265,7 @@ def test_width_search_finds_a_shape_the_executed_width_reaches_non_monotonically
     caller turns into a terminal rejection of a job the allocator would have launched.
     """
     from flash.engine.plan.steps import sft_data_parallel_cards
-    from flash.providers.base import GPU_INFO, combined_vram_gb, smallest_fitting_gpu_count
+    from flash.providers.core.base import GPU_INFO, combined_vram_gb, smallest_fitting_gpu_count
 
     width = lambda count: sft_data_parallel_cards(count, 3, 3)  # noqa: E731
     assert (width(2), width(4)) == (1, 3), "premise: the executed width dips, then climbs"
@@ -2286,8 +2286,8 @@ def test_catalog_hint_is_withheld_when_the_width_would_not_launch():
     `smallest_fitting_gpu_count` has no executed-width notion, so for a clamped sft run it names a
     count that buys nothing -- sending the user to ask a provider to confirm a SKU that cannot help.
     """
-    from flash.providers.allocator import _resolve_exact_gpu
-    from flash.providers.base import GPU_INFO, UnsupportedGpuError
+    from flash.providers.core.allocator import _resolve_exact_gpu
+    from flash.providers.core.base import GPU_INFO, UnsupportedGpuError
 
     need = GPU_INFO["H100"].vram_gb + 40.0  # fits on 2 rented cards, never on 1
 
@@ -2320,8 +2320,8 @@ def test_provider_incompatible_pin_reports_the_incompatibility_not_a_fit_remedy(
     Checking fit first made the message name `--gpus 2` -- a flag that cannot help, because no
     Lambda H200 exists at any count. The user would raise the ceiling and fail identically.
     """
-    from flash.providers.allocator import _resolve_exact_gpu
-    from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
+    from flash.providers.core.allocator import _resolve_exact_gpu
+    from flash.providers.core.base import GPU_INFO, UnsupportedGpuError, providers_for
 
     assert "lambda" not in providers_for("H200")
     need = GPU_INFO["H200"].vram_gb + 40  # would fit on 2 cards, were they purchasable
@@ -2351,8 +2351,8 @@ def test_unpurchasable_width_names_a_remedy_the_user_can_actually_apply():
     Driven through ``_resolved_gpu_count`` rather than the message builder directly: the pin
     context is LOST at that boundary, so a builder-only test would pass against the defect.
     """
-    from flash.providers.allocator import _resolved_gpu_count
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core.allocator import _resolved_gpu_count
+    from flash.providers.core.base import UnsupportedGpuError
 
     shared = {
         "need": 188.0,
@@ -2442,8 +2442,8 @@ def test_exact_gpu_rejection_reports_a_pin_that_hides_a_wider_count():
     suppresses that entirely -- yet RunPod carries the very same H100 and rents it at any count, so
     dropping the pin is a real fix the bare shortfall message hides.
     """
-    from flash.providers.allocator import _resolve_exact_gpu
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core.allocator import _resolve_exact_gpu
+    from flash.providers.core.base import UnsupportedGpuError
 
     def reject(provider, available, unpinned, need=188.0):
         with pytest.raises(UnsupportedGpuError) as exc:
@@ -2491,8 +2491,8 @@ def test_fit_remedy_is_withheld_when_only_fixed_count_sku_providers_remain():
     offered the width to ask its catalog for. Naming a width to check beats a bare shortfall the
     user cannot act on; asserting one exists would send them to buy a shape that may not be sold.
     """
-    from flash.providers.allocator import _resolve_exact_gpu
-    from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
+    from flash.providers.core.allocator import _resolve_exact_gpu
+    from flash.providers.core.base import GPU_INFO, UnsupportedGpuError, providers_for
 
     assert {"lambda", "vast"} <= set(providers_for("H100"))
     need = GPU_INFO["H100"].vram_gb + 40  # fits on 2 H100s
@@ -2563,8 +2563,8 @@ def test_exact_pin_on_a_fixed_count_provider_still_names_a_width_to_check():
     `gpu_4x_h100_pcie` against its own catalog and rejects what it does not sell with a precise
     error. Naming the width to try is one flag from working; the bare shortfall is a dead end.
     """
-    from flash.providers.allocator import _resolve_exact_gpu
-    from flash.providers.base import GPU_INFO, UnsupportedGpuError
+    from flash.providers.core.allocator import _resolve_exact_gpu
+    from flash.providers.core.base import GPU_INFO, UnsupportedGpuError
 
     need = GPU_INFO["H100"].vram_gb * 2.35  # 188 GB: needs 4 cards, not 2
 
@@ -2609,7 +2609,7 @@ def test_the_obstacle_never_contradicts_the_remedy_printed_after_it():
     exactly that shape is a self-contradiction: the run is one or two flags from working, not
     unsellable. The fixed-count catalog wording is only true when nothing behind the pin fits.
     """
-    from flash.providers.fit_errors import vram_fit_error_message
+    from flash.providers.core.fit_errors import vram_fit_error_message
 
     def message(need, *, requested, widenable):
         return vram_fit_error_message(
@@ -2660,7 +2660,7 @@ def test_the_fit_message_states_capacity_the_run_will_actually_have():
     delivers 191.6. Every number a user reads has to be memory the run will actually have.
     """
     from flash.engine.plan.steps import sft_data_parallel_cards
-    from flash.providers.fit_errors import vram_fit_error_message
+    from flash.providers.core.fit_errors import vram_fit_error_message
 
     width = lambda count: sft_data_parallel_cards(count, 3, 3)  # noqa: E731
 
@@ -2697,7 +2697,7 @@ def test_a_shape_label_reconciles_with_the_capacity_printed_beside_it():
     when the batch is the limiter -- so the label has to name the join count and the reason.
     """
     from flash.engine.plan.steps import sft_data_parallel_cards
-    from flash.providers.fit_errors import vram_fit_error_message
+    from flash.providers.core.fit_errors import vram_fit_error_message
 
     width = lambda count: sft_data_parallel_cards(count, 3, 3)  # noqa: E731
     reason = "sft shards by data, so the batch and retained rows bound the rank count"
@@ -2760,8 +2760,8 @@ def test_pinned_class_names_the_bounding_knob_of_the_algorithm_it_rejected():
     rejects at parse time -- and at retained rows, which rl has no concept of. The reason now comes
     from the one shared formatter, so the two cannot drift apart again.
     """
-    from flash.providers.allocator import _executed_width, _resolve_exact_gpu
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core.allocator import _executed_width, _resolve_exact_gpu
+    from flash.providers.core.base import UnsupportedGpuError
 
     def reject(algorithm, train):
         with pytest.raises(UnsupportedGpuError) as exc:
@@ -2796,8 +2796,8 @@ def test_unreachable_class_reports_the_configuration_not_the_vram_shortfall():
     ``no configured active provider`` -- so the diagnostic depended on how big the run happened to
     be rather than on what actually blocked it, and the shortfall pointed at a knob that cannot help.
     """
-    from flash.providers.allocator import _resolve_exact_gpu
-    from flash.providers.base import GPU_INFO, UnsupportedGpuError, providers_for
+    from flash.providers.core.allocator import _resolve_exact_gpu
+    from flash.providers.core.base import GPU_INFO, UnsupportedGpuError, providers_for
 
     assert "lambda" not in providers_for("H200")
     over = GPU_INFO["H200"].vram_gb * 2.5  # far beyond one card
@@ -2838,8 +2838,8 @@ def test_catalog_check_is_withheld_when_no_configured_provider_carries_the_class
     `--gpus N` cannot succeed at any N -- that run belongs to the `no configured active provider`
     rejection, which names the real problem instead of sending the user to retry a dead end.
     """
-    from flash.providers.allocator import _resolve_exact_gpu
-    from flash.providers.base import UnsupportedGpuError, providers_for
+    from flash.providers.core.allocator import _resolve_exact_gpu
+    from flash.providers.core.base import UnsupportedGpuError, providers_for
 
     # H200 is runpod-only, so a lambda-only plane cannot rent it at any width.
     assert "lambda" not in providers_for("H200")
@@ -2874,7 +2874,7 @@ def test_catalog_check_is_withheld_when_no_configured_provider_carries_the_class
 
 def test_rents_arbitrary_card_counts_splits_providers_by_how_counts_are_sold():
     """The predicate must track how a count is PURCHASED, not whether the provider is configured."""
-    from flash.providers.fit_errors import rents_arbitrary_card_counts
+    from flash.providers.core.fit_errors import rents_arbitrary_card_counts
 
     assert rents_arbitrary_card_counts(("runpod",)) is True
     assert rents_arbitrary_card_counts(("lambda",)) is False

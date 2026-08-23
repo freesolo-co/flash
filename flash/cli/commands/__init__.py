@@ -15,12 +15,12 @@ from flash._internal.logging import get_logger
 
 # the follow loops below stay here; what a transient failure IS, and how long to tolerate one,
 # lives in `log_follow` so this module does not carry the classification too.
-from flash.cli.commands.log_follow import (
+from flash.cli.commands.ops.log_follow import (
     # re-exported, not used here: `test_step_metrics` reads the rendered field set off this
     # module to assert verl emits nothing the CLI would drop on the floor.
     _FOLLOW_METRIC_FIELDS as _FOLLOW_METRIC_FIELDS,
 )
-from flash.cli.commands.log_follow import (
+from flash.cli.commands.ops.log_follow import (
     FollowInterrupted,
     _follow_transient_reason,
     _FollowRetry,
@@ -56,7 +56,7 @@ from flash.schema import (
     ConfigError,
     spec_and_train_keys_from_file,
 )
-from flash.serve.urls import is_freesolo_hosted_url
+from flash.serve.contract.urls import is_freesolo_hosted_url
 
 logger = get_logger("flash.cli")
 
@@ -318,8 +318,8 @@ def cmd_models(args) -> int:
 
 def cmd_gpus(args) -> int:
     """List validated managed GPU classes, VRAM, and estimated $/hr."""
-    from flash.providers.base import GPU_INFO
-    from flash.providers.runpod.pricing import static_rates as runpod_static_rates
+    from flash.providers.core.base import GPU_INFO
+    from flash.providers.runpod.client.pricing import static_rates as runpod_static_rates
 
     runpod_rates = runpod_static_rates()
     infos = sorted(
@@ -896,7 +896,7 @@ def cmd_chat(args) -> int:
     ):
         # delay the label and blank chunks until real text arrives. otherwise an empty response has
         # non-empty stdout and cannot serve as a health check. release buffered blanks verbatim;
-        # flash/cli/commands/env/eval.py grades emptiness the same way.
+        # flash/cli/commands/env/testing/eval.py grades emptiness the same way.
         if not wrote:
             pending.append(chunk)
             if not chunk.strip():
@@ -925,7 +925,7 @@ def cmd_chat(args) -> int:
 # re-exported at the bottom rather than imported at the top: `deploy` resolves names back through
 # this package, so a top import would be circular. the parser and the cli tests both address these
 # handlers as attributes of `flash.cli.commands`, which is why they stay on it after the move.
-from flash.cli.commands.deploy import (  # noqa: E402,F401
+from flash.cli.commands.ops.deploy import (  # noqa: E402,F401
     _DEPLOY_FINAL_READ_FRACTION,
     _DEPLOY_FINAL_READ_SECONDS,
     _DEPLOY_POLL_SECONDS,
@@ -942,13 +942,13 @@ from flash.cli.commands.deploy import (  # noqa: E402,F401
 )
 
 # imported at the bottom because the train helpers resolve patched command-package names lazily.
-from flash.cli.commands.prompt_budget import (  # noqa: E402
+from flash.cli.commands.ops.prompt_budget import (  # noqa: E402
     print_status_prompt_budget_warning,
     print_warmstart_context_supplement,
     prompt_budget_validation_suffix,
     warn_before_paid_submit,
 )
-from flash.cli.commands.train_cost import (  # noqa: E402,F401
+from flash.cli.commands.ops.train_cost import (  # noqa: E402,F401
     _client_train_schema,
     _cmd_train_cost,
     _cmd_train_cost_offline,
@@ -963,7 +963,7 @@ from flash.cli.commands.train_cost import (  # noqa: E402,F401
 )
 
 # re-exported because cmd_log and focused cli tests address these through the command package.
-from flash.cli.commands.worker_output import (  # noqa: E402,F401
+from flash.cli.commands.ops.worker_output import (  # noqa: E402,F401
     _artifact_attempt,
     _print_worker_output,
     _snapshot_live_attempt,

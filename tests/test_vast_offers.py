@@ -78,7 +78,7 @@ def test_vast_a100_pcie_offer_resolves_by_vram():
     # class). A 40 GB "A100 PCIE" offer fails the 80 GB VRAM gate, so without aliasing it onto the 40 GB
     # class it drops real A100 capacity for 35-40 GB runs. The largest-fitting-class rule keeps an 80 GB
     # board on the 80 GB class; only a 40 GB one lands on the 40 GB class.
-    from flash.providers.base import vast_gpu_for_offer
+    from flash.providers.core.base import vast_gpu_for_offer
 
     assert vast_gpu_for_offer("A100 PCIE", 80 * 1024) == "A100 PCIe"  # 80 GB -> 80 GB class
     assert (
@@ -87,7 +87,7 @@ def test_vast_a100_pcie_offer_resolves_by_vram():
 
 
 def test_usable_offers_filters_and_order(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
 
     captured = {}
@@ -124,7 +124,7 @@ def test_usable_offers_filters_and_order(monkeypatch):
 def test_usable_offers_always_datacenter_only(monkeypatch):
     """Community/marketplace hosts (hosting_type 0) are ALWAYS rejected — run secrets ship to the
     box, so even a verified community host (id=10) never makes the cut."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
 
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
@@ -134,7 +134,7 @@ def test_usable_offers_always_datacenter_only(monkeypatch):
 
 
 def test_usable_offers_vram_gate(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
 
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
@@ -144,7 +144,7 @@ def test_usable_offers_vram_gate(monkeypatch):
 
 
 def test_usable_offers_exclude_machines(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
 
     rows = [_offer(id=1, machine_id=7, dph_total=0.25), _offer(id=2, machine_id=8, dph_total=0.30)]
@@ -156,7 +156,7 @@ def test_usable_offers_search_page_spans_all_classes(monkeypatch):
     # the price-sorted search page must be wide enough to span EVERY managed class (callers bucket
     # by class); the old limit=64 let a flood of one cheap class hide a larger fitting class with
     # usable offers just past the page.
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
 
     captured = {}
@@ -184,7 +184,7 @@ def test_usable_offers_search_page_spans_all_classes(monkeypatch):
 
 
 def test_usable_offers_exact_h100_threads_name_and_vram_filters(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
 
     captured = {}
@@ -202,7 +202,7 @@ def test_usable_offers_exact_h100_threads_name_and_vram_filters(monkeypatch):
 
 
 def test_usable_offers_exact_40gb_bounds_shared_name_server_side(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
 
     captured = {}
@@ -229,7 +229,7 @@ def test_usable_offers_exact_40gb_bounds_shared_name_server_side(monkeypatch):
 def test_usable_offers_threads_duration_floor(monkeypatch):
     # when a wall cap is supplied, usable_offers does not extend it with provisioning grace.
     # a zero wall keeps the duration filter disabled.
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
 
     captured = {}
@@ -302,7 +302,7 @@ def test_live_rates_gates_on_min_disk(monkeypatch):
     # live pricing must gate on MIN_DISK_GB (what create() enforces), not disk_gb=0 — otherwise it
     # prices off "cheapest" offers that aren't actually provisionable.
     from flash.providers.vast import jobs as vast
-    from flash.providers.vast import pricing
+    from flash.providers.vast.client import pricing
 
     captured = {}
 
@@ -321,9 +321,9 @@ def test_live_rates_floors_query_at_smallest_managed_vram(monkeypatch):
     # min_vram_gb=0 lets tiny UNMANAGED low-VRAM offers fill the fixed-size price-sorted page and
     # crowd managed classes off it, so hourly_rate() falls back to static rates even when live
     # offers exist. The floor keeps it to one market query while making the page relevant.
-    from flash.providers.base import GPU_INFO
+    from flash.providers.core.base import GPU_INFO
     from flash.providers.vast import jobs as vast
-    from flash.providers.vast import pricing
+    from flash.providers.vast.client import pricing
 
     captured = {}
 
@@ -345,7 +345,7 @@ def test_live_rates_threads_wall_cap_and_bypasses_cache(monkeypatch):
     # cheap short-lived offer that the launch-time filter rejects can't set the rate. Duration-bound
     # queries must also NOT pollute the shared duration-agnostic cache (the `flash gpus` path).
     from flash.providers.vast import jobs as vast
-    from flash.providers.vast import pricing
+    from flash.providers.vast.client import pricing
 
     captured = {}
 
@@ -366,7 +366,7 @@ def test_live_rates_caches_within_ttl_and_refresh_bypasses(monkeypatch):
     # repeated live_rates() within the TTL must share ONE market fetch (the refresh param was
     # previously ignored); refresh=True forces a fresh query.
     from flash.providers.vast import jobs as vast
-    from flash.providers.vast import pricing
+    from flash.providers.vast.client import pricing
 
     calls = {"n": 0}
 
@@ -394,7 +394,7 @@ def test_usable_offers_threads_and_rechecks_card_count(monkeypatch):
     divides dph_total into the per-card rate the allocator ranks on. A server that ignored the
     filter would otherwise hand back single-card rows that get priced as if they were multi-card.
     """
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
 
     captured = {}

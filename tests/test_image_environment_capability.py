@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from flash.content.multimodal import validate_image_observation_environment
-from flash.envs.adapter import FreesoloEnvironment
-from flash.envs.base import BaseEnvironment
+from flash.envs.loading.adapter import FreesoloEnvironment
+from flash.envs.loading.base import BaseEnvironment
 
 
 class _PlainEnvironment(BaseEnvironment):

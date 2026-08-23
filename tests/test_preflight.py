@@ -6,8 +6,8 @@ import os
 
 import pytest
 
-import flash.providers.preflight as pf
-import flash.providers.runpod.auth as runpod_keys
+import flash.providers.core.preflight as pf
+import flash.providers.runpod.client.auth as runpod_keys
 from flash._internal.channel import CLI_NAME
 
 # Credentials every control plane needs regardless of which GPU substrate it runs on.
@@ -220,7 +220,7 @@ def test_require_operator_config_still_refuses_a_missing_credential(clean_env, m
 
 
 def test_runpod_key_is_env_only(clean_env):
-    from flash.providers.runpod.auth import load_api_key
+    from flash.providers.runpod.client.auth import load_api_key
 
     assert load_api_key() is None
 

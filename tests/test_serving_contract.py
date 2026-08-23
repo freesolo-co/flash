@@ -6,14 +6,14 @@ import types
 
 import pytest
 
-from flash.serve.contract import (
+from flash.serve.contract.contract import (
     ADAPTER_REVISION_PATTERN,
     PREFERRED_SERVING_CAPABILITIES,
     REQUIRED_SERVING_CAPABILITIES,
     ServingHealthError,
     parse_serving_health,
 )
-from flash.serve.deploy import (
+from flash.serve.deployment.deploy import (
     Deployment,
     deploy_adapter,
     serving_base_url,
@@ -23,7 +23,7 @@ from flash.serve.deploy import (
 
 @pytest.fixture(autouse=True)
 def _stub_shared_http_client(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     class _Client:
         def request(self, method, url, **kwargs):
@@ -73,7 +73,7 @@ def test_schema_and_generated_backends_share_the_adapter_revision_pattern():
 
 
 def test_serving_base_url_default_and_override(monkeypatch):
-    from flash.serve.deploy import DEFAULT_FREESOLO_SERVING_URL
+    from flash.serve.deployment.deploy import DEFAULT_FREESOLO_SERVING_URL
 
     monkeypatch.delenv("FREESOLO_SERVING_URL", raising=False)
     assert serving_base_url() == DEFAULT_FREESOLO_SERVING_URL
@@ -100,7 +100,7 @@ def test_deploy_dry_run_has_no_user_facing_mode():
 def test_adapter_artifact_metadata_reads_the_exported_modality_marker(
     monkeypatch, marker, targets_images
 ):
-    from flash.serve import adapter_check
+    from flash.serve.deployment import adapter_check
 
     config = {"r": 32}
     if marker is not ...:
@@ -141,8 +141,8 @@ def _stub_deploy_preconditions(monkeypatch, deploy_mod) -> None:
 def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
     import httpx
 
-    import flash.serve.deploy as deploy_mod
-    from flash.serve.deploy import ServingError
+    import flash.serve.deployment.deploy as deploy_mod
+    from flash.serve.deployment.deploy import ServingError
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     req = httpx.Request("POST", "https://serve.example/adapters")
@@ -161,8 +161,8 @@ def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
 def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     import httpx
 
-    import flash.serve.deploy as deploy_mod
-    from flash.serve.deploy import ServingError
+    import flash.serve.deployment.deploy as deploy_mod
+    from flash.serve.deployment.deploy import ServingError
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     req = httpx.Request("POST", "https://serve.example/adapters")
@@ -194,7 +194,7 @@ def test_require_capabilities_provenance_is_preferred_not_required(monkeypatch):
     # The production serving backend advertises the two safety-critical caps + the deferred
     # thinking/structured-outputs cap, but NOT `revision_provenance`. That must NOT block deploys
     # (it only gates the rare ambiguous-registration recovery path).
-    import flash.serve.deploy as deploy_mod
+    import flash.serve.deployment.deploy as deploy_mod
 
     _stub_healthz(
         monkeypatch,
@@ -211,8 +211,8 @@ def test_require_capabilities_provenance_is_preferred_not_required(monkeypatch):
 
 
 def test_require_capabilities_still_fails_on_missing_safety_critical(monkeypatch):
-    import flash.serve.deploy as deploy_mod
-    from flash.serve.deploy import ServingError
+    import flash.serve.deployment.deploy as deploy_mod
+    from flash.serve.deployment.deploy import ServingError
 
     # Missing the atomic alias CAS (safety-critical) -> deploy MUST still be blocked.
     _stub_healthz(monkeypatch, deploy_mod, ["immutable_adapter_revisions", "revision_provenance"])
@@ -223,8 +223,8 @@ def test_require_capabilities_still_fails_on_missing_safety_critical(monkeypatch
 
 
 def test_require_capabilities_thinking_structured_outputs_required_when_used(monkeypatch):
-    import flash.serve.deploy as deploy_mod
-    from flash.serve.deploy import ServingError
+    import flash.serve.deployment.deploy as deploy_mod
+    from flash.serve.deployment.deploy import ServingError
 
     # Backend lacks the deferred thinking/structured-outputs cap -> a thinking+SO deploy is blocked.
     _stub_healthz(
@@ -238,8 +238,8 @@ def test_require_capabilities_thinking_structured_outputs_required_when_used(mon
 def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch):
     import httpx
 
-    import flash.serve.deploy as deploy_mod
-    from flash.serve.deploy import ServingError
+    import flash.serve.deployment.deploy as deploy_mod
+    from flash.serve.deployment.deploy import ServingError
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
 
@@ -255,7 +255,7 @@ def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch
 
 
 def test_undeploy_calls_freesolo_delete(monkeypatch):
-    import flash.serve.deploy as deploy_mod
+    import flash.serve.deployment.deploy as deploy_mod
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     deleted_urls = []
@@ -286,7 +286,7 @@ def test_undeploy_calls_freesolo_delete(monkeypatch):
 
 
 def test_undeploy_404_is_clean(monkeypatch):
-    import flash.serve.deploy as deploy_mod
+    import flash.serve.deployment.deploy as deploy_mod
 
     class _Resp:
         status_code = 404
@@ -354,7 +354,7 @@ def test_immutable_revision_identifier_uses_full_hub_sha():
 
 
 def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     sha = "b2" * 20
     revision = f"flash-1-abc@step-20.{sha}"
@@ -466,7 +466,7 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
 
 
 def test_registration_conflict_is_not_masked_by_existing_revision(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     _stub_deploy_preconditions(monkeypatch, deploy)
     monkeypatch.setattr(
@@ -494,7 +494,7 @@ def test_registration_conflict_is_not_masked_by_existing_revision(monkeypatch):
 
 
 def test_ambiguous_registration_requires_matching_immutable_identity(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     _stub_deploy_preconditions(monkeypatch, deploy)
     monkeypatch.setattr(
@@ -532,7 +532,7 @@ def test_ambiguous_registration_requires_matching_immutable_identity(monkeypatch
 
 
 def test_revision_poll_rejects_mismatched_immutable_identity(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     revision = "flash-1@final." + "a" * 40
     expected = {
@@ -566,7 +566,7 @@ def test_revision_poll_rejects_mismatched_immutable_identity(monkeypatch):
 
 
 def test_revision_poll_tolerates_absent_provenance_when_not_advertised(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     revision = "flash-1@final." + "a" * 40
     expected = {
@@ -619,7 +619,7 @@ def test_revision_poll_tolerates_absent_provenance_when_not_advertised(monkeypat
 
 
 def test_activation_transport_ambiguity_reconciles_authoritative_alias(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     revision = "flash-1@final." + "a" * 40
     monkeypatch.setattr(
@@ -642,7 +642,7 @@ def test_activation_transport_ambiguity_reconciles_authoritative_alias(monkeypat
 
 
 def test_activation_readback_rejects_disabled_alias_with_stale_target(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     revision = "flash-1@final." + "a" * 40
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
@@ -666,7 +666,7 @@ def test_activation_readback_rejects_disabled_alias_with_stale_target(monkeypatc
 
 
 def test_activation_commit_survives_lost_response_and_transient_readback_failure(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     previous = "flash-1@step-10." + "b" * 40
     revision = "flash-1@final." + "a" * 40
@@ -708,7 +708,7 @@ def test_activation_commit_survives_lost_response_and_transient_readback_failure
 
 
 def test_activation_lost_response_and_readback_remains_explicitly_unknown(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     revision = "flash-1@final." + "a" * 40
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
@@ -728,7 +728,7 @@ def test_activation_lost_response_and_readback_remains_explicitly_unknown(monkey
 
 
 def test_activation_reconciliation_accepts_alias_without_updated_at(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     revision = "flash-1@final." + "a" * 40
     monkeypatch.setattr(
@@ -752,7 +752,7 @@ def test_activation_reconciliation_accepts_alias_without_updated_at(monkeypatch)
 
 
 def test_first_activation_missing_alias_target_remains_ambiguous(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     revision = "flash-1@final." + "a" * 40
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
@@ -772,7 +772,7 @@ def test_first_activation_missing_alias_target_remains_ambiguous(monkeypatch):
 
 
 def test_activation_divergence_requires_reconciliation(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     previous = "flash-1@step-10." + "b" * 40
     revision = "flash-1@step-20." + "a" * 40
@@ -798,7 +798,7 @@ def test_activation_divergence_requires_reconciliation(monkeypatch):
 
 
 def test_activation_response_mismatch_reconciles_authoritative_previous_alias(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     previous = "flash-1@step-10." + "b" * 40
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
@@ -830,7 +830,7 @@ def test_activation_response_mismatch_reconciles_authoritative_previous_alias(mo
 
 
 def test_malformed_activation_response_reconciles_committed_alias(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     previous = "flash-1@step-10." + "b" * 40
     revision = "flash-1@step-20." + "a" * 40
@@ -863,7 +863,7 @@ def test_malformed_activation_response_reconciles_committed_alias(monkeypatch):
 
 
 def test_undeploy_returns_disabled_aliases_and_revisions(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     class Resp:
         status_code = 200
@@ -883,7 +883,7 @@ def test_undeploy_returns_disabled_aliases_and_revisions(monkeypatch):
 
 
 def test_undeploy_rejects_malformed_disabled_id_lists(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     class Resp:
         status_code = 200
@@ -901,7 +901,7 @@ def test_undeploy_rejects_malformed_disabled_id_lists(monkeypatch):
 
 
 def test_serving_capabilities_are_required(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     class Resp:
         def json(self):
@@ -914,7 +914,7 @@ def test_serving_capabilities_are_required(monkeypatch):
 
 def test_capability_preflight_reads_healthz(monkeypatch):
     # serving exposes GET /healthz only; a /health preflight 404s and fails every real deploy.
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     seen = {}
 
@@ -940,7 +940,7 @@ def test_capability_preflight_reads_healthz(monkeypatch):
 
 
 def test_activation_conflict_preserves_expected_alias(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     previous = "flash-1@step-10." + "b" * 40
     revision = "flash-1@step-20." + "a" * 40

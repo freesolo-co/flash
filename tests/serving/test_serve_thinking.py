@@ -18,8 +18,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from flash.serving.src.registry import AdapterRegistry
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.store.registry import AdapterRegistry
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):

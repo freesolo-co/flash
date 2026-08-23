@@ -8,8 +8,8 @@ import os
 import sys
 
 from flash._internal.logging import configure_logging
-from flash.providers.preflight import PreflightError
-from flash.server.app import run_server
+from flash.providers.core.preflight import PreflightError
+from flash.server.asgi.app import run_server
 
 HOST_ENV = "FLASH_SERVER_HOST"
 PORT_ENV = "FLASH_SERVER_PORT"

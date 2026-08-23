@@ -8,7 +8,7 @@ import tomllib
 import zipfile
 from pathlib import Path
 
-from flash.engine.worker.backend_common import TRANSFORMERS_REQUIREMENT
+from flash.engine.worker.train.entry.backend_common import TRANSFORMERS_REQUIREMENT
 
 ROOT = Path(__file__).resolve().parents[1]
 # the packaged serving app runs from these modules, so a wheel that omits them leaves

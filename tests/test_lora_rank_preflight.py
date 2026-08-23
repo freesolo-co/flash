@@ -560,7 +560,7 @@ def _patch_fused_submit_preflight(
 ):
     import flash.adapters.fused_experts as fused_experts
     import flash.adapters.lora_rank as lora_rank
-    import flash.runner.preparation as preparation
+    import flash.runner.lifecycle.preparation as preparation
     import flash.runner.results.checkpoints as checkpoints
 
     target_spec = _spec(rank=child_rank, model=_FUSED_MODEL)
@@ -667,7 +667,7 @@ def test_submit_passes_the_loaded_config_to_validation_then_rank_preflight(monke
 
 
 def test_preparation_returns_resolved_source_rank_on_worker_spec(monkeypatch):
-    from flash.providers.allocator import required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb
 
     config = _config(target_parameters=list(_FUSED_TARGETS))
     preparation, target_spec, _events = _patch_fused_submit_preflight(

@@ -28,8 +28,8 @@ import numpy as np
 import pytest
 from safetensors.numpy import save
 
-from flash.engine.worker import backend_common as vc
-from flash.engine.worker import rl_train
+from flash.engine.worker.train.entry import backend_common as vc
+from flash.engine.worker.train.entry import rl_train
 from flash.engine.worker.perf.lifecycle import RetriableInfraError
 from flash.engine.worker.train.core.child import runtime as child_runtime
 
@@ -201,11 +201,11 @@ def _trainer_source(module: str) -> str:
     vacuously. These are read by PATH rather than imported because the assertions are on source
     text, so the set of files has to be maintained here when a trainer is split further.
     """
-    parts = [f"flash/engine/worker/{module}.py"]
+    parts = [f"flash/engine/worker/train/entry/{module}.py"]
     if module == "opd_train":
-        parts.append("flash/engine/worker/train/opd/overrides.py")
+        parts.append("flash/engine/worker/train/opd/orchestration/overrides.py")
     if module == "rl_train":
-        parts.append("flash/engine/worker/train/rl/verl_config.py")
+        parts.append("flash/engine/worker/train/rl/launch/verl_config.py")
     return "\n".join(pathlib.Path(_REPO_ROOT, p).read_text() for p in parts)
 
 
@@ -2774,7 +2774,7 @@ def test_the_conftest_fixture_restores_the_flag_the_entry_point_set():
         "    libc.prctl(37, ctypes.byref(cur), 0, 0, 0)\n"
         "    return cur.value\n"
         "import os\n"
-        "from flash.engine.worker import backend_common as vc\n"
+        "from flash.engine.worker.train.entry import backend_common as vc\n"
         "def test_claims_adoption():\n"
         "    vc.run_verl_training(['bash', '-c', \"echo 'step: 1'\"], env=dict(os.environ))\n"
         "    assert flag() == 1\n"
@@ -2981,7 +2981,7 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
 _SHORT_LIVED_WORKER = r"""
 import os, sys, time
 sys.path.insert(0, {repo!r})
-from flash.engine.worker import backend_common as vc
+from flash.engine.worker.train.entry import backend_common as vc
 
 # a straggler as teardown leaves one: exited, owed to this process, recorded because it was still
 # running when the drain deadline passed.
@@ -3102,7 +3102,7 @@ def test_every_test_touching_a_linux_only_api_carries_the_platform_guard():
 _TOPOLOGY_PROBE = r"""
 import ctypes, os, signal, sys, time
 sys.path.insert(0, {repo!r})
-from flash.engine.worker.backend_common import _reap, adopt_orphaned_descendants
+from flash.engine.worker.train.entry.backend_common import _reap, adopt_orphaned_descendants
 
 CLAIM = {claim!r}
 
@@ -3854,7 +3854,7 @@ def test_both_verl_bridges_use_the_bounded_server():
     each bridge is defined in its own module, so a fix applied to one leaves the other able to
     exhaust the thread table on exactly the same rollout shape.
     """
-    from flash.engine.worker import opd_train
+    from flash.engine.worker.train.entry import opd_train
 
     # the teacher bridge is a module-level class, so check the type itself.
     assert issubclass(opd_train._TeacherBridgeHTTPServer, vc.BoundedThreadingHTTPServer), (
@@ -3884,7 +3884,7 @@ def _exit_delay_with_pool(pool_expr: str) -> float:
     program = textwrap.dedent(f"""
         import sys, time
         sys.path.insert(0, {str(pathlib.Path(vc.__file__).parents[3])!r})
-        from flash.engine.worker.backend_common import _DaemonBridgeThreadPool  # noqa: F401
+        from flash.engine.worker.train.entry.backend_common import _DaemonBridgeThreadPool  # noqa: F401
         from concurrent.futures import ThreadPoolExecutor  # noqa: F401
 
         pool = {pool_expr}
@@ -4522,9 +4522,9 @@ def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
     Each trainer resolves the backend once from `caps` and threads the ANSWER through its config
     dict, so the override builders read `cfg[...]` and only the call sites name the helper.
     """
-    import flash.engine.worker.opd_train as opd_train
-    import flash.engine.worker.rl_train as rl_train
-    import flash.engine.worker.sft_train as sft_train
+    import flash.engine.worker.train.entry.opd_train as opd_train
+    import flash.engine.worker.train.entry.rl_train as rl_train
+    import flash.engine.worker.train.entry.sft_train as sft_train
 
     for module in (sft_train, rl_train, opd_train):
         source = pathlib.Path(module.__file__).read_text()
@@ -4549,9 +4549,9 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
     triton measured 2.25x faster. That failure is invisible today -- every catalog model is a gdn
     hybrid -- which is exactly why it needs a test rather than a reader noticing it later.
     """
-    import flash.engine.worker.opd_train as opd_train
-    import flash.engine.worker.rl_train as rl_train
-    import flash.engine.worker.sft_train as sft_train
+    import flash.engine.worker.train.entry.opd_train as opd_train
+    import flash.engine.worker.train.entry.rl_train as rl_train
+    import flash.engine.worker.train.entry.sft_train as sft_train
 
     for module in (sft_train, rl_train, opd_train):
         lines = pathlib.Path(module.__file__).read_text().splitlines()

@@ -17,12 +17,12 @@ from typing import Any
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
-from flash.providers._lifecycle.deadline import (
+from flash.providers._lifecycle.net.deadline import (
     deadline_kwargs,
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers._lifecycle.poll import (
+from flash.providers._lifecycle.instances.poll import (
     FIRST_LIVENESS_S,
     LOAD_TIMEOUT_S,
     SETUP_GRACE_S,
@@ -30,19 +30,19 @@ from flash.providers._lifecycle.poll import (
     make_say,
     preload_box_reap_due,
 )
-from flash.providers._lifecycle.poll_instance import InstancePollAdapter, poll_instance_job
+from flash.providers._lifecycle.instances.poll_instance import InstancePollAdapter, poll_instance_job
 from flash.providers.artifacts.hf import (
     error_artifact_name,
     heartbeat_reader_for,
     make_hf_text_reader,
 )
-from flash.providers.base import (
+from flash.providers.core.base import (
     GPU_INFO,
     PollResult,
     UnreconciledCreateError,
     UnsupportedGpuError,
 )
-from flash.providers.lambda_ import api as lambda_api
+from flash.providers.lambda_.client import api as lambda_api
 from flash.providers.lambda_.jobs.builders import (
     LambdaInstance,
     LambdaJobHandle,
@@ -98,8 +98,8 @@ def usable_instances(
     capacity, so it drops out here exactly like a sold-out region — the caller never gets an
     unrentable shape back.
     """
-    from flash.providers.lambda_.gpus import instance_type_disk_gb, instance_type_for
-    from flash.providers.lambda_.pricing import hourly_rate
+    from flash.providers.lambda_.client.gpus import instance_type_disk_gb, instance_type_for
+    from flash.providers.lambda_.client.pricing import hourly_rate
 
     info = GPU_INFO[gpu_class]
     count = max(1, int(gpu_count))

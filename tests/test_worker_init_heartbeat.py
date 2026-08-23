@@ -215,7 +215,7 @@ def test_checkpoint_uploading_keepalive_stage_is_throttled_on_tight_cadence():
     throttled (else ~120/hr blows the HF commit cap) AND ride the tighter setup-liveness interval, so
     the provider stall clock is refreshed well inside STALL_AFTER_S rather than every _HB_MIN_INTERVAL_S."""
     import flash.engine.worker as ne
-    from flash.providers._lifecycle.poll import STALL_AFTER_S
+    from flash.providers._lifecycle.instances.poll import STALL_AFTER_S
 
     assert "checkpoint_uploading" in ne._HB_UPLOAD_LIVENESS_STAGES
     assert "checkpoint_uploading" in ne._HB_TIGHT_LIVENESS_STAGES
@@ -615,7 +615,7 @@ def test_rl_lifecycle_heartbeats_carry_latest_metrics():
     import ast
     import textwrap
 
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
     source = inspect.getsource(rl_train.run_rl_train) + inspect.getsource(
         rl_train._write_terminal_metadata
@@ -1204,7 +1204,7 @@ def test_hf_cache_bytes_counts_blobs_and_reports_unmeasurable_as_none(tmp_path, 
 # Provider: liveness pings must NOT count as progress (else a wedged worker pinging "alive" masks the
 # stall). surface_heartbeat — shared by every provider — returns no-advance for a liveness heartbeat.
 def test_is_training_heartbeat_gates_setup_vs_training():
-    from flash.providers._lifecycle.poll import is_training_heartbeat
+    from flash.providers._lifecycle.instances.poll import is_training_heartbeat
 
     # Setup stages (and a missing stage) never tighten — still the cold start.
     assert is_training_heartbeat("rl_train_start", None) is False
@@ -1241,7 +1241,7 @@ def test_setup_heartbeat_stages_cover_every_pre_training_liveness_stage():
     """The worker's progress-carry latch can upgrade any liveness ping to a REAL heartbeat. Every
     pre-training liveness stage must therefore be in SETUP_HEARTBEAT_STAGES, or a carried setup
     heartbeat would prematurely flip stall detection to the tight training window."""
-    from flash.providers._lifecycle.poll import SETUP_HEARTBEAT_STAGES
+    from flash.providers._lifecycle.instances.poll import SETUP_HEARTBEAT_STAGES
 
     for stage in (
         "model_prefetching",
@@ -1260,7 +1260,7 @@ def test_setup_heartbeat_stages_cover_every_pre_training_liveness_stage():
 
 
 def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatch):
-    from flash.providers._lifecycle import poll as _poll
+    from flash.providers._lifecycle.instances import poll as _poll
 
     real = {"stage": "rl_initializing", "step": 0, "ts": 100.0, "attempt": "1"}
     key, stage = _poll.surface_heartbeat(lambda: real, None, lambda _m: None)
@@ -1402,7 +1402,7 @@ def test_venv_provisioning_and_the_capability_probe_run_under_one_wrap(modname, 
 def test_rl_warmstart_adapter_download_is_wrapped_in_liveness_heartbeat():
     """The warm-start adapter pull is multi-GB and lives in the input resolver rather than the
     entry point, so it carries its own wrap; the sibling test above cannot see it."""
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
     src = inspect.getsource(rl_train._resolve_grpo_inputs)
     assert 'liveness_heartbeat("rl_adapter_loading")' in src, (
@@ -1415,7 +1415,7 @@ def test_sft_configuring_is_a_setup_stage_on_the_tight_liveness_cadence():
     wide setup grace (it has not even loaded the model yet), refreshes status on the faster setup
     cadence, and is throttled so its 30s re-emit can't blow the HF commit cap."""
     import flash.engine.worker as ne
-    from flash.providers._lifecycle.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+    from flash.providers._lifecycle.instances.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
 
     assert "sft_configuring" in SETUP_HEARTBEAT_STAGES
     assert is_training_heartbeat("sft_configuring", 0) is False
@@ -1441,7 +1441,7 @@ def test_post_download_model_setup_runs_under_a_liveness_wrap():
     status` freezes there for the whole span and a healthy cold cache is indistinguishable from a
     dead worker.
     """
-    from flash.engine.worker import opd_train, sft_train_runner
+    from flash.engine.worker.train.entry import opd_train, sft_train_runner
 
     sft_src = inspect.getsource(sft_train_runner._prepare_sft_model)
     assert re.search(r'liveness_heartbeat\(\s*"sft_model_load"', sft_src), (
@@ -1481,7 +1481,7 @@ def test_post_download_model_setup_runs_under_a_liveness_wrap():
 def test_opd_model_load_stage_is_actually_emitted():
     """`opd_model_load` is classified as setup by the poller and documented to users in TRAINING.md,
     but nothing ever emitted it -- so the stage users are told to expect never appeared."""
-    from flash.engine.worker import opd_train
+    from flash.engine.worker.train.entry import opd_train
 
     src = inspect.getsource(opd_train._load_opd_model)
     assert re.search(r'heartbeat\(\s*\n?\s*"opd_model_load"', src), (
@@ -1495,7 +1495,7 @@ def test_model_load_is_a_throttled_setup_stage(stage):
     a slow cold mount spends the HF commit budget on them, and must keep the WIDE setup grace since
     no training has started."""
     import flash.engine.worker as ne
-    from flash.providers._lifecycle.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+    from flash.providers._lifecycle.instances.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
 
     assert stage in SETUP_HEARTBEAT_STAGES
     assert is_training_heartbeat(stage, 0) is False

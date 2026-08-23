@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash.serving.src.model_config import (
+from flash.serving.src.engine.model_config import (
     SERVING_MODELS,
     base_models,
     engine_overrides_for,

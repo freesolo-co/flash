@@ -9,7 +9,7 @@ import sys
 import pytest
 
 from flash.engine.result.rollout_samples import build_rollout_sample, select_rollout_samples
-from flash.providers._lifecycle.poll import _format_heartbeat
+from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
 
 def test_build_rollout_sample_shows_full_text_and_sanitizes_without_redacting_placeholder(

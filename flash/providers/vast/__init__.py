@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from flash.providers._lifecycle.instance import InstanceJobHandle
-from flash.providers._lifecycle.provider import InstanceProvider
-from flash.providers.base import (
+from flash.providers._lifecycle.instances.instance import InstanceJobHandle
+from flash.providers._lifecycle.instances.provider import InstanceProvider
+from flash.providers.core.base import (
     AllocationConstraints,
     Candidate,
     CapacityLookupError,
@@ -35,17 +35,17 @@ class VastProvider(InstanceProvider):
         return VastJobHandle
 
     def _load_api_key(self) -> Any:
-        from flash.providers.vast.auth import load_api_key
+        from flash.providers.vast.client.auth import load_api_key
 
         return load_api_key()
 
     def _missing_credentials(self, require_hf: bool) -> list[str]:
-        from flash.providers.vast.preflight import missing_credentials
+        from flash.providers.vast.client.preflight import missing_credentials
 
         return missing_credentials(require_hf=require_hf)
 
     def _hourly_rate(self, gpu: str) -> float:
-        from flash.providers.vast.pricing import hourly_rate
+        from flash.providers.vast.client.pricing import hourly_rate
 
         return hourly_rate(gpu)
 
@@ -142,7 +142,7 @@ class VastProvider(InstanceProvider):
         provisions with, so a high-disk or long run isn't advertised capacity it couldn't actually rent (an
         impossible attempt a max_retries=0 run never escapes).
         """
-        from flash.providers.vast.pricing import live_candidate_rates
+        from flash.providers.vast.client.pricing import live_candidate_rates
 
         fitting = [g for g in self.gpu_classes() if g.vram_gb >= need_vram_gb]
         if not fitting:
@@ -188,7 +188,7 @@ class VastProvider(InstanceProvider):
         cancel(strict.to_dict())
 
     def destroy(self, handle: JobHandle) -> None:
-        from flash.providers.vast import api as vast_api
+        from flash.providers.vast.client import api as vast_api
         from flash.providers.vast.jobs import _best_effort_destroy
 
         strict = self._handle_cls.from_dict(handle.to_dict())

@@ -550,7 +550,7 @@ def test_startup_runs_completion_charge_sweep(monkeypatch, tmp_path):
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
     # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make this self-contained).
-    import flash.providers.runpod.auth as runpod_keys
+    import flash.providers.runpod.client.auth as runpod_keys
 
     runpod_keys.reset()
 
@@ -573,7 +573,7 @@ def test_startup_runs_completion_charge_sweep(monkeypatch, tmp_path):
         lambda *, internal_key, status: charged.append(status.run_id) or {"amountCents": 123},
     )
 
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()
@@ -612,7 +612,7 @@ def test_startup_does_not_block_on_slow_charge_backlog(monkeypatch, tmp_path):
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
     # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make this self-contained).
-    import flash.providers.runpod.auth as runpod_keys
+    import flash.providers.runpod.client.auth as runpod_keys
 
     runpod_keys.reset()
 
@@ -640,7 +640,7 @@ def test_startup_does_not_block_on_slow_charge_backlog(monkeypatch, tmp_path):
 
     monkeypatch.setattr("flash.server.billing.charges.charge_completed_run", slow_charge)
 
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()

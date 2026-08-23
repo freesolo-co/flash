@@ -17,7 +17,7 @@ import shutil
 import subprocess
 from collections.abc import Sequence
 
-from flash.engine.worker.backend_common import (
+from flash.engine.worker.train.entry.backend_common import (
     CAUSAL_CONV1D_REQUIREMENT,
     FLA_REQUIREMENT,
     FLASH_QLA_REQUIREMENT,

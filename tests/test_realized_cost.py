@@ -8,9 +8,9 @@ from __future__ import annotations
 import pytest
 
 from flash import runner
-from flash.providers import realized
-from flash.providers.runpod.cost import shape_endpoint_cost
-from flash.server.domain import reconcile
+from flash.providers.core import realized
+from flash.providers.runpod.client.cost import shape_endpoint_cost
+from flash.server.domain.ops import reconcile
 
 
 # --------------------------------------------------------------------------- RunPod shaping
@@ -36,7 +36,7 @@ def test_runpod_shape_empty_is_zero():
 
 # --------------------------------------------------------------------------- provider dispatch
 def test_dispatch_runpod(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     monkeypatch.setattr(
         api, "billing_endpoints", lambda **kw: [{"endpointId": "ep-1", "amount": 3.0}]
@@ -397,10 +397,10 @@ def _run_reconcile_loop_once(monkeypatch, reconcile_once_impl):
     SYNC callable run via asyncio.to_thread(...), so the stub is a plain sync function."""
     import asyncio
 
-    from flash.server import app as server_app
+    from flash.server.asgi import app as server_app
 
     # reconcile_once is imported function-locally inside the loop
-    # (`from flash.server.domain.reconcile import reconcile_once`), so patch it at the source module.
+    # (`from flash.server.domain.ops.reconcile import reconcile_once`), so patch it at the source module.
     monkeypatch.setattr(reconcile, "reconcile_once", reconcile_once_impl)
 
     calls = {"sleep": 0}

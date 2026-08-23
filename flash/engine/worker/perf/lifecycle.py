@@ -297,7 +297,7 @@ def _gpu_mismatch_reason(
 ) -> str | None:
     """Return a human reason the live GPU can't satisfy the requested class, else None."""
     try:
-        from flash.providers.base import get_gpu_info, min_cuda_modern
+        from flash.providers.core.base import get_gpu_info, min_cuda_modern
 
         info = get_gpu_info(requested_gpu or "")
     except Exception:
@@ -328,7 +328,7 @@ def verify_gpu(requested_gpu: str | None, *, gpu_type: str = "") -> None:
     with contextlib.suppress(Exception):
         live_name = torch.cuda.get_device_name(0)
     if gpu_type:
-        from flash.providers.base import canonical_gpu
+        from flash.providers.core.base import canonical_gpu
 
         requested_canonical = canonical_gpu(gpu_type)
         try:

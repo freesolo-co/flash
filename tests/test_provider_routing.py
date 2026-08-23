@@ -80,7 +80,7 @@ def _public_spec(run_id="flash-1700000001-rt01", algorithm="sft") -> JobSpec:
 
 
 def _alloc(gpu="RTX 4090", rate=0.69, candidates=None):
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
 
     if candidates is None:
         candidates = (Candidate("runpod", gpu, rate, 24),)
@@ -193,9 +193,9 @@ def test_preflight_rejects_an_unreachable_fallback_class(orch, monkeypatch) -> N
 def test_runpod_allocation_routes_to_runpod_submit(
     orch, monkeypatch, gpu_preferences, expected_provider, expected_providers
 ):
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     captured = {}
 
@@ -300,9 +300,9 @@ def test_effective_spec_carries_the_allocated_card_count(orch) -> None:
 
 
 def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     spec = _spec(max_retries=0)
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
@@ -340,10 +340,10 @@ def test_terminal_race_before_effective_spec_persistence_skips_provider(orch, mo
 def test_cancel_waits_for_durable_provider_handle_then_tears_down(
     orch, monkeypatch, first_revocation_fails
 ):
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.server.platform import db as server_db
 
     spec = _spec(run_id="flash-provider-handshake-cancel", max_retries=0)
@@ -465,9 +465,9 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(
 
 
 def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch, monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     spec = _spec(run_id="flash-concurrent-supervisors", max_retries=0)
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
@@ -537,9 +537,9 @@ def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch,
     ["provider_exception", "provider_without_callback", "callback_persistence_exception"],
 )
 def test_provider_submission_paths_release_run_lock(orch, monkeypatch, failure_mode):
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.server.platform.locks import _deploy_lock
 
     spec = _spec(run_id=f"flash-lock-release-{failure_mode}", max_retries=0)
@@ -583,10 +583,10 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     from dataclasses import replace
 
     import flash.core.catalog as catalog
-    import flash.envs.loader as env_loader
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    import flash.envs.loading.loader as env_loader
+    from flash.providers.core import allocator
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.runner.supervise import lifecycle
 
     resolved_sha = "a" * 40
@@ -695,8 +695,8 @@ def test_sft_submission_fails_closed_when_the_environment_cannot_be_pinned(orch,
     it would freeze a quote against a ref that can move before the worker resolves it. grpo and opd
     have no such key, so for them the best-effort pin plus lifecycle fallback stays correct.
     """
-    import flash.envs.loader as env_loader
-    from flash.providers import allocator
+    import flash.envs.loading.loader as env_loader
+    from flash.providers.core import allocator
 
     persisted = []
 
@@ -725,7 +725,7 @@ def test_sft_submission_fails_closed_when_the_environment_cannot_be_pinned(orch,
 
 
 def _permanent_404(_parsed, *_args, **_kwargs):
-    from flash.envs.identity import GitHubPermanentError
+    from flash.envs.meta.identity import GitHubPermanentError
 
     raise GitHubPermanentError("GitHub environment request failed (404): Not Found")
 
@@ -742,8 +742,8 @@ def test_permanent_env_404_is_refused_before_a_gpu_is_allocated(
     existed only to rediscover the 404 the control plane already had. The dry-run case is the point
     of the parametrisation -- that mode's entire job is to answer this without paying.
     """
-    import flash.envs.loader as env_loader
-    from flash.providers import allocator
+    import flash.envs.loading.loader as env_loader
+    from flash.providers.core import allocator
 
     monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", _permanent_404)
@@ -762,8 +762,8 @@ def test_unauthenticated_404_still_defers_rather_than_refusing(orch, monkeypatch
     see. Every managed-hub environment is private, so a tokenless plane 404s on refs that are
     perfectly valid -- refusing those would ground legitimate runs to catch a typo.
     """
-    import flash.envs.loader as env_loader
-    from flash.providers import allocator
+    import flash.envs.loading.loader as env_loader
+    from flash.providers.core import allocator
 
     monkeypatch.setattr(env_loader, "_github_token", lambda: None)
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", _permanent_404)
@@ -784,9 +784,9 @@ def test_transient_github_failure_still_defers_the_pin(orch, monkeypatch, blip_k
     changes that, so every transient class -- and anything untyped, which is unproven -- keeps
     reaching allocation.
     """
-    import flash.envs.loader as env_loader
-    from flash.envs.identity import GitHubRateLimitError, GitHubUnavailableError
-    from flash.providers import allocator
+    import flash.envs.loading.loader as env_loader
+    from flash.envs.meta.identity import GitHubRateLimitError, GitHubUnavailableError
+    from flash.providers.core import allocator
 
     blip = {
         "rate-limit": GitHubRateLimitError("GitHub API rate limit exceeded (429)"),
@@ -814,8 +814,8 @@ def test_the_gate_keeps_the_sha_it_resolved_instead_of_resolving_twice(orch, mon
     resolving again for the pin doubles this submit's spend against the secondary rate limit the
     pin exists to protect -- and the two calls can disagree, since a ref can move between them.
     """
-    import flash.envs.loader as env_loader
-    from flash.providers import allocator
+    import flash.envs.loading.loader as env_loader
+    from flash.providers.core import allocator
 
     sha = "a" * 40
     calls = []
@@ -871,8 +871,8 @@ def test_unpinnable_sft_environment_reports_githubs_own_diagnosis(
     """
     from dataclasses import replace
 
-    import flash.envs.loader as env_loader
-    from flash.providers import allocator
+    import flash.envs.loading.loader as env_loader
+    from flash.providers.core import allocator
 
     def fail(_parsed, *_args, **_kwargs):
         raise RuntimeError(github_error)
@@ -907,8 +907,8 @@ def test_the_reported_reason_describes_the_resolve_that_was_actually_used(orch, 
     """
     from dataclasses import replace
 
-    import flash.envs.loader as env_loader
-    from flash.providers import allocator
+    import flash.envs.loading.loader as env_loader
+    from flash.providers.core import allocator
 
     calls = []
 
@@ -940,9 +940,9 @@ def test_controller_staging_is_persisted_before_provider_submission(orch, monkey
 
     import flash.core.catalog as catalog
     from flash.core.spec import EnvironmentPackageSpec
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.runner.supervise import lifecycle
 
     resolved_sha = "e" * 40
@@ -1147,9 +1147,9 @@ def test_the_allocated_card_count_reaches_the_metrics_the_cost_is_read_from(orch
     this drives the real submit path rather than handing `_persist_metrics` a literal, because the
     two halves fail independently: pricing can multiply correctly by a count that is never recorded.
     """
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     monkeypatch.setattr(
         allocator,
@@ -1176,10 +1176,10 @@ def test_the_allocated_card_count_reaches_the_metrics_the_cost_is_read_from(orch
 
 
 def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (
         Candidate("runpod", "RTX 4090", 0.39, 24),
@@ -1220,10 +1220,10 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
 
 def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch, monkeypatch):
     """A fixed multi-class market stops when the projected class refuses twice."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (
         Candidate("runpod", "A100 PCIe", 1.19, 80),
@@ -1267,10 +1267,10 @@ def test_a_named_alternative_still_gets_its_own_look_after_the_first_class_refus
     orch, monkeypatch
 ):
     """Each named class gets one refusal before a repeated class is stopped."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (
         Candidate("runpod", "A100 PCIe", 1.19, 80),
@@ -1309,11 +1309,11 @@ def test_a_named_alternative_still_gets_its_own_look_after_the_first_class_refus
 
 
 def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
     from flash.providers.runpod import RunpodProvider
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (
         Candidate("runpod", "RTX 4090", 0.39, 24),
@@ -1365,7 +1365,7 @@ def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monke
 
 
 def _oom_candidates():
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
 
     return (
         Candidate("runpod", "A100 PCIe", 1.0, 80),
@@ -1375,10 +1375,10 @@ def _oom_candidates():
 
 
 def _run_failed_oom_sequence(orch, monkeypatch, failures, *, max_retries):
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=_oom_candidates()))
     monkeypatch.setattr(
@@ -1454,7 +1454,7 @@ def test_oom_never_escalates_at_max_retries_0(orch, monkeypatch):
 def test_select_candidate_escapes_failed_provider_then_walks_classes():
     """The retry picker prefers cheapest first, escapes a failed provider cross-provider on retry,
     and only walks classes within a provider once every provider has been burned."""
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
     from flash.runner.supervise.lifecycle import _select_candidate
 
     cands = (
@@ -1479,7 +1479,7 @@ def test_select_candidate_escapes_failed_provider_then_walks_classes():
 
 
 def test_select_candidate_escapes_a_failed_preferred_provider():
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
     from flash.runner.supervise.lifecycle import _select_candidate
 
     # the allocator placed the preferred provider first even though vast was cheaper. retry must
@@ -1503,7 +1503,7 @@ def test_select_candidate_keeps_the_allocators_per_step_ranking():
     running the slower card for more total money. Ordering is the allocator's job; this picker only
     demotes failed providers and tried shapes.
     """
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
     from flash.runner.supervise.lifecycle import _select_candidate
 
     # as allocate() returns them: cheapest PER STEP first, which is NOT cheapest per hour.
@@ -1521,7 +1521,7 @@ def test_select_candidate_keeps_the_allocators_per_step_ranking():
 
 def test_select_candidate_single_provider_walks_classes():
     """With only one provider configured, the picker degrades to the cheapest untried class."""
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
     from flash.runner.supervise.lifecycle import _select_candidate
 
     cands = (Candidate("runpod", "RTX 4090", 0.39, 24), Candidate("runpod", "H100", 0.49, 48))
@@ -1533,7 +1533,7 @@ def test_select_candidate_single_fitting_gpu_never_breaks():
     re-picking THAT class on every infra retry — the candidate list only ever holds *fitting*
     classes, so the walk can never escape to a card too small to hold the model, and the picker
     must still return it (not None / not raise) even after it's been tried and its provider burned."""
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
     from flash.runner.supervise.lifecycle import _select_candidate
 
     only = Candidate("runpod", "H200", 4.0, 141)
@@ -1548,11 +1548,11 @@ def test_select_candidate_single_fitting_gpu_never_breaks():
 def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     """Issue 7: a RunPod queue / no-capacity failure must retry on a DIFFERENT provider
     (Lambda) rather than walking to the next RunPod class while Lambda sits available."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
     from flash.providers.lambda_ import jobs as lambda_jobs
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (
         Candidate("runpod", "H100", 0.49, 48),  # cheapest -> attempt 0
@@ -1598,10 +1598,10 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
 @pytest.mark.parametrize("failure", ["no_capacity", "poll_error"])
 def test_shared_cache_zero_retries_submits_exactly_once(orch, monkeypatch, failure):
     """max_retries=0 is one provider submission even with the managed shared cache."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     monkeypatch.setattr(
@@ -1641,10 +1641,10 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
     no_capacity, the run must still walk to a DIFFERENT class (its one real retry), not stop after the
     cache drop. Regression for the cache-fallback-steals-the-only-retry gap (the stop check counted the
     cache-drop attempt against max_retries)."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     candidates = (
@@ -1695,12 +1695,12 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     """Issue 5: a Lambda instance whose CUDA never inits fails job_preempted; the retry must move to
     a DIFFERENT provider (RunPod) instead of re-rolling another broken Lambda instance, and the sick
     instance is torn down before the retry."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs as lambda_jobs
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (
         Candidate("lambda", "A10", 0.40, 24),  # cheapest -> attempt 0 (lands on broken instance)
@@ -1752,12 +1752,12 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
     reached 'active' but the worker never booted). It is infra-shaped, so the retry ESCAPES to a
     different provider rather than re-rolling the same sick substrate — the observed us-east-1 /
     CANADA-1 case, now caught in ~15 min instead of ~50."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs as lambda_jobs
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (
         Candidate("lambda", "H100", 0.45, 48),  # cheapest -> attempt 0 (sick region)
@@ -1799,9 +1799,9 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
 
 
 def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
     calls = []
@@ -1821,7 +1821,7 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
 
 
 def test_cancel_rejects_legacy_handle_without_provider_identity(orch, monkeypatch):
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod import serverless as rp_train
 
     cancelled_jobs, deleted_eps = [], []
@@ -1903,10 +1903,10 @@ def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monk
     on the next-best GPU' while the picker had nowhere to walk and re-selected that same class. The
     log must describe the retry that actually happens. A stalled failure now exercises the same
     last-class retry message because ordinary exhausted capacity stops instead."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     # exactly one fitting class: the picker can only ever re-pick it.
     candidates = (Candidate("runpod", "H200", 4.0, 141),)
@@ -1953,10 +1953,10 @@ def test_retry_message_admits_when_the_projected_provider_already_failed(orch, m
     provider, not more waiting, so the message has to say the pool is exhausted. A stalled failure
     keeps the retry-message path active while preserving the same provider topology.
     """
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     # one provider, two fitting classes: every candidate's provider fails together.
     candidates = (
@@ -2000,10 +2000,10 @@ def test_retry_message_does_not_deny_a_provider_that_is_in_the_candidate_list(or
     that provider and push the operator toward the wrong remedy -- the answer there is to unpin or
     wait for one of them to recover, not to go find a provider that is already on the list.
     """
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     # two providers, both of which this run burns through.
     candidates = (
@@ -2042,10 +2042,10 @@ def test_retry_message_does_not_deny_a_provider_that_is_in_the_candidate_list(or
 
 def test_a_genuine_cross_provider_failover_is_not_labelled_exhausted(orch, monkeypatch):
     """The admission must not fire when the retry really does escape to a different provider."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (
         Candidate("runpod", "A100 PCIe", 1.2, 40),
@@ -2080,10 +2080,10 @@ def test_last_gpu_retry_message_names_the_clamped_back_class_not_the_current_one
     fitting classes the walk is PCIe, SXM, then back to the cheaper PCIe, so the message printed on
     the SXM failure must name the PCIe the picker actually selects, not the SXM it is leaving. Stalls
     retain the full retry walk needed to exercise that clamp-back message."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (
         Candidate("runpod", "A100 PCIe", 1.0, 80),
@@ -2135,10 +2135,10 @@ def test_cache_drop_retry_names_the_same_class_it_reselects(orch, monkeypatch):
     on_last_gpu -- with several fitting classes it runs while on_last_gpu is false -- so gating the
     projection on the flag left exactly this escalation described by the generic retry line, the
     same misleading claim the change exists to fix."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     candidates = (
@@ -2181,10 +2181,10 @@ def test_cache_drop_failure_detail_does_not_contradict_the_action_line(orch, mon
     poll_job holds neither the retry budget nor the candidate list, so it cannot know a cache drop is
     coming; the fix is to make the detail state only the escalation fact and leave the target to the
     supervisor. Asserts on the block as a whole, which is what an operator actually reads."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     candidates = (
@@ -2232,10 +2232,10 @@ def test_projected_retry_class_is_worded_as_a_projection_not_a_promise(orch, mon
     Providers that rebuild candidates from live capacity can drop the named class or surface a
     cheaper one, so the log must not claim this is the class the retry will certainly use. A stalled
     failure keeps this projection observable after exhausted capacity became terminal."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     # capacity moves between attempts: the projected H200 is gone by the time the retry allocates.
     allocations = [
@@ -2285,10 +2285,10 @@ def test_sole_class_cache_drop_does_not_claim_the_class_is_exhausted(orch, monke
     and reselects the same class cold, so the line read "expecting to retry on H100 @ runpod again,
     no untried GPU class fits this run": naming the untried class in the same clause that denies one
     exists. Derive the clause from the sets the retry will actually see instead."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     # exactly one fitting class -> untried is a single entry -> on_last_gpu true from attempt 0.
@@ -2329,10 +2329,10 @@ def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
     one fitting class the clause is accurate and must survive. Guards against fixing the false
     positive by deleting the clause outright. A stalled failure exercises this ordinary infra retry.
     """
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (Candidate("runpod", "H100", 0.49, 80),)
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
@@ -2368,10 +2368,10 @@ def test_workload_profile_mismatch_fails_fast_instead_of_retrying(orch, monkeypa
     retry budget on real ``time.sleep`` backoffs before failing anyway -- the shape that wedged the
     suite for 20 minutes on a single test."""
     from flash.engine.profiling.workload_profile import WorkloadProfileMismatch
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
@@ -2418,10 +2418,10 @@ def test_unknown_prompt_pool_size_fails_fast_instead_of_retrying(orch, monkeypat
     in-flight unbounded run would spend its entire retry budget on backoff sleeps before failing.
     """
     from flash.cost.spec import UnknownPromptPoolSize
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda e, _fingerprint: True)
@@ -2463,7 +2463,7 @@ def test_submit_supplies_the_worker_pip_when_the_author_declared_none() -> None:
     Shipping a worker with no Freesolo SDK fails only once a GPU is already rented, so the baseline
     must be present whether or not the author declared anything.
     """
-    from flash.providers._lifecycle.instance import build_payload
+    from flash.providers._lifecycle.instances.instance import build_payload
 
     spec = _spec()
     assert not spec.environment.pip
@@ -2488,7 +2488,7 @@ def test_submit_appends_authored_pip_without_displacing_the_worker_spec() -> Non
     """
     from dataclasses import replace
 
-    from flash.providers._lifecycle.instance import build_payload
+    from flash.providers._lifecycle.instances.instance import build_payload
 
     spec = _spec()
     spec = replace(spec, environment=replace(spec.environment, pip=("pymongo>=4.6", "rapidfuzz")))
@@ -2507,7 +2507,7 @@ def test_submit_appends_authored_pip_without_displacing_the_worker_spec() -> Non
 
 def test_worker_pip_with_extras_dedupes_and_ignores_blanks() -> None:
     """Restating the worker spec must not install it twice, and blanks must not reach pip."""
-    from flash.envs.base import worker_pip_with_extras
+    from flash.envs.loading.base import worker_pip_with_extras
 
     assert worker_pip_with_extras("e", ["freesolo>=0.4.1", "pymongo"]) == [
         "freesolo>=0.4.1",
@@ -2527,7 +2527,7 @@ def _submit_failure(provider_obj):
 
     import flash.providers as _providers
     import flash.runner as _runner
-    import flash.server.domain.teacher_broker as _broker
+    import flash.server.domain.teacher.broker as _broker
     from flash.runner.supervise import seed_submission as _ss
 
     @_contextlib.contextmanager
@@ -2601,7 +2601,7 @@ def test_the_pool_exhaustion_message_survives_supervision():
     itself. Those have different operator fixes -- wait, versus another class or provider -- so an
     error that draws the distinction is worthless if it is discarded one frame later.
     """
-    from flash.providers.base import RunExhaustedProviderPoolError
+    from flash.providers.core.base import RunExhaustedProviderPoolError
 
     class _Boom:
         def submit_run(self, *_a, **_kw):
@@ -2624,7 +2624,7 @@ def test_generic_provider_exception_text_still_never_reaches_the_run_record():
     would not save it: that redacts CONFIGURED secrets, so arbitrary provider text passes straight
     through. Surfacing the authored error is safe precisely because Flash writes that string.
     """
-    from flash.providers.vast.api import VastApiError
+    from flash.providers.vast.client.api import VastApiError
 
     result, _ = _submit_failure_with_secret(
         VastApiError("create rejected: body echoed a token nobody registered")
@@ -2645,10 +2645,10 @@ def test_pinned_gpu_out_of_capacity_stops_instead_of_requeueing_on_the_same_clas
     Two, not one: `no_capacity` also covers a transient search flake and an exhausted provider pool,
     and a dry market frees cards, so the second refusal is what separates a blip from a wall (see
     `test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up`)."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     # exactly what hard class and provider pins produce: one fixed class-provider shape.
     candidates = (Candidate("runpod", "H200", 4.0, 141),)
@@ -2692,10 +2692,10 @@ def test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up(orch, monkey
     queue-grace expiry, and capacity that was gone a minute ago comes back. Stopping on the first
     refusal would convert every momentary shortage into a failed run -- the opposite defect from the
     75-minute loop, and the more expensive one, because the work is already paid for."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (Candidate("runpod", "H200", 4.0, 141),)
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
@@ -2725,10 +2725,10 @@ def test_pinned_gpu_retries_a_single_capacity_blip_before_giving_up(orch, monkey
 @pytest.mark.parametrize("gpu_type", ["", "H200"], ids=["auto-class", "pinned-class"])
 def test_dynamic_provider_search_keeps_the_full_capacity_retry_budget(orch, monkeypatch, gpu_type):
     """Without a hard provider pin, each retry can discover a class on a returning provider."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.runner.supervise.lifecycle import INFRA_RETRY_FLOOR
 
     candidates = (Candidate("runpod", "H200", 4.0, 141),)
@@ -2757,10 +2757,10 @@ def test_dynamic_provider_search_keeps_the_full_capacity_retry_budget(orch, monk
 
 def test_multi_count_pin_keeps_retry_budget_when_another_width_can_reappear(orch, monkeypatch):
     """A count ceiling admits several shapes, even when the current market exposes only one."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.runner.supervise.lifecycle import INFRA_RETRY_FLOOR
 
     candidates = (Candidate("runpod", "H200", 4.0, 141, gpu_count=1),)
@@ -2792,8 +2792,8 @@ def test_multi_count_pin_keeps_retry_budget_when_another_width_can_reappear(orch
 
 
 def test_allocation_time_sellout_counts_for_a_fixed_shape(orch, monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import CapacityUnavailableError
+    from flash.providers.core import allocator
+    from flash.providers.core.base import CapacityUnavailableError
 
     calls = 0
 
@@ -2820,8 +2820,8 @@ def test_allocation_time_sellout_counts_for_a_fixed_shape(orch, monkeypatch):
 
 
 def test_allocation_lookup_outage_keeps_the_full_retry_budget(orch, monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import CapacityLookupError
+    from flash.providers.core import allocator
+    from flash.providers.core.base import CapacityLookupError
     from flash.runner.supervise.lifecycle import INFRA_RETRY_FLOOR
 
     calls = 0
@@ -2849,10 +2849,10 @@ def test_allocation_lookup_outage_keeps_the_full_retry_budget(orch, monkeypatch)
 
 def test_a_provisioned_attempt_resets_the_class_capacity_refusals(orch, monkeypatch):
     """A worker-side failure proves the class admitted the run, so an older shortage is stale."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     candidates = (Candidate("runpod", "H200", 4.0, 141),)
     monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=candidates))
@@ -2889,10 +2889,10 @@ def test_dropping_the_weight_cache_gives_the_widened_search_its_own_capacity_loo
     answers "any capacity for this class in that region?" -- a narrower question than the cacheless
     retry asks. Carrying the tally across would let one region's shortage plus a single blip in the
     unrestricted pool reach two and stop the run, having heard the wider market refuse only once."""
-    from flash.providers import allocator
-    from flash.providers.base import Candidate, PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     candidates = (Candidate("runpod", "H100", 0.49, 48),)

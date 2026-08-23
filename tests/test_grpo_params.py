@@ -721,7 +721,7 @@ def test_grpo_prompt_budget_guard_matches_the_worker_resolver() -> None:
     from flash import schema
     from flash.engine.plan.recipe import RECIPE
     from flash.engine.plan.vram import grpo_completion_len
-    from flash.engine.worker.train.rl import inputs
+    from flash.engine.worker.train.rl.launch import inputs
 
     assert grpo_completion_len(None, False) == RECIPE.rl.max_completion_len
     assert grpo_completion_len(None, True) == RECIPE.rl.max_completion_len_thinking

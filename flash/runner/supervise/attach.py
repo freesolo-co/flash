@@ -16,8 +16,8 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from flash.core.spec import JobSpec
-from flash.envs.staged import StagedEnvironmentTransientError
-from flash.providers._lifecycle.poll import _attempt_int
+from flash.envs.loading.staged import StagedEnvironmentTransientError
+from flash.providers._lifecycle.instances.poll import _attempt_int
 
 # imported by value rather than through `_deploy()`: the set and its lock are mutated in place and
 # never rebound, so both modules share the one object, and the tests that assert on membership read
@@ -29,7 +29,7 @@ from flash.runner.supervise.deploy import (
 )
 
 if TYPE_CHECKING:
-    from flash.providers.base import JobHandle, PollResult
+    from flash.providers.core.base import JobHandle, PollResult
     from flash.runner import RunStatus
 
 
@@ -313,7 +313,7 @@ def _reconcile_attached_remote(
     failure: str,
 ) -> None:
     """Reconcile one exact maybe-live attempt until it is gone or the wall deadline expires."""
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
     from flash.runner import (
         TERMINAL_STATES,
         _compare_and_fail_remote,
@@ -506,7 +506,7 @@ def _build_attach_context(
     persisted_remote: dict,
 ) -> _AttachContext:
     """Validate the persisted handle and collect the inputs needed to poll it."""
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
     from flash.runner import get_status, source_snapshot_from_status
 
     remote = dict(persisted_remote)
@@ -537,7 +537,7 @@ def _build_attach_context(
 
 def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log) -> RunStatus:
     """Tear down and fail a run whose persisted public spec cannot be parsed."""
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
     from flash.runner import _compare_and_fail_remote, _record_cleanup_remote, get_status
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 

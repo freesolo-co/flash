@@ -11,7 +11,7 @@ from fastapi import Header, HTTPException
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.core.spec import JobSpec, require_project_id
 from flash.schema import ConfigError, spec_from_dict
-from flash.server import app as _app
+from flash.server.asgi import app as _app
 from flash.server.platform import auth, db
 
 _RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
@@ -151,7 +151,7 @@ def _require_supported_environment_form(env_raw: dict) -> None:
     env_id = env_raw.get("id")
     if not isinstance(env_id, str) or not env_id.strip():
         return  # absent/malformed ids are the schema's error to report, with its own message
-    from flash.envs.adapter import canonical_managed_environment_slug, is_managed_environment_slug
+    from flash.envs.loading.adapter import canonical_managed_environment_slug, is_managed_environment_slug
 
     env_id = env_id.strip()
     if auth.standalone():

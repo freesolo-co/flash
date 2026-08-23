@@ -41,7 +41,7 @@ def test_persisted_decoder_rejects_unknown_keys() -> None:
 
 
 def test_current_envelope_digest_round_trips_and_detects_tampering() -> None:
-    from flash.runner.submit import _effective_preparation_snapshot
+    from flash.runner.lifecycle.submit import _effective_preparation_snapshot
 
     spec = _current_spec()
     snapshot = _effective_preparation_snapshot(spec, spec, None)
@@ -69,7 +69,7 @@ def test_current_envelope_version_is_validated_but_absence_still_recovers() -> N
     way (`snapshot.get("version", CURRENT_VERSION)`), and its own regression pins a bool rather
     than an absent key.
     """
-    from flash.runner.submit import _effective_preparation_snapshot
+    from flash.runner.lifecycle.submit import _effective_preparation_snapshot
 
     spec = _current_spec()
     snapshot = _effective_preparation_snapshot(spec, spec, None)

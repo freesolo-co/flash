@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from flash.serve.contract import MAX_CHAT_REQUEST_BYTES, reject_non_finite_json_constant
+from flash.serve.contract.contract import MAX_CHAT_REQUEST_BYTES, reject_non_finite_json_constant
 from flash.serve.runtime import (
     AdapterNotFoundError,
     EngineDeadError,

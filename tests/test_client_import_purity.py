@@ -21,7 +21,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Imported only by the control plane (`server` extra) or by the GPU worker (`gpu` extra), never
-# by a client command. flash/serve/deploy.py and preflight.py sit under flash/serve/ but are
+# by a client command. flash/serve/deployment/deploy.py and preflight.py sit under flash/serve/ but are
 # reached exclusively through function-local imports in flash/runner/ and flash/server/, which is
 # what keeps httpx and jsonschema off the client path.
 SERVER_ONLY_PREFIXES = (

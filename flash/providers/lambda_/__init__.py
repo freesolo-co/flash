@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from flash.providers._lifecycle.instance import InstanceJobHandle
-from flash.providers._lifecycle.provider import InstanceProvider
-from flash.providers.base import (
+from flash.providers._lifecycle.instances.instance import InstanceJobHandle
+from flash.providers._lifecycle.instances.provider import InstanceProvider
+from flash.providers.core.base import (
     AllocationConstraints,
     Candidate,
     CapacityLookupError,
@@ -32,17 +32,17 @@ class LambdaProvider(InstanceProvider):
         return LambdaJobHandle
 
     def _load_api_key(self) -> Any:
-        from flash.providers.lambda_.auth import load_api_key
+        from flash.providers.lambda_.client.auth import load_api_key
 
         return load_api_key()
 
     def _missing_credentials(self, require_hf: bool) -> list[str]:
-        from flash.providers.lambda_.preflight import missing_credentials
+        from flash.providers.lambda_.client.preflight import missing_credentials
 
         return missing_credentials(require_hf=require_hf)
 
     def _hourly_rate(self, gpu: str) -> float:
-        from flash.providers.lambda_.pricing import hourly_rate
+        from flash.providers.lambda_.client.pricing import hourly_rate
 
         return hourly_rate(gpu)
 
@@ -93,7 +93,7 @@ class LambdaProvider(InstanceProvider):
         )
 
     def _teardown_reattached(self, handle: JobHandle, spec) -> None:
-        from flash.providers.lambda_ import api as lambda_api
+        from flash.providers.lambda_.client import api as lambda_api
 
         lambda_api.terminate_instance_confirmed(handle.instance_id)
 
@@ -134,8 +134,8 @@ class LambdaProvider(InstanceProvider):
         is probed against the live catalog and only the counts with real capacity are reported. The
         rate stays per-card (``usable_instances`` divides the per-instance price).
         """
-        from flash.providers.lambda_ import api as lambda_api
-        from flash.providers.lambda_.gpus import instance_type_disk_gb, instance_type_for
+        from flash.providers.lambda_.client import api as lambda_api
+        from flash.providers.lambda_.client.gpus import instance_type_disk_gb, instance_type_for
         from flash.providers.lambda_.jobs import usable_instances
 
         out: list[Candidate] = []
@@ -201,7 +201,7 @@ PROVIDER: Provider = LambdaProvider()
 
 
 def _terminate_handle_instance(handle: JobHandle) -> None:
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     d = handle.to_dict()
     if d.get("instance_id"):

@@ -56,7 +56,7 @@ def live_attempt(obj: dict) -> int | None:
     about which attempt is current -- three surfaces that a user reads within one screen of each
     other, where a disagreement reads as a run that is on two attempts at once.
     """
-    from flash.providers._lifecycle.poll import _attempt_int
+    from flash.providers._lifecycle.instances.poll import _attempt_int
 
     remote = obj.get("remote")
     if isinstance(remote, dict):
@@ -83,7 +83,7 @@ def heartbeat_is_current_attempt(obj: dict, heartbeat: dict) -> bool:
     """
     # reuse the poller's attempt-identity contract (a bounded nonnegative int, never a bool, string,
     # or float) so the status display and stall detection agree on what a valid attempt is.
-    from flash.providers._lifecycle.poll import _attempt_int
+    from flash.providers._lifecycle.instances.poll import _attempt_int
 
     remote = obj.get("remote")
     current_attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
@@ -291,7 +291,7 @@ def _stale_step_hint(
     # step 0 is the cold, still-running first step: no optimizer update has landed, so there is no
     # later hidden step for the reassurance to point at. reuse the shared step-gated predicate
     # rather than a bare presence check.
-    from flash.providers._lifecycle.poll import is_training_heartbeat
+    from flash.providers._lifecycle.instances.poll import is_training_heartbeat
 
     if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
         return None

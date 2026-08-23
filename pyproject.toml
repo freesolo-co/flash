@@ -25,7 +25,7 @@ dependencies = []
 
 [project.optional-dependencies]
 # heavy deps for running the fine-tuning worker locally (on the gpu worker these are
-# installed by runpod flash from the dependency list in flash/providers/_lifecycle/worker.py).
+# installed by runpod flash from the dependency list in flash/providers/_lifecycle/net/worker.py).
 gpu = [
     "torch==2.10.0",
     "transformers>=5.6,<5.13",
@@ -306,7 +306,7 @@ ignore = [
 # Routes live inside the create_app() closure; with PEP 563 lazy annotations,
 # Annotated[..., Depends(closure_local)] cannot be resolved by get_type_hints,
 # so the definition-time `= Depends(...)` form is required here.
-"flash/server/app.py" = ["FAST002"]
+"flash/server/asgi/app.py" = ["FAST002"]
 # `_ScoredResponseText` subclasses `str` to stay grader-compatible while carrying the structured
 # views as attributes; __slots__ would defeat that.
-"flash/envs/adapter.py" = ["SLOT000"]
+"flash/envs/loading/adapter.py" = ["SLOT000"]

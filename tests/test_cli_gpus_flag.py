@@ -191,7 +191,7 @@ def test_a_pinned_small_class_still_does_not_pin_the_card_count():
     experiment off it silently gets fewer ranks than they asked for. Driving the real allocator
     rather than reading the doc string, so the claim is pinned to behavior and not to wording.
     """
-    from flash.providers.allocator import allocate
+    from flash.providers.core.allocator import allocate
 
     # 9B SFT on a 24 GB class does not fit alone, so this is the combination path, not the
     # fit-alone one. the algorithm is load-bearing: the same model+class does not allocate AT ALL
@@ -220,8 +220,8 @@ def test_a_pinned_class_can_need_a_wider_ceiling_for_grpo_and_opd():
     """
     import pytest
 
-    from flash.providers.allocator import allocate
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core.allocator import allocate
+    from flash.providers.core.base import UnsupportedGpuError
 
     # same model and class; only the algorithm and resulting memory floor differ.
     assert (
@@ -263,7 +263,7 @@ def test_the_allocation_log_line_carries_the_count_that_status_does_not():
     Both spellings are asserted because the doc states both: multi-card carries the Nx prefix and
     single-card does not, so a user grepping for "1x" on a one-card run would find nothing.
     """
-    from flash.providers.allocator import Allocation, allocation_summary
+    from flash.providers.core.allocator import Allocation, allocation_summary
 
     def summarize(count: int) -> str:
         return allocation_summary(

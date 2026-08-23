@@ -102,7 +102,7 @@ def make_client(tmp_path, monkeypatch):
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
     # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.auth as runpod_keys
+    import flash.providers.runpod.client.auth as runpod_keys
 
     runpod_keys.reset()
 
@@ -120,7 +120,7 @@ def make_client(tmp_path, monkeypatch):
     # work). The client request/response contract is unaffected.
     monkeypatch.setattr(runner, "_run_job", lambda *a, **k: None)
 
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
     monkeypatch.setattr(
@@ -133,9 +133,9 @@ def make_client(tmp_path, monkeypatch):
     # dispatch real sweep_orphans() list calls — and the urllib->TestClient shim below isn't installed
     # until AFTER create_app() runs. Stub the provider set to empty so startup stays hermetic.
     import flash.providers as providers_mod
-    import flash.server.domain.environment_registry as environment_registry
-    import flash.server.domain.projects as projects_mod
-    import flash.server.domain.run_registry as run_registry
+    import flash.server.domain.registry.environment_registry as environment_registry
+    import flash.server.domain.registry.projects as projects_mod
+    import flash.server.domain.registry.run_registry as run_registry
 
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(environment_registry, "require_environment_project", lambda **_kwargs: None)

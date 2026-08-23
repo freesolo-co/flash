@@ -12,14 +12,14 @@ import ast
 import inspect
 import textwrap
 
-from flash.engine.worker import rl_train_runner
-from flash.engine.worker.backend_common import (
+from flash.engine.worker.train.entry import rl_train_runner
+from flash.engine.worker.train.entry.backend_common import (
     append_step_metrics,
     parse_verl_metric,
     parse_verl_step_metrics,
     verl_step_number,
 )
-from flash.engine.worker.rl_train_runner import _ingest_step_metrics, _StepMetricState
+from flash.engine.worker.train.entry.rl_train_runner import _ingest_step_metrics, _StepMetricState
 
 # a realistic verl step line: ray tags worker stdout with a pid prefix, and reduce_metrics returns
 # numpy scalars that pprint renders as np.float64(...) under numpy>=2.
@@ -241,7 +241,7 @@ def test_exact_advantage_bounds_are_retained_in_the_forced_step_heartbeat(monkey
 
 
 def _verl_rl_tree() -> ast.Module:
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
     source = "\n".join(
         inspect.getsource(fn)
@@ -377,7 +377,7 @@ def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():
     # the payload schema belongs to the cli, not verl: a key the renderer does not know is dead
     # weight, so keep the mapping's flash-side names inside the rendered set.
     from flash.cli.commands import _FOLLOW_METRIC_FIELDS
-    from flash.engine.worker.backend_common import _VERL_METRIC_FIELDS
+    from flash.engine.worker.train.entry.backend_common import _VERL_METRIC_FIELDS
 
     rendered = {name for name, *_ in _FOLLOW_METRIC_FIELDS}
     emitted = {flash_key for _, flash_key in _VERL_METRIC_FIELDS}

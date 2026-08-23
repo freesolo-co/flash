@@ -32,8 +32,8 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.http.router import AdapterRouter, build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.conftest import attest
 
 

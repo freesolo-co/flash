@@ -109,7 +109,7 @@ class _SubmitContext:
         if not self.seen_endpoints:
             return
         from flash.providers import get_provider
-        from flash.providers.base import JobHandle
+        from flash.providers.core.base import JobHandle
 
         rp = get_provider("runpod")
         for remote in self.seen_endpoints.values():
@@ -238,7 +238,7 @@ def _require_opd_configuration(ctx: _SubmitContext) -> None:
     if ctx.spec.algorithm != "opd":
         return
     from flash.runner import _load_run_deadline_at
-    from flash.server.domain.teacher_broker import require_teacher_broker_configuration
+    from flash.server.domain.teacher.broker import require_teacher_broker_configuration
 
     # configuration and absolute policy fail before allocation can create a paid worker.
     require_teacher_broker_configuration(ctx.spec)
@@ -252,7 +252,7 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     if not ctx.last_handle:
         return None
     from flash.providers import get_provider
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
     from flash.runner import (
         _compare_and_clear_remote,
         _load_run_deadline_at,
@@ -400,8 +400,8 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
 
 
 def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
-    from flash.providers.allocator import allocate
-    from flash.providers.base import CapacityUnavailableError, PollResult, UnsupportedGpuError
+    from flash.providers.core.allocator import allocate
+    from flash.providers.core.base import CapacityUnavailableError, PollResult, UnsupportedGpuError
     from flash.runner import _load_run_deadline_at, get_status
 
     # a cancel can land after _run_training's pre-submit check but while
@@ -516,7 +516,7 @@ def _build_candidate_plan(
     ctx: _SubmitContext, prepared: _PreparedAttempt, allocation
 ) -> _CandidatePlan | None:
     from flash.providers import get_provider
-    from flash.providers.allocator import allocation_summary
+    from flash.providers.core.allocator import allocation_summary
     from flash.runner import _spec_with_gpu, _spec_with_remaining_wall
 
     candidates = tuple(_lifecycle._oom_escalated(allocation.candidates, ctx.oom_vram_floor))
@@ -597,7 +597,7 @@ def _build_candidate_plan(
 
 def _estimate_selected_quote(ctx: _SubmitContext, plan: _CandidatePlan, latest) -> float:
     from flash.cost.spec import estimate_for_spec
-    from flash.providers.base import Allocation as QuoteAllocation
+    from flash.providers.core.base import Allocation as QuoteAllocation
 
     # preparation stays offline so a market outage cannot consume the lifecycle's first
     # retry before the run exists. now that allocation selected an exact live shape,
@@ -631,7 +631,7 @@ def _submit_provider(
     plan: _CandidatePlan,
 ):
     from flash.providers import get_provider
-    from flash.providers.base import (
+    from flash.providers.core.base import (
         PollResult,
         RunExhaustedProviderPoolError,
         UnreconciledCreateError,
@@ -641,7 +641,7 @@ def _submit_provider(
         _TerminalHandleRace,
         _worker_deadline_at,
     )
-    from flash.server.domain.teacher_broker import teacher_attempt_transport
+    from flash.server.domain.teacher.broker import teacher_attempt_transport
 
     provider = get_provider(plan.chosen.provider)
     try:
@@ -712,7 +712,7 @@ def _submit_candidate(
 ):
     from flash.cost.spec import UnknownPromptPoolSize
     from flash.engine.profiling.workload_profile import WorkloadProfileMismatch
-    from flash.providers.base import PollResult
+    from flash.providers.core.base import PollResult
     from flash.runner import (
         TERMINAL_STATES,
         _persist_effective_worker_spec,
@@ -928,7 +928,7 @@ def submit_seed_supervised(
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures."""
     if spec.algorithm == "opd":
-        from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+        from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
 
         # policy and plane configuration are spec-level gates and must fail before durable run state
         # or source identity is consulted. the deadline-dependent gate still runs after context load.

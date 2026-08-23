@@ -5,8 +5,8 @@ from __future__ import annotations
 import contextlib
 from typing import Any
 
-from flash.providers._lifecycle.deadline import deadline_kwargs
-from flash.providers.base import (
+from flash.providers._lifecycle.net.deadline import deadline_kwargs
+from flash.providers.core.base import (
     AllocationConstraints,
     Candidate,
     GpuClass,
@@ -37,22 +37,22 @@ class RunpodProvider:
     def is_configured(self) -> bool:
         # require a usable parsed key pool, not merely a set env var. otherwise the allocator ranks
         # RunPod classes the operator cannot provision.
-        from flash.providers.runpod import auth
+        from flash.providers.runpod.client import auth
 
         return bool(auth.keys())
 
     def preflight(self, require_hf: bool = True) -> list[str]:
-        from flash.providers.runpod.preflight import missing_credentials
+        from flash.providers.runpod.client.preflight import missing_credentials
 
         return missing_credentials(require_hf=require_hf)
 
     def gpu_classes(self) -> list[GpuClass]:
-        from flash.providers.runpod.gpus import gpu_classes
+        from flash.providers.runpod.client.gpus import gpu_classes
 
         return gpu_classes()
 
     def hourly_rate(self, gpu: str) -> float:
-        from flash.providers.runpod.pricing import hourly_rate
+        from flash.providers.runpod.client.pricing import hourly_rate
 
         return hourly_rate(gpu)
 
@@ -85,7 +85,7 @@ class RunpodProvider:
         _deadline_at: float | None = None,
     ) -> PollResult:
         from flash.core.spec import require_matching_seed
-        from flash.providers.runpod.jobs import submit_run
+        from flash.providers.runpod.execution.jobs import submit_run
 
         seed = require_matching_seed(spec, seed)
         kwargs = {
@@ -110,8 +110,8 @@ class RunpodProvider:
         _deadline_at: float | None = None,
     ) -> PollResult:
         from flash.core.spec import gpu_count_of, require_matching_seed
-        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
-        from flash.providers.runpod.jobs import (
+        from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
+        from flash.providers.runpod.execution.jobs import (
             make_hf_failure_detail_reader,
             make_hf_heartbeat_reader,
             poll_job,
@@ -167,8 +167,8 @@ class RunpodProvider:
         )
 
     def cancel(self, handle: JobHandle) -> None:
-        from flash.providers.runpod import api as runpod_api
-        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+        from flash.providers.runpod.client import api as runpod_api
+        from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
 
         strict = RunpodJobHandle.from_dict(handle.to_dict())
         if not strict.job_id:
@@ -186,8 +186,8 @@ class RunpodProvider:
             raise runpod_api.RunpodApiError("runpod cancellation could not be confirmed")
 
     def destroy(self, handle: JobHandle) -> None:
-        from flash.providers.runpod import api as runpod_api
-        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+        from flash.providers.runpod.client import api as runpod_api
+        from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
 
         strict = RunpodJobHandle.from_dict(handle.to_dict())
         if runpod_api.delete_endpoint_for_fingerprint(strict.endpoint_id, strict.key_fingerprint):

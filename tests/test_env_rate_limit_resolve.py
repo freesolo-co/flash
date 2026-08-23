@@ -33,7 +33,7 @@ def _patch_no_sleep(monkeypatch):
 
 
 def test_urlopen_raises_typed_error_on_429(monkeypatch):
-    from flash.envs.loader import GitHubRateLimitError, _urlopen
+    from flash.envs.loading.loader import GitHubRateLimitError, _urlopen
 
     _patch_no_sleep(monkeypatch)
     monkeypatch.setattr(
@@ -46,7 +46,7 @@ def test_urlopen_raises_typed_error_on_429(monkeypatch):
 
 
 def test_urlopen_raises_typed_error_on_rate_limit_403(monkeypatch):
-    from flash.envs.loader import GitHubRateLimitError, _urlopen
+    from flash.envs.loading.loader import GitHubRateLimitError, _urlopen
 
     _patch_no_sleep(monkeypatch)
     body = '{"message": "API rate limit exceeded for user ID 1"}'
@@ -62,7 +62,7 @@ def test_urlopen_treats_credential_failure_as_permanent(monkeypatch, code):
     # a 401, or a 403 that is not a rate limit, is a token this plane cannot fix by waiting. it must
     # be non-retriable (so the run does not loop on a fresh worker) AND typed permanent, so the
     # submit-time preflight fails closed instead of deferring the same error past gpu allocation.
-    from flash.envs.loader import GitHubPermanentError, GitHubRateLimitError, _urlopen
+    from flash.envs.loading.loader import GitHubPermanentError, GitHubRateLimitError, _urlopen
 
     _patch_no_sleep(monkeypatch)
     monkeypatch.setattr(
@@ -78,7 +78,7 @@ def test_urlopen_treats_credential_failure_as_permanent(monkeypatch, code):
 def test_urlopen_rate_limit_403_stays_transient_not_permanent(monkeypatch):
     # the rate-limit 403 is claimed before the credential branch: it is a quota to wait out, not a
     # bad token, so widening the permanent set must not swallow it.
-    from flash.envs.loader import GitHubPermanentError, GitHubRateLimitError, _urlopen
+    from flash.envs.loading.loader import GitHubPermanentError, GitHubRateLimitError, _urlopen
 
     _patch_no_sleep(monkeypatch)
     monkeypatch.setattr(
@@ -95,7 +95,7 @@ def test_urlopen_rate_limit_403_stays_transient_not_permanent(monkeypatch):
 
 @pytest.mark.parametrize("code", [404, 422])
 def test_urlopen_raises_permanent_error_on_settled_github_answer(monkeypatch, code):
-    from flash.envs.loader import GitHubPermanentError, _urlopen
+    from flash.envs.loading.loader import GitHubPermanentError, _urlopen
 
     monkeypatch.setattr(
         urllib.request,
@@ -108,7 +108,7 @@ def test_urlopen_raises_permanent_error_on_settled_github_answer(monkeypatch, co
 
 
 def test_urlopen_raises_unavailable_error_on_server_failure(monkeypatch):
-    from flash.envs.loader import GitHubUnavailableError, _urlopen
+    from flash.envs.loading.loader import GitHubUnavailableError, _urlopen
 
     monkeypatch.setattr(
         urllib.request,
@@ -121,7 +121,7 @@ def test_urlopen_raises_unavailable_error_on_server_failure(monkeypatch):
 
 
 def test_urlopen_success_returns_bytes(monkeypatch):
-    from flash.envs.loader import _urlopen
+    from flash.envs.loading.loader import _urlopen
 
     class _Resp:
         def __enter__(self):
@@ -140,7 +140,7 @@ def test_urlopen_success_returns_bytes(monkeypatch):
 def test_rate_limit_error_is_retriable_runtime_error():
     # The worker's top-level handler treats GitHubRateLimitError as retriable precisely because it
     # is a RuntimeError subclass caught by `isinstance(e, (RetriableInfraError, GitHubRateLimitError))`.
-    from flash.envs.adapter import GitHubRateLimitError
+    from flash.envs.loading.adapter import GitHubRateLimitError
 
     assert issubclass(GitHubRateLimitError, RuntimeError)
     assert isinstance(GitHubRateLimitError("x"), GitHubRateLimitError)
@@ -162,8 +162,8 @@ def _fake_loader(captured):
 
 
 def test_registry_preserves_user_params_and_pins_out_of_band(monkeypatch):
-    import flash.envs.adapter as adapter
-    from flash.envs.base import load_environment
+    import flash.envs.loading.adapter as adapter
+    from flash.envs.loading.base import load_environment
 
     captured = {}
     monkeypatch.setattr(adapter, "load_freesolo_environment", _fake_loader(captured))
@@ -184,8 +184,8 @@ def test_registry_preserves_user_params_and_pins_out_of_band(monkeypatch):
 def test_registry_user_pinned_sha_param_is_forwarded_not_consumed(monkeypatch):
     # Even a user param literally named "pinned_sha" must reach the SDK loader untouched while the
     # control-plane pin stays separate (the whole point of making it positional-only).
-    import flash.envs.adapter as adapter
-    from flash.envs.base import load_environment
+    import flash.envs.loading.adapter as adapter
+    from flash.envs.loading.base import load_environment
 
     captured = {}
     monkeypatch.setattr(adapter, "load_freesolo_environment", _fake_loader(captured))
@@ -197,8 +197,8 @@ def test_registry_user_pinned_sha_param_is_forwarded_not_consumed(monkeypatch):
 
 
 def test_registry_omits_pin_when_unset(monkeypatch):
-    import flash.envs.adapter as adapter
-    from flash.envs.base import load_environment
+    import flash.envs.loading.adapter as adapter
+    from flash.envs.loading.base import load_environment
 
     captured = {}
     monkeypatch.setattr(adapter, "load_freesolo_environment", _fake_loader(captured))
@@ -213,7 +213,7 @@ _GH_ENV = "github:owner/repo@main:env/environment.py"
 
 
 def test_assign_resolved_env_sha_pins_when_resolver_succeeds(monkeypatch):
-    import flash.envs.loader as adapter
+    import flash.envs.loading.loader as adapter
     from flash import runner
     from flash.core.spec import EnvironmentSpec, JobSpec
 
@@ -228,7 +228,7 @@ def test_assign_resolved_env_sha_pins_when_resolver_succeeds(monkeypatch):
 def test_assign_resolved_env_sha_uses_fast_no_retry_resolver(monkeypatch):
     # the control-plane preflight must never block run creation on github retries: it resolves with a
     # short timeout and zero rate-limit retries before authoritative controller staging.
-    import flash.envs.loader as adapter
+    import flash.envs.loading.loader as adapter
     from flash import runner
     from flash.core.spec import EnvironmentSpec, JobSpec
 
@@ -246,7 +246,7 @@ def test_assign_resolved_env_sha_uses_fast_no_retry_resolver(monkeypatch):
 
 
 def test_assign_resolved_env_sha_best_effort_on_failure(monkeypatch):
-    import flash.envs.loader as adapter
+    import flash.envs.loading.loader as adapter
     from flash import runner
     from flash.core.spec import EnvironmentSpec, JobSpec
 
@@ -260,7 +260,7 @@ def test_assign_resolved_env_sha_best_effort_on_failure(monkeypatch):
 
 
 def test_assign_resolved_env_sha_noop_without_env_or_already_pinned(monkeypatch):
-    import flash.envs.loader as adapter
+    import flash.envs.loading.loader as adapter
     from flash import runner
     from flash.core.spec import EnvironmentSpec, JobSpec
 

@@ -14,7 +14,7 @@ from flash.core.catalog import (
     SERVING_MODEL_REPOS,
     get_model,
 )
-from flash.providers.base import KNOWN, canonical_gpu
+from flash.providers.core.base import KNOWN, canonical_gpu
 
 
 def test_recommended_gpu_is_supported():

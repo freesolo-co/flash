@@ -25,7 +25,7 @@ from flash.client.streaming import (
     _read_response_body,
 )
 from flash.core.spec import require_project_id
-from flash.serve.urls import is_freesolo_hosted_url
+from flash.serve.contract.urls import is_freesolo_hosted_url
 
 
 class ClientError(RuntimeError):
@@ -483,7 +483,7 @@ class ApiClient:
         # nonblank but unusable one (`my-env`, `acme/env`, unsafe path characters) would be
         # advertised as usable and then fail at submit. Validated with the managed parser itself
         # rather than a second predicate here, so the two cannot drift apart.
-        from flash.envs.loader import _parse_managed_environment_slug
+        from flash.envs.loading.loader import _parse_managed_environment_slug
 
         ids: list[str] = []
         for row in rows:
@@ -528,7 +528,7 @@ class ApiClient:
 
     def download_env_package(self, env_id: str) -> bytes:
         """Download a managed environment package through the Flash control plane."""
-        from flash.envs import loader
+        from flash.envs.loading import loader
 
         quoted = urllib.parse.quote(env_id, safe="/")
         return self._request_bytes(

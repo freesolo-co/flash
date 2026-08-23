@@ -5,7 +5,7 @@ from typing import Any, ClassVar
 import httpx
 import pytest
 
-from flash.serving.src.persistence import (
+from flash.serving.src.store.persistence import (
     PERSISTED_COLUMNS,
     PersistenceConflict,
     PersistenceRecordError,
@@ -18,8 +18,8 @@ from flash.serving.src.persistence import (
     load_adapters,
     replace_adapter_cas,
 )
-from flash.serving.src.schemas import AdapterRecord, PersistedAdapterRecord
-from flash.serving.src.settings import Settings
+from flash.serving.src.io.schemas import AdapterRecord, PersistedAdapterRecord
+from flash.serving.src.store.settings import Settings
 
 SHA = "a" * 40
 RUN_ID = "flash-1234567890-abcdef12"
@@ -132,7 +132,7 @@ class FakeClient:
 @pytest.fixture(autouse=True)
 def fake_http(monkeypatch) -> None:
     FakeClient.reset()
-    monkeypatch.setattr("flash.serving.src.persistence.httpx.Client", FakeClient)
+    monkeypatch.setattr("flash.serving.src.store.persistence.httpx.Client", FakeClient)
 
 
 def test_load_uses_explicit_projected_columns_and_ready_filter() -> None:

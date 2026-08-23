@@ -44,7 +44,7 @@ def _backend_common():
     handling. Reading it back through the parent is what keeps that patch reaching this collector,
     and falling through to the builtin is what keeps a test that patches `builtins.open` working.
     """
-    from flash.engine.worker import backend_common
+    from flash.engine.worker.train.entry import backend_common
 
     return backend_common
 

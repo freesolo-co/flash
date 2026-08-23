@@ -245,7 +245,7 @@ def test_build_worker_env_lists_declared_secret_names_for_the_redactors(monkeypa
     """the producer's exact applied-name metadata is also the verl child scrub contract."""
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.engine.worker.sft_train import _build_verl_child_env
+    from flash.engine.worker.train.entry.sft_train import _build_verl_child_env
     from flash.providers.runpod.serverless import build_worker_env
 
     declared = (
@@ -472,7 +472,7 @@ def test_all_worker_redactors_share_the_same_secret_corpus(monkeypatch):
     import textwrap
 
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
-    from flash.providers._lifecycle.bootstrap_secrets import _safe_detail as bootstrap_safe_detail
+    from flash.providers._lifecycle.bootstrapping.secrets import _safe_detail as bootstrap_safe_detail
     from flash.providers.runpod.serverless import endpoints
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
@@ -603,7 +603,7 @@ def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
     if an operator sets it), and neither worker run_mode path gates the upload."""
     import inspect
 
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
+    from flash.providers._lifecycle.bootstrapping import bootstrap as _instance_bootstrap
     from flash.providers.runpod.serverless import build_worker_env, endpoints
 
     # the flag is gone — setting it in the control-plane env does not reach the worker
@@ -628,7 +628,7 @@ def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
     _REMOVED_OPTIMIZATION_ENV blocks dead keys that configure nothing.
     """
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import _REMOVED_OPTIMIZATION_ENV
+    from flash.providers._lifecycle.net.worker import _REMOVED_OPTIMIZATION_ENV
     from flash.providers.runpod.serverless import build_worker_env
 
     # every removed key, not a chalk special case. FLASH_TRITON_LORA stands in for the rest.
@@ -1190,7 +1190,7 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     import inspect
 
     from flash.engine.profiling import sft_image_rows, sft_workload
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
     from flash.engine.worker.entry import sft
 
     # run_sft is now a pure delegation: no backend selector, no trainer of its own.
@@ -1205,7 +1205,7 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
 
     # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
     # this guard spans both modules. keep these in step when sft_train is split further.
-    from flash.engine.worker.train.sft import config as sft_config
+    from flash.engine.worker.train.sft.setup import config as sft_config
     from flash.engine.worker.train.sft.child import plugin as sft_plugin
 
     train_src = inspect.getsource(sft_train) + inspect.getsource(sft_config)
@@ -1297,7 +1297,7 @@ def test_train_body_uploads_console_on_missing_metrics(
     def materialize(_archive_path, _descriptor, destination):
         target = run_code / "flash-test-run-attempt-7"
         assert destination == str(target)
-        console = target / "flash/providers/_lifecycle/bootstrap_console.py"
+        console = target / "flash/providers/_lifecycle/bootstrapping/console.py"
         console.parent.mkdir(parents=True, exist_ok=True)
         console.write_text(
             "import threading, time\n"
@@ -1432,7 +1432,7 @@ def test_train_body_rejects_malformed_source_descriptor_before_download(monkeypa
 
 def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
     import flash.engine.worker as worker
-    from flash.providers._lifecycle import bootstrap as instance_bootstrap
+    from flash.providers._lifecycle.bootstrapping import bootstrap as instance_bootstrap
     from flash.providers.runpod.serverless import endpoints
 
     assert endpoints._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
@@ -1447,7 +1447,7 @@ def test_first_console_snapshot_precedes_stall_teardown():
     import importlib
     import inspect
 
-    from flash.providers._lifecycle import bootstrap_console
+    from flash.providers._lifecycle.bootstrapping import console as bootstrap_console
 
     importlib.import_module("flash.providers.runpod.jobs")
     poll_job = importlib.import_module("flash.providers.runpod.job_execution").poll_job
@@ -1473,7 +1473,7 @@ def test_console_heartbeat_stays_flat_so_the_scanner_can_match_on_substrings(tmp
     import json
 
     from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
-    from flash.providers._lifecycle import bootstrap_console
+    from flash.providers._lifecycle.bootstrapping import console as bootstrap_console
 
     snapshot = _console_heartbeat_snapshot(
         {
@@ -1506,7 +1506,7 @@ def test_min_cuda_for_uses_the_gpu_class_floor():
 def test_apply_disk_raises_to_the_requested_floor():
     from types import SimpleNamespace
 
-    from flash.providers.runpod.jobs import apply_disk_gb
+    from flash.providers.runpod.execution.jobs import apply_disk_gb
 
     tpl = SimpleNamespace(containerDiskInGb=64)
     cfg = SimpleNamespace(template=tpl)

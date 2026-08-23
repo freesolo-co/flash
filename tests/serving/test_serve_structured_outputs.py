@@ -25,12 +25,12 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from flash.serving.src.engine_support import _require_reasoning_api_compatibility
-from flash.serving.src.model_config import reasoning_parser_for
-from flash.serving.src.registry import AdapterRegistry
-from flash.serving.src.responses import openai_generate_fields
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
-from flash.serving.src.streaming import openai_chat_stream
+from flash.serving.src.engine.support import _require_reasoning_api_compatibility
+from flash.serving.src.engine.model_config import reasoning_parser_for
+from flash.serving.src.store.registry import AdapterRegistry
+from flash.serving.src.io.responses import openai_generate_fields
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.streaming import openai_chat_stream
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}

@@ -19,8 +19,8 @@ from flash.core.spec import JobSpec
 from flash.runner import adapter_prefix, read_verified_adapter_revisions
 from flash.runner.results.checkpoints import checkpoint_adapter_prefix
 from flash.schema import parse_adapter_revision
-from flash.serve.deploy import ServingError
-from flash.server import app as _app
+from flash.serve.deployment.deploy import ServingError
+from flash.server.asgi import app as _app
 
 # defined here rather than in the route module because that one imports this one: the routes read
 # them back through their own namespace, so there is still exactly one definition.

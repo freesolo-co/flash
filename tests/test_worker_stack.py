@@ -652,7 +652,7 @@ def test_worker_exports_only_the_current_warmstart_adapter_surface(monkeypatch):
 def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
     import flash.engine.worker as worker
     from flash.core.spec import JobSpec
-    from flash.engine.worker.train import finalize
+    from flash.engine.worker.train.core.lifecycle import finalize
 
     captured = []
     monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(model_revision="refs/pr/123"))
@@ -683,7 +683,7 @@ def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
 
 def test_train_metadata_preserves_terminal_heartbeat_fields(monkeypatch):
     import flash.engine.worker as worker
-    from flash.engine.worker.train import finalize
+    from flash.engine.worker.train.core.lifecycle import finalize
 
     emitted = []
     finalized = []
@@ -1672,7 +1672,7 @@ def test_no_except_handler_supplies_a_fallback_gdn_hybrid():
     import ast
     import inspect as _inspect
 
-    from flash.engine.worker import opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import opd_train, rl_train, sft_train
 
     for module in (sft_train, opd_train, rl_train):
         tree = ast.parse(_inspect.getsource(module))
@@ -1702,7 +1702,7 @@ def test_each_path_resolves_the_gdn_arch_question_exactly_once():
     import ast
     import inspect as _inspect
 
-    from flash.engine.worker import opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import opd_train, rl_train, sft_train
 
     for module in (sft_train, opd_train, rl_train):
         tree = ast.parse(_inspect.getsource(module))
@@ -1731,12 +1731,12 @@ def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
     """
     import inspect as _inspect
 
-    from flash.engine.worker import opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import opd_train, rl_train, sft_train
 
     # grpo renders its run metadata in train.rl.verl_config and opd in train.opd.overrides, so
     # each trainer's source is its module plus wherever its notes are built.
-    from flash.engine.worker.train.opd import overrides as opd_overrides
-    from flash.engine.worker.train.rl import verl_config as rl_verl_config
+    from flash.engine.worker.train.opd.orchestration import overrides as opd_overrides
+    from flash.engine.worker.train.rl.launch import verl_config as rl_verl_config
 
     extra = {"rl_train": rl_verl_config, "opd_train": opd_overrides}
     for module in (sft_train, opd_train, rl_train):
@@ -1762,7 +1762,7 @@ def test_sft_remove_padding_is_ungated_tensor_layout():
     import ast
     import inspect as _inspect
 
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     tree = ast.parse(_inspect.getsource(sft_train))
     assigns = [
@@ -1801,7 +1801,7 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
     import inspect as _inspect
     import textwrap as _textwrap
 
-    from flash.engine.worker import backend_common, opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import backend_common, opd_train, rl_train, sft_train
 
     # the gate lives in one shared helper, so the assertions split: the helper must raise, and each
     # affected algorithm must route through it rather than re-deriving a decision of its own.

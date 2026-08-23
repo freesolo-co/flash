@@ -185,7 +185,7 @@ def test_ranking_sizing_and_quote_read_the_same_optimizer_batch_key():
     """
     from flash.core.catalog import optimizer_batch_key
     from flash.engine.plan.vram import model_required_vram_gb
-    from flash.providers.base import run_config_for_ranking
+    from flash.providers.core.base import run_config_for_ranking
 
     assert optimizer_batch_key("grpo") == "prompts_per_step"
     assert optimizer_batch_key("opd") == "prompts_per_step"

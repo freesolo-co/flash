@@ -11,7 +11,7 @@ import pytest
 
 from flash.core.catalog import resolve_model
 from flash.engine.plan.vram import estimate_vram_gb
-from flash.providers.base import get_gpu_info
+from flash.providers.core.base import get_gpu_info
 from flash.schema import ConfigError, spec_from_dict
 from tests._helpers.specs import raw_spec as _raw
 

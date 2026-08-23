@@ -22,7 +22,7 @@ import huggingface_hub
 import pytest
 
 import flash.engine.worker as worker
-from flash.engine.worker_entrypoint import WORKER_FAILURE_LINE
+from flash.engine.support.worker_entrypoint import WORKER_FAILURE_LINE
 
 
 class _HardExit(BaseException):

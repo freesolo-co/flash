@@ -7,12 +7,12 @@ from typing import Any
 import pytest
 from fastapi import Request
 
-from flash.serving.src import inference_routes
-from flash.serving.src.inference_routes import _discard_prepared_stream, _stream_chat_completion
-from flash.serving.src.routing import AdapterRouter
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
-from flash.serving.src.serving_io import _sse
-from flash.serving.src.streaming import openai_chat_stream, prepare_stream
+from flash.serving.src.http import inference_routes
+from flash.serving.src.http.inference_routes import _discard_prepared_stream, _stream_chat_completion
+from flash.serving.src.http.routing import AdapterRouter
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.serving_io import _sse
+from flash.serving.src.io.streaming import openai_chat_stream, prepare_stream
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 

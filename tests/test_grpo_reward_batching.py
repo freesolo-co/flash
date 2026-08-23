@@ -8,9 +8,9 @@ import time
 
 import pytest
 
-from flash.engine.worker import rl_train
+from flash.engine.worker.train.entry import rl_train
 from flash.engine.worker.runtime.pkg_proxy import W
-from flash.engine.worker.score_batcher import ScoreBatcher
+from flash.engine.worker.train.entry.score_batcher import ScoreBatcher
 from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
 

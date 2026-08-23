@@ -1,7 +1,7 @@
 import inspect
 
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
-from flash.engine.worker.rl_train import (
+from flash.engine.worker.train.entry.rl_train import (
     _ingest_step_metrics,
     _start_reward_runtime,
     run_rl_train,

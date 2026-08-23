@@ -42,12 +42,12 @@ class _CompletedAttemptPending(RuntimeError):
 
 def _canonical_provider_handle(handle):
     """Validate and canonicalize one complete provider-specific persisted handle."""
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
 
     data = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
     provider = data.get("provider")
     if provider == "runpod":
-        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+        from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
 
         return JobHandle.from_dict(RunpodJobHandle.from_dict(data).to_dict())
     if provider == "lambda":
@@ -69,8 +69,8 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
         data = canonical.to_dict()
         if canonical.provider != "runpod" or not data.get("job_id"):
             return None
-        from flash.providers.runpod import api as runpod_api
-        from flash.providers.runpod.jobs import TERMINAL_OK, decode_output
+        from flash.providers.runpod.client import api as runpod_api
+        from flash.providers.runpod.execution.jobs import TERMINAL_OK, decode_output
 
         # a status probe must fail fast: cap it at a short fresh timeout regardless of how far
         # the run wall deadline is. handing job_status the wall+grace deadline (which can be
@@ -158,8 +158,8 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
         if not job_id:
             return False
         try:
-            from flash.providers.runpod import api as runpod_api
-            from flash.providers.runpod.jobs import TERMINAL_FAIL, TERMINAL_OK
+            from flash.providers.runpod.client import api as runpod_api
+            from flash.providers.runpod.execution.jobs import TERMINAL_FAIL, TERMINAL_OK
 
             job = runpod_api.job_status(
                 data["endpoint_id"],
@@ -180,7 +180,7 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
 
 def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
     """Delete one exact RunPod endpoint without trusting the persisted handle's own metadata."""
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     endpoint_id = data.get("endpoint_id")
     if not isinstance(endpoint_id, str) or not endpoint_id:
@@ -309,12 +309,12 @@ def _completed_attempt_metrics(
     """Read a strict successful instance marker plus its run-scoped metrics."""
     if provider not in {"vast", "lambda"} or not spec.train.hf_repo:
         return None
-    from flash.providers._lifecycle.poll import make_say
-    from flash.providers._lifecycle.poll_instance import (
+    from flash.providers._lifecycle.instances.poll import make_say
+    from flash.providers._lifecycle.instances.poll_instance import (
         _TERMINAL_REREAD_RETRIES,
         _TERMINAL_REREAD_WAIT_S,
     )
-    from flash.providers._lifecycle.terminal_artifacts import (
+    from flash.providers._lifecycle.instances.terminal_artifacts import (
         INVALID_MARKER_DETAIL,
         AttemptIdentity,
         ProbeBudget,
@@ -451,7 +451,7 @@ def _candidate_usable_vram_gb(candidate) -> float:
     can launch fewer ranks than it rents; the allocator stamps that run-specific width, while an
     unstamped candidate preserves the historical all-rented-cards behavior.
     """
-    from flash.providers.base import combined_vram_gb
+    from flash.providers.core.base import combined_vram_gb
 
     rented = int(getattr(candidate, "gpu_count", 1) or 1)
     executed = getattr(candidate, "executed_gpu_count", None)
@@ -506,7 +506,7 @@ def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
     from flash.runner import get_status
 
     try:
-        from flash.server.domain.checkpoints import register_checkpoints_best_effort
+        from flash.server.domain.registry.checkpoints import register_checkpoints_best_effort
 
         register_checkpoints_best_effort(get_status(spec.run_id), log=log)
     except Exception as exc:  # never let checkpoint bookkeeping disturb a run

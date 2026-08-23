@@ -9,7 +9,7 @@ import pytest
 
 
 def test_control_http_client_is_reused_and_all_clients_close(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     created = []
 
@@ -60,7 +60,7 @@ def test_control_http_client_is_reused_and_all_clients_close(monkeypatch):
 
 
 def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     created = []
 
@@ -143,7 +143,7 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
 
 
 def test_normal_chat_pool_cannot_starve_control_requests(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     created = []
     chat_started = threading.Event()
@@ -222,7 +222,7 @@ def test_normal_chat_pool_cannot_starve_control_requests(monkeypatch):
 
 
 def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     revision = "run-1@final." + "a" * 40
     subfolder = "sft/run-1/seed0/adapter"
@@ -264,7 +264,7 @@ def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
 
 
 def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, tmp_path):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     config_path = tmp_path / "adapter_config.json"
     config_path.write_text(json.dumps({"r": 32}), encoding="utf-8")
@@ -303,7 +303,7 @@ def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, 
 
 
 def test_adapter_preflight_config_failure_does_not_start_tensor_listing(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     tensor_started = False
 
@@ -333,14 +333,14 @@ def test_adapter_preflight_config_failure_does_not_start_tensor_listing(monkeypa
 
 
 def test_zero_retry_after_uses_positive_readiness_backoff(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0.5)
     assert deploy._readback_delay(0, "0") == 0.5
 
 
 def test_activation_reconciliation_keeps_reliability_delay(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     revision = "run-1@final." + "a" * 40
     previous = "run-1@final." + "b" * 40
@@ -373,7 +373,7 @@ def test_activation_reconciliation_keeps_reliability_delay(monkeypatch):
 
 
 def test_bounded_smoke_chat_uses_isolated_client(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     created = []
 

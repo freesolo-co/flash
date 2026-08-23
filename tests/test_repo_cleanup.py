@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 import pytest
 
 from flash.runner import _DEFAULT_ARTIFACT_NAMESPACE
-from flash.server.domain import repo_cleanup as rc
+from flash.server.domain.ops import repo_cleanup as rc
 
 # Real implementations captured before the offline conftest stub swaps in a no-op sweep.
 _REAL_DEPLOYED = rc.deployed_prefixes
@@ -140,7 +140,7 @@ def test_scan_workers_ignores_environment(value):
         [
             sys.executable,
             "-c",
-            "from flash.server.domain.repo_cleanup import _SCAN_WORKERS; print(_SCAN_WORKERS)",
+            "from flash.server.domain.ops.repo_cleanup import _SCAN_WORKERS; print(_SCAN_WORKERS)",
         ],
         env=env,
         check=True,
@@ -224,7 +224,7 @@ def test_private_opd_retry_markers_are_never_cleanup_targets(monkeypatch):
 
 def _serving(monkeypatch, records):
     """Point deployed_prefixes' serving call at a canned ``GET /adapters`` payload."""
-    from flash.serve import deploy as sd
+    from flash.serve.deployment import deploy as sd
 
     monkeypatch.setattr(sd, "serving_base_url", lambda: "https://serving.test")
     resp = types.SimpleNamespace(json=lambda: {"adapters": records})

@@ -28,7 +28,7 @@ _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 @pytest.fixture(autouse=True)
 def _stub_teacher_broker_transport(monkeypatch):
-    import flash.server.domain.teacher_broker as teacher_broker
+    import flash.server.domain.teacher.broker as teacher_broker
 
     monkeypatch.setattr(
         teacher_broker,
@@ -605,9 +605,9 @@ def test_next_attempt_cas_race_blocks_opd_reservation(monkeypatch, tmp_path):
 
 def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypatch, tmp_path):
     import flash.providers as providers
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.runner as runner
-    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -679,9 +679,9 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
 
 def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch, tmp_path):
     import flash.providers as providers
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.runner as runner
-    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
@@ -711,7 +711,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
             self.worker_envs = []
 
         def submit_run(self, _spec, _seed, *, attempt, on_handle, **kwargs):
-            from flash.providers._lifecycle.worker import build_worker_env
+            from flash.providers._lifecycle.net.worker import build_worker_env
 
             secrets = kwargs.get("runtime_secrets")
             self.runtime_secrets.append(secrets)
@@ -778,7 +778,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
 def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkeypatch, tmp_path):
     import flash.providers as providers
     import flash.runner as runner
-    from flash.providers.base import PollResult
+    from flash.providers.core.base import PollResult
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
@@ -875,7 +875,7 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
     A lost response cannot prove the commit failed, so the published marker must fail closed before
     another worker allocates a GPU.
     """
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.runner as runner
     from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
@@ -1125,7 +1125,7 @@ def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
     resume_world_size, survivor_indexes, headline
 ):
     """a pinned resume admits only candidates that execute at the checkpoint width."""
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise.seed_submission import _pinned_to_resume_width
 
     candidates = (
@@ -1163,7 +1163,7 @@ def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
 
 def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
     """a filtered rental reports the incompatible execution width, not its card count."""
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise.seed_submission import (
         _build_candidate_plan,
         _pinned_to_resume_width,
@@ -1209,7 +1209,7 @@ def test_retry_allocation_falls_back_for_unusable_executed_width(
     executed_present, executed_gpu_count, wrong_width
 ):
     """absent and malformed executed widths fall back to the rented card count."""
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise.seed_submission import _pinned_to_resume_width
 
     if executed_present:

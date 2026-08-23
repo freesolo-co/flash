@@ -21,7 +21,7 @@ class _FakeConfig:
 
 
 def test_apply_disk_gb_raises_disk():
-    from flash.providers.runpod.jobs import apply_disk_gb
+    from flash.providers.runpod.execution.jobs import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, 160)
@@ -30,7 +30,7 @@ def test_apply_disk_gb_raises_disk():
 
 def test_apply_disk_gb_never_shrinks():
     """Configs carry a historical disk_gb=60 default; it must not shrink the 64 default."""
-    from flash.providers.runpod.jobs import apply_disk_gb
+    from flash.providers.runpod.execution.jobs import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, 60)
@@ -38,7 +38,7 @@ def test_apply_disk_gb_never_shrinks():
 
 
 def test_apply_disk_gb_noops():
-    from flash.providers.runpod.jobs import apply_disk_gb
+    from flash.providers.runpod.execution.jobs import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, None)

@@ -32,7 +32,7 @@ import pytest
 
 import flash.engine.worker as W
 from flash.core.grpo import SUPPORTED_GRPO_GROUP_SIZES
-from flash.engine.worker import backend_common, rl_train, sft_train
+from flash.engine.worker.train.entry import backend_common, rl_train, sft_train
 from flash.engine.worker.entry import rl
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
 from flash.engine.worker.train.core.child import runtime as child_runtime
@@ -1538,8 +1538,8 @@ def test_grpo_launches_the_width_the_step_can_fill():
     """
     import inspect
 
-    from flash.engine.worker import rl_train_runner
-    from flash.engine.worker.train.rl import inputs as rl_inputs
+    from flash.engine.worker.train.entry import rl_train_runner
+    from flash.engine.worker.train.rl.launch import inputs as rl_inputs
 
     # one derivation, in the builder that assembles every other resolved grpo knob.
     resolver = inspect.getsource(rl_inputs._assemble_grpo_inputs)
@@ -1732,7 +1732,7 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
     """
     from flash.core.catalog import MODELS
     from flash.engine.plan.vram import colocate_kv_util
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.base import get_gpu_info
 
     info = MODELS["Qwen/Qwen3.5-4B"]
     want = colocate_kv_util(
@@ -1839,7 +1839,7 @@ def test_multigpu_gpu_mem_util_shards_only_weights_and_frees_the_observed_shortf
 def test_multigpu_gpu_mem_util_reserves_rank_local_lora_inside_vllm_without_reducing_kv():
     from flash.core.catalog import MODELS
     from flash.engine.plan.vram import _lora_weight_memory_gb, colocate_kv_util
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.base import get_gpu_info
 
     info = MODELS["Qwen/Qwen3.6-35B-A3B"]
     card_gb = float(get_gpu_info("B200").vram_gb)
@@ -1878,7 +1878,7 @@ def test_multigpu_gpu_mem_util_reserves_rank_local_lora_inside_vllm_without_redu
 def test_gpu_mem_util_preserves_current_budget_without_catalog_lora_shapes(monkeypatch):
     from flash.core.catalog import MODELS
     from flash.engine.plan.vram import _lora_weight_memory_gb, colocate_kv_util
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.base import get_gpu_info
 
     model_id = "test/shape-less-model"
     info = SimpleNamespace(
@@ -1974,7 +1974,7 @@ def test_gpu_mem_util_keeps_the_constant_where_the_model_does_not_apply(monkeypa
         == default
     )
     # any sizing exception keeps launch on the prior constant rather than making sizing fatal.
-    monkeypatch.setattr("flash.providers.base.get_gpu_info", lambda _gpu_type: 1 / 0)
+    monkeypatch.setattr("flash.providers.core.base.get_gpu_info", lambda _gpu_type: 1 / 0)
     assert (
         rl_train.resolve_gpu_mem_util(
             _mem_util_inp(), gpu_type="H100", n_gpus=2, fp8_kv=False, sleep_unsupported=False
@@ -2547,7 +2547,7 @@ def test_build_verl_overrides_kl_on_when_requested():
 
 def test_verl_uses_canonical_heartbeat_stage_contracts():
     from flash.engine.worker.io.heartbeat import _HB_THROTTLED_STAGES
-    from flash.providers._lifecycle.poll import STEP_GATED_STAGES
+    from flash.providers._lifecycle.instances.poll import STEP_GATED_STAGES
     from flash.runner import _TRAINING_STAGES
 
     src = inspect.getsource(rl_train.run_rl_train)
@@ -4158,7 +4158,7 @@ def test_resume_uploader_uploads_each_completed_step(tmp_path):
     seen = []
     uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0)
 
-    import flash.engine.worker.rl_train as mod
+    import flash.engine.worker.train.entry.rl_train as mod
 
     original = mod._w.upload_resume_checkpoint
     mod._w.upload_resume_checkpoint = lambda step, path, **k: seen.append(int(step))
@@ -4182,7 +4182,7 @@ def test_resume_uploader_skips_the_step_it_resumed_from(tmp_path):
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     seen = []
-    import flash.engine.worker.rl_train as mod
+    import flash.engine.worker.train.entry.rl_train as mod
 
     original = mod._w.upload_resume_checkpoint
     mod._w.upload_resume_checkpoint = lambda step, path, **k: seen.append(int(step))
@@ -4201,7 +4201,7 @@ def test_resume_uploader_never_fails_the_run_on_an_upload_error(tmp_path):
     # the policy is still trained and published; a failed resume upload only costs restart distance.
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
-    import flash.engine.worker.rl_train as mod
+    import flash.engine.worker.train.entry.rl_train as mod
 
     def boom(step, path, **k):
         raise RuntimeError("hf is down")
@@ -4883,7 +4883,7 @@ def _identity_summary(identities):
 
 
 def test_successful_child_validation_publishes_exact_rollout_identity_evidence_in_notes():
-    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+    from flash.engine.worker.train.rl.rollout.identity import RolloutIdentityLedger
 
     ledger = RolloutIdentityLedger(1, 2)
     expected = [
@@ -4933,7 +4933,7 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
 
 
 def test_already_complete_resume_finalizes_empty_rollout_identity_evidence():
-    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+    from flash.engine.worker.train.rl.rollout.identity import RolloutIdentityLedger
 
     state = rl_train._StepMetricState()
     runtime = SimpleNamespace(identity_ledger=RolloutIdentityLedger(1, 2))
@@ -5301,7 +5301,7 @@ def test_multimodal_prompts_carry_descriptors_and_rendered_text(monkeypatch):
 
 
 def test_top_level_record_image_reaches_actor_and_environment_prompts():
-    from flash.engine.worker.train.rl import inputs as rl_inputs
+    from flash.engine.worker.train.rl.launch import inputs as rl_inputs
 
     prompts = rl_inputs._build_grpo_prompts(
         [{"image": _capability_image_uri()}],
@@ -5674,7 +5674,7 @@ class _BridgeEnv:
 
     def new_rollout_state(self, example, prepared_prompt):
         # `messages` starts as a copy of `prompt` and turns are appended onto it, matching
-        # flash.envs.adapter.new_rollout_state. anything reading the transcript has to account
+        # flash.envs.loading.adapter.new_rollout_state. anything reading the transcript has to account
         # for that seeding rather than treating `messages` as turns-only.
         prompt = [dict(message) for message in prepared_prompt]
         state: dict = {
@@ -5698,7 +5698,7 @@ class _BridgeEnv:
         return len(self.recorded) >= self.done_after
 
     def rollout_rewards_many(self, items):
-        from flash.envs.base import RolloutReward
+        from flash.envs.loading.base import RolloutReward
 
         self.scored.extend(state for _, state in items)
         return [RolloutReward(episode=self.episode, turns=None) for _ in items]
@@ -5884,7 +5884,7 @@ def test_bridge_authentication_joins_consecutive_text_blocks_like_the_chat_templ
 
 
 def test_bridge_authentication_rejects_changed_text_after_text_block_concatenation():
-    from flash.engine.worker.train.rl.multi_turn import _BadRequest
+    from flash.engine.worker.train.rl.rollout.multi_turn import _BadRequest
 
     bridge = _bridge(
         _BridgeEnv(),
@@ -5915,7 +5915,7 @@ def test_bridge_authentication_rejects_changed_text_after_text_block_concatenati
 
 
 def test_bridge_authentication_rejects_image_placement_and_media_digest_sabotage():
-    from flash.engine.worker.train.rl.multi_turn import (
+    from flash.engine.worker.train.rl.rollout.multi_turn import (
         _authentication_prompts_equal,
         _BadRequest,
     )
@@ -6024,7 +6024,7 @@ def test_bridge_authentication_rejects_image_placement_and_media_digest_sabotage
 
 
 def test_image_observation_prompt_without_initial_images_authenticates_through_verl_row():
-    from flash.engine.worker.train.rl import inputs as rl_inputs
+    from flash.engine.worker.train.rl.launch import inputs as rl_inputs
 
     class _ImageObservationEnv(_BridgeEnv):
         image_observations = True
@@ -6190,7 +6190,7 @@ def test_bridge_rejects_a_fifth_image_before_processor_glue_or_another_generatio
 
 
 def test_bridge_rejects_prefix_and_media_sabotage_before_recording_the_turn():
-    from flash.engine.worker.train.rl.multi_turn import _BadRequest
+    from flash.engine.worker.train.rl.rollout.multi_turn import _BadRequest
 
     env = _BridgeEnv(done_after=99)
     tokenizer = _BridgeGlueTokenizer()
@@ -6666,7 +6666,7 @@ def test_concurrently_finished_episodes_are_scored_in_one_env_call():
             self.batch_sizes: list[int] = []
 
         def rollout_rewards_many(self, items):
-            from flash.envs.base import RolloutReward
+            from flash.envs.loading.base import RolloutReward
 
             self.batch_sizes.append(len(items))
             return [RolloutReward(episode=1.0, turns=None) for _ in items]
@@ -6710,7 +6710,7 @@ def test_a_batched_score_reaches_the_env_under_the_same_lock_every_other_call_ta
             self.held_during_scoring: list[bool] = []
 
         def rollout_rewards_many(self, items):
-            from flash.envs.base import RolloutReward
+            from flash.envs.loading.base import RolloutReward
 
             acquired = bridge._lock.acquire(blocking=False)
             self.held_during_scoring.append(not acquired)
@@ -8013,7 +8013,7 @@ def test_multi_turn_bridge_returns_turns_only_under_per_turn_credit():
             return {"prompt": list(prepared_prompt), "messages": list(prepared_prompt)}
 
         def rollout_rewards_many(self, items):
-            from flash.envs.base import RolloutReward
+            from flash.envs.loading.base import RolloutReward
 
             return [RolloutReward(episode=1.0, turns=(0.25, 0.75)) for _ in items]
 
@@ -8039,7 +8039,7 @@ def test_multi_turn_bridge_sends_no_turns_when_the_env_vector_is_unusable():
             return {"prompt": list(prepared_prompt), "messages": list(prepared_prompt)}
 
         def rollout_rewards_many(self, items):
-            from flash.envs.base import RolloutReward
+            from flash.envs.loading.base import RolloutReward
 
             # one reward for two turns: the validator rejects the count and drops to None.
             return [RolloutReward(episode=1.0, turns=(0.5,)) for _ in items]
@@ -8252,13 +8252,13 @@ class _SpanEnv:
         return [{"role": "user", "content": "next"}]
 
     def rollout_rewards_many(self, items):
-        from flash.envs.base import RolloutReward
+        from flash.envs.loading.base import RolloutReward
 
         return [RolloutReward(episode=1.0, turns=tuple(0.5 for _ in self.recorded)) for _ in items]
 
 
 def test_multi_turn_child_preserves_exact_identity_through_start_and_score(monkeypatch):
-    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+    from flash.engine.worker.train.rl.rollout.identity import RolloutIdentityLedger
 
     ledger = RolloutIdentityLedger(1, 2)
     ledger.register(
@@ -8540,7 +8540,7 @@ def test_the_verl_child_allowlist_keeps_the_kernel_choice_but_drops_credentials(
     """The grpo child still needs the FLA_ kernel backend the parent picked (on sm100 FLA_TILELANG=0
     is a correctness floor, not a preference), so the allowlist must carry it while excluding the
     credentials. This pins both halves of that split for the path grpo now shares with sft/opd."""
-    from flash.engine.worker.sft_train import _build_verl_child_env
+    from flash.engine.worker.train.entry.sft_train import _build_verl_child_env
 
     keep = {"FLA_TILELANG": "0", "CUDA_VISIBLE_DEVICES": "0", "HF_HOME": "/cache/hf"}
     drop = {"HF_TOKEN": "hub-secret", "GITHUB_TOKEN": "gh-secret", "RUNPOD_API_KEY": "prov-secret"}
@@ -8675,7 +8675,7 @@ def test_grpo_finalization_carries_the_completed_step():
     assert step_arg.id == "steps_run"
 
     # finalize only forwards a positive int, so a stepless spelling would silently no-op.
-    from flash.engine.worker.train import finalize
+    from flash.engine.worker.train.core.lifecycle import finalize
 
     forwarding = inspect.getsource(finalize.write_train_meta)
     assert '"step": int(step)' in forwarding
@@ -9222,7 +9222,7 @@ def test_resumed_grpo_ignores_the_replayed_resume_step_bounds():
     requires exactly `resume_step + 1 .. horizon`. Admitting the replayed line therefore reports
     the resume step as an `extra` step and fails a healthy resumed run at its terminal verdict.
     """
-    from flash.engine.worker import rl_train_runner
+    from flash.engine.worker.train.entry import rl_train_runner
 
     state = rl_train._StepMetricState()
     state.resume_step = 2
@@ -9261,12 +9261,12 @@ def test_resumed_grpo_seeds_the_dump_watermark_at_the_resume_boundary():
     `RolloutIdentityLedger.seal` raises "has no registered rollout identity set" and kills a
     resumed run at its first output line.
     """
-    from flash.engine.worker import rl_train_runner
+    from flash.engine.worker.train.entry import rl_train_runner
 
     source = " ".join(inspect.getsource(rl_train_runner._execute_rl_child).split())
     assert "if resume_step: last_dump_step[0] = resume_step" in source
 
-    from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
+    from flash.engine.worker.train.rl.rollout.identity import RolloutIdentityLedger
 
     # the ledger a resumed run builds: registration starts after the resume boundary.
     ledger = RolloutIdentityLedger(1, 2)

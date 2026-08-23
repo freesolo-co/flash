@@ -2,7 +2,7 @@
 
 `JobSpec` is read through four different contracts -- authored config, public representation,
 persisted recovery record, and resolved worker payload -- and `_preparation_digest`
-(flash/runner/preparation.py) sha256-hashes the canonical JSON of two of them. That makes their
+(flash/runner/lifecycle/preparation.py) sha256-hashes the canonical JSON of two of them. That makes their
 serialized bytes a recovery contract rather than an implementation detail: a refactor that changes
 which KEYS `to_dict()` or `to_internal_dict()` emit invalidates the stored digest of every
 warm-start and workload-profile run in flight, and those runs then fail integrity validation on

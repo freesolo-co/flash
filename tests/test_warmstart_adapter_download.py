@@ -280,7 +280,7 @@ def test_snapshot_success_but_adapter_never_complete_raises_retriable(monkeypatc
 
 def _warmstart_guard_call(monkeypatch, tmp_path, *, rank, alpha, expected_rank, expected_alpha):
     """Drive the real sft/opd warm-start guard against an on-disk adapter config."""
-    import flash.engine.worker.sft_train as sft_train
+    import flash.engine.worker.train.entry.sft_train as sft_train
 
     adapter_dir = tmp_path / "src-adapter"
     adapter_dir.mkdir()

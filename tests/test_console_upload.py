@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from flash.providers._lifecycle import bootstrap_console as console
+from flash.providers._lifecycle.bootstrapping import console as console
 
 
 def test_console_progress_classifies_complete_lines_and_tracks_observed_eof(tmp_path):

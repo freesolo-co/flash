@@ -237,7 +237,7 @@ def test_freesolo_floor_is_in_lockstep():
     floor is the one that actually governs, so a lower floor there means a run can resolve an SDK
     the env package would have rejected.
     """
-    from flash.envs.base import FREESOLO_WORKER_SPEC
+    from flash.envs.loading.base import FREESOLO_WORKER_SPEC
 
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
     docker_fs = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "freesolo"]
@@ -296,7 +296,7 @@ def test_print_baked_arches_cli_exits_before_fingerprint_work(tmp_path):
 
 
 def test_baked_arch_workflows_match_canonical_source():
-    from flash.providers._lifecycle.worker import BAKED_PER_SM_ARCHES
+    from flash.providers._lifecycle.net.worker import BAKED_PER_SM_ARCHES
 
     worker_source = (ROOT / "flash" / "providers" / "_lifecycle" / "worker.py").read_text()
     source_arches = kf.parse_baked_per_sm_arches(worker_source)

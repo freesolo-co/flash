@@ -353,7 +353,7 @@ def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:
     monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.setattr(runtime_secrets, "resolve_hf_token", lambda *a, **k: "hf_x")
     monkeypatch.setattr(
-        "flash.cli.commands.deploy._hf_identity_and_write_access", lambda *_: "acme"
+        "flash.cli.commands.ops.deploy._hf_identity_and_write_access", lambda *_: "acme"
     )
     monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _ExportClient())
 
@@ -672,7 +672,7 @@ def test_a_repeated_short_root_flag_is_recognized_under_every_parse_optional_sha
     parse loop reads this same value: reshaping it parser-wide fails inside argparse and would
     prove nothing about our handling.
     """
-    from flash.cli.errors import _is_repeated_root_short_option
+    from flash.cli.parsing.errors import _is_repeated_root_short_option
 
     root = argparse.ArgumentParser()
     root.add_argument("-v", action="count")

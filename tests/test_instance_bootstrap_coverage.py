@@ -23,8 +23,8 @@ import types
 
 import pytest
 
-from flash.providers._lifecycle import bootstrap as b
-from flash.providers._lifecycle.deadline import deadline_kwargs
+from flash.providers._lifecycle.bootstrapping import bootstrap as b
+from flash.providers._lifecycle.net.deadline import deadline_kwargs
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 SOURCE_SNAPSHOT = valid_source_snapshot()
@@ -2444,7 +2444,7 @@ def test_read_console_tail_drops_a_single_unterminated_line(tmp_path, monkeypatc
     configured secret then removes a prefix sized for THAT secret and leaves a long fragment of the
     runtime one, which full-value redaction can never match. The empty tail never leaked.
     """
-    from flash.providers._lifecycle import bootstrap_secrets
+    from flash.providers._lifecycle.bootstrapping import secrets as bootstrap_secrets
 
     for name in [key for key in b.os.environ if bootstrap_secrets._secret_env_name(key)]:
         monkeypatch.delenv(name, raising=False)

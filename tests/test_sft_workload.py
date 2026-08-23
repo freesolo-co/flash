@@ -1273,7 +1273,7 @@ def test_a_cap_landing_on_the_answer_separator_does_not_report_lost_reasoning(ca
 
 def test_reasoning_sampled_without_an_opening_tag_still_counts_as_authored(capsys) -> None:
     """``reasoned</think>answer`` is reasoning: the PROMPT supplied the opening tag, and
-    ``flash/serve/thinking.py`` recognises the same shape. Requiring a balanced pair leaves such a
+    ``flash/serve/request/thinking.py`` recognises the same shape. Requiring a balanced pair leaves such a
     turn out of the authored denominator entirely, so an early turn the template strips goes
     unreported.
     """

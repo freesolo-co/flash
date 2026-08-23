@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import flash.server.routes.serving as serving
-from flash.serve.deploy import ServingError
+from flash.serve.deployment.deploy import ServingError
 
 
 class _Connection:

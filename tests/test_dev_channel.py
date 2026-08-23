@@ -33,7 +33,7 @@ def test_checked_in_source_is_prod_channel():
     # The functional defaults everything reads from.
     assert config.DEFAULT_API_URL == "https://flash.freesolo.co"
 
-    from flash.serve import deploy
+    from flash.serve.deployment import deploy
 
     assert deploy.DEFAULT_FREESOLO_SERVING_URL == "https://serve.freesolo.co"
 
@@ -53,7 +53,7 @@ def test_default_serving_url_follows_channel():
     posts a dev `org_id` into the prod database and takes a 23503 foreign-key violation -- which
     reads as a serving outage but is a routing defect, and which no retry can clear.
     """
-    from flash.serve.deploy import (
+    from flash.serve.deployment.deploy import (
         DEV_FREESOLO_SERVING_URL,
         PROD_FREESOLO_SERVING_URL,
         default_serving_url,
@@ -70,7 +70,7 @@ def test_every_hosted_default_flips_with_the_channel():
     """Build the dev channel for real and assert NO hosted default is left pointing at prod.
 
     This is the regression that was missing. `serve.freesolo.co` sat hardcoded in
-    `flash/serve/deploy.py` while `client/config.py` derived its URL from CHANNEL, so the dev
+    `flash/serve/deployment/deploy.py` while `client/config.py` derived its URL from CHANNEL, so the dev
     package shipped a prod serving endpoint and every dev deploy failed the prod org_id FK.
     Each half was internally consistent, so nothing was red -- the same shape as the earlier
     catalog drift between the flash and serving rank limits.
@@ -91,12 +91,12 @@ def test_every_hosted_default_flips_with_the_channel():
     assert dev_channel == "dev"
 
     from flash.client.config import default_api_url
-    from flash.serve.deploy import default_serving_url
+    from flash.serve.deployment.deploy import default_serving_url
 
     # Every channel-derived default, evaluated as the built dev package would.
     dev_defaults = {
         "control plane (flash.client.config.default_api_url)": default_api_url(dev_channel),
-        "serving plane (flash.serve.deploy.default_serving_url)": default_serving_url(dev_channel),
+        "serving plane (flash.serve.deployment.deploy.default_serving_url)": default_serving_url(dev_channel),
     }
     assert dev_defaults, "no hosted defaults collected -- the scan would pass vacuously"
 
@@ -108,7 +108,7 @@ def test_every_hosted_default_flips_with_the_channel():
         + "; ".join(f"{name} -> {url}" for name, url in sorted(leaked.items()))
         + ". Each hosted plane is backed by its own Supabase project, so a dev client hitting a "
         "prod endpoint fails the org_id foreign key. Give the constant a prod/dev pair that "
-        "derives from CHANNEL, as flash.client.config and flash.serve.deploy both do."
+        "derives from CHANNEL, as flash.client.config and flash.serve.deployment.deploy both do."
     )
 
 
@@ -256,8 +256,8 @@ def test_scaffolded_files_follow_flash_cli_invocation(tmp_path, monkeypatch):
     from unittest import mock
 
     from flash._internal import channel
-    from flash.cli.commands.env import retained as retained_module
-    from flash.cli.commands.env import setup as setup_module
+    from flash.cli.commands.env.ops import retained as retained_module
+    from flash.cli.commands.env.ops import setup as setup_module
 
     project = "11111111-1111-4111-8111-111111111111"
     original_argv = list(sys.argv)

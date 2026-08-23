@@ -4,7 +4,7 @@ Skipped unless `--serving-url` names one:
         --conformance-repo acme/artifacts \\
         --conformance-subfolder sft/run-abc/adapter \\
         --conformance-base-model Qwen/Qwen3.5-4B
-Every assertion here mirrors something `flash/serve/deploy.py` genuinely checks, so a backend that
+Every assertion here mirrors something `flash/serve/deployment/deploy.py` genuinely checks, so a backend that
 passes works with `flash models deploy` / `chat` / `undeploy` unchanged. Where the client accepts
 two shapes (a bare record or `{"adapter": ...}`), so does this suite -- it tests the contract, not
 one implementation of it.
@@ -221,7 +221,7 @@ def _activate(http, revision: str, expected: str | None):
 
 
 def test_the_per_request_cap_still_matches_the_client():
-    from flash.serve import deploy
+    from flash.serve.deployment import deploy
 
     source = inspect.getsource(deploy._serving_request)
     found = re.findall(r"min\((\d+(?:\.\d+)?),", source)
@@ -230,7 +230,7 @@ def test_the_per_request_cap_still_matches_the_client():
 
 
 def test_the_readiness_backoff_still_matches_the_client():
-    from flash.serve import deploy
+    from flash.serve.deployment import deploy
 
     source = Path(deploy.__file__).read_text()
     shipped = {}
@@ -251,7 +251,7 @@ def test_the_readiness_backoff_still_matches_the_client():
 
 
 def test_the_readiness_backoff_is_driven_through_the_same_attempt_sequence(monkeypatch):
-    from flash.serve import deploy
+    from flash.serve.deployment import deploy
 
     class _Response:
         status_code = 404

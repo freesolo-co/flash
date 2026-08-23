@@ -12,7 +12,7 @@ from typing import ClassVar
 
 import pytest
 
-import flash.serve.deploy as deploy
+import flash.serve.deployment.deploy as deploy
 from flash.client.http import ClientError
 
 

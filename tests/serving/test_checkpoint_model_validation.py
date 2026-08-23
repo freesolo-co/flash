@@ -6,8 +6,8 @@ import pytest
 from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.http.router import AdapterRouter, build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 INTERNAL_KEY = "fs-internal"

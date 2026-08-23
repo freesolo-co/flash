@@ -311,7 +311,7 @@ def test_authoring_still_rejects_every_legacy_shape(prompts_per_step, group_size
 
 @pytest.mark.parametrize("group_size", SUPPORTED_GRPO_GROUP_SIZES)
 def test_supported_authored_groups_reach_allocation(group_size):
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
 
     spec = spec_from_dict(
         _public_grpo_train(prompts_per_step=4, group_size=group_size),
@@ -339,7 +339,7 @@ def test_supported_authored_groups_reach_allocation(group_size):
     ],
 )
 def test_persisted_legacy_shapes_reach_allocation(prompts_per_step, group_size):
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
 
     spec = JobSpec.from_dict(
         _internal_grpo_train(
@@ -385,7 +385,7 @@ def test_non_grpo_jobspec_behavior_is_unchanged(algorithm, prompts_per_step, gro
 
 def test_grpo_worker_env_reasserts_managed_native_thread_policy(monkeypatch):
     from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(
         algorithm="grpo",
@@ -401,7 +401,7 @@ def test_grpo_worker_env_reasserts_managed_native_thread_policy(monkeypatch):
 
 def test_grpo_child_env_reasserts_native_thread_policy_last(monkeypatch):
     from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
     hostile = dict.fromkeys(GRPO_NATIVE_THREAD_ENV, "999")
     monkeypatch.setattr(rl_train, "_build_verl_child_env", lambda **_kwargs: dict(hostile))
@@ -420,7 +420,7 @@ def test_grpo_child_env_reasserts_native_thread_policy_last(monkeypatch):
 
 def test_sft_worker_env_does_not_gain_grpo_native_policy():
     from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(
         algorithm="sft",
@@ -450,7 +450,7 @@ def test_training_guide_describes_authored_admission_and_retained_execution_clam
 def test_persisted_legacy_shapes_reach_worker_option_resolution(
     monkeypatch, prompts_per_step, group_size
 ):
-    from flash.engine.worker.train.rl import inputs
+    from flash.engine.worker.train.rl.launch import inputs
 
     spec = JobSpec.from_dict(
         _internal_grpo_train(prompts_per_step=prompts_per_step, group_size=group_size)
@@ -471,7 +471,7 @@ def test_persisted_legacy_shapes_reach_worker_option_resolution(
 
 @pytest.mark.parametrize("group_size", SUPPORTED_GRPO_GROUP_SIZES)
 def test_supported_shapes_reach_worker_option_resolution_exactly(monkeypatch, group_size):
-    from flash.engine.worker.train.rl import inputs
+    from flash.engine.worker.train.rl.launch import inputs
 
     spec = spec_from_dict(_public_grpo_train(prompts_per_step=4, group_size=group_size))
     monkeypatch.setattr(

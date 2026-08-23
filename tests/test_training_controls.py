@@ -295,7 +295,7 @@ def test_upload_failure_cause_reaches_the_rendered_run_log():
     The formatter emits a fixed list of numeric metric keys, so a stage whose entire content is an
     explanation rather than a measurement committed the cause and printed `stage=... step=50` alone.
     """
-    from flash.providers._lifecycle.poll import _format_heartbeat
+    from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
     line = _format_heartbeat(
         {
@@ -323,7 +323,7 @@ def test_a_failure_cause_cannot_rewrite_the_log_it_is_printed_in():
     raw would let a `\\x1b[2J` clear the screen or a `\\r` overwrite the line the user is reading
     the failure in -- and the failure report is exactly when the log has to stay legible.
     """
-    from flash.providers._lifecycle.poll import _format_heartbeat
+    from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
     line = _format_heartbeat(
         {
@@ -344,7 +344,7 @@ def test_a_failure_cause_cannot_rewrite_the_log_it_is_printed_in():
 
 def test_a_heartbeat_without_a_failure_cause_is_unchanged():
     """The failure fields are additive: an ordinary step line must not grow an empty `error=`."""
-    from flash.providers._lifecycle.poll import _format_heartbeat
+    from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
     line = _format_heartbeat(
         {"stage": "sft_step", "step": 12, "error": "   ", "checkpoint_failure": {}}
@@ -447,7 +447,7 @@ def test_worker_seed_prefers_jobspec_when_present():
 
 
 def test_provider_worker_env_emits_authoritative_spec_seed():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(model="model", seed=987)
     assert build_worker_env(spec, 987)["SEED"] == "987"
@@ -483,7 +483,7 @@ def test_grpo_under_ran_only_fails_a_genuine_under_run():
     import inspect
     import textwrap
 
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
     compares = [
@@ -522,7 +522,7 @@ def test_from_dict_rejects_misspelled_train_key():
 
 
 def test_runtime_secret_cannot_override_control_plane_seed():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     # a directly-constructed spec can declare a seed env secret (the toml schema rejects it, but
     # json/direct construction does not). the built worker env must still hold the canonical seed.
@@ -532,7 +532,7 @@ def test_runtime_secret_cannot_override_control_plane_seed():
 
 
 def test_provider_worker_env_carries_control_plane_resume_revision():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
     from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
     spec = JobSpec(model="m", algorithm="opd", seed=987)

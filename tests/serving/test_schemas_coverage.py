@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from flash.serving.src.schemas import (
+from flash.serving.src.io.schemas import (
     AdapterRecord,
     GenerateRequest,
     ImmutableRevisionMetadata,

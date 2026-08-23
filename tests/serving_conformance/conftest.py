@@ -84,7 +84,7 @@ def adapter_source(request) -> dict:
 
 @pytest.fixture(scope="session")
 def ready_timeout(request, adapter_source) -> float:
-    from flash.serve.deploy import revision_ready_budget_seconds
+    from flash.serve.deployment.deploy import revision_ready_budget_seconds
 
     override = request.config.getoption("--conformance-ready-timeout")
     if override is not None:

@@ -36,7 +36,7 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
 
-    import flash.providers.runpod.auth as runpod_keys
+    import flash.providers.runpod.client.auth as runpod_keys
     import flash.runner as runner
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
@@ -48,8 +48,8 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
 
     import flash.providers as providers_mod
-    import flash.server.app as app_mod
-    import flash.server.domain.run_registry as run_registry
+    import flash.server.asgi.app as app_mod
+    import flash.server.domain.registry.run_registry as run_registry
 
     importlib.reload(app_mod)
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
@@ -62,7 +62,7 @@ def api(tmp_path, monkeypatch):
 
 
 def test_download_env_package_endpoint_returns_package(api, monkeypatch):
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.envs as envs_mod
 
     seen: dict = {}
 
@@ -84,7 +84,7 @@ def test_download_env_package_endpoint_returns_package(api, monkeypatch):
 
 
 def test_download_env_package_endpoint_rejects_non_canonical_id(api, monkeypatch):
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.envs as envs_mod
 
     monkeypatch.setattr(
         envs_mod, "download_package", lambda **_k: pytest.fail("storage must not be touched")

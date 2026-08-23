@@ -24,12 +24,12 @@ from typing import TypeVar
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.artifacts import attempt_scoped_artifact_name
-from flash.providers._lifecycle.deadline import (
+from flash.providers._lifecycle.net.deadline import (
     deadline_kwargs,
     remaining_seconds,
     require_deadline_at,
 )
-from flash.providers._lifecycle.poll import _attempt_int
+from flash.providers._lifecycle.instances.poll import _attempt_int
 from flash.teacher.retry_contract import (
     decode_opd_optimizer_start_json,
     opd_checkpoint_world_size,

@@ -16,7 +16,7 @@ from flash.core.spec import (
     CreditAssignment,
     WandbSpec,
 )
-from flash.envs.adapter import is_freesolo_environment_id
+from flash.envs.loading.adapter import is_freesolo_environment_id
 
 
 def _section_int(

@@ -37,26 +37,26 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
-from flash.cli.commands.env.eval import (
+from flash.cli.commands.env.testing.eval import (
     _MAX_CONCURRENCY,
     bounded_concurrency,
     cmd_env_eval,
     finite_float,
     positive_int,
 )
-from flash.cli.commands.env.list import cmd_env_list
-from flash.cli.commands.env.push import cmd_env_delete, cmd_env_pull, cmd_env_push
-from flash.cli.commands.env.setup import cmd_env_setup
-from flash.cli.commands.env.test import cmd_env_test
-from flash.cli.commands.traces import (
+from flash.cli.commands.env.ops.list import cmd_env_list
+from flash.cli.commands.env.ops.push import cmd_env_delete, cmd_env_pull, cmd_env_push
+from flash.cli.commands.env.ops.setup import cmd_env_setup
+from flash.cli.commands.env.testing.test import cmd_env_test
+from flash.cli.commands.ops.traces import (
     DEFAULT_EXPORT_PATH,
     EXPORT_FORMATS,
     RAW_EXPORT_PATH,
     RECORDS_FORMAT,
     cmd_traces_export,
 )
-from flash.cli.errors import friendly_error
-from flash.cli.serve_parser import _add_serve_commands
+from flash.cli.parsing.errors import friendly_error
+from flash.cli.parsing.serve_parser import _add_serve_commands
 from flash.cli.ui import render
 from flash.client.config import shadowed_login_warning
 from flash.core.catalog import ALGORITHMS

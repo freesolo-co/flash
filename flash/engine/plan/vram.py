@@ -329,7 +329,7 @@ def _rollout_kv_floor_gb(
         preserve_legacy_floor=preserve_legacy_floor,
         lora_rank=lora_rank,
     )
-    from flash.providers.base import max_non_fp8_kv_vram_gb
+    from flash.providers.core.base import max_non_fp8_kv_vram_gb
 
     if _declares_linear_attention(model_info, model_id):
         return floor
@@ -706,7 +706,7 @@ def _opd_fp8_adjust(
     model_info=None,
 ) -> int:
     """Re-size an OPD requirement with fp8 KV on modern cards when sufficient."""
-    from flash.providers.base import max_non_fp8_kv_vram_gb
+    from flash.providers.core.base import max_non_fp8_kv_vram_gb
 
     # a gdn hybrid keeps the bf16 reservation only while its engine sleeps. once the catalog pins
     # it resident the worker sends fp8 (rollout_fp8_kv), so sizing must price the same cache or it

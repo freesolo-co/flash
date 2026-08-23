@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-import flash.envs.loader as loader
-import flash.server.domain.envs as domain
+import flash.envs.loading.loader as loader
+import flash.server.domain.registry.envs as domain
 
 
 def _tree(*entries: dict, truncated: bool = False) -> dict:

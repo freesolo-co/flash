@@ -199,6 +199,6 @@ def _reject_image_completion(
 
 def run_sft():
     """Run SFT. verl is the only backend; this module keeps the dataset helpers it shares."""
-    from flash.engine.worker.sft_train import run_sft_train
+    from flash.engine.worker.train.entry.sft_train import run_sft_train
 
     run_sft_train()

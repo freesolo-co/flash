@@ -172,7 +172,7 @@ def test_gkd_coverage_never_exceeds_100pct_with_in_span_zero_width_token():
 # student tokenization: the loss trains the SAMPLED ids (not a re-tokenization of decoded text)
 # --------------------------------------------------------------------------------------------------
 def test_student_tokens_use_sampled_ids_with_offsets_into_completion_text():
-    from flash.engine.worker.train.opd.gkd import student_tokens_with_offsets
+    from flash.engine.worker.train.opd.orchestration.gkd import student_tokens_with_offsets
 
     class _Tok:
         def decode(self, ids, skip_special_tokens=True):
@@ -193,7 +193,7 @@ def test_student_tokens_share_span_for_split_multibyte_char():
     independently gave one id the whole char and the other a ZERO-WIDTH span — dropping a real
     byte-token from the alignment and undercounting the char's student logprob. Both byte-ids must
     share the completed-char span so neither is dropped."""
-    from flash.engine.worker.train.opd.gkd import student_tokens_with_offsets
+    from flash.engine.worker.train.opd.orchestration.gkd import student_tokens_with_offsets
 
     class _Tok:
         def decode(self, ids, skip_special_tokens=True):
@@ -229,7 +229,7 @@ def test_student_tokens_do_not_over_merge_a_genuine_replacement_char():
     LEGITIMATELY decodes to the replacement glyph (the model actually emitted U+FFFD as content). Such
     a token is already reflected in completion_text, so decode(prefix) is a prefix of it — the loop
     must stop and keep it as its own span instead of swallowing the following token."""
-    from flash.engine.worker.train.opd.gkd import student_tokens_with_offsets
+    from flash.engine.worker.train.opd.orchestration.gkd import student_tokens_with_offsets
 
     class _Tok:
         def decode(self, ids, skip_special_tokens=True):
@@ -248,7 +248,7 @@ def test_student_tokens_offsets_decode_is_not_quadratic():
     """Regression (opd.py): offsets must be built by decoding a SMALL window per step, not
     the whole growing prefix ids[:i+1] (which was O(len^2) and dominated CPU on long completions).
     Assert the longest id-slice handed to tok.decode stays bounded regardless of completion length."""
-    from flash.engine.worker.train.opd.gkd import student_tokens_with_offsets
+    from flash.engine.worker.train.opd.orchestration.gkd import student_tokens_with_offsets
 
     class _Tok:
         def __init__(self):
@@ -273,7 +273,7 @@ def test_student_tokens_offsets_decode_is_not_quadratic():
 
 
 def test_trim_trailing_stop_drops_delimiter_from_ids_and_text():
-    from flash.engine.worker.train.opd.gkd import _trim_trailing_stop
+    from flash.engine.worker.train.opd.orchestration.gkd import _trim_trailing_stop
 
     class _Tok:
         def decode(self, ids, skip_special_tokens=True):
@@ -293,7 +293,7 @@ def test_trim_trailing_stop_keeps_ids_and_text_synced_when_stop_starts_inside_to
     (that token decodes to "B</answer>"), the whole token is dropped from the kept ids — so returning
     completion_text[:keep_len] would keep a "B" the ids can no longer represent, desyncing the
     teacher-scored text from the student ids. The returned text must equal decode(kept ids)."""
-    from flash.engine.worker.train.opd.gkd import _trim_trailing_stop
+    from flash.engine.worker.train.opd.orchestration.gkd import _trim_trailing_stop
 
     class _Tok:
         def decode(self, ids, skip_special_tokens=True):
@@ -312,7 +312,7 @@ def test_trim_trailing_stop_prefers_longest_overlapping_stop():
     r"""Regression (opd.py:150): with overlapping delimiters like ["\n", "\n\n"] listed
     shortest-first, a "\n\n" tail must have BOTH newlines trimmed (the longest/earliest matching stop),
     not just the first-listed "\n" — otherwise the teacher still scores a leftover delimiter newline."""
-    from flash.engine.worker.train.opd.gkd import _trim_trailing_stop
+    from flash.engine.worker.train.opd.orchestration.gkd import _trim_trailing_stop
 
     class _Tok:
         def decode(self, ids, skip_special_tokens=True):
@@ -333,7 +333,7 @@ def test_stop_detection_and_trim_handle_special_token_delimiter():
     delimiter — _rollout_terminated would misclassify the rollout as truncated and _trim_trailing_stop
     would never remove it, skipping every usable sample for that config. Detection/trim must run on the
     special-tokens-INCLUDED decode."""
-    from flash.engine.worker.train.opd.gkd import _rollout_terminated, _trim_trailing_stop
+    from flash.engine.worker.train.opd.orchestration.gkd import _rollout_terminated, _trim_trailing_stop
 
     IM_END = 9  # a special token; renders to "<|im_end|>" ONLY when specials are kept
 
@@ -362,7 +362,7 @@ def test_trim_trailing_stop_scans_from_end_not_quadratically():
     the dropped tail), not decode every growing prefix ids[:1..n] — which was O(completion^2) and could
     dominate CPU before teacher scoring once [train].max_completion_tokens is raised. Assert decode is called only
     a bounded number of times, independent of completion length."""
-    from flash.engine.worker.train.opd.gkd import _trim_trailing_stop
+    from flash.engine.worker.train.opd.orchestration.gkd import _trim_trailing_stop
 
     class _Tok:
         def __init__(self):
@@ -392,7 +392,7 @@ def test_rollout_terminated_requires_eos_or_stop_not_length():
     stop_sequences) the decoded text ends with a stop delimiter. A max_new_tokens cap hit OR a
     gen_cfg.max_time cut ends without either and is a partial mid-output fragment OPD must skip (it
     can't supervise the stop token). Length is NOT the criterion."""
-    from flash.engine.worker.train.opd.gkd import _rollout_terminated
+    from flash.engine.worker.train.opd.orchestration.gkd import _rollout_terminated
 
     EOS = frozenset({99})
     # EOS in the ids -> terminated (HF appends EOS when it stops on it), regardless of length.
@@ -413,7 +413,7 @@ def test_rollout_terminated_requires_eos_or_stop_not_length():
 
 def test_generation_eos_ids_unions_tokenizer_and_model_text_config():
     """every tokenizer, generation, top-level, and decoder text-config eos remains a halt id."""
-    from flash.engine.worker.train.opd.gkd import _generation_eos_ids
+    from flash.engine.worker.train.opd.orchestration.gkd import _generation_eos_ids
 
     nested_config = SimpleNamespace(eos_token_id=248044)
     text_config_calls = []
@@ -442,7 +442,7 @@ def test_generation_eos_ids_unions_tokenizer_and_model_text_config():
 
 
 def test_generation_eos_ids_ignores_malformed_or_missing_nested_values():
-    from flash.engine.worker.train.opd.gkd import _generation_eos_ids
+    from flash.engine.worker.train.opd.orchestration.gkd import _generation_eos_ids
 
     class _BrokenSupportedAccess:
         text_config = SimpleNamespace(eos_token_id=[248044, "248045", True, None])
@@ -617,7 +617,7 @@ def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
     # asserting only on the helper would pass if the caller moved it after the probe.
     import inspect
 
-    from flash.engine.worker.opd_train import _validate_multimodal_opd, run_opd_train
+    from flash.engine.worker.train.entry.opd_train import _validate_multimodal_opd, run_opd_train
 
     caller = inspect.getsource(run_opd_train)
     assert caller.index("_validate_multimodal_opd(") < caller.index("_probe_gpu_in_subprocess(")
@@ -667,7 +667,7 @@ def test_opd_filtering_stage_is_setup_not_training():
     """Regression (_poll.py): opd_filtering_prompts emits REAL progress heartbeats, so
     is_training_heartbeat would classify it as TRAINING (the tight, sticky stall window) mid-setup
     unless it's registered as a setup stage. It must be treated as cold-start setup."""
-    from flash.providers._lifecycle.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+    from flash.providers._lifecycle.instances.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
 
     assert "opd_filtering_prompts" in SETUP_HEARTBEAT_STAGES
     assert is_training_heartbeat("opd_filtering_prompts", 0) is False
@@ -682,7 +682,7 @@ def test_opd_preprocessing_stages_are_setup_on_the_provider_side():
     stages carry a progress callback, so is_training_heartbeat classified a run that was still
     preprocessing as TRAINING and judged it by the tight (sticky) stall window instead of the
     cold-start grace -- a large split is torn down as "stalled" before its first step."""
-    from flash.providers._lifecycle.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+    from flash.providers._lifecycle.instances.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
 
     for stage in ("opd_prompt_scan", "opd_image_prep"):
         assert stage in SETUP_HEARTBEAT_STAGES
@@ -743,7 +743,7 @@ def test_opd_teacher_prompt_includes_thinking_prefill():
     block (e.g. <think>) AFTER the generation prompt and samples its completion after it. The teacher
     must condition on that SAME trailing prefill; the plain 'Assistant: ' prompt (empty prefill) would
     score every thinking-mode logprob against a prefix that never opened the block."""
-    from flash.engine.worker.train.opd import gkd as opd_gkd
+    from flash.engine.worker.train.opd.orchestration import gkd as opd_gkd
 
     msgs = [{"role": "user", "content": "hi"}]
     # default (thinking off / no prefill) -> ends at the plain generation boundary.
@@ -759,7 +759,7 @@ def test_teacher_prompt_text_reads_content_blocks_rather_than_their_repr():
     teacher a python repr ("[{'type': 'text', 'text': 'hi'}]") and score that literal. It does not
     raise, so only an assertion on the rendered text catches it.
     """
-    from flash.engine.worker.train.opd import gkd as opd_gkd
+    from flash.engine.worker.train.opd.orchestration import gkd as opd_gkd
 
     blocks = [{"role": "user", "content": [{"type": "text", "text": "describe it"}]}]
     rendered = opd_gkd._teacher_prompt_text(blocks)
@@ -878,7 +878,7 @@ def test_student_tokens_absorb_dropped_leading_space_sentencepiece():
     following offset, misassigning teacher spans to the wrong sampled ids. Offsets must be anchored to
     completion_text so the dropped space is absorbed into the token's start and spans stay contiguous
     and exact."""
-    from flash.engine.worker.train.opd.gkd import student_tokens_with_offsets
+    from flash.engine.worker.train.opd.orchestration.gkd import student_tokens_with_offsets
 
     class _SPTok:  # decode of token 11 in isolation drops the leading space (SentencePiece behavior)
         def decode(self, ids, skip_special_tokens=True):
@@ -1084,8 +1084,8 @@ def test_opd_35b_full_context_group1_is_rejected_because_it_only_fits_under_fp8(
 
     from flash.core.catalog import MODELS, vocab_size_for
     from flash.engine.plan.vram import estimate_vram_gb, model_required_vram_gb
-    from flash.providers.allocator import vram_headroom
-    from flash.providers.base import GPU_INFO, UnsupportedGpuError, cheapest_gpu
+    from flash.providers.core.allocator import vram_headroom
+    from flash.providers.core.base import GPU_INFO, UnsupportedGpuError, cheapest_gpu
 
     moe = "Qwen/Qwen3.6-35B-A3B"
     info = MODELS[moe]
@@ -1124,7 +1124,7 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
     smaller OPD run that fits the 80 GB A100 (sm80, no fp8) must keep its bf16 KV sizing and its A100
     route — never dropping onto a card that would not actually use fp8 (and would then OOM)."""
     from flash.engine.plan.vram import model_required_vram_gb
-    from flash.providers.base import (
+    from flash.providers.core.base import (
         _FP8_KV_MIN_CAPABILITY,
         _sm_capability,
         cheapest_gpu,
@@ -1158,7 +1158,7 @@ def test_gdn_fp8_exclusion_survives_a_pinned_revision():
         estimate_vram_gb,
         model_required_vram_gb,
     )
-    from flash.providers.allocator import vram_headroom
+    from flash.providers.core.allocator import vram_headroom
 
     # the guard itself, at the exact input the pinned path hands it.
     assert _declares_linear_attention(None, "Qwen/Qwen3.6-35B-A3B")
@@ -1250,7 +1250,7 @@ def test_opd_sizing_prices_fp8_for_a_resident_gdn_engine():
     from flash.engine.plan import vram as vram_module
     from flash.engine.plan.vram import _rollout_stays_resident, model_required_vram_gb
     from flash.engine.worker.verl.capabilities import rollout_fp8_kv
-    from flash.providers.allocator import vram_headroom
+    from flash.providers.core.allocator import vram_headroom
 
     hr = vram_headroom()
     train = {
@@ -1292,7 +1292,7 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
     """
     import inspect
 
-    from flash.engine.worker import opd_train
+    from flash.engine.worker.train.entry import opd_train
 
     src = inspect.getsource(opd_train.run_opd_train)
     assert "model_is_gdn_hybrid(model_id, revision=model_revision)" in src
@@ -1398,7 +1398,7 @@ def test_opd_oversized_reject_names_the_knobs_to_shrink(monkeypatch):
     """When even the biggest GPU can't hold an OPD run, the reject must be actionable: it names that
     OPD is resident-only (trainer + colocated vLLM student = two weight copies + rollout KV) and the
     knobs that shrink it, not the opaque 'no GPU that big' message the raw cheapest_gpu emits."""
-    from flash.providers.base import UnsupportedGpuError, provisional_gpu
+    from flash.providers.core.base import UnsupportedGpuError, provisional_gpu
 
     train = {
         "max_context_tokens": 4096,
@@ -1421,7 +1421,7 @@ def test_opd_oversized_reject_names_the_knobs_to_shrink(monkeypatch):
 
 def test_opd_oversized_reject_reports_the_rentable_odd_ceiling(monkeypatch):
     """A ceiling of 5-7 buys four cards, so the diagnostic must never claim a fictitious shape."""
-    from flash.providers.base import UnsupportedGpuError, provisional_gpu
+    from flash.providers.core.base import UnsupportedGpuError, provisional_gpu
 
     monkeypatch.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 700)
     with pytest.raises(UnsupportedGpuError) as exc:
@@ -1771,7 +1771,7 @@ def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
     fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     import flash.engine.worker.teacher.client as teacher_mod
-    from flash.engine.worker import opd_train as opd_mod
+    from flash.engine.worker.train.entry import opd_train as opd_mod
 
     env = SimpleNamespace(
         is_tool_env=False,

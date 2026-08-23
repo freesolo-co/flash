@@ -282,13 +282,13 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 # so it registers nothing, and inside the ``flash`` package so the image's
 # ``add_local_python_source("flash")`` ships it to the remote container under the same import path
 # it has here), re-exported so ``_build_engine`` can subclass it.
-from flash.serving.src.lora_engine import _LoraEngineImpl  # noqa: E402
+from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
 
 # ---- One Modal LoraEngine class per GPU tier -----------------------------------------------------
 # model_config is a pure-stdlib module (no heavy deps), so importing it at module scope is safe for
 # `modal deploy` (which imports modal_app.py locally) — unlike the vllm/transformers imports, which
 # stay lazy inside the engine methods.
-from flash.serving.src.model_config import base_models, engine_overrides_for, gpu_for  # noqa: E402
+from flash.serving.src.engine.model_config import base_models, engine_overrides_for, gpu_for  # noqa: E402
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
@@ -710,8 +710,8 @@ def _base_model_records() -> list:
     records are never persisted and never org-owned; ``serve_base_model`` marks them so the engine
     generates against the base weights (lora_request=None) and the router serves them openly.
     """
-    from flash.serving.src.model_config import base_models
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.engine.model_config import base_models
+    from flash.serving.src.io.schemas import AdapterRecord
 
     return [
         AdapterRecord(
@@ -740,10 +740,10 @@ def _base_model_records() -> list:
     custom_domains=[SERVING_CUSTOM_DOMAIN] if SERVING_CUSTOM_DOMAIN else None,
 )
 def router():
-    from flash.serving.src import settings as cfg
-    from flash.serving.src.persistence import get_adapter, load_adapters
-    from flash.serving.src.router import AdapterRouter, build_serving_app
-    from flash.serving.src.settings import Settings
+    from flash.serving.src.store import settings as cfg
+    from flash.serving.src.store.persistence import get_adapter, load_adapters
+    from flash.serving.src.http.router import AdapterRouter, build_serving_app
+    from flash.serving.src.store.settings import Settings
 
     settings = Settings()
     # Seed the base-model records alongside the persisted LoRA adapters so every base model is
@@ -777,7 +777,7 @@ def start_all(base_model: str | None = None) -> None:
     matching base model. This manual diagnostic can boot one model with ``--base-model`` or every
     catalog model without changing the scale-to-zero deployment.
     """
-    from flash.serving.src.model_config import base_models, gpu_for
+    from flash.serving.src.engine.model_config import base_models, gpu_for
 
     started = {}
     failures: list[str] = []

@@ -120,7 +120,7 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
                 _run_job_inner(spec, log_path, runtime_secrets=runtime_secrets)
                 break
             except Exception as exc:
-                from flash.envs.staged import StagedEnvironmentTransientError
+                from flash.envs.loading.staged import StagedEnvironmentTransientError
                 from flash.runner import _load_run_deadline_at
 
                 if not isinstance(exc, StagedEnvironmentTransientError):
@@ -226,7 +226,7 @@ def _terminal_failure_detail(exc: BaseException) -> str:
     plane-side credential indistinguishable from a bad spec, since both surfaced as a bare
     `RuntimeError: run failed`.
     """
-    from flash.server.domain.teacher_broker import TeacherBrokerConfigurationError
+    from flash.server.domain.teacher.broker import TeacherBrokerConfigurationError
 
     if isinstance(exc, TeacherBrokerConfigurationError):
         return f"{type(exc).__name__}: {exc}"
@@ -265,7 +265,7 @@ def _run_job_inner(
     except _RunCancelled:
         return  # cancel_run already set the terminal state
     except Exception as exc:
-        from flash.envs.staged import StagedEnvironmentTransientError
+        from flash.envs.loading.staged import StagedEnvironmentTransientError
 
         if isinstance(exc, StagedEnvironmentTransientError):
             raise
@@ -303,7 +303,7 @@ def _run_training(
     )
 
     if spec.algorithm == "opd":
-        from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+        from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
 
         preflight_validate_managed_teacher(spec)
     status = get_status(spec.run_id)

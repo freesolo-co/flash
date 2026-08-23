@@ -14,7 +14,7 @@ import pytest
 
 
 def test_checkpoint_export_saves_complete_processor_sidecars(monkeypatch, tmp_path):
-    from flash.engine.worker.train.sft import checkpoints
+    from flash.engine.worker.train.sft.setup import checkpoints
 
     actor_dir = tmp_path / "actor"
     actor_dir.mkdir()
@@ -55,7 +55,7 @@ def test_checkpoint_export_saves_complete_processor_sidecars(monkeypatch, tmp_pa
 
 
 def test_multimodal_checkpoint_export_passes_explicit_modality_marker(monkeypatch, tmp_path):
-    from flash.engine.worker.train.sft import checkpoints
+    from flash.engine.worker.train.sft.setup import checkpoints
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 
     actor_dir = tmp_path / "actor"
@@ -90,7 +90,7 @@ def test_multimodal_checkpoint_export_passes_explicit_modality_marker(monkeypatc
 
 
 def test_text_checkpoint_export_does_not_invent_processor_sidecars(monkeypatch, tmp_path):
-    from flash.engine.worker.train.sft import checkpoints
+    from flash.engine.worker.train.sft.setup import checkpoints
 
     actor_dir = tmp_path / "actor"
     actor_dir.mkdir()
@@ -221,14 +221,14 @@ def test_chained_disk_evidence_wins_over_an_outer_nondisk_oserror(monkeypatch, a
 
 def _watcher_boundary(kind: str):
     if kind == "sft":
-        from flash.engine.worker.train.sft.checkpoints import _VerlCheckpointWatcher
+        from flash.engine.worker.train.sft.setup.checkpoints import _VerlCheckpointWatcher
 
         return (
             object.__new__(_VerlCheckpointWatcher),
             "raise_if_failed",
             "verl checkpoint watcher failed",
         )
-    from flash.engine.worker.train.rl.checkpoints import _VerlResumeUploader
+    from flash.engine.worker.train.rl.launch.checkpoints import _VerlResumeUploader
 
     return object.__new__(_VerlResumeUploader), "raise_if_incomplete", "verl resume uploader failed"
 
@@ -455,7 +455,7 @@ def test_export_moves_adapter_files_and_cleans_merge_tree(monkeypatch, actor_dir
 
 
 def test_merger_uses_the_shared_streaming_supervisor(monkeypatch):
-    from flash.engine.worker import backend_common
+    from flash.engine.worker.train.entry import backend_common
     from flash.engine.worker.verl import checkpoints
 
     seen = {}
@@ -478,7 +478,7 @@ def test_merger_uses_the_shared_streaming_supervisor(monkeypatch):
 def test_short_write_marker_survives_the_merger_subprocess_boundary(
     monkeypatch, actor_dir, tmp_path
 ):
-    from flash.engine.worker import backend_common
+    from flash.engine.worker.train.entry import backend_common
     from flash.engine.worker.verl import checkpoints
 
     free = {"value": 1 << 40}
@@ -506,7 +506,7 @@ def test_short_write_marker_survives_the_merger_subprocess_boundary(
 def test_direct_disk_marker_replaces_an_earlier_short_write_marker(
     monkeypatch, actor_dir, tmp_path
 ):
-    from flash.engine.worker import backend_common
+    from flash.engine.worker.train.entry import backend_common
     from flash.engine.worker.verl import checkpoints
 
     def supervise(cmd, *, env, on_line, errors):
@@ -530,7 +530,7 @@ def test_direct_disk_marker_replaces_an_earlier_short_write_marker(
 
 
 def test_merger_preserves_cancellation_identity(monkeypatch):
-    from flash.engine.worker import backend_common
+    from flash.engine.worker.train.entry import backend_common
     from flash.engine.worker.verl import checkpoints
 
     cancellation = SystemExit("cancelled")
@@ -565,7 +565,7 @@ def test_merger_preserves_invalid_output_first_disk_marker_and_exit_code(capsys)
 @pytest.mark.wallclock
 @_needs_process_teardown
 def test_merger_output_is_live_without_explicit_child_flush(monkeypatch, tmp_path):
-    from flash.engine.worker import backend_common
+    from flash.engine.worker.train.entry import backend_common
     from flash.engine.worker.verl import checkpoints
 
     gate = tmp_path / "continue"

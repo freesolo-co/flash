@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from functools import cache
 
-from flash.providers.base import Provider
+from flash.providers.core.base import Provider
 
 # registry order is not a primary selection preference. it affects only exact full-key allocation
 # ties through Python's stable sort.

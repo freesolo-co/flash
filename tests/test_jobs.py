@@ -67,7 +67,7 @@ def _runpod_handle_dict(
 
 
 def test_job_handle_roundtrip_and_rejects_legacy_shapes():
-    from flash.providers.runpod.jobs import JobHandle
+    from flash.providers.runpod.execution.jobs import JobHandle
 
     handle = JobHandle(
         "ep123",
@@ -107,8 +107,8 @@ def test_job_handle_roundtrip_and_rejects_legacy_shapes():
 
 
 def test_strict_teardown_uses_valid_runpod_owner_without_inventory(monkeypatch):
-    from flash.providers.base import JobHandle
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.core.base import JobHandle
+    from flash.providers.runpod.client import api as runpod_api
     from flash.runner.supervise import lifecycle
 
     fingerprint = "rpk-" + "a" * 64
@@ -160,8 +160,8 @@ def test_strict_teardown_uses_valid_runpod_owner_without_inventory(monkeypatch):
     ],
 )
 def test_strict_teardown_discovers_runpod_owner_for_invalid_fingerprint(monkeypatch, fingerprint):
-    from flash.providers.base import JobHandle
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.core.base import JobHandle
+    from flash.providers.runpod.client import api as runpod_api
     from flash.runner.supervise import lifecycle
 
     owner_fingerprint = "rpk-" + "b" * 64
@@ -212,8 +212,8 @@ def test_strict_teardown_keeps_runpod_record_when_no_configured_account_owns_it(
     cleanup record while an unreachable endpoint keeps billing. refuse instead, so the record
     survives for a drain that may have the owning key configured again.
     """
-    from flash.providers.base import JobHandle
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.core.base import JobHandle
+    from flash.providers.runpod.client import api as runpod_api
     from flash.runner.supervise import lifecycle
 
     handle = JobHandle.from_dict(
@@ -250,8 +250,8 @@ def test_strict_teardown_keeps_runpod_record_when_no_configured_account_owns_it(
 
 @pytest.mark.parametrize("mode", ["incomplete", "multiple-owners"])
 def test_strict_teardown_rejects_unconfirmed_runpod_owner_discovery(monkeypatch, mode):
-    from flash.providers.base import JobHandle
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.core.base import JobHandle
+    from flash.providers.runpod.client import api as runpod_api
     from flash.runner.supervise import lifecycle
 
     handle = JobHandle.from_dict(
@@ -296,14 +296,14 @@ def test_strict_teardown_rejects_unconfirmed_runpod_owner_discovery(monkeypatch,
 
 
 def test_decode_output_success():
-    from flash.providers.runpod.jobs import decode_output
+    from flash.providers.runpod.execution.jobs import decode_output
 
     metrics = {"trained_eval_acc": 0.9, "cost_usd": 0.5}
     assert decode_output(metrics) == metrics
 
 
 def test_decode_output_error_includes_stdout_tail():
-    from flash.providers.runpod.jobs import decode_output
+    from flash.providers.runpod.execution.jobs import decode_output
 
     stdout = "STDOUT-BEGIN\n" + ("x" * 5000) + "\nSTDOUT-END"
     with pytest.raises(RuntimeError) as ei:
@@ -317,7 +317,7 @@ def test_decode_output_error_includes_stdout_tail():
 def test_decode_output_client_mode_serverless_handler():
     """Baked-image path: the serverless rp_handler returns the metrics dict directly (RunPod
     surfaces it as job["output"]), with no Flash success/result envelope — return it as-is."""
-    from flash.providers.runpod.jobs import decode_output
+    from flash.providers.runpod.execution.jobs import decode_output
 
     metrics = {"trained_eval_acc": 0.87, "train_wall": 12.3, "cost_usd": 0.04}
     assert decode_output(metrics) == metrics
@@ -329,7 +329,7 @@ def test_decode_output_client_mode_serverless_handler():
 def test_decode_output_client_mode_error_includes_stdout_tail():
     """Client-mode failures must also carry the worker stdout tail (poll_job root-causes
     crashes from it) — same as the Flash envelope path."""
-    from flash.providers.runpod.jobs import decode_output
+    from flash.providers.runpod.execution.jobs import decode_output
 
     stdout = "STDOUT-BEGIN\n" + ("z" * 5000) + "\nSTDOUT-END"
     with pytest.raises(RuntimeError) as ei:
@@ -344,7 +344,7 @@ def test_decode_output_client_mode_error_includes_stdout_tail():
 def test_decode_output_error_redacts_credentials(monkeypatch):
     """The decoded error reaches the user-readable run log, so it is sanitized like the
     instance providers' failure details are."""
-    from flash.providers.runpod.jobs import decode_output
+    from flash.providers.runpod.execution.jobs import decode_output
 
     secret = "hf_ZZZdecodeoutputsecret0123456789"
     monkeypatch.setenv("HF_TOKEN", secret)
@@ -359,7 +359,7 @@ def test_decode_output_error_redacts_credentials(monkeypatch):
 def test_decode_output_tail_is_sanitized_before_the_bound(monkeypatch):
     """slicing the raw text first can cut a credential at the boundary, leaving a suffix that no
     longer value-matches; the complete text is sanitized before the tail is selected."""
-    from flash.providers.runpod.jobs import decode_output
+    from flash.providers.runpod.execution.jobs import decode_output
 
     secret = "hf_ZZZboundarystraddler0123456789abcdef"
     monkeypatch.setenv("HF_TOKEN", secret)
@@ -378,8 +378,8 @@ def test_decode_output_tail_is_sanitized_before_the_bound(monkeypatch):
 # poll_job state machine (mocked runpod_api)
 # ---------------------------------------------------------------------------
 def _poll(monkeypatch, statuses, heartbeats=None, stall_after_s=10.0):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     seq = iter(statuses)
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: next(seq))
@@ -412,8 +412,8 @@ def test_poll_job_completes(monkeypatch):
 
 
 def test_poll_job_surfaces_heartbeat_before_terminal_return(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     recorded = []
     heartbeat = {
@@ -424,7 +424,7 @@ def test_poll_job_surfaces_heartbeat_before_terminal_return(monkeypatch):
         "metrics_last": [{"step": 4, "reward": 0.75}],
     }
     forces = []
-    monkeypatch.setattr("flash.providers._lifecycle.poll._record_heartbeat", recorded.append)
+    monkeypatch.setattr("flash.providers._lifecycle.instances.poll._record_heartbeat", recorded.append)
     monkeypatch.setattr(jobs, "decode_output", lambda _output: {"acc": 1.0})
 
     monkeypatch.setattr(
@@ -449,7 +449,7 @@ def test_poll_job_surfaces_heartbeat_before_terminal_return(monkeypatch):
 
 
 def test_surface_heartbeat_logs_gpu_status(monkeypatch):
-    from flash.providers._lifecycle.poll import surface_heartbeat
+    from flash.providers._lifecycle.instances.poll import surface_heartbeat
 
     lines = []
     hb = {
@@ -471,7 +471,7 @@ def test_surface_heartbeat_logs_gpu_status(monkeypatch):
             "processes": [{"pid": 1234, "process_name": "/usr/bin/python", "used_memory_gb": 21.9}],
         },
     }
-    monkeypatch.setattr("flash.providers._lifecycle.poll._record_heartbeat", lambda _hb: None)
+    monkeypatch.setattr("flash.providers._lifecycle.instances.poll._record_heartbeat", lambda _hb: None)
 
     key, stage = surface_heartbeat(lambda: hb, None, lines.append)
 
@@ -500,8 +500,8 @@ def test_poll_job_failure(monkeypatch):
 def test_poll_job_failure_detail_redacts_secrets_in_provider_error_and_stdout(monkeypatch):
     """A control-plane secret echoed by the worker must not reach the run log (Vast/Lambda
     sanitize every part of their failure detail; RunPod has to match)."""
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     secret = "hf_ZZZterminaldetailsecret0123456789"
     monkeypatch.setenv("HF_TOKEN", secret)
@@ -531,8 +531,8 @@ def test_poll_job_failure_detail_redacts_secrets_in_provider_error_and_stdout(mo
 def test_poll_job_failure_surfaces_forced_heartbeat(monkeypatch):
     import io
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(
         runpod_api,
@@ -561,8 +561,8 @@ def test_poll_job_failure_surfaces_forced_heartbeat(monkeypatch):
 
 
 def test_poll_job_failure_appends_worker_artifacts(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     seq = iter(
         [
@@ -612,8 +612,8 @@ def test_poll_job_platform_preempt_maps_to_job_preempted(monkeypatch):
 
 
 def test_poll_job_platform_preempt_does_not_read_worker_artifacts(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(
         runpod_api,
@@ -637,8 +637,8 @@ def test_poll_job_platform_preempt_does_not_read_worker_artifacts(monkeypatch):
 
 
 def _poll_failed_with_heartbeat(monkeypatch, hb):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     # The heartbeat has to sit on the same timeline as the launch: `worker_flagged_retriable` only
     # honours a heartbeat stamped at or after the launch it claims to describe, so a fixed ts=2.0
@@ -672,7 +672,7 @@ def test_poll_job_failed_without_retriable_heartbeat_is_job_failed(monkeypatch):
 
 
 def test_worker_flagged_retriable_requires_exact_attempt_and_timestamp():
-    from flash.providers.runpod.jobs import worker_flagged_retriable
+    from flash.providers.runpod.execution.jobs import worker_flagged_retriable
 
     def reader(hb):
         return lambda force=False: hb
@@ -699,8 +699,8 @@ def test_poll_job_completed_decode_error_consults_worker_flags(monkeypatch):
     # COMPLETED but the output decodes as an error (a handler exception). An infra failure can
     # surface here too, so poll_job must consult the worker heartbeat -> job_preempted when the
     # worker stamped retriable, not silently drop it as a plain job_failed.
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
     # An output envelope that decode_output raises RuntimeError on (success False).
@@ -729,8 +729,8 @@ def test_poll_job_stall_detection(monkeypatch):
     # job stays IN_PROGRESS forever, heartbeat never advances -> stall
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -749,8 +749,8 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
     # setup_grace_s, so the runner's gpu-walk re-provisions on the next-best class.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
     # endpoint_health raises (the common real case for a brand-new endpoint with no workers): its
@@ -790,8 +790,8 @@ def test_no_capacity_detail_never_predicts_the_retry_disposition(monkeypatch):
     # exhausted-budget cases, so poll detail must claim neither a retry nor a class choice.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
     monkeypatch.setattr(
@@ -825,8 +825,8 @@ def _queued_forever(monkeypatch, health, *, step=20.0, queue_grace_s=900.0, log=
     """
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
     monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
@@ -870,8 +870,8 @@ def test_empty_workers_log_elapsed_capacity_grace_before_no_capacity(monkeypatch
 def test_unbounded_capacity_grace_keeps_throttled_worker_failure(monkeypatch):
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     statuses = iter(
         [
@@ -909,7 +909,7 @@ def test_unbounded_capacity_grace_keeps_throttled_worker_failure(monkeypatch):
 
 
 def test_four_card_last_gpu_log_names_only_scaled_capacity_grace(monkeypatch):
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     logs = io.StringIO()
     grace = jobs.stall_kwargs(on_last_gpu=True, gpu_count=4)["queue_grace_s"]
@@ -1015,7 +1015,7 @@ def test_capacity_timer_rearms_when_worker_health_stops_being_readable(monkeypat
     # observation is stamped and expires after WORKER_COMING_UP_TTL_S: one good reading buys a
     # bounded suppression, not a permanent one. Here the probe answers once and then fails
     # forever, so the capacity verdict must come back.
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     calls = {"n": 0}
 
@@ -1082,7 +1082,7 @@ def test_capacity_grace_scales_with_gpu_walk_position():
     # placed workers remain governed by the larger setup grace.
     import inspect
 
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     not_last = jobs.stall_kwargs()  # default on_last_gpu=False
     assert not_last["queue_grace_s"] == 300.0
@@ -1106,7 +1106,7 @@ def test_capacity_grace_scales_with_the_card_count():
     # the supervisor tears the endpoint down and re-requests the SAME class, paying a fresh cold
     # start to rejoin the queue it just left. Observed as 3-5 attempts and ~55 min of queueing per
     # arm before a single optimizer step, worst on the multi-GPU arms.
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     single = jobs.stall_kwargs(on_last_gpu=True, gpu_count=1)
     assert single["queue_grace_s"] == 900.0
@@ -1135,8 +1135,8 @@ def _queued_forever_scaled(monkeypatch, *, gpu_count, heartbeat_reader, workers=
     """Drive the REAL poll loop against a job that never leaves IN_QUEUE, on a scaled grace."""
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
     monkeypatch.setattr(
@@ -1181,8 +1181,8 @@ def _queued_until_worker_granted(monkeypatch, *, gpu_count, grant_at, workers=No
     """Poll a job that sits IN_QUEUE with no worker until ``grant_at``, then reports one placed."""
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     clock_now = {"t": 0.0}
 
@@ -1258,8 +1258,8 @@ def test_an_unhealthy_worker_counts_as_a_grant(monkeypatch):
     # Pristine `dev` reports `stalled` here, so this is a regression to avoid, not a change.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     flip = {"n": 0}
 
@@ -1297,8 +1297,8 @@ def test_one_flaky_job_status_does_not_prove_a_worker_grant(monkeypatch):
     # exactly this pattern.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     reads = {"n": 0}
 
@@ -1337,8 +1337,8 @@ def test_a_current_attempt_heartbeat_proves_a_grant_on_the_reattach_path(monkeyp
     # despite a heartbeat for THIS attempt proving a worker ran and wrote it.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
 
@@ -1385,8 +1385,8 @@ def test_a_liveness_ping_for_this_attempt_proves_a_grant(monkeypatch):
     # a 4-card shape here waited 4200s for the same wrong answer.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
 
@@ -1423,8 +1423,8 @@ def test_a_stale_attempt_liveness_ping_does_not_prove_a_grant(monkeypatch):
     # longer holds, so its ping says nothing about whether this one was ever granted a GPU.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda *a, **k: {"status": "IN_QUEUE"})
 
@@ -1464,8 +1464,8 @@ def test_a_requeued_job_that_already_ran_is_not_reported_as_no_capacity(monkeypa
     # reports `stalled` here, so this is a regression to avoid, not a behavior change.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     now = {"t": 0.0}
 
@@ -1523,8 +1523,8 @@ def test_a_worker_granted_then_lost_is_stalled_not_reported_as_no_capacity(monke
     # here, so this is a regression this PR must not introduce, not a behavior change.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     now = {"t": 0.0}
 
@@ -1567,8 +1567,8 @@ def test_flapping_health_cannot_rearm_the_cold_start_budget_forever(monkeypatch)
     # deadline. Latching the first grant bounds it at the setup grace instead.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     flip = {"n": 0}
 
@@ -1622,8 +1622,8 @@ def test_a_job_outside_the_queue_still_stalls_on_its_own_limit(monkeypatch):
     # stall timer generally would let a wedged trainer burn the whole run deadline.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(
@@ -1646,7 +1646,7 @@ def test_single_card_capacity_grace_is_unchanged_by_the_scaling():
     # The whole change must be invisible to 1x runs, which are the overwhelming majority: an
     # absent, unusable, or explicitly-single count all multiply by exactly 1. A default that
     # silently scaled would lengthen every single-card run's failover.
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     baseline = jobs.stall_kwargs(on_last_gpu=True)
     assert baseline["queue_grace_s"] == 900.0
@@ -1663,9 +1663,9 @@ def test_reattach_poll_reproduces_the_multi_card_capacity_grace(monkeypatch):
     # `allocated_gpu_count` off the remote before the handle ever reaches the provider, so sourcing
     # it there would silently read 1 and halve a 2x run's grace on every recovery.
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
     from flash.providers.runpod import PROVIDER
-    from flash.providers.runpod import jobs as jobs
+    from flash.providers.runpod.execution import jobs as jobs
 
     captured: dict = {}
 
@@ -1701,9 +1701,9 @@ def test_reattach_poll_reproduces_the_multi_card_capacity_grace(monkeypatch):
 
 def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
     from flash.providers.runpod import PROVIDER
-    from flash.providers.runpod import jobs as jobs
+    from flash.providers.runpod.execution import jobs as jobs
 
     captured: dict = {}
 
@@ -1747,8 +1747,8 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
 
 def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     spec = JobSpec(
         run_id="flash-source-snapshot",
@@ -1784,7 +1784,7 @@ def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
 
 def test_submit_run_rejects_malformed_source_before_deploy(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
     from flash.source_snapshot import SourceSnapshotError
 
     spec = JobSpec(
@@ -1819,8 +1819,8 @@ def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkey
     # spec this attempt is launching, which allocation may have resolved to FEWER cards than the
     # run's ceiling named, so the wait matches what was actually rented.
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     captured: dict = {}
     monkeypatch.setattr(
@@ -1858,8 +1858,9 @@ def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkey
 
 def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deletion(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs, serverless
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod import serverless
+from flash.providers.runpod.execution import jobs
 
     spec = JobSpec(
         run_id="runpod-submit-retryable",
@@ -1906,9 +1907,10 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
 @pytest.mark.parametrize("deletion_mode", ["false", "exception"])
 def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch, deletion_mode):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import UnreconciledCreateError
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs, serverless
+    from flash.providers.core.base import UnreconciledCreateError
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod import serverless
+from flash.providers.runpod.execution import jobs
 
     spec = JobSpec(
         run_id=f"runpod-submit-unreconciled-{deletion_mode}",
@@ -1963,9 +1965,10 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
     ],
 )
 def test_runpod_cancel_rejects_unconfirmed_acknowledgement(monkeypatch, response):
-    from flash.providers.base import JobHandle
-    from flash.providers.runpod import RunpodProvider, jobs
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.core.base import JobHandle
+    from flash.providers.runpod import RunpodProvider
+    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.client import api as runpod_api
 
     monkeypatch.setattr(runpod_api, "cancel_job", lambda _endpoint_id, _job_id, **_kw: response)
     handle = JobHandle.from_dict(
@@ -1982,9 +1985,10 @@ def test_runpod_cancel_rejects_unconfirmed_acknowledgement(monkeypatch, response
 
 
 def test_runpod_cancel_accepts_exact_cancelled_acknowledgement(monkeypatch):
-    from flash.providers.base import JobHandle
-    from flash.providers.runpod import RunpodProvider, jobs
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.core.base import JobHandle
+    from flash.providers.runpod import RunpodProvider
+    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.client import api as runpod_api
 
     calls = []
 
@@ -2009,9 +2013,10 @@ def test_runpod_cancel_accepts_exact_cancelled_acknowledgement(monkeypatch):
 
 def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import JobHandle, PollResult
-    from flash.providers.runpod import RunpodProvider, jobs
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.core.base import JobHandle, PollResult
+    from flash.providers.runpod import RunpodProvider
+    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.client import api as runpod_api
 
     spec = JobSpec(
         run_id="runpod-shared-deadline",
@@ -2056,8 +2061,8 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
 
 def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     spec = JobSpec(
         run_id="runpod-deadline-boundary",
@@ -2097,8 +2102,8 @@ def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch)
 def test_poll_job_in_queue_then_progress_does_not_false_stall(monkeypatch):
     # A job that leaves IN_QUEUE (a worker picks it up) must clear the queue timer: the later
     # IN_PROGRESS/COMPLETED path is governed by the heartbeat/setup windows, never by queue_grace_s.
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     ok = {"acc": 1.0}
     # A few IN_QUEUE polls, THEN IN_PROGRESS (a worker picked it up), then COMPLETED — exercising the
@@ -2130,8 +2135,8 @@ def test_poll_job_throttled_timer_resets_on_leaving_queue(monkeypatch):
     # measured from the re-queue, not the original arm. Otherwise the first re-queue probe fires
     # no_capacity instantly, defeating throttled_grace_s. Clock advances one tick per job_status poll.
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     ok = {"acc": 1.0}
     statuses = iter(
@@ -2181,8 +2186,8 @@ def test_poll_job_setup_grace_before_first_heartbeat(monkeypatch):
     # stall_after_s window — it waits for the larger setup_grace_s instead.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -2203,8 +2208,8 @@ def test_poll_job_tight_stall_after_first_heartbeat(monkeypatch):
     # stall_after_s window applies, not the big setup grace.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -2231,8 +2236,8 @@ def test_poll_job_ignores_prior_attempt_heartbeat_keeps_setup_grace(monkeypatch)
     # otherwise a healthy-but-slow retry cold start (image pull + big snapshot_download) false-stalls.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -2259,8 +2264,9 @@ def test_poll_job_ignores_prior_attempt_heartbeat_keeps_setup_grace(monkeypatch)
 def test_reattach_normalizes_persisted_attempt_once_for_failure_reader_and_poll(monkeypatch):
     import types
 
-    from flash.providers import base
-    from flash.providers.runpod import RunpodProvider, jobs
+    from flash.providers.core import base
+    from flash.providers.runpod import RunpodProvider
+    from flash.providers.runpod.execution import jobs
 
     captured = {}
 
@@ -2314,8 +2320,9 @@ def test_reattach_normalizes_persisted_attempt_once_for_failure_reader_and_poll(
 def test_reattach_rejects_explicit_malformed_persisted_attempt(monkeypatch, raw_attempt):
     import types
 
-    from flash.providers import base
-    from flash.providers.runpod import RunpodProvider, jobs
+    from flash.providers.core import base
+    from flash.providers.runpod import RunpodProvider
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(
         jobs,
@@ -2344,8 +2351,9 @@ def test_reattach_rejects_explicit_malformed_persisted_attempt(monkeypatch, raw_
 def test_reattach_rejects_endpoint_only_handle(monkeypatch):
     import types
 
-    from flash.providers import base
-    from flash.providers.runpod import RunpodProvider, jobs
+    from flash.providers.core import base
+    from flash.providers.runpod import RunpodProvider
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(
         jobs,
@@ -2375,8 +2383,8 @@ def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
     # tight training window — the slow model-load/vLLM-init still has to fit setup_grace_s.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -2400,8 +2408,8 @@ def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
 def test_poll_job_liveness_heartbeat_does_not_reset_progress(monkeypatch):
     # Liveness pings refresh visible status/logs, but they must not extend the provider's progress
     # clock. Otherwise a wedged setup thread could ping "alive" forever and mask the stall.
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -2440,8 +2448,8 @@ def test_poll_job_liveness_heartbeat_does_not_reset_progress(monkeypatch):
 def test_poll_job_stale_late_heartbeat_does_not_reset_progress(monkeypatch):
     # an older heartbeat may land after a newer upload was skipped. only an advancing timestamp may
     # reset the stall window; stale content changes are no-ops.
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -2488,9 +2496,9 @@ def test_older_heartbeat_cannot_regress_status_progress_anchor(
     # a queue exemption or status transition can advance the shared progress anchor beyond the
     # worker timestamp. a heartbeat that becomes visible later may still advance heartbeat-specific
     # bookkeeping, but neither credit branch may move the stall anchor backward.
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
-    job_execution = sys.modules["flash.providers.runpod.job_execution"]
+    job_execution = sys.modules["flash.providers.runpod.execution.job_execution"]
     heartbeat_key = ("boot", None, 100.0, 0)
     monkeypatch.setattr(
         job_execution,
@@ -2529,8 +2537,8 @@ def _stall_clock_at_giveup(
     delayed reattach. The handle rejects a non-positive launch, so the clock starts high rather than
     the launch going negative.
     """
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -2612,8 +2620,8 @@ def test_a_heartbeat_from_a_prior_attempt_buys_this_attempt_no_progress(monkeypa
     # prior-attempt heartbeat must do neither, leaving the wider setup window running from launch.
     # Asserting "stale lasts longer" therefore proves the heartbeat was ignored end to end; the
     # reverse ordering would mean prior-attempt evidence had been credited.
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     def _giveup_with(hb_attempt):
         monkeypatch.setattr(
@@ -2654,8 +2662,8 @@ def test_poll_job_gapfill_step0_does_not_tighten(monkeypatch):
     # started — it must keep the larger setup grace, not switch to the tight training window.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -2696,8 +2704,8 @@ def test_poll_job_malformed_step_does_not_crash(monkeypatch):
     # same bounded integer helper; an invalid step stays setup-classified and must not raise.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -2722,8 +2730,8 @@ def test_poll_job_malformed_step_does_not_crash(monkeypatch):
 def test_poll_job_older_attempt_heartbeat_does_not_reset_progress(monkeypatch):
     # attempts share one heartbeat path. a newer timestamp from an older attempt is still stale and
     # must not reset the current attempt's stall window.
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -2769,8 +2777,8 @@ def test_poll_job_fast_fails_on_stuck_unhealthy_worker(monkeypatch):
     # endpoint. Regression guard for the multi-hour "waited on a dead worker" failure.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
     monkeypatch.setattr(
@@ -2801,8 +2809,8 @@ def test_poll_job_transient_unhealthy_then_recovers_does_not_fail(monkeypatch):
     # fast-fail (it resets once a usable/initializing worker appears) — only a STUCK unhealthy does.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     statuses = iter(
         [
@@ -2850,8 +2858,8 @@ def test_poll_job_fast_fails_on_stuck_throttled_worker(monkeypatch):
     # GPU. Regression guard for the observed "stuck queued for the whole wall-clock" failure.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     # poll_job is a pure function of its args (throttled_grace_s is passed below), so no env setup.
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
@@ -2886,8 +2894,8 @@ def test_poll_job_transient_throttled_then_recovers_does_not_fail(monkeypatch):
     # fast-fail (it resets once a usable worker appears) — only a STUCK throttle does.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     statuses = iter(
         [
@@ -2933,7 +2941,7 @@ def test_failure_detail_reader_is_attempt_scoped(monkeypatch, tmp_path):
     error_artifact_name), so a retry can't surface a prior attempt's stale traceback as the crash."""
     import huggingface_hub
 
-    from flash.providers.runpod.jobs import make_hf_failure_detail_reader
+    from flash.providers.runpod.execution.jobs import make_hf_failure_detail_reader
 
     requested: list[str] = []
     err_file = tmp_path / "err.txt"
@@ -3011,8 +3019,8 @@ def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
     # setup_grace must NOT silently slow stall detection — stay on stall_after_s.
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_PROGRESS"})
     monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
@@ -3030,8 +3038,8 @@ def test_poll_job_no_reader_keeps_tight_window(monkeypatch):
 
 
 def test_poll_job_tolerates_transient_api_errors(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     ok = {"acc": 0.7}
     calls = {"n": 0}
@@ -3059,7 +3067,7 @@ def _fresh_orchestrator(tmp, monkeypatch):
 
     runner = fresh_runner(tmp, monkeypatch)
     import flash.adapters.lora_rank as rank_mod
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     monkeypatch.setattr(
         runpod_api, "delete_endpoint_for_fingerprint", lambda endpoint_id, _fingerprint: True
@@ -3085,7 +3093,7 @@ def _fresh_orchestrator(tmp, monkeypatch):
 
 
 def _confirm_runpod_retry_teardown(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     monkeypatch.setattr(
         runpod_api,
@@ -3155,10 +3163,10 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_du
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers as providers
-        import flash.providers.allocator as allocator
+        import flash.providers.core.allocator as allocator
         import flash.runner.supervise.lifecycle as lifecycle
-        from flash.providers.base import Allocation, Candidate, PollResult
-        from flash.providers.runpod import api as runpod_api
+        from flash.providers.core.base import Allocation, Candidate, PollResult
+        from flash.providers.runpod.client import api as runpod_api
 
         spec = _spec("completed-before-retry")
         spec = replace(spec, gpu=replace(spec.gpu, max_retries=0))
@@ -3243,7 +3251,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         calls = {"n": 0}
@@ -3282,7 +3290,7 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.adapters.lora_rank as rank_mod
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
         import flash.runner.results.checkpoints as checkpoints
         from flash.core.spec import JobSpec
@@ -3758,7 +3766,7 @@ def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypa
         import flash.adapters.lora_rank as rank_mod
         import flash.providers as providers
         from flash.core.spec import JobSpec
-        from flash.providers.base import PollResult
+        from flash.providers.core.base import PollResult
 
         base = _spec("warm-recover").to_dict()
         public_spec = JobSpec.from_dict(
@@ -3842,7 +3850,7 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
         import flash.adapters.lora_rank as rank_mod
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
         from flash.core.spec import JobSpec
 
@@ -3939,7 +3947,7 @@ def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
         import flash.adapters.lora_rank as rank_mod
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         from flash.core.spec import JobSpec
 
         base = _spec("warm-recover").to_dict()
@@ -4029,7 +4037,7 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         from flash.core.spec import JobSpec
 
         base = _spec("warm-recover").to_dict()
@@ -4162,9 +4170,9 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
     path must now reap seen_endpoints."""
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
-        from flash.providers.runpod import api as runpod_api
+        from flash.providers.runpod.client import api as runpod_api
 
         deleted: list[str] = []
         monkeypatch.setattr(
@@ -4211,7 +4219,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         calls = {"n": 0}
@@ -4244,7 +4252,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
 def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         calls = {"n": 0}
@@ -4272,7 +4280,7 @@ def test_supervisor_infra_failure_retries_up_to_floor(monkeypatch):
 
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         calls = {"n": 0}
@@ -4296,7 +4304,7 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
 
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         calls = {"n": 0}
@@ -4326,7 +4334,7 @@ def test_shared_cache_zero_retry_budget_submits_exactly_once(monkeypatch, failur
 
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         submissions = []
@@ -4359,7 +4367,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
         from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
@@ -4403,7 +4411,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         # the hourly rate. The two agree only when the step is compute-bound. This spec retains one
         # prompt, so the step is latency-bound and a faster card can finish it for less despite a
         # higher hourly rate; asserting sorted hourly rates would pin the wrong invariant.
-        from flash.providers.base import GPU_INFO, _run_cost_key
+        from flash.providers.core.base import GPU_INFO, _run_cost_key
 
         cost_key = _run_cost_key(
             "Qwen/Qwen3.5-0.8B", "grpo", train={"epochs": 1, "max_examples": 1}
@@ -4421,12 +4429,12 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
         _confirm_runpod_retry_teardown(monkeypatch)
         import contextlib
 
-        import flash.providers.allocator as allocator
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.core.allocator as allocator
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
-        import flash.server.domain.teacher_broker as teacher_broker
+        import flash.server.domain.teacher.broker as teacher_broker
         from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-        from flash.providers.base import Allocation, Candidate
+        from flash.providers.core.base import Allocation, Candidate
 
         monkeypatch.setattr(
             teacher_broker,
@@ -4523,7 +4531,7 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
     # budget exists only for infra-shaped failures, not code bugs.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
         from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
@@ -4559,8 +4567,8 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.allocator as allocator
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.core.allocator as allocator
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
         from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
@@ -4625,8 +4633,8 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.allocator as allocator
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.core.allocator as allocator
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
         from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
@@ -4690,8 +4698,8 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
     # one. (Regression guard for the walk-offset-vs-attempt-counter bug.)
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.allocator as allocator
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.core.allocator as allocator
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
         from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
@@ -4778,7 +4786,7 @@ def test_selected_quote_increase_rechecks_affordability(monkeypatch):
 def test_selected_quote_refresh_failure_retries_without_skipping_the_candidate(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
         import flash.runner.supervise.lifecycle as lifecycle
         from flash.core.spec import GpuSpec, JobSpec, TrainSpec
@@ -4834,9 +4842,9 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
     # recovery via attach_run costs the card it actually ran on, not the provisional one.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
-        from flash.providers.runpod import api as runpod_api
+        from flash.providers.runpod.client import api as runpod_api
 
         status = provisioned_status(
             orch,
@@ -4882,7 +4890,7 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         import json
         import os
 
-        from flash.providers.runpod.pricing import hourly_rate
+        from flash.providers.runpod.client.pricing import hourly_rate
 
         # cost_usd is now the QUOTE (flash.cost estimate we charge); the MEASURED cost in metrics.json
         # is what proves recovery costed the walked 5090, not the provisional 4090.
@@ -5003,11 +5011,11 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
                 calls.append("destroy")
 
         import flash.providers
-        import flash.serve.deploy
+        import flash.serve.deployment.deploy
 
         monkeypatch.setattr(flash.providers, "get_provider", lambda name: Provider())
         monkeypatch.setattr(
-            flash.serve.deploy, "undeploy_adapter", lambda run_id: calls.append("undeploy")
+            flash.serve.deployment.deploy, "undeploy_adapter", lambda run_id: calls.append("undeploy")
         )
         monkeypatch.setattr(
             orch, "_gc_run_endpoints", lambda spec: calls.append(("gc", spec.train.lora_rank))
@@ -5033,7 +5041,7 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
 def test_cancel_uses_rest_handle(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        from flash.providers.runpod import api as runpod_api
+        from flash.providers.runpod.client import api as runpod_api
 
         status = orch.RunStatus(
             run_id="c1",
@@ -5077,7 +5085,7 @@ def test_cancel_uses_rest_handle(monkeypatch):
 def test_attach_completes_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         status = provisioned_status(
@@ -5116,7 +5124,7 @@ def test_attach_completes_run(monkeypatch):
 def test_attach_cleanup_survives_unreadable_final_status(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
 
         run_id = "attach-finally-status"
         orch._save_status(
@@ -5171,7 +5179,7 @@ def test_attach_cleanup_survives_unreadable_final_status(monkeypatch):
 def test_attach_confirmed_cancel_survives_unreadable_cleanup_status(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
 
         run_id = "attach-confirmed-cancel"
         orch._save_status(
@@ -5229,7 +5237,7 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
 
         run_id = "attach-live-owner"
         stale_remote = {
@@ -5364,7 +5372,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         status = provisioned_status(
@@ -5423,7 +5431,7 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         spec = _spec("one-shot-recovery")
@@ -5466,7 +5474,7 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         status = provisioned_status(
@@ -5528,7 +5536,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         status = provisioned_status(
@@ -5623,8 +5631,8 @@ def test_attach_does_not_resume_over_unconfirmed_runpod_teardown(
 ):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
-        from flash.providers.runpod import api as runpod_api
+        import flash.providers.runpod.execution.jobs as jobs
+        from flash.providers.runpod.client import api as runpod_api
 
         remote = {
             "provider": "runpod",
@@ -5700,7 +5708,7 @@ def test_attach_preserves_newer_remote_before_compare_and_clear(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
 
         old_remote = {
             "provider": "runpod",
@@ -5767,8 +5775,8 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch, rema
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers as providers
         import flash.providers.runpod.serverless as flash_train
-        from flash.providers.base import PollResult
-        from flash.providers.vast import api as vast_api
+        from flash.providers.core.base import PollResult
+        from flash.providers.vast.client import api as vast_api
 
         orch._save_status(
             provisioned_status(
@@ -6104,7 +6112,7 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
 def test_attach_reconciler_caps_completed_adoption_retry_to_grace(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.runner.supervise.deploy as deploy_mod
         import flash.runner.supervise.lifecycle as lifecycle_mod
 
@@ -6154,7 +6162,7 @@ def test_attach_reconciler_caps_completed_adoption_retry_to_grace(monkeypatch):
 def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.runner.supervise.deploy as deploy_mod
         import flash.runner.supervise.lifecycle as lifecycle_mod
 
@@ -6213,7 +6221,7 @@ def test_attach_reconciler_rate_limits_failed_terminal_cas_past_grace(monkeypatc
     # sleeping 0 (remaining grace is <= 0 past the window) and busy-spinning the loop.
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.runner.supervise.deploy as deploy_mod
         import flash.runner.supervise.lifecycle as lifecycle_mod
 
@@ -6453,8 +6461,8 @@ def _patch_deploy_deps(monkeypatch, jobs, *, set_key: bool = True):
 
     ``set_key=False`` preserves a caller-installed multi-account pool for failover tests.
     """
-    import flash.providers.runpod.auth as auth_mod
-    import flash.providers.runpod.auth as keys
+    import flash.providers.runpod.client.auth as auth_mod
+    import flash.providers.runpod.client.auth as keys
 
     # Pin the pool for the default case rather than reading the ambient env: callers assert on the
     # fingerprint of THIS key, and a real operator key would both leak into the assertion and
@@ -6479,7 +6487,7 @@ def _patch_deploy_deps(monkeypatch, jobs, *, set_key: bool = True):
 
 def test_deploy_train_endpoint_retries_on_quota_error(monkeypatch):
     """On a workers-quota error, deploy_train_endpoint sweeps idle endpoints and retries."""
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.execution.jobs as jobs
 
     attempts = {"count": 0}
     swept = {"count": 0}
@@ -6516,7 +6524,7 @@ def test_deploy_train_endpoint_retries_on_quota_error(monkeypatch):
 
 def test_deploy_train_endpoint_raises_after_max_quota_retries(monkeypatch):
     """deploy_train_endpoint re-raises the quota error after all retries are exhausted."""
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.execution.jobs as jobs
 
     class FakeRM:
         async def get_or_deploy_resource(self, config):
@@ -6537,8 +6545,8 @@ def test_deploy_train_endpoint_raises_after_max_quota_retries(monkeypatch):
 
 def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
     """A multi-account RUNPOD_API_KEY fails the deploy over to the next account on quota."""
-    import flash.providers.runpod.auth as keys
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.client.auth as keys
+    import flash.providers.runpod.execution.jobs as jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB")
     keys.reset()
@@ -6571,8 +6579,8 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
 def test_deploy_fails_over_to_next_account_on_balance(monkeypatch):
     """An out-of-balance account fails the deploy over to the next account WITHOUT sweeping idle
     endpoints (sweeping can't add balance)."""
-    import flash.providers.runpod.auth as keys
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.client.auth as keys
+    import flash.providers.runpod.execution.jobs as jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB")
     keys.reset()
@@ -6608,8 +6616,8 @@ def test_deploy_fails_over_to_next_account_on_balance(monkeypatch):
 def test_deploy_balance_error_single_account_raises_fast(monkeypatch):
     """A balance error on the only account re-raises (not swallowed) and fails fast without
     sweep-and-retry on the same broke account."""
-    import flash.providers.runpod.auth as keys
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.client.auth as keys
+    import flash.providers.runpod.execution.jobs as jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "solo-key")
     keys.reset()
@@ -6639,8 +6647,8 @@ def test_deploy_captures_owner_before_concurrent_failover_after_sdk_create(monke
     fingerprint must remain account A's, never the newly active account B's."""
     import threading
 
-    import flash.providers.runpod.auth as keys
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.client.auth as keys
+    import flash.providers.runpod.execution.jobs as jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "account-a,account-b")
     keys.reset()
@@ -6683,8 +6691,8 @@ def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
     it must NOT loop forever. The deploy bounds its failovers by a key_count()-based COUNT (NOT by
     advance_key()'s return value, which always advances/wraps for a multi-key pool); a regression
     would spin here indefinitely."""
-    import flash.providers.runpod.auth as keys
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.client.auth as keys
+    import flash.providers.runpod.execution.jobs as jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB")
     keys.reset()
@@ -6719,8 +6727,8 @@ def test_deploy_failover_from_midpool_tries_every_remaining_account(monkeypatch)
     Bound failovers by ``key_count() - 1``; treating wrap to index zero as exhaustion skips kA when
     starting from kB in the kA, kB, kC pool.
     """
-    import flash.providers.runpod.auth as keys
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.client.auth as keys
+    import flash.providers.runpod.execution.jobs as jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "kA,kB,kC")
     keys.reset()
@@ -6764,8 +6772,8 @@ def test_deploy_failover_from_midpool_tries_every_remaining_account(monkeypatch)
 
 def test_sweep_idle_flash_endpoints(monkeypatch):
     """_sweep_idle_flash_endpoints deletes only idle flash-* / live-flash-* endpoints."""
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.client.api as runpod_api
+    import flash.providers.runpod.execution.jobs as jobs
 
     # RunPod Flash registers endpoints as "live-<endpoint_name>", so real names are
     # "live-flash-<gpu>-<suffix>". Both the bare "flash-*" and "live-flash-*" forms
@@ -6829,8 +6837,8 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
 def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
     """reap_warm=False (the deploy-time reactive sweep, which protects only the current run) reaps
     ONLY fully scaled-to-zero endpoints — never another run's warm idle/ready leftover one."""
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.client.api as runpod_api
+    import flash.providers.runpod.execution.jobs as jobs
 
     endpoints = [
         {"id": "ep-warm", "name": "live-flash-a100-warm"},  # warm idle/ready worker
@@ -6870,8 +6878,8 @@ def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
 def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
     """With min_idle_s > 0, an endpoint that reports a single transient zero (cold start / between
     jobs) is NOT deleted; only one idle across sweeps for >= min_idle_s is reaped."""
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.client.api as runpod_api
+    import flash.providers.runpod.execution.jobs as jobs
 
     monkeypatch.setattr(
         runpod_api,
@@ -6914,8 +6922,8 @@ def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
 def test_sweep_grace_resets_when_endpoint_becomes_busy(monkeypatch):
     """A busy reading clears the grace timer, so the idle clock restarts if it goes idle again —
     a long-running endpoint that dips idle briefly is never reaped."""
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.client.api as runpod_api
+    import flash.providers.runpod.execution.jobs as jobs
 
     state = {"busy": False}
     monkeypatch.setattr(
@@ -6958,8 +6966,8 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
     reaper and a deploy-time sweep run on different threads, so the prune can't race mid-iteration)."""
     import threading
 
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.client.api as runpod_api
+    import flash.providers.runpod.execution.jobs as jobs
 
     monkeypatch.setattr(
         runpod_api,
@@ -6999,8 +7007,8 @@ def test_runpod_completed_metrics_undecodable_output_pending_within_grace(monkey
     # returned None, letting callers tear down / resubmit a job that had already completed.
     import time as _time
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
     from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(
@@ -7023,8 +7031,8 @@ def test_runpod_completed_metrics_undecodable_output_pending_within_grace(monkey
 
 
 def test_runpod_completed_metrics_probes_after_expired_recovery_grace(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
     from flash.runner.supervise import lifecycle
 
     now = 1_000.0
@@ -7051,8 +7059,8 @@ def test_runpod_completed_metrics_caps_probe_deadline_when_wall_deadline_far_fut
     # a runpod api outage, burns its full per-request retry budget (~minutes) before returning,
     # stalling the attach/recovery reconciler each pass. the wall+grace value governs only the
     # pending-output decision, never the per-probe timeout.
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
     from flash.runner.supervise import lifecycle
 
     now = 1_000.0
@@ -7081,8 +7089,8 @@ def test_runpod_completed_metrics_readable_failure_not_pending(monkeypatch):
     # path instead of reconciling a job that already failed.
     import time as _time
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
     from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(
@@ -7103,7 +7111,7 @@ def test_deploy_train_endpoint_threads_gpu_count(monkeypatch):
     """gpu.count from the job spec becomes the runpod Endpoint gpu_count (multi-gpu pod)."""
     import sys
 
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.execution.jobs as jobs
     from flash.core.spec import GpuSpec, JobSpec
 
     captured: dict = {}
@@ -7137,7 +7145,7 @@ def test_deploy_train_endpoint_gpu_count_defaults_to_one(monkeypatch):
     """No spec keeps the historical single-gpu Endpoint payload (count == 1)."""
     import sys
 
-    import flash.providers.runpod.jobs as jobs
+    import flash.providers.runpod.execution.jobs as jobs
 
     captured: dict = {}
 
@@ -7168,8 +7176,8 @@ def _poll_in_queue_forever(monkeypatch, **poll_kwargs):
     """Drive poll_job against a job that never leaves IN_QUEUE (no capacity for the pinned class)."""
     import itertools
 
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
     monkeypatch.setattr(
@@ -7222,9 +7230,9 @@ def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch
     wording even though it still selects the longer wait.
     """
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
     from flash.providers.runpod import PROVIDER
-    from flash.providers.runpod import jobs as jobs
+    from flash.providers.runpod.execution import jobs as jobs
 
     captured: dict = {}
 

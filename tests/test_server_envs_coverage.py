@@ -22,7 +22,7 @@ from typing import ClassVar
 
 import pytest
 
-from flash.server.domain import envs
+from flash.server.domain.registry import envs
 
 pytest.importorskip("fastapi")
 from fastapi import HTTPException
@@ -32,7 +32,7 @@ import flash.server.routes.serving_completion as serving_completion
 import flash.server.routes.serving_smoke as serving_smoke
 from flash.content import multimodal
 from flash.engine.plan.recipe import RECIPE
-from flash.serve.deploy import AliasThinkingSilent, ServingError
+from flash.serve.deployment.deploy import AliasThinkingSilent, ServingError
 
 
 def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
@@ -48,7 +48,7 @@ def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
 
 
 # ===========================================================================
-# flash.server.domain.envs
+# flash.server.domain.registry.envs
 # ===========================================================================
 
 
@@ -866,7 +866,7 @@ def test_smoke_uses_the_capability_set_deploy_gated_on_not_a_second_healthz(monk
     the smoke would let a mid-rollout replica that does not advertise the attestation -- or one
     transient failure -- accept a response that omits a header this deployment WAS promised.
     """
-    from flash.serve import deploy as deploy_mod
+    from flash.serve.deployment import deploy as deploy_mod
 
     healthz_calls = 0
 
@@ -1334,7 +1334,7 @@ def test_run_deployment_smoke_sends_no_stop_when_none_configured(monkeypatch):
 
 def test_chat_body_carries_stop_sequences(monkeypatch):
     """The stop sequences must reach the wire body, not just the flash-side call."""
-    from flash.serve import deploy as _deploy
+    from flash.serve.deployment import deploy as _deploy
 
     sent = {}
 
@@ -1366,7 +1366,7 @@ def test_chat_body_carries_stop_sequences(monkeypatch):
 
 
 def test_chat_captures_lora_request_adapter_attestation_for_smoke(monkeypatch):
-    from flash.serve import deploy as _deploy
+    from flash.serve.deployment import deploy as _deploy
 
     class _Resp:
         status_code = 200
@@ -1410,7 +1410,7 @@ def test_chat_captures_lora_request_adapter_attestation_for_smoke(monkeypatch):
 
 
 def test_zero_completion_budget_resolves_to_thinking_recipe_default():
-    from flash.serve.preflight import resolve_effective_completion_tokens
+    from flash.serve.deployment.preflight import resolve_effective_completion_tokens
 
     spec = _smoke_spec(
         thinking=True,
@@ -1422,7 +1422,7 @@ def test_zero_completion_budget_resolves_to_thinking_recipe_default():
 
 
 def test_thinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default():
-    from flash.serve.preflight import resolve_smoke_completion_tokens
+    from flash.serve.deployment.preflight import resolve_smoke_completion_tokens
 
     spec = _smoke_spec(thinking=True, algorithm="sft")
 
@@ -1433,7 +1433,7 @@ def test_thinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default(
 
 
 def test_sft_smoke_budget_follows_an_explicit_context_over_the_recipe_default():
-    from flash.serve.preflight import resolve_smoke_completion_tokens
+    from flash.serve.deployment.preflight import resolve_smoke_completion_tokens
 
     # the worker bounds the packed block by max_context_tokens and only falls back to the recipe
     # when it is unset (flash/engine/worker/entry/sft.py), so below the ceiling the smoke resolves
@@ -1467,7 +1467,7 @@ def test_smoke_budget_is_capped_independently_of_the_training_context():
     also coupled the knobs backwards, since raising max_context_tokens to avoid training truncation
     made the run HARDER to deploy.
     """
-    from flash.serve.preflight import (
+    from flash.serve.deployment.preflight import (
         SMOKE_COMPLETION_TOKEN_CEILING,
         resolve_smoke_completion_tokens,
     )
@@ -1496,7 +1496,7 @@ def test_a_configured_grammar_keeps_the_runs_own_budget():
     correctly becomes undeployable. That case passes today on an explicit budget, so the ceiling
     must not reach it.
     """
-    from flash.serve.preflight import (
+    from flash.serve.deployment.preflight import (
         SMOKE_COMPLETION_TOKEN_CEILING,
         resolve_smoke_completion_tokens,
     )
@@ -1514,7 +1514,7 @@ def test_a_configured_grammar_keeps_the_runs_own_budget():
 
 
 def test_nonthinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default():
-    from flash.serve.preflight import resolve_smoke_completion_tokens
+    from flash.serve.deployment.preflight import resolve_smoke_completion_tokens
 
     spec = _smoke_spec(thinking=False, algorithm="sft")
 
@@ -1522,7 +1522,7 @@ def test_nonthinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_defau
 
 
 def test_sft_contributes_no_completion_budget_to_the_serving_context_guard():
-    from flash.serve.preflight import resolve_effective_completion_tokens
+    from flash.serve.deployment.preflight import resolve_effective_completion_tokens
 
     # max_context_tokens spans prompt AND completion for sft, so handing it to the guard as a
     # completion budget double-counts the prompt: a 4096-context run that fits a 4096 serving cap
@@ -1546,7 +1546,7 @@ def test_sft_contributes_no_completion_budget_to_the_serving_context_guard():
 
 def test_rollout_budget_ignores_context_tokens():
     from flash.engine.plan.recipe import RECIPE
-    from flash.serve.preflight import resolve_effective_completion_tokens
+    from flash.serve.deployment.preflight import resolve_effective_completion_tokens
 
     # grpo budgets the completion, not the whole rollout, so max_context_tokens must not become
     # its completion budget the way it does for sft.
@@ -1677,7 +1677,7 @@ def test_unconstrained_thinking_smoke_rejects_a_reconstructed_empty_answer(monke
 
     `_smoke_provenance` rejects an empty generation, but flash now folds the split-out
     `reasoning_content` back into a balanced block before it gets there
-    (flash/serve/deploy.py::_balanced_thinking_content). `_thinking_answer` asserts an answer exists
+    (flash/serve/deployment/deploy.py::_balanced_thinking_content). `_thinking_answer` asserts an answer exists
     for every thinking smoke; before it did, only the grammar-constrained path checked, so an
     unconstrained deployment could go live on a smoke that produced no answer at all.
     """

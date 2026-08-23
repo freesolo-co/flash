@@ -18,8 +18,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flash._internal.logging import configure_logging, get_logger
-from flash.providers._lifecycle.deadline import deadline_kwargs
-from flash.providers._lifecycle.poll import preload_instance_run_id
+from flash.providers._lifecycle.net.deadline import deadline_kwargs
+from flash.providers._lifecycle.instances.poll import preload_instance_run_id
 from flash.providers.artifacts.hf import make_hf_text_reader
 
 # imported at the top rather than re-exported at the bottom: these are default argument
@@ -28,13 +28,13 @@ from flash.providers.artifacts.preload_runpod import (
     _PRELOAD_GPU,
     _PRELOAD_TIMEOUT_S,
 )
-from flash.providers.base import UnreconciledCreateError
-from flash.providers.runpod import api as runpod_api  # noqa: F401
+from flash.providers.core.base import UnreconciledCreateError
+from flash.providers.runpod.client import api as runpod_api  # noqa: F401
 
 # several names below have no call site here since the runpod half moved to `.preload_runpod`,
 # but they are kept imported on purpose: the preload tests patch them on THIS module and that
 # half reads them back through it. an autofix that drops them as unused breaks those tests.
-from flash.providers.runpod.jobs import (  # noqa: F401
+from flash.providers.runpod.execution.jobs import (  # noqa: F401
     GraceTimer,
     decode_output,
     deploy_train_endpoint,
@@ -164,7 +164,7 @@ def _lambda_provisioned_regions() -> set[str]:
     for what is only a reporting nicety. Losing the snapshot degrades the summary; blocking on it
     delays warming.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     try:
@@ -223,7 +223,7 @@ def _region_filesystem_is_listed(region: str, deadline: float) -> bool:
     call begins by listing and returns early on a match, so once the filesystem is listed no later
     caller can reach the non-idempotent create path for it.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     fses = lambda_api.list_filesystems(
@@ -254,7 +254,7 @@ def _ensure_region_filesystem(region: str, deadline: float) -> str:
       ``"doubtful"``    -- reached Lambda but cannot confirm; launching could pay for a second
                            filesystem forever, so the caller must skip the region.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     try:
@@ -574,7 +574,7 @@ def provision_lambda_filesystems(name: str | None = None) -> list[str]:
 
     Best-effort: zero-capacity regions are covered by the launch-time ensure_filesystem backstop.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     target = name or WEIGHT_CACHE_VOLUME_NAME

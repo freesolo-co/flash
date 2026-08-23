@@ -32,23 +32,23 @@ from flash.serve.provisioning import (
     ServingRuntimeSecrets,
     serving_resource_names,
 )
-from flash.serve.provisioning._modal_deployment import _work_deadline
-from flash.serve.provisioning._modal_plan import (
+from flash.serve.provisioning.modal.execution.deployment import _work_deadline
+from flash.serve.provisioning.modal.planning.plan import (
     MODAL_APP_TAG_LIMIT,
     MODAL_DEPLOYMENT_TAG_LIMIT,
     MODAL_STARTUP_TIMEOUT_SECONDS,
     build_modal_create_plan,
 )
-from flash.serve.provisioning._modal_probe import ModalEndpointProbe, _provenance_matches
-from flash.serve.provisioning._modal_readiness import ExpectedResources
-from flash.serve.provisioning._modal_sdk import (
+from flash.serve.provisioning.modal.readiness_checks.probe import ModalEndpointProbe, _provenance_matches
+from flash.serve.provisioning.modal.readiness_checks.readiness import ExpectedResources
+from flash.serve.provisioning.modal.execution.sdk import (
     ModalAppObservation,
     ModalNamedResource,
     ModalObservation,
     ModalSdkFailure,
     PinnedModalSdk,
 )
-from flash.serve.provisioning.modal import (
+from flash.serve.provisioning.modal.execution.lifecycle_entry import (
     _abort_created_resources,
     _CreatedResources,
     provision_modal_deployment,
@@ -456,7 +456,7 @@ def _default_serve_timeout_seconds() -> float:
     """
     import argparse
 
-    from flash.cli.serve_parser import _add_deployment_arguments
+    from flash.cli.parsing.serve_parser import _add_deployment_arguments
 
     command = argparse.ArgumentParser()
     _add_deployment_arguments(command)
@@ -2213,8 +2213,8 @@ builtins.__import__ = guarded
 from flash.serve.app.manifest import ServingManifest
 from flash.serve.app.materialize import hydrate_manifest
 from flash.serve.provisioning import ServingImage
-from flash.serve.provisioning._modal_plan import build_modal_create_plan
-from flash.serve.provisioning.modal import provision_modal_deployment
+from flash.serve.provisioning.modal.planning.plan import build_modal_create_plan
+from flash.serve.provisioning.modal.execution.lifecycle_entry import provision_modal_deployment
 
 assert ServingManifest
 assert hydrate_manifest

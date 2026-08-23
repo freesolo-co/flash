@@ -53,7 +53,7 @@ def _ndc() -> int:
     """Size of the ALLOWED datacenter set (DataCenter.all()) — what the endpoint's `datacenter` list
     spans. Derived from the same source the code uses, so it tracks the SDK's storage-DC set.
     """
-    from flash.providers.runpod.jobs import weight_cache_datacenters
+    from flash.providers.runpod.execution.jobs import weight_cache_datacenters
 
     n = len(weight_cache_datacenters())
     assert n > 1
@@ -115,7 +115,7 @@ def test_weight_cache_datacenters_excludes_volume_incapable():
     # creating a volume there 500s the whole deploy, so the fleet must exclude them.
     from runpod_flash.core.resources.datacenter import DataCenter
 
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     dcs = jobs.weight_cache_datacenters()
     vals = {d.value for d in dcs}
@@ -127,7 +127,7 @@ def test_weight_cache_datacenters_excludes_volume_incapable():
 
 def test_weight_cache_datacenters_ignores_removed_env_knob(monkeypatch):
     # Regression: the FLASH_WEIGHT_CACHE_DATACENTERS knob is GONE — the fleet is fixed/managed.
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     baseline = len(jobs.weight_cache_datacenters())
     monkeypatch.setenv("FLASH_WEIGHT_CACHE_DATACENTERS", "US-CA-2")
@@ -136,7 +136,7 @@ def test_weight_cache_datacenters_ignores_removed_env_knob(monkeypatch):
 
 def test_weight_cache_volumes_distinct_name_per_dc():
     from flash import runner
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     vols = jobs.weight_cache_volumes(_vol_spec(gb=100))
     # EAGER: one volume in EVERY storage DC (no lazy used-set gating).
@@ -161,7 +161,7 @@ def test_weight_cache_volumes_size_tolerant_of_bad_values():
     # must never raise (best-effort would silently drop the cache) or create a 0-GB volume; on the
     # shared cache it lands on the managed size.
     from flash import runner
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     for raw in ("0", 0, -5, "abc", None, True):
         vols = jobs.weight_cache_volumes(_vol_spec(gb=raw))
@@ -177,7 +177,7 @@ def test_custom_volume_keeps_its_spec_size_while_shared_cache_is_managed():
     Flooring every volume at the cache size would silently over-provision (and over-bill) a custom
     volume that was deliberately asked for small.
     """
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     vols = jobs.weight_cache_volumes(_vol_spec(name="my-own-volume", gb=20))
     assert {v.size for v in vols} == {20}
@@ -186,7 +186,7 @@ def test_custom_volume_keeps_its_spec_size_while_shared_cache_is_managed():
 def test_weight_cache_volume_name_includes_datacenter():
     from runpod_flash.core.resources.datacenter import DataCenter
 
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     assert (
         jobs.weight_cache_volume_name("flash-weights", DataCenter.US_CA_2)
@@ -195,13 +195,13 @@ def test_weight_cache_volume_name_includes_datacenter():
 
 
 def test_weight_cache_volumes_empty_without_volume_name():
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     assert jobs.weight_cache_volumes(JobSpec(model="m")) == []
 
 
 def test_weight_cache_endpoint_kwargs_volume_in_every_dc():
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     kw = jobs.weight_cache_endpoint_kwargs(_vol_spec())
     assert sorted(kw) == ["datacenter", "volume"]
@@ -213,13 +213,13 @@ def test_weight_cache_endpoint_kwargs_volume_in_every_dc():
 
 
 def test_weight_cache_endpoint_kwargs_empty_without_volume():
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     assert jobs.weight_cache_endpoint_kwargs(JobSpec(model="m")) == {}
 
 
 def test_weight_cache_endpoint_kwargs_swallows_errors(monkeypatch):
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(
         jobs, "weight_cache_volumes", lambda spec: (_ for _ in ()).throw(RuntimeError("sdk boom"))
@@ -236,7 +236,7 @@ def test_weight_cache_satisfies_real_sdk_superset_validation(monkeypatch):
     from runpod_flash import Endpoint
     from runpod_flash.core.resources.gpu import GpuGroup
 
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     kw = jobs.weight_cache_endpoint_kwargs(_vol_spec())
     ep = Endpoint(name="wc-test", gpu=GpuGroup.AMPERE_48, gpu_count=1, **kw)
@@ -251,7 +251,7 @@ def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
     import runpod_flash
     import runpod_flash.core.resources.resource_manager as rm_mod
 
-    from flash.providers.runpod import auth, jobs
+    from flash.providers.runpod.client import auth, jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     auth.reset()
@@ -291,7 +291,7 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
     import runpod_flash
     import runpod_flash.core.resources.resource_manager as rm_mod
 
-    from flash.providers.runpod import auth, jobs
+    from flash.providers.runpod.client import auth, jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     auth.reset()
@@ -323,7 +323,7 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
 # worker weight_cache_env / build_worker_env redirect
 # ---------------------------------------------------------------------------
 def test_weight_cache_env_is_base_model_scoped():
-    from flash.providers._lifecycle.worker import weight_cache_env
+    from flash.providers._lifecycle.net.worker import weight_cache_env
 
     env = weight_cache_env("/runpod-volume")
     # BASE-MODEL-SCOPED: FLASH_WEIGHT_CACHE_DIR points the base-model prefetch at the mount's HF hub
@@ -341,13 +341,13 @@ def test_weight_cache_env_is_base_model_scoped():
 
 
 def test_weight_cache_env_custom_mount():
-    from flash.providers._lifecycle.worker import weight_cache_env
+    from flash.providers._lifecycle.net.worker import weight_cache_env
 
     assert weight_cache_env("/workspace")["FLASH_WEIGHT_CACHE_DIR"] == "/workspace/hf-cache/hub"
 
 
 def test_build_worker_env_sets_base_model_cache_with_volume():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     env = build_worker_env(_vol_spec(), 0)
     assert env["FLASH_WEIGHT_CACHE_DIR"] == "/runpod-volume/hf-cache/hub"
@@ -356,7 +356,7 @@ def test_build_worker_env_sets_base_model_cache_with_volume():
 
 
 def test_build_worker_env_no_cache_without_volume():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     env = build_worker_env(JobSpec(model="m", seed=0), 0)
     # Without a volume the base-model cache var must NOT be set (pointing at a missing mount).
@@ -493,7 +493,7 @@ def test_shared_weight_cache_dir_resolves_mount_for_both_substrates(tmp_path, mo
 # instance-provider integration (Lambda reuses RunPod's build_worker_env)
 # ---------------------------------------------------------------------------
 def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
-    from flash.providers._lifecycle.worker import strip_runpod_volume_env
+    from flash.providers._lifecycle.net.worker import strip_runpod_volume_env
 
     env = {
         "FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub",
@@ -510,8 +510,8 @@ def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
 def test_instance_payload_strips_runpod_volume_redirect():
     # The RunPod weight-cache base-model redirect must NOT leak into a Lambda payload —
     # those instances never mount /runpod-volume. (build_worker_env DOES set it; the instance strips.)
-    from flash.providers._lifecycle import instance as _instance
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.instances import instance as _instance
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     # network_volume is managed -> carried by the internal dict (the leak source that build_worker_env
     # turns into the /runpod-volume redirect).
@@ -839,7 +839,7 @@ def _supervised_walk(monkeypatch, failures):
 
     with tempfile.TemporaryDirectory() as tmp:
         orch = fresh_runner(tmp, monkeypatch)
-        import flash.providers.runpod.jobs as jobs
+        import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
 
         seen: list = []
@@ -1038,7 +1038,7 @@ def test_teardown_weight_cache_deletes_only_fleet_volumes(monkeypatch):
 
     import runpod_flash.core.api.runpod as rp_api
 
-    from flash.providers.runpod import auth as rp_keys
+    from flash.providers.runpod.client import auth as rp_keys
 
     monkeypatch.setattr(rp_keys, "keys", lambda: ["k1"])  # single-account pool
     monkeypatch.setattr(rp_api, "RunpodRestClient", FakeRest)
@@ -1058,7 +1058,7 @@ def test_teardown_weight_cache_no_runpod_key_is_noop(monkeypatch):
     import runpod_flash.core.api.runpod as rp_api
 
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod import auth as rp_keys
+    from flash.providers.runpod.client import auth as rp_keys
 
     def _boom(*a, **k):
         raise AssertionError("RunpodRestClient must not be constructed without a key")
@@ -1087,7 +1087,7 @@ def test_teardown_weight_cache_sweeps_all_pool_accounts(monkeypatch):
 
     import runpod_flash.core.api.runpod as rp_api
 
-    from flash.providers.runpod import auth as rp_keys
+    from flash.providers.runpod.client import auth as rp_keys
 
     monkeypatch.setattr(rp_keys, "keys", lambda: ["k1", "k2"])  # two-account pool
     monkeypatch.setattr(rp_api, "RunpodRestClient", FakeRest)
@@ -1103,7 +1103,7 @@ def test_teardown_does_not_report_failed_deletes(monkeypatch):
     import runpod_flash.core.api.runpod as rp_api
 
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod import auth as rp_keys
+    from flash.providers.runpod.client import auth as rp_keys
 
     class FakeRest:
         def __init__(self, api_key=None):
@@ -1129,7 +1129,7 @@ def test_teardown_works_inside_running_event_loop(monkeypatch):
     import runpod_flash.core.api.runpod as rp_api
 
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod import auth as rp_keys
+    from flash.providers.runpod.client import auth as rp_keys
 
     class FakeRest:
         def __init__(self, api_key=None):
@@ -1154,7 +1154,7 @@ def test_teardown_works_inside_running_event_loop(monkeypatch):
 
 def test_teardown_lambda_filesystems_deletes_only_fleet(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     fses = [
         {"id": "f1", "name": "flash-weights", "region": {"name": "us-east-1"}},
@@ -1172,7 +1172,7 @@ def test_teardown_lambda_filesystems_deletes_only_fleet(monkeypatch):
 
 def test_teardown_lambda_filesystems_no_key_is_noop(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     monkeypatch.setattr(
         lambda_api,
@@ -1281,7 +1281,7 @@ def test_teardown_weight_cache_empty_list_is_noop_not_all(monkeypatch):
     import runpod_flash.core.api.runpod as rp_api
 
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod import auth as rp_keys
+    from flash.providers.runpod.client import auth as rp_keys
 
     def _boom(*a, **k):
         raise AssertionError("an empty scope must not list/delete any volumes")
@@ -1296,7 +1296,7 @@ def test_teardown_weight_cache_empty_list_is_noop_not_all(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     ensured = []
     monkeypatch.setattr(
@@ -1321,7 +1321,7 @@ def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
 
 def test_provision_lambda_skips_failed_region(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     def flaky(name, region, deadline_at=None):
         if region == "bad-1":
@@ -1336,7 +1336,7 @@ def test_provision_lambda_skips_failed_region(monkeypatch):
 
 def test_provision_lambda_no_key_is_noop(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     monkeypatch.setattr(
         lambda_api,
@@ -1606,7 +1606,7 @@ def _preload_spec():
 
 
 def test_instance_build_payload_preload_mode():
-    from flash.providers._lifecycle import instance as _instance
+    from flash.providers._lifecycle.instances import instance as _instance
 
     spec = _preload_spec()
     p = _instance.build_payload(
@@ -1630,7 +1630,7 @@ def test_instance_build_payload_preload_mode():
 
 
 def test_instance_build_payload_no_mode_by_default():
-    from flash.providers._lifecycle import instance as _instance
+    from flash.providers._lifecycle.instances import instance as _instance
 
     spec = _preload_spec()
     p = _instance.build_payload(
@@ -1647,7 +1647,7 @@ def test_instance_build_payload_no_mode_by_default():
 
 
 def test_instance_preload_requires_mounted_cache():
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     # FLASH_WEIGHT_CACHE_DIR rooted at an UNMOUNTED cache -> refuse (would warm ephemeral disk), no download
     r = b.run_preload(
@@ -1662,7 +1662,7 @@ def test_instance_preload_downloads_into_cache(tmp_path, monkeypatch):
     import sys
     import types
 
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     calls = []
 
@@ -1698,7 +1698,7 @@ def test_instance_preload_skips_download_when_already_cached(tmp_path, monkeypat
     snapshot already_cached and does NOT re-download it."""
     import sys
 
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     real_downloads = []
 
@@ -1721,7 +1721,7 @@ def test_instance_preload_skips_download_when_already_cached(tmp_path, monkeypat
 def test_nfs_mount_check_verifies_mountpoint_and_writes_sentinel():
     """The NFS (Lambda) preamble drops the sentinel ONLY when the host path is a real mountpoint, so an
     auto-created empty Docker-bind dir (failed/unready NFS) is detectable in-container."""
-    from flash.providers._lifecycle import instance as _instance
+    from flash.providers._lifecycle.instances import instance as _instance
 
     pre = _instance._cache_nfs_mount_check({"cache_host_mount": "/lambda/nfs/flash-weights"})
     assert "mountpoint -q '/lambda/nfs/flash-weights'" in pre  # gates on a REAL mount
@@ -1735,7 +1735,7 @@ def test_instance_preload_nfs_requires_mount_sentinel(tmp_path, monkeypatch):
     auto-creates a missing host dir, so isdir(mount) alone can't prove the NFS actually mounted."""
     import sys
 
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     def _boom(**k):
         raise AssertionError("must not download when the NFS cache isn't really mounted")
@@ -1762,7 +1762,7 @@ def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch)
     """With the NFS preamble's real-mount sentinel present, a Lambda preload proceeds to download."""
     import sys
 
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     calls = []
 
@@ -1789,7 +1789,7 @@ def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch)
 def test_build_payload_carries_mount_marker_for_nfs_cache():
     """a cache-attached Lambda preload payload carries cache_mount_marker so the in-container check
     can require the NFS mount sentinel."""
-    from flash.providers._lifecycle import instance as _instance
+    from flash.providers._lifecycle.instances import instance as _instance
 
     spec = _preload_spec()
     p = _instance.build_payload(
@@ -1809,7 +1809,7 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
 def test_preload_wall_cap_timer_armed_and_cancellable(monkeypatch):
     """run_preload has no worker subprocess, so the preload branch arms an absolute-deadline watchdog
     that hard-exits the box if a download hangs past deadline_at. The timer is cancellable on finish."""
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     now = 1_000.0
     monkeypatch.setattr(b.time, "time", lambda: now)
@@ -1832,7 +1832,7 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     import base64
     import json as _json
 
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs
 
     launched = {}
@@ -1874,7 +1874,7 @@ def test_lambda_warm_caller_uses_source_independent_preload_payload(monkeypatch)
     import json as _json
 
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs
     from tests.test_lambda_runner import _inst
 
@@ -2134,7 +2134,7 @@ def test_lambda_ladder_is_ordered_cheapest_first():
     Guards against someone appending a class without checking where it lands on price.
     """
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_.pricing import _STATIC_RATES
+    from flash.providers.lambda_.client.pricing import _STATIC_RATES
 
     rates = [_STATIC_RATES[c] for c in preload._LAMBDA_PRELOAD_GPU_LADDER]
     assert rates == sorted(rates), f"ladder must be cheapest-first, got {rates}"
@@ -2318,7 +2318,7 @@ def test_warm_stops_the_ladder_on_an_ambiguous_create(monkeypatch):
     Every class in a region shares one run_id, and UnreconciledCreateError means Lambda may have billed
     an instance we cannot see. The error exists to forbid another create, so it must end the ladder.
     """
-    from flash.providers.base import UnreconciledCreateError
+    from flash.providers.core.base import UnreconciledCreateError
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -2345,7 +2345,7 @@ def test_warm_ensures_the_region_filesystem_once_before_the_class_ladder(monkeyp
     Creation is non-idempotent; pre-ensuring makes later class attempts observe the existing mount
     instead of billing duplicate filesystems.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -2383,7 +2383,7 @@ def test_warm_skips_a_region_whose_created_filesystem_is_not_yet_listed(monkeypa
     Later `ensure_filesystem` calls are safe only after listing visibility; otherwise launch can
     submit a second non-idempotent create.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -2416,7 +2416,7 @@ def test_warm_does_not_launch_while_the_filesystem_is_unconfirmed(monkeypatch):
     Reconciliation failures can lose their sentinel under capacity wrapping. Launching anyway risks
     a second non-idempotent create, so skip the cold region.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -2478,7 +2478,7 @@ def test_warm_still_walks_the_ladder_when_lambda_was_never_reached(monkeypatch):
     Without this distinction the pre-ensure would fail on every host lacking LAMBDA_API_KEY, pin the
     ladder to a single class, and silently disable the class fallback this module exists to provide.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -2489,7 +2489,7 @@ def test_warm_still_walks_the_ladder_when_lambda_was_never_reached(monkeypatch):
     tried = []
 
     def unconfigured(**k):
-        # the exact text RestClient.missing_key_message builds in flash/providers/_lifecycle/http.py
+        # the exact text RestClient.missing_key_message builds in flash/providers/_lifecycle/net/http.py
         raise RuntimeError("LAMBDA_API_KEY not configured on the control-plane host")
 
     def rejected(spec, seed, instances, **k):
@@ -2639,7 +2639,7 @@ def test_provisioned_region_snapshot_is_deadline_bounded(monkeypatch):
     line.
     """
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     seen = {}
 
@@ -3577,7 +3577,7 @@ def test_grow_raises_undersized_volumes_and_leaves_the_rest_alone(monkeypatch):
     Existing 100 GB volumes require REST growth to reach 250 GB or larger models still hit
     "Disk quota exceeded".
     """
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     calls = []
 
@@ -3619,7 +3619,7 @@ def test_grow_tolerates_a_volume_listing_without_usable_sizes(monkeypatch):
     Raising here would take down a preload for every datacenter over one bad row from the listing
     API, which is strictly worse than attaching a volume at whatever size it already has.
     """
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     patched = []
 
@@ -3663,8 +3663,8 @@ def test_one_stalling_volume_cannot_starve_the_rest_of_the_fleet(monkeypatch):
     """
     import types
 
-    from flash.providers._lifecycle import deadline as _deadline
-    from flash.providers.runpod import api
+    from flash.providers._lifecycle.net import deadline as _deadline
+    from flash.providers.runpod.client import api
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(_deadline, "time", types.SimpleNamespace(time=lambda: clock["t"]))
@@ -3709,7 +3709,7 @@ def test_warm_grows_the_volume_before_attaching_it(monkeypatch):
     import inspect
 
     from flash import runner
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     # the grow must sit ahead of the create inside the same serialized attempt
     src = inspect.getsource(jobs.deploy_train_endpoint)
@@ -3735,7 +3735,7 @@ def test_a_bad_account_key_never_blocks_a_warm(monkeypatch):
     but a warm aborted over an expired key warms nothing.
     """
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(
         jobs.runpod_api,
@@ -4016,7 +4016,7 @@ def test_an_ordinary_deploy_grows_the_stale_volume_before_attaching(monkeypatch)
     stale size and fail with "Disk quota exceeded".
     """
     from flash import runner
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     calls = []
     monkeypatch.setattr(
@@ -4040,7 +4040,7 @@ def test_an_ordinary_deploy_grows_the_stale_volume_before_attaching(monkeypatch)
 
 def test_an_ordinary_deploy_leaves_a_custom_volume_alone(monkeypatch):
     """Only the platform-managed cache is reconciled; a custom volume is the caller's to size."""
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     calls = []
     monkeypatch.setattr(
@@ -4058,7 +4058,7 @@ def test_an_ordinary_deploy_leaves_a_custom_volume_alone(monkeypatch):
 def test_a_failed_grow_never_blocks_an_ordinary_deploy(monkeypatch):
     """Reconciliation is best-effort: attaching the old size beats failing the deploy outright."""
     from flash import runner
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     def _boom(*_a, **_k):
         raise RuntimeError("runpod unreachable")
@@ -4075,7 +4075,7 @@ def test_deploy_side_grow_takes_a_bounded_budget_not_the_run_deadline(monkeypatc
     Bound its retrying listing separately so a healthy account retains the 60-second create minimum.
     """
     from flash import runner
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     seen = {}
     monkeypatch.setattr(
@@ -4116,9 +4116,9 @@ def test_a_short_timeout_still_reconciles(monkeypatch):
     Growth yields the 60-second create allowance, so callers must add headroom or reconciliation
     receives no budget.
     """
-    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
+    from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod.jobs import (
+    from flash.providers.runpod.execution.jobs import (
         WEIGHT_CACHE_GROW_BUDGET_S,
         weight_cache_grow_headroom_s,
     )
@@ -4149,8 +4149,8 @@ def test_deploy_side_grow_yields_the_create_allowance_it_sits_in_front_of(monkey
     Growth must yield the create allowance before `_deploy_once` rechecks it.
     """
     from flash import runner
-    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
-    from flash.providers.runpod import jobs
+    from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod.execution import jobs
 
     calls = []
     monkeypatch.setattr(
@@ -4178,7 +4178,7 @@ def test_deploy_side_grow_is_wired_to_the_run_deadline(monkeypatch):
     """The deadline must actually reach the helper, not just be honoured once it does."""
     import inspect
 
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     src = inspect.getsource(jobs.deploy_train_endpoint)
     assert "grow_weight_cache_volumes(spec, owning_key, deadline_at, wanted=cache_volumes)" in src
@@ -4192,10 +4192,10 @@ def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
     """
     import runpod_flash
 
-    from flash.providers._lifecycle import deadline as _deadline
-    from flash.providers.runpod import auth as rp_auth
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
+    from flash.providers._lifecycle.net import deadline as _deadline
+    from flash.providers.runpod.client import auth as rp_auth
+    from flash.providers.runpod.client import auth as rp_keys
+    from flash.providers.runpod.execution import jobs
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4252,11 +4252,11 @@ def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch)
     """
     import runpod_flash
 
-    from flash.providers._lifecycle import deadline as _deadline
-    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
-    from flash.providers.runpod import auth as rp_auth
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
+    from flash.providers._lifecycle.net import deadline as _deadline
+    from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod.client import auth as rp_auth
+    from flash.providers.runpod.client import auth as rp_keys
+    from flash.providers.runpod.execution import jobs
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4322,10 +4322,10 @@ def test_a_volume_free_run_reserves_no_grow_time(monkeypatch):
     """
     import runpod_flash
 
-    from flash.providers._lifecycle import deadline as _deadline
-    from flash.providers.runpod import auth as rp_auth
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
+    from flash.providers._lifecycle.net import deadline as _deadline
+    from flash.providers.runpod.client import auth as rp_auth
+    from flash.providers.runpod.client import auth as rp_keys
+    from flash.providers.runpod.execution import jobs
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4370,9 +4370,9 @@ def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
     """
     import runpod_flash
 
-    from flash.providers.runpod import auth as rp_auth
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import auth as rp_auth
+    from flash.providers.runpod.client import auth as rp_keys
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "only-account")
     monkeypatch.setattr(rp_keys, "key_count", lambda: 1)
@@ -4417,10 +4417,10 @@ def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
     import runpod_flash
 
     from flash import runner
-    from flash.providers._lifecycle import deadline as _deadline
-    from flash.providers.runpod import auth as rp_auth
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
+    from flash.providers._lifecycle.net import deadline as _deadline
+    from flash.providers.runpod.client import auth as rp_auth
+    from flash.providers.runpod.client import auth as rp_keys
+    from flash.providers.runpod.execution import jobs
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4463,10 +4463,10 @@ def test_the_grow_reserve_still_caps_what_a_create_may_spend(monkeypatch):
     import runpod_flash
 
     from flash import runner
-    from flash.providers._lifecycle import deadline as _deadline
-    from flash.providers.runpod import auth as rp_auth
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
+    from flash.providers._lifecycle.net import deadline as _deadline
+    from flash.providers.runpod.client import auth as rp_auth
+    from flash.providers.runpod.client import auth as rp_keys
+    from flash.providers.runpod.execution import jobs
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4515,11 +4515,11 @@ def test_the_post_grow_recheck_does_not_recharge_a_paid_slice(monkeypatch):
     import runpod_flash
 
     from flash import runner
-    from flash.providers._lifecycle import deadline as _deadline
-    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
-    from flash.providers.runpod import auth as rp_auth
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
+    from flash.providers._lifecycle.net import deadline as _deadline
+    from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod.client import auth as rp_auth
+    from flash.providers.runpod.client import auth as rp_keys
+    from flash.providers.runpod.execution import jobs
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4574,11 +4574,11 @@ def test_admission_is_rejudged_with_the_key_the_attempt_lands_on(monkeypatch):
     import runpod_flash
 
     from flash import runner
-    from flash.providers._lifecycle import deadline as _deadline
-    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
-    from flash.providers.runpod import auth as rp_auth
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
+    from flash.providers._lifecycle.net import deadline as _deadline
+    from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod.client import auth as rp_auth
+    from flash.providers.runpod.client import auth as rp_keys
+    from flash.providers.runpod.execution import jobs
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4648,11 +4648,11 @@ def test_a_large_key_pool_does_not_zero_the_create_timeout(monkeypatch):
     import runpod_flash
 
     from flash import runner
-    from flash.providers._lifecycle import deadline as _deadline
-    from flash.providers._lifecycle.deadline import CREATE_ALLOWANCE_S
-    from flash.providers.runpod import auth as rp_auth
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
+    from flash.providers._lifecycle.net import deadline as _deadline
+    from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
+    from flash.providers.runpod.client import auth as rp_auth
+    from flash.providers.runpod.client import auth as rp_keys
+    from flash.providers.runpod.execution import jobs
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
@@ -4695,8 +4695,8 @@ def test_a_large_key_pool_does_not_zero_the_create_timeout(monkeypatch):
 
 def test_grow_headroom_covers_every_account_in_the_pool(monkeypatch):
     """The caller cannot fund a whole deploy from a single grow budget: failover reconciles again."""
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import auth as rp_keys
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(rp_keys, "key_count", lambda: 3)
     assert jobs.weight_cache_grow_headroom_s() == jobs.WEIGHT_CACHE_GROW_BUDGET_S * 3
@@ -4712,7 +4712,7 @@ def test_one_bad_volume_never_blocks_the_others(monkeypatch):
     Aborting the loop left later DCs' volumes unreconciled, so a run placed in one still hit
     "Disk quota exceeded" -- the failure this whole path exists to prevent.
     """
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     listed = [
         {"name": "flash-weights-us-ca-2", "id": "v1", "size": 100},
@@ -4787,9 +4787,9 @@ def test_failover_reconciles_the_account_it_lands_on(monkeypatch):
     Reconcile inside each attempt because a pre-sweep cannot know which account will succeed.
     Drive through `deploy_train_endpoint` so dropped `cache_volumes` passthrough fails the test.
     """
-    from flash.providers.runpod import auth as rp_auth
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import auth as rp_auth
+    from flash.providers.runpod.client import auth as rp_keys
+    from flash.providers.runpod.execution import jobs
 
     account = {"key": "first-account"}
     # deploy_train_endpoint imports ensure_auth function-locally, so patch it at the source
@@ -4836,7 +4836,7 @@ def test_datacenter_discovery_failure_never_fails_the_deploy(monkeypatch):
     cannot fail a deploy.
     """
     from flash import runner
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     def _boom():
         raise RuntimeError("incompatible SDK: DataCenter.all() is gone")
@@ -4849,7 +4849,7 @@ def test_datacenter_discovery_failure_never_fails_the_deploy(monkeypatch):
 
 def test_spec_none_without_named_volumes_stays_a_no_op(monkeypatch):
     """Callers that neither carry a spec nor name volumes have nothing to reconcile."""
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.execution import jobs
 
     grown = []
     monkeypatch.setattr(
@@ -4871,7 +4871,7 @@ def test_the_owning_key_is_read_inside_the_serialized_section():
     """
     import inspect
 
-    from flash.providers.runpod import job_execution
+    from flash.providers.runpod.execution import job_execution
 
     src = inspect.getsource(job_execution.deploy_train_endpoint)
     # the key is read under FLASH_SDK_LOCK and that same value is what the grow is charged to, so

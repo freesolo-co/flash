@@ -9,8 +9,8 @@ import re
 import threading
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.providers._lifecycle.worker import logger
-from flash.providers.base import canonical_gpu, gpu_short
+from flash.providers._lifecycle.net.worker import logger
+from flash.providers.core.base import canonical_gpu, gpu_short
 
 # runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
@@ -100,7 +100,7 @@ def _train_body(input_data: dict) -> dict:
         a multiline secret never appears whole in any single call: the child's stdout is sanitized one
         line at a time, so only a component line is ever seen. component lines keep the floor as a hard
         skip: a short one is punctuation such as "}", not a credential. mirrors
-        flash.providers._lifecycle.bootstrap_secrets._needles.
+        flash.providers._lifecycle.bootstrapping.secrets._needles.
         """
         import urllib.parse
 
@@ -541,7 +541,7 @@ def _train_body(input_data: dict) -> dict:
         _install_extra_pip()
         console_module = _load_exact_module(
             code_dir,
-            "flash/providers/_lifecycle/bootstrap_console.py",
+            "flash/providers/_lifecycle/bootstrapping/console.py",
             "_flash_downloaded_bootstrap_console",
         )
         artifact_module = _load_exact_module(
@@ -789,7 +789,7 @@ def _patch_runpod_backoff() -> None:
 
 def min_cuda_for(friendly_gpu: str) -> str:
     """Minimum host CUDA driver version for this GPU class (Blackwell requires >=13.0)."""
-    from flash.providers.base import min_cuda_modern
+    from flash.providers.core.base import min_cuda_modern
 
     return min_cuda_modern(friendly_gpu)
 
@@ -845,7 +845,7 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
     # and a concurrent call could swap the registry scope between our lookup and undeploy.
     with FLASH_SDK_LOCK:
         try:
-            from flash.providers.runpod.auth import ensure_auth
+            from flash.providers.runpod.client.auth import ensure_auth
 
             ensure_auth()
             isolate_flash_state(_run_suffix(run_id))
@@ -918,7 +918,7 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
 
     # registry-less cleanup must inspect every configured account and exact retry suffix.
     try:
-        from flash.providers.runpod import api as runpod_api
+        from flash.providers.runpod.client import api as runpod_api
 
         by_fingerprint, failed_fingerprints = runpod_api.list_endpoints_by_key()
         for fingerprint, endpoints in by_fingerprint.items():

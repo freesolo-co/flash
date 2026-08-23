@@ -11,7 +11,7 @@ import types
 
 import pytest
 
-from flash.serve.urls import is_freesolo_hosted_url
+from flash.serve.contract.urls import is_freesolo_hosted_url
 
 
 def test_login_writes_private_config(monkeypatch):

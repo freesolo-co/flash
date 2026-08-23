@@ -24,7 +24,7 @@ import pathlib
 from dataclasses import fields
 
 import flash.engine.profiling.sft_workload as sft_workload_mod
-import flash.engine.worker.sft_train as sft_train_mod
+import flash.engine.worker.train.entry.sft_train as sft_train_mod
 from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.profiling.sft_workload import sft_max_length as _measured_max_length

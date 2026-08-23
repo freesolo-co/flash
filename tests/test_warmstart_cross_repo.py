@@ -1015,7 +1015,7 @@ def test_worker_metrics_sanitizer_redacts_nested_and_direct_private_refs():
 
 def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_path):
     import flash.runner as R
-    import flash.server.domain.run_registry as registry
+    import flash.server.domain.registry.run_registry as registry
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(R, "RESULTS_DIR", str(tmp_path / "results"))

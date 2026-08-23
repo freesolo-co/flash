@@ -17,10 +17,10 @@ from pathlib import Path
 import pytest
 
 from flash._internal.channel import CLI_NAME
-from flash.cli.commands.env import push as envpush
-from flash.cli.commands.env.push import cmd_env_pull
-from flash.envs import loader as adapter
-from flash.envs.pull import environment_local_dirname
+from flash.cli.commands.env.ops import push as envpush
+from flash.cli.commands.env.ops.push import cmd_env_pull
+from flash.envs.loading import loader as adapter
+from flash.envs.loading.pull import environment_local_dirname
 
 _TOP = "freesolo-co-environment-hub-deadbeef"
 

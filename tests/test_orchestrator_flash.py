@@ -77,7 +77,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         status = runner.submit_job(spec, dry_run=False, background=False)
 
         assert status.state == "done", status.error
-        from flash.providers.runpod.pricing import hourly_rate
+        from flash.providers.runpod.client.pricing import hourly_rate
 
         # We charge the QUOTE (flash.cost estimate); the measured 1h-on-a-4090 cost lands in metrics.json.
         assert status.cost_usd == runner.charge_usd_for_spec(spec), status.cost_usd
@@ -159,7 +159,7 @@ def test_publish_source_snapshot_forces_private_and_captures_commit(monkeypatch,
     import hashlib
     import types
 
-    from flash.providers._lifecycle import worker
+    from flash.providers._lifecycle.net import worker
 
     archive = b"deterministic-source-archive"
     archive_file = tmp_path / "archive.zip"
@@ -208,7 +208,7 @@ def test_publish_source_snapshot_forces_private_and_captures_commit(monkeypatch,
 def test_publish_source_snapshot_creates_missing_repo(monkeypatch, tmp_path):
     import types
 
-    from flash.providers._lifecycle import worker
+    from flash.providers._lifecycle.net import worker
 
     archive = b"archive"
     archive_file = tmp_path / "archive.zip"
@@ -282,7 +282,7 @@ def test_hf_call_honors_retry_after(monkeypatch):
             raise _RateLimited("slow down")
         return "ok"
 
-    monkeypatch.setattr("flash.providers._lifecycle.worker.time.sleep", sleeps.append)
+    monkeypatch.setattr("flash.providers._lifecycle.net.worker.time.sleep", sleeps.append)
     monkeypatch.setattr(flash_train.logger, "warning", lambda msg, *args: logs.append((msg, args)))
 
     assert flash_train._hf_call(flaky, "upload") == "ok"
@@ -312,7 +312,7 @@ def test_hf_call_caps_http_date_retry_after(monkeypatch):
             raise _RateLimited("slow down")
         return "ok"
 
-    monkeypatch.setattr("flash.providers._lifecycle.worker.time.sleep", sleeps.append)
+    monkeypatch.setattr("flash.providers._lifecycle.net.worker.time.sleep", sleeps.append)
     monkeypatch.setattr(flash_train.logger, "warning", lambda *_args: None)
 
     assert flash_train._hf_call(flaky, "upload") == "ok"
@@ -322,7 +322,7 @@ def test_hf_call_caps_http_date_retry_after(monkeypatch):
 def test_publish_source_snapshot_reuses_verified_archive_at_exact_head(monkeypatch, tmp_path):
     import types
 
-    from flash.providers._lifecycle import worker
+    from flash.providers._lifecycle.net import worker
 
     archive = b"same-archive"
     archive_file = tmp_path / "archive.zip"
@@ -361,7 +361,7 @@ def test_publish_source_snapshot_reuses_verified_archive_at_exact_head(monkeypat
 def test_publish_source_snapshot_rereads_concurrent_winner(monkeypatch, tmp_path):
     import types
 
-    from flash.providers._lifecycle import worker
+    from flash.providers._lifecycle.net import worker
 
     archive = b"same-archive"
     archive_file = tmp_path / "archive.zip"

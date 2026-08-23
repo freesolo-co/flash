@@ -17,11 +17,11 @@ from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.testclient import TestClient
 from starlette.responses import StreamingResponse
 
-from flash.serving.src.adapter_routes import remove_adapter
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
-from flash.serving.src.serving_io import _sse
-from flash.serving.src.streaming import _produce_openai_chat_stream, openai_chat_stream
+from flash.serving.src.http.adapter_routes import remove_adapter
+from flash.serving.src.http.router import AdapterRouter, build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.io.serving_io import _sse
+from flash.serving.src.io.streaming import _produce_openai_chat_stream, openai_chat_stream
 from tests.serving.conftest import attest
 
 
@@ -1898,7 +1898,7 @@ def test_concurrent_misses_hydrate_in_order_without_stampeding():
     """
     import asyncio
 
-    from flash.serving.src.lookup import AdapterLookup
+    from flash.serving.src.store.lookup import AdapterLookup
 
     revision = _rec("late", QWEN)
     fresh = [revision, _alias(revision)]
@@ -1961,7 +1961,7 @@ def test_reload_stampede_stays_bounded_as_callers_pile_up():
     """The coalescing must bound fetches by generation, not by caller count."""
     import asyncio
 
-    from flash.serving.src.lookup import AdapterLookup
+    from flash.serving.src.store.lookup import AdapterLookup
 
     calls = {"count": 0}
 
@@ -1988,7 +1988,7 @@ def test_a_reload_that_snapshotted_first_cannot_answer_a_later_miss():
     """
     import asyncio
 
-    from flash.serving.src.lookup import AdapterLookup
+    from flash.serving.src.store.lookup import AdapterLookup
 
     revision = _rec("committed-late", QWEN)
     # snapshotted before production sees the records, for the same reason as above: the router

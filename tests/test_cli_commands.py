@@ -15,9 +15,9 @@ import types
 import pytest
 
 import flash.cli as cli
-from flash.cli.commands import traces as cli_traces
+from flash.cli.commands.ops import traces as cli_traces
 from flash.client.config import DEFAULT_API_URL
-from flash.providers._lifecycle.poll import _format_heartbeat
+from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
 
 def test_format_heartbeat_appends_named_reward_metrics() -> None:
@@ -312,7 +312,7 @@ def test_projects_create_mints_a_local_id_on_a_self_hosted_plane(monkeypatch, ca
     assert _run(["projects", "create", "My project"]) == 0
     minted = capsys.readouterr().out.strip()
 
-    from flash.server.domain.projects import require_project_access
+    from flash.server.domain.registry.projects import require_project_access
 
     monkeypatch.setenv("FLASH_STANDALONE", "1")
     assert (
@@ -498,7 +498,7 @@ def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:
 def test_env_setup_maps_inaccessible_project_to_client_error(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
     from flash.client import ApiError, ClientError
 
     # pinned to a HOSTED url and a key: ownership is only resolved against the backend when the
@@ -527,12 +527,12 @@ def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypat
     Resolving it against ``api.freesolo.co`` sent the operator's plane-root key to a service with
     no relationship to it, which answered 401 -- so `flash env setup`, the first command in the
     SELF_HOSTING.md quickstart, died before writing a file. The plane exposes no project routes at
-    all, so there is nothing else to ask; ``flash/server/domain/projects.py`` performs exactly this
+    all, so there is nothing else to ask; ``flash/server/domain/registry/projects.py`` performs exactly this
     shape-only check under ``standalone()`` when the same run is later submitted.
     """
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
@@ -559,7 +559,7 @@ def _scaffold(monkeypatch, tmp_path, api_url: str | None, *, turn_mode: str | No
     """Run `flash env setup` in tmp_path against a plane at api_url; return the written files."""
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     monkeypatch.setattr(
         env_setup,
@@ -593,8 +593,8 @@ def test_env_setup_scaffolds_the_github_form_on_a_self_hosted_plane(monkeypatch,
     """
     import tomllib
 
-    from flash.cli.commands.env import setup as setup_mod
-    from flash.envs.loader import _parse_github_environment_ref
+    from flash.cli.commands.env.ops import setup as setup_mod
+    from flash.envs.loading.loader import _parse_github_environment_ref
 
     written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
 
@@ -640,7 +640,7 @@ def test_env_setup_keeps_the_push_workflow_on_the_managed_plane(monkeypatch, tmp
 
     An unset api_url is the managed plane too: it means the built-in default.
     """
-    from flash.cli.commands.env import setup as setup_mod
+    from flash.cli.commands.env.ops import setup as setup_mod
 
     placeholders = set(setup_mod._HOSTED_GUIDANCE) | set(setup_mod._SELF_HOSTED_GUIDANCE)
     for index, api_url in enumerate(("https://flash.freesolo.co", None)):
@@ -767,7 +767,7 @@ def test_env_setup_survives_a_retained_starter_it_cannot_decode(
     """
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
     capsys.readouterr()
@@ -829,7 +829,7 @@ def test_env_setup_does_not_let_an_unreadable_env_override_the_turn_flag(
     from argparse import Namespace
     from pathlib import Path
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     starter = tmp_path / "environment.py"
     starter.write_bytes(b"# -*- coding: latin-1 -*-\nclass E(EnvironmentMultiTurn):  # caf\xe9\n")
@@ -881,14 +881,14 @@ def test_training_guide_says_a_private_env_repo_needs_a_plane_side_token(
 ) -> None:
     """The scaffold tells a self-hoster to point at their own repo without naming the token it needs.
 
-    `_github_token` (flash/envs/loader.py) reads `GITHUB_TOKEN` from the resolving process's own
+    `_github_token` (flash/envs/loading/loader.py) reads `GITHUB_TOKEN` from the resolving process's own
     environment and there is no spec or client field that carries one, so a private repo resolves as
     missing no matter what the operator has exported locally. The guide has to name where the token
     belongs, since the failure surfaces as an unreadable ref rather than an auth error.
     """
     import inspect
 
-    from flash.envs import loader
+    from flash.envs.loading import loader
 
     # the premise: the token comes from the plane's process env, not from anything the client sends
     source = inspect.getsource(loader._github_token)
@@ -909,7 +909,7 @@ def test_training_guide_says_env_eval_rejects_a_github_id(monkeypatch, tmp_path)
     """
     import inspect
 
-    from flash.cli.commands.env import eval as env_eval
+    from flash.cli.commands.env.testing import eval as env_eval
 
     # the premise: the gate is a managed-slug check, not a soft preference
     source = inspect.getsource(env_eval._resolve_evaluation_environment)
@@ -938,7 +938,7 @@ def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatc
     """Skipping the ownership lookup must not skip the shape check that stands in for it."""
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
@@ -955,7 +955,7 @@ def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatc
 def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
     from flash.client import ClientError
 
     monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
@@ -988,7 +988,7 @@ def test_env_setup_interactive_lists_projects_from_an_operator_backend(monkeypat
     """
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     project_id = "11111111-1111-4111-8111-111111111111"
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://identity.operator.example")
@@ -1052,7 +1052,7 @@ def test_supplied_project_is_ownership_checked_against_an_operator_backend(monke
 def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     project_id = "11111111-1111-4111-8111-111111111111"
     api_url = "https://flash.freesolo.co"
@@ -1082,7 +1082,7 @@ def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> No
 def test_env_setup_interactive_retains_the_selected_project_name(monkeypatch, tmp_path) -> None:
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     project_id = "11111111-1111-4111-8111-111111111111"
     project_name = "Interactive Project"
@@ -1399,7 +1399,7 @@ def test_inline_records_are_not_labelled_a_published_copy_in_cost_rows(monkeypat
     """
     from types import SimpleNamespace
 
-    from flash.cli.commands import train_cost
+    from flash.cli.commands.ops import train_cost
 
     monkeypatch.setenv("FLASH_STYLE", "0")
     profile = {
@@ -1426,7 +1426,7 @@ def test_published_rows_keep_their_published_labels(monkeypatch) -> None:
     """The inline branch must not relabel an ordinary published quote."""
     from types import SimpleNamespace
 
-    from flash.cli.commands import train_cost
+    from flash.cli.commands.ops import train_cost
 
     monkeypatch.setenv("FLASH_STYLE", "0")
     profile = {
@@ -2261,7 +2261,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
         def grade(self, response, example):
             return True
 
-    from flash.envs.evaluations import load_evaluation_suites
+    from flash.envs.meta.evaluations import load_evaluation_suites
 
     starter_suite = load_evaluation_suites(tmp_path, environment=StarterEnvironment())[0]
     starter_case = starter_suite.cases()[0]
@@ -2463,7 +2463,7 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
     evaluations_text = (tmp_path / "evaluations.py").read_text()
     assert "load_evaluations(environment=None)" in evaluations_text
     # the multi-turn scaffold gets its own suite. `reward(response, example)` with no episode state
-    # sends `_score_one` down the single-turn branch (flash/envs/adapter.py:237-243), which grades an
+    # sends `_score_one` down the single-turn branch (flash/envs/loading/adapter.py:237-243), which grades an
     # EMPTY transcript -- the arithmetic suite scored this guess-the-number env 1.0 on "12".
     assert "self.environment.reward(response, example)" not in evaluations_text
     assert "`score(self, case, response, state)`" in evaluations_text
@@ -2548,7 +2548,7 @@ def test_env_setup_reasoning_conflict_names_every_stale_config(
 
 
 def test_existing_reasoning_ignores_thinking_text_in_comments(tmp_path) -> None:
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     sft = tmp_path / "sft.toml"
     rl = tmp_path / "rl.toml"
@@ -2731,8 +2731,8 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
     )
     assert (tmp_path / "evaluations.py").is_file()
 
-    from flash.envs.evaluations import load_evaluation_suites
-    from flash.envs.loader import load_freesolo_environment
+    from flash.envs.meta.evaluations import load_evaluation_suites
+    from flash.envs.loading.loader import load_freesolo_environment
 
     environment = load_freesolo_environment(str(tmp_path / "environment.py"))
     suite = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0]
@@ -2752,7 +2752,7 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
     # the environment is multi-turn but this suite grades one reply, so it must NOT opt into
     # episode play. driving it would score the last turn instead of the opening action, and these
     # cases carry no `output` for `step_episode` to advance from, so the case would error out.
-    from flash.cli.commands.env.episode import _grades_episodes
+    from flash.cli.commands.env.testing.episode import _grades_episodes
 
     assert environment.multi_turn is True
     assert _grades_episodes(suite) is False
@@ -2771,8 +2771,8 @@ def test_env_setup_multi_turn_eval_case_does_not_duplicate_the_episode_prompt(
         == 0
     )
 
-    from flash.envs.evaluations import load_evaluation_suites
-    from flash.envs.loader import load_freesolo_environment
+    from flash.envs.meta.evaluations import load_evaluation_suites
+    from flash.envs.loading.loader import load_freesolo_environment
 
     environment = load_freesolo_environment(str(tmp_path / "environment.py"))
     case = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0].cases()[
@@ -2806,7 +2806,7 @@ def test_starter_evaluator_fails_a_near_miss_the_environment_rejects(monkeypatch
     monkeypatch.chdir(tmp_path)
     assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
-    from flash.envs.evaluations import load_evaluation_suites
+    from flash.envs.meta.evaluations import load_evaluation_suites
 
     class ShapedEnvironment:
         """Pays partial credit for a wrong answer, exactly as the multi-turn starter does."""
@@ -2914,7 +2914,7 @@ def test_env_setup_uses_project_id_when_canonical_name_is_unusable(
 
 
 def test_env_setup_rejects_blank_folder_name_before_writes(monkeypatch, tmp_path, capsys) -> None:
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     class _BlankCwd:
         name = "   "
@@ -2988,7 +2988,7 @@ def test_submit_payload_carries_authored_pip_and_the_worker_appends_it(
     """
     from flash.client.specs import spec_payload
     from flash.core.spec import EnvironmentSpec, JobSpec
-    from flash.envs.base import worker_pip_with_extras
+    from flash.envs.loading.base import worker_pip_with_extras
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-0.8B",
@@ -3007,7 +3007,7 @@ def test_submit_payload_carries_authored_pip_and_the_worker_appends_it(
 
 def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeypatch) -> None:
     # The --api-key flag is the destination HF token; checkpoint refs and --public are forwarded.
-    from flash.cli.commands import deploy as cli_deploy
+    from flash.cli.commands.ops import deploy as cli_deploy
 
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.setattr(cli_deploy, "_hf_identity_and_write_access", lambda *_: "me")
@@ -3039,7 +3039,7 @@ def test_export_reads_hf_token_from_env_and_defaults_private(
     fake_client, monkeypatch, capsys
 ) -> None:
     # No --api-key: the token resolves from HF_TOKEN, and the repo defaults to private.
-    from flash.cli.commands import deploy as cli_deploy
+    from flash.cli.commands.ops import deploy as cli_deploy
 
     monkeypatch.setenv("HF_TOKEN", "hf_env")
     monkeypatch.setattr(cli_deploy, "_hf_identity_and_write_access", lambda *_: "me")
@@ -5123,7 +5123,7 @@ def test_displayable_url_keeps_ipv6_brackets_and_rejects_bad_ports():
     ``2001:db8::1:8443`` -- an address the reader cannot split back into host and port. A URL
     printed in an error is meant to be copied, so it has to survive the round trip.
     """
-    from flash.serve.urls import displayable_url
+    from flash.serve.contract.urls import displayable_url
 
     assert displayable_url("https://[2001:db8::1]:8443") == "https://[2001:db8::1]:8443"
     assert displayable_url("https://[2001:db8::1]") == "https://[2001:db8::1]"
@@ -5272,8 +5272,8 @@ def test_follow_gives_up_after_the_retry_window_and_names_the_run(monkeypatch, c
     # the retry budget reads the clock in `log_follow`; patch it there rather than relying on
     # `cli.commands.time` happening to be the same module object.
     clock = iter([0.0] + [1000.0] * 20)
-    monkeypatch.setattr(cli.commands.log_follow.time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(cli.commands.log_follow.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(cli.commands.ops.log_follow.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cli.commands.ops.log_follow.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
 
     assert cli.commands._follow_run(_DeadClient(), "flash-dead") == 1

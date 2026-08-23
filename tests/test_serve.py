@@ -22,7 +22,7 @@ _IMMUTABLE_SERVING_CAPABILITIES = {
 
 @pytest.fixture(autouse=True)
 def _stub_shared_http_client(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     class _Client:
         def request(self, method, url, **kwargs):
@@ -91,7 +91,7 @@ def _stub_adapter_config(
         types.SimpleNamespace(hf_hub_download=fake_hf_hub_download, HfApi=_HfApi),
     )
 
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     if stub_capabilities:
         monkeypatch.setattr(
@@ -121,7 +121,7 @@ def _capture_registration_body(
     **deploy_kwargs,
 ):
     """Run a non-dry-run deploy_adapter and return the posted adapter body."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -168,7 +168,7 @@ def _capture_registration_body(
 
 
 def test_deploy_dry_run():
-    from flash.serve.deploy import deploy_adapter
+    from flash.serve.deployment.deploy import deploy_adapter
 
     dep = deploy_adapter(
         run_id="r1",
@@ -188,7 +188,7 @@ def test_deploy_dry_run():
 
 
 def test_thinking_structured_dry_run_does_not_probe_capabilities(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setattr(
         d,
@@ -210,7 +210,7 @@ def test_thinking_structured_dry_run_does_not_probe_capabilities(monkeypatch):
 def test_deploy_9b_dry_run_is_not_rejected():
     """The 9B (bf16 LoRA) tier is deployable: freesolo serving folds the bf16 LoRA delta
     into the bf16 base, instead of being rejected up front."""
-    from flash.serve.deploy import deploy_adapter
+    from flash.serve.deployment.deploy import deploy_adapter
 
     dep = deploy_adapter(
         run_id="q1",
@@ -223,7 +223,7 @@ def test_deploy_9b_dry_run_is_not_rejected():
 
 
 def test_deploy_27b_dry_run_accepts_rank_at_serving_cap():
-    from flash.serve.deploy import deploy_adapter
+    from flash.serve.deployment.deploy import deploy_adapter
 
     dep = deploy_adapter(
         run_id="q27",
@@ -237,7 +237,7 @@ def test_deploy_27b_dry_run_accepts_rank_at_serving_cap():
 
 
 def test_deploy_27b_rejects_lora_rank_above_serving_cap():
-    from flash.serve.deploy import deploy_adapter
+    from flash.serve.deployment.deploy import deploy_adapter
 
     with pytest.raises(ValueError, match="max_lora_rank=64"):
         deploy_adapter(
@@ -252,7 +252,7 @@ def test_deploy_27b_rejects_lora_rank_above_serving_cap():
 
 def test_deploy_rejects_lora_rank_above_serving_cap():
     from flash.core.catalog import serving_lora_rank_cap
-    from flash.serve.deploy import deploy_adapter
+    from flash.serve.deployment.deploy import deploy_adapter
 
     # derive the over-cap rank from the catalog rather than hardcoding it: the 4B cap has moved
     # twice (32 -> 64 -> 128), and a literal here silently stops testing the boundary each time.
@@ -272,7 +272,7 @@ def test_deploy_rejects_lora_rank_above_serving_cap():
 def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, tmp_path):
     """Deploy validates the effective artifact rank, not only spec.train.lora_rank."""
     from flash.core.catalog import serving_lora_rank_cap
-    from flash.serve.deploy import deploy_adapter
+    from flash.serve.deployment.deploy import deploy_adapter
 
     # the artifact's effective rank exceeds the cap even though the spec lora_rank (32) fits, so
     # deploy must catch the ARTIFACT rank. derived from the catalog: pinned to a literal, this stops
@@ -297,7 +297,7 @@ def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, 
 
 
 def test_deploy_rejects_adapter_config_without_rank_metadata(monkeypatch, tmp_path):
-    from flash.serve.deploy import deploy_adapter
+    from flash.serve.deployment.deploy import deploy_adapter
 
     _stub_adapter_config(monkeypatch, tmp_path, config={})
 
@@ -313,7 +313,7 @@ def test_deploy_rejects_adapter_config_without_rank_metadata(monkeypatch, tmp_pa
 
 
 def test_deploy_rejects_falsey_invalid_rank_pattern(monkeypatch, tmp_path):
-    from flash.serve.deploy import deploy_adapter
+    from flash.serve.deployment.deploy import deploy_adapter
 
     _stub_adapter_config(monkeypatch, tmp_path, config={"r": 32, "rank_pattern": []})
 
@@ -329,7 +329,7 @@ def test_deploy_rejects_falsey_invalid_rank_pattern(monkeypatch, tmp_path):
 
 
 def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     def fake_hf_hub_download(**_kwargs):
         raise RuntimeError("hub timeout")
@@ -354,7 +354,7 @@ def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
 
 
 def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     class _Response:
         status_code = 404
@@ -384,7 +384,7 @@ def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
 
 
 def test_deploy_adapter_missing_tensor_file_is_adapter_tensor_missing(monkeypatch, tmp_path):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"README.md": 123})
 
@@ -400,7 +400,7 @@ def test_deploy_adapter_missing_tensor_file_is_adapter_tensor_missing(monkeypatc
 
 
 def test_deploy_adapter_zero_byte_tensor_file_is_adapter_tensor_missing(monkeypatch, tmp_path):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"adapter_model.safetensors": 0})
 
@@ -416,7 +416,7 @@ def test_deploy_adapter_zero_byte_tensor_file_is_adapter_tensor_missing(monkeypa
 
 
 def test_deploy_adapter_rejects_zero_byte_sharded_tensor(monkeypatch, tmp_path):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     _stub_adapter_config(
         monkeypatch,
@@ -439,7 +439,7 @@ def test_deploy_adapter_rejects_zero_byte_sharded_tensor(monkeypatch, tmp_path):
 
 
 def test_deploy_rejects_bin_adapter_tensor(monkeypatch, tmp_path):
-    from flash.serve.deploy import AdapterTensorMissing, adapter_artifact_metadata
+    from flash.serve.deployment.deploy import AdapterTensorMissing, adapter_artifact_metadata
 
     seen = _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"adapter_model.bin": None})
 
@@ -449,7 +449,7 @@ def test_deploy_rejects_bin_adapter_tensor(monkeypatch, tmp_path):
 
 
 def test_deploy_adapter_options_are_keyword_only():
-    from flash.serve.deploy import deploy_adapter
+    from flash.serve.deployment.deploy import deploy_adapter
 
     with pytest.raises(TypeError):
         deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0", True)
@@ -458,7 +458,7 @@ def test_deploy_adapter_options_are_keyword_only():
 def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serving_registry):
     """A non-dry-run deploy POSTs the adapter to {FREESOLO_SERVING_URL}/adapters with the
     right body and the internal-key auth header."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -611,7 +611,7 @@ def test_deploy_registers_structured_outputs_for_thinking_after_capability_probe
 def test_thinking_structured_capability_failure_never_posts_adapter(
     monkeypatch, tmp_path, health_case, match
 ):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
@@ -674,7 +674,7 @@ def test_missing_provenance_only_still_deploys(monkeypatch, tmp_path):
     thinking/structured-outputs cap, but NOT revision_provenance. That must NOT block the deploy
     (regression guard for the org-wide `serving_contract_unsupported: ... revision_provenance`
     outage): the capability check passes and registration is attempted."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
@@ -719,7 +719,7 @@ def test_missing_provenance_only_still_deploys(monkeypatch, tmp_path):
 
 
 def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatch, tmp_path):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
@@ -779,7 +779,7 @@ def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatc
 
 
 def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     revision = "run-1@final." + "a" * 40
     ready = {
@@ -811,7 +811,7 @@ def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
 
 
 def test_wait_revision_ready_caps_reads_by_remaining_wall_time(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     revision = "run-1@final." + "a" * 40
     clock = [100.0]
@@ -845,7 +845,7 @@ def test_revision_ready_budget_scales_with_base_model_size():
     as `remained 'registered'`; re-running the identical deploy against the now-warm engine
     succeeded. Bigger base, bigger budget.
     """
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
     from flash.core.catalog import MODELS
 
     smallest = d.revision_ready_budget_seconds("Qwen/Qwen3.5-0.8B")
@@ -888,7 +888,7 @@ def test_revision_ready_budget_scales_with_base_model_size():
 
 def test_revision_ready_budget_unknown_model_keeps_the_floor():
     """A fork's own catalog entry or a revision-pinned id must not fail the lookup into an error."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     for unknown in ("some-org/not-in-catalog", "", "   "):
         assert d.revision_ready_budget_seconds(unknown) == d.REVISION_READY_MIN_BUDGET_SECONDS
@@ -903,7 +903,7 @@ def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
     before the CLI's default `--wait` gives up, so the cap must reserve time rather than merely clear
     smoke.
     """
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     # take the CLI default from the parser rather than restating it, so the two cannot drift apart
     # silently: shrinking bare `--wait` must fail here, not in a deploy.
@@ -926,7 +926,7 @@ def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
 
 def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_path):
     """`deploy_adapter` must pass the scaled budget; the default argument alone is the old bug."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
     monkeypatch.setattr(d, "resolve_hf_revision", lambda _repo: "a" * 40)
@@ -962,7 +962,7 @@ def test_revision_ready_timeout_message_is_self_diagnosing(monkeypatch):
     subsystem. The distinction matters operationally: retrying is correct for this message and
     wrong for an actively rejected adapter.
     """
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     revision = "run-1@final." + "a" * 40
     clock = [100.0]
@@ -997,7 +997,7 @@ def test_revision_ready_timeout_reports_the_loader_failure(monkeypatch):
     This is the evidence that says which subsystem is at fault; dropping it is what made the
     original message send readers to serving when the cause was upstream.
     """
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     revision = "run-1@final." + "a" * 40
     clock = [100.0]
@@ -1031,7 +1031,7 @@ def test_revision_ready_timeout_reports_the_loader_failure(monkeypatch):
 
 def test_revision_ready_timeout_distinguishes_a_never_visible_record(monkeypatch):
     """A revision that 404s for the whole budget is a different fault from a slow load."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     revision = "run-1@final." + "a" * 40
     clock = [100.0]
@@ -1061,7 +1061,7 @@ def test_a_cleared_loader_failure_is_not_reported_after_the_timeout(monkeypatch)
     Retaining the first one makes the timeout prescribe "fix the artifact" for what the final
     record says is an ordinary cold-engine timeout -- the wrong direction, again.
     """
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     revision = "run-1@final." + "a" * 40
     clock = [100.0]
@@ -1099,7 +1099,7 @@ def test_a_loader_failure_survives_later_transient_read_errors(monkeypatch):
     the read error points at serving -- but serving already said the artifact is wrong, and that
     survives a warm engine. The deterministic complaint is the actionable half and must be kept.
     """
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     revision = "run-1@final." + "a" * 40
     clock = [100.0]
@@ -1140,7 +1140,7 @@ def test_a_loader_failure_survives_later_transient_read_errors(monkeypatch):
 
 def test_rejected_adapter_still_fails_distinctly_from_a_timeout(monkeypatch):
     """The rejection path must keep its own message: retrying it is wrong."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     revision = "run-1@final." + "a" * 40
     monkeypatch.setattr(
@@ -1165,7 +1165,7 @@ def test_rejected_adapter_still_fails_distinctly_from_a_timeout(monkeypatch):
 
 
 def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp_path):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     real_wait_revision_ready = d._wait_revision_ready
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
@@ -1218,7 +1218,7 @@ def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp
 
 
 def test_registered_adapter_caps_request_timeout(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     seen = {}
 
@@ -1238,7 +1238,7 @@ def test_registered_adapter_caps_request_timeout(monkeypatch):
 
 
 def test_adapter_alias_target_rejects_legacy_record(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     revision = "run-1@final." + "a" * 40
     monkeypatch.setattr(
@@ -1267,7 +1267,7 @@ def test_adapter_alias_target_rejects_legacy_record(monkeypatch):
 def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_serving_registry):
     """When the deploying org is known, registration carries `org_id` so serving can persist
     hosted_lora_adapters.org_id and later authorize external chat by org. Omitted when unknown."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -1314,7 +1314,7 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
     """Registration carries the run's training `thinking` flag so serving can default
     enable_thinking to it for raw chat callers (those that omit chat_template_kwargs). A
     thinking=true run registers thinking=true; a thinking=false run registers thinking=false."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -1362,7 +1362,7 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
 def test_deploy_propagates_serving_error(monkeypatch, tmp_path):
     """A non-2xx from the serving app surfaces as a ServingError (the server maps it to a 502)
     instead of swallowing it or letting a raw httpx error escape as an unhandled 500."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
 
@@ -1379,7 +1379,7 @@ def test_deploy_propagates_serving_error(monkeypatch, tmp_path):
 
 def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
     """A terminal /v1 override keeps undeploy calls on the serving control root."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -1429,7 +1429,7 @@ def test_undeploy_propagates_serving_error(monkeypatch):
     """A non-404 failure from the serving app surfaces as a ServingError (carrying the upstream
     status, so the server maps it to a 502) — exactly like deploy — instead of letting a raw
     httpx error escape as an unhandled 500. A 404 still no-ops (already-gone is success)."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     class _Resp:
         def __init__(self, code):
@@ -1465,7 +1465,7 @@ def test_undeploy_propagates_serving_error(monkeypatch):
 
 
 def test_chat_classifies_retryable_alias_smoke_503_for_the_expected_revision(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     run_id = "run-1"
     revision = f"{run_id}@final." + "a" * 40
@@ -1533,7 +1533,7 @@ def test_chat_classifies_retryable_alias_smoke_503_for_the_expected_revision(mon
     ],
 )
 def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     revision = "run-1@final." + "a" * 40
 
@@ -1582,7 +1582,7 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
 
 def test_chat_posts_to_freesolo_serving(monkeypatch):
     """A terminal /v1 override produces one OpenAI path for direct chat."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -1647,7 +1647,7 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
 
 
 def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -1682,7 +1682,7 @@ def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkey
 
 def test_chat_stream_yields_openai_sse_content(monkeypatch):
     """A terminal /v1 override produces one OpenAI path for streaming chat."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -1760,7 +1760,7 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
     """
     import httpx
 
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
 
@@ -1785,7 +1785,7 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
 
 def _erroring_stream_seams(monkeypatch, resp):
     """Point the chat_stream seams at a fake client whose stream() yields ``resp``."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     class _FakeClient:
         def stream(self, method, url, **kwargs):
@@ -1805,7 +1805,7 @@ def test_chat_stream_upstream_error_raises_before_first_chunk(monkeypatch):
     """
     import httpx
 
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     exits = []
 
@@ -1857,7 +1857,7 @@ def test_chat_stream_midstream_failure_raises_and_closes_upstream(monkeypatch):
 
     The propagating exception is what makes the serving route abort the chunked body, so the
     client sees a truncated transfer rather than a clean eof."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     resp = _MidstreamFailureResp()
     _erroring_stream_seams(monkeypatch, resp)
@@ -1875,7 +1875,7 @@ def test_chat_stream_close_without_iterating_closes_upstream(monkeypatch):
     chat_stream opens the upstream connection eagerly, so the returned generator must already
     be running: close() on a never-started generator skips the finally that exits the httpx
     stream context."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     resp = _MidstreamFailureResp()
     _erroring_stream_seams(monkeypatch, resp)
@@ -1894,7 +1894,7 @@ def test_internal_key_is_stripped_on_cross_origin_redirect(monkeypatch):
     """
     import httpx
 
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -1919,7 +1919,7 @@ def test_internal_key_survives_same_origin_redirect_polls(monkeypatch):
     """Modal's async-result poll flow (same-origin 303s) must keep working with the key."""
     import httpx
 
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -1949,7 +1949,7 @@ def test_serving_clients_bound_redirect_chains(monkeypatch):
     """
     import httpx
 
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     # sized for the 30-minute chat timeout at one poll hop per ~150s, with margin.
     assert d._MAX_REDIRECTS * 150 >= 30 * 60

@@ -152,7 +152,7 @@ def test_image_sft_warm_start_inherits_the_source_pin_like_any_other_algorithm()
     """
     from dataclasses import replace
 
-    from flash.runner.preparation import _adopted_warmstart_revision
+    from flash.runner.lifecycle.preparation import _adopted_warmstart_revision
 
     spec = JobSpec.from_dict(_image_sft_spec())
     assert spec.algorithm == "sft"

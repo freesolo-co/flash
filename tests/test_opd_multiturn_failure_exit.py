@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.train.opd import failures
+from flash.engine.worker.train.opd.orchestration import failures
 from flash.engine.worker.train.opd.child import bridge, multiturn
 
 
@@ -375,7 +375,7 @@ def test_parent_reconciliation_reports_rollout_record_before_subprocess_status(
     monkeypatch,
     tmp_path,
 ):
-    import flash.engine.worker.opd_train_runner as opd_runner
+    import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     rollout_path = tmp_path / "rollout-failure"
     monkeypatch.setenv("FLASH_OPD_ROLLOUT_FAILURE_PATH", str(rollout_path))
@@ -412,7 +412,7 @@ def test_parent_reconciliation_reports_rollout_record_before_subprocess_status(
 
 
 def test_copied_child_shims_import_flat_without_flash_package(tmp_path):
-    import flash.engine.worker.opd_train_runner as runner
+    import flash.engine.worker.train.entry.opd_train_runner as runner
 
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()

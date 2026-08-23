@@ -40,7 +40,7 @@ def _fake_lambda_types() -> dict:
     drift from the real naming (the class is ``gpu_1x_h100_pcie``, not the ``_sxm5`` one might
     guess) and quietly stock a catalog nothing ever looks up.
     """
-    from flash.providers.lambda_.gpus import instance_type_for
+    from flash.providers.lambda_.client.gpus import instance_type_for
 
     return {
         instance_type_for(_TRI_PROVIDER_GPU, n): {
@@ -81,8 +81,8 @@ def all_providers_configured(monkeypatch):
     calls are stubbed at their single entry points -- ``list_instance_types`` and ``search_offers``
     -- leaving every line of the count-aware provider code under test and only the transport faked.
     """
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.providers.vast import api as vast_api
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("LAMBDA_API_KEY", "test-key-not-used")
     monkeypatch.setenv("VAST_API_KEY", "test-key-not-used")
@@ -156,7 +156,7 @@ def test_provider_only_offers_counts_it_can_rent(all_providers_configured, provi
     managed model's head count is a power of two: a 3-card box would abort at engine init.
     """
     from flash.providers import get_provider
-    from flash.providers.base import AllocationConstraints, rentable_gpu_counts
+    from flash.providers.core.base import AllocationConstraints, rentable_gpu_counts
 
     # spelled out rather than taken from rentable_gpu_counts: the providers call that same helper, so
     # comparing candidates against it would compare the code to itself and could never disagree.
@@ -183,7 +183,7 @@ def test_single_card_constraint_yields_only_single_card_offers(all_providers_con
     the constraint entirely would still look correct in the max_gpu_count=8 test above.
     """
     from flash.providers import available_providers, get_provider
-    from flash.providers.base import AllocationConstraints
+    from flash.providers.core.base import AllocationConstraints
 
     checked = []
     for name in available_providers():
@@ -199,7 +199,7 @@ def test_single_card_constraint_yields_only_single_card_offers(all_providers_con
 
 def test_lambda_names_the_card_count_in_the_instance_type():
     """Lambda reaches an n-card box only by rewriting the count segment of the type name."""
-    from flash.providers.lambda_.gpus import instance_type_for
+    from flash.providers.lambda_.client.gpus import instance_type_for
 
     one = instance_type_for("H100")
     assert one.startswith("gpu_1x_")
@@ -215,7 +215,7 @@ def test_lambda_resolves_a_multi_card_sku_that_renames_its_suffix():
     derived ``gpu_8x_h100_pcie`` does not exist. ``regions_with_capacity`` answers [] for an unknown
     type, which reads as "sold out" rather than "wrong name" -- real capacity disappears silently.
     """
-    from flash.providers.lambda_.gpus import instance_type_for
+    from flash.providers.lambda_.client.gpus import instance_type_for
 
     derived = instance_type_for("H100", 4)
     real = derived.replace("_pcie", "_sxm5")
@@ -237,7 +237,7 @@ def test_lambda_catalog_suffix_fallback_preserves_the_managed_memory_class():
     arbitrarily; in the live catalog that selected the 80 GB box at $22.32/hr instead of the fitting
     40 GB box at $15.92/hr while still labelling the candidate ``A100 SXM 40GB``.
     """
-    from flash.providers.lambda_.gpus import instance_type_for
+    from flash.providers.lambda_.client.gpus import instance_type_for
 
     forty = "gpu_8x_a100"
     eighty = "gpu_8x_a100_80gb_sxm4"
@@ -270,10 +270,10 @@ def test_lambda_missing_required_count_sku_is_terminal(monkeypatch):
     Without the catalog check both cases return no live candidates and the allocator retries them as
     capacity failures. A shape Lambda does not sell can never recover by retrying.
     """
-    from flash.providers.base import AllocationConstraints, UnsupportedGpuError
+    from flash.providers.core.base import AllocationConstraints, UnsupportedGpuError
     from flash.providers.lambda_ import LambdaProvider
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.providers.lambda_.gpus import instance_type_for
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.client.gpus import instance_type_for
 
     gpu = "A100 SXM 40GB"
 
@@ -307,8 +307,8 @@ def test_lambda_missing_required_count_sku_is_terminal(monkeypatch):
 
 def test_lambda_sku_miss_is_provider_local_during_auto_allocation(monkeypatch):
     """A missing Lambda count SKU must not discard a valid shape from another provider."""
-    import flash.providers.allocator as allocator
-    from flash.providers.base import Candidate, UnsupportedGpuError, gpu_classes_for
+    import flash.providers.core.allocator as allocator
+    from flash.providers.core.base import Candidate, UnsupportedGpuError, gpu_classes_for
 
     class _LambdaMiss:
         live_capacity = True
@@ -343,8 +343,8 @@ def test_lambda_instance_type_never_reaches_the_network():
     An in-function catalog fetch turns a pure name lookup into live I/O on every sizing call and
     deadlocks the offline test path. Callers holding a catalog pass it; nobody else pays.
     """
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.providers.lambda_.gpus import instance_type_for
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.client.gpus import instance_type_for
 
     def explode(*_a, **_k):
         raise AssertionError("instance_type_for fetched the catalog")
@@ -377,7 +377,7 @@ def test_lambda_price_is_per_card_not_per_instance():
 
     monkey = pytest.MonkeyPatch()
     try:
-        monkey.setattr("flash.providers.lambda_.pricing.hourly_rate", fake_rate)
+        monkey.setattr("flash.providers.lambda_.client.pricing.hourly_rate", fake_rate)
         monkey.setattr(lj.lambda_api, "regions_with_capacity", fake_regions)
         four = lj.usable_instances("H100", gpu_count=4)
     finally:
@@ -513,7 +513,7 @@ def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
     1-card box while the worker still starts n ranks -- the exact billing exposure the submit-path
     test guards, reached through the other door.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs as lj
     from flash.providers.lambda_.jobs.builders import LambdaInstance
 
@@ -561,7 +561,7 @@ def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
 
 def test_vast_capacity_refresh_keeps_the_allocated_card_count():
     """Same contract on Vast: ``usable_offers`` defaults ``num_gpus`` to 1 on an omitted refresh."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vj
     from flash.providers.vast.jobs.builders import VastOffer
 
@@ -622,7 +622,7 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
     cards = 4
 
     if provider == "lambda":
-        from flash.providers.lambda_ import api as lambda_api
+        from flash.providers.lambda_.client import api as lambda_api
         from flash.providers.lambda_ import jobs as lj
         from flash.providers.lambda_.jobs.builders import LambdaInstance
 
@@ -649,7 +649,7 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
         finally:
             monkey.undo()
     else:
-        from flash.providers.vast import api as vast_api
+        from flash.providers.vast.client import api as vast_api
         from flash.providers.vast import jobs as vj
         from flash.providers.vast.jobs.builders import VastOffer
 
@@ -682,7 +682,7 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
 
     assert handle.hourly_usd == pytest.approx(per_card * cards)
     # and the realized-COGS reader must agree, since that is the consumer that would under-bill.
-    from flash.providers.realized import realized_cost_for_remote
+    from flash.providers.core.realized import realized_cost_for_remote
 
     realized = realized_cost_for_remote(
         {
@@ -707,7 +707,7 @@ def test_retry_bookkeeping_distinguishes_card_counts_of_one_class():
     so a 2-tuple ``(provider, gpu)`` retry key marks EVERY count tried the moment one fails and the
     walk skips a wider shape that would have fit.
     """
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
     from flash.runner.supervise.lifecycle import _select_candidate, _shape_key
 
     two = Candidate(
@@ -777,7 +777,7 @@ def test_gpu_count_is_honoured_by_parse_time_sizing():
     Pinned to a need no single validated class holds (180 GB max) but four cards do, so the
     assertion cannot pass by accident on a run that fits one card anyway.
     """
-    from flash.providers.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
+    from flash.providers.core.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
 
     need = 234
     assert all(info.vram_gb < need for info in _validated_infos()), (
@@ -791,7 +791,7 @@ def test_gpu_count_is_honoured_by_parse_time_sizing():
         chosen = cheapest_gpu(need, gpu_count=count)
         # the shape it names must genuinely hold the run under the SAME fit model the allocator
         # applies at submit time -- naming a class that does not fit would just move the failure.
-        from flash.providers.base import get_gpu_info
+        from flash.providers.core.base import get_gpu_info
 
         assert combined_vram_gb(get_gpu_info(chosen).vram_gb, count) >= need
 
@@ -803,7 +803,7 @@ def test_public_max_gpu_count_is_rentable_not_silently_clamped():
     ``gpu.count = 8``; clamping it to 4 makes that provider capacity unreachable and contradicts the
     authored ceiling without an error.
     """
-    from flash.providers.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
+    from flash.providers.core.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
 
     # above the widest 4-card shape but below 8x B200, so restoring the old cap to 4 kills this test.
     need = 700
@@ -811,7 +811,7 @@ def test_public_max_gpu_count_is_rentable_not_silently_clamped():
     with pytest.raises(UnsupportedGpuError):
         cheapest_gpu(need, gpu_count=4)
     chosen = cheapest_gpu(need, gpu_count=8)
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.base import get_gpu_info
 
     assert combined_vram_gb(get_gpu_info(chosen).vram_gb, 8) >= need
 
@@ -826,7 +826,7 @@ def test_eight_cards_require_validated_head_geometry(monkeypatch):
     """
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     monkeypatch.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
 
@@ -850,7 +850,7 @@ def test_geometry_cap_follows_each_models_own_head_count():
     is capped at 4 instead of rented at 8 and failed in Ulysses init.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     for model_id, info in MODELS.items():
         heads = info.num_attention_heads
@@ -905,7 +905,7 @@ def test_a_certified_pin_reaches_eight_cards():
     pinned commit's own config is readable, so it is what decides the width.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     monkey = pytest.MonkeyPatch()
     try:
@@ -931,7 +931,7 @@ def test_a_pin_that_contradicts_the_catalog_certifies_nothing():
     when sizing runs, so the conservative ceiling here is belt-and-braces rather than the only gate.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     info = MODELS["Qwen/Qwen3.5-9B"]
     assert info.num_attention_heads == 16
@@ -962,7 +962,7 @@ def test_a_pin_without_parameter_metadata_certifies_nothing():
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     info = MODELS["Qwen/Qwen3.5-9B"]
 
@@ -1022,7 +1022,7 @@ def test_a_pinned_head_lookup_is_not_repeated_or_cached_on_failure():
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     info = MODELS["Qwen/Qwen3.5-9B"]
     rev = "a" * 40
@@ -1132,7 +1132,7 @@ def test_only_the_submission_path_certifies_a_pin():
     import inspect
 
     import flash.cost.analytical as analytical
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.schema as schema
 
     def _certifying_calls(module) -> list[bool]:
@@ -1178,7 +1178,7 @@ def test_a_low_ceiling_pin_does_not_reach_the_hub():
     """
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     monkey = pytest.MonkeyPatch()
     try:
@@ -1217,7 +1217,7 @@ def test_a_blip_after_sizing_cannot_narrow_an_already_validated_pin():
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     model = "Qwen/Qwen3.5-9B"
     info = MODELS[model]
@@ -1255,7 +1255,7 @@ def test_geometry_cap_narrows_a_row_whose_heads_do_not_divide_eight():
     from dataclasses import replace
 
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     awkward = replace(MODELS["Qwen/Qwen3.5-9B"], id="Qwen/Fake-20-Head", num_attention_heads=20)
     patched = dict(MODELS)
@@ -1290,7 +1290,7 @@ def test_an_uncertified_pin_still_narrows_below_the_four_card_ceiling():
     from dataclasses import replace
 
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     six = replace(MODELS["Qwen/Qwen3.5-9B"], id="Qwen/Fake-6-Head", num_attention_heads=6)
     patched = dict(MODELS)
@@ -1329,8 +1329,8 @@ def test_unpinned_sold_out_live_market_stays_retryable():
     as terminal, killing a run a retry would have placed. A genuinely oversized run must still fail
     terminally, so the distinction is gated on whether any offered shape could hold the run at all.
     """
-    import flash.providers.allocator as alloc
-    from flash.providers.base import CapacityLookupError, UnsupportedGpuError
+    import flash.providers.core.allocator as alloc
+    from flash.providers.core.base import CapacityLookupError, UnsupportedGpuError
 
     class _SoldOutLiveMarket:
         name = "lambda"
@@ -1340,7 +1340,7 @@ def test_unpinned_sold_out_live_market_stays_retryable():
             return []  # structurally offered, nothing free right now
 
         def gpu_classes(self):
-            from flash.providers import base
+            from flash.providers.core import base
 
             return base.gpu_classes_for("lambda_name")
 
@@ -1360,7 +1360,7 @@ def test_unpinned_sold_out_live_market_stays_retryable():
 
 
 def _validated_infos():
-    from flash.providers.base import GPU_INFO
+    from flash.providers.core.base import GPU_INFO
 
     return [info for info in GPU_INFO.values() if info.validated]
 
@@ -1405,7 +1405,7 @@ def test_unpinned_quote_bills_the_allocator_selected_count():
     """The exact lifecycle quote charges selected count and timing, never the authored ceiling."""
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
 
     config = RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=100, gpu_count=8)
     one = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 1))
@@ -1425,7 +1425,7 @@ def test_vast_keeps_confirmed_shapes_when_another_count_query_fails():
     failed allocation when the 2-card query blipped -- unrecoverable at `max_retries=0`. Only a
     total lookup failure may raise.
     """
-    from flash.providers.base import AllocationConstraints, CapacityLookupError
+    from flash.providers.core.base import AllocationConstraints, CapacityLookupError
     from flash.providers.vast import VastProvider
 
     provider = VastProvider()
@@ -1447,7 +1447,7 @@ def test_vast_keeps_confirmed_shapes_when_another_count_query_fails():
 
     monkey = pytest.MonkeyPatch()
     try:
-        monkey.setattr("flash.providers.vast.pricing.live_candidate_rates", _flaky)
+        monkey.setattr("flash.providers.vast.client.pricing.live_candidate_rates", _flaky)
         got = provider.live_candidates(
             fitting_vram, AllocationConstraints(max_gpu_count=4, disk_gb=100.0)
         )
@@ -1456,7 +1456,7 @@ def test_vast_keeps_confirmed_shapes_when_another_count_query_fails():
         assert calls == [4, 2, 1]  # every count still attempted, none short-circuited
 
         calls.clear()
-        monkey.setattr("flash.providers.vast.pricing.live_candidate_rates", _all_dead)
+        monkey.setattr("flash.providers.vast.client.pricing.live_candidate_rates", _all_dead)
         # nothing confirmed anywhere -> still retryable, not a terminal "no GPU fits".
         with pytest.raises(CapacityLookupError):
             provider.live_candidates(
@@ -1476,8 +1476,8 @@ def test_lambda_single_card_pricing_survives_a_catalog_outage():
     for EVERY Lambda quote -- even though the per-type price lookup underneath would have answered
     fine. Live pricing that silently reverts to a stale snapshot misprices allocation and billing.
     """
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.providers.lambda_.pricing import _STATIC_RATES, hourly_rate
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.client.pricing import _STATIC_RATES, hourly_rate
 
     live_rate, calls = 2.49, []
 
@@ -1509,7 +1509,7 @@ def test_structured_opd_compiler_vocab_is_card_independent():
     inside resolution, so the shape cannot reach it and cannot reject anything: the resolved
     vocabulary is a function of the model and its revision alone.
     """
-    from flash.engine.worker.train.opd.validation import _resolve_compiler_vocab_size
+    from flash.engine.worker.train.opd.orchestration.validation import _resolve_compiler_vocab_size
 
     seen: list[tuple] = []
 
@@ -1578,8 +1578,8 @@ def test_every_catalog_row_shards_on_every_vllm_tensor_parallel_axis():
     divides on query heads is caught here rather than on a paid box.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
-    from flash.providers.base import rentable_gpu_counts
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.base import rentable_gpu_counts
 
     for model_id, info in MODELS.items():
         cap = geometry_safe_gpu_cap(model_id, 8)

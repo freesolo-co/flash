@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from flash.serving.src.model_config import base_models, gpu_for
+from flash.serving.src.engine.model_config import base_models, gpu_for
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -340,7 +340,7 @@ def test_router_secret_keeps_supabase_credentials(modal_app_module, monkeypatch)
 
 
 def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_path) -> None:
-    from flash.serving.src.registry import AdapterRegistry
+    from flash.serving.src.store.registry import AdapterRegistry
 
     revision = "a" * 40
     adapter_id = f"run-1@step-1.{revision}"
@@ -403,7 +403,7 @@ def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
 
 
 builtins.__import__ = blocked_import
-import flash.serving.src.lora_engine
+import flash.serving.src.engine.lora_engine
 
 assert "PIL" not in sys.modules
 assert "flash.serving.src.multimodal" not in sys.modules
@@ -566,7 +566,7 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
     """_health must advertise the EFFECTIVE context limit. The 35B MoE overrides max_model_len via its
     per-model engine override, so health must report that — not the global default — or monitoring
     misreports the context window vLLM actually serves."""
-    from flash.serving.src import settings as cfg
+    from flash.serving.src.store import settings as cfg
 
     impl = modal_app_module._LoraEngineImpl
 
@@ -585,7 +585,7 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
 
 
 def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
-    from flash.serving.src import model_config
+    from flash.serving.src.engine import model_config
 
     mod = modal_app_module
     monkeypatch.setattr(model_config, "base_models", lambda: ["ok", "boom"])
@@ -750,7 +750,7 @@ def _load_engine_and_args(
     monkeypatch.setattr(
         transformers.AutoProcessor, "from_pretrained", lambda *a, **k: fake_processor
     )
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     import vllm  # conftest stub when real vLLM is absent
 

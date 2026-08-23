@@ -344,7 +344,7 @@ run. Count what the worker will actually get, with the **same params as the subm
 config**:
 
 ```python
-from flash.envs.base import load_environment
+from flash.envs.loading.base import load_environment
 
 env = load_environment("<your-env-id>", params={...})  # the [environment.params] you submit
 print(len(env.dataset()))
@@ -1438,7 +1438,7 @@ path and the model can correct itself, while a wrongly-applied one desynchronise
 reward for the rest of the episode.
 
 Gate that on the template, not on `thinking`. Flash's own flag is `thinking` **and** "the
-rendered prompt ends inside `<think>`" (`flash/engine/worker/train/rl/inputs.py`), so under
+rendered prompt ends inside `<think>`" (`flash/engine/worker/train/rl/launch/inputs.py`), so under
 `thinking = true` with a template that does not pre-open, a tagless `<move>...</move>` is a
 valid answer that Flash grades as one — rejecting it there desynchronises state from reward in
 the opposite direction. Render one prompt with your model's tokenizer to see which case you are

@@ -11,9 +11,9 @@ import pytest
 from synchronicity import Synchronizer
 
 from flash.serve.control import ModalCredentials
-from flash.serve.provisioning._modal_plan import MODAL_VOLUME_MOUNT, build_modal_create_plan
-from flash.serve.provisioning._modal_sdk import ModalSdkFailure, PinnedModalSdk
-from flash.serve.provisioning._modal_wrapper import launch_modal_server
+from flash.serve.provisioning.modal.planning.plan import MODAL_VOLUME_MOUNT, build_modal_create_plan
+from flash.serve.provisioning.modal.execution.sdk import ModalSdkFailure, PinnedModalSdk
+from flash.serve.provisioning.modal.planning.wrapper import launch_modal_server
 from tests.test_serve_provisioning_modal import (
     APP_ID,
     ARTIFACT_SECRET,
@@ -598,7 +598,7 @@ class _DeferredThread:
 
 
 def _defer_modal_watcher(monkeypatch) -> list[_DeferredThread]:
-    from flash.serve.provisioning import _modal_wrapper
+    from flash.serve.provisioning.modal.planning import wrapper as _modal_wrapper
 
     watchers = []
 
@@ -663,7 +663,7 @@ def _assert_modal_wrapper_signals_parent(monkeypatch, exit_code: int) -> None:
     import signal
 
     from flash.serve.app import launch
-    from flash.serve.provisioning import _modal_wrapper
+    from flash.serve.provisioning.modal.planning import wrapper as _modal_wrapper
 
     parent_pid = 2468
     signals = []
@@ -805,7 +805,7 @@ def test_pinned_sdk_deploys_exact_image_without_local_source_overlays() -> None:
     assert function["region"] == "us-east-1"
     assert function["include_source"] is False
     assert modal.calls["function_target"] is launch_modal_server
-    assert launch_modal_server.__module__ == "flash.serve.provisioning._modal_wrapper"
+    assert launch_modal_server.__module__ == "flash.serve.provisioning.modal.planning.wrapper"
     assert modal.calls["web_server"] == (
         8000,
         bootstrap.startup_timeout_seconds,
@@ -905,7 +905,7 @@ def test_id_mutation_deadline_is_ambiguous_and_cancels_the_owning_loop_rpc() -> 
 
 
 def test_id_mutation_declines_when_the_generated_request_is_unavailable(monkeypatch) -> None:
-    from flash.serve.provisioning import _modal_sdk
+    from flash.serve.provisioning.modal.execution import sdk as _modal_sdk
 
     plan = build_modal_create_plan(_bundle())
     modal = _ModalModule(plan)

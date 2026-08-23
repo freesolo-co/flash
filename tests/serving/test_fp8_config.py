@@ -30,9 +30,9 @@ def engine_args():
     The conftest installs the vLLM stub at import, so this resolves against the same
     ``AsyncEngineArgs`` field set the engine would see on a build missing newer args.
     """
-    from flash.serving.src import settings as cfg
-    from flash.serving.src.engine_boot import engine_args_for
-    from flash.serving.src.model_config import engine_overrides_for
+    from flash.serving.src.store import settings as cfg
+    from flash.serving.src.engine.boot import engine_args_for
+    from flash.serving.src.engine.model_config import engine_overrides_for
 
     def _for(model: str, **overrides):
         resolved = {**engine_overrides_for(model), **overrides}
@@ -42,7 +42,7 @@ def engine_args():
 
 
 def test_engine_args_wires_fp8_weights_and_kv(engine_args) -> None:
-    from flash.serving.src import settings as cfg
+    from flash.serving.src.store import settings as cfg
 
     # FP8 weights: with no pre-quantized checkpoint the base is online-quantized to cfg.QUANTIZATION
     # and serves itself.
@@ -66,7 +66,7 @@ def test_a_model_can_opt_out_to_bf16_explicitly(engine_args) -> None:
     # reach vLLM as None (the documented 35B H200 bf16 fallback), not fall back to the global FP8
     # default. serve_model_id is cleared first, or the default would already be None and this could
     # not tell the two apart.
-    from flash.serving.src import settings as cfg
+    from flash.serving.src.store import settings as cfg
 
     assert engine_args(MODEL, serve_model_id=None)["quantization"] == cfg.QUANTIZATION
     opted_out = engine_args(MODEL, serve_model_id=None, quantization=None)
@@ -87,7 +87,7 @@ def test_moe_backend_override_is_guarded(engine_args, monkeypatch, capsys) -> No
     # on an unknown kwarg.
     assert engine_args(MODEL, moe_backend="triton")["moe_backend"] == "triton"
 
-    monkeypatch.setattr("flash.serving.src.engine_boot._async_engine_arg_names", lambda _t: set())
+    monkeypatch.setattr("flash.serving.src.engine.boot._async_engine_arg_names", lambda _t: set())
     assert "moe_backend" not in engine_args(MODEL, moe_backend="triton")
     assert "no moe_backend arg" in capsys.readouterr().out
 
@@ -97,7 +97,7 @@ def test_max_num_batched_tokens_override_is_guarded(engine_args, monkeypatch, ca
     # exceeds vLLM's 2048 default. Forward it only when this AsyncEngineArgs build exposes the field.
     assert engine_args(MODEL, max_num_batched_tokens=4096)["max_num_batched_tokens"] == 4096
 
-    monkeypatch.setattr("flash.serving.src.engine_boot._async_engine_arg_names", lambda _t: set())
+    monkeypatch.setattr("flash.serving.src.engine.boot._async_engine_arg_names", lambda _t: set())
     assert "max_num_batched_tokens" not in engine_args(MODEL, max_num_batched_tokens=4096)
     assert "no max_num_batched_tokens arg" in capsys.readouterr().out
 
@@ -113,7 +113,7 @@ def test_reasoning_parser_forwarding_fails_closed_on_incompatible_vllm(
         raise RuntimeError("vllm build cannot forward reasoning_parser")
 
     monkeypatch.setattr(
-        "flash.serving.src.engine_boot._require_reasoning_api_compatibility", _incompatible
+        "flash.serving.src.engine.boot._require_reasoning_api_compatibility", _incompatible
     )
     with pytest.raises(RuntimeError):
         engine_args(MODEL, reasoning_parser="qwen3")

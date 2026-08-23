@@ -298,7 +298,7 @@ def _teardown_or_preserve_remote(run_id: str, remote: dict) -> bool:
     instead, so a leaked box stays addressable. Failing to record either is a hard error, since
     that would lose the only handle to a billing resource.
     """
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
     from flash.runner import _record_cleanup_remote
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
@@ -486,7 +486,7 @@ def _checkpoint_to_preserve(
     )
     if status.state != "dry_run" and (contended.active_attempt or unknown_activation):
         try:
-            from flash.serve.deploy import adapter_alias_target
+            from flash.serve.deployment.deploy import adapter_alias_target
 
             live_alias_target = adapter_alias_target(run_id)
         except Exception:
@@ -624,7 +624,7 @@ def _revoke_serving(
                 run_id, str(exc), backend_outcome="not_attempted"
             ) from exc
     try:
-        from flash.serve.deploy import undeploy_adapter
+        from flash.serve.deployment.deploy import undeploy_adapter
 
         undeploy_adapter(run_id)
     except Exception as exc:
@@ -829,7 +829,7 @@ def cancel_run(run_id: str) -> RunStatus:
                 _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
 
         with contextlib.suppress(Exception):
-            from flash.server.domain.checkpoints import register_checkpoints_best_effort
+            from flash.server.domain.registry.checkpoints import register_checkpoints_best_effort
 
             register_checkpoints_best_effort(get_status(run_id))
 

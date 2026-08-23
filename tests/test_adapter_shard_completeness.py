@@ -288,7 +288,7 @@ def test_opd_resume_gate_rejects_an_orphan_shard():
 
 def test_export_refuses_shards_without_an_index(tmp_path):
     """export fell back to shipping every matching shard, producing weights peft loads as a no-op."""
-    from flash.serve import export
+    from flash.serve.deployment import export
 
     key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight"
     (tmp_path / _SHARDS[0]).write_bytes(_safetensors_bytes([key]))
@@ -302,8 +302,8 @@ def test_serving_validation_refuses_an_orphan_shard(monkeypatch):
 
     import huggingface_hub
 
-    from flash.serve.adapter_check import _verify_adapter_artifact_tensors
-    from flash.serve.errors import AdapterTensorMissing
+    from flash.serve.deployment.adapter_check import _verify_adapter_artifact_tensors
+    from flash.serve.contract.errors import AdapterTensorMissing
 
     class FakeApi:
         def list_repo_tree(self, **_kwargs):
@@ -320,7 +320,7 @@ def test_serving_validation_accepts_a_complete_shard_set(monkeypatch):
 
     import huggingface_hub
 
-    from flash.serve.adapter_check import _verify_adapter_artifact_tensors
+    from flash.serve.deployment.adapter_check import _verify_adapter_artifact_tensors
 
     class FakeApi:
         def list_repo_tree(self, **_kwargs):

@@ -49,7 +49,7 @@ def _stub_prepare_dependencies(monkeypatch, spec=None):
         lambda _spec, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
+        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
         lambda _spec: None,
     )
 
@@ -315,8 +315,8 @@ def test_opd_model_revision_is_keyword_only():
     # controlled comparison this file exists to protect. the guard moved from trl's rollout engine
     # (OpdVllmRolloutEngine, deleted) to the verl checkpoint watcher, which is what carries the
     # revision through opd now -- it re-exports each checkpoint adapter under that pin.
-    from flash.engine.worker.opd_train import _OpdVerlCheckpointWatcher
-    from flash.engine.worker.sft_train import _VerlCheckpointWatcher
+    from flash.engine.worker.train.entry.opd_train import _OpdVerlCheckpointWatcher
+    from flash.engine.worker.train.entry.sft_train import _VerlCheckpointWatcher
 
     # the opd subclass forwards **kwargs, so the binding it inherits is what has to be keyword-only.
     assert issubclass(_OpdVerlCheckpointWatcher, _VerlCheckpointWatcher)
@@ -448,7 +448,7 @@ def test_structured_opd_mistral_tokenizer_model_is_rejected_before_allocation(mo
         lambda _spec: (_ for _ in ()).throw(AssertionError("preparation must reject first")),
     )
     monkeypatch.setattr(
-        "flash.engine.worker.train.opd.validation._resolve_structured_model_metadata",
+        "flash.engine.worker.train.opd.orchestration.validation._resolve_structured_model_metadata",
         lambda _model, _rev: (151936, ("tekken.json",)),
     )
     spec = _structured_opd_spec(json.dumps({"json": {"type": "object"}}))
@@ -468,7 +468,7 @@ def test_a_valid_structured_opd_constraint_still_prepares(monkeypatch):
     _stub_prepare_dependencies(monkeypatch)
     _stub_structured_opd_hub(monkeypatch)
     monkeypatch.setattr(
-        "flash.engine.worker.train.opd.validation._resolve_structured_model_metadata",
+        "flash.engine.worker.train.opd.orchestration.validation._resolve_structured_model_metadata",
         lambda _model, _rev: (151936, ("tokenizer.json",)),
     )
     schema = {

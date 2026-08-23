@@ -207,7 +207,7 @@ jobs:
           # import the constants module, not persistence.py: this job installs only modal and
           # python-dotenv, while persistence.py imports httpx at module scope, so importing it
           # would raise ModuleNotFoundError and the guard below would block every prod deploy.
-          if ! columns="$(python -c 'from flash.serving.src.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
+          if ! columns="$(python -c 'from flash.serving.src.store.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
             # failing closed matters here: an empty list would degrade the query back to a bare
             # existence check and this gate would pass while proving nothing.
             echo "::error::Could not read PERSISTED_COLUMNS; refusing to deploy against an unverified schema."

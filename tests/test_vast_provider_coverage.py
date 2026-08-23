@@ -6,13 +6,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.providers.base import AllocationConstraints, CapacityLookupError, JobHandle
+from flash.providers.core.base import AllocationConstraints, CapacityLookupError, JobHandle
 from flash.providers.vast import VastProvider
 
 
 def test_vast_provider_delegates_credentials_pricing_gc_and_orphan_sweep(monkeypatch) -> None:
     """Thin provider methods must preserve arguments and return values from their Vast helpers."""
-    from flash.providers.vast import jobs, preflight, pricing
+    from flash.providers.vast import jobs
+    from flash.providers.vast.client import preflight
+    from flash.providers.vast.client import pricing
 
     provider = VastProvider()
     calls = []
@@ -51,7 +53,7 @@ def test_vast_provider_delegates_credentials_pricing_gc_and_orphan_sweep(monkeyp
 
 def test_live_candidates_returns_empty_when_no_gpu_class_fits(monkeypatch) -> None:
     """A VRAM request above every Vast class must avoid a pointless market lookup."""
-    from flash.providers.vast import pricing
+    from flash.providers.vast.client import pricing
 
     provider = VastProvider()
     monkeypatch.setattr(
@@ -70,7 +72,7 @@ def test_live_candidates_returns_empty_when_no_gpu_class_fits(monkeypatch) -> No
 
 def test_live_candidates_wraps_market_failures_as_capacity_errors(monkeypatch) -> None:
     """Transient Vast market failures must remain retryable allocator capacity errors."""
-    from flash.providers.vast import pricing
+    from flash.providers.vast.client import pricing
 
     provider = VastProvider()
     monkeypatch.setattr(

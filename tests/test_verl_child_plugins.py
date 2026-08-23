@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from flash.engine.worker import opd_train, rl_train, sft_train
+from flash.engine.worker.train.entry import opd_train, rl_train, sft_train
 from flash.engine.worker.train.core.child import runtime
 from flash.engine.worker.train.opd.child import entry as opd_entry
 from flash.engine.worker.train.rl.child import entry as grpo_entry

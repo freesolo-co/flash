@@ -12,7 +12,7 @@ they are told apart:
 - resolved worker payload -- `to_internal_dict()` / `to_json()`, complete, including every managed
   and resolved field the GPU worker needs.
 
-`flash/runner/preparation.py::_preparation_digest` hashes the canonical JSON of `to_dict()` and
+`flash/runner/lifecycle/preparation.py::_preparation_digest` hashes the canonical JSON of `to_dict()` and
 `to_internal_dict()`, so the BYTES those two emit are a recovery contract, not an implementation
 detail. See their docstrings before changing either.
 """
@@ -102,7 +102,7 @@ def _validated_gpu_type(value: Any, *, field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string")
 
-    from flash.providers.base import GPU_INFO, UnsupportedGpuError, canonical_gpu
+    from flash.providers.core.base import GPU_INFO, UnsupportedGpuError, canonical_gpu
 
     try:
         canonical = canonical_gpu(value)
@@ -312,7 +312,7 @@ class EnvironmentPackageSpec:
     manifest_sha256: str
 
     def __post_init__(self) -> None:
-        from flash.envs.identity import is_commit_sha
+        from flash.envs.meta.identity import is_commit_sha
 
         if (
             not is_commit_sha(self.artifact_revision)
@@ -347,7 +347,7 @@ class EnvironmentSpec:
     def __post_init__(self) -> None:
         if self.package is None:
             return
-        from flash.envs.identity import canonical_environment_id, is_commit_sha
+        from flash.envs.meta.identity import canonical_environment_id, is_commit_sha
 
         canonical_environment_id(self.id)
         if not is_commit_sha(self.resolved_sha) or self.resolved_sha.lower() != self.resolved_sha:

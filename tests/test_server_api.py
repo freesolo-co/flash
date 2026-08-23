@@ -130,12 +130,12 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
     # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.auth as runpod_keys
+    import flash.providers.runpod.client.auth as runpod_keys
 
     runpod_keys.reset()
     import flash.runner as runner
-    import flash.server.domain.environment_registry as environment_registry_mod
-    import flash.server.domain.projects as projects_mod
+    import flash.server.domain.registry.environment_registry as environment_registry_mod
+    import flash.server.domain.registry.projects as projects_mod
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
 
@@ -145,7 +145,7 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
     monkeypatch.setattr(
@@ -160,7 +160,7 @@ def api(tmp_path, monkeypatch):
     # provider set to empty: preflight still passes on the keys, but startup stays CPU-only
     # with no network.
     import flash.providers as providers_mod
-    import flash.server.domain.run_registry as run_registry
+    import flash.server.domain.registry.run_registry as run_registry
 
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     # The dummy FREESOLO_INTERNAL_KEY also enables the best-effort backend reporting path: a dry-run
@@ -230,7 +230,7 @@ def test_requests_without_key_are_rejected(api):
 def test_project_validation_blocks_before_run_preparation(api, monkeypatch) -> None:
     from fastapi import HTTPException
 
-    import flash.server.domain.projects as projects_mod
+    import flash.server.domain.registry.projects as projects_mod
     import flash.server.routes.runs as runs_route
 
     monkeypatch.setattr(
@@ -257,7 +257,7 @@ def test_project_validation_blocks_before_run_preparation(api, monkeypatch) -> N
 def test_environment_project_validation_blocks_before_run_preparation(api, monkeypatch) -> None:
     from fastapi import HTTPException
 
-    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.registry.environment_registry as registry
     import flash.server.routes.runs as runs_route
 
     def reject_environment(**kwargs):
@@ -307,7 +307,7 @@ def test_a_github_environment_is_refused_before_validation_or_preparation(
     is meaningless for a repo the plane does not own) nor job preparation (which would fetch and
     run the code). Both are asserted by failing the test if either is called.
     """
-    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.registry.environment_registry as registry
     import flash.server.routes.runs as runs_route
 
     monkeypatch.setattr(
@@ -333,7 +333,7 @@ def test_a_github_environment_is_refused_before_validation_or_preparation(
 
 def test_a_hub_environment_still_reaches_preparation(api, monkeypatch) -> None:
     """The counterpart: the refusal above is about the FORM, not the parser blocking every run."""
-    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.registry.environment_registry as registry
 
     seen: list[str] = []
     monkeypatch.setattr(
@@ -358,7 +358,7 @@ def test_a_hub_environment_still_reaches_preparation(api, monkeypatch) -> None:
 def test_run_rejects_noncanonical_managed_environment_before_registry(
     api, monkeypatch, environment_id
 ) -> None:
-    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.registry.environment_registry as registry
     import flash.server.routes.runs as runs_route
 
     monkeypatch.setattr(
@@ -387,8 +387,8 @@ def test_run_rejects_noncanonical_managed_environment_before_registry(
 def test_project_validation_blocks_before_environment_publication(api, monkeypatch) -> None:
     from fastapi import HTTPException
 
-    import flash.server.domain.envs as envs_mod
-    import flash.server.domain.projects as projects_mod
+    import flash.server.domain.registry.envs as envs_mod
+    import flash.server.domain.registry.projects as projects_mod
 
     monkeypatch.setattr(
         projects_mod,
@@ -416,9 +416,9 @@ def test_project_validation_blocks_before_environment_publication(api, monkeypat
 
 
 def test_canonical_slug_resolution_blocks_before_environment_publication(api, monkeypatch) -> None:
-    import flash.server.domain.environment_registry as registry_mod
-    import flash.server.domain.envs as envs_mod
-    import flash.server.domain.projects as projects_mod
+    import flash.server.domain.registry.environment_registry as registry_mod
+    import flash.server.domain.registry.envs as envs_mod
+    import flash.server.domain.registry.projects as projects_mod
 
     importlib.reload(projects_mod)
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
@@ -478,7 +478,7 @@ def test_canonical_slug_resolution_blocks_before_environment_publication(api, mo
 
 
 def _install_real_internal_project_validation(monkeypatch):
-    import flash.server.domain.projects as projects_mod
+    import flash.server.domain.registry.projects as projects_mod
 
     importlib.reload(projects_mod)
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://api.freesolo.co")
@@ -551,8 +551,8 @@ def test_internal_run_uses_internal_project_validation_endpoint(api, monkeypatch
 
 
 def test_internal_publish_uses_internal_project_validation_endpoint(api, monkeypatch) -> None:
-    import flash.server.domain.environment_registry as registry
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.environment_registry as registry
+    import flash.server.domain.registry.envs as envs_mod
 
     requests = _install_real_internal_project_validation(monkeypatch)
     monkeypatch.setattr(
@@ -571,8 +571,8 @@ def test_internal_publish_uses_internal_project_validation_endpoint(api, monkeyp
 
 
 def test_internal_delete_uses_internal_project_validation_endpoint(api, monkeypatch) -> None:
-    import flash.server.domain.environment_registry as registry
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.environment_registry as registry
+    import flash.server.domain.registry.envs as envs_mod
 
     requests = _install_real_internal_project_validation(monkeypatch)
     monkeypatch.setattr(envs_mod, "delete_package", lambda **_kwargs: True)
@@ -893,8 +893,8 @@ def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_o
 def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
     api, monkeypatch, tmp_path, max_completion_tokens, status_code
 ) -> None:
-    import flash.engine.worker.train.opd.validation as opd_validation
-    import flash.envs.loader as envs_loader
+    import flash.engine.worker.train.opd.orchestration.validation as opd_validation
+    import flash.envs.loading.loader as envs_loader
     import flash.schema as schema
     import flash.server.routes.runs as runs_route
     from tests._helpers.teacher import configure_managed_teacher
@@ -1198,7 +1198,7 @@ def test_invalid_external_email_is_not_persisted(api, monkeypatch):
 
 
 def test_create_run_rejects_authored_warmstart_rank_before_prepare_or_persist(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     calls = {"prepare": 0, "persist": 0}
 
@@ -1239,7 +1239,7 @@ def test_create_run_rejects_authored_warmstart_rank_before_prepare_or_persist(ap
 
 def test_warmstart_dry_run_persists_source_adapter_alpha(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     def prepare(spec, **_kwargs):
         resolved = replace(spec, train=replace(spec.train, lora_alpha=32))
@@ -1272,7 +1272,7 @@ def test_warmstart_dry_run_persists_source_adapter_alpha(api, monkeypatch):
 
 def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     from flash.core.spec import JobSpec
 
     def prepare(spec, **_kwargs):
@@ -1309,7 +1309,7 @@ def test_warmstart_accepts_normalized_default_alpha_without_authored_metadata(ap
 
 def test_warmstart_rejects_explicit_conflicting_alpha(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     from flash.schema import train_schema_metadata
 
     def prepare(spec, **_kwargs):
@@ -1486,7 +1486,7 @@ def test_create_run_redacts_internal_warmstart_preparation_error(api, monkeypatc
 
 
 def test_sft_missing_dataset_is_a_400_with_packaging_remediation(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(
         app_mod,
@@ -1516,7 +1516,7 @@ def test_create_run_does_not_blame_the_adapter_for_an_unrelated_failure(api, mon
     # keeps its own message, so a warm-start run told to check its adapter really has an adapter
     # problem. the previous broad except rewrote every prepare_job failure into the adapter
     # message, sending users to re-verify a healthy adapter while the real cause never arrived.
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(
         app_mod,
@@ -1550,7 +1550,7 @@ def test_create_run_keeps_ownership_when_submit_fails_after_persisting_status(ap
     logs and cancel for the only key entitled to it, while the provider footprint lives on.
     """
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     from flash.server.platform import db
 
     submitted = []
@@ -1586,7 +1586,7 @@ def test_create_run_keeps_ownership_when_submit_fails_after_persisting_status(ap
 def test_create_run_deletes_the_row_when_submit_fails_before_persisting_status(api, monkeypatch):
     # the other half of the guard: no status file means the launch left nothing behind, so the
     # ownership row is pure debris and must go rather than wedge the id forever.
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     from flash.server.platform import db
 
     submitted = []
@@ -1640,7 +1640,7 @@ def test_create_run_dry_run_failure_leaves_no_recoverable_run(api, monkeypatch):
     explicitly asked never to rent. The row is dropped instead, exactly as before the guard.
     """
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     from flash.server.platform import db
 
     submitted: list[str] = []
@@ -1666,7 +1666,7 @@ def test_create_run_retained_secretful_run_fails_instead_of_recovering(api, monk
     the error, and recovery skips terminal runs.
     """
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     from flash.server.platform import db
 
     submitted: list[str] = []
@@ -1699,7 +1699,7 @@ def test_create_run_secretful_run_dropped_when_terminalization_fails(api, monkey
     lesser harm, so the row is dropped instead.
     """
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     from flash.server.platform import db
 
     submitted: list[str] = []
@@ -1734,7 +1734,7 @@ def test_create_run_secretful_run_kept_when_status_read_fails(api, monkeypatch):
     correctly failed run - orphaning it for its owner and throwing away the error just persisted.
     """
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     from flash.server.platform import db
 
     submitted: list[str] = []
@@ -1781,8 +1781,8 @@ def test_create_run_retained_run_records_managed_environment_use(api, monkeypatc
     # a retained run stays live and can recover into real training, so it must carry the same
     # managed-environment association a successful submission records.
     import flash.runner as runner
-    import flash.server.app as app_mod
-    import flash.server.domain.environment_registry as registry
+    import flash.server.asgi.app as app_mod
+    import flash.server.domain.registry.environment_registry as registry
     from flash.server.platform import db
 
     calls: list[dict] = []
@@ -2240,7 +2240,7 @@ def test_logs_offset_paging(api):
 def test_worker_output_route(api, monkeypatch):
     # /worker surfaces the train-subprocess stdout/traceback from the run's HF repo (operator
     # token, server-side). Best-effort: no artifacts -> empty dict; present -> passed through.
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -2271,7 +2271,7 @@ def test_internal_key_reads_logs_and_worker_with_matching_org(api, monkeypatch):
     # internal key plus the run's org in X-Freesolo-Org-Id. The header is honored ONLY for the
     # internal key and ONLY when it matches the run's persisted org. All failures are 404 so run
     # existence is never leaked, and a rejected request must not trigger the expensive worker fetch.
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     owner = _login()
     org = f"org-{owner.removeprefix(_USER_PREFIX)}"
@@ -2350,7 +2350,7 @@ def test_internal_org_header_does_not_widen_owner_only_endpoints(api):
 def test_internal_key_cannot_read_run_without_persisted_org(api, monkeypatch):
     # A run with no persisted org context cannot be matched by the internal path even with a
     # non-empty header: _status_org_id is empty, so it never equals a real org and fails closed.
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     owner = _login()
     run_id = api.post(
@@ -2831,7 +2831,7 @@ def test_deploy_dry_run(api):
 
 def test_user_key_undeploy_returns_public_persisted_deployment(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
@@ -2882,7 +2882,7 @@ def test_user_key_undeploy_returns_public_persisted_deployment(api, monkeypatch)
 
 def test_internal_org_undeploy_returns_public_persisted_deployment(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     owner = _login()
     org = f"org-{owner.removeprefix(_USER_PREFIX)}"
@@ -2947,7 +2947,7 @@ def test_internal_org_undeploy_returns_public_persisted_deployment(api, monkeypa
 
 def test_deployment_management_allows_matching_internal_scope_and_redacts_polling(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     owner = _login()
     org = f"org-{owner.removeprefix(_USER_PREFIX)}"
@@ -3154,7 +3154,7 @@ def test_internal_deployment_management_rejects_missing_run_org(api):
 
 def test_internal_owned_run_still_requires_matching_org_for_deployment_management(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     internal = _bearer("fslo-internal-test")
     project = "33333333-3333-4333-8333-333333333333"
@@ -3340,7 +3340,7 @@ def test_serving_routes_map_leaked_revision_decode_failures_to_conflict(api, rou
 
 def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -3364,7 +3364,7 @@ def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
 
 def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
     import flash.runner as runner
-    import flash.serve.deploy as deploy_mod
+    import flash.serve.deployment.deploy as deploy_mod
 
     key = _login()
     run_id = api.post(
@@ -3412,7 +3412,7 @@ def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
 
 def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -3527,8 +3527,8 @@ def test_malformed_legacy_warmstart_spec_drops_both_topology_keys():
 def test_deploy_serving_error_is_recorded_as_failed_deployment(api, monkeypatch):
     """A serving-backend failure during deploy is recorded on the deployment status."""
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import ServingError
 
     key = _login()
     run_id = api.post(
@@ -3573,8 +3573,8 @@ def test_deployment_failure_persisted_matches_default_error():
 
 
 def test_deployment_transitions_report_persisted_states_and_skip_dry_run(api, monkeypatch):
-    import flash.server.app as app_mod
-    import flash.server.domain.run_registry as registry
+    import flash.server.asgi.app as app_mod
+    import flash.server.domain.registry.run_registry as registry
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -3624,9 +3624,9 @@ def test_deployment_transitions_report_persisted_states_and_skip_dry_run(api, mo
 
 def test_deployment_reporting_skips_failed_cas_and_reports_failure(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    import flash.server.domain.run_registry as registry
-    from flash.serve.deploy import ServingError
+    import flash.server.asgi.app as app_mod
+    import flash.server.domain.registry.run_registry as registry
+    from flash.serve.deployment.deploy import ServingError
     from flash.server.routes import serving
 
     key = _login()
@@ -3659,9 +3659,9 @@ def test_deployment_reporting_skips_failed_cas_and_reports_failure(api, monkeypa
 
 def test_undeploy_reports_revocation_failure_and_undeployed(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    import flash.server.domain.run_registry as registry
-    from flash.serve.deploy import ServingError
+    import flash.server.asgi.app as app_mod
+    import flash.server.domain.registry.run_registry as registry
+    from flash.serve.deployment.deploy import ServingError
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
@@ -3704,7 +3704,7 @@ def test_undeploy_reports_revocation_failure_and_undeployed(api, monkeypatch):
 def test_deployment_job_shutdown_closes_producers(monkeypatch):
     from threading import Event
 
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
     app_mod._open_deployment_jobs()
@@ -3845,7 +3845,7 @@ def test_restart_recovery_preserves_unknown_activation_for_authoritative_readbac
 
 
 def test_deployment_job_is_started_before_waiters_can_observe_it(monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     started_while_locked = []
 
@@ -3868,7 +3868,7 @@ def test_deployment_job_is_started_before_waiters_can_observe_it(monkeypatch):
 
 def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -3917,7 +3917,7 @@ def test_concurrent_deploy_returns_409_without_queueing_duplicate(api, monkeypat
     import threading
 
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -3978,7 +3978,7 @@ def test_concurrent_deploy_returns_409_without_queueing_duplicate(api, monkeypat
 @pytest.mark.parametrize("deployment_state", ["ready", None])
 def test_concurrent_non_deploy_operation_returns_generic_409(api, monkeypatch, deployment_state):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     starts: list[dict] = []
 
@@ -4017,7 +4017,7 @@ def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
     import threading
 
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     from flash.server.routes import serving
 
     key = _login()
@@ -4086,7 +4086,7 @@ def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
 
 def test_deploy_start_failure_persists_terminal_failure(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -4290,11 +4290,11 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
     from threading import Event
 
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     import flash.server.billing.retry as billing_retry
-    import flash.server.domain.reconcile as reconcile
-    import flash.server.domain.repo_cleanup as repo_cleanup
-    from flash.providers import preflight
+    import flash.server.domain.ops.reconcile as reconcile
+    import flash.server.domain.ops.repo_cleanup as repo_cleanup
+    from flash.providers.core import preflight
     from flash.server.routes import serving
 
     replay_started = Event()
@@ -5135,7 +5135,7 @@ def test_deploy_rejects_verify_false_before_anything_registers(api, monkeypatch)
     # smoke verification is mandatory: an explicit opt-out is a 400 before queuing, and neither
     # serving registration nor alias activation is ever attempted.
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -5169,7 +5169,7 @@ def test_deploy_rejects_verify_false_before_anything_registers(api, monkeypatch)
 
 def test_deploy_rechecks_run_state_before_alias_activation(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -5199,8 +5199,8 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
     import threading
 
     import flash.runner as runner
-    import flash.serve.deploy as deploy_mod
-    import flash.server.app as app_mod
+    import flash.serve.deployment.deploy as deploy_mod
+    import flash.server.asgi.app as app_mod
     from flash.server.routes import serving
 
     key = _login()
@@ -5297,9 +5297,9 @@ def test_contended_cancel_revokes_activation_completed_after_predecessor_restore
     import threading
 
     import flash.runner as runner
-    import flash.serve.deploy as deploy_mod
-    import flash.server.app as app_mod
-    from flash.serve.deploy import Deployment
+    import flash.serve.deployment.deploy as deploy_mod
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import Deployment
     from flash.server.routes import serving
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
@@ -5486,7 +5486,7 @@ def test_cancel_local_persistence_failure_returns_structured_retryable_error(api
 
 def test_cancel_double_undeploy_failure_returns_structured_retryable_error(api, monkeypatch):
     import flash.runner as runner
-    import flash.serve.deploy as deploy_mod
+    import flash.serve.deployment.deploy as deploy_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -5527,8 +5527,8 @@ def test_cancel_double_undeploy_failure_returns_structured_retryable_error(api, 
 
 def test_deploy_recovers_ambiguous_ready_persistence_after_activation(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import Deployment
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import Deployment
     from flash.server.routes import serving
 
     key = _login()
@@ -5585,8 +5585,8 @@ def test_deploy_fails_when_the_activated_alias_serves_no_reasoning(api, monkeypa
     has to say so, because `ready` on a thinking run asserts that it thinks.
     """
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import Deployment
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import Deployment
 
     key = _login()
     run_id = api.post(
@@ -5651,8 +5651,8 @@ def test_deploy_fails_when_the_activated_alias_serves_no_reasoning(api, monkeypa
 )
 def test_deploy_persists_ordinary_post_activation_probe_failures(api, monkeypatch, probe_error):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import Deployment, ServingError
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import Deployment, ServingError
     from flash.server.routes import serving
 
     key = _login()
@@ -5710,7 +5710,7 @@ def test_deploy_persists_ordinary_post_activation_probe_failures(api, monkeypatc
 
 
 def test_post_activation_failure_persistence_error_records_divergence(monkeypatch, capsys):
-    from flash.serve.deploy import ServingError
+    from flash.serve.deployment.deploy import ServingError
     from flash.server.routes import serving_completion
 
     revision = "run-1@final." + "a" * 40
@@ -5735,8 +5735,8 @@ def test_post_activation_failure_persistence_error_records_divergence(monkeypatc
 def test_deploy_records_alias_thinking_on_a_healthy_thinking_deployment(api, monkeypatch):
     """The healthy path still commits ready and exposes the resolved state on the record."""
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import Deployment
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import Deployment
 
     key = _login()
     run_id = api.post(
@@ -5783,8 +5783,8 @@ def test_deploy_records_alias_thinking_on_a_healthy_thinking_deployment(api, mon
 
 def test_ready_commit_status_read_failure_records_divergence(api, monkeypatch, capsys):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import Deployment
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import Deployment
     from flash.server.routes import serving_completion
 
     key = _login()
@@ -5843,8 +5843,8 @@ def test_commit_miss_with_same_attempt_retries_and_persists_ready(api, monkeypat
     # this attempt still owns the deployment record: the ready commit must be retried against the
     # fresh state, never dropped silently after the serving alias already flipped.
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import Deployment
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import Deployment
 
     key = _login()
     run_id = api.post(
@@ -5890,8 +5890,8 @@ def test_commit_miss_superseded_records_divergence_without_alias_revert(api, mon
     # recorded as a divergence rather than dropped, and the serving alias must NOT be reverted
     # (post-promotion recovery reads the authoritative alias).
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import Deployment
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import Deployment
 
     key = _login()
     run_id = api.post(
@@ -5966,7 +5966,7 @@ def test_deploy_forwards_structured_outputs_to_serving(api, monkeypatch):
     """The deploy route hands the run's [train].structured_outputs to deploy_adapter so serving can
     register it as the adapter's guided-decoding default (guided-decoding train/serve parity)."""
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     schema = {"type": "object", "properties": {"industries": {"type": "array"}}}
@@ -5995,7 +5995,7 @@ def test_deploy_forwards_structured_outputs_to_serving(api, monkeypatch):
 
 def test_thinking_structured_deploy_rejects_verify_false_before_mutation(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     schema = {"type": "object", "required": ["answer"]}
@@ -6035,7 +6035,7 @@ def test_thinking_structured_deploy_rejects_verify_false_before_mutation(api, mo
 
 def test_deploy_retry_takes_over_stale_busy_record(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -6069,7 +6069,7 @@ def test_chat_forwards_trained_stop_sequences(api, monkeypatch):
     forwards them, so the adapter verifies and activates -- but if user inference does not, the same
     model runs on to max_tokens or emits trailing text past its answer on every real request."""
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     spec = json.loads(json.dumps(SPEC))
@@ -6108,7 +6108,7 @@ def test_chat_forwards_trained_stop_sequences(api, monkeypatch):
 def test_chat_sends_no_stop_when_run_configured_none(api, monkeypatch):
     """A run that never configured a delimiter must not receive one."""
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -6144,8 +6144,8 @@ def test_chat_sends_no_stop_when_run_configured_none(api, monkeypatch):
 
 def test_failed_smoke_revision_cannot_be_exact_chatted(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import ServingError
 
     key = _login()
     run_id = api.post(
@@ -6193,8 +6193,8 @@ def test_failed_smoke_revision_cannot_be_exact_chatted(api, monkeypatch):
 
 def test_failed_redeploy_restores_previous_ready_deployment(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import ServingError
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
@@ -6220,9 +6220,9 @@ def test_failed_redeploy_restores_previous_ready_deployment(api, monkeypatch):
 
 def test_consecutive_failed_redeployments_each_report_restored_ready_state(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    import flash.server.domain.run_registry as registry
-    from flash.serve.deploy import ServingError
+    import flash.server.asgi.app as app_mod
+    import flash.server.domain.registry.run_registry as registry
+    from flash.serve.deployment.deploy import ServingError
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
@@ -6264,8 +6264,8 @@ def test_consecutive_failed_redeployments_each_report_restored_ready_state(api, 
 @pytest.mark.parametrize("deployment_state", ["undeployed", "revocation_failed"])
 def test_redeploy_after_inactive_deployment_state_is_allowed(api, monkeypatch, deployment_state):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import ServingError
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -6290,8 +6290,8 @@ def test_confirmed_active_failed_redeploy_uses_exact_revision_and_restores_on_fa
     api, monkeypatch
 ):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import ServingError
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -6332,8 +6332,8 @@ def test_confirmed_active_failed_redeploy_uses_exact_revision_and_restores_on_fa
 
 def test_confirmed_active_failed_redeploy_can_replace_the_live_revision(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import Deployment
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import Deployment
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -6385,7 +6385,7 @@ def test_unknown_same_revision_preserves_confirmed_failed_predecessor_despite_le
     api, monkeypatch
 ):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -6409,7 +6409,7 @@ def test_unknown_same_revision_preserves_confirmed_failed_predecessor_despite_le
         "previous_deployment": active_failed,
     }
     runner._save_status(status)
-    from flash.serve.deploy import ServingError
+    from flash.serve.deployment.deploy import ServingError
 
     alias_reads = []
     monkeypatch.setattr(
@@ -6444,8 +6444,8 @@ def test_unknown_same_revision_preserves_confirmed_failed_predecessor_despite_le
 
 def test_ordinary_failed_record_is_not_a_redeploy_predecessor(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import ServingError
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -6480,8 +6480,8 @@ def test_activation_unknown_keeps_confirmed_failed_predecessor_for_readback(
     api, monkeypatch, attempts_same_revision
 ):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ActivationOutcomeUnknown, ServingError
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import ActivationOutcomeUnknown, ServingError
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -6547,8 +6547,8 @@ def test_activation_unknown_keeps_confirmed_failed_predecessor_for_readback(
 
 def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ActivationOutcomeUnknown, ServingError
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import ActivationOutcomeUnknown, ServingError
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -6627,7 +6627,7 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
 @pytest.mark.parametrize("retry_state", ["queued", "smoke_testing"])
 def test_unknown_reconciliation_allows_one_retry_then_blocks_overlap(api, monkeypatch, retry_state):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -6674,8 +6674,8 @@ def test_unknown_reconciliation_allows_one_retry_then_blocks_overlap(api, monkey
 
 def test_activation_unknown_synthetic_checkpoint_predecessor_survives_cancel(api, monkeypatch):
     import flash.runner as runner
-    import flash.serve.deploy as deploy
-    import flash.server.app as app_mod
+    import flash.serve.deployment.deploy as deploy
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -6744,8 +6744,8 @@ def test_activation_unknown_synthetic_checkpoint_predecessor_survives_cancel(api
 
 def test_cancel_restores_owned_previous_checkpoint_and_bare_chat_authority(api, monkeypatch):
     import flash.runner as runner
-    import flash.serve.deploy as deploy
-    import flash.server.app as app_mod
+    import flash.serve.deployment.deploy as deploy
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "running")
@@ -6808,7 +6808,7 @@ def test_cancel_restores_owned_previous_checkpoint_and_bare_chat_authority(api, 
 
 def test_failed_redeploy_after_registration_restores_previous_serving(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
@@ -6843,7 +6843,7 @@ def test_failed_redeploy_after_registration_restores_previous_serving(api, monke
 
 def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -6881,7 +6881,7 @@ def test_deploy_works_the_same_whether_or_not_gpu_count_was_authored(api, monkey
     so that was nearly every run. These two specs differ only in that one authors `gpu.count = 1`.
     """
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     def fake_start(target, *args, **kwargs):
         kwargs["deploy_lock"].release()
@@ -6910,8 +6910,8 @@ def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkey
     per-step deployable checkpoints) must not fail run-level deploy with an opaque 502 rank
     error: it returns a 409 telling the caller to `flash models deploy <run>/step-N`."""
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import AdapterConfigMissing
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import AdapterConfigMissing
 
     key = _login()
     run_id = api.post(
@@ -6941,8 +6941,8 @@ def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkey
 def test_deploy_missing_adapter_without_checkpoints_stays_502(api, monkeypatch):
     """No checkpoints to point at -> keep the 502 with the upstream reason."""
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import AdapterConfigMissing
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import AdapterConfigMissing
 
     key = _login()
     run_id = api.post(
@@ -6968,8 +6968,8 @@ def test_deploy_attributes_adapter_to_run_owning_org(api, monkeypatch):
     """The adapter is registered under the RUN's owning org (its persisted billing_context) so
     serving can authorize external chat by org — not merely whatever key initiated the deploy."""
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import Deployment
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import Deployment
 
     key = _login()
     run_id = api.post(
@@ -7006,8 +7006,8 @@ def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
     """An internal/operator deploy has no billing_context but persists the org in
     platform_context; the adapter must still be attributed to that run-owning org."""
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import Deployment
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import Deployment
 
     key = _login()
     run_id = api.post(
@@ -7049,7 +7049,7 @@ def test_deploy_without_any_org_context_is_rejected(api, monkeypatch):
     (org_id is a best-effort passthrough), so the orgless-key case is reachable in production.
     """
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     import flash.server.platform.auth as auth_mod
 
     key = _login()
@@ -7163,7 +7163,7 @@ def test_deployments_listing_requires_internal_scope_and_filters_to_it(api):
 
 def test_chat_streams_deployed_run(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -7208,7 +7208,7 @@ def test_chat_streams_deployed_run(api, monkeypatch):
 
 def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -7285,7 +7285,7 @@ def test_chat_stream_upstream_error_before_first_byte_is_502(api, monkeypatch):
     request and raise_for_status run only once Starlette iterates the body does so after the
     200 has been flushed, so the route's except can never fire and an upstream 502 arrives as
     an empty success."""
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     key, run_id = _deployed_chat_run(api)
 
@@ -7327,7 +7327,7 @@ def test_chat_stream_midstream_failure_aborts_response(api, monkeypatch):
     body: the exception must propagate out of the response iterator (uvicorn then drops the
     connection without the terminating chunk) rather than being swallowed into an eof the
     client would read as a finished answer."""
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
 
@@ -7351,7 +7351,7 @@ def test_chat_stream_midstream_failure_aborts_response(api, monkeypatch):
 
 def test_chat_step_selector_prefers_current_revision_for_redeployed_step(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -7392,7 +7392,7 @@ def test_chat_step_selector_prefers_current_revision_for_redeployed_step(api, mo
 
 def test_chat_step_selector_rejects_multiple_verified_revisions(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -7424,7 +7424,7 @@ def test_chat_step_selector_rejects_multiple_verified_revisions(api, monkeypatch
 
 def test_chat_step_selector_requires_a_verified_deployment(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -7456,7 +7456,7 @@ def test_chat_step_selector_requires_a_verified_deployment(api, monkeypatch):
 
 
 def test_chat_rejects_adapter_revision_and_step_together(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -7482,7 +7482,7 @@ def test_chat_rejects_adapter_revision_and_step_together(api, monkeypatch):
 
 @pytest.mark.parametrize("step", ["abc", 1.5, -1, True])
 def test_chat_rejects_invalid_step_selector(api, monkeypatch, step):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -7504,7 +7504,7 @@ def test_chat_rejects_invalid_step_selector(api, monkeypatch, step):
 
 def test_chat_ready_record_without_ledger_membership_rejects_revision(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -7543,7 +7543,7 @@ def test_chat_ready_record_without_ledger_membership_rejects_revision(api, monke
 
 def test_chat_bare_alias_rejects_status_only_ready_record(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
@@ -7569,7 +7569,7 @@ def test_chat_bare_alias_rejects_status_only_ready_record(api, monkeypatch):
 
 def test_chat_bare_alias_rejects_confirmed_active_failed_record(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
@@ -7605,7 +7605,7 @@ def test_chat_bare_alias_rejects_confirmed_active_failed_record(api, monkeypatch
 
 def test_chat_reconciling_alias_rejects_bare_and_allows_verified_revision(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -7664,7 +7664,7 @@ def test_chat_reconciling_alias_rejects_bare_and_allows_verified_revision(api, m
 
 def test_chat_selects_immutable_revisions_independently(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -7709,7 +7709,7 @@ def test_chat_selects_immutable_revisions_independently(api, monkeypatch):
 
 def test_chat_rejects_cross_run_immutable_revision(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -7749,7 +7749,7 @@ def test_chat_rejects_cross_run_immutable_revision(api, monkeypatch):
 
 def test_chat_uses_saved_thinking_flag_not_payload_override(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -7796,7 +7796,7 @@ def test_chat_uses_saved_thinking_flag_not_payload_override(api, monkeypatch):
 
 def test_chat_forwards_user_supplied_system_prompt(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -7848,7 +7848,7 @@ def test_chat_serves_cancelled_run_with_active_checkpoint_deployment(api, monkey
     """A run cancelled mid-RL can deploy a per-step checkpoint (stays `cancelled`, listed active by
     /v1/deployments). The chat route must SERVE that live adapter, not 409 on the cancelled state."""
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -7903,7 +7903,7 @@ def test_chat_cancelled_run_without_deployment_is_409(api):
 
 def test_chat_rejects_undeployed_record_with_previous_ready_deployment(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -7938,7 +7938,7 @@ def test_chat_rejects_non_finite_sampling_params_with_400(api, monkeypatch):
     OverflowError is ArithmeticError, not TypeError or ValueError, so the guard must include it.
     """
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -7972,8 +7972,8 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
     """An undeploy that hits a serving-backend failure surfaces as a clean 502 (same as deploy),
     not an unhandled 500: ServingError from undeploy_adapter is translated to HTTPException(502)."""
     import flash.runner as runner
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import ServingError
 
     key = _login()
     run_id = api.post(
@@ -8005,8 +8005,8 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
 
 def test_undeploy_without_status_projection_invalidates_orphaned_ledger(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
-    import flash.server.domain.run_registry as registry
+    import flash.server.asgi.app as app_mod
+    import flash.server.domain.registry.run_registry as registry
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -8140,7 +8140,7 @@ def test_deploy_lock_is_usable_and_weakly_cleaned():
     # would TypeError on the first deploy). It must also re-enter and serialize.
     import gc
 
-    from flash.server import app as app_mod
+    from flash.server.asgi import app as app_mod
 
     lk = app_mod._deploy_lock("run-xyz")
     assert app_mod._deploy_lock("run-xyz") is lk  # same lock for the same run while alive
@@ -8165,7 +8165,7 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
 
@@ -8228,7 +8228,7 @@ def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_p
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
     run_id = "terminal-cleanup-recovery"
@@ -8271,7 +8271,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
     spec = JobSpec(
@@ -8328,7 +8328,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
 
@@ -8389,7 +8389,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
 
@@ -8446,7 +8446,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
 
@@ -8515,7 +8515,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
 
@@ -8567,7 +8567,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
 
@@ -8630,7 +8630,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
 
@@ -8697,7 +8697,7 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
 
@@ -8764,7 +8764,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
 
@@ -8852,7 +8852,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
     public_spec = {
@@ -8949,7 +8949,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
 
@@ -9071,7 +9071,7 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     import io
     import tarfile
 
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.envs as envs_mod
 
     published_roots: list[str] = []
     monkeypatch.setattr(
@@ -9117,7 +9117,7 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
     import io
     import tarfile
 
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.envs as envs_mod
 
     captured: list = []
     monkeypatch.setattr(
@@ -9160,8 +9160,8 @@ def test_publish_env_forwards_project_id_to_registry(api, monkeypatch):
     import io
     import tarfile
 
-    import flash.server.domain.environment_registry as registry_mod
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.environment_registry as registry_mod
+    import flash.server.domain.registry.envs as envs_mod
 
     monkeypatch.setattr(envs_mod, "publish_package", stub_publish_package("key-1/checkout-bot/e"))
 
@@ -9208,8 +9208,8 @@ def test_publish_env_forwards_project_id_to_registry(api, monkeypatch):
 
 
 def test_publish_env_returns_502_when_association_record_returns_false(api, monkeypatch):
-    import flash.server.domain.environment_registry as registry
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.environment_registry as registry
+    import flash.server.domain.registry.envs as envs_mod
 
     events: list[str] = []
     monkeypatch.setattr(
@@ -9241,8 +9241,8 @@ def test_publish_env_returns_502_when_association_record_returns_false(api, monk
 
 
 def test_publish_env_returns_502_when_association_record_raises(api, monkeypatch):
-    import flash.server.domain.environment_registry as registry
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.environment_registry as registry
+    import flash.server.domain.registry.envs as envs_mod
 
     events: list[str] = []
     monkeypatch.setattr(
@@ -9275,8 +9275,8 @@ def test_publish_env_returns_502_when_association_record_raises(api, monkeypatch
 
 
 def test_publish_env_retry_repairs_association_after_false_ack(api, monkeypatch):
-    import flash.server.domain.environment_registry as registry
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.environment_registry as registry
+    import flash.server.domain.registry.envs as envs_mod
 
     uploads: list[str] = []
     acknowledgements = iter((False, True))
@@ -9423,8 +9423,8 @@ def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
 
 def test_delete_env_endpoint_removes_package(api, monkeypatch):
     """DELETE /v1/envs/{id} removes the package and reports it deleted."""
-    import flash.server.domain.envs as envs_mod
-    from flash.server.domain import environment_registry
+    import flash.server.domain.registry.envs as envs_mod
+    from flash.server.domain.registry import environment_registry
 
     seen: dict = {}
 
@@ -9465,8 +9465,8 @@ def test_delete_env_endpoint_removes_package(api, monkeypatch):
 def test_delete_env_missing_mirror_and_package_is_idempotent(api, monkeypatch):
     from fastapi import HTTPException
 
-    import flash.server.domain.envs as envs_mod
-    from flash.server.domain import environment_registry
+    import flash.server.domain.registry.envs as envs_mod
+    from flash.server.domain.registry import environment_registry
 
     key = _login()
     namespace = _identity_for_token(key)["org_slug"]
@@ -9509,8 +9509,8 @@ def test_delete_env_missing_mirror_and_package_is_idempotent(api, monkeypatch):
 def test_delete_env_internal_key_missing_mirror_and_package_is_idempotent(api, monkeypatch):
     from fastapi import HTTPException
 
-    import flash.server.domain.envs as envs_mod
-    from flash.server.domain import environment_registry
+    import flash.server.domain.registry.envs as envs_mod
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.setattr(
         environment_registry,
@@ -9552,8 +9552,8 @@ def test_delete_env_internal_key_missing_mirror_and_package_is_idempotent(api, m
 def test_delete_env_internal_key_missing_mirror_does_not_delete_existing_package(api, monkeypatch):
     from fastapi import HTTPException
 
-    import flash.server.domain.envs as envs_mod
-    from flash.server.domain import environment_registry
+    import flash.server.domain.registry.envs as envs_mod
+    from flash.server.domain.registry import environment_registry
 
     mirror_error = HTTPException(status_code=404, detail="flash environment not found")
     monkeypatch.setattr(
@@ -9588,8 +9588,8 @@ def test_delete_env_internal_key_missing_mirror_does_not_delete_existing_package
 def test_delete_env_user_key_missing_mirror_requires_matching_namespace(api, monkeypatch):
     from fastapi import HTTPException
 
-    import flash.server.domain.envs as envs_mod
-    from flash.server.domain import environment_registry
+    import flash.server.domain.registry.envs as envs_mod
+    from flash.server.domain.registry import environment_registry
 
     key = _login()
     monkeypatch.setattr(
@@ -9630,8 +9630,8 @@ def test_delete_env_user_key_missing_mirror_requires_matching_namespace(api, mon
 def test_delete_env_missing_mirror_surfaces_hub_outage_status(api, monkeypatch):
     from fastapi import HTTPException
 
-    import flash.server.domain.envs as envs_mod
-    from flash.server.domain import environment_registry
+    import flash.server.domain.registry.envs as envs_mod
+    from flash.server.domain.registry import environment_registry
 
     key = _login()
     namespace = _identity_for_token(key)["org_slug"]
@@ -9678,8 +9678,8 @@ def test_delete_env_missing_mirror_surfaces_hub_outage_status(api, monkeypatch):
 def test_delete_env_missing_mirror_does_not_delete_existing_package(api, monkeypatch):
     from fastapi import HTTPException
 
-    import flash.server.domain.envs as envs_mod
-    from flash.server.domain import environment_registry
+    import flash.server.domain.registry.envs as envs_mod
+    from flash.server.domain.registry import environment_registry
 
     key = _login()
     namespace = _identity_for_token(key)["org_slug"]
@@ -9715,7 +9715,7 @@ def test_delete_env_missing_mirror_does_not_delete_existing_package(api, monkeyp
 
 
 def test_delete_env_endpoint_requires_project_header_before_storage(api, monkeypatch):
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.envs as envs_mod
 
     monkeypatch.setattr(
         envs_mod, "delete_package", lambda **_k: pytest.fail("storage must not be touched")
@@ -9726,9 +9726,9 @@ def test_delete_env_endpoint_requires_project_header_before_storage(api, monkeyp
 
 
 def test_delete_env_validates_project_and_environment_before_storage(api, monkeypatch):
-    import flash.server.domain.envs as envs_mod
-    import flash.server.domain.projects as projects_mod
-    from flash.server.domain import environment_registry
+    import flash.server.domain.registry.envs as envs_mod
+    import flash.server.domain.registry.projects as projects_mod
+    from flash.server.domain.registry import environment_registry
 
     events: list[tuple[str, dict]] = []
 
@@ -9769,8 +9769,8 @@ def test_delete_env_validates_project_and_environment_before_storage(api, monkey
 def test_delete_env_project_mismatch_blocks_storage(api, monkeypatch):
     from fastapi import HTTPException
 
-    import flash.server.domain.envs as envs_mod
-    from flash.server.domain import environment_registry
+    import flash.server.domain.registry.envs as envs_mod
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.setattr(
         environment_registry,
@@ -9797,7 +9797,7 @@ def test_delete_env_project_mismatch_blocks_storage(api, monkeypatch):
 
 def test_delete_env_endpoint_maps_publish_error_status(api, monkeypatch):
     """A namespace-authorization EnvPublishError surfaces as its HTTP status (403)."""
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.envs as envs_mod
 
     def fake_delete_package(*, slug, key):
         raise envs_mod.EnvPublishError("not your namespace", status=403)
@@ -9815,8 +9815,8 @@ def test_delete_env_endpoint_maps_publish_error_status(api, monkeypatch):
 
 def test_delete_env_endpoint_mirror_failure_is_non_fatal(api, monkeypatch):
     """A failing metadata-mirror delete must not turn a successful delete into a 500."""
-    import flash.server.domain.envs as envs_mod
-    from flash.server.domain import environment_registry
+    import flash.server.domain.registry.envs as envs_mod
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.setattr(envs_mod, "delete_package", lambda *, slug, key: True)
 
@@ -9837,8 +9837,8 @@ def test_delete_env_endpoint_mirror_failure_is_non_fatal(api, monkeypatch):
 
 def test_delete_env_endpoint_rejects_non_canonical_id(api, monkeypatch):
     """A non-canonical id (uppercase / trailing slash) is rejected 400 before any storage call."""
-    import flash.server.domain.envs as envs_mod
-    from flash.server.domain import environment_registry
+    import flash.server.domain.registry.envs as envs_mod
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.setattr(
         envs_mod, "delete_package", lambda **_k: pytest.fail("storage must not be touched")
@@ -9952,7 +9952,7 @@ def _make_run(api, key, state):
 
 
 def test_list_checkpoints_endpoint(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _login()
@@ -9963,7 +9963,7 @@ def test_list_checkpoints_endpoint(api, monkeypatch):
 
 
 def test_deploy_specific_checkpoint_of_finished_run(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     captured = {}
@@ -9997,7 +9997,7 @@ def test_deploy_specific_checkpoint_of_finished_run(api, monkeypatch):
 def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatch):
     """The headline fix: a run cancelled mid-RL can deploy a checkpoint, and stays `cancelled`."""
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
 
@@ -10029,7 +10029,7 @@ def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatc
 def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, state):
     """A resolved checkpoint step proves the adapter exists, so run state does not gate serving it."""
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
 
@@ -10059,7 +10059,7 @@ def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, 
 
 def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _login()
@@ -10089,7 +10089,7 @@ def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, mon
 
 def test_deploy_checkpoint_preserves_final_deploy_that_wins_cas(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     undeploys = []
@@ -10123,7 +10123,7 @@ def test_deploy_checkpoint_preserves_final_deploy_that_wins_cas(api, monkeypatch
 
 
 def test_deploy_checkpoint_of_dry_run_run_is_409(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     monkeypatch.setattr(
@@ -10141,7 +10141,7 @@ def test_deploy_checkpoint_of_dry_run_run_is_409(api, monkeypatch):
 
 def test_deploy_checkpoint_preserves_concurrent_run_undeploy(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     undeploys = []
@@ -10169,7 +10169,7 @@ def test_deploy_checkpoint_preserves_concurrent_run_undeploy(api, monkeypatch):
 
 def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatch):
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
@@ -10203,7 +10203,7 @@ def test_deploy_cancelled_run_without_step_is_409(api):
 
 
 def test_deploy_unknown_step_is_404_with_available(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _login()
@@ -10216,7 +10216,7 @@ def test_deploy_unknown_step_is_404_with_available(api, monkeypatch):
 def test_deploy_rejects_non_integer_step(api, monkeypatch):
     """A bool (True->1) or non-integer step must be rejected, not silently coerced. An all-digit string
     over Python's 4300-digit int()-conversion limit must also be a clean 400, not int()->uncaught 500."""
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _login()
@@ -10227,7 +10227,7 @@ def test_deploy_rejects_non_integer_step(api, monkeypatch):
 
 
 def test_create_run_records_managed_environment_use(api, monkeypatch):
-    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.registry.environment_registry as registry
 
     calls: list[dict] = []
     monkeypatch.setattr(
@@ -10253,7 +10253,7 @@ def test_create_run_records_managed_environment_use(api, monkeypatch):
 
 
 def test_internal_run_environment_use_merges_header_org(api, monkeypatch):
-    import flash.server.domain.environment_registry as registry
+    import flash.server.domain.registry.environment_registry as registry
 
     calls: list[dict] = []
     monkeypatch.setattr(
@@ -10274,7 +10274,7 @@ def test_internal_run_environment_use_merges_header_org(api, monkeypatch):
 
 
 def test_create_run_records_flash_training_run(api, monkeypatch):
-    import flash.server.domain.run_registry as registry
+    import flash.server.domain.registry.run_registry as registry
 
     calls: list[dict] = []
     monkeypatch.setattr(
@@ -10319,7 +10319,7 @@ def _finished_run(api, key) -> str:
 def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     """A finished run's final adapter is read privately and exported with a public source ref."""
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _finished_run(api, key)
@@ -10374,7 +10374,7 @@ def test_export_sends_the_runner_assigned_revision_not_the_public_blank(api, mon
     tests captured `base_model_revision` and never checked it, which is why this reached review.
     """
     import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     from flash.core.spec import JobSpec
 
     key = _login()
@@ -10417,7 +10417,7 @@ def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
     operation to interleave with the request. Assert the lock is already held during the payload
     validation (``_validate_hf_repo_id``, which runs first) AND by the time owned_run runs.
     """
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     from flash.server.routes import serving as serving_routes
 
     key = _login()
@@ -10461,7 +10461,7 @@ def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
 
 
 def test_export_public_flag_sets_private_false(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _finished_run(api, key)
@@ -10532,7 +10532,7 @@ def test_export_validates_repository_and_token(api):
 def test_export_unfinished_run_is_409(api, monkeypatch):
     """A run with no trained final adapter (never finished) can't be exported — and the HF copy
     is never attempted."""
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -10552,7 +10552,7 @@ def test_export_unfinished_run_is_409(api, monkeypatch):
 
 
 def test_export_missing_artifacts_is_404(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _finished_run(api, key)
@@ -10573,8 +10573,8 @@ def test_export_missing_artifacts_is_404(api, monkeypatch):
 def test_export_hf_failure_is_clean_502(api, monkeypatch):
     """An HF transport/permission failure (download or upload) surfaces as a clean 502 carrying the
     real reason — not an unhandled 500 (mirrors the deploy/undeploy ServingError handling)."""
-    import flash.server.app as app_mod
-    from flash.serve.deploy import ServingError
+    import flash.server.asgi.app as app_mod
+    from flash.serve.deployment.deploy import ServingError
 
     key = _login()
     run_id = _finished_run(api, key)
@@ -10595,7 +10595,7 @@ def test_export_hf_failure_is_clean_502(api, monkeypatch):
 def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
     """Step export targets the exact per-step checkpoint `flash deploy RUN_ID/step-N` would serve; an
     unknown step 404s with the available list (resolved against published checkpoints)."""
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _finished_run(api, key)
@@ -10644,8 +10644,8 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
 def test_export_reports_product_analytics_event(api, monkeypatch):
     """A successful export fires the platform product-event reporter (best-effort) with the
     destination repo, url, and step; the report failing must never fail the export itself."""
-    import flash.server.app as app_mod
-    import flash.server.domain.run_registry as run_registry
+    import flash.server.asgi.app as app_mod
+    import flash.server.domain.registry.run_registry as run_registry
 
     key = _login()
     run_id = _finished_run(api, key)
@@ -10674,8 +10674,8 @@ def test_export_reports_product_analytics_event(api, monkeypatch):
 
 
 def test_export_succeeds_even_when_analytics_report_raises(api, monkeypatch):
-    import flash.server.app as app_mod
-    import flash.server.domain.run_registry as run_registry
+    import flash.server.asgi.app as app_mod
+    import flash.server.domain.registry.run_registry as run_registry
 
     key = _login()
     run_id = _finished_run(api, key)
@@ -10699,7 +10699,7 @@ def test_export_succeeds_even_when_analytics_report_raises(api, monkeypatch):
 def test_record_model_exported_posts_allowlisted_event(monkeypatch):
     """The reporter posts the flash_model_exported event with org/user attribution and the
     export detail; no org in context disables the report entirely."""
-    import flash.server.domain.run_registry as run_registry
+    import flash.server.domain.registry.run_registry as run_registry
 
     posted: dict = {}
     monkeypatch.setattr(
@@ -10775,7 +10775,7 @@ def test_managed_teacher_rejection_reports_which_side_is_at_fault(
     would re-create, at the HTTP layer, the same "misconfiguration looks like a spec error"
     conflation that hoisting this gate to submit time exists to end.
     """
-    import flash.envs.loader as envs_loader
+    import flash.envs.loading.loader as envs_loader
     from tests._helpers.teacher import configure_managed_teacher
 
     configure_managed_teacher(monkeypatch)

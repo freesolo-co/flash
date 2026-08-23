@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from flash.server.domain import envs
+from flash.server.domain.registry import envs
 
 
 def _git(cwd: Path, *args: str) -> None:

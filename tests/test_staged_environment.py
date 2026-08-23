@@ -19,7 +19,7 @@ import httpx
 import pytest
 
 from flash.core.spec import JobSpec
-from flash.envs.staged import (
+from flash.envs.loading.staged import (
     ResolvedEnvironmentSource,
     StagedEnvironmentTransientError,
     archive_path_for_digest,
@@ -114,7 +114,7 @@ def _hf_downloads(
 
 
 def _disable_github(monkeypatch) -> None:
-    from flash.envs import loader
+    from flash.envs.loading import loader
 
     def boom(*_args, **_kwargs):
         raise AssertionError("worker must not call github")
@@ -147,8 +147,8 @@ def _prepared_status(public: JobSpec, worker: JobSpec, *, state: str = "provisio
 def test_controller_acquires_fresh_managed_tree_without_reading_poisoned_cache(
     monkeypatch, tmp_path
 ) -> None:
-    from flash.envs import loader
-    from flash.envs.staged import resolve_environment_source
+    from flash.envs.loading import loader
+    from flash.envs.loading.staged import resolve_environment_source
 
     poisoned = tmp_path / "cache" / "poisoned"
     poisoned.mkdir(parents=True)
@@ -192,8 +192,8 @@ def test_controller_acquires_fresh_managed_tree_without_reading_poisoned_cache(
 def test_resolved_git_sha_is_lowercase_before_exact_acquisition(
     monkeypatch, tmp_path, env_id, pinned_sha
 ) -> None:
-    from flash.envs import loader
-    from flash.envs.staged import resolve_environment_source
+    from flash.envs.loading import loader
+    from flash.envs.loading.staged import resolve_environment_source
 
     acquired: list[str] = []
 
@@ -215,7 +215,7 @@ def test_resolved_git_sha_is_lowercase_before_exact_acquisition(
 
 
 def test_staging_deadline_stops_before_request_attempt(monkeypatch) -> None:
-    from flash.envs import loader
+    from flash.envs.loading import loader
 
     attempted = False
 
@@ -233,7 +233,7 @@ def test_staging_deadline_stops_before_request_attempt(monkeypatch) -> None:
 
 
 def test_staging_request_timeout_and_backoff_are_capped_to_deadline(monkeypatch) -> None:
-    from flash.envs import loader
+    from flash.envs.loading import loader
 
     clock = iter((100.0, 100.0, 103.0, 105.0))
     timeouts: list[float] = []
@@ -279,9 +279,9 @@ def test_archive_permissions_are_deterministic(tmp_path) -> None:
 
 
 def test_load_staged_environment_uses_hf_only_and_cleans_owned_tree(monkeypatch, tmp_path) -> None:
-    import flash.envs.adapter as adapter
-    from flash.envs import loader
-    from flash.envs.staged import load_staged_freesolo_environment
+    import flash.envs.loading.adapter as adapter
+    from flash.envs.loading import loader
+    from flash.envs.loading.staged import load_staged_freesolo_environment
 
     package, manifest, archive, _manifest_path, _archive_path = _staged_files(tmp_path)
     calls = _hf_downloads(monkeypatch, package, manifest, archive)
@@ -330,7 +330,7 @@ def test_load_staged_environment_uses_hf_only_and_cleans_owned_tree(monkeypatch,
 
 
 def test_materialization_cleans_partial_tree_on_extraction_failure(monkeypatch, tmp_path) -> None:
-    from flash.envs.staged import materialize_staged_environment
+    from flash.envs.loading.staged import materialize_staged_environment
 
     package, manifest, archive, _manifest_path, _archive_path = _staged_files(tmp_path)
     archive.write_bytes(b"not a gzip archive")
@@ -344,7 +344,7 @@ def test_materialization_cleans_partial_tree_on_extraction_failure(monkeypatch, 
     _hf_downloads(monkeypatch, package, manifest, archive)
     owned = tmp_path / "owned-materialization"
     monkeypatch.setattr(
-        "flash.envs.staged.tempfile.mkdtemp",
+        "flash.envs.loading.staged.tempfile.mkdtemp",
         lambda **_kwargs: str(owned),
     )
 
@@ -369,7 +369,7 @@ def test_materialization_cleans_partial_tree_on_extraction_failure(monkeypatch, 
 def test_actual_staged_download_classifies_transient_failures(
     monkeypatch, tmp_path, failure
 ) -> None:
-    from flash.envs.staged import verify_staged_environment
+    from flash.envs.loading.staged import verify_staged_environment
 
     package, _manifest, _archive, _manifest_path, _archive_path = _staged_files(tmp_path)
     monkeypatch.setenv("HF_TOKEN", "hf-test")
@@ -385,7 +385,7 @@ def test_actual_staged_download_classifies_transient_failures(
 
 
 def test_missing_immutable_revision_is_terminal(monkeypatch, tmp_path) -> None:
-    from flash.envs.staged import verify_staged_environment
+    from flash.envs.loading.staged import verify_staged_environment
 
     package, _manifest, _archive, _manifest_path, _archive_path = _staged_files(tmp_path)
 
@@ -406,7 +406,7 @@ def test_missing_immutable_revision_is_terminal(monkeypatch, tmp_path) -> None:
 
 def test_worker_failure_boundary_marks_staged_transient_retriable() -> None:
     from flash.engine import worker
-    from flash.envs.identity import GitHubUnavailableError
+    from flash.envs.meta.identity import GitHubUnavailableError
 
     assert worker._worker_failure_flags(StagedEnvironmentTransientError("temporary")) == {
         "retriable": True,
@@ -434,8 +434,8 @@ def test_worker_failure_boundary_marks_staged_transient_retriable() -> None:
 def test_manifest_identity_tampering_fails_before_environment_import(
     monkeypatch, tmp_path, field, value
 ) -> None:
-    from flash.envs import loader
-    from flash.envs.staged import load_staged_freesolo_environment
+    from flash.envs.loading import loader
+    from flash.envs.loading.staged import load_staged_freesolo_environment
 
     package, manifest, archive, _manifest_path, _archive_path = _staged_files(tmp_path)
     payload = json.loads(manifest.read_text(encoding="utf-8"))
@@ -463,9 +463,9 @@ def test_controller_stage_uploads_completion_last_and_verifies_returned_revision
 ) -> None:
     import huggingface_hub
 
-    import flash.envs.staged as staged
-    import flash.providers._lifecycle.worker as provider_worker
-    from flash.runner.artifacts import stage_environment_package
+    import flash.envs.loading.staged as staged
+    import flash.providers._lifecycle.net.worker as provider_worker
+    from flash.runner.accounting.artifacts import stage_environment_package
 
     source = _source(tmp_path)
     uploads: list[dict] = []
@@ -515,9 +515,9 @@ def test_identical_archives_for_different_git_shas_use_distinct_manifests_concur
 ) -> None:
     import huggingface_hub
 
-    import flash.envs.staged as staged
-    import flash.providers._lifecycle.worker as provider_worker
-    from flash.runner.artifacts import stage_environment_package
+    import flash.envs.loading.staged as staged
+    import flash.providers._lifecycle.net.worker as provider_worker
+    from flash.runner.accounting.artifacts import stage_environment_package
 
     sources = {
         _SHA: _source(tmp_path, sha=_SHA, name="source-a"),
@@ -697,7 +697,7 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
     monkeypatch, tmp_path
 ) -> None:
     import flash.runner as runner
-    from flash.providers.base import PollResult
+    from flash.providers.core.base import PollResult
     from flash.runner.supervise import attach, deploy
 
     package, _manifest, _archive, _manifest_path, _archive_path = _staged_files(tmp_path)
@@ -760,7 +760,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
     monkeypatch, tmp_path
 ) -> None:
     import flash.runner as runner
-    from flash.providers.base import PollResult
+    from flash.providers.core.base import PollResult
     from flash.runner.supervise import attach, deploy
     from flash.runner.supervise import lifecycle as supervise_lifecycle
 
@@ -832,7 +832,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
     monkeypatch.setattr(runner, "_compare_and_clear_remote", record_clear)
     monkeypatch.setattr(runner, "_compare_and_fail_remote", record_fail)
     monkeypatch.setattr(runner, "_run_training", forbidden_training)
-    monkeypatch.setattr("flash.providers.allocator.allocate", forbidden_allocation)
+    monkeypatch.setattr("flash.providers.core.allocator.allocate", forbidden_allocation)
     monkeypatch.setattr(
         deploy,
         "_schedule_attach_reconciliation",
@@ -855,7 +855,7 @@ def test_worker_cleans_materialized_package_after_training_handler(
     monkeypatch, tmp_path, handler_fails
 ) -> None:
     from flash.engine import worker
-    from flash.envs.staged import StagedEnvironmentMaterialization
+    from flash.envs.loading.staged import StagedEnvironmentMaterialization
 
     class WorkerExited(BaseException):
         pass
@@ -908,7 +908,7 @@ def test_package_descriptor_contains_only_immutable_transport_values(tmp_path) -
 
 
 def test_artifact_repository_identity_keeps_raw_environment_spelling(monkeypatch) -> None:
-    from flash.runner.artifacts import managed_hf_repo_for_environment
+    from flash.runner.accounting.artifacts import managed_hf_repo_for_environment
 
     monkeypatch.setenv("FLASH_HF_NAMESPACE", "owner")
     managed = "org/project/env"

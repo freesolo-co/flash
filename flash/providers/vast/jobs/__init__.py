@@ -16,26 +16,26 @@ from collections.abc import Callable
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
-from flash.providers._lifecycle.deadline import (
+from flash.providers._lifecycle.net.deadline import (
     deadline_kwargs,
     remaining_seconds,
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers._lifecycle.poll import (
+from flash.providers._lifecycle.instances.poll import (
     FIRST_LIVENESS_S,
     LOAD_TIMEOUT_S,
     SETUP_GRACE_S,
     STALL_AFTER_S,
     make_say,
 )
-from flash.providers._lifecycle.poll_instance import InstancePollAdapter, poll_instance_job
+from flash.providers._lifecycle.instances.poll_instance import InstancePollAdapter, poll_instance_job
 from flash.providers.artifacts.hf import (
     error_artifact_name,
     heartbeat_reader_for,
     make_hf_text_reader,
 )
-from flash.providers.base import (
+from flash.providers.core.base import (
     GPU_INFO,
     PollResult,
     RunExhaustedProviderPoolError,
@@ -45,7 +45,7 @@ from flash.providers.base import (
     min_cuda_modern,
     vast_gpu_for_offer,
 )
-from flash.providers.vast import api as vast_api
+from flash.providers.vast.client import api as vast_api
 from flash.providers.vast.jobs.builders import (
     VastJobHandle,
     VastOffer,
@@ -88,7 +88,7 @@ _DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
 # set and merely re-learns. Persisting it would put market trivia in the run record and still not
 # be authoritative, since offer ids churn.
 _run_dead_machines: dict[str, set[int]] = {}
-# Supervision runs on background threads (flash/server/app.py, supervise/attach.py), so two runs can
+# Supervision runs on background threads (flash/server/asgi/app.py, supervise/attach.py), so two runs can
 # reach the map at once. Its mutations are read-modify-write (size check then evict; setdefault then
 # add), which is not atomic under the GIL.
 _dead_machines_lock = threading.Lock()

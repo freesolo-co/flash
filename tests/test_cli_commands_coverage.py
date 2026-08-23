@@ -5,7 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import flash.cli.commands as commands
-import flash.cli.commands.env.list as env_list_commands
+import flash.cli.commands.env.ops.list as env_list_commands
 
 
 class _Client:
@@ -434,7 +434,7 @@ def test_teardown_window_still_tags_the_dead_workers_heartbeat(capsys) -> None:
     exists for -- the dead attempt's heartbeat reached ``grep HEARTBEAT | tail -1`` unmarked while
     replacement capacity was still being acquired.
     """
-    from flash.cli.commands.worker_output import _NO_LIVE_WORKER
+    from flash.cli.commands.ops.worker_output import _NO_LIVE_WORKER
 
     commands._print_worker_output(
         {
@@ -502,7 +502,7 @@ def test_follow_also_tags_a_teardown_it_ends_inside(capsys) -> None:
 
 def test_snapshot_distinguishes_teardown_from_an_unknown_attempt() -> None:
     """``remote: null`` means torn down; a failed lookup means unknown. They are not the same."""
-    from flash.cli.commands.worker_output import _NO_LIVE_WORKER, _snapshot_live_attempt
+    from flash.cli.commands.ops.worker_output import _NO_LIVE_WORKER, _snapshot_live_attempt
     from flash.client import ClientError
 
     class _Run:
@@ -527,7 +527,7 @@ def test_snapshot_distinguishes_teardown_from_an_unknown_attempt() -> None:
 
 def test_heartbeat_tagging_is_idempotent() -> None:
     """Re-printing an already-tagged dump must not stack a second marker onto the line."""
-    from flash.cli.commands.worker_output import _mark_superseded_heartbeats
+    from flash.cli.commands.ops.worker_output import _mark_superseded_heartbeats
 
     once = _mark_superseded_heartbeats('HEARTBEAT {"step":1}\n', 0, 1)
     twice = _mark_superseded_heartbeats(once, 0, 1)

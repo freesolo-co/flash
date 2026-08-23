@@ -40,14 +40,14 @@ from flash.schema import parse_adapter_revision
 # `RetryableServingUnavailable` is raised by the serving-coverage tests as
 # `serving.RetryableServingUnavailable`, so it stays reachable here even though the smoke path
 # that catches it now lives in `.serving_smoke`.
-from flash.serve.deploy import (  # noqa: F401
+from flash.serve.deployment.deploy import (  # noqa: F401
     ActivationOutcomeUnknown,
     AdapterConfigMissing,
     RetryableServingUnavailable,
     ServingError,
 )
-from flash.serve.urls import public_deployment
-from flash.server import app as _app
+from flash.serve.contract.urls import public_deployment
+from flash.server.asgi import app as _app
 from flash.server.platform import auth, db
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
 from flash.server.platform.internal_client import run_org_id
@@ -200,7 +200,7 @@ def _queued_deployment_record(
     # Validate the cheap configured-rank part synchronously so obvious spec errors return 400
     # instead of becoming background deployment failures.
     try:
-        from flash.serve.deploy import validate_serving_lora_rank
+        from flash.serve.deployment.deploy import validate_serving_lora_rank
 
         validate_serving_lora_rank(
             effective_spec.model,
@@ -564,7 +564,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     # best-effort product-analytics report: exports never otherwise touch the
     # platform backend (the copy is hf-to-hf inside flash).
     with contextlib.suppress(Exception):
-        from flash.server.domain.run_registry import record_model_exported
+        from flash.server.domain.registry.run_registry import record_model_exported
 
         record_model_exported(
             status=status,

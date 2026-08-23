@@ -20,7 +20,7 @@ from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.fused_experts import lora_target_parameters
 from flash.core.spec import FIXED_SEED, gpu_count_of, load_job_spec_from_env
 from flash.engine.result.accounting import RunMetrics
-from flash.engine.worker.backend_common import collect_ray_failure_logs
+from flash.engine.worker.train.entry.backend_common import collect_ray_failure_logs
 from flash.engine.worker.entry.opd import run_opd
 from flash.engine.worker.entry.rl import run_rl
 from flash.engine.worker.entry.sft import run_sft
@@ -85,15 +85,15 @@ from flash.engine.worker.perf import (
 )
 from flash.engine.worker.runtime.kernel_warmup import _current_cuda_sm, load_mega_cache
 from flash.engine.worker.runtime.rng import backend_seed, seed_training_rngs
-from flash.engine.worker.train.finalize import write_train_meta
-from flash.engine.worker.train.rl.config import (
+from flash.engine.worker.train.core.lifecycle.finalize import write_train_meta
+from flash.engine.worker.train.rl.launch.config import (
     build_grpo_prompt_dataset,
     grpo_mask_truncated_completions,
     grpo_overrides,
     resolve_grpo_prompts_per_step,
 )
-from flash.envs.identity import GitHubTransientError
-from flash.envs.staged import (
+from flash.envs.meta.identity import GitHubTransientError
+from flash.envs.loading.staged import (
     StagedEnvironmentMaterialization,
     StagedEnvironmentTransientError,
     load_staged_freesolo_environment,
@@ -150,7 +150,7 @@ _HB_PROGRESS_UPLOADED_SEQ = 0
 _HB_PENDING_CHECKPOINT_FAILURE: dict[str, int | str] | None = None
 # Environment-scoped artifact repos are shared by many runs. Keep heartbeat commits below the HF
 # per-repo commit cap while staying under the provider poller's training stall window
-# (STALL_AFTER_S=1500s in flash/providers/_lifecycle/poll.py).
+# (STALL_AFTER_S=1500s in flash/providers/_lifecycle/instances/poll.py).
 _HB_MIN_INTERVAL_S = 900.0
 # highest optimizer step committed by a heartbeat.
 # force bypasses the 900s throttle only on step advance so cancel billing stays current.

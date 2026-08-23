@@ -405,7 +405,7 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.auth as runpod_keys
+    import flash.providers.runpod.client.auth as runpod_keys
 
     runpod_keys.reset()
 
@@ -453,7 +453,7 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", fake_urlopen)
 
     import flash.providers as providers_mod
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
     # The Lambda key above (required by the new preflight) makes configured_providers()

@@ -10,15 +10,15 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from flash.serving.src import adapter_routes
-from flash.serving.src.adapter_routes import remove_adapter
-from flash.serving.src.persistence import (
+from flash.serving.src.http import adapter_routes
+from flash.serving.src.http.adapter_routes import remove_adapter
+from flash.serving.src.store.persistence import (
     PersistenceConflict,
     PersistenceRecordError,
     PersistenceReferenceError,
 )
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import (
+from flash.serving.src.http.router import AdapterRouter, build_serving_app
+from flash.serving.src.io.schemas import (
     AdapterRecord,
     ImmutableAdapterRegistration,
     PersistedAdapterRecord,
@@ -234,10 +234,10 @@ def setup(monkeypatch):
     persistence = MemoryPersistence()
     pool = FakePool()
     router = AdapterRouter()
-    monkeypatch.setattr("flash.serving.src.persistence.get_adapter", persistence.get)
-    monkeypatch.setattr("flash.serving.src.persistence.list_run_adapters", persistence.list_run)
-    monkeypatch.setattr("flash.serving.src.persistence.insert_adapter", persistence.insert)
-    monkeypatch.setattr("flash.serving.src.persistence.replace_adapter_cas", persistence.replace)
+    monkeypatch.setattr("flash.serving.src.store.persistence.get_adapter", persistence.get)
+    monkeypatch.setattr("flash.serving.src.store.persistence.list_run_adapters", persistence.list_run)
+    monkeypatch.setattr("flash.serving.src.store.persistence.insert_adapter", persistence.insert)
+    monkeypatch.setattr("flash.serving.src.store.persistence.replace_adapter_cas", persistence.replace)
     client = TestClient(
         build_serving_app(pool, router, internal_key="secret"),
         headers=INTERNAL_HEADERS,
@@ -673,7 +673,7 @@ def test_unresolvable_org_is_permanent_not_a_retryable_outage(setup, monkeypatch
 
     # the fixture already bound src.persistence.insert_adapter, so rebind that same symbol --
     # replacing persistence.insert here would leave the router calling the fixture's original.
-    monkeypatch.setattr("flash.serving.src.persistence.insert_adapter", _reject_unknown_org)
+    monkeypatch.setattr("flash.serving.src.store.persistence.insert_adapter", _reject_unknown_org)
 
     response = _register(client, _registration(org_id="dev-org"))
 
@@ -702,9 +702,9 @@ def test_unclassified_storage_conflict_does_not_trigger_duplicate_readback(
             pytest.fail("unclassified 409 must not enter conflict readback")
 
     monkeypatch.setattr(
-        "flash.serving.src.persistence.insert_adapter", _reject_unclassified_conflict
+        "flash.serving.src.store.persistence.insert_adapter", _reject_unclassified_conflict
     )
-    monkeypatch.setattr("flash.serving.src.persistence.get_adapter", _read_required_namespaces)
+    monkeypatch.setattr("flash.serving.src.store.persistence.get_adapter", _read_required_namespaces)
 
     result = _register(client, _registration())
 

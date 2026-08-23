@@ -107,7 +107,7 @@ def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
 
 def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
     """stream merger output and prefer direct disk evidence over a short-write marker."""
-    from flash.engine.worker import backend_common
+    from flash.engine.worker.train.entry import backend_common
 
     disk_line = ""
     short_write_line = ""
@@ -334,7 +334,7 @@ def resume_topology_matches(resume_dir: str, *, world_size: int, job_label: str)
     what a failed resume fetch already does, and costs only the steps since the last save.
 
     an unreadable topology is always a mismatch, with no single-gpu exemption: ``rentable_gpu_counts``
-    in ``flash/providers/base.py`` walks every power-of-two card count up to a spec's cap, largest
+    in ``flash/providers/core/base.py`` walks every power-of-two card count up to a spec's cap, largest
     first, and the allocator rewrites the retried attempt to whichever count it lands on, so a
     single-gpu retry can follow a multi-gpu attempt that wrote the checkpoint -- the card count this
     attempt runs at is no evidence of the count the checkpoint was written at. a directory with no

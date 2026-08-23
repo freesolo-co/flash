@@ -493,7 +493,7 @@ def test_gpu_sizing_consumes_the_canonical_warmstart_reference() -> None:
 
 
 def test_warmstart_placeholder_rank_does_not_reject_a_source_rank_that_fits_b200() -> None:
-    from flash.providers.allocator import required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb
 
     train = {
         "epochs": 1,
@@ -768,7 +768,7 @@ def test_env_ref_validator_matches_adapter_acceptor() -> None:
     # they must agree exactly (accept <-> no raise, reject <-> raise) or a ref accepted at submit
     # could fail on the worker (or vice-versa). _require_environment_ref now delegates to the
     # adapter's is_freesolo_environment_id; this pins that alignment across the grammar's corners.
-    from flash.envs.adapter import is_freesolo_environment_id
+    from flash.envs.loading.adapter import is_freesolo_environment_id
     from flash.schema.fields import _require_environment_ref
 
     corpus = [
@@ -1801,7 +1801,7 @@ def test_model_revision_force_pin_rejects_invalid_internal_states(overrides) -> 
 
 
 def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:
-    from flash.runner.preparation import _preparation_digest
+    from flash.runner.lifecycle.preparation import _preparation_digest
 
     scalar = JobSpec(
         model="Qwen/Qwen3.5-9B",
@@ -1823,7 +1823,7 @@ def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:
 
 def test_resubmitting_a_public_spec_gets_a_fresh_runner_pin(monkeypatch) -> None:
     """Round-tripping an auto-pinned run's public spec must keep the pin platform-managed."""
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     resolved_sha = "d" * 40
 
@@ -1849,7 +1849,7 @@ def test_resubmitting_a_public_spec_gets_a_fresh_runner_pin(monkeypatch) -> None
 
 
 def test_forced_sft_model_revision_verifies_and_retains_the_exact_pin(monkeypatch) -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     exact = "a" * 40
     moving_head = "b" * 40
@@ -1884,7 +1884,7 @@ def test_forced_sft_model_revision_verifies_and_retains_the_exact_pin(monkeypatc
 
 @pytest.mark.parametrize("reported", ["b" * 40, "A" * 40])
 def test_forced_model_revision_rejects_a_mismatched_hub_resolution(monkeypatch, reported) -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     class _Api:
         def __init__(self, *a, **k) -> None: ...
@@ -1907,7 +1907,7 @@ def test_forced_model_revision_rejects_a_mismatched_hub_resolution(monkeypatch, 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "opd"])
 def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algorithm) -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     exact = "c" * 40
     asked_for = []
@@ -1938,7 +1938,7 @@ def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algo
 
 
 def test_unmanaged_model_revision_is_rejected_and_runner_pin_is_unchanged() -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     with pytest.raises(ValueError, match="model_revision requires model_revision_auto=True"):
         _job_from_dict({"model_revision": "release-tag"})
@@ -1949,7 +1949,7 @@ def test_unmanaged_model_revision_is_rejected_and_runner_pin_is_unchanged() -> N
 
 
 def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() -> None:
-    from flash.runner.preparation import _preparation_digest
+    from flash.runner.lifecycle.preparation import _preparation_digest
 
     public = spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft"))
     worker = replace(public, model_revision="a" * 40, model_revision_auto=True)
@@ -1973,7 +1973,7 @@ def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> No
     Built by round-tripping through to_dict() rather than by hand, so the test cannot assert a
     shape that submit does not actually produce.
     """
-    from flash.runner.preparation import _validate_effective_spec
+    from flash.runner.lifecycle.preparation import _validate_effective_spec
 
     public = spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft"))
     worker = replace(public, model_revision="a" * 40, model_revision_auto=True)

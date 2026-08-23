@@ -32,7 +32,7 @@ The size gates fail on the _whole_ file or function, so the fix is always to ext
 cohesive piece into a sibling, never to reflow lines.
 
 If you change the verl pin (`Dockerfile.worker` or
-`flash/engine/worker/backend_common.py`), also run the one check that needs the network:
+`flash/engine/worker/train/entry/backend_common.py`), also run the one check that needs the network:
 
 ```bash
 uv run python scripts/check_verl_pin_exists.py   # the pinned commit is reachable on the fork

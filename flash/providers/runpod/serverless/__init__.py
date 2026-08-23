@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flash.providers._lifecycle.worker import (  # noqa: F401
+from flash.providers._lifecycle.net.worker import (  # noqa: F401
     DEFAULT_EXECUTION_TIMEOUT_MS,
     WORKER_IMAGE,
     _hf_call,

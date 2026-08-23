@@ -20,9 +20,9 @@ from flash.runner import (
     runs_file_path,
 )
 from flash.schema import train_schema_metadata
-from flash.serve.preflight import ServingPreflightError
-from flash.server import app as _app
-from flash.server.domain.teacher_broker import TeacherBrokerConfigurationError
+from flash.serve.deployment.preflight import ServingPreflightError
+from flash.server.asgi import app as _app
+from flash.server.domain.teacher.broker import TeacherBrokerConfigurationError
 from flash.server.platform import db
 from flash.server.platform.deps import (
     _parse_spec,
@@ -196,7 +196,7 @@ def _submission_context(
 
 def _resolve_managed_environment(spec, *, project_id: str, reporting_key: dict) -> str | None:
     """Return the canonical managed environment slug for ``spec``, or ``None`` when unmanaged."""
-    from flash.envs.adapter import canonical_managed_environment_slug
+    from flash.envs.loading.adapter import canonical_managed_environment_slug
 
     try:
         environment_slug = canonical_managed_environment_slug(spec.environment.id)
@@ -204,8 +204,8 @@ def _resolve_managed_environment(spec, *, project_id: str, reporting_key: dict) 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if environment_slug is None:
         return None
-    from flash.server.domain import envs as managed_envs
-    from flash.server.domain.environment_registry import require_environment_project
+    from flash.server.domain.registry import envs as managed_envs
+    from flash.server.domain.registry.environment_registry import require_environment_project
 
     try:
         environment_slug = managed_envs.canonical_env_id(environment_slug)
@@ -225,7 +225,7 @@ def _record_environment_use(
 ) -> None:
     """Report the environment use for an already-submitted run; never fails the request."""
     try:
-        from flash.server.domain.environment_registry import record_environment_use
+        from flash.server.domain.registry.environment_registry import record_environment_use
 
         if environment_slug is not None:
             record_environment_use(
@@ -339,7 +339,7 @@ def create_run(
         if detail is None:
             raise
         raise HTTPException(status_code=400, detail=detail) from exc
-    from flash.server.domain.projects import require_project_access
+    from flash.server.domain.registry.projects import require_project_access
 
     project_id = require_project_access(
         project_id=spec.project,
@@ -546,7 +546,7 @@ def run_checkpoints(run_id: str, key: Annotated[dict, Depends(require_key)]):
     spec = _internal_spec_from_status(status)
     checkpoints = _app.list_checkpoints(spec)
     with contextlib.suppress(Exception):
-        from flash.server.domain.checkpoints import register_checkpoints_best_effort
+        from flash.server.domain.registry.checkpoints import register_checkpoints_best_effort
 
         register_checkpoints_best_effort(status)
     return {"run_id": run_id, "checkpoints": checkpoints}

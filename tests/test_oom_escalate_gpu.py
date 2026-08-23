@@ -58,7 +58,7 @@ def test_a_child_process_oom_is_classified_from_its_output():
     So the child's own output is the only evidence, and without it the one OOM shape that happens
     DURING training (rather than at vllm startup) is never retried on a larger card.
     """
-    from flash.engine.worker.backend_common import ChildOutputTail, raise_for_classified_verl_exit
+    from flash.engine.worker.train.entry.backend_common import ChildOutputTail, raise_for_classified_verl_exit
     from flash.engine.worker.perf.lifecycle import is_cuda_oom
 
     tail = ChildOutputTail()
@@ -83,7 +83,7 @@ def test_child_output_that_merely_mentions_memory_is_not_an_oom():
     environment's own error text, or a Triton message as a CUDA OOM and burn a retry on a larger
     card for a run that would fail there identically.
     """
-    from flash.engine.worker.backend_common import ChildOutputTail, raise_for_classified_verl_exit
+    from flash.engine.worker.train.entry.backend_common import ChildOutputTail, raise_for_classified_verl_exit
 
     for line in (
         "MemoryError: host ram: out of memory",
@@ -275,8 +275,8 @@ def _shape(gpu, vram, count):
 
 
 def test_sft_oom_escalation_uses_the_ranks_that_joined():
-    from flash.providers.allocator import _executed_width, _fitting_candidates
-    from flash.providers.base import Candidate, combined_vram_gb
+    from flash.providers.core.allocator import _executed_width, _fitting_candidates
+    from flash.providers.core.base import Candidate, combined_vram_gb
     from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
 
     failed = Candidate("runpod", "RTX 4090", 0.69, 24, 4)
@@ -297,8 +297,8 @@ def test_sft_oom_escalation_uses_the_ranks_that_joined():
 
 
 def test_non_sft_oom_escalation_still_uses_every_rented_card():
-    from flash.providers.allocator import _executed_width, _fitting_candidates
-    from flash.providers.base import Candidate, combined_vram_gb
+    from flash.providers.core.allocator import _executed_width, _fitting_candidates
+    from flash.providers.core.base import Candidate, combined_vram_gb
     from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
 
     failed = Candidate("runpod", "RTX 4090", 0.69, 24, 4)
@@ -316,8 +316,8 @@ def test_non_sft_oom_escalation_still_uses_every_rented_card():
 
 
 def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
-    from flash.providers.allocator import _executed_width, _fitting_candidates
-    from flash.providers.base import Candidate, PollResult
+    from flash.providers.core.allocator import _executed_width, _fitting_candidates
+    from flash.providers.core.base import Candidate, PollResult
     from flash.runner.supervise import seed_submission
     from flash.runner.supervise.lifecycle import _oom_escalated, _RetryBudget
 
@@ -369,7 +369,7 @@ def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
     130.4 GB usable, so the "larger" retry is smaller than the shape that already failed and burns a
     paid attempt to reach the same OOM.
     """
-    from flash.providers.base import combined_vram_gb
+    from flash.providers.core.base import combined_vram_gb
     from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
 
     single_h200 = _shape("H200", 141, 1)
@@ -388,7 +388,7 @@ def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
 
 
 def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
-    from flash.providers.runpod.jobs import surfaced_worker_flags
+    from flash.providers.runpod.execution.jobs import surfaced_worker_flags
 
     say = lambda _m: None  # noqa: E731
     reads = {"n": 0}
@@ -418,7 +418,7 @@ def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
 
 
 def test_heartbeat_oom_for_attempt_gates_stale_flag():
-    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, 0) is True
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, 1) is False
@@ -436,7 +436,7 @@ def test_heartbeat_oom_for_attempt_gates_stale_flag():
 def test_heartbeat_oom_accepts_only_canonical_attempt_identities(
     heartbeat_attempt, current_attempt
 ):
-    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": heartbeat_attempt}, current_attempt)
 
@@ -462,7 +462,7 @@ def test_heartbeat_oom_accepts_only_canonical_attempt_identities(
     ],
 )
 def test_heartbeat_oom_rejects_malformed_heartbeat_attempt(malformed_attempt):
-    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": malformed_attempt}, 1) is False
 
@@ -488,14 +488,14 @@ def test_heartbeat_oom_rejects_malformed_heartbeat_attempt(malformed_attempt):
     ],
 )
 def test_heartbeat_oom_rejects_malformed_current_attempt(malformed_attempt):
-    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": 1}, malformed_attempt) is False
 
 
 def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(jobs.time, "sleep", lambda _s: None)
     monkeypatch.setattr(
@@ -785,7 +785,7 @@ def test_preflight_never_re_derives_what_the_run_needs(monkeypatch):
     batch 1), so recomputing from ``JOB_SPEC.train`` here demands more VRAM than the card was
     rented for and rejects the instance the allocator correctly picked.
     """
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     from flash.engine.worker import _preflight_gpu_occupancy_for_spec
     from flash.engine.worker.perf import lifecycle as lc
 

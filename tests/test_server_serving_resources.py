@@ -13,7 +13,7 @@ import pytest
 from flash.serve.app import ManifestError
 from flash.serve.control import DeploymentRequest, DeploymentSpec, ModalPlacement
 from flash.serve.provisioning import ServingImage, serving_resource_names
-from flash.server.domain.serving_resources import dry_run_deployment, resolve_deployment_bundle
+from flash.server.domain.ops.serving_resources import dry_run_deployment, resolve_deployment_bundle
 from tests.test_serve_app_manifest import IMAGE_DIGEST, _spec_and_inputs
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -175,8 +175,6 @@ provider_roots = ("modal", "runpod", "runpod_flash")
 lifecycle_prefixes = (
     "flash.serve.provisioning.modal",
     "flash.serve.provisioning.runpod",
-    "flash.serve.provisioning._modal",
-    "flash.serve.provisioning._runpod",
 )
 real_import = builtins.__import__
 intercepted = []
@@ -198,7 +196,7 @@ def guarded(name, globals=None, locals=None, fromlist=(), level=0):
 
 
 builtins.__import__ = guarded
-from flash.server.domain.serving_resources import dry_run_deployment, resolve_deployment_bundle
+from flash.server.domain.ops.serving_resources import dry_run_deployment, resolve_deployment_bundle
 
 assert dry_run_deployment
 assert resolve_deployment_bundle

@@ -664,7 +664,7 @@ def test_grpo_rows_retain_arrow_safe_images_and_reward_examples(tmp_path):
     pytest.importorskip("datasets")
     from datasets import Dataset
 
-    from flash.engine.worker.train.rl.config import build_grpo_prompt_dataset
+    from flash.engine.worker.train.rl.launch.config import build_grpo_prompt_dataset
 
     root, _image = _package(tmp_path)
     descriptor = mm.normalize_image_source("dataset/red.png", root)
@@ -970,7 +970,7 @@ def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
     own subprocess, so the ban is injected as a rollout shim rather than a generate kwarg."""
     import inspect
 
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
     # the shim's own rendering is covered in test_rl_train.py; what belongs here is the multimodal
     # wiring -- the pad id comes from the PROCESSOR (a text run resolves none) and reaches the shim.

@@ -369,7 +369,7 @@ def _staged_checkpoint(root, step, *, world_size=None, shards=0, nested=True):
 
 
 def _rl_resume(monkeypatch, tmp_path, src, *, world_size):
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
@@ -445,7 +445,7 @@ def test_unknown_topology_is_always_discarded(monkeypatch, tmp_path, world_size,
 
 def test_sft_flat_layout_is_guarded_too(monkeypatch, tmp_path, capsys):
     # SFT writes its shards into global_step_N itself rather than a nested actor/ dir.
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     src = _staged_checkpoint(tmp_path, 9, world_size=2, shards=2, nested=False)
     local_dir = tmp_path / "ckpt"
@@ -489,7 +489,7 @@ def test_grpo_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     of whether this attempt could load it, so checkpoint-3 could never be reached while checkpoint-7
     stayed the remote max -- exactly the repeat-discard loop this fix closes.
     """
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
     incompatible = _staged_checkpoint(tmp_path, 7, world_size=4, shards=4)
     compatible = _staged_checkpoint(tmp_path, 3, world_size=2, shards=2)
@@ -512,7 +512,7 @@ def test_sft_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     monkeypatch, tmp_path
 ):
     """Same repeat-discard-loop fix as the GRPO case, for SFT's flat (non-nested) checkpoint layout."""
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     incompatible = _staged_checkpoint(tmp_path, 9, world_size=4, shards=4, nested=False)
     compatible = _staged_checkpoint(tmp_path, 5, world_size=2, shards=2, nested=False)
@@ -535,7 +535,7 @@ def test_opd_discards_a_mismatched_checkpoint_with_its_accounting(monkeypatch, t
     The accounting in opd_state.json describes steps a discarded resume simply redoes, so the pair
     has to move together; reading it back beside shards this attempt cannot load would be worse.
     """
-    from flash.engine.worker import opd_train
+    from flash.engine.worker.train.entry import opd_train
 
     src = _staged_checkpoint(tmp_path, 2, world_size=4, shards=4)
     (src / "opd_state.json").write_text(json.dumps({"unreadable": True}))
@@ -556,7 +556,7 @@ def test_opd_pinned_revision_topology_mismatch_fails_closed(monkeypatch, tmp_pat
     """A pinned OPD_RESUME_REVISION means an optimizer step already crossed and the replacement
     gate approved continuation from exactly that checkpoint; discarding it and restarting from
     step 0 would repeat billed teacher work, so a world-size mismatch must raise, not restart."""
-    from flash.engine.worker import opd_train
+    from flash.engine.worker.train.entry import opd_train
 
     src = _staged_checkpoint(tmp_path, 2, world_size=4, shards=4)
     local_dir = tmp_path / "ckpt"
@@ -596,7 +596,7 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
 
 
 def _alloc():
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
 
     candidates = (Candidate("runpod", "RTX 4090", 0.69, 24),)
     return Allocation(
@@ -652,8 +652,8 @@ def _lambda_handle(attempt=0):
 def orch(monkeypatch, tmp_path):
     """The runner package wired to a tmp run-store, with the inter-attempt RunPod teardown stubbed."""
     from flash import runner
-    from flash.providers import allocator
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.core import allocator
+    from flash.providers.runpod.client import api as runpod_api
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
@@ -691,8 +691,8 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
     is what lets the replacement worker pick up the prior checkpoint. A changed run_id here would
     silently turn every "retry from last checkpoint" into a restart from scratch.
     """
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     calls = []
 
@@ -722,8 +722,8 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
     label (provider.gc, run-scoped / not active-shielded) and FAIL the seed terminally; the handle is
     preserved (not cleared) for the run's outer GC."""
     import flash.providers as providers
-    from flash.providers import allocator
-    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Allocation, Candidate, PollResult
 
     submits = []
     gc_calls = []
@@ -741,7 +741,7 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
             return PollResult(False, failure="stalled", detail="infra")
 
         def destroy(self, handle):
-            from flash.providers.vast import api as vast_api
+            from flash.providers.vast.client import api as vast_api
 
             raise vast_api.VastApiError("destroy unconfirmed (success:false)")
 
@@ -773,9 +773,9 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
 
 
 def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orch, monkeypatch):
-    from flash.providers import allocator
-    from flash.providers.base import Allocation, Candidate, PollResult
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Allocation, Candidate, PollResult
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs as lambda_jobs
 
     submits = []
@@ -824,9 +824,9 @@ def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orc
 def test_terminal_runpod_job_allows_retry_and_persists_leaked_endpoint(
     orch, monkeypatch, terminal_status
 ):
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     submits = []
 
@@ -955,9 +955,9 @@ def test_await_runpod_completed_metrics_checks_cancellation_before_sleep(monkeyp
 def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
     orch, monkeypatch, teardown_failure, status_mode
 ):
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
     from flash.providers.runpod import serverless as runpod_train
 
     submits = []
@@ -1020,9 +1020,9 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
     prior worker remains; for RunPod it re-issues a redundant cancel/delete. Sequence: attempt 0
     provisions ep0 then fails infra; attempt 1 confirms ep0's teardown then fails no_capacity (no new
     handle); attempt 2 must NOT touch ep0 again (last_handle cleared) and must succeed."""
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     # cancel_job fires ONLY in the inter-attempt teardown block (never in the success _gc_seen_endpoints
     # sweep, which only delete_endpoints), so counting it cleanly isolates re-teardown.
@@ -1070,8 +1070,8 @@ def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
     this actually guards the classification: if ``job_failed`` were ever added to the supervisor's
     infra-shaped retry set, this test would FAIL (it'd relaunch a doomed crash and burn GPU budget).
     """
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     calls = []
 
@@ -1097,8 +1097,8 @@ def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
     instance adoptable) raises ``UnreconciledCreateError`` from submit. The supervisor must classify it
     TERMINAL (job_failed), NOT as the generic ``poll_error`` flake — retrying would rent a SECOND box
     while the phantom from this attempt may still surface and bill under the still-active run."""
-    from flash.providers.base import UnreconciledCreateError
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core.base import UnreconciledCreateError
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     calls = []
 
@@ -1125,8 +1125,8 @@ def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypa
     currently retrying healthily reads the OOM stack that ended the PREVIOUS attempt and concludes
     the run is failing. Each new attempt must announce itself and disown what is above it.
     """
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         if attempt == 0:
@@ -1160,8 +1160,8 @@ def test_the_marker_does_not_claim_one_previous_attempt_after_two_failures(orch,
     attempt begins, which stays true however many failed before it -- so it must not name a single
     owner for the bytes above.
     """
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         if attempt < 2:
@@ -1185,8 +1185,8 @@ def test_the_marker_does_not_claim_one_previous_attempt_after_two_failures(orch,
 
 def test_a_single_attempt_run_gets_no_boundary_marker(orch, monkeypatch):
     """Attempt 0 has nothing above it to disown. A header on the common path is pure noise."""
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import jobs as rp_jobs
 
     monkeypatch.setattr(
         rp_jobs,

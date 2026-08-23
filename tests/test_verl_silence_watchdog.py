@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from flash.engine.worker import backend_common, rl_train
+from flash.engine.worker.train.entry import backend_common, rl_train
 from flash.engine.worker.io import heartbeat
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
 from flash.engine.worker.teacher.client import TeacherClient

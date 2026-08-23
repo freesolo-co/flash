@@ -496,7 +496,7 @@ def test_sft_cost_asks_the_server_for_the_quote_without_creating_a_training_run(
     ids=("branch", "tag", "sha"),
 )
 def test_github_republish_advice_covers_branch_tag_and_sha(environment_id, expected, absent):
-    from flash.cli.commands import train_cost
+    from flash.cli.commands.ops import train_cost
 
     advice = train_cost._republish_advice(environment_id)
 
@@ -505,7 +505,7 @@ def test_github_republish_advice_covers_branch_tag_and_sha(environment_id, expec
 
 
 def test_managed_hub_github_ref_uses_env_push_advice():
-    from flash.cli.commands import train_cost
+    from flash.cli.commands.ops import train_cost
 
     advice = train_cost._republish_advice(
         "github:freesolo-co/environment-hub@main:owner/project/env/environment.py"
@@ -516,7 +516,7 @@ def test_managed_hub_github_ref_uses_env_push_advice():
 
 
 def test_managed_republish_advice_prints_required_env_push_arguments():
-    from flash.cli.commands import train_cost
+    from flash.cli.commands.ops import train_cost
 
     advice = train_cost._republish_advice("owner/project/env")
 
@@ -527,7 +527,7 @@ def test_managed_republish_advice_prints_required_env_push_arguments():
 
 
 def test_published_environment_note_ignores_unknown_environment_ids(monkeypatch, capsys):
-    from flash.cli.commands import train_cost
+    from flash.cli.commands.ops import train_cost
 
     monkeypatch.setenv("FLASH_STYLE", "0")
     train_cost._print_published_sft_environment_note(
@@ -1133,7 +1133,7 @@ def test_higher_warm_start_rank_crosses_hardware_shape_boundary():
     from dataclasses import replace
 
     from flash.cost import estimate_cost
-    from flash.providers.base import GPU_INFO
+    from flash.providers.core.base import GPU_INFO
 
     config = _warm_start_rank_boundary_config()
     rank_1 = estimate_cost(replace(config, lora_rank=1))
@@ -1150,7 +1150,7 @@ def test_higher_warm_start_rank_can_select_cheaper_hardware(monkeypatch):
     from dataclasses import replace
 
     from flash.cost import estimate_cost
-    from flash.providers import base
+    from flash.providers.core import base
 
     b200 = replace(base.GPU_INFO["B200"], hourly_usd=5.50)
     h200 = replace(base.GPU_INFO["H200"], hourly_usd=4.00)

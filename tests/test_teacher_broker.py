@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
-from flash.server.domain import teacher_broker
+from flash.server.domain.teacher import broker as teacher_broker
 from flash.server.platform import db
 from tests._helpers.source_snapshot import valid_source_snapshot
 
@@ -205,7 +205,7 @@ def test_exact_24_hour_capability_deadline_is_accepted(broker_db, monkeypatch):
 
 
 def test_48_hour_opd_wall_is_rejected_before_allocation(monkeypatch):
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     from flash.runner.supervise import lifecycle
 
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
@@ -1362,7 +1362,7 @@ def test_worker_fails_closed_on_nontransient_broker_classification(monkeypatch, 
 
 def test_opd_batch_error_preserves_provider_status():
     from flash.engine.worker.teacher.client import TeacherError
-    from flash.engine.worker.train.opd.batching import _teacher_batch_error
+    from flash.engine.worker.train.opd.bridging.batching import _teacher_batch_error
 
     wrapped = _teacher_batch_error(
         TeacherError("rate limited", permanent=False, provider_status=429)
@@ -1946,7 +1946,7 @@ def test_legacy_teacher_broker_url_does_not_configure_the_plane(monkeypatch):
 
 @pytest.mark.parametrize("missing", ["FLASH_PUBLIC_URL", "PARASAIL_API_KEY"])
 def test_missing_broker_configuration_fails_before_allocation(monkeypatch, missing):
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     from flash.runner.supervise import lifecycle
 
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
@@ -2065,10 +2065,10 @@ def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypa
 
 
 def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monkeypatch):
-    from flash.providers._lifecycle.worker import build_worker_env
-    from flash.providers.base import PollResult
+    from flash.providers._lifecycle.net.worker import build_worker_env
+    from flash.providers.core.base import PollResult
     from flash.providers.lambda_.jobs.builders import build_payload as build_lambda_payload
-    from flash.providers.runpod import jobs as runpod_jobs
+    from flash.providers.runpod.execution import jobs as runpod_jobs
     from flash.providers.vast.jobs.builders import build_payload as build_vast_payload
 
     spec = JobSpec(
@@ -2216,7 +2216,7 @@ def test_broker_gate_reason_survives_into_the_persisted_run_error(tmp_path, monk
     terminal handler recorded only the exception TYPE. Both a missing plane credential and a bad
     spec landed on that identical string, so the run itself could not say which had happened.
     """
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.runner as runner
     from flash.runner import RunStatus
     from flash.runner.supervise import lifecycle
@@ -2297,7 +2297,7 @@ def test_dry_run_rejects_an_unservable_opd_spec_before_creating_a_run(
     that exists to catch exactly this, and no run row is written for work that cannot start.
     """
     import flash.runner as runner
-    from flash.runner.submit import submit_job
+    from flash.runner.lifecycle.submit import submit_job
 
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
@@ -2323,7 +2323,7 @@ def test_dry_run_rejects_an_unservable_opd_spec_before_creating_a_run(
 def test_dry_run_still_previews_a_servable_opd_spec(tmp_path, monkeypatch):
     """The hoisted gate must not reject a correctly configured plane: paired control for the above."""
     import flash.runner as runner
-    from flash.runner.submit import submit_job
+    from flash.runner.lifecycle.submit import submit_job
 
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")

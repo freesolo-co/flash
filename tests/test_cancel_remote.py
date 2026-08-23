@@ -113,7 +113,7 @@ def test_select_empty_target_matches_nothing():
 
 def test_terminate_endpoint_never_raises_when_sdk_missing(monkeypatch):
     # ensure_auth raises (no key) -> terminate_endpoint must swallow and return a result list
-    import flash.providers.runpod.auth as auth
+    import flash.providers.runpod.client.auth as auth
 
     monkeypatch.setattr(auth, "ensure_auth", lambda: (_ for _ in ()).throw(RuntimeError("no key")))
     out = ftrain.terminate_endpoint("RTX 5090", "flash-1-abcd1234")
@@ -267,7 +267,7 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     # must flip to "undeployed" so /v1/deployments and /chat stop treating the
     # cancelled run as active (and can't recreate the endpoint).
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     from flash.core.spec import JobSpec
@@ -295,7 +295,7 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
     # non-terminal so `cancelled` still wins, but the entry-gated undeploy never ran. cancel_run must
     # re-read post-write and tear down the raced-in deployment so it is never orphaned.
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     from flash.core.spec import JobSpec
@@ -337,7 +337,7 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
     import inspect
 
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     from flash.core.spec import JobSpec
@@ -380,7 +380,7 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
     # against the terminal `done` CAS, leaving the deployment advertised as `ready`). It must
     # mark the deployment undeployed regardless of the terminal race.
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     from flash.core.spec import JobSpec
@@ -423,7 +423,7 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
     # not `done`. (Mirrors test_cancel_deployed_run_undeployed_even_when_raced_to_terminal but
     # asserts the state verdict specifically.)
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     from flash.core.spec import JobSpec
@@ -492,7 +492,7 @@ def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):
     UNDER FLASH_SDK_LOCK, not just the undeploy. isolate_flash_state swaps runpod_flash's
     process-wide registry globals, so a concurrent deploy could swap the scope mid-teardown.
     Asserts the lock is held when isolate_flash_state runs (and released afterward)."""
-    import flash.providers.runpod.auth as auth
+    import flash.providers.runpod.client.auth as auth
 
     monkeypatch.setattr(auth, "ensure_auth", lambda: None)
     held = {}
@@ -520,9 +520,9 @@ def test_terminate_endpoint_from_async_context_does_not_raise(monkeypatch):
     import sys
     import types as _types
 
-    import flash.providers.runpod.auth as auth
+    import flash.providers.runpod.client.auth as auth
     import flash.providers.runpod.serverless.endpoints as ep_mod
-    from flash.providers.base import canonical_gpu
+    from flash.providers.core.base import canonical_gpu
 
     run_id = "flash-1-abcd1234"
     friendly = canonical_gpu("RTX 5090")
@@ -535,7 +535,7 @@ def test_terminate_endpoint_from_async_context_does_not_raise(monkeypatch):
     # The registry-less REST sweep runs after the undeploy and would report every configured
     # account as unreachable (offline suite), appending a failure row this assertion would then
     # have to spell out. Stub it clear: this test is about the event loop, not the sweep.
-    import flash.providers.runpod.api as runpod_api
+    import flash.providers.runpod.client.api as runpod_api
 
     monkeypatch.setattr(runpod_api, "list_endpoints_by_key", lambda **_: ({}, []))
 
@@ -809,7 +809,7 @@ def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkey
         lambda *a, **k: training_calls.__setitem__("n", training_calls["n"] + 1),
     )
 
-    from flash.providers.base import PollResult
+    from flash.providers.core.base import PollResult
 
     def racing_poll(handle, spec, seed):
         # A concurrent recovery/cancel flips the run terminal AFTER attach_run's initial check
@@ -847,7 +847,7 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
         "_run_training",
         lambda *a, **k: training_calls.__setitem__("n", training_calls["n"] + 1),
     )
-    from flash.providers.base import PollResult
+    from flash.providers.core.base import PollResult
 
     _make_poll_provider(
         monkeypatch,
@@ -950,7 +950,7 @@ def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path,
     import flash.providers as providers
     import flash.runner as orch
     import flash.runner.results.verified_revisions as verified_revisions
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-order"
@@ -994,7 +994,7 @@ def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path,
 
 def test_cancel_preserves_ready_verified_same_step_checkpoint(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-preserve"
@@ -1030,7 +1030,7 @@ def test_cancel_preserves_busy_attempt_previous_checkpoint_without_alias_lookup(
     tmp_path, monkeypatch, state
 ):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = f"flash-checkpoint-{state}"
@@ -1063,7 +1063,7 @@ def test_cancel_preserves_busy_attempt_previous_checkpoint_without_alias_lookup(
 
 def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
     import flash.server.platform.locks as locks
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -1142,7 +1142,7 @@ def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path
 
 def test_cancel_contended_unknown_activation_is_fenced_before_wait(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
     import flash.server.platform.locks as locks
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -1200,7 +1200,7 @@ def test_cancel_contended_predecessor_recommit_failure_stays_fenced_and_revokes(
     tmp_path, monkeypatch, restore_failure
 ):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
     import flash.server.platform.locks as locks
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -1266,7 +1266,7 @@ def test_cancel_contended_fence_revokes_when_alias_changes_before_lock_release(
     tmp_path, monkeypatch, attempted_step
 ):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
     import flash.server.platform.locks as locks
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -1348,7 +1348,7 @@ def test_cancel_contended_fence_revokes_when_alias_changes_before_lock_release(
 
 def test_cancel_unknown_outcome_restores_live_verified_previous_checkpoint(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-unknown-previous"
@@ -1393,7 +1393,7 @@ def test_cancel_checkpoint_restore_survives_owned_run_state_race(
     tmp_path, monkeypatch, raced_state, expected_state
 ):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = f"flash-checkpoint-state-race-{raced_state}"
@@ -1476,7 +1476,7 @@ def test_cancel_restore_failure_revokes_instead_of_leaving_reconciling_authority
     tmp_path, monkeypatch
 ):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-restore-failure"
@@ -1524,7 +1524,7 @@ def test_cancel_restore_failure_revokes_instead_of_leaving_reconciling_authority
 
 def test_cancel_restore_ack_failure_preserves_persisted_verified_checkpoint(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-restore-ack-failure"
@@ -1573,7 +1573,7 @@ def test_cancel_unknown_outcome_revokes_attempted_live_checkpoint(
     tmp_path, monkeypatch, live_verified
 ):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = f"flash-checkpoint-live-{live_verified}"
@@ -1617,7 +1617,7 @@ def test_cancel_unknown_outcome_revokes_attempted_live_checkpoint(
 
 def test_cancel_unknown_outcome_rejects_unverified_divergent_checkpoint(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-live-divergent"
@@ -1652,7 +1652,7 @@ def test_cancel_unknown_outcome_alias_failure_revokes_fail_closed(
     tmp_path, monkeypatch, alias_result
 ):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = f"flash-checkpoint-alias-{alias_result}"
@@ -1687,7 +1687,7 @@ def test_cancel_unknown_outcome_alias_failure_revokes_fail_closed(
 
 def test_cancel_unknown_outcome_never_preserves_verified_final_alias(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-final-alias-unknown"
@@ -1750,7 +1750,7 @@ def test_activation_unknown_final_predecessor_is_not_preservable_checkpoint(tmp_
 
 def test_cancel_revokes_final_deployment(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-final-revoke"
@@ -1776,7 +1776,7 @@ def test_cancel_revokes_final_deployment(tmp_path, monkeypatch):
 
 def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-inflight"
@@ -1812,7 +1812,7 @@ def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
 
 def test_cancel_active_deployment_with_malformed_spec_still_revokes(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
     import flash.server.platform.locks as locks
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -1862,7 +1862,7 @@ def test_cancel_backend_success_local_commit_failure_is_not_backend_uncertainty(
     tmp_path, monkeypatch
 ):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
     from flash.runner.supervise.deploy import DeploymentStatePersistenceError
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -1906,7 +1906,7 @@ def test_cancel_backend_success_local_commit_failure_is_not_backend_uncertainty(
 
 def test_repeated_cancel_preserves_checkpoint_serving(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-repeat"
@@ -1930,7 +1930,7 @@ def test_repeated_cancel_preserves_checkpoint_serving(tmp_path, monkeypatch):
 
 def test_cancel_preserved_checkpoint_prunes_other_verified_revisions(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-prune"
@@ -1964,7 +1964,7 @@ def test_cancel_preserved_checkpoint_prunes_other_verified_revisions(tmp_path, m
 def test_cancel_checkpoint_prune_failure_is_retryable_without_revocation(tmp_path, monkeypatch):
     import flash.runner as orch
     import flash.runner.results.verified_revisions as verified_revisions
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
     from flash.runner.supervise.deploy import DeploymentStatePersistenceError
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
@@ -2014,7 +2014,7 @@ def test_cancel_checkpoint_prune_failure_is_retryable_without_revocation(tmp_pat
 
 def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_path, monkeypatch):
     import flash.runner as orch
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     from flash.core.spec import JobSpec
@@ -2076,10 +2076,10 @@ def _fake_sdk_with_orphan(monkeypatch, *, rest_find, rest_delete, resources=None
     """
     import types as _types
 
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.auth as auth
+    import flash.providers.runpod.client.api as runpod_api
+    import flash.providers.runpod.client.auth as auth
     import flash.providers.runpod.serverless.endpoints as ep_mod
-    from flash.providers.base import canonical_gpu
+    from flash.providers.core.base import canonical_gpu
 
     monkeypatch.setattr(auth, "ensure_auth", lambda: None)
     monkeypatch.setattr(ep_mod, "isolate_flash_state", lambda *a, **k: None)

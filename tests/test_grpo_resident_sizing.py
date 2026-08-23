@@ -166,7 +166,7 @@ def _worker_runtime_for(algorithm: str) -> dict[str, str] | None:
 
 def _built_env_for(algorithm: str, phase: str) -> dict:
     from flash.core.spec import JobSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec.from_dict({"model": "m", "seed": 0, "algorithm": algorithm})
     assert spec.phase == phase, "phase is derived from algorithm; the mapping moved"

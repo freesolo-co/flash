@@ -75,7 +75,7 @@ def test_grpo_requires_at_least_as_much_vram_as_sft():
 
 def test_omitted_sft_batch_sizes_like_the_real_allocator():
     # An omitted SFT batch sizes VRAM like the allocator (micro-batch 4), not the recipe batch (32).
-    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "sft", 100)  # batch_size omitted
     _, need, *_ = _offline_gpu_shape(cfg)
@@ -87,7 +87,7 @@ def test_omitted_sft_batch_sizes_like_the_real_allocator():
 def test_explicit_sft_batch_is_still_forwarded_for_sizing():
     # An EXPLICIT batch_size is honored for VRAM sizing (and matches the allocator at that
     # batch), so a deliberately large batch still routes to the right card.
-    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "sft", 100, batch_size=32)
     _, need, *_ = _offline_gpu_shape(cfg)
@@ -197,7 +197,7 @@ def test_35b_moe_long_context_grpo_sized_past_the_resident_wall():
     # the 35b moe is resident-only for grpo because vllm sleep hangs its wake. 205 gb separates
     # moderate from long contexts using the resident peak, preventing admission into the broken sleep
     # path; it is intentionally not a card size.
-    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb as alloc_required_vram_gb
 
     moe = "Qwen/Qwen3.6-35B-A3B"
     # default + moderate context stay under the wall.
@@ -231,7 +231,7 @@ def test_omitted_grpo_context_sizes_like_the_real_allocator():
     # An omitted GRPO context mirrors the worker's max(1024, max_prompt_len + completion), not
     # bare max_prompt_len -- else the estimate under-sizes VRAM by the completion budget.
     from flash.engine.plan.recipe import RECIPE
-    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "grpo", 100)  # max_context_tokens / seq_len omitted
     worker_len = max(1024, RECIPE.rl.max_prompt_len + RECIPE.rl.max_completion_len)
@@ -260,7 +260,7 @@ def test_omitted_grpo_context_mirrors_worker_with_thinking():
 def test_explicit_grpo_context_still_wins():
     # An explicitly pinned seq_len (engine length) is honored verbatim, not overridden by the
     # worker-mirrored default, and matches the allocator at that same pinned context.
-    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "grpo", 100, seq_len=8192)
     assert cfg.normalized().seq_len == 8192
@@ -407,8 +407,8 @@ def test_offline_quote_and_allocator_agree_on_the_executed_sft_width():
 
     from flash.cost.analytical import _offline_gpu_shape, executed_gpu_count
     from flash.cost.types import RunConfig
-    from flash.providers.allocator import _fits
-    from flash.providers.base import GPU_INFO, Candidate
+    from flash.providers.core.allocator import _fits
+    from flash.providers.core.base import GPU_INFO, Candidate
 
     def quoted_shape_is_allocatable(**kwargs):
         config = RunConfig("Qwen/Qwen3.6-27B", "sft", 10, **kwargs)

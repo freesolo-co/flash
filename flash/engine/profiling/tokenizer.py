@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 
-from flash.engine.huggingface import model_revision_kwargs
+from flash.engine.support.huggingface import model_revision_kwargs
 
 _TRANSFORMERS_IMPORT_LOCK = threading.Lock()
 

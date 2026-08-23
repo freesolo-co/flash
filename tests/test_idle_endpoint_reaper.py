@@ -4,9 +4,9 @@ run-aware protected set + idle grace down to the provider sweep. (Server-side; n
 
 from __future__ import annotations
 
-import flash.providers.runpod.jobs as jobs
-import flash.server.app as app_mod
-from flash.providers.base import canonical_gpu
+import flash.providers.runpod.execution.jobs as jobs
+import flash.server.asgi.app as app_mod
+from flash.providers.core.base import canonical_gpu
 from flash.providers.runpod.serverless import _run_suffix, endpoint_name
 from flash.runner import RunStatus
 
@@ -243,7 +243,7 @@ def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
     Exercises the full path the lifespan loop runs: ``_sweep_orphan_instances_once`` ->
     ``configured_providers`` -> ``LambdaProvider.sweep_orphans`` -> the real
     name<->run matching -> the (faked) terminate call. No ``sweep_orphans`` mock anywhere."""
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs as lambda_jobs
     from flash.runner import RunStatus
 
@@ -285,7 +285,7 @@ def test_sweep_spares_other_control_planes_live_instances(monkeypatch):
     possibly a LIVE training instance. Before the ``known_labels`` scope, this plane saw the other's
     box, found its run id absent from ITS active set, and reaped it (the planes mutually executed
     each other's live runs every sweep)."""
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs as lambda_jobs
     from flash.runner import RunStatus
 
@@ -317,7 +317,7 @@ def test_sweep_resolves_active_labels_after_listing(monkeypatch):
     """Launch-race fix: when ``active_labels`` is a callable, the real provider resolves it AFTER it
     lists instances. A run that only enters the live set concurrently with the sweep therefore still
     shields its fresh worker, instead of having it reaped as a phantom orphan."""
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs
 
     events = []
@@ -349,7 +349,7 @@ def test_sweep_skips_when_active_set_resolution_raises(monkeypatch):
     """If resolving a callable ``active_labels`` raises (e.g. a db/status read error), the sweep must
     SKIP (return []) — never fall through to an empty protection set, which would treat every live
     run's instance as an orphan and reap it. Honors the 'never raises' contract."""
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs
 
     terminated = []

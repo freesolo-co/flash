@@ -21,7 +21,7 @@ def _require_key():
 def test_runpod_auth_and_list_endpoints():
     """Auth + reachability: listing endpoints is a read-only account call."""
     _require_key()
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     endpoints = runpod_api.list_endpoints()
     assert isinstance(endpoints, list)  # 200 + a (possibly empty) list == authed & reachable

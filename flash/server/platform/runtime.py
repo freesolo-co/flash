@@ -27,7 +27,7 @@ async def _reconcile_cost_loop() -> None:
     report it to the freesolo backend for estimator accuracy. The provider billing calls are
     blocking urllib, so each sweep is offloaded to a thread; failures are swallowed and retried
     next cycle. Off entirely when FREESOLO_INTERNAL_KEY is unset (see reconcile_enabled)."""
-    from flash.server.domain.reconcile import reconcile_once
+    from flash.server.domain.ops.reconcile import reconcile_once
 
     interval = 3600.0  # COGS reconcile sweep interval (fixed; flash is fully managed)
     while True:
@@ -54,7 +54,7 @@ async def _repo_cleanup_loop() -> None:
     The 7-day age and daily cadence are fixed in ``flash.server.domain.repo_cleanup``. Each threaded sweep
     fails closed when the live serving set is unconfirmed and requires operator ``HF_TOKEN``.
     """
-    from flash.server.domain.repo_cleanup import CleanupAborted, run_scheduled_cleanup
+    from flash.server.domain.ops.repo_cleanup import CleanupAborted, run_scheduled_cleanup
 
     interval = (
         24.0 * 3600.0

@@ -26,7 +26,7 @@ from flash.core.spec import (
     require_project_id,
 )
 from flash.providers import PROVIDER_NAMES, validated_provider_preferences
-from flash.providers.base import (
+from flash.providers.core.base import (
     UnsupportedGpuError,
     authored_gpu_ceiling,
     get_gpu_info,
@@ -49,7 +49,7 @@ from flash.schema.fields import (
     _train_teacher,
     _wandb_spec,
 )
-from flash.serve.contract import ADAPTER_REVISION_PATTERN
+from flash.serve.contract.contract import ADAPTER_REVISION_PATTERN
 
 # the smallest rank the parser accepts, and so the smallest a source adapter can turn out to have.
 # unresolved warm starts use it instead of the serialization default for permissive client-side
@@ -463,9 +463,9 @@ def _parse_time_wider_shape_remedy(
     remedy -- the rejection itself is already correct and stands on its own.
     """
     try:
-        from flash.providers.allocator import _executed_width, geometry_safe_gpu_cap
-        from flash.providers.base import MAX_COMBINATION_CARDS, wider_shape_remedy
-        from flash.providers.fit_errors import widenable_gpu_names
+        from flash.providers.core.allocator import _executed_width, geometry_safe_gpu_cap
+        from flash.providers.core.base import MAX_COMBINATION_CARDS, wider_shape_remedy
+        from flash.providers.core.fit_errors import widenable_gpu_names
 
         if not widenable_gpu_names((candidate,), (provider,) if provider else None):
             return ""
@@ -554,7 +554,7 @@ def _validate_gpu_section(
     )
     try:
         if gpu_types and preflight_gpu_count <= 1 and not model_revision:
-            from flash.providers.allocator import required_vram_gb
+            from flash.providers.core.allocator import required_vram_gb
 
             # sized from `preflight_train`, so an unresolved warm start is measured at rank 1 rather
             # than at the placeholder. that is a true vram lower bound: no source adapter can need

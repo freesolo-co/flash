@@ -15,14 +15,14 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.responses import (
+from flash.serving.src.io.responses import (
     _openai_structured_outputs,
     _response_format_to_spec,
     _usage_block,
 )
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
-from flash.serving.src.structured_outputs import StructuredOutputsError
+from flash.serving.src.http.router import AdapterRouter, build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.io.structured_outputs import StructuredOutputsError
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 
@@ -227,7 +227,7 @@ def test_shutdown_cancels_timed_out_usage_report_before_closing_client(monkeypat
     import asyncio
     import threading
 
-    import flash.serving.src.router as router_module
+    import flash.serving.src.http.router as router_module
 
     monkeypatch.setattr(router_module, "_USAGE_REPORT_DRAIN_TIMEOUT_SECONDS", 0.01)
     started = threading.Event()

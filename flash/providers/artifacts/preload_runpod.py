@@ -15,8 +15,8 @@ import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from flash.providers.runpod import api as runpod_api
-from flash.providers.runpod.jobs import (
+from flash.providers.runpod.client import api as runpod_api
+from flash.providers.runpod.execution.jobs import (
     GraceTimer,
     weight_cache_volume_name,
 )
@@ -191,7 +191,7 @@ def _preload_one_dc(
         # allowance all by itself, the grow yields to that allowance, and reconciliation
         # is skipped entirely -- reintroducing the under-sized mount this whole path
         # exists to prevent.
-        from flash.providers.runpod.jobs import weight_cache_grow_headroom_s
+        from flash.providers.runpod.execution.jobs import weight_cache_grow_headroom_s
 
         deadline_at = _preload().time.time() + timeout_s + weight_cache_grow_headroom_s()
         # The warm attaches its own volume (spec=None), so the deploy cannot derive what to
@@ -428,7 +428,7 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     ``datacenters=None`` → whole fleet; ``[]`` → no-op (never widened to all — that's a footgun).
     """
 
-    from flash.providers.runpod import auth as rp_keys
+    from flash.providers.runpod.client import auth as rp_keys
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     # Explicit [] is a no-op — never widen zero DCs to the whole fleet.
@@ -507,7 +507,7 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
 
 def teardown_lambda_filesystems(name: str | None = None) -> list[str]:
     """Delete Lambda weight-cache filesystems across all regions. Best-effort and idempotent."""
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME
 
     target = name or WEIGHT_CACHE_VOLUME_NAME

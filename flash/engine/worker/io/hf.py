@@ -583,6 +583,6 @@ from flash.engine.worker.io.prefetch import (  # noqa: E402,F401
     write_base_model_provenance,
 )
 
-# the sha predicate lives in the client-safe `envs.loader`; re-exported here because the
+# the sha predicate lives in the client-safe `envs.loading.loader`; re-exported here because the
 # provenance tests patch and assert it as `hf.is_commit_sha`.
-from flash.envs.loader import is_commit_sha  # noqa: E402,F401
+from flash.envs.loading.loader import is_commit_sha  # noqa: E402,F401

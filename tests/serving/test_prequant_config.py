@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from flash.serving.src.model_config import base_models
-from flash.serving.src.prequant_config import (
+from flash.serving.src.engine.model_config import base_models
+from flash.serving.src.engine.prequant_config import (
     FP8_SERVE_MODEL_REPOS,
     OFFICIAL_FP8_MODEL_REPOS,
     OWNED_FP8_MODEL_REPOS,
