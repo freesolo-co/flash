@@ -16,6 +16,7 @@ import time
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.adapters.lora_rank import alpha_from_adapter_config, rank_from_adapter_config
+from flash.engine.worker.runtime.kernel_warmup import KERNEL_CACHE_ENV_SUBDIRS
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
@@ -209,6 +210,16 @@ _CHILD_ENV_EXACT = frozenset(
         "TOKENIZERS_PARALLELISM",
         "FLASH_VERL_PYTHON",
     }
+    # the baked per-sm kernel cache is addressed ONLY through these vars, and the child is the
+    # interpreter that actually trains: a cache the child never sees is no cache at all, so without
+    # them it falls back to $HOME/.cache and re-JITs the FA2/GDN triton kernels the bake already paid
+    # ~124s to build. taken from kernel_warmup rather than restated so the two cannot drift -- and
+    # they must be named EXACTly, because TORCHINDUCTOR_CACHE_DIR does NOT match the "TORCH_" prefix
+    # below (its sixth character is "I"), which is how it was dropped despite looking like it passes.
+    # safe to share: /opt/verl-venv resolves the SAME torch as the parent (both 2.10.0+cu128 on the
+    # published cu128-sm90 image), and both are image-local, so this shares nothing across tenants --
+    # see providers/_lifecycle/worker.py, which keeps JIT caches OFF the multi-tenant volume.
+    | KERNEL_CACHE_ENV_SUBDIRS.keys()
 )
 _CHILD_ENV_PREFIXES = (
     "CUDA_",

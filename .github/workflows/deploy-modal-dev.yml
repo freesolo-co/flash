@@ -99,6 +99,9 @@ jobs:
 
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         if: steps.gate.outputs.deploy == 'true'
+        with:
+          # pin the installed binary as well as the action implementation.
+          version: "0.12.5"
 
       - name: Install Modal client
         if: steps.gate.outputs.deploy == 'true'
@@ -109,7 +112,8 @@ jobs:
           # app file, so running from the repo root is what resolves `from flash.serving.src...`.
           # pinned to the exact client pyproject declares; see deploy-modal.yml for why an
           # unbounded range is unsafe for the deploy path.
-          uv pip install --system "modal==1.5.4" "python-dotenv>=1.0.0"
+          # exact pins keep the deploy client bootstrap reproducible across runner image changes.
+          uv pip install --system "modal==1.5.4" "python-dotenv==1.2.3"
 
       - name: Verify development deployment inputs
         if: steps.gate.outputs.deploy == 'true'

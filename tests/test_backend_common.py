@@ -392,12 +392,12 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     # looking healthy. with the package absent, use_liger=true raises ImportError at verl's lazy
     # import (transformer_impl.py) instead of silently producing a zero-delta adapter.
     assert "liger-kernel" not in install
-    assert "bitsandbytes>=0.49" in install
-    assert "qwen-vl-utils" in install
-    assert "torchvision" in install
+    assert "bitsandbytes==0.50.1" in install
+    assert "qwen-vl-utils==0.0.14" in install
+    assert "torchvision==0.25.0" in install
     assert "xgrammar==0.1.25" in install
-    assert "tqdm" in install
-    assert "pyarrow" in install
+    assert "tqdm==4.70.0" in install
+    assert "pyarrow==25.0.1" in install
     # venv, the resolve above, the prebuilt flash_attn wheel on its own --no-build-isolation line,
     # then causal_conv1d (also its own line: it source-builds against the venv's torch), the import
     # probe that proves the conv extension actually loaded, and last the libcudart stub repair that
@@ -531,8 +531,10 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
     assert f"verl[vllm] @ {vc.VERL_REQUIREMENT_URL}" in install
     # the extra's own ceiling is vllm<=0.12.0, which registers neither Qwen3.5 arch. pin past it.
     assert "vllm==0.19.1" in install
-    for module in ("cachetools", "uvicorn", "fastapi"):
-        assert module in install, f"verl imports {module} at module level but never declares it"
+    for requirement in ("cachetools==7.1.7", "uvicorn==0.52.4", "fastapi==0.141.1"):
+        assert requirement in install, (
+            f"verl must install its exact direct dependency {requirement}"
+        )
     # opd's entrypoint calls tq.init()/tq.close() and verl's setup.py omits TransferQueue.
     assert "TransferQueue==0.1.7" in install
 
@@ -1270,8 +1272,8 @@ def test_the_fallback_pins_transformers_like_the_image_does(monkeypatch, tmp_pat
 
     install = calls[1]
     override_file = install[install.index("--override") + 1]
-    assert vc.TRANSFORMERS_REQUIREMENT in pathlib.Path(override_file).read_text()
-    assert vc.TRANSFORMERS_REQUIREMENT in install
+    assert vc.TRANSFORMERS_INSTALL_REQUIREMENT in pathlib.Path(override_file).read_text()
+    assert vc.TRANSFORMERS_INSTALL_REQUIREMENT in install
 
 
 def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
@@ -1281,12 +1283,13 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     root = pathlib.Path(__file__).resolve().parents[1]
     dockerfile = root / "Dockerfile.worker"
     text = dockerfile.read_text()
-    quoted = f'"{vc.TRANSFORMERS_REQUIREMENT}"'
-    assert quoted in text, (
-        "Dockerfile.worker's transformers pin drifted from backend_common.TRANSFORMERS_REQUIREMENT"
+    install_quoted = f'"{vc.TRANSFORMERS_INSTALL_REQUIREMENT}"'
+    assert text.count(install_quoted) == 3, (
+        "Dockerfile.worker's main, override, and venv transformers pins drifted from "
+        "backend_common.TRANSFORMERS_INSTALL_REQUIREMENT"
     )
-    # and specifically in the verl venv's override file, not only the main interpreter's install.
-    assert f'"{vc.TRANSFORMERS_REQUIREMENT}" > /tmp/verl-overrides.txt' in text
+    # the exact override prevents transitive declarations from re-widening the deployed version.
+    assert f'"{vc.TRANSFORMERS_INSTALL_REQUIREMENT}" > /tmp/verl-overrides.txt' in text
 
     # pyproject declares the same range for the gpu/server/dev extras, and a lower ceiling there
     # puts anyone installing the package (local worker, self-hosted plane) on a transformers line
@@ -1306,9 +1309,9 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
 
 
 def test_the_venv_stamp_covers_the_transformers_pin_so_a_prepin_venv_is_rebuilt():
-    # a venv provisioned before this pin holds an out-of-range transformers. if the stamp ignored
-    # the range, a retry on the same pod would reuse that venv forever with no rebuild path.
-    assert vc.TRANSFORMERS_REQUIREMENT in vc.VERL_VENV_STAMP
+    # a venv provisioned before this pin may hold a different resolved transformers. the stamp must
+    # cover the exact install so a retry rebuilds it instead of reusing drift.
+    assert vc.TRANSFORMERS_INSTALL_REQUIREMENT in vc.VERL_VENV_STAMP
 
 
 def test_the_venv_stamp_covers_fla_so_a_prefla_venv_is_rebuilt(monkeypatch, tmp_path):
@@ -1464,7 +1467,14 @@ def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypat
     # wandb is the LAST call: it follows the kernel installs, and unlike the required ones before it
     # it is best-effort (check=False) so a wandb outage cannot fail a training run.
     assert calls[-1] == (
-        ["uv", "pip", "install", "--python", str(tmp_path / "verl-venv/bin/python"), "wandb"],
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(tmp_path / "verl-venv/bin/python"),
+            "wandb==0.28.2",
+        ],
         False,
     )
 
@@ -1472,7 +1482,9 @@ def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypat
 def _wandb_installs(calls, tmp_path):
     """The wandb install commands in a recorded run list, whatever else ran around them."""
     py = str(tmp_path / "verl-venv/bin/python")
-    return [c for c, _check in calls if c == ["uv", "pip", "install", "--python", py, "wandb"]]
+    return [
+        c for c, _check in calls if c == ["uv", "pip", "install", "--python", py, "wandb==0.28.2"]
+    ]
 
 
 def test_resolve_verl_python_installs_wandb_into_a_venv_it_is_reusing(monkeypatch, tmp_path):
@@ -4844,6 +4856,40 @@ def test_rollout_layered_summon_uses_a_bare_override_not_an_append():
     (override,) = rollout_layered_summon_overrides(["mlp.experts.gate_up_proj"])
     assert not override.startswith("+")
     assert override.startswith("actor_rollout_ref.rollout.layered_summon=")
+
+
+def test_fused_expert_orig_params_is_on_for_fused_expert_targets():
+    # the regression this exists for: PEFT applies `target_parameters` by registering a torch
+    # parametrization onto a NAMED TENSOR at forward time (peft/tuners/lora/layer.py:2463). fsdp1
+    # with verl's default use_orig_params=False (workers/config/engine.py:254) flattens that tensor
+    # into a FlatParameter, so the attribute is gone and register_parametrization raises
+    # "Module 'Qwen3_5MoeExperts(...)' does not have a parameter ... with name 'down_proj'" in the
+    # log-prob forward -- which is how the first GRPO run to survive the weight sync died.
+    from flash.engine.worker.verl.capabilities import fused_expert_orig_params_overrides
+
+    assert fused_expert_orig_params_overrides(
+        ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
+    ) == ["actor_rollout_ref.actor.fsdp_config.use_orig_params=true"]
+
+
+@pytest.mark.parametrize("empty", [None, [], (), ""])
+def test_fused_expert_orig_params_stays_off_for_dense_models(empty):
+    # a dense model's lora lives on wrapper MODULES, which fsdp flattening does not remove. it keeps
+    # verl's default, which is the cheaper layout.
+    from flash.engine.worker.verl.capabilities import fused_expert_orig_params_overrides
+
+    assert fused_expert_orig_params_overrides(empty) == []
+
+
+def test_fused_expert_orig_params_uses_a_bare_override_not_an_append():
+    # use_orig_params is declared in verl's fsdp.yaml (fsdp.yaml:36) and in the generated trainer
+    # config (_generated_ppo_trainer.yaml:38), so hydra already has the key. a '+' prefix would be
+    # an append to an existing key and fail the config merge.
+    from flash.engine.worker.verl.capabilities import fused_expert_orig_params_overrides
+
+    (override,) = fused_expert_orig_params_overrides(["mlp.experts.gate_up_proj"])
+    assert not override.startswith("+")
+    assert override.startswith("actor_rollout_ref.actor.fsdp_config.use_orig_params=")
 
 
 def test_rollout_max_num_seqs_rejects_a_nonpositive_batch():

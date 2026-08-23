@@ -31,6 +31,7 @@ import numpy as np
 import pytest
 
 import flash.engine.worker as W
+from flash.core.grpo import SUPPORTED_GRPO_GROUP_SIZES
 from flash.engine.worker import backend_common, rl_train, sft_train
 from flash.engine.worker.entry import rl
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
@@ -1287,6 +1288,23 @@ def test_build_verl_overrides_omits_layered_summon_for_dense_models():
     assert not [x for x in o if "layered_summon" in x]
 
 
+def test_build_verl_overrides_keeps_fused_expert_params_addressable_under_fsdp1():
+    # end-to-end through the real builder. grpo emits no `actor.strategy`, so it inherits verl's
+    # fsdp1 default (actor/dp_actor.yaml:22-26) -- unlike the sft driver, which pins fsdp2
+    # (train/sft/config.py:138) and therefore never flattens. on fsdp1 the flag is what keeps
+    # `mlp.experts.down_proj` reachable by name for PEFT's forward-time parametrization.
+    o = rl_train.build_verl_overrides(
+        _overrides_cfg(target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
+    )
+    assert "actor_rollout_ref.actor.fsdp_config.use_orig_params=true" in o
+    assert not [x for x in o if x.startswith("actor_rollout_ref.actor.strategy=")]
+
+
+def test_build_verl_overrides_omits_orig_params_for_dense_models():
+    o = rl_train.build_verl_overrides(_overrides_cfg(target_parameters=None))
+    assert not [x for x in o if "use_orig_params" in x]
+
+
 def test_build_verl_overrides_carries_dr_grpo_recipe():
     o = rl_train.build_verl_overrides(_overrides_cfg())
     assert "algorithm.adv_estimator=grpo" in o
@@ -1925,7 +1943,7 @@ def test_multigpu_gpu_mem_util_never_exceeds_the_previous_constant():
         for gpu_type in ("H100", "H200", "B200"):
             for tensor_parallel in (2, 4, 8):
                 for engine_len in (1024, 2048, 8192, 32768):
-                    for group_size in (2, 4, 8):
+                    for group_size in SUPPORTED_GRPO_GROUP_SIZES:
                         got = rl_train.resolve_gpu_mem_util(
                             _mem_util_inp(
                                 model_id=model_id,

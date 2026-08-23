@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import asdict
 
 import pytest
@@ -17,6 +18,16 @@ from flash.cost.types import RunConfig
 from flash.engine.plan.recipe import RECIPE
 from flash.schema import spec_from_dict
 from flash.schema.fields import ConfigError
+
+
+def _unsupported_group_message() -> str:
+    """the rejection message as a regex, derived from the contract rather than spelled out.
+
+    hardcoding the set here means widening `SUPPORTED_GRPO_GROUP_SIZES` leaves a test asserting the
+    old wording, which passes only while the tuple never changes.
+    """
+    allowed = ", ".join(str(value) for value in SUPPORTED_GRPO_GROUP_SIZES)
+    return re.escape(f"must be one of {{{allowed}}}")
 
 
 def _public_grpo_train(**train):
@@ -43,10 +54,25 @@ def test_grpo_rollout_contract_accepts_supported_groups(group_size):
     assert (shape.prompts_per_step, shape.group_size) == (1, group_size)
 
 
-@pytest.mark.parametrize("group_size", [0, 1, 3, 5, 6, 7, 9, 16, 1024])
+@pytest.mark.parametrize("group_size", [0, 1, 3, 5, 6, 7, 9, 15, 17, 32, 1024])
 def test_grpo_rollout_contract_rejects_every_other_group(group_size):
     with pytest.raises(ValueError, match="must be one of"):
         resolve_grpo_rollout_shape(1, group_size)
+
+
+def test_group_size_16_is_authorable_and_bounded_by_the_completion_ceiling():
+    """16 is a supported group, and widening the set did not widen the concurrency bound.
+
+    Named rather than left to the parametrized cases above so narrowing the tuple fails loudly
+    here instead of silently shrinking what those cases cover. `prompts_per_step` is what has to
+    absorb the wider group: the ceiling bounds `prompts * group`, so 16 buys a larger group at
+    proportionally fewer prompts, never more total completions in a step.
+    """
+    assert 16 in SUPPORTED_GRPO_GROUP_SIZES
+    assert resolve_grpo_rollout_shape(8, 16).completions_per_step == 128
+    assert resolve_grpo_rollout_shape(32, 16).completions_per_step == MAX_GRPO_COMPLETIONS_PER_STEP
+    with pytest.raises(ValueError, match=r"must be <= 512"):
+        resolve_grpo_rollout_shape(33, 16)
 
 
 @pytest.mark.parametrize("value", [False, True, 1.0, "8", [], {}])
@@ -89,7 +115,7 @@ def test_recipe_uses_shared_grpo_defaults():
     assert RECIPE.rl.group_size == DEFAULT_GRPO_GROUP_SIZE
 
 
-@pytest.mark.parametrize("group_size", [16, 3, 0, 10**9])
+@pytest.mark.parametrize("group_size", [32, 3, 0, 10**9])
 def test_public_parser_rejects_unsupported_group_before_gpu_validation(monkeypatch, group_size):
     import flash.schema as schema
 
@@ -99,7 +125,7 @@ def test_public_parser_rejects_unsupported_group_before_gpu_validation(monkeypat
         "_validate_gpu_section",
         lambda *_args, **_kwargs: calls.append("gpu") or pytest.fail("gpu validation ran"),
     )
-    with pytest.raises(ConfigError, match=r"must be one of \{2, 4, 8\}"):
+    with pytest.raises(ConfigError, match=_unsupported_group_message()):
         spec_from_dict(_public_grpo_train(prompts_per_step=4, group_size=group_size))
     assert calls == []
 
@@ -135,8 +161,8 @@ def test_persisted_decode_reads_back_shapes_an_older_flash_accepted():
     teardown all reconstruct existing runs through this decoder -- so an upgrade would strand them
     with their endpoints still billing.
     """
-    legacy_group = JobSpec.from_dict(_internal_grpo_train(prompts_per_step=64, group_size=16))
-    assert legacy_group.train.group_size == 16
+    legacy_group = JobSpec.from_dict(_internal_grpo_train(prompts_per_step=64, group_size=32))
+    assert legacy_group.train.group_size == 32
     assert legacy_group.train.prompts_per_step == 64
 
     # and a historical run over today's completion ceiling reads back at its recorded shape.
@@ -147,7 +173,7 @@ def test_persisted_decode_reads_back_shapes_an_older_flash_accepted():
 def test_authoring_still_rejects_the_shapes_persistence_reads_back():
     """Relaxing the decoder must not relax what a user can newly submit."""
     for train in (
-        {"prompts_per_step": 64, "group_size": 16},
+        {"prompts_per_step": 64, "group_size": 32},
         {"prompts_per_step": 128, "group_size": 8},
     ):
         with pytest.raises(ConfigError):
@@ -246,6 +272,7 @@ def test_supported_grpo_shape_pricing_is_numerically_unchanged():
         2: 0.22565183513227507,
         4: 0.2578620035978836,
         8: 0.3222823405291006,
+        16: 0.4511230143915344,
     }
 
     actual = {
@@ -267,8 +294,8 @@ def test_supported_grpo_shape_pricing_is_numerically_unchanged():
 @pytest.mark.parametrize(
     ("prompts_per_step", "group_size", "message"),
     [
-        (4, 3, r"must be one of \{2, 4, 8\}"),
-        (4, 16, r"must be one of \{2, 4, 8\}"),
+        (4, 3, _unsupported_group_message()),
+        (4, 32, _unsupported_group_message()),
         (65, 8, r"must be <= 512"),
     ],
 )
@@ -308,7 +335,7 @@ def test_supported_authored_groups_reach_allocation(group_size):
     [
         (4, 3),
         (65, 8),
-        (64, 16),
+        (64, 32),
     ],
 )
 def test_persisted_legacy_shapes_reach_allocation(prompts_per_step, group_size):
@@ -334,7 +361,7 @@ def test_persisted_legacy_shapes_reach_allocation(prompts_per_step, group_size):
     assert allocation.provider == "runpod"
     assert allocation.gpu == "H100"
     assert allocation.min_vram_gb == expected_vram
-    if group_size == 16:
+    if group_size == 32:
         default_vram = allocator.required_vram_gb(
             spec.model,
             spec.algorithm,
