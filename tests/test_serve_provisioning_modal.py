@@ -1512,7 +1512,35 @@ def test_artifact_cleanup_ambiguity_keeps_handle_and_never_retries() -> None:
     assert sdk is not None
     assert result.status == "outcome_unknown"
     assert result.handle is not None
+    assert result.error_reason == "artifact_cleanup_delete_unknown"
+    assert result.error_reason.startswith("artifact_cleanup_")
     assert [name for name, _value in sdk.calls].count("delete_artifact") == 1
+
+
+def test_artifact_cleanup_observation_failure_reports_the_live_modal_app() -> None:
+    bundle = _bundle()
+    factory = _Factory()
+
+    class _ObservationFailureAfterDeleteSdk(_FakeSdk):
+        artifact_deleted = False
+
+        def observe(self, plan, *, app_id_hint=None, deadline_at=None) -> ModalObservation:
+            if self.artifact_deleted:
+                raise ModalSdkFailure("transport_failed")
+            return super().observe(plan, app_id_hint=app_id_hint, deadline_at=deadline_at)
+
+        def delete_secret(self, plan, secret_id: str, *, deadline_at=None) -> None:
+            super().delete_secret(plan, secret_id, deadline_at=deadline_at)
+            if secret_id == ARTIFACT_SECRET_ID:
+                self.artifact_deleted = True
+
+    factory.sdk_class = _ObservationFailureAfterDeleteSdk
+    result, _probe = _provision(bundle, factory)
+
+    assert result.status == "outcome_unknown"
+    assert result.handle is not None
+    assert result.error_reason == "artifact_cleanup_observation_failed"
+    assert result.error_reason.startswith("artifact_cleanup_")
 
 
 def test_finalization_ambiguity_is_reconciled_read_only_without_artifact_deletion() -> None:
@@ -1560,6 +1588,8 @@ def test_post_cleanup_core_resource_drift_is_outcome_unknown() -> None:
         sleep=lambda _seconds: None,
     )
     assert result.status == "outcome_unknown"
+    assert result.error_reason == "artifact_cleanup_conflict"
+    assert result.error_reason.startswith("artifact_cleanup_")
     assert [name for name, _value in sdk.calls].count("delete_artifact") == 1
 
 

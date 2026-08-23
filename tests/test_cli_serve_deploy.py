@@ -502,29 +502,44 @@ def test_artifact_cleanup_rejection_warns_that_the_pod_is_live_and_billing(
     assert "flash serve undeploy" in captured.err
 
 
-def test_modal_artifact_cleanup_rejection_warns_that_the_app_is_live_and_billing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("error_code", "error_reason"),
+    [
+        ("provider_rejected", "artifact_cleanup_delete_rejected"),
+        ("resource_ambiguous", "artifact_cleanup_conflict"),
+        ("resource_ambiguous", "artifact_cleanup_observation_failed"),
+        ("resource_ambiguous", "artifact_cleanup_delete_unknown"),
+    ],
+)
+def test_modal_artifact_cleanup_result_warns_that_the_app_is_live_and_billing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error_code: str,
+    error_reason: str,
 ) -> None:
     from flash.serve.control import DeploymentResult
 
-    def _rejected(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+    def _cleanup_failure(bundle, credentials, secrets, *, deadline_at, **_kwargs):
         ready = _result(bundle)
         return DeploymentResult.from_spec(
             bundle.spec,
-            status="failed",
+            status="failed" if error_code == "provider_rejected" else "outcome_unknown",
             handle=ready.handle,
-            error_code="provider_rejected",
-            error_reason="artifact_cleanup_delete_rejected",
+            error_code=error_code,
+            error_reason=error_reason,
         )
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.provision_modal_deployment", _rejected)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.provision_modal_deployment", _cleanup_failure
+    )
 
     assert cmd_serve_deploy(_args(provider="modal")) == 1
     captured = capsys.readouterr()
     assert "app ap-1111111111111111111111" in captured.err
     assert "app is live and billing" in captured.err
+    assert "flash serve status" in captured.err
     assert "flash serve undeploy" in captured.err
 
 

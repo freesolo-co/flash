@@ -153,6 +153,26 @@ def test_status_credential_failure_keeps_request_scoped_guidance(
     )
 
 
+def test_status_invalid_inference_key_uses_the_credential_error_path(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_environment(monkeypatch)
+    args = _args_with_identity(monkeypatch)
+    invalid_key = f"invalid{chr(32)}key"
+    monkeypatch.setenv(serve_deploy.INFERENCE_KEY_ENV, invalid_key)
+
+    assert cmd_serve_status(args) == 1
+    captured = capsys.readouterr()
+    assert (
+        "credentials are read from the environment for this one request and are never stored"
+        in captured.err
+    )
+    assert "Traceback" not in captured.err
+    assert invalid_key not in captured.out
+    assert invalid_key not in captured.err
+
+
 def test_status_uses_deploy_time_identity_after_the_model_tip_advances(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

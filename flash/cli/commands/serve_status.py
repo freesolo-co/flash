@@ -68,17 +68,16 @@ def cmd_serve_status(args) -> int:
     try:
         credentials = _credentials(provider)
         inference_token = _optional_env(INFERENCE_KEY_ENV)
+        from flash.serve.provisioning import ServingRuntimeSecrets
+
+        runtime_secrets = (
+            ServingRuntimeSecrets(inference_token) if inference_token is not None else None
+        )
     except (ValueError, TypeError) as exc:
         return _err(
             f"{exc}. credentials are read from the environment for this one request and are never "
             f"stored"
         )
-
-    from flash.serve.provisioning import ServingRuntimeSecrets
-
-    runtime_secrets = (
-        ServingRuntimeSecrets(inference_token) if inference_token is not None else None
-    )
     deadline_at = time.monotonic() + float(args.timeout)
     if provider == "modal":
         from flash.serve.provisioning.modal import reconcile_modal_deployment

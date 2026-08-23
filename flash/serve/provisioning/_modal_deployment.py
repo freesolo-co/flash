@@ -295,10 +295,24 @@ def _delete_artifact_and_confirm(
             clock=clock,
             sleep=sleep,
         )
-    except (ModalResourceConflict, ModalSdkFailure):
-        return unknown_result(finalized_plan, handle=proof.handle)
+    except ModalResourceConflict:
+        return unknown_result(
+            finalized_plan,
+            reason="artifact_cleanup_conflict",
+            handle=proof.handle,
+        )
+    except ModalSdkFailure:
+        return unknown_result(
+            finalized_plan,
+            reason="artifact_cleanup_observation_failed",
+            handle=proof.handle,
+        )
     if cleaned is None:
-        return unknown_result(finalized_plan, handle=proof.handle)
+        return unknown_result(
+            finalized_plan,
+            reason="artifact_cleanup_delete_unknown",
+            handle=proof.handle,
+        )
     return DeploymentResult.from_spec(
         finalized_plan.bundle.spec,
         status="ready",
