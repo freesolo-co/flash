@@ -852,10 +852,41 @@ def test_image_deployment_smoke_uses_valid_trusted_image_without_persisting_it(m
 
 
 def test_image_deployment_smoke_rejects_missing_lora_request_attestation(monkeypatch):
+    """A backend that ADVERTISES the attestation must actually send it."""
     response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+    monkeypatch.setattr(serving_smoke, "_lora_attestation_advertised", lambda: True)
 
     with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
+        _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+
+
+def test_image_deployment_smoke_allows_missing_attestation_when_not_advertised(monkeypatch):
+    """The header is emitted by the serving image, not by the run.
+
+    Demanding it from a backend that never claimed to produce it failed every deployment
+    org-wide (187 failed / 1 ready) while proving nothing about the adapter under test. This is
+    the same shape of bug ``REVISION_PROVENANCE_CAPABILITY`` already had to fix once.
+    """
+    response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+    monkeypatch.setattr(serving_smoke, "_lora_attestation_advertised", lambda: False)
+
+    out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+    assert out["verify_kind"] == "fixed_image"
+
+
+def test_image_deployment_smoke_rejects_wrong_adapter_even_when_not_advertised(monkeypatch):
+    """Degrading on ABSENCE must not degrade on a WRONG identity.
+
+    If the backend volunteers an adapter id at all, a mismatch means some other LoRA answered,
+    which stays a hard failure whatever the backend advertises.
+    """
+    response = _smoke_response(_smoke_expected_colour(), request_adapter="run-1@final." + "b" * 40)
+    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+    monkeypatch.setattr(serving_smoke, "_lora_attestation_advertised", lambda: False)
+
+    with pytest.raises(ServingError, match="wrong LoRA request adapter"):
         _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
 
 
@@ -986,15 +1017,19 @@ def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(m
 
 
 @pytest.mark.parametrize(
-    ("request_adapter", "error"),
+    ("request_adapter", "error", "advertised"),
     [
-        (None, "omitted LoRA request adapter attestation"),
-        ("run-1@final." + "b" * 40, "wrong LoRA request adapter"),
+        # absence only fails when the backend claimed it would send it
+        (None, "omitted LoRA request adapter attestation", True),
+        # a WRONG identity fails either way -- some other LoRA answered
+        ("run-1@final." + "b" * 40, "wrong LoRA request adapter", True),
+        ("run-1@final." + "b" * 40, "wrong LoRA request adapter", False),
     ],
 )
 def test_image_structured_smoke_requires_attestation_on_second_request(
-    monkeypatch, request_adapter, error
+    monkeypatch, request_adapter, error, advertised
 ):
+    monkeypatch.setattr(serving_smoke, "_lora_attestation_advertised", lambda: advertised)
     calls = 0
 
     def fake_serve_chat(**_kwargs):

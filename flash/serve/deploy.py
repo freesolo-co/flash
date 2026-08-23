@@ -91,6 +91,10 @@ ACTIVATION_READBACK_DELAY_SECONDS = 2.0
 SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
+# the serving backend echoes back WHICH LoRA answered a request. like revision provenance
+# this is produced by the serving image, not by the run, so a client cannot make it appear
+# by changing the adapter, the config, or the training.
+LORA_REQUEST_ATTESTATION_CAPABILITY = "lora_request_attestation"
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 _INTERNAL_KEY_HEADER = "X-Freesolo-Internal-Key"
 # modal 303-redirects a slow request to an async-result poll url on the same origin, once per poll

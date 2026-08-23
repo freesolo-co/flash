@@ -24,7 +24,12 @@ from referencing.exceptions import Unresolvable
 from flash.adapters.lora_rank import serving_completion_token_capacity
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.core.spec import JobSpec
-from flash.serve.deploy import AliasThinkingSilent, RetryableServingUnavailable, ServingError
+from flash.serve.deploy import (
+    LORA_REQUEST_ATTESTATION_CAPABILITY,
+    AliasThinkingSilent,
+    RetryableServingUnavailable,
+    ServingError,
+)
 from flash.serve.preflight import (
     SERVING_PROMPT_TOKEN_ALLOWANCE,
     ExternalSchemaReference,
@@ -316,8 +321,42 @@ def _smoke_answer(
     return content, finish, answer
 
 
-def _smoke_lora_request_adapter(result: dict, adapter_revision: str) -> str:
+def _lora_attestation_advertised() -> bool:
+    """Whether the serving backend says it emits ``X-Freesolo-LoRA-Request-Adapter``.
+
+    Read through the same ``/healthz`` contract ``deploy`` already uses. A backend that cannot be
+    asked is treated as NOT advertising: the attestation then degrades rather than turning an
+    unrelated health-check problem into a deployment failure.
+    """
+    from flash.serve.deploy import _require_serving_capabilities
+
+    try:
+        return LORA_REQUEST_ATTESTATION_CAPABILITY in _require_serving_capabilities()
+    except Exception:  # never let capability discovery be what fails a deploy
+        return False
+
+
+def _smoke_lora_request_adapter(
+    result: dict, adapter_revision: str, *, attestation_advertised: bool
+) -> str | None:
+    """Check which LoRA answered the smoke, when the serving backend can actually say.
+
+    ``X-Freesolo-LoRA-Request-Adapter`` is emitted by the serving image, not by the run, so a
+    missing header says nothing about the adapter under test -- exactly the shape of the bug that
+    ``REVISION_PROVENANCE_CAPABILITY`` already had to fix once. Demanding it from a backend that
+    never advertised it fails every deployment org-wide while proving nothing, so absence of the
+    capability degrades the check instead of blocking the deploy.
+
+    Where the capability IS advertised the check stays strict: a missing or mismatched header then
+    means the serving backend broke a contract it agreed to, which is a real failure.
+    """
     attested = result.get("_freesolo_lora_request_adapter")
+    if not attestation_advertised:
+        if attested and attested != adapter_revision:
+            # the backend volunteered an identity and it is the WRONG one. that is a genuine
+            # mismatch regardless of what it advertises, so it still fails.
+            raise ServingError("image deployment smoke returned the wrong LoRA request adapter")
+        return str(attested) if attested else None
     if not attested:
         raise ServingError("image deployment smoke omitted LoRA request adapter attestation")
     if attested != adapter_revision:
@@ -495,6 +534,7 @@ def _run_deployment_smoke(
     from flash.core.catalog import supports_image_training
 
     image_capable = supports_image_training(spec.model)
+    attestation_advertised = _lora_attestation_advertised()
     expected_colour, image_messages = _smoke_image_challenge(run_id)
     result = _bounded_smoke_chat(
         serving_model=serving_model,
@@ -517,7 +557,9 @@ def _run_deployment_smoke(
     verify_turns = 1
     attested_adapter_revision: str | None = None
     if image_capable:
-        attested_adapter_revision = _smoke_lora_request_adapter(result, serving_model)
+        attested_adapter_revision = _smoke_lora_request_adapter(
+            result, serving_model, attestation_advertised=attestation_advertised
+        )
         if answer.strip().upper() != expected_colour:
             raise ServingError(
                 "image deployment smoke did not identify the trusted "
@@ -540,7 +582,9 @@ def _run_deployment_smoke(
                 serving_model=serving_model,
                 expected_checkpoint=expected_checkpoint,
             )
-            _smoke_lora_request_adapter(structured_result, serving_model)
+            _smoke_lora_request_adapter(
+                structured_result, serving_model, attestation_advertised=attestation_advertised
+            )
             _validate_structured_smoke(
                 structured_answer,
                 constraint,
