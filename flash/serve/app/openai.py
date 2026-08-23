@@ -42,8 +42,6 @@ class OpenAIRequestError(ValueError):
 class OpenAIChatRequest:
     """strict normalized subset accepted by the packaged serving app."""
 
-    model: str
-    messages: tuple[dict[str, Any], ...]
     stream: bool
     include_usage: bool
     generation: GenerationRequest
@@ -81,8 +79,8 @@ def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAICha
     include_usage = parse_stream_options(payload.get("stream_options"), stream)
     structured = _structured_override(payload)
     generation = GenerationRequest(
-        adapter_id=resolved.adapter_revision,
-        expected_incarnation=resolved.incarnation,
+        adapter_id=resolved.adapter.adapter_revision,
+        expected_incarnation=resolved.adapter.aggregate_sha256,
         messages=messages,
         max_tokens=_positive_int(payload.get("max_tokens", 1024), "max_tokens"),
         temperature=_number(payload.get("temperature", 0.0), "temperature", minimum=0.0),
@@ -94,8 +92,6 @@ def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAICha
         structured_outputs=structured,
     )
     return OpenAIChatRequest(
-        model=model,
-        messages=tuple(dict(message) for message in messages),
         stream=stream,
         include_usage=include_usage,
         generation=generation,
@@ -289,10 +285,6 @@ def provenance_payload(
         "source_subfolder": adapter.source_subfolder,
         "aggregate_sha256": adapter.aggregate_sha256,
     }
-
-
-def provenance_headers(provenance: dict[str, Any]) -> dict[str, str]:
-    return {f"x-flash-{key.replace('_', '-')}": str(value) for key, value in provenance.items()}
 
 
 def nonstream_response(

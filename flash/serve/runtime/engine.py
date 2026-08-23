@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import inspect
 import sys
-import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
+
+from flash.serve.runtime_support import reasoning_compatibility_guard
 
 from .adapters import AdapterBinding, AdapterManager
 from .errors import (
@@ -122,39 +122,9 @@ def _cached_token_state(request_output: Any) -> tuple[int, bool]:
     return count, True
 
 
-def _argument_names(argument_type: Any) -> set[str]:
-    try:
-        return {field.name for field in dataclasses.fields(argument_type)}
-    except TypeError:
-        try:
-            return set(inspect.signature(argument_type).parameters)
-        except (TypeError, ValueError):
-            return set()
-
-
-def _require_reasoning_compatibility(
-    async_engine_args_type: Any,
-    generate: Any,
-    reasoning_parser: str | None,
-) -> None:
-    if reasoning_parser is None:
-        return
-    engine_args = _argument_names(async_engine_args_type)
-    try:
-        generate_args = inspect.signature(generate).parameters
-    except (TypeError, ValueError):
-        generate_args = {}
-    missing = [
-        name
-        for name, available in (
-            ("reasoning_parser", "reasoning_parser" in engine_args),
-            ("reasoning_ended", "reasoning_ended" in generate_args),
-            ("reasoning_parser_kwargs", "reasoning_parser_kwargs" in generate_args),
-        )
-        if not available
-    ]
-    if missing:
-        raise RuntimeNotReadyError("vllm reasoning api is missing " + ", ".join(missing))
+_require_reasoning_compatibility = reasoning_compatibility_guard(
+    RuntimeNotReadyError, "vllm reasoning api is missing "
+)
 
 
 def _has_hub_credential(configured_token: str | None) -> bool:
@@ -255,7 +225,6 @@ class VllmLoraRuntime:
         """run one non-streaming generation with final-only vllm output."""
         await self._ensure_started()
         request_id = uuid.uuid4().hex
-        started = time.perf_counter()
         async with self._binding(request) as binding:
             adapter = binding.spec if binding is not None else None
             lora_request = binding.lora_request if binding is not None else None
@@ -286,17 +255,14 @@ class VllmLoraRuntime:
         cached_tokens, cached_reported = _cached_token_state(final_output)
         return GenerationResult(
             request_id=request_id,
-            runtime_id=self.runtime_id,
             adapter_id=request.adapter_id,
             incarnation=adapter.incarnation if adapter is not None else None,
             text=str(getattr(sequence, "text", "") or ""),
             finish_reason=getattr(sequence, "finish_reason", None),
-            token_ids=token_ids,
             prompt_tokens=_num_prompt_tokens(final_output),
             completion_tokens=len(token_ids),
             cached_tokens=cached_tokens,
             cached_tokens_reported=cached_reported,
-            duration_seconds=time.perf_counter() - started,
             thinking=thinking,
         )
 
@@ -304,7 +270,6 @@ class VllmLoraRuntime:
         """yield ready, normalized delta, and terminal accounting events."""
         await self._ensure_started()
         request_id = uuid.uuid4().hex
-        started = time.perf_counter()
         async with self._binding(request) as binding:
             adapter = binding.spec if binding is not None else None
             lora_request = binding.lora_request if binding is not None else None
@@ -339,7 +304,7 @@ class VllmLoraRuntime:
                         output = await anext(output_stream)
                     except StopAsyncIteration:
                         break
-                yield self._finished_event(request, adapter, thinking, request_id, started, state)
+                yield self._finished_event(request, adapter, thinking, request_id, state)
             except Exception:
                 await self._notify_if_dead()
                 raise
@@ -579,7 +544,6 @@ class VllmLoraRuntime:
         adapter: AdapterSpec | None,
         thinking: bool | None,
         request_id: str,
-        started: float,
         state: _StreamState,
     ) -> StreamFinished:
         if state.final_output is None:
@@ -598,7 +562,6 @@ class VllmLoraRuntime:
             completion_tokens=len(state.token_ids),
             cached_tokens=state.cached_tokens,
             cached_tokens_reported=state.cached_reported,
-            duration_seconds=time.perf_counter() - started,
             thinking=thinking,
         )
 

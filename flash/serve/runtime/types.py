@@ -423,20 +423,17 @@ class GenerationRequest:
 
 @dataclass(frozen=True, slots=True)
 class GenerationResult:
-    """completed generation text, identity, accounting, and timing."""
+    """completed generation text, identity, and accounting."""
 
     request_id: str
-    runtime_id: str
     adapter_id: str | None
     incarnation: str | None
     text: str
     finish_reason: str | None
-    token_ids: tuple[int, ...]
     prompt_tokens: int
     completion_tokens: int
     cached_tokens: int
     cached_tokens_reported: bool
-    duration_seconds: float
     thinking: bool | None
 
 
@@ -474,7 +471,6 @@ class StreamFinished:
     completion_tokens: int
     cached_tokens: int
     cached_tokens_reported: bool
-    duration_seconds: float
     thinking: bool | None
     type: Literal["finished"] = field(default="finished", init=False)
 

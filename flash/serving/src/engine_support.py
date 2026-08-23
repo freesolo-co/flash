@@ -6,10 +6,21 @@ state, so they are testable without constructing an engine.
 """
 
 import hashlib
-import inspect
 import re
 from pathlib import Path
 from typing import Any
+
+from flash.serve.runtime_support import (
+    argument_names,
+    is_adapter_tensor_file,
+    reasoning_compatibility_guard,
+)
+
+_async_engine_arg_names = argument_names
+_is_adapter_tensor_file = is_adapter_tensor_file
+_require_reasoning_api_compatibility = reasoning_compatibility_guard(
+    RuntimeError, "vLLM reasoning API is incompatible; missing "
+)
 
 _RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
     {
@@ -91,13 +102,6 @@ def _adapter_cache_path(root: Path, subfolder: str | None) -> Path:
     return _assert_source_cache_containment(root, path)
 
 
-def _is_adapter_tensor_file(path: Path) -> bool:
-    name = path.name
-    return name in {"adapter_model.safetensors", "adapter_model.bin"} or (
-        name.startswith("adapter_model-") and name.endswith((".safetensors", ".bin"))
-    )
-
-
 def _adapter_cache_ready(path: Path) -> bool:
     if not (path / "adapter_config.json").is_file():
         return False
@@ -160,42 +164,6 @@ def _cached_tokens_reported(request_output: Any) -> bool:
         return int(value) >= 0
     except (TypeError, ValueError):
         return False
-
-
-def _async_engine_arg_names(async_engine_args_type: Any) -> set[str]:
-    import dataclasses
-
-    try:
-        return {field.name for field in dataclasses.fields(async_engine_args_type)}
-    except TypeError:
-        try:
-            return set(inspect.signature(async_engine_args_type).parameters)
-        except (TypeError, ValueError):
-            return set()
-
-
-def _require_reasoning_api_compatibility(
-    async_engine_args_type: Any, generate: Any, reasoning_parser: str | None
-) -> None:
-    """Fail closed when a configured parser cannot receive request-local reasoning state."""
-    if reasoning_parser is None:
-        return
-    engine_args = _async_engine_arg_names(async_engine_args_type)
-    try:
-        generate_args = inspect.signature(generate).parameters
-    except (TypeError, ValueError):
-        generate_args = {}
-    missing = [
-        name
-        for name, available in (
-            ("reasoning_parser", "reasoning_parser" in engine_args),
-            ("reasoning_ended", "reasoning_ended" in generate_args),
-            ("reasoning_parser_kwargs", "reasoning_parser_kwargs" in generate_args),
-        )
-        if not available
-    ]
-    if missing:
-        raise RuntimeError("vLLM reasoning API is incompatible; missing " + ", ".join(missing))
 
 
 def _engine_is_dead(engine: Any) -> bool:

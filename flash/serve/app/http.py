@@ -33,7 +33,6 @@ from .openai import (
     ReasoningDeltaSplitter,
     nonstream_response,
     parse_chat_request,
-    provenance_headers,
     provenance_payload,
     sse_data,
     stream_chunk,
@@ -126,7 +125,9 @@ def create_app(
         except (OpenAIRequestError, PromptError, RuntimeConfigurationError, ValueError):
             return _error(422, "invalid_request", "request validation failed")
         provenance = provenance_payload(state.bootstrap.manifest, resolved)
-        headers = provenance_headers(provenance)
+        headers = {
+            f"x-flash-{key.replace('_', '-')}": str(value) for key, value in provenance.items()
+        }
         if not parsed.stream:
             try:
                 result = await _await_until_disconnect(
@@ -142,8 +143,8 @@ def create_app(
             except Exception:
                 return _error(503, "service_unavailable", "generation service is unavailable")
             if (
-                result.adapter_id != resolved.adapter_revision
-                or result.incarnation != resolved.incarnation
+                result.adapter_id != resolved.adapter.adapter_revision
+                or result.incarnation != resolved.adapter.aggregate_sha256
                 or result.thinking != resolved.adapter.thinking_default
                 or result.finish_reason is None
             ):
@@ -170,8 +171,8 @@ def create_app(
             return _error(503, "service_unavailable", "generation service is unavailable")
         if (
             type(first) is not StreamReady
-            or first.adapter_id != resolved.adapter_revision
-            or first.incarnation != resolved.incarnation
+            or first.adapter_id != resolved.adapter.adapter_revision
+            or first.incarnation != resolved.adapter.aggregate_sha256
             or first.thinking != resolved.adapter.thinking_default
         ):
             await _close_iterator(event_stream)
@@ -353,8 +354,8 @@ async def _stream_body(
         if (
             finished.request_id != ready.request_id
             or finished.runtime_id != ready.runtime_id
-            or finished.adapter_id != resolved.adapter_revision
-            or finished.incarnation != resolved.incarnation
+            or finished.adapter_id != resolved.adapter.adapter_revision
+            or finished.incarnation != resolved.adapter.aggregate_sha256
             or finished.thinking != ready.thinking
         ):
             raise RuntimeError("stream terminal identity mismatch")

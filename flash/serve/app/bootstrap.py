@@ -21,15 +21,6 @@ class PublishedAdapter:
 
     requested_model: str
     adapter: ManifestAdapter
-    local_path: Path
-
-    @property
-    def adapter_revision(self) -> str:
-        return self.adapter.adapter_revision
-
-    @property
-    def incarnation(self) -> str:
-        return self.adapter.aggregate_sha256
 
 
 class ServingBootstrap:
@@ -163,7 +154,6 @@ async def bootstrap_serving(
                 revisions[adapter.adapter_revision] = PublishedAdapter(
                     requested_model=adapter.adapter_revision,
                     adapter=adapter,
-                    local_path=path,
                 )
             emit_boot_progress("adapters-registered", count=len(revisions))
         published = dict(revisions)
@@ -172,7 +162,6 @@ async def bootstrap_serving(
             published[alias] = PublishedAdapter(
                 requested_model=alias,
                 adapter=target.adapter,
-                local_path=target.local_path,
             )
         owner._models = MappingProxyType(dict(sorted(published.items())))
         owner._ready = True

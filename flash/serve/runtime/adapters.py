@@ -11,6 +11,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from flash.serve.runtime_support import is_adapter_tensor_file as _is_adapter_tensor_file
+
 from .errors import (
     AdapterConflictError,
     AdapterError,
@@ -70,13 +72,6 @@ def lora_int_id(adapter_id: str) -> int:
     """return a positive int32-compatible deterministic starting id."""
     digest = hashlib.sha1(adapter_id.encode("utf-8")).digest()
     return (int.from_bytes(digest[:4], "big") & _MAX_LORA_ID) or 1
-
-
-def _is_adapter_tensor_file(path: Path) -> bool:
-    name = path.name
-    return name in {"adapter_model.safetensors", "adapter_model.bin"} or (
-        name.startswith("adapter_model-") and name.endswith((".safetensors", ".bin"))
-    )
 
 
 def validate_adapter_path(raw_path: str) -> Path:

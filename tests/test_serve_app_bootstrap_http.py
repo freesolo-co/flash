@@ -73,17 +73,14 @@ class _FakeRuntime:
             raise self.generate_error
         return GenerationResult(
             request_id="request-1",
-            runtime_id="runtime-1",
             adapter_id=request.adapter_id,
             incarnation=request.expected_incarnation,
             text="why</think>answer",
             finish_reason="stop",
-            token_ids=(1, 2),
             prompt_tokens=5,
             completion_tokens=2,
             cached_tokens=3,
             cached_tokens_reported=True,
-            duration_seconds=0.1,
             thinking=True,
         )
 
@@ -113,8 +110,8 @@ def _published_owner() -> tuple[ServingBootstrap, _FakeRuntime]:
     runtime.started = True
     owner = ServingBootstrap(manifest, runtime)
     adapter = manifest.adapters[0]
-    revision = PublishedAdapter(adapter.adapter_revision, adapter, Path("/cache/adapter"))
-    alias = PublishedAdapter("run-1", adapter, Path("/cache/adapter"))
+    revision = PublishedAdapter(adapter.adapter_revision, adapter)
+    alias = PublishedAdapter("run-1", adapter)
     owner._models = MappingProxyType({adapter.adapter_revision: revision, "run-1": alias})
     owner._ready = True
     return owner, runtime
@@ -234,7 +231,7 @@ def test_bootstrap_registers_every_revision_before_atomic_publish(
         manifest.adapters[0].adapter_revision
     ]
     assert tuple(owner.models) == tuple(sorted((manifest.adapters[0].adapter_revision, "run-1")))
-    assert owner.models["run-1"].adapter_revision == manifest.adapters[0].adapter_revision
+    assert owner.models["run-1"].adapter.adapter_revision == manifest.adapters[0].adapter_revision
     assert not hasattr(owner, "token")
     asyncio.run(owner.close())
     assert runtime.closed is True
@@ -622,7 +619,7 @@ def test_nonstream_reasoning_accounting_provenance_and_structured_precedence() -
     }
     provenance = payload["flash_provenance"]
     assert provenance["requested_model"] == "run-1"
-    assert provenance["adapter_revision"] == owner.models["run-1"].adapter_revision
+    assert provenance["adapter_revision"] == owner.models["run-1"].adapter.adapter_revision
     assert provenance["logical_base_revision"] == owner.manifest.logical_base_revision
     assert provenance["served_checkpoint_revision"] == owner.manifest.engine.model_revision
     assert provenance["tokenizer_model"] == owner.manifest.engine.tokenizer_model
@@ -674,8 +671,8 @@ def test_reasoning_split_uses_first_close_and_preserves_non_thinking_literals() 
 
 def test_stream_primes_before_200_splits_reasoning_and_emits_one_real_finish() -> None:
     owner, runtime = _published_owner()
-    revision = owner.models["run-1"].adapter_revision
-    incarnation = owner.models["run-1"].incarnation
+    revision = owner.models["run-1"].adapter.adapter_revision
+    incarnation = owner.models["run-1"].adapter.aggregate_sha256
     runtime.stream_events = [
         StreamReady("request-2", "runtime", revision, incarnation, True),
         StreamDelta("why</thi"),
@@ -691,7 +688,6 @@ def test_stream_primes_before_200_splits_reasoning_and_emits_one_real_finish() -
             2,
             1,
             True,
-            0.1,
             True,
         ),
     ]
@@ -738,8 +734,8 @@ def test_stream_primes_before_200_splits_reasoning_and_emits_one_real_finish() -
 
 def test_stream_missing_duplicate_or_failed_terminal_is_sanitized_without_fake_stop() -> None:
     owner, runtime = _published_owner()
-    revision = owner.models["run-1"].adapter_revision
-    incarnation = owner.models["run-1"].incarnation
+    revision = owner.models["run-1"].adapter.adapter_revision
+    incarnation = owner.models["run-1"].adapter.aggregate_sha256
     ready = StreamReady("request-3", "runtime", revision, incarnation, True)
     terminal = StreamFinished(
         "request-3",
@@ -752,7 +748,6 @@ def test_stream_missing_duplicate_or_failed_terminal_is_sanitized_without_fake_s
         1,
         0,
         False,
-        0.1,
         True,
     )
     mismatched_terminal = StreamFinished(
@@ -766,7 +761,6 @@ def test_stream_missing_duplicate_or_failed_terminal_is_sanitized_without_fake_s
         1,
         0,
         False,
-        0.1,
         True,
     )
     scenarios = (

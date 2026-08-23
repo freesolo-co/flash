@@ -531,7 +531,6 @@ def test_nonstream_generation_binds_thinking_structured_outputs_and_accounting(
     second = asyncio.run(runtime.generate(request))
 
     assert result.text == '{"answer":"yes"}'
-    assert result.token_ids == (7, 8)
     assert result.prompt_tokens == 5
     assert result.completion_tokens == 2
     assert result.cached_tokens == 2
