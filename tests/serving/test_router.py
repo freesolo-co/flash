@@ -426,20 +426,39 @@ def test_chat_accepts_openai_response_format(app_setup):
         assert pool.structured[-1] == expected
 
 
-def test_chat_extension_beats_response_format(app_setup):
-    """Precedence: our structured_outputs extension wins over the OpenAI response_format."""
+def test_chat_rejects_both_structured_output_fields(app_setup):
+    """each field works alone, but supplying both is an invalid request."""
     client, pool, _ = app_setup
-    resp = client.post(
+    base = {
+        "model": "mc",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    extension = client.post(
+        "/v1/chat/completions",
+        json={**base, "structured_outputs": {"choice": ["a", "b"]}},
+    )
+    assert extension.status_code == 200
+    assert pool.structured[-1] == {"choice": ["a", "b"]}
+
+    standard = client.post(
+        "/v1/chat/completions",
+        json={**base, "response_format": {"type": "json_object"}},
+    )
+    assert standard.status_code == 200
+    assert pool.structured[-1] == {"json_object": True}
+
+    conflict = client.post(
         "/v1/chat/completions",
         json={
-            "model": "mc",
-            "messages": [{"role": "user", "content": "hi"}],
+            **base,
             "structured_outputs": {"choice": ["a", "b"]},
             "response_format": {"type": "json_object"},
         },
     )
-    assert resp.status_code == 200
-    assert pool.structured[-1] == {"choice": ["a", "b"]}
+    assert conflict.status_code == 422
+    assert conflict.json()["detail"] == "structured_outputs and response_format cannot both be set"
+    assert len(pool.generated) == 2
 
 
 def test_chat_response_format_json_schema_without_schema_is_422(app_setup):

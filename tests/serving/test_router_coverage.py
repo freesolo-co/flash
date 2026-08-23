@@ -89,18 +89,27 @@ def test_response_format_to_spec_rejects_malformed():
         _response_format_to_spec({"type": "image_url"})
 
 
-def test_openai_structured_outputs_precedence():
-    # Our extension wins outright.
-    assert _openai_structured_outputs(
-        {"structured_outputs": {"choice": ["a"]}, "response_format": {"type": "json_object"}}
-    ) == {"choice": ["a"]}
-    # Falls back to translating response_format.
+def test_openai_structured_output_fields_are_mutually_exclusive():
+    with pytest.raises(
+        StructuredOutputsError,
+        match="structured_outputs and response_format cannot both be set",
+    ):
+        _openai_structured_outputs(
+            {
+                "structured_outputs": {"choice": ["a"]},
+                "response_format": {"type": "json_object"},
+            }
+        )
+    # response_format alone translates to the canonical spec.
     assert _openai_structured_outputs({"response_format": {"type": "json_object"}}) == {
         "json_object": True
     }
-    # An explicit {} extension is "unconstrained", distinct from absent (checked with `is not None`).
+    # structured_outputs alone remains unchanged, including an explicit unconstrained marker.
+    assert _openai_structured_outputs({"structured_outputs": {"choice": ["a"]}}) == {
+        "choice": ["a"]
+    }
     assert _openai_structured_outputs({"structured_outputs": {}}) == {}
-    # Neither field present -> None.
+    # neither field is unconstrained by the request.
     assert _openai_structured_outputs({"messages": []}) is None
 
 

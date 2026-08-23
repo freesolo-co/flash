@@ -109,17 +109,20 @@ def _usage_block(prompt_tokens: int, completion_tokens: int, cached_tokens: Any)
 def _openai_structured_outputs(payload: dict[str, Any]) -> Any:
     """The structured-outputs spec carried by an OpenAI-style chat payload, or None.
 
-    Our first-class extension (``structured_outputs``) wins; failing that,
-    the OpenAI-standard ``response_format`` is accepted — but ONLY here, at the OpenAI-compatible
-    ``/v1/chat/completions`` boundary — and translated to our canonical spec, so an OpenAI-SDK
-    client gets structured output with no code change. The result is returned RAW so
+    Our first-class extension (``structured_outputs``) and the OpenAI-standard
+    ``response_format`` are mutually exclusive. The latter is accepted only here, at the
+    OpenAI-compatible ``/v1/chat/completions`` boundary, and translated to our canonical spec, so an
+    OpenAI-SDK client gets structured output with no code change. The result is returned raw so
     GenerateRequest's validator normalizes it (consistent 422s across every entry point). Checked
     with ``is not None``, not truthiness: ``{}`` / ``false`` are explicit "unconstrained" markers,
     distinct from an absent field.
     """
-    if (spec := payload.get("structured_outputs")) is not None:
-        return spec
+    spec = payload.get("structured_outputs")
     response_format = payload.get("response_format")
+    if spec is not None and response_format is not None:
+        raise StructuredOutputsError("structured_outputs and response_format cannot both be set")
+    if spec is not None:
+        return spec
     if response_format is not None:
         return _response_format_to_spec(response_format)
     return None
