@@ -307,7 +307,13 @@ def _completed_attempt_metrics(
     log=None,
 ) -> dict | None:
     """Read a strict successful instance marker plus its run-scoped metrics."""
-    if provider not in {"vast", "lambda"} or not spec.train.hf_repo:
+    # every instance provider writes the same `{provider}_attempt{N}.json` marker from the shared
+    # bootstrap, so this reads the registry rather than a second hardcoded tuple. keeping a private
+    # list here is what let modal reach this function through the caller's allowlist and still be
+    # dropped on the next line -- a completed run misread as wall-deadline exhaustion.
+    from flash.providers import INSTANCE_PROVIDERS
+
+    if provider not in INSTANCE_PROVIDERS or not spec.train.hf_repo:
         return None
     from flash.providers._lifecycle.poll import make_say
     from flash.providers._lifecycle.poll_instance import (

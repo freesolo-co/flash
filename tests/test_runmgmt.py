@@ -2424,6 +2424,44 @@ def test_handleless_completed_metrics_checks_modal_attempt(monkeypatch):
     ]
 
 
+def test_completed_attempt_metrics_reads_the_modal_marker(monkeypatch):
+    """The provider gate INSIDE _completed_attempt_metrics must admit modal, not just the caller.
+
+    The caller's allowlist and this function's own check are two separate gates. Opening only the
+    outer one let modal reach here and get dropped on the first line, so a finished run that wrote
+    modal_attempt{N}.json was never adopted and failed at the wall deadline instead. This test does
+    not mock _completed_attempt_metrics -- mocking it is exactly what hid the miss.
+    """
+    from flash.core.spec import JobSpec, TrainSpec
+    from flash.runner.supervise import recovery
+
+    spec = JobSpec(
+        run_id="modal-marker",
+        model="Qwen/Qwen3.5-4B",
+        algorithm="sft",
+        train=TrainSpec(hf_repo="acme/run-artifacts"),
+    )
+    requested: list[str] = []
+
+    def fake_reader(repo, path):
+        requested.append(path)
+        return lambda force=False: None
+
+    monkeypatch.setattr(recovery, "make_hf_text_reader", fake_reader, raising=False)
+    monkeypatch.setattr(
+        "flash.providers.artifacts.hf.make_hf_text_reader", fake_reader, raising=False
+    )
+
+    recovery._completed_attempt_metrics(
+        spec, provider="modal", attempt=3, launch_floor=100.0, deadline_at=500.0
+    )
+
+    # reaching the artifact reads at all is the proof: before the fix it returned None immediately.
+    assert any("modal_attempt3.json" in path for path in requested), (
+        "modal must reach its attempt marker rather than being refused by the provider gate"
+    )
+
+
 def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, tmp_path):
     import flash.runner as runner
     import flash.server.platform.runtime as runtime
