@@ -6352,6 +6352,28 @@ def test_overrides_point_verl_at_a_warm_start_adapter():
     assert warm["actor_rollout_ref.model.lora_adapter_path"] == "/w/source_adapter"
 
 
+def test_overrides_enable_layered_summon_for_fused_expert_targets():
+    # opd shares verl's collect_lora_params with grpo, so the whole-model summon is the same
+    # oversized gather there. requires load_format=safetensors, which verl checks as
+    # base_sync_done before allowing the layered walk.
+    overrides = dict(
+        value.split("=", 1)
+        for value in build_opd_overrides(
+            _config(target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
+        )
+    )
+    assert overrides["actor_rollout_ref.rollout.layered_summon"] == "true"
+    assert overrides["actor_rollout_ref.rollout.load_format"] == "safetensors"
+
+
+def test_overrides_omit_layered_summon_for_dense_models():
+    assert not [
+        value
+        for value in build_opd_overrides(_config(target_parameters=None))
+        if "layered_summon" in value
+    ]
+
+
 def test_overrides_match_verl_0_8_sync_distillation_contract():
     overrides = dict(value.split("=", 1) for value in build_opd_overrides(_config()))
     assert overrides["distillation._target_"] == "flash_opd_plugin.FlashRemoteDistillationConfig"
