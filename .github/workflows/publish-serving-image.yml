@@ -1,0 +1,213 @@
+name: Publish serving image
+
+# The customer-owned serving path pins a digest-qualified OCI reference: `ServingImage`
+# (flash/serve/provisioning/_common.py) rejects a tag-only reference, so a deployment cannot
+# name "whatever :dev points at today". That digest has to come from somewhere, and nothing
+# published `Dockerfile.serve` -- which is why the provisioning code had no reachable caller.
+#
+# This mirrors publish-image.yml, which already pushes ghcr.io/freesolo-co/freesolo-flash from
+# ./Dockerfile, so GHCR is the established registry for this repo rather than a new external
+# surface.
+#
+# The digest is deliberately only an OUTPUT here and is never written back into the repository.
+# Dockerfile.serve COPYs the whole `flash` package, so recording the digest inside that package
+# would change the image inputs and invalidate the digest it just recorded. Whatever consumes
+# this (a profile, a release manifest) must live outside the image build context.
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    # deliberately no trigger-level ``paths`` filter, for the same reason deploy-modal.yml omits
+    # one: github evaluates path filters against only the first 300 changed files of a push, so a
+    # large merge that touches an image input beyond that window would never start this workflow
+    # and the tags would keep pointing at old code. the in-job gate below diffs the full history since
+    # the revision actually published to ghcr, so it cannot miss a relevant change; an irrelevant push
+    # just runs the cheap gate and skips the expensive build.
+  workflow_dispatch:
+
+concurrency:
+  group: publish-serving-image-${{ github.ref }}
+  # keep a running publish alive, but do not rely on concurrency to preserve a pending run: github
+  # replaces an older pending run even when cancel-in-progress is false. the gate therefore compares
+  # against the revision stamped into the image currently published under this branch's tag, so a
+  # replacement run repeats every relevant change that has not actually reached ghcr.
+  cancel-in-progress: false
+
+jobs:
+  publish-serving-image:
+    name: Build and push serving image
+    # Upstream only, for the same reason as publish-image.yml: the push target is in our org
+    # namespace, so a fork's GITHUB_TOKEN cannot write it and the build would burn its runner
+    # and then fail at the push.
+    if: github.repository == 'freesolo-co/flash'
+    # NOT ubuntu-latest, despite publish-image.yml using it: that workflow builds a
+    # `python:3.12-slim` image, while Dockerfile.serve shares the WORKER image's
+    # `pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel` base and then installs vllm on top. A standard
+    # hosted runner only guarantees ~14 GB free, so this needs the same larger runner and the same
+    # disk reclaim as worker-image.yml or it dies with ENOSPC and never publishes a digest.
+    runs-on: ubuntu-24.04-8core
+    # The serving image installs the vLLM/torch runtime extra on a CUDA devel base, so it is
+    # substantially heavier than the control-plane image. 90 minutes covers a cold cache.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/freesolo-co/freesolo-flash-serve
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # the publish gate diffs against the revision currently stamped in the published image.
+          fetch-depth: 0
+
+      # this is a best-effort metadata reader, not a publication prerequisite. any download,
+      # checksum, or execution failure is ignored here and makes the gate publish safely below.
+      - name: Install crane for published revision lookup
+        continue-on-error: true
+        env:
+          CRANE: ${{ runner.temp }}/serving-publish-tools/crane
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/crane.tar.gz"
+          mkdir -p "$(dirname "$CRANE")"
+          curl --fail --silent --show-error --location --output "$archive" \
+            https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz
+          printf '%s  %s\n' \
+            c14340087103ba9dadf61d45acd20675490fd0ccbd56ac7901fc1b502137f44b \
+            "$archive" | sha256sum --check --status
+          tar -xzf "$archive" -C "$(dirname "$CRANE")" crane
+          "$CRANE" version
+
+      # the image inputs Dockerfile.serve reads: a change to any of them changes the published image
+      # while the tags keep pointing at the old one. that is the whole COPY set -- `flash`, the
+      # lockfile, the launcher, and the files copied alongside them -- plus `.dockerignore`, which
+      # decides what the build context contains at all, and this workflow file, so a change to the
+      # build here republishes rather than leaving the old image serving under the same tags.
+      - name: Decide whether to publish
+        id: gate
+        working-directory: .
+        env:
+          EVENT: ${{ github.event_name }}
+          CURRENT_SHA: ${{ github.sha }}
+          PUBLISHED_IMAGE: ${{ env.IMAGE }}:${{ github.ref_name }}
+          CRANE: ${{ runner.temp }}/serving-publish-tools/crane
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          publish=false
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            publish=true
+          elif [ ! -x "$CRANE" ] || ! printf '%s' "$GHCR_TOKEN" | "$CRANE" auth login \
+            ghcr.io --username "$GHCR_ACTOR" --password-stdin >/dev/null 2>&1; then
+            # a missing reader or any registry authentication failure must publish safely.
+            publish=true
+          elif ! image_config="$("$CRANE" config "$PUBLISHED_IMAGE" 2>/dev/null)"; then
+            # a missing tag or any registry, network, or metadata failure must publish safely.
+            publish=true
+          elif ! last_published_sha="$(python3 -c '
+          import json
+          import re
+          import sys
+
+          payload = json.load(sys.stdin)
+          revision = payload.get("config", {}).get("Labels", {}).get(
+              "org.opencontainers.image.revision"
+          )
+          if not isinstance(revision, str) or re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
+              raise SystemExit(1)
+          print(revision.lower())
+          ' <<< "$image_config" 2>/dev/null)"; then
+            # an image without a valid source label cannot safely bound the unpublished changes.
+            publish=true
+          elif ! git merge-base --is-ancestor "$last_published_sha" "$CURRENT_SHA" 2>/dev/null; then
+            # a missing or rewritten published revision cannot safely bound the unpublished changes.
+            publish=true
+          elif ! changed="$(git diff --name-only "$last_published_sha" "$CURRENT_SHA" 2>/dev/null)"; then
+            publish=true
+          elif grep -qE "^(flash/|Dockerfile\.serve$|\.dockerignore$|serve_launch\.py$|pyproject\.toml$|uv\.lock$|README\.md$|LICENSE$|NOTICE$|\.github/workflows/publish-serving-image\.yml$)" <<< "$changed"; then
+            publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "Publish serving image: $publish"
+
+      # Same reclaim as worker-image.yml, which builds the same CUDA devel base. The runner ships
+      # several GB of toolchains this build never uses, and the image does not fit without them
+      # removed first.
+      - name: Free disk space
+        if: steps.gate.outputs.publish == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache /usr/share/swift \
+            /usr/local/share/boost /usr/local/lib/node_modules \
+            /usr/local/share/powershell /usr/share/miniconda || true
+          sudo apt-get clean || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        if: steps.gate.outputs.publish == 'true'
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.publish == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        if: steps.gate.outputs.publish == 'true'
+        id: tags
+        run: |
+          # Same scheme as publish-image.yml: main publishes :main + :latest, any other branch
+          # publishes :<branch>, and every build gets an immutable :sha-<short> tag. Deployments
+          # pin the digest, not these tags; the tags exist for humans reading the registry.
+          short_sha="$(git rev-parse --short HEAD)"
+          branch="${GITHUB_REF_NAME}"
+          {
+            echo "tags<<EOF"
+            if [ "$branch" = "main" ]; then
+              echo "${IMAGE}:main"
+              echo "${IMAGE}:latest"
+            else
+              echo "${IMAGE}:${branch}"
+            fi
+            echo "${IMAGE}:sha-${short_sha}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        if: steps.gate.outputs.publish == 'true'
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile.serve
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      # The digest is the whole point of this workflow: it is the one value a deployment can
+      # pin that cannot be moved under it later. Surface it in the job summary so the exact
+      # reference can be copied into a serving profile without digging through build logs.
+      - name: Report the digest-qualified reference
+        if: steps.gate.outputs.publish == 'true'
+        run: |
+          reference="${IMAGE}@${{ steps.build.outputs.digest }}"
+          {
+            echo "### Serving image published"
+            echo
+            echo '```'
+            echo "${reference}"
+            echo '```'
+            echo
+            echo "Pin this exact reference. Tags move; the digest does not."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "${reference}"

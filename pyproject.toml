@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.2.104"
+version = "1.2.105"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -57,6 +57,8 @@ gpu = [
 server = [
     "fastapi",
     "uvicorn",
+    # customer-owned modal lifecycle mutations execute in the control plane.
+    "modal==1.5.4",
     "runpod-flash",
     "httpx>=0.27",
     "jsonschema>=4.23",
@@ -72,6 +74,52 @@ server = [
     # `RuntimeError: Pillow is required for multimodal image training` at preflight on any
     # multimodal opd run. the gpu extra gets Pillow transitively via vllm; server does not.
     "pillow>=11",
+]
+# The serving app (flash/serving/) that runs inside the GPU container. Kept out of `server` because
+# the control plane never imports it: only the container image and the offline serving tests need
+# these. vLLM is deliberately absent -- it is a multi-GB CUDA wheel that the container image pins
+# (vllm==0.23.0, held exactly by a 25h 35B outage on 0.21.0), and the offline tests substitute a
+# stub whenever the real package is unimportable, so CI exercises the app without it.
+serving = [
+    # the hosted app talks to supabase (durable adapter registry) and the platform backend (usage
+    # billing) over httpx, at module scope in src/persistence.py and src/supabase_rest.py. it is
+    # NOT transitively guaranteed by the other bounds, so the image must state it.
+    "httpx>=0.27.0",
+    # the app IS a fastapi app: `src/router.py` and nine sibling modules import it at module scope.
+    # nothing else here guarantees it -- modal does not depend on fastapi -- so installing this
+    # extra alone could not import the app it exists to run. CI only passed because it also
+    # installs `server`, which happens to carry fastapi.
+    "fastapi",
+    # the same exact pin as `server`, deliberately. both extras drive the same modal lifecycle, and
+    # this one is what the serving image installs ALONE -- so a range here lets the container
+    # resolve a different modal than the control plane was validated against, on a rebuild that
+    # changed nothing else. one policy per package.
+    "modal==1.5.4",
+    "orjson>=3.10.0",
+    # `src/multimodal.py` decodes and normalizes inbound images at module scope. the `gpu` extra
+    # gets Pillow transitively via vllm, but this extra deliberately excludes vllm, so it has to
+    # state Pillow itself.
+    "pillow>=11",
+    # imported directly by `src/schemas.py`, `src/serving_io.py` and `src/settings.py`. it does
+    # arrive under `pydantic-settings`, but a direct module-scope import should not rely on
+    # another package's dependency to keep supplying it.
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.6.0",
+    "python-dotenv>=1.0.0",
+]
+# reusable gpu execution runtime for customer-owned deployments. these are the model-path
+# dependencies validated by the current production serving image. vllm stays exact until a real-gpu
+# base plus lora canary validates a replacement.
+serve-runtime = [
+    "fastapi",
+    "uvicorn",
+    "huggingface-hub>=1.2.0",
+    "safetensors",
+    "pillow>=11.0.0",
+    # same range as every other extra: the serving image resolves from these bounds rather than the
+    # lockfile, so an unbounded declaration silently rides a transformers line nothing validated.
+    "transformers>=5.6,<5.13",
+    "vllm==0.23.0",
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
@@ -137,7 +185,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.2.104"
+version = "1.2.105"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -157,6 +205,14 @@ markers = [
 [tool.uv]
 # Heavy GPU extras are worker-side; keep the default sync light.
 package = true
+# training and serving intentionally validate different exact vllm builds and cannot be installed
+# into one environment. uv records both resolutions while rejecting only the incompatible combination.
+conflicts = [
+    [
+        { extra = "gpu" },
+        { extra = "serve-runtime" },
+    ],
+]
 
 [dependency-groups]
 dev = [
