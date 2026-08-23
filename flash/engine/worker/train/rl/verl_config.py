@@ -26,6 +26,7 @@ from flash.engine.worker.backend_common import (
 )
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.sft_train import _hydra_val, _verl_image_message_content
+from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
     resolve_reshard_after_forward,
@@ -321,6 +322,11 @@ def _rollout_overrides(cfg: dict) -> list[str]:
         # child-silence watchdog kills it 1200s later. capping the pool leaves group_size and
         # prompts_per_step exactly as authored -- only scheduling parallelism narrows.
         f"actor_rollout_ref.rollout.agent.num_workers={agent_loop_workers(int(cfg['prompts_per_step']) * int(cfg['group_size']), cap=4 if cfg.get('multimodal') else 8)}",
+        # one grpo step submits exactly prompts_per_step * group_size sequences. left unset verl
+        # keeps its 1024 default, and vllm sizes cuda-graph capture and (on a gdn/mamba hybrid)
+        # per-slot recurrent state from that number, both up front -- so a 32-sequence run paid a
+        # 1024-sequence reservation and OOMed during capture with most of the card still free.
+        f"actor_rollout_ref.rollout.max_num_seqs={rollout_max_num_seqs(int(cfg['prompts_per_step']) * int(cfg['group_size']))}",
         # multi-turn runs flash's own agent loop, registered in the child by flash_grpo_plugin. the
         # stock single_turn_agent generates once and returns; it has no notion of an environment
         # reply, so a multi-turn env on the default loop would train on first turns only.
