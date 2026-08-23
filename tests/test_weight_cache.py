@@ -891,8 +891,17 @@ def test_poll_error_on_volume_attempt_drops_cache(monkeypatch):
 def test_cache_drop_does_not_advance_gpu_walk(monkeypatch):
     # The cache-drop transition must retry the SAME (cheapest) GPU cache-less on the wider pool
     # first — the capacity miss may have been the cache DC set, not the GPU class globally.
+    from flash.runner.supervise import seed_submission
+
+    refusals = []
+    monkeypatch.setattr(
+        seed_submission._capacity_experience,
+        "record_capacity_refusal",
+        refusals.append,
+    )
     seen = _supervised_walk(monkeypatch, {0: "no_capacity"})
     assert seen[1][1] == seen[0][1]  # same GPU class on the cache-drop retry (walk NOT advanced)
+    assert refusals == []
 
 
 def test_cache_drop_then_walks_on_next_failure(monkeypatch):

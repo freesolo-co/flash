@@ -893,10 +893,13 @@ def _handle_failure(
         refused_key = _capacity_refusal_key(ctx, outcome)
         if refused_key is not None:
             ctx.capacity_refusals[refused_key] = ctx.capacity_refusals.get(refused_key, 0) + 1
-            _record_capacity_observation(
-                _capacity_experience.record_capacity_refusal,
-                refused_key,
-            )
+            if not first_cache_drop:
+                # the cached attempt asks only about the datacenter holding that volume. recording
+                # it plane-wide would demote the class before the cacheless retry asks the wider market.
+                _record_capacity_observation(
+                    _capacity_experience.record_capacity_refusal,
+                    refused_key,
+                )
     retry_target = _retry_target(
         ctx,
         outcome,
