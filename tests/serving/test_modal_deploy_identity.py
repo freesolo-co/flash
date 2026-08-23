@@ -12,6 +12,7 @@ import pytest
 _DEPLOYMENT_ENV_VARS = (
     "SERVING_DEPLOYMENT_MODE",
     "SERVING_CUSTOM_DOMAIN",
+    "MODAL_IS_REMOTE",
     "FREESOLO_INTERNAL_KEY",
     "HF_TOKEN",
     "PLATFORM_BACKEND_URL",
@@ -84,6 +85,18 @@ def test_engine_container_imports_with_only_hf_token_in_dev(monkeypatch) -> None
     monkeypatch.setenv("HF_TOKEN", "fake")
 
     modal_app = _import_modal_app(monkeypatch, is_local=False, environment="dev")
+
+    assert modal_app.SERVING_DEPLOYMENT_MODE == "production"
+    assert modal_app.MODAL_ENVIRONMENT == "dev"
+    assert modal_app.SERVING_CUSTOM_DOMAIN == ""
+
+
+def test_remote_child_imports_with_only_hf_token_in_dev(monkeypatch) -> None:
+    _clear_deployment_environment(monkeypatch)
+    monkeypatch.setenv("HF_TOKEN", "fake")
+    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
+
+    modal_app = _import_modal_app(monkeypatch, is_local=True, environment="dev")
 
     assert modal_app.SERVING_DEPLOYMENT_MODE == "production"
     assert modal_app.MODAL_ENVIRONMENT == "dev"

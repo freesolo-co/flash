@@ -25,40 +25,37 @@ REPO_DIR = SERVING_DIR.parent.parent
 
 # deployment identity is resolved before dotenv so development can never inherit production wiring.
 _ALLOWED_SERVING_DEPLOYMENT_MODES = frozenset({"production", "development"})
-_requested_deployment_mode = os.environ.get("SERVING_DEPLOYMENT_MODE", "").strip()
-SERVING_DEPLOYMENT_MODE = _requested_deployment_mode or "production"
-MODAL_ENVIRONMENT = str(modal.config.config.get("environment") or "").strip()
-# modal imports this module in every runtime container; only the local deploy process can be
-# mis-targeted or load deployment wiring.
-_is_deploy_process = modal.is_local()
-if _is_deploy_process:
-    if SERVING_DEPLOYMENT_MODE not in _ALLOWED_SERVING_DEPLOYMENT_MODES:
-        raise ValueError(
-            "SERVING_DEPLOYMENT_MODE must be 'production' or 'development', "
-            f"not {SERVING_DEPLOYMENT_MODE!r}"
-        )
-    if SERVING_DEPLOYMENT_MODE == "development" and MODAL_ENVIRONMENT != "dev":
-        raise ValueError("development serving must target Modal environment 'dev'")
-    if SERVING_DEPLOYMENT_MODE == "production" and MODAL_ENVIRONMENT == "dev":
-        raise ValueError("production serving must not target Modal environment 'dev'")
-    if load_dotenv is not None and SERVING_DEPLOYMENT_MODE == "production":
-        load_dotenv(REPO_DIR / ".env")
-
-APP_NAME = "freesolo-lora-serving"  # hardcoded; no deploy-time knob
-_USAGE_REPORT_RETRY_DELAYS_SECONDS = (0.1, 0.25, 0.5)
 # branded serving hostname, served alongside the default *.modal.run url once dns + tls resolve.
 # this remains environment-driven because custom domains must already be verified in the target modal
 # workspace. production keeps the domain optional for local and fork workspaces, while the official
 # development deployment fails closed on its isolated public domain.
 _DEVELOPMENT_SERVING_DOMAIN = "serve-dev.freesolo.co"
-SERVING_CUSTOM_DOMAIN = os.environ.get("SERVING_CUSTOM_DOMAIN", "").strip()
-if _is_deploy_process:
-    if (
-        SERVING_DEPLOYMENT_MODE == "development"
-        and SERVING_CUSTOM_DOMAIN != _DEVELOPMENT_SERVING_DOMAIN
-    ):
-        raise ValueError(f"development SERVING_CUSTOM_DOMAIN must be {_DEVELOPMENT_SERVING_DOMAIN}")
-    if SERVING_DEPLOYMENT_MODE == "development":
+
+
+def _resolve_deployment_identity(*, validate_deploy_wiring: bool) -> tuple[str, str, str]:
+    requested_deployment_mode = os.environ.get("SERVING_DEPLOYMENT_MODE", "").strip()
+    serving_deployment_mode = requested_deployment_mode or "production"
+    modal_environment = str(modal.config.config.get("environment") or "").strip()
+
+    if validate_deploy_wiring:
+        if serving_deployment_mode not in _ALLOWED_SERVING_DEPLOYMENT_MODES:
+            raise ValueError(
+                "SERVING_DEPLOYMENT_MODE must be 'production' or 'development', "
+                f"not {serving_deployment_mode!r}"
+            )
+        if serving_deployment_mode == "development" and modal_environment != "dev":
+            raise ValueError("development serving must target Modal environment 'dev'")
+        if serving_deployment_mode == "production" and modal_environment == "dev":
+            raise ValueError("production serving must not target Modal environment 'dev'")
+        if load_dotenv is not None and serving_deployment_mode == "production":
+            load_dotenv(REPO_DIR / ".env")
+
+    serving_custom_domain = os.environ.get("SERVING_CUSTOM_DOMAIN", "").strip()
+    if validate_deploy_wiring and serving_deployment_mode == "development":
+        if serving_custom_domain != _DEVELOPMENT_SERVING_DOMAIN:
+            raise ValueError(
+                f"development SERVING_CUSTOM_DOMAIN must be {_DEVELOPMENT_SERVING_DOMAIN}"
+            )
         required = (
             "FREESOLO_INTERNAL_KEY",
             "PLATFORM_BACKEND_URL",
@@ -84,6 +81,18 @@ if _is_deploy_process:
         expected_supabase_url = f"https://{dev_ref}.supabase.co"
         if os.environ["SUPABASE_URL"].strip().rstrip("/") != expected_supabase_url:
             raise ValueError("development SUPABASE_URL must match SUPABASE_PROJECT_REF_DEV")
+
+    return serving_deployment_mode, modal_environment, serving_custom_domain
+
+
+# modal.is_local() is true in remote child processes, so the remote marker must also be absent.
+_validate_deploy_wiring = modal.is_local() and os.environ.get("MODAL_IS_REMOTE") != "1"
+SERVING_DEPLOYMENT_MODE, MODAL_ENVIRONMENT, SERVING_CUSTOM_DOMAIN = _resolve_deployment_identity(
+    validate_deploy_wiring=_validate_deploy_wiring
+)
+
+APP_NAME = "freesolo-lora-serving"  # hardcoded; no deploy-time knob
+_USAGE_REPORT_RETRY_DELAYS_SECONDS = (0.1, 0.25, 0.5)
 HF_CACHE_VOLUME_NAME = "freesolo-lora-serving-hf-cache"
 HOSTING_CACHE_MOUNT = "/vol/hosting-cache"
 

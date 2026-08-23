@@ -176,11 +176,20 @@ jobs:
             ready)
               ;;
             wrong-suffix)
-              modal environment update dev --set-web-suffix dev
+              modal environment update dev --set-web-suffix dev || {
+                echo "::error::A Modal workspace admin must run: modal environment update dev --set-web-suffix dev"
+                exit 1
+              }
               ;;
             missing)
-              modal environment create dev
-              modal environment update dev --set-web-suffix dev
+              modal environment create dev || {
+                echo "::error::A Modal workspace admin must run: modal environment create dev"
+                exit 1
+              }
+              modal environment update dev --set-web-suffix dev || {
+                echo "::error::A Modal workspace admin must run: modal environment update dev --set-web-suffix dev"
+                exit 1
+              }
               ;;
             *)
               echo "::error::Could not determine the state of the development Modal environment."
