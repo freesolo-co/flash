@@ -7,7 +7,10 @@ import urllib.error
 import urllib.request
 
 from ._common import DeploymentBundle
-from ._modal_probe import _provenance_matches as _modal_provenance_matches
+
+# runpod deliberately reuses modal's exact provenance check so the providers cannot drift.
+# a weaker check let pods pass while omitting the run alias or serving extra models.
+from ._modal_probe import _provenance_matches
 from ._runpod_transport import USER_AGENT, build_no_redirect_opener
 
 _MAX_PROBE_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -69,16 +72,3 @@ class RunPodEndpointProbe:
         if callable(self._opener):
             return self._opener(request, timeout=timeout)
         raise OSError("probe opener is invalid")
-
-
-def _provenance_matches(payload: object, bundle: DeploymentBundle) -> bool:
-    """the same exact comparison the modal probe applies, not a weaker one.
-
-    readiness means the same thing on both providers, so this reuses `_modal_probe`'s check rather
-    than keeping a second implementation that can drift from it. the check this replaced compared
-    only five deployment-wide fields and accepted any superset of the revision ids, so a pod that
-    omitted the run alias, served extra models, or reported wrong per-adapter provenance still
-    passed -- and the customer got a "ready" deployment whose documented alias request could 404.
-    """
-
-    return _modal_provenance_matches(payload, bundle)

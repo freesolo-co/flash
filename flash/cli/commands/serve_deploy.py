@@ -122,16 +122,6 @@ def _report(result, bundle) -> int:
             "want it.",
             file=sys.stderr,
         )
-    elif (
-        result.error_code == "readiness_timeout"
-        and handle is not None
-        and handle.provider == "runpod"
-    ):
-        print(
-            f"\nreadiness did not prove within the deadline for pod {handle.pod_id}. run `flash serve "
-            "undeploy` to tear it down and stop billing before retrying.",
-            file=sys.stderr,
-        )
     elif result.status == "outcome_unknown":
         # the provider may or may not hold live resources. saying "failed" here would invite a
         # retry that double-provisions and bills twice.

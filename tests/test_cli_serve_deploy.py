@@ -439,32 +439,6 @@ def test_identity_reporting_does_not_swallow_keyboard_interrupt(
         serve_deploy._report_identity(object())
 
 
-def test_readiness_timeout_names_the_pod_and_points_to_teardown(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    from flash.serve.control import DeploymentResult
-
-    def _timed_out(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        ready = _result(bundle)
-        return DeploymentResult.from_spec(
-            bundle.spec,
-            status="failed",
-            handle=ready.handle,
-            error_code="readiness_timeout",
-        )
-
-    _stub_resolution(monkeypatch)
-    _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.provision_runpod_deployment", _timed_out)
-
-    assert cmd_serve_deploy(_args(provider="runpod")) == 1
-    captured = capsys.readouterr()
-    assert "readiness did not prove within the deadline" in captured.err
-    assert "pod pod1234567890" in captured.err
-    assert "flash serve undeploy" in captured.err
-    assert "outcome could not be confirmed" not in captured.err
-
-
 def test_artifact_cleanup_timeout_reports_a_live_billing_service(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
