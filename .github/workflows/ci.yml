@@ -35,10 +35,12 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
+          # pin the installed binary as well as the action implementation.
+          version: "0.12.5"
           python-version: ${{ matrix.python-version }}
 
       - name: Sync (server extra + dev)
-        run: uv sync --extra server --extra serving --dev
+        run: uv sync --extra server --extra serving --dev --locked
 
       - name: Ruff check
         run: uv run ruff check .
@@ -158,10 +160,12 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
+          # pin the installed binary as well as the action implementation.
+          version: "0.12.5"
           python-version: "3.11"
 
       - name: Sync (server extra + dev)
-        run: uv sync --extra server --extra serving --dev
+        run: uv sync --extra server --extra serving --dev --locked
 
       - name: mypy
         run: |
