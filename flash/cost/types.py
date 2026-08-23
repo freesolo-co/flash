@@ -11,6 +11,18 @@ from flash.providers import PROVIDER_NAMES, validated_provider_preferences
 from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
 
 
+def vram_clause(per_card_gb: int, offered_gb: int, gpu_count: int) -> str:
+    """The VRAM half of a quote's GPU line, in terms comparable to the run's requirement.
+
+    A single-card shape offers exactly its card, so it keeps the plain spelling. A multi-card
+    shape states the pooled figure the fit gate actually used and keeps the per-card number
+    beside it, because that is the one the user checks against a provider's listing.
+    """
+    if gpu_count > 1 and offered_gb != per_card_gb:
+        return f"{offered_gb} GB usable across {gpu_count}x {per_card_gb} GB"
+    return f"{per_card_gb} GB"
+
+
 @dataclass(frozen=True)
 class RunConfig:
     """One training run to price. ``None`` knobs resolve to recipe defaults."""
@@ -278,13 +290,28 @@ class CostEstimate:
     def billable_hours(self) -> float:
         return self.train_seconds / 3600.0
 
+    @property
+    def offered_vram_gb(self) -> int:
+        """VRAM this SHAPE offers the run, valued the way the allocator's fit gate valued it.
+
+        ``required_vram_gb`` is a whole-run figure, so pairing it with the per-card
+        ``gpu_vram_gb`` compares two different quantities: a quote that passed the fit gate on
+        pooled capacity then renders as "180 GB; needs >= 199 GB" and reads as a rejection of
+        the shape it just recommended. ``combined_vram_gb`` is the allocator's own fit model,
+        so quoting through it makes the two numbers comparable on every count.
+        """
+        from flash.providers.sharding import combined_vram_gb
+
+        return int(combined_vram_gb(self.gpu_vram_gb, max(1, self.gpu_count)))
+
     def breakdown(self) -> str:
         """Multi-line itemized breakdown for CLI output."""
         lines = [
             f"Run        : {self.model_id}  [{self.method.upper()}, {self.steps} steps]",
             (
                 f"GPU        : {f'{self.gpu_count}x ' if self.gpu_count > 1 else ''}{self.gpu} "
-                f"({self.gpu_vram_gb} GB; run needs >= {self.required_vram_gb} GB) "
+                f"({vram_clause(self.gpu_vram_gb, self.offered_vram_gb, self.gpu_count)}; "
+                f"run needs >= {self.required_vram_gb} GB) "
                 f"@ ${self.gpu_hourly_usd:.2f}/hr{' per card' if self.gpu_count > 1 else ''}"
             ),
             f"Setup      : {self.setup_seconds / 60:.1f} min (cold start: boot + deps + model load"

@@ -842,3 +842,65 @@ def test_offline_exact_pin_on_a_fixed_count_provider_still_names_a_width_to_chec
         )
     assert "--gpus" not in str(unfittable.value)
     assert "Lower [train]" in str(unfittable.value)
+
+
+def test_multi_card_quote_states_pooled_vram_not_per_card():
+    """A multi-card quote must not pair a per-card figure with a whole-run requirement.
+
+    The requirement is a whole-run number and the fit gate values a shape with
+    ``combined_vram_gb``, so rendering the per-card size beside it produced lines like
+    "180 GB; run needs >= 199 GB" on a shape that had just PASSED the gate -- a quote that reads
+    as a rejection of the hardware it recommends.
+    """
+    from flash.providers.base import Candidate
+    from flash.providers.sharding import combined_vram_gb
+
+    config = RunConfig("Qwen/Qwen3.5-4B", "grpo", 50, gpu_count=2)
+    two = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
+    pooled = int(combined_vram_gb(80, 2))
+    assert two.offered_vram_gb == pooled
+    assert pooled > two.gpu_vram_gb, "a 2-card shape must offer more than one of its cards"
+    line = next(ln for ln in two.breakdown().splitlines() if ln.startswith("GPU"))
+    assert f"{pooled} GB usable across 2x 80 GB" in line
+    # the per-card number stays visible: it is the one a user checks against a provider listing.
+    assert "80 GB" in line
+    # whatever the requirement is, the quoted shape must not read as failing it.
+    assert two.offered_vram_gb >= two.required_vram_gb
+
+
+def test_single_card_quote_keeps_the_plain_vram_spelling():
+    """One card offers exactly itself, so the pooled wording must not appear."""
+    from flash.providers.base import Candidate
+
+    one = estimate_cost(
+        RunConfig("Qwen/Qwen3.5-4B", "grpo", 50),
+        allocation=Candidate("runpod", "H100", 3.29, 80, 1),
+    )
+    assert one.offered_vram_gb == one.gpu_vram_gb == 80
+    line = next(ln for ln in one.breakdown().splitlines() if ln.startswith("GPU"))
+    assert "80 GB; run needs >=" in line
+    assert "usable across" not in line
+
+
+def test_themed_panel_and_breakdown_agree_on_the_vram_clause():
+    """The two renderers must not describe the same shape differently."""
+    import os
+
+    from flash.cli.ui import render
+    from flash.providers.base import Candidate
+
+    two = estimate_cost(
+        RunConfig("Qwen/Qwen3.5-4B", "grpo", 50, gpu_count=2),
+        allocation=Candidate("runpod", "H100", 3.29, 80, 2),
+    )
+    clause = f"{two.offered_vram_gb} GB usable across 2x {two.gpu_vram_gb} GB"
+    assert clause in two.breakdown()
+    prior = os.environ.get("NO_COLOR")
+    os.environ["NO_COLOR"] = "1"
+    try:
+        assert clause in render.cost_panel(two)
+    finally:
+        if prior is None:
+            os.environ.pop("NO_COLOR", None)
+        else:
+            os.environ["NO_COLOR"] = prior
