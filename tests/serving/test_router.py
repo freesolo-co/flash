@@ -1094,7 +1094,7 @@ def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):
 
 
 @pytest.mark.parametrize("stream", [1, "true"])
-def test_openai_chat_rejects_non_boolean_stream_before_authorization(stream):
+def test_openai_chat_rejects_non_boolean_stream_after_authorization(stream):
     authorizations: list[str] = []
 
     async def _authorize(_token: str, adapter_id: str) -> None:
@@ -1113,7 +1113,7 @@ def test_openai_chat_rejects_non_boolean_stream_before_authorization(stream):
 
     assert response.status_code == 400
     assert response.json()["detail"] == "stream must be a boolean"
-    assert authorizations == []
+    assert authorizations == ["qa"]
     assert pool.generated == []
 
 

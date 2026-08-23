@@ -97,16 +97,15 @@ def _chat(client: TestClient, model: str, *, stream: bool = False, headers=None)
 
 
 @pytest.mark.parametrize("registered", [False, True])
-def test_generated_checkpoint_reference_is_400_before_authorization(registered: bool) -> None:
+def test_generated_checkpoint_reference_requires_authorization_first(registered: bool) -> None:
     auth = FakeAuthorizer(error=HTTPException(status.HTTP_403_FORBIDDEN, "hidden"))
     records = [_rec(CHECKPOINT_MODEL)] if registered else []
     client, pool = _client(records, auth)
 
     response = _chat(client, CHECKPOINT_MODEL)
 
-    assert response.status_code == 400
-    assert response.json() == {"detail": DETAIL}
-    assert auth.calls == []
+    assert response.status_code == 403
+    assert auth.calls == [("user-key", CHECKPOINT_MODEL)]
     assert pool.generated == []
 
 
@@ -118,11 +117,11 @@ def test_generated_checkpoint_reference_is_normalized_before_validation() -> Non
 
     assert response.status_code == 400
     assert response.json() == {"detail": DETAIL}
-    assert auth.calls == []
+    assert auth.calls == [("user-key", CHECKPOINT_MODEL)]
     assert pool.generated == []
 
 
-def test_generated_checkpoint_reference_precedes_internal_key_bypass() -> None:
+def test_generated_checkpoint_reference_is_400_for_internal_caller() -> None:
     auth = FakeAuthorizer()
     client, pool = _client([], auth)
 
@@ -153,7 +152,7 @@ def test_generated_checkpoint_reference_streaming_request_is_plain_400() -> None
         response.read()
         assert response.json() == {"detail": DETAIL}
 
-    assert auth.calls == []
+    assert auth.calls == [("user-key", CHECKPOINT_MODEL)]
     assert pool.generated == []
 
 

@@ -62,11 +62,10 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
 async def generate_for_adapter(
     adapter_id: str, payload: dict[str, Any], request: Request
 ) -> JSONResponse:
-    # Parse first so the GenerateRequest validator normalizes (strips) the adapter id, then
-    # authorize and route against that same normalized value (not the raw path parameter).
     context = ServingContext.of(request)
+    normalized_adapter_id = adapter_id.strip()
+    caller_org = await context.authorize_inference(request, normalized_adapter_id)
     req = _parse_generate({**payload, "adapter_id": adapter_id})
-    caller_org = await context.authorize_inference(request, req.adapter_id)
     requested, target = await context.lookup.resolve(req.adapter_id)
     await _prepare_generate_request(req, target)
     result = await _await_until_disconnect(
@@ -82,18 +81,16 @@ async def generate_for_adapter(
     return _inference_json_response(result, target)
 
 
-def _openai_model_id(payload: dict[str, Any]) -> str:
-    """The adapter id an OpenAI-shaped request is asking for, stripped and validated.
-
-    Rejecting a checkpoint identifier here is the difference between a clear 400 and a confusing
-    404: `flash-<run>/step-<n>` is a real thing the caller has, just not a servable model id.
-    """
+def _openai_adapter_id(payload: dict[str, Any]) -> str:
+    """return the stripped adapter id required to authorize an openai-shaped request."""
     adapter_id = payload.get("model")
     if not isinstance(adapter_id, str) or not adapter_id.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "model must be the adapter id")
-    # use the stripped id consistently for validation, auth, routing, and the echoed response
-    # model, so a caller that sends "  qa  " is authorized against and routed to "qa".
-    adapter_id = adapter_id.strip()
+    return adapter_id.strip()
+
+
+def _validate_openai_model_id(adapter_id: str) -> None:
+    """reject checkpoint identifiers after the caller has been authorized."""
     match = _FLASH_CHECKPOINT_MODEL_RE.fullmatch(adapter_id)
     if match is not None:
         raise HTTPException(
@@ -101,13 +98,14 @@ def _openai_model_id(payload: dict[str, Any]) -> str:
             "This is a checkpoint identifier, not a serving model identifier. "
             f"Deploy it first or use model {match.group('run_id')}.",
         )
-    return adapter_id
 
 
 @inference_router.post("/v1/chat/completions", tags=["openai"])
 async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     context = ServingContext.of(request)
-    adapter_id = _openai_model_id(payload)
+    adapter_id = _openai_adapter_id(payload)
+    caller_org = await context.authorize_inference(request, adapter_id)
+    _validate_openai_model_id(adapter_id)
     stream = payload.get("stream", False)
     if type(stream) is not bool:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "stream must be a boolean")
@@ -115,7 +113,6 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         include_usage = parse_stream_options(payload.get("stream_options"), stream)
     except OpenAIRequestError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-    caller_org = await context.authorize_inference(request, adapter_id)
     requested, target = await context.lookup.resolve(adapter_id)
     try:
         fields = openai_generate_fields(payload, adapter_id)

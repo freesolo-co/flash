@@ -200,6 +200,32 @@ def test_generate_endpoint_is_also_enforced() -> None:
     assert auth.calls == [("fs-user-key", "qa")]
 
 
+def test_chat_auth_precedes_stream_validation() -> None:
+    auth = FakeAuthorizer()
+    response = _client(authorizer=auth).post(
+        "/v1/chat/completions",
+        json={
+            "model": "qa",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": "not-a-boolean",
+        },
+    )
+
+    assert response.status_code == 401
+    assert auth.calls == []
+
+
+def test_per_adapter_auth_precedes_payload_validation() -> None:
+    auth = FakeAuthorizer()
+    response = _client(authorizer=auth).post(
+        "/adapters/qa/generate",
+        json={"prompt": "hi", "top_p": "not-a-number"},
+    )
+
+    assert response.status_code == 401
+    assert auth.calls == []
+
+
 def test_generate_authorizes_against_the_normalized_adapter_id() -> None:
     # A whitespace-padded id is stripped once (GenerateRequest validator) so /generate authorizes
     # and routes against the same value ("qa"), not "  qa  ".
