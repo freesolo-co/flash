@@ -138,6 +138,8 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
                         flush=True,
                     )
                     return
+            else:
+                context.router.upsert(fenced, revive=True)
     except HTTPException as exc:
         print(
             f"adapter registration reconciliation skipped for {registration.adapter_id}: {exc!r}",
@@ -166,7 +168,8 @@ async def _register_revision(context: ServingContext, stored: AdapterRecord) -> 
     registration = stored
     try:
         await context.pool.register(registration.base_model, registration)
-    except Exception:  # a failed load leaves the revision disabled
+    except Exception:
+        await _reconcile_failed_promotion(context, registration)
         return
     try:
         committed = await _replace_stored_cas(
@@ -187,11 +190,15 @@ async def get_adapter(adapter_id: str, request: Request) -> dict[str, Any]:
     context = ServingContext.of(request)
     context.assert_internal(request)
     record = await context.lookup.get_exact(adapter_id)
+    lifecycle_state = record.status
+    if record.status == "disabled" and record.deployment_generation is not None:
+        lifecycle_state = "loading"
     return {
         "ok": True,
         "adapter": {
             **internal_adapter_payload(record),
-            "lifecycle_state": "ready",
+            "status": lifecycle_state,
+            "lifecycle_state": lifecycle_state,
         },
     }
 

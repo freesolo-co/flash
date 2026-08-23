@@ -104,7 +104,7 @@ class AdapterLookup:
         if not cached_ready and self._reload_records is not None:
             await self.reload()
             record = self._router.get(adapter_id)
-        if record is None or record.status != "ready":
+        if record is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
         if not record.serve_base_model and not (record.is_alias or record.is_revision):
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")

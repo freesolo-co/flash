@@ -451,7 +451,63 @@ def test_registration_reconciliation_survives_unload_failure(setup, monkeypatch)
     )
 
 
-def test_get_revision_is_not_found_until_ready_then_returns_full_identity(setup) -> None:
+def test_registration_response_loss_reconciles_remote_success(setup) -> None:
+    client, pool, router, persistence = setup
+    register = pool.register
+
+    async def lose_response(base_model: str, record: AdapterRecord) -> None:
+        await register(base_model, record)
+        raise RuntimeError("registration response lost")
+
+    pool.register = lose_response
+
+    response = _register(client, _registration())
+
+    assert response.status_code == 200
+    assert persistence.rows[REVISION_A].status == "disabled"
+    assert persistence.rows[REVISION_A].deployment_generation is None
+    assert router.resolve(REVISION_A) is None
+    assert pool.loaded_generations == {}, "response loss left an unrecorded adapter loaded"
+    assert pool.unregistered == [REVISION_A]
+    assert pool.unregistered_generations == [pool.registered_generations[0]]
+
+
+def test_get_loading_revision_reloads_status_without_making_it_routable(setup) -> None:
+    _, pool, _, persistence = setup
+    revision = ImmutableAdapterRegistration.model_validate(_registration()).to_record()
+    stored = persistence.insert(revision, object())
+    loading = persistence.replace(
+        stored.model_copy(update={"deployment_generation": stored.updated_at}),
+        expected_updated_at=stored.updated_at,
+        settings=object(),
+    )
+    assert loading is not None
+    router = AdapterRouter()
+    client = TestClient(
+        build_serving_app(
+            pool,
+            router,
+            internal_key="secret",
+            reload_records=lambda: list(persistence.rows.values()),
+        ),
+        headers=INTERNAL_HEADERS,
+    )
+    encoded_revision = quote(REVISION_A, safe="")
+
+    response = client.get(f"/adapters/{encoded_revision}")
+
+    assert response.status_code == 200
+    record = response.json()["adapter"]
+    assert record["status"] == "loading"
+    assert record["lifecycle_state"] == "loading"
+    assert "deployment_generation" not in record
+    assert router.get(REVISION_A) == loading
+    assert router.resolve(REVISION_A) is None
+    inference = client.post("/generate", json={"adapter_id": REVISION_A, "prompt": "hello"})
+    assert inference.status_code == 404
+
+
+def test_get_revision_reports_disabled_until_ready_then_returns_full_identity(setup) -> None:
     client, pool, _, persistence = setup
     register = pool.register
 
@@ -462,7 +518,10 @@ def test_get_revision_is_not_found_until_ready_then_returns_full_identity(setup)
     assert _register(client, _registration()).status_code == 200
     assert persistence.rows[REVISION_A].status == "disabled"
     encoded_revision = quote(REVISION_A, safe="")
-    assert client.get(f"/adapters/{encoded_revision}").status_code == 404
+    disabled = client.get(f"/adapters/{encoded_revision}")
+    assert disabled.status_code == 200
+    assert disabled.json()["adapter"]["status"] == "disabled"
+    assert disabled.json()["adapter"]["lifecycle_state"] == "disabled"
 
     pool.register = register
     assert _register(client, _registration()).status_code == 200
@@ -760,34 +819,33 @@ def test_delete_run_alias_cascades_ready_alias_and_revisions(setup) -> None:
     )
 
 
-def test_undeploy_fences_retried_disabled_revision_with_prior_generation(setup) -> None:
+def test_failed_retry_fences_prior_generation_before_undeploy(setup) -> None:
     client, pool, _, persistence = setup
     assert _register(client, _registration()).status_code == 200
     previous = persistence.rows[REVISION_A]
     disabled = persistence._stamp(previous.model_copy(update={"status": "disabled"}))
     persistence.rows[REVISION_A] = disabled
+    attempts: list[AdapterRecord] = []
 
-    async def _fail_register(_base_model: str, _record: AdapterRecord) -> None:
+    async def _fail_register(_base_model: str, record: AdapterRecord) -> None:
+        attempts.append(record)
         raise RuntimeError("still loading")
 
     pool.register = _fail_register
     assert _register(client, _registration()).status_code == 200
-    loading = persistence.rows[REVISION_A]
-    assert loading.status == "disabled"
-    assert loading.deployment_generation == disabled.updated_at
-
-    response = client.delete(f"/adapters/{RUN_ID}")
-
-    assert response.status_code == 200
-    assert response.json()["disabled_revisions"] == [REVISION_A]
-    assert persistence.rows[REVISION_A].deployment_generation is None
+    attempt = attempts[0]
+    fenced = persistence.rows[REVISION_A]
+    assert attempt.deployment_generation == disabled.updated_at
+    assert fenced.status == "disabled"
+    assert fenced.deployment_generation is None
+    assert fenced.updated_at != attempt.updated_at
     stale_promotion = persistence.replace(
-        loading.model_copy(update={"status": "ready"}),
-        expected_updated_at=loading.updated_at,
+        attempt.model_copy(update={"status": "ready"}),
+        expected_updated_at=attempt.updated_at,
         settings=object(),
     )
     assert stale_promotion is None, "the retried load retained promotion authority"
-    assert pool.unregistered_generations[-1] == loading.deployment_generation
+    assert pool.unregistered_generations[-1] == attempt.deployment_generation
 
 
 def test_delete_run_alias_evicts_revision_whose_register_result_was_lost(setup) -> None:
