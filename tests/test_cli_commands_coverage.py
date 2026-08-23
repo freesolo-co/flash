@@ -426,6 +426,60 @@ def test_current_attempt_heartbeats_are_left_untouched(capsys) -> None:
     assert "[superseded" not in out
 
 
+def test_teardown_window_still_tags_the_dead_workers_heartbeat(capsys) -> None:
+    """An explicitly null ``remote`` is PROOF no worker is live, so every heartbeat is a dead one.
+
+    ``live_attempt`` answers ``None`` both for "the worker is torn down" and for "no attempt is
+    known", and collapsing the two disabled tagging exactly during the retry window the tagging
+    exists for -- the dead attempt's heartbeat reached ``grep HEARTBEAT | tail -1`` unmarked while
+    replacement capacity was still being acquired.
+    """
+    from flash.cli.commands.worker_output import _NO_LIVE_WORKER
+
+    commands._print_worker_output(
+        {
+            "console_rl_attempt0.txt": (
+                'HEARTBEAT {"stage":"rl_step","step":76,"attempt":0,"device_name":"H200"}\n'
+            )
+        },
+        printed_any=True,
+        current_attempt=_NO_LIVE_WORKER,
+    )
+
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if "HEARTBEAT" in line]
+    assert lines, "the dead attempt's console dump must still be printed"
+    assert "[superseded attempt=0; worker torn down]" in lines[-1], (
+        f"a torn-down worker's heartbeat reached the pipe unmarked: {lines[-1]}"
+    )
+    assert "worker torn down; no live attempt" in out, "the heading must say so too"
+
+
+def test_snapshot_distinguishes_teardown_from_an_unknown_attempt() -> None:
+    """``remote: null`` means torn down; a failed lookup means unknown. They are not the same."""
+    from flash.cli.commands.worker_output import _NO_LIVE_WORKER, _snapshot_live_attempt
+    from flash.client import ClientError
+
+    class _Run:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def get_run(self, _run_id):
+            if isinstance(self._payload, Exception):
+                raise self._payload
+            return self._payload
+
+    torn_down = {"state": "running", "remote": None, "last_heartbeat": {"attempt": 0}}
+    assert _snapshot_live_attempt(_Run(torn_down), "flash-1") == _NO_LIVE_WORKER
+    live = {"state": "running", "remote": {"attempt": 1}, "last_heartbeat": {"attempt": 0}}
+    assert _snapshot_live_attempt(_Run(live), "flash-1") == 1
+    # a lookup failure must NOT claim there is no live worker
+    assert _snapshot_live_attempt(_Run(ClientError("boom")), "flash-1") is None
+    # nor must a payload that simply carries no remote key
+    no_remote = {"state": "running", "last_heartbeat": {"attempt": 0}}
+    assert _snapshot_live_attempt(_Run(no_remote), "flash-1") == 0
+
+
 def test_heartbeat_tagging_is_idempotent() -> None:
     """Re-printing an already-tagged dump must not stack a second marker onto the line."""
     from flash.cli.commands.worker_output import _mark_superseded_heartbeats
