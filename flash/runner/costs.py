@@ -291,37 +291,54 @@ def cancelled_charge_usd(
     return min(repriced, quote)
 
 
-def _persisted_completed_steps(spec) -> int | None:
-    """Authoritative completed optimizer steps from the worker's terminal metrics."""
+def _persisted_completed_work(spec) -> tuple[int | None, dict | None]:
+    """Authoritative completed steps and rented basis from terminal metrics."""
     try:
         with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as handle:
             metrics = json.load(handle)
     except (OSError, TypeError, ValueError):
-        return None
+        return None, None
     if not isinstance(metrics, dict):
-        return None
+        return None, None
     step = metrics.get("step")
-    if isinstance(step, bool) or not isinstance(step, (int, float)):
-        return None
-    if isinstance(step, float) and (not math.isfinite(step) or not step.is_integer()):
-        return None
-    if step < 0:
-        return None
-    return int(step)
+    valid_step = (
+        isinstance(step, (int, float))
+        and not isinstance(step, bool)
+        and (not isinstance(step, float) or (math.isfinite(step) and step.is_integer()))
+        and step >= 0
+    )
+    completed_steps = int(step) if valid_step else None
+    provider = metrics.get("allocated_provider")
+    gpu = metrics.get("allocated_gpu")
+    gpu_count = metrics.get("allocated_gpu_count")
+    rented_remote = {
+        "provider": provider,
+        "allocated_gpu": gpu,
+        "allocated_gpu_count": gpu_count,
+    }
+    if not any(value is not None for value in rented_remote.values()):
+        rented_remote = None
+    return completed_steps, rented_remote
 
 
 def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
     """Charge the quote exactly for full work, or its estimated share for an early finish."""
-    completed_steps = _persisted_completed_steps(spec)
+    completed_steps, persisted_basis = _persisted_completed_work(spec)
     if completed_steps is not None:
         # reuse cancellation's estimated-work fraction: one-time compile and reached saves stay
         # whole, unreached saves stay out, and a wall-capped plan reaches 100% at its priced cap.
         # a complete horizon produces a fraction of exactly 1 and therefore the accepted quote.
+        status_remote = status.remote if isinstance(status.remote, dict) else {}
+        rented_remote = {
+            key: value for key, value in (persisted_basis or {}).items() if value is not None
+        }
+        rented_remote.update(status_remote)
         return runner.cancelled_charge_usd(
             status,
             spec,
             steps=completed_steps,
             fallback=fallback,
+            rented_remote=rented_remote or None,
         )
     quote = getattr(status, "estimated_cost_usd", None)
     if quote is not None:

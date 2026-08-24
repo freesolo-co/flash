@@ -29,12 +29,29 @@ def _spec():
     return spec_from_dict(SPEC, run_id="run-1")
 
 
-def _write_terminal_steps(tmp_path, monkeypatch, spec, step, *, wall_seconds=1.0):
+def _write_terminal_steps(
+    tmp_path,
+    monkeypatch,
+    spec,
+    step,
+    *,
+    wall_seconds=1.0,
+    allocated_provider=None,
+    allocated_gpu=None,
+    allocated_gpu_count=None,
+):
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path))
     dest = runner.artifacts_dir(spec)
     os.makedirs(dest, exist_ok=True)
+    metrics = {"step": step, "wall_seconds": wall_seconds}
+    if allocated_provider is not None:
+        metrics["allocated_provider"] = allocated_provider
+    if allocated_gpu is not None:
+        metrics["allocated_gpu"] = allocated_gpu
+    if allocated_gpu_count is not None:
+        metrics["allocated_gpu_count"] = allocated_gpu_count
     with open(os.path.join(dest, "metrics.json"), "w") as handle:
-        json.dump({"step": step, "wall_seconds": wall_seconds}, handle)
+        json.dump(metrics, handle)
 
 
 # --------------------------------------------------------------------------- pricing helper
@@ -650,6 +667,46 @@ def test_completed_early_work_uses_the_same_estimated_fraction_as_cancellation(
     expected = runner.cancelled_charge_usd(status, spec, steps=10)
     assert 0.0 < expected < accepted_quote
     assert runner._status_estimated_charge(status, spec) == expected
+
+
+def test_completed_early_work_uses_the_persisted_rented_topology(tmp_path, monkeypatch):
+    from flash.cost.types import RunConfig
+
+    cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000, gpu_type="H100", gpu_count=4)
+    spec = _patched_cfg_spec(monkeypatch, cfg)
+    accepted_quote = 8.0
+    status = runner.RunStatus(
+        run_id="r",
+        state="done",
+        spec={},
+        estimated_cost_usd=accepted_quote,
+        remote=None,
+    )
+    monkeypatch.setattr(runner, "artifacts_dir", lambda _spec: str(tmp_path / "metrics"))
+    _write_terminal_steps(
+        tmp_path,
+        monkeypatch,
+        spec,
+        1,
+        allocated_provider="runpod",
+        allocated_gpu="H100",
+        allocated_gpu_count=4,
+    )
+
+    charge = runner._status_estimated_charge(status, spec)
+    partial = runner.charge_usd_for_spec(
+        spec, steps=1, provider="runpod", gpu_type="H100", gpu_count=4
+    )
+    full = runner.charge_usd_for_spec(spec, provider="runpod", gpu_type="H100", gpu_count=4)
+    expected = accepted_quote * partial / full
+    ceiling = (
+        accepted_quote
+        * runner.charge_usd_for_spec(spec, steps=1)
+        / runner.charge_usd_for_spec(spec)
+    )
+
+    assert charge == expected
+    assert charge != ceiling
 
 
 def test_completed_zero_work_charges_zero(tmp_path, monkeypatch):
