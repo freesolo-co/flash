@@ -1226,7 +1226,7 @@ def test_models_table(fake_client, capsys) -> None:
     # every catalog model is listed (no experimental/hidden tier)
     assert "Qwen/Qwen3.5-9B" in out
     assert "Qwen/Qwen3.5-9B" in out
-    assert "Qwen/Qwen3.6-27B" in out
+    assert "Qwen/Qwen3.8-27B" in out
     assert "Qwen/Qwen3.5-9B" in out
     # only bare model ids, none of the extra per-model detail columns
     assert "2.3B" not in out

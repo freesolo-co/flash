@@ -1812,7 +1812,7 @@ def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(
     "retired_model",
-    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"],
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
 )
 def test_cancel_active_removed_model_still_cleans_up_and_revokes(
     tmp_path, monkeypatch, retired_model

@@ -146,7 +146,7 @@ def test_sweep_charges_crashed_pending_run(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     "retired_model",
-    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"],
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
 )
 def test_sweep_charges_historical_removed_model_without_runtime_activation(
     monkeypatch, tmp_path, retired_model

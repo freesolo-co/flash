@@ -227,7 +227,7 @@ def test_deploy_27b_dry_run_accepts_rank_at_serving_cap():
 
     dep = deploy_adapter(
         run_id="q27",
-        model="Qwen/Qwen3.6-27B",
+        model="Qwen/Qwen3.8-27B",
         hf_repo="org/repo",
         adapter_prefix="sft/q27/seed0",
         dry_run=True,
@@ -242,7 +242,7 @@ def test_deploy_27b_rejects_lora_rank_above_serving_cap():
     with pytest.raises(ValueError, match="max_lora_rank=64"):
         deploy_adapter(
             run_id="q27-r65",
-            model="Qwen/Qwen3.6-27B",
+            model="Qwen/Qwen3.8-27B",
             hf_repo="org/repo",
             adapter_prefix="sft/q27-r65/seed0",
             dry_run=True,

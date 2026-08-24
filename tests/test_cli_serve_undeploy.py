@@ -125,7 +125,7 @@ def _fail_hub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize(
     "retired_model",
-    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"],
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
 )
 def test_undeploy_uses_immutable_identity_for_removed_model(
     monkeypatch: pytest.MonkeyPatch, retired_model: str

@@ -612,7 +612,7 @@ load the base with the multimodal class whose parameters live under that namespa
 from transformers import AutoModelForImageTextToText
 
 base = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen3.5-9B")
-# qwen3.5/3.6 dense models resolve to Qwen3_5ForConditionalGeneration
+# qwen3.5/3.8 dense models resolve to Qwen3_5ForConditionalGeneration
 # qwen3.6-35b-a3b (moe) resolves to Qwen3_5MoeForConditionalGeneration
 model = PeftModel.from_pretrained(base, "<you>/<repo>")
 ```

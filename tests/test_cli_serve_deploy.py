@@ -358,7 +358,7 @@ def test_tag_only_image_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize(
     "retired_model",
-    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"],
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
 )
 def test_removed_model_is_refused_before_resolution(
     monkeypatch: pytest.MonkeyPatch, retired_model: str
@@ -369,6 +369,17 @@ def test_removed_model_is_refused_before_resolution(
     monkeypatch.setattr("flash.serve.resolve.resolve_adapter", _explode)
 
     assert cmd_serve_deploy(_args(model=retired_model)) == 1
+
+
+def test_qwen38_customer_owned_deploy_is_refused_before_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _explode(**_kwargs):
+        raise AssertionError("resolution ran for a model without a customer-owned profile")
+
+    monkeypatch.setattr("flash.serve.resolve.resolve_adapter", _explode)
+
+    assert cmd_serve_deploy(_args(model="Qwen/Qwen3.8-27B")) == 1
 
 
 def test_runpod_provisioning_warns_that_the_pod_may_be_live_and_billing(

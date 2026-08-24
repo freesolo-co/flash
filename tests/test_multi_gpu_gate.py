@@ -863,12 +863,12 @@ def test_geometry_cap_follows_each_models_own_head_count():
     derived_wrong = {
         m for m, i in MODELS.items() if i.hidden_size // i.head_dim != i.num_attention_heads
     }
-    assert derived_wrong == {"Qwen/Qwen3.6-27B", "Qwen/Qwen3.6-35B-A3B"}
+    assert derived_wrong == {"Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"}
 
     # every CURRENT row divides by 8, so no row is narrowed today. that is a property of this
     # catalog, not an invariant -- the loop above is what enforces it for whatever is added next.
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.6-27B", 8) == 8
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.8-27B", 8) == 8
     # an authored ceiling below the geometric limit still wins; the cap only ever narrows.
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 2) == 2
     # a model outside the catalog has no readable geometry, so it keeps the unvalidated ceiling.
@@ -1616,7 +1616,7 @@ def test_the_tensor_parallel_axis_check_fails_a_row_vllm_would_reject():
     # kv axis (3 can neither partition across nor replicate into 4 ranks) still objects.
     assert _vllm_tp_axis_failures(row, 4) == ["kv_heads"]
     # a real row stays clean at every width, so the helper is not merely rejecting everything.
-    assert _vllm_tp_axis_failures(MODELS["Qwen/Qwen3.6-27B"], 8) == []
+    assert _vllm_tp_axis_failures(MODELS["Qwen/Qwen3.8-27B"], 8) == []
     # the conv axis is reported, and ISOLATED: conv_dim is `head_k*num_k*2 + head_v*num_v`, which
     # the catalog's 128-wide head dims keep a multiple of 8 for any head count -- so no value-head
     # count alone can break it. Narrow the dims instead: 1*3*2 + 1*16 = 22 fails while the value

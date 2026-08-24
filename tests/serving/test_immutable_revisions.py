@@ -27,7 +27,7 @@ from flash.serving.src.schemas import (
 from tests.serving.conftest import attest
 
 QWEN = "Qwen/Qwen3.5-9B"
-QWEN_27B = "Qwen/Qwen3.6-27B"
+QWEN_27B = "Qwen/Qwen3.8-27B"
 RUN_ID = "flash-1234567890-abcdef12"
 SHA_A = "a" * 40
 SHA_B = "b" * 40

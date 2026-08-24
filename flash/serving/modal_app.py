@@ -432,6 +432,15 @@ def _engine_cls_for(base_model: str) -> Any:
     return ENGINE_BY_KEY[_engine_key(base_model)]
 
 
+_HISTORICAL_CLEANUP_ENGINE_KEYS = {"Qwen/Qwen3.6-27B": ("H100", 16)}
+
+
+def _cleanup_engine_cls_for(base_model: str) -> Any:
+    """Resolve active engines plus the one retired hosted engine needed for exact eviction."""
+    key = _HISTORICAL_CLEANUP_ENGINE_KEYS.get(base_model)
+    return ENGINE_BY_KEY[key] if key is not None else _engine_cls_for(base_model)
+
+
 class _ModalEnginePool:
     """Dispatches router calls to each base model's per-gpu-tier ``LoraEngine`` container."""
 
@@ -493,7 +502,7 @@ class _ModalEnginePool:
         adapter_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        engine = _engine_cls_for(base_model)(base_model=base_model)
+        engine = _cleanup_engine_cls_for(base_model)(base_model=base_model)
         await engine.unregister.remote.aio(adapter_id, expected_generation)
 
 

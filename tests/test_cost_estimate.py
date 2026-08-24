@@ -158,7 +158,7 @@ def test_a_malformed_retained_example_count_is_rejected_not_read_as_unknown():
     from flash.cost.types import RunConfig
 
     def config(rows):
-        return RunConfig("Qwen/Qwen3.6-27B", "sft", 10, batch_size=8, sft_retained_examples=rows)
+        return RunConfig("Qwen/Qwen3.8-27B", "sft", 10, batch_size=8, sft_retained_examples=rows)
 
     for bad in (0, -5):
         with pytest.raises(ValueError, match="sft_retained_examples must be >= 1"):

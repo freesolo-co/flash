@@ -107,11 +107,22 @@ def _thinking_prefill_text(tok) -> str:
         return ""
     probe = [{"role": "user", "content": ""}]
     with contextlib.suppress(Exception):
+        from flash.content.thinking import messages_for_chat_template
+
+        probe = messages_for_chat_template(probe)
         base = tok.apply_chat_template(
-            probe, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            probe,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+            preserve_thinking=False,
         )
         think = tok.apply_chat_template(
-            probe, tokenize=False, add_generation_prompt=True, enable_thinking=True
+            probe,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True,
+            preserve_thinking=False,
         )
         if think == base:
             return ""  # template ignores enable_thinking -> plain "Assistant: " already matches

@@ -196,7 +196,7 @@ _LIGER_LONG_CTX_TOKENS = 2048
 _SFT_CHUNKED_NLL_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-9B",
-        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
 )

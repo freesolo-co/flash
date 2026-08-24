@@ -164,8 +164,8 @@ def test_sft_provisional_count_credits_only_the_batch_bound_width():
     from flash.providers.allocator import _executed_width, required_vram_gb
     from flash.providers.base import provisional_gpu_count
 
-    model_id = "Qwen/Qwen3.6-27B"
-    expected_needs = {131072: 159, 262144: 247, 400000: 339, 600000: 473}
+    model_id = "Qwen/Qwen3.8-27B"
+    expected_needs = {131072: 162, 262144: 251, 400000: 344, 600000: 480}
     for sequence, expected_need in expected_needs.items():
         train = {"batch_size": 1, "lora_rank": 32, "max_context_tokens": sequence}
         count = provisional_gpu_count(model_id, "sft", train=train)
@@ -178,7 +178,7 @@ def test_batch_bound_sft_is_rejected_at_parse_time():
     from flash.schema import ConfigError, spec_from_dict
 
     raw = {
-        "model": "Qwen/Qwen3.6-27B",
+        "model": "Qwen/Qwen3.8-27B",
         "algorithm": "sft",
         "environment": {"id": "freesolo/example/example"},
         "train": {
@@ -190,7 +190,7 @@ def test_batch_bound_sft_is_rejected_at_parse_time():
     with pytest.raises(ConfigError) as exc:
         spec_from_dict(raw, run_id="parse-width")
     message = str(exc.value)
-    assert "sft needs >= 247 GB VRAM" in message
+    assert "sft needs >= 251 GB VRAM" in message
     assert "1 of which joins this run" in message
     assert "batch and retained rows bound the rank count" in message
 
@@ -222,7 +222,7 @@ def test_non_sft_provisional_count_is_unchanged(algorithm, train, expected_count
     from flash.providers.allocator import _executed_width
     from flash.providers.base import provisional_gpu_count
 
-    count = provisional_gpu_count("Qwen/Qwen3.6-27B", algorithm, train=train)
+    count = provisional_gpu_count("Qwen/Qwen3.8-27B", algorithm, train=train)
     assert count == expected_count
     assert _executed_width(algorithm, train, None)(count) == count
 
@@ -240,7 +240,7 @@ def test_width_bound_rl_is_told_to_raise_its_step_not_shrink_it():
     from flash.schema import ConfigError, spec_from_dict
 
     raw = {
-        "model": "Qwen/Qwen3.6-27B",
+        "model": "Qwen/Qwen3.8-27B",
         "algorithm": "opd",
         "environment": {"id": "freesolo/example/example"},
         "train": {
@@ -270,7 +270,7 @@ def test_parse_and_allocator_agree_on_batch_bound_sft(sequence, accepted):
     from flash.providers.base import UnsupportedGpuError
     from flash.schema import ConfigError, spec_from_dict
 
-    model_id = "Qwen/Qwen3.6-27B"
+    model_id = "Qwen/Qwen3.8-27B"
     train = {"batch_size": 1, "lora_rank": 32, "max_context_tokens": sequence}
     raw = {
         "model": model_id,

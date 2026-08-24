@@ -22,6 +22,10 @@ Two credentials and at least one GPU account:
 
 Everything else is optional.
 
+The active training catalog is Qwen3.5 9B, Qwen3.8 27B, and Qwen3.6 35B-A3B. Customer-owned
+serving through `flash serve deploy` remains Qwen3.5 9B-only; the hosted 27B profile is not a
+customer-provider placement contract.
+
 ## Quickstart
 
 ```bash

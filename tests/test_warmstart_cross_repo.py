@@ -245,6 +245,37 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     assert source_context is None
 
 
+def test_qwen36_adapter_is_never_reinterpreted_as_qwen38(monkeypatch):
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.6-27B",
+            "model_revision": "a" * 40,
+            "model_revision_auto": True,
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    source_status = provisioned_status(R, source, state="done")
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.8-27B",
+            "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+            "model_revision_auto": True,
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run"},
+        }
+    )
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+
+    with pytest.raises(ValueError, match=r"unsupported model 'Qwen/Qwen3\.6-27B'"):
+        R._prepare_init_from_adapter(child, token="token")
+
+
 def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
     import flash.runner as R
     from flash.core.spec import JobSpec

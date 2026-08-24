@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from flash.adapters.targets import resolve_lora_targeting
+from flash.content.thinking import messages_for_chat_template
 from flash.core.catalog import get_model
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.worker import opd_train as _opd_train
@@ -221,6 +222,7 @@ def _prepare_prompts(
                 multi_turn=request.multi_turn,
                 package_root=package_root,
             )
+            student_messages = messages_for_chat_template(student_messages)
             if image_descriptors:
                 assert processor is not None
                 teacher_messages = image_teacher_prompt_messages(
@@ -252,6 +254,7 @@ def _prepare_prompts(
                         tokenize=False,
                         add_generation_prompt=True,
                         enable_thinking=_opd_train._w.THINKING,
+                        preserve_thinking=False,
                     )
                     prompt_ids = _opd_train._normalize_prompt_ids(
                         tokenizer.apply_chat_template(
@@ -259,6 +262,7 @@ def _prepare_prompts(
                             tokenize=True,
                             add_generation_prompt=True,
                             enable_thinking=_opd_train._w.THINKING,
+                            preserve_thinking=False,
                         )
                     )
             if len(prompt_ids) > prompt_budget:
@@ -362,6 +366,11 @@ def _prepare_workload(
                     {
                         "role": str(message.get("role") or ""),
                         "content": _opd_train._verl_image_message_content(message.get("content")),
+                        **(
+                            {"reasoning_content": message["reasoning_content"]}
+                            if "reasoning_content" in message
+                            else {}
+                        ),
                     }
                     for message in prompt.student_messages
                 ]

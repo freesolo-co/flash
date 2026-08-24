@@ -3,9 +3,9 @@
 The serving app runs one vLLM GPU engine per base model, each on the Modal GPU class set by its
 catalog ``gpu`` (see below). Adapters and routing key off the logical ``base_model``; the engine
 loads a PRE-QUANTIZED FP8 checkpoint for that model (see ``src.prequant_config``) at the checkpoint's
-own dtype. Every DENSE catalog model serves a pre-quantized FP8 checkpoint (no online quantization, no
-community-repo dependence); vLLM auto-detects the checkpoint's compressed-tensors quantization, so
-the engine passes no online ``quantization``. The 35B-A3B MoE is the exception: it serves the BASE
+own dtype. Every dense catalog model serves a pre-quantized FP8 checkpoint with no online
+quantization: the 9B is Freesolo compressed-tensors FP8 and the 27B is official native block-FP8.
+vLLM auto-detects the checkpoint format. The 35B-A3B MoE is the exception: it serves the base
 bf16 weights (the fused-MoE LoRA path won't compile on FP8), see the 35B block below.
 """
 
@@ -26,8 +26,8 @@ from flash.serving.src.prequant_config import fp8_serve_model_for as _prequant_s
 # `engine` (optional): per-model vLLM engine-arg overrides (LoRA buffer shape, scheduler/memory caps,
 # language_model_only, …). The engine's LOADED checkpoint is NOT in here — it is resolved centrally by
 # ``serve_model_for`` from ``src.prequant_config`` and injected into the overrides as ``serve_model_id``.
-# so every model loads a pre-quantized FP8 checkpoint: Freesolo-owned FP8_DYNAMIC for the dense
-# models (including the 27B) and official Qwen FP8 for the 35B VL MoE.
+# so every model loads a pre-quantized fp8 checkpoint: freesolo compressed-tensors for 9b, official
+# qwen native block-fp8 for 27b, and the 35b override to its validated base bf16 path.
 # ⚠ serve_model_id is pointed only at checkpoints VERIFIED to exist (a missing repo 404-crash-loops
 # the engine — the reason this mechanism was removed once); the owned repos are VL-preserving FP8
 # checkpoints published to the operator HF org.
@@ -64,12 +64,17 @@ SERVING_MODELS: list[dict[str, Any]] = [
         },
     },
     {
-        "base_model": "Qwen/Qwen3.6-27B",
+        "base_model": "Qwen/Qwen3.8-27B",
         "image_input_limit": 4,
         "gpu": "H100",
         "engine": {
-            # 0.90 (was 0.98) makes room for CUDA-graph capture. this hybrid GatedDeltaNet measured
-            # about 11 tok/s eager versus 80 tok/s with CUDA graphs on the H100.
+            # immutable official fp8 weights and logical bf16 tokenizer/processor identity.
+            "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+            "tokenizer_model": "Qwen/Qwen3.8-27B",
+            "tokenizer_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+            "processor_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+            # 0.90 leaves room for cuda-graph capture. the inherited h100 shape remains a candidate
+            # until the exact official fp8 canary qualifies it.
             "gpu_memory_utilization": 0.90,
             "max_loras": 16,
             "max_lora_rank": 64,
@@ -162,12 +167,25 @@ def gpu_for(base_model: str) -> str:
 
 
 def serve_model_for(base_model: str) -> str:
-    """The pre-quantized FP8 checkpoint the engine LOADS for ``base_model``. Every catalog model
-    resolves to a verified pre-quant checkpoint; adapters and routing still key off the logical
-    ``base_model``, and vLLM auto-detects the checkpoint's compressed-tensors quantization (no online
-    override)."""
+    """Return the pre-quantized checkpoint the engine loads for ``base_model``."""
     _config_for(base_model)  # reject uncataloged models before resolving a checkpoint
     return _prequant_serve_model_for(base_model)
+
+
+def tokenizer_model_for(base_model: str) -> str:
+    """Return the logical tokenizer and processor repository for a hosted base model."""
+    engine = _config_for(base_model).get("engine") or {}
+    return str(engine.get("tokenizer_model") or base_model)
+
+
+def immutable_serving_revisions(base_model: str) -> dict[str, str]:
+    """Return model/tokenizer/processor pins required by this hosted engine."""
+    engine = _config_for(base_model).get("engine") or {}
+    return {
+        key: str(engine[key])
+        for key in ("model_revision", "tokenizer_revision", "processor_revision")
+        if engine.get(key)
+    }
 
 
 def engine_overrides_for(base_model: str) -> dict[str, Any]:

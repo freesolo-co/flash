@@ -621,7 +621,7 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
         model_revision="a" * 40,
     )
 
-    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-27B"):
+    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B"):
         captured.clear()
         worker.make_lora(model_id)
         assert captured.get("init_lora_weights") is True

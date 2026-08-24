@@ -27,7 +27,7 @@ from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord, GenerateRequest
 
 QWEN = "Qwen/Qwen3.5-9B"
-QWEN_27B = "Qwen/Qwen3.6-27B"
+QWEN_27B = "Qwen/Qwen3.8-27B"
 RUN_ID = "flash-1234567890-abcdef12"
 SHA = "a" * 40
 REVISION_ID = f"{RUN_ID}@step-20.{SHA}"
@@ -560,6 +560,7 @@ def test_engine_processor_render_and_vllm_multimodal_input_shape() -> None:
         "add_generation_prompt": True,
         "custom": "value",
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
     prompt_input = engine.engine.prompt_inputs[0]
     assert prompt_input["prompt"] == "rendered multimodal prompt"

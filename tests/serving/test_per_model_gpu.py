@@ -462,8 +462,8 @@ def test_9b_routes_to_l40s(modal_app_module):
 def test_27b_routes_to_h100(modal_app_module):
     """rank-64 LoRA serving for 27B uses the H100 tier (8-seq -> (H100, 16))."""
     by_key = modal_app_module.ENGINE_BY_KEY
-    assert gpu_for("Qwen/Qwen3.6-27B") == "H100"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-27B") is by_key[("H100", 16)]
+    assert gpu_for("Qwen/Qwen3.8-27B") == "H100"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B") is by_key[("H100", 16)]
 
 
 def test_35b_moe_routes_to_h200(modal_app_module):
@@ -707,6 +707,37 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
     ]
 
 
+def test_historical_qwen36_27b_unregister_uses_cleanup_only_h100_dispatch(
+    modal_app_module, monkeypatch
+):
+    calls = []
+
+    async def _unregister(adapter_id, expected_generation):
+        calls.append((adapter_id, expected_generation))
+
+    engine = types.SimpleNamespace(
+        unregister=types.SimpleNamespace(remote=types.SimpleNamespace(aio=_unregister))
+    )
+    bound_models = []
+
+    def _bind(*, base_model):
+        bound_models.append(base_model)
+        return engine
+
+    def historical_class(**kwargs):
+        return _bind(**kwargs)
+
+    monkeypatch.setitem(modal_app_module.ENGINE_BY_KEY, ("H100", 16), historical_class)
+    pool = modal_app_module._ModalEnginePool()
+
+    asyncio.run(pool.unregister("Qwen/Qwen3.6-27B", "retired@final.sha", "generation-1"))
+
+    assert bound_models == ["Qwen/Qwen3.6-27B"]
+    assert calls == [("retired@final.sha", "generation-1")]
+    with pytest.raises(ValueError, match="Unsupported base model"):
+        modal_app_module._engine_cls_for("Qwen/Qwen3.6-27B")
+
+
 # ---- Functional: actually run _load() and capture the AsyncEngineArgs (vLLM/tokenizer stubbed) ----
 # Stronger than the AST checks in test_fp8_config: this exercises the real per-model override
 # resolution (_ov.get) + the _arg_supported guard, proving the FP8 + moe_backend wiring end-to-end.
@@ -765,7 +796,7 @@ def test_lora_pinning_only_when_hot_pool_covers_cpu_pool(modal_app_module, monke
 
     for model, max_loras in (
         ("Qwen/Qwen3.5-9B", 16),
-        ("Qwen/Qwen3.6-27B", 16),
+        ("Qwen/Qwen3.8-27B", 16),
     ):
         engine, args = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, model)
         assert args.max_loras == max_loras
@@ -788,9 +819,88 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
     assert getattr(args, "max_num_batched_tokens", None) is None
 
 
-def test_load_owned_fp8_checkpoint_for_27b(modal_app_module, monkeypatch, tmp_path):
-    args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.6-27B")
-    assert args.model == "Freesolo-Co/Qwen3.6-27B-FP8"  # owned pre-quant checkpoint
+def test_qwen38_immutable_engine_args_fail_closed_when_vllm_drops_revision_support(
+    monkeypatch,
+):
+    from flash.serving.src import engine_boot
+    from flash.serving.src import settings as cfg
+    from flash.serving.src.model_config import engine_overrides_for
+
+    monkeypatch.setattr(engine_boot, "_async_engine_arg_names", lambda _cls: {"model"})
+    with pytest.raises(RuntimeError, match=r"cannot pin.*missing engine args"):
+        engine_boot.engine_args_for(
+            "Qwen/Qwen3.8-27B",
+            engine_overrides_for("Qwen/Qwen3.8-27B"),
+            cfg,
+        )
+
+
+def test_qwen38_health_attests_effective_model_tokenizer_and_processor_identity(
+    modal_app_module,
+):
+    engine = object.__new__(modal_app_module._LoraEngineImpl)
+    engine.base_model = "Qwen/Qwen3.8-27B"
+    engine.registry = types.SimpleNamespace(list_ready=list)
+    engine._prompt_token_cache = {}
+
+    health = engine._health()
+
+    assert health["served_model"] == "Qwen/Qwen3.8-27B-FP8"
+    assert health["immutable_identity"] == {
+        "model": {
+            "repo": "Qwen/Qwen3.8-27B-FP8",
+            "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+        },
+        "tokenizer": {
+            "repo": "Qwen/Qwen3.8-27B",
+            "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        },
+        "processor": {
+            "repo": "Qwen/Qwen3.8-27B",
+            "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        },
+    }
+
+
+def test_qwen38_load_tokenizer_pins_bf16_processor_revision(monkeypatch):
+    import transformers
+
+    from flash.serving.src import settings as cfg
+    from flash.serving.src.engine_boot import load_tokenizer
+
+    calls = []
+    tokenizer = types.SimpleNamespace(pad_token="<pad>", eos_token="<eos>", eos_token_id=0)
+    processor = types.SimpleNamespace(tokenizer=tokenizer)
+
+    def _processor(model, **kwargs):
+        calls.append((model, kwargs))
+        return processor
+
+    monkeypatch.setattr(transformers.AutoProcessor, "from_pretrained", _processor)
+    loaded_processor, loaded_tokenizer = load_tokenizer(
+        "Qwen/Qwen3.8-27B", types.SimpleNamespace(hf_api_key="token"), cfg
+    )
+
+    assert loaded_processor is processor
+    assert loaded_tokenizer is tokenizer
+    assert calls == [
+        (
+            "Qwen/Qwen3.8-27B",
+            {
+                "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+                "token": "token",
+                "trust_remote_code": cfg.TRUST_REMOTE_CODE,
+            },
+        )
+    ]
+
+
+def test_load_official_fp8_checkpoint_for_27b(modal_app_module, monkeypatch, tmp_path):
+    args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.8-27B")
+    assert args.model == "Qwen/Qwen3.8-27B-FP8"  # official native block-fp8 checkpoint
+    assert args.revision == "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
+    assert args.tokenizer == "Qwen/Qwen3.8-27B"
+    assert args.tokenizer_revision == "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
     assert args.tensor_parallel_size == 1
     assert args.quantization is None
     assert args.kv_cache_dtype == "fp8"

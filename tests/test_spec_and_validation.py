@@ -724,10 +724,10 @@ def test_lora_rank_must_fit_large_serving_cap() -> None:
     from flash.core.catalog import serving_lora_rank_cap
 
     # derive the active 27b profile's lower cap from the catalog.
-    cap = serving_lora_rank_cap("Qwen/Qwen3.6-27B")
+    cap = serving_lora_rank_cap("Qwen/Qwen3.8-27B")
     assert cap is not None
     with pytest.raises(ConfigError, match=f"serving max_lora_rank={cap}"):
-        spec_from_dict(_raw(model="Qwen/Qwen3.6-27B", **{"train.lora_rank": cap + 1}))
+        spec_from_dict(_raw(model="Qwen/Qwen3.8-27B", **{"train.lora_rank": cap + 1}))
 
 
 def test_bare_environment_id_is_rejected() -> None:
@@ -1933,6 +1933,46 @@ def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algo
     assert resolved.model_revision == exact
     assert resolved.model_revision_auto is True
     assert resolved.model_revision_force_pin is False
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_qwen38_catalog_revision_is_forced_and_verified(monkeypatch, algorithm) -> None:
+    from flash.runner.preparation import _resolve_model_revision
+
+    exact = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+    asked_for = []
+
+    class _Api:
+        def __init__(self, *a, **k) -> None: ...
+
+        def model_info(self, model, revision=None):
+            asked_for.append((model, revision))
+            return type("_Info", (), {"sha": exact})
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+    spec = _job_from_dict({"model": "Qwen/Qwen3.8-27B", "algorithm": algorithm})
+
+    resolved = _resolve_model_revision(spec, required=algorithm == "sft")
+
+    assert asked_for == [("Qwen/Qwen3.8-27B", exact)]
+    assert resolved.model_revision == exact
+    assert resolved.model_revision_auto is True
+    assert resolved.model_revision_force_pin is False
+
+
+def test_qwen38_catalog_revision_rejects_inherited_qwen36_pin() -> None:
+    from flash.runner.preparation import _resolve_model_revision
+
+    inherited = _job_from_dict(
+        {
+            "model": "Qwen/Qwen3.8-27B",
+            "algorithm": "grpo",
+            "model_revision": "a" * 40,
+            "model_revision_auto": True,
+        }
+    )
+    with pytest.raises(ValueError, match="requires immutable revision"):
+        _resolve_model_revision(inherited)
 
 
 def test_unmanaged_model_revision_is_rejected_and_runner_pin_is_unchanged() -> None:

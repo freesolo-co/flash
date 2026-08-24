@@ -190,6 +190,7 @@ def test_lora_engine_builds_tokenized_chat_prompt(modal_app_module):
                 "add_generation_prompt": True,
                 "return_dict": False,
                 "enable_thinking": True,
+                "preserve_thinking": False,
             }
             return [1, 2, 3]
 
@@ -283,6 +284,7 @@ def test_lora_engine_filters_reserved_chat_template_kwargs(modal_app_module):
         "add_generation_prompt": True,
         "return_dict": False,
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
 
 
@@ -384,6 +386,7 @@ def test_lora_engine_drops_return_shape_chat_template_kwargs(modal_app_module):
         "add_generation_prompt": True,
         "return_dict": False,
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
 
     # A non-dict chat_template_kwargs is ignored entirely (no crash). enable_thinking still comes
@@ -396,6 +399,7 @@ def test_lora_engine_drops_return_shape_chat_template_kwargs(modal_app_module):
         "add_generation_prompt": True,
         "return_dict": False,
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
 
 
@@ -465,6 +469,7 @@ def test_lora_engine_health_reports_served_model_and_baked_config(modal_app_modu
         "engine_dead": False,
         "base_model": "Qwen/Qwen3.5-9B",
         "served_model": "Freesolo-Co/Qwen3.5-9B-FP8",
+        "immutable_identity": None,
         # A pre-quant FP8 checkpoint carries fp8 weights (auto-detected) + the global fp8 KV cache.
         "quantization": "fp8",
         "kv_cache_dtype": "fp8",
@@ -572,7 +577,7 @@ def test_load_adapters_for_base_filters_records(modal_app_module, monkeypatch):
             self.status = "ready"
             self.is_revision = True
 
-    records = [_Record("Qwen/Qwen3.6-27B"), _Record("Qwen/Qwen3.5-9B")]
+    records = [_Record("Qwen/Qwen3.8-27B"), _Record("Qwen/Qwen3.5-9B")]
     monkeypatch.setattr("flash.serving.src.persistence.load_adapters", lambda settings: records)
 
     assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-9B") == [records[1]]

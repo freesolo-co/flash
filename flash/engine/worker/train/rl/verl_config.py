@@ -16,6 +16,7 @@ import os
 from flash.adapters.targets import resolve_lora_targeting
 from flash.content.multimodal import messages_with_decoded_images
 from flash.content.structured_outputs import reasoning_parser_for
+from flash.content.thinking import messages_for_chat_template
 from flash.engine.worker.backend_common import (
     actor_fsdp_strategy_overrides,
     agent_loop_workers,
@@ -84,6 +85,11 @@ def build_verl_dataset_rows(
                 {
                     "role": str(message.get("role") or ""),
                     "content": _verl_image_message_content(message.get("content")),
+                    **(
+                        {"reasoning_content": message["reasoning_content"]}
+                        if "reasoning_content" in message
+                        else {}
+                    ),
                 }
                 for message in messages
             ]
@@ -133,7 +139,11 @@ def _processor_expanded_prompt(
     images = decode_image_descriptors(list(image_descriptors), package_root)
     prepared = messages_with_decoded_images(messages, images)
     rendered = processor.apply_chat_template(
-        prepared, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
+        messages_for_chat_template(prepared),
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+        preserve_thinking=False,
     )
     model_inputs = processor(
         text=[rendered], images=images or None, videos=None, return_tensors="pt"
@@ -157,7 +167,13 @@ def _verl_grpo_parquet_features():
     return Features(
         {
             "data_source": Value("string"),
-            "prompt": [{"role": Value("string"), "content": Value("string")}],
+            "prompt": [
+                {
+                    "role": Value("string"),
+                    "content": Value("string"),
+                    "reasoning_content": Value("string"),
+                }
+            ],
             "images": [{"image": Value("string")}],
             "ability": Value("string"),
             "reward_model": {"style": Value("string"), "ground_truth": Value("string")},
@@ -213,6 +229,7 @@ def _data_overrides(cfg: dict) -> list[str]:
         # rollout prompt parity: verl renders raw messages with the tokenizer's chat template;
         # thread flash's thinking mode so the rollout sees the same prompt the retired trl path saw.
         f"+data.apply_chat_template_kwargs.enable_thinking={str(bool(cfg.get('thinking', False))).lower()}",
+        "+data.apply_chat_template_kwargs.preserve_thinking=false",
         f"data.seed={cfg['seed']}",
         "data.dataloader_num_workers=0",
         # set the rollout seed through engine_kwargs: verl 0.8.0 has no RolloutConfig.seed, and

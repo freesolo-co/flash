@@ -957,7 +957,7 @@ def test_catalog_model_ids_are_the_cache_fitting_catalog():
     assert ids <= set(MODELS)
     # The whole catalog fits the volume, so the large checkpoints — the ones with the
     # slowest cold downloads — are warmed too.
-    assert "Qwen/Qwen3.6-27B" in ids
+    assert "Qwen/Qwen3.8-27B" in ids
     assert "Qwen/Qwen3.6-35B-A3B" in ids
 
 

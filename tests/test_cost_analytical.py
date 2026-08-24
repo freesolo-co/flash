@@ -62,7 +62,7 @@ def test_grpo_costs_more_than_sft():
 def test_bigger_model_costs_more_per_step():
     gpu = "H100"
     small = seconds_per_step(RunConfig("Qwen/Qwen3.5-9B", "sft", 1), gpu)
-    big = seconds_per_step(RunConfig("Qwen/Qwen3.6-27B", "sft", 1), gpu)
+    big = seconds_per_step(RunConfig("Qwen/Qwen3.8-27B", "sft", 1), gpu)
     assert big > small
 
 
@@ -107,7 +107,7 @@ def test_grpo_colocate_routes_4b_to_a_bigger_card_than_sft():
 def test_setup_grpo_exceeds_sft_and_scales_with_model_size():
     # grpo pays an extra vllm-init cost; bigger models download longer.
     assert setup_seconds(RunConfig(MID, "grpo", 1)) > setup_seconds(RunConfig(MID, "sft", 1))
-    assert setup_seconds(RunConfig("Qwen/Qwen3.6-27B", "sft", 1)) > setup_seconds(
+    assert setup_seconds(RunConfig("Qwen/Qwen3.8-27B", "sft", 1)) > setup_seconds(
         RunConfig("Qwen/Qwen3.5-9B", "sft", 1)
     )
 
@@ -440,7 +440,7 @@ def test_offline_quote_and_allocator_agree_on_the_executed_sft_width():
     from flash.providers.base import GPU_INFO, Candidate
 
     def quoted_shape_is_allocatable(**kwargs):
-        config = RunConfig("Qwen/Qwen3.6-27B", "sft", 10, **kwargs)
+        config = RunConfig("Qwen/Qwen3.8-27B", "sft", 10, **kwargs)
         gpu, need, count, _provider, rate = _offline_gpu_shape(config)
         candidate = Candidate(
             provider="runpod",
@@ -459,9 +459,9 @@ def test_offline_quote_and_allocator_agree_on_the_executed_sft_width():
     assert quoted_shape_is_allocatable(seq_len=4096, batch_size=8, sft_retained_examples=64)
 
     # the shared helper is the reason they cannot drift: sft narrows, everything else does not.
-    grpo = RunConfig("Qwen/Qwen3.6-27B", "grpo", 10, batch_size=8, sft_retained_examples=10)
+    grpo = RunConfig("Qwen/Qwen3.8-27B", "grpo", 10, batch_size=8, sft_retained_examples=10)
     assert executed_gpu_count(grpo, 4) == 4
     sft_rows_bound = RunConfig(
-        "Qwen/Qwen3.6-27B", "sft", 10, batch_size=8, sft_retained_examples=10
+        "Qwen/Qwen3.8-27B", "sft", 10, batch_size=8, sft_retained_examples=10
     )
     assert executed_gpu_count(sft_rows_bound, 4) == 2

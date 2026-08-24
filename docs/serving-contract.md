@@ -5,7 +5,8 @@ client, shared runtime, and customer-owned provider deployment. Freesolo's hoste
 (`flash/serving/`) is another implementation of this contract.
 A deployment serves one base model and its LoRA adapters. Use `flash serve deploy` to provision one
 in your own Modal or RunPod account, or implement these endpoints and run the conformance suite
-below.
+below. The maintained customer-owned profile supports only `Qwen/Qwen3.5-9B`; Qwen3.6 27B is
+retired and Qwen3.8 27B is available only through the separately managed hosted-serving catalog.
 
 ## Identity model
 

@@ -1,4 +1,4 @@
-"""Owned prequantized FP8 checkpoint mappings and serve-model resolution."""
+"""Prequantized FP8 checkpoint ownership and serve-model resolution."""
 
 from __future__ import annotations
 
@@ -12,38 +12,30 @@ from flash.serving.src.prequant_config import (
     fp8_serve_model_for,
 )
 
-OWNED_DENSE_MODELS = (
-    "Qwen/Qwen3.5-9B",
-    "Qwen/Qwen3.6-27B",
-)
-DENSE_27B = "Qwen/Qwen3.6-27B"
+OWNED_9B = "Qwen/Qwen3.5-9B"
+DENSE_27B = "Qwen/Qwen3.8-27B"
 MOE_35B = "Qwen/Qwen3.6-35B-A3B"
 
 
-def test_owned_fp8_covers_the_dense_models_only() -> None:
-    assert set(OWNED_FP8_MODEL_REPOS) == set(OWNED_DENSE_MODELS)
-    for repo in OWNED_FP8_MODEL_REPOS.values():
-        assert repo.startswith("Freesolo-Co/")
-        assert repo.endswith("-FP8")
-    # the 27B dense model is owned; only the 35B MoE uses the official Qwen FP8 checkpoint.
-    assert OWNED_FP8_MODEL_REPOS[DENSE_27B] == "Freesolo-Co/Qwen3.6-27B-FP8"
-    assert MOE_35B not in OWNED_FP8_MODEL_REPOS
+def test_owned_fp8_contains_only_the_freesolo_9b_checkpoint() -> None:
+    assert OWNED_FP8_MODEL_REPOS == {OWNED_9B: "Freesolo-Co/Qwen3.5-9B-FP8"}
 
 
-def test_fp8_serve_map_uses_official_fp8_for_35b() -> None:
-    assert OFFICIAL_FP8_MODEL_REPOS[MOE_35B] == "Qwen/Qwen3.6-35B-A3B-FP8"
-    assert set(OFFICIAL_FP8_MODEL_REPOS) == {MOE_35B}
-    for base in OWNED_DENSE_MODELS:
-        assert FP8_SERVE_MODEL_REPOS[base] == OWNED_FP8_MODEL_REPOS[base]
+def test_official_fp8_contains_qwen38_27b_and_35b_moe() -> None:
+    assert OFFICIAL_FP8_MODEL_REPOS == {
+        DENSE_27B: "Qwen/Qwen3.8-27B-FP8",
+        MOE_35B: "Qwen/Qwen3.6-35B-A3B-FP8",
+    }
+    assert DENSE_27B not in OWNED_FP8_MODEL_REPOS
     assert set(FP8_SERVE_MODEL_REPOS) == set(base_models())
 
 
-def test_fp8_serve_model_for_resolves_fp8_for_every_base() -> None:
-    for base in OWNED_DENSE_MODELS:
-        assert fp8_serve_model_for(base).endswith("-FP8")
-    assert fp8_serve_model_for(DENSE_27B) == "Freesolo-Co/Qwen3.6-27B-FP8"
-    # the 35B serves the official Qwen FP8 (VL-preserving).
+def test_fp8_serve_model_for_resolves_every_base_without_translation() -> None:
+    assert fp8_serve_model_for(OWNED_9B) == "Freesolo-Co/Qwen3.5-9B-FP8"
+    assert fp8_serve_model_for(DENSE_27B) == "Qwen/Qwen3.8-27B-FP8"
     assert fp8_serve_model_for(MOE_35B) == "Qwen/Qwen3.6-35B-A3B-FP8"
+    with pytest.raises(ValueError, match="Allowed models"):
+        fp8_serve_model_for("Qwen/Qwen3.6-27B")
 
 
 def test_fp8_serve_model_for_rejects_unknown_base() -> None:

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypedDict, cast
 
 from flash.content.multimodal import NormalizedImages
+from flash.content.thinking import messages_for_chat_template
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
 from flash.engine.profiling.sft_image_rows import (
@@ -421,12 +422,16 @@ def _text_sft_row_spec(
     row_index: int,
     multiturn: bool,
 ) -> tuple[str, _RowReasoning, dict[str, Any]]:
-    text = render_transcript([*prompt_messages, *completion_messages])
+    normalized_prompt = messages_for_chat_template(prompt_messages)
+    normalized_completion = messages_for_chat_template(completion_messages)
+    normalized_source = [*normalized_prompt, *normalized_completion]
+    text = render_transcript(normalized_source)
     prompt_text = tokenizer.apply_chat_template(
-        prompt_messages,
+        normalized_prompt,
         tokenize=False,
         add_generation_prompt=True,
         enable_thinking=spec.thinking,
+        preserve_thinking=False,
     )
     reasoning = _row_reasoning(
         prompt_messages,
@@ -441,9 +446,9 @@ def _text_sft_row_spec(
         {
             "text": text,
             "prompt_text": prompt_text,
-            "target_messages": completion_messages,
-            "source_messages": [*prompt_messages, *completion_messages],
-            "template_kwargs": {"enable_thinking": spec.thinking},
+            "target_messages": normalized_completion,
+            "source_messages": normalized_source,
+            "template_kwargs": {"enable_thinking": spec.thinking, "preserve_thinking": False},
             # measurement carried alongside the row rather than in it: the parquet row is built from
             # an explicit key list below, so neither key reaches verl.
             "row_index": row_index,
@@ -482,10 +487,11 @@ def _tokenize_prompt_rows(
 
     def render_transcript(messages: list[dict]) -> str:
         return tokenizer.apply_chat_template(
-            messages,
+            messages_for_chat_template(messages),
             tokenize=False,
             add_generation_prompt=False,
             enable_thinking=spec.thinking,
+            preserve_thinking=False,
         )
 
     for row_index, (

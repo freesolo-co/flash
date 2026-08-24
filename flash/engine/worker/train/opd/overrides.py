@@ -98,7 +98,7 @@ def _data_runtime_overrides(config: dict) -> list[str]:
         # dict, so assigning a whole dict to it is rejected as an unknown sub-key.
         "++data.apply_chat_template_kwargs={enable_thinking:"
         + _hydra_val(config.get("thinking", False))
-        + "}",
+        + ",preserve_thinking:false}",
     ]
 
 
@@ -467,7 +467,13 @@ def _opd_multimodal_parquet_features():
 
     return Features(
         {
-            "prompt": [{"role": Value("string"), "content": Value("string")}],
+            "prompt": [
+                {
+                    "role": Value("string"),
+                    "content": Value("string"),
+                    "reasoning_content": Value("string"),
+                }
+            ],
             "images": [{"image": Value("string")}],
             "data_source": Value("string"),
             "reward_model": {

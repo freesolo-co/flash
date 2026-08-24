@@ -14,7 +14,7 @@ _ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd"})
 _IMAGE_TRAINING_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-9B",
-        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
 )
@@ -99,6 +99,9 @@ class ModelInfo:
     # module prefix containing every language layer on the loaded conditional-generation model.
     # required by text-only lora targeting; kept out of the public catalog rows below.
     lora_language_prefix: str = ""
+    # runner-managed immutable training revision for the one model that requires an exact hub pin.
+    # this is internal preparation policy, not a public catalog field.
+    managed_revision: str = ""
     quant: str = "bf16"
     recommended_gpu: str = DEFAULT_GPU
     # 0 => GRPO uses min_vram_gb like SFT; set when colocated vLLM rollout needs a bigger card.
@@ -178,6 +181,7 @@ class ModelInfo:
             "linear_value_head_dim",
             "linear_conv_kernel_dim",
             "lora_language_prefix",
+            "managed_revision",
             "lora_target_shapes",
             "lora_expert_count",
         ):
@@ -200,13 +204,14 @@ class ModelInfo:
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 
-# the checkpoint each base model's serving engine loads. dense models serve freesolo-owned fp8
-# checkpoints; the 35b-a3b moe serves the base bf16 checkpoint because its full-expert lora path is
-# incompatible with fp8 on the validated h200 tier. informational for the catalog mirror; adapter
+# the checkpoint each base model's serving engine loads. the 9b uses a freesolo-owned fp8 checkpoint,
+# the 27b uses qwen's official native block-fp8 checkpoint, and the 35b-a3b moe serves its base bf16
+# checkpoint because its full-expert lora path is incompatible with fp8 on the validated h200 tier.
+# informational for the catalog mirror; adapter
 # deployment gates read max_lora_rank, and serving preflight reads max_model_len.
 SERVING_MODEL_REPOS: dict[str, str] = {
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
-    "Qwen/Qwen3.6-27B": "Freesolo-Co/Qwen3.6-27B-FP8",
+    "Qwen/Qwen3.8-27B": "Qwen/Qwen3.8-27B-FP8",
     "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B",
 }
 
@@ -266,12 +271,13 @@ MODELS: dict[str, ModelInfo] = {
         "(two bf16 copies + KV + the 248k-vocab fp32 logits) needs an 80 GB-class card "
         "(grpo_min_vram_gb floor).",
     ),
-    "Qwen/Qwen3.6-27B": ModelInfo(
-        id="Qwen/Qwen3.6-27B",
-        display_name="Qwen3.6 27B",
-        params="27B dense (multimodal VL, hybrid GDN)",
-        params_b=27.0,
+    "Qwen/Qwen3.8-27B": ModelInfo(
+        id="Qwen/Qwen3.8-27B",
+        display_name="Qwen3.8 27B",
+        params="27.781427952B dense (multimodal VL, hybrid GDN)",
+        params_b=27.781427952,
         lora_language_prefix="model.language_model",
+        managed_revision="1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
         num_layers=64,
         hidden_size=5120,
         vocab_size=248_320,
@@ -310,7 +316,7 @@ MODELS: dict[str, ModelInfo] = {
         min_disk_gb=160,
         serving=ServingCapacity(
             gpu="H100",
-            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.6-27B"],
+            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.8-27B"],
             max_loras=16,
             max_lora_rank=64,
             max_model_len=32768,
@@ -318,10 +324,10 @@ MODELS: dict[str, ModelInfo] = {
             gpu_memory_utilization=0.90,
         ),
         thinking="hybrid",
-        notes="Dense 27B multimodal VL checkpoint with image-capable bf16 LoRA training. SFT fits "
-        "the 80GB A100 (~54GB weights); colocated GRPO needs the B200 (trainer + vLLM rollout = two "
-        "~54GB copies). Serves the owned VL-preserving FP8 on an H100 tier (dense, so no MoE expert "
-        "LoRA-buffer multiplier).",
+        notes="Dense 27.781427952B multimodal VL checkpoint with image-capable bf16 LoRA training. "
+        "SFT fits the 80GB A100 (~55.6GB weights); colocated GRPO needs the B200 (trainer + vLLM "
+        "rollout = two copies). Serves Qwen's official native block-FP8 checkpoint on an H100 tier "
+        "(dense, so no MoE expert LoRA-buffer multiplier).",
     ),
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",

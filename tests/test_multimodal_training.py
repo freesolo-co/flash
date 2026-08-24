@@ -1197,7 +1197,7 @@ def test_catalog_image_capability_does_not_change_public_rows():
     from flash.core.catalog import public_model_rows, supports_image_training
 
     assert supports_image_training("Qwen/Qwen3.5-9B")
-    assert supports_image_training("Qwen/Qwen3.6-27B")
+    assert supports_image_training("Qwen/Qwen3.8-27B")
     assert not supports_image_training("meta-llama/Llama-3.2-1B")
     forbidden = {"modalities", "multimodal", "supports_images", "image_training"}
     assert all(not (forbidden & set(row)) for row in public_model_rows())

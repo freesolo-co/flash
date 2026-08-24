@@ -37,10 +37,10 @@ def test_runpod_allocation_lands_on_full_validated_cards():
     a9 = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a9.provider == "runpod"
     assert a9.gpu == "A100 PCIe"  # cheapest validated 80 GB RunPod card
-    a27_sft = allocator.allocate("Qwen/Qwen3.6-27B", "sft")
+    a27_sft = allocator.allocate("Qwen/Qwen3.8-27B", "sft")
     assert a27_sft.provider == "runpod"
     assert a27_sft.gpu == "A100 PCIe"
-    a27_grpo = allocator.allocate("Qwen/Qwen3.6-27B", "grpo")
+    a27_grpo = allocator.allocate("Qwen/Qwen3.8-27B", "grpo")
     assert a27_grpo.provider == "runpod"
     assert (
         a27_grpo.gpu == "B200"
@@ -723,7 +723,7 @@ def test_opd_uses_opd_sizing_not_grpo():
     from flash.engine.plan.vram import model_required_vram_gb
 
     train = {"max_context_tokens": 8192, "max_completion_tokens": 8192, "lora_rank": 16}
-    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-27B"):
+    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B"):
         opd_need = model_required_vram_gb(model_id, "opd", train=train)
         grpo_need = model_required_vram_gb(model_id, "grpo", train=train)
         assert opd_need != grpo_need, f"{model_id} OPD must not size as the GRPO colocate path"
@@ -1251,7 +1251,7 @@ def test_sft_chunked_nll_model_gate_mirrors_worker():
     from flash.engine.plan.vram import sft_chunked_nll_enabled
 
     assert sft_chunked_nll_enabled("Qwen/Qwen3.5-9B") is True
-    assert sft_chunked_nll_enabled("Qwen/Qwen3.6-27B") is True
+    assert sft_chunked_nll_enabled("Qwen/Qwen3.8-27B") is True
     assert sft_chunked_nll_enabled("Qwen/Qwen3.6-35B-A3B") is True
     assert sft_chunked_nll_enabled("meta-llama/Llama-3.2-1B") is False
     assert sft_chunked_nll_enabled("org/unknown") is False
@@ -1261,7 +1261,7 @@ def test_every_sft_catalog_model_is_sized_for_the_fused_loss():
     """sizing must mirror the worker, which sets use_fused_kernels=true for EVERY model.
 
     the enumerated gate above cannot fail when a NEW catalog model is added and left out of the
-    set, which is exactly how Qwen3.6-27B came to be sized for dense logits it never allocates.
+    set, which is exactly how Qwen3.8-27B came to be sized for dense logits it never allocates.
     every catalog model is a qwen3_5/qwen3_5_moe checkpoint, and verl dispatches both to the fused
     torch backend, so the sft-capable catalog and the set must stay identical.
     """
@@ -1403,7 +1403,7 @@ def test_unset_count_auto_sizes_the_27b_grpo_run_to_two_cards(monkeypatch):
     ]
     _stub_provider(monkeypatch, allocator, cands)
     allocation = allocator.allocate(
-        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.8-27B",
         "grpo",
         train={"max_context_tokens": 8192, "max_completion_tokens": 4096},
     )
@@ -1458,7 +1458,7 @@ def test_unset_count_quote_prices_the_auto_sized_shape():
 
     estimate = estimate_cost(
         RunConfig(
-            model_id="Qwen/Qwen3.6-27B",
+            model_id="Qwen/Qwen3.8-27B",
             method="grpo",
             steps=1,
             seq_len=8192,
@@ -1467,7 +1467,7 @@ def test_unset_count_quote_prices_the_auto_sized_shape():
         )
     )
     assert estimate.gpu_count == 2
-    assert estimate.required_vram_gb == 229
+    assert estimate.required_vram_gb == 235
 
 
 def test_explicit_two_card_pin_never_escalates_to_four(monkeypatch):

@@ -1395,16 +1395,20 @@ def test_an_image_rows_visual_tokens_are_charged_against_the_reasoning_cap() -> 
         def apply_chat_template(
             self, messages, *, tokenize, return_dict, return_tensors, enable_thinking, **_kwargs
         ):
-            text = "".join(
-                block.get("text") or ""
-                for message in messages
-                for block in (
-                    message["content"]
-                    if isinstance(message.get("content"), list)
-                    else [{"type": "text", "text": str(message.get("content") or "")}]
+            text = ""
+            for message in messages:
+                reasoning = message.get("reasoning_content")
+                if isinstance(reasoning, str):
+                    text += f"<think>{reasoning}</think>"
+                content = message.get("content")
+                blocks = (
+                    content
+                    if isinstance(content, list)
+                    else [{"type": "text", "text": str(content or "")}]
                 )
-                if isinstance(block, dict)
-            )
+                text += "".join(
+                    block.get("text") or "" for block in blocks if isinstance(block, dict)
+                )
             ids = [3 + ord(char) % 89 for char in text] + [7] * self.visual
             return {"input_ids": [ids], "attention_mask": [[1] * len(ids)]}
 

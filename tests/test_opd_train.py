@@ -827,6 +827,37 @@ def test_verl_0_8_rlhf_dataset_builds_one_structured_block_per_image(
     ]
 
 
+def test_opd_multimodal_parquet_preserves_reasoning_content_for_child(tmp_path):
+    datasets = pytest.importorskip("datasets")
+    rows = [
+        {
+            "prompt": [
+                {"role": "user", "content": "first"},
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "old",
+                },
+                {"role": "user", "content": "look<image>"},
+            ],
+            "images": [{"image": "file:///tmp/only.png"}],
+            "data_source": "flash_opd",
+            "reward_model": {"style": "rule", "ground_truth": ""},
+            "extra_info": {"index": 0},
+        }
+    ]
+    path = tmp_path / "reasoning.parquet"
+
+    _write_opd_parquet(rows, str(path))
+    restored = datasets.Dataset.from_parquet(str(path))[0]["prompt"]
+
+    assert restored[1] == {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "old",
+    }
+
+
 class _MockMultimodalProcessor:
     image_token_id = 151655
 
@@ -840,6 +871,7 @@ class _MockMultimodalProcessor:
             "tokenize": False,
             "add_generation_prompt": True,
             "enable_thinking": False,
+            "preserve_thinking": False,
         }
         self.rendered = messages
         return "<vision>describe"
@@ -2785,12 +2817,13 @@ class _MultiTurnProcessor:
         return {"input_ids": [[ord(character) % 64 for character in text[0]]]}
 
 
-def _multiturn_bridge(env, *, max_turns=4, processor=None, teacher=None):
+def _multiturn_bridge(env, *, max_turns=4, processor=None, teacher=None, student_messages=None):
+    student_messages = student_messages or [{"role": "user", "content": "q"}]
     return _TeacherAlignmentBridge(
         prompts=[
             _BridgePrompt(
-                student_messages=[{"role": "user", "content": "q"}],
-                teacher_messages=[{"role": "user", "content": "q"}],
+                student_messages=student_messages,
+                teacher_messages=student_messages,
                 prompt_ids=(10, 11),
                 image_descriptors=(),
                 package_root=None,
@@ -2808,6 +2841,67 @@ def _multiturn_bridge(env, *, max_turns=4, processor=None, teacher=None):
         multi_turn=True,
         max_turns=max_turns,
     )
+
+
+def test_opd_multiturn_start_preserves_reasoning_content_and_rejects_metadata():
+    prompt = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+        {"role": "user", "content": "question"},
+    ]
+
+    class _ReasoningEnv(_RecordingEnv):
+        def new_rollout_state(self, _example):
+            return {
+                "messages": [dict(message) for message in prompt],
+                "prompt": [dict(message) for message in prompt],
+            }
+
+    bridge = _multiturn_bridge(_ReasoningEnv(), student_messages=prompt)
+
+    assert bridge.start_multiturn(
+        index=0,
+        session_id="reasoning",
+        prompt_ids=[10, 11],
+        raw_prompt=prompt,
+        image_count=0,
+        image_digests=[],
+    ) == {"max_turns": 4}
+    assert bridge._sessions["reasoning"]["messages"] == prompt
+
+    with pytest.raises(ValueError, match="does not match the frozen environment prompt"):
+        _multiturn_bridge(_ReasoningEnv(), student_messages=prompt).start_multiturn(
+            index=0,
+            session_id="wrong-reasoning",
+            prompt_ids=[10, 11],
+            raw_prompt=[
+                *prompt[:1],
+                {**prompt[1], "reasoning_content": "different"},
+                *prompt[2:],
+            ],
+            image_count=0,
+            image_digests=[],
+        )
+
+    malformed = [*prompt[:1], {**prompt[1], "reasoning_content": {"text": "old"}}, *prompt[2:]]
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        _multiturn_bridge(_ReasoningEnv(), student_messages=prompt).start_multiturn(
+            index=0,
+            session_id="bad-reasoning",
+            prompt_ids=[10, 11],
+            raw_prompt=malformed,
+            image_count=0,
+            image_digests=[],
+        )
+    with pytest.raises(ValueError, match="unsupported transcript metadata"):
+        _multiturn_bridge(_ReasoningEnv(), student_messages=prompt).start_multiturn(
+            index=0,
+            session_id="bad-metadata",
+            prompt_ids=[10, 11],
+            raw_prompt=[{**prompt[0], "name": None}, *prompt[1:]],
+            image_count=0,
+            image_digests=[],
+        )
 
 
 def test_an_unusable_opd_turn_is_never_shown_to_the_environment():
@@ -6421,6 +6515,10 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["data.image_key"] == "images"
     assert overrides["data.return_raw_chat"] == "true"
     assert overrides["data.return_multi_modal_inputs"] == "false"
+    assert (
+        overrides["++data.apply_chat_template_kwargs"]
+        == "{enable_thinking:false,preserve_thinking:false}"
+    )
     # `++`-prefixed: these keys are absent from the composed node, so a bare assignment would abort
     # the run at hydra composition. see build_opd_overrides for the per-key reasoning.
     assert overrides["++actor_rollout_ref.rollout.limit_images"] == "4"
@@ -8019,9 +8117,14 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
         eos_token = "<eos>"
 
         def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking, preserve_thinking
         ):
-            assert messages == [{"role": "user", "content": "question"}]
+            assert preserve_thinking is False
+            assert messages == [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+                {"role": "user", "content": "question"},
+            ]
             assert add_generation_prompt is True
             assert enable_thinking is thinking
             return [10, 11] if tokenize else rendered_prompt
@@ -8073,13 +8176,27 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
 
     state = opd_train_runner._prepare_prompts(
         request,
-        [({}, [{"role": "user", "content": "question"}])],
+        [
+            (
+                {},
+                [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "<think>old</think>answer"},
+                    {"role": "user", "content": "question"},
+                ],
+            )
+        ],
         False,
         "capability",
         "https://control.invalid",
     )
 
     assert len(state.prompts) == 1
+    assert state.prompts[0].student_messages[1] == {
+        "role": "assistant",
+        "reasoning_content": "old",
+        "content": "answer",
+    }
     assert env.thinking is thinking
     assert env.prompt_opens_thinking is expected_opened
 
@@ -8108,8 +8225,9 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
         eos_token = "<eos>"
 
         def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking, preserve_thinking
         ):
+            assert preserve_thinking is False
             rendered, ids = rows[messages[0]["content"]]
             return ids if tokenize else rendered
 

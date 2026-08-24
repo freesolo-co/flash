@@ -21,9 +21,13 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
-- The active training and serving catalog now starts at `Qwen/Qwen3.5-9B`. The 0.8B, 2B, and 4B
-  Qwen3.5 tiers are no longer accepted for new or persisted runtime activation, while historical
-  status, billing, cancellation, cleanup, and identity-based undeploy operations remain available.
+- Active training and hosted serving now expose exactly `Qwen/Qwen3.5-9B`,
+  `Qwen/Qwen3.8-27B`, and `Qwen/Qwen3.6-35B-A3B`. Qwen3.8 uses the immutable BF16 revision
+  `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` and official native block-FP8 serving revision
+  `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`. The Qwen3.5 0.8B, 2B, and 4B tiers and
+  `Qwen/Qwen3.6-27B` cannot activate, while historical status, accepted billing retry,
+  cancellation, cleanup, hosted revocation, and exact identity-based undeploy remain available.
+  Qwen3.6 27B adapters are not compatible with Qwen3.8. Customer-owned serving remains 9B-only.
 - `[train] init_from_adapter` now works for every source/target algorithm pair. SFT was rejected as
   a warm-start target, so an adapter could be continued only by GRPO or OPD; that restriction
   described the retired trl SFT backend, and the verl backend that replaced it loads a warm-start

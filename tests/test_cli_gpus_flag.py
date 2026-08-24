@@ -20,7 +20,7 @@ BASE = (
 )
 
 BIG_GRPO = (
-    'model = "Qwen/Qwen3.6-27B"\n'
+    'model = "Qwen/Qwen3.8-27B"\n'
     'project = "11111111-1111-4111-8111-111111111111"\n'
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
@@ -83,7 +83,7 @@ def test_explicit_one_card_pin_rejects_with_a_fitting_count(tmp_path):
     with pytest.raises(ConfigError) as exc:
         _spec(tmp_path, "--gpus", "1", config=BIG_GRPO)
     message = str(exc.value)
-    assert "grpo needs >= 229 GB VRAM" in message
+    assert "grpo needs >= 235 GB VRAM" in message
     assert "gpu.count=1 provides at most 180 GB (B200)" in message
     assert "--gpus 2" in message
     assert "max_context_tokens" in message

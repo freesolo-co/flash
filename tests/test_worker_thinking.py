@@ -51,6 +51,95 @@ def _restore_env(saved):
             os.environ[k] = v
 
 
+def test_messages_for_chat_template_exposes_inline_reasoning_without_mutating_input():
+    from flash.content.thinking import messages_for_chat_template
+
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "<think>reason\n</think>\nanswer"},
+    ]
+
+    from flash.engine.worker.train.core.child.glue import _messages_for_chat_template
+
+    normalized = messages_for_chat_template(messages)
+
+    assert normalized == [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "reasoning_content": "reason", "content": "answer"},
+    ]
+    assert _messages_for_chat_template(messages) == normalized
+    assert messages[1] == {"role": "assistant", "content": "<think>reason\n</think>\nanswer"}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "quote <think>x</think>",
+        "literal </think> close",
+        "<think>unclosed",
+        "<think>a</think>mid<think>b</think>answer",
+        "<think>a</think>answer</think>",
+    ],
+)
+def test_messages_for_chat_template_preserves_ambiguous_or_noncanonical_markers(content):
+    from flash.content.thinking import messages_for_chat_template
+    from flash.engine.worker.train.core.child.glue import _messages_for_chat_template
+
+    messages = [{"role": "assistant", "content": content}]
+
+    assert messages_for_chat_template(messages) == messages
+    assert _messages_for_chat_template(messages) == messages
+
+
+def test_messages_for_chat_template_preserves_explicit_reasoning_and_nonassistant_tags():
+    from flash.content.thinking import messages_for_chat_template
+    from flash.engine.worker.train.core.child.glue import _messages_for_chat_template
+
+    messages = [
+        {"role": "user", "content": "quote <think>x</think>"},
+        {"role": "assistant", "reasoning_content": "", "content": "<think>tag</think> answer"},
+    ]
+
+    assert messages_for_chat_template(messages) == messages
+    assert _messages_for_chat_template(messages) == messages
+
+
+def test_child_prompt_transport_preserves_reasoning_content_and_rejects_metadata():
+    import asyncio
+
+    from flash.engine.worker.train.core.child.glue import prepare_episode_prompt
+
+    class _Loop:
+        processor = None
+
+        async def process_multi_modal_info(self, messages):
+            self.messages = messages
+            return {}
+
+        def _get_mm_processor_kwargs(self, _audios):
+            return {}
+
+        async def apply_chat_template(self, messages, **_kwargs):
+            assert messages[1]["reasoning_content"] == "old"
+            return [1, 2]
+
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+    ]
+    prompt = asyncio.run(prepare_episode_prompt(_Loop(), messages))
+    assert prompt.structured_messages == messages
+
+    with pytest.raises(ValueError, match="unsupported transcript metadata"):
+        asyncio.run(prepare_episode_prompt(_Loop(), [{**messages[0], "name": None}, messages[1]]))
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        asyncio.run(
+            prepare_episode_prompt(
+                _Loop(), [messages[0], {**messages[1], "reasoning_content": ["old"]}]
+            )
+        )
+
+
 def test_strip_think_unit():
     import flash.engine.worker as ne
 

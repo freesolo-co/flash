@@ -76,7 +76,7 @@ def test_preflight_accepts_child_rank_and_alpha_mismatches():
     assert metadata.alpha == 128
 
 
-@pytest.mark.parametrize("model", ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-27B"])
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B"])
 def test_preflight_rejects_adapter_rank_above_serving_cap(model):
     from flash.core.catalog import serving_lora_rank_cap
 
@@ -121,7 +121,7 @@ def test_inspection_rejects_incompatible_task_type():
 def test_inspection_rejects_incompatible_base_model():
     with pytest.raises(ValueError, match=r"base model.*does not match target model"):
         inspect_adapter_config(
-            _config(base_model_name_or_path="Qwen/Qwen3.6-27B"),
+            _config(base_model_name_or_path="Qwen/Qwen3.8-27B"),
             source="adapter",
             target_model="Qwen/Qwen3.5-9B",
         )

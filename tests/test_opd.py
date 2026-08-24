@@ -781,8 +781,15 @@ def test_thinking_prefill_text_is_template_delta(monkeypatch):
 
     class _Tok:
         def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+            self,
+            messages,
+            *,
+            tokenize,
+            add_generation_prompt,
+            enable_thinking,
+            preserve_thinking,
         ):
+            assert preserve_thinking is False
             return "<|im_start|>assistant\n" + ("<think>\n" if enable_thinking else "")
 
     monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=False))

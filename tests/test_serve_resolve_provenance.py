@@ -93,7 +93,7 @@ def test_a_base_model_that_disagrees_with_the_config_is_rejected(monkeypatch, tm
     _install_hub(
         monkeypatch,
         tmp_path,
-        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": "Qwen/Qwen3.6-27B"},
+        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": "Qwen/Qwen3.8-27B"},
     )
 
     with pytest.raises(ResolveError, match="trained against"):

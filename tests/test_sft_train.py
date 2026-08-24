@@ -2728,8 +2728,10 @@ def _stub_sft_run(
             tokenize,
             add_generation_prompt,
             enable_thinking,
+            preserve_thinking,
         ):
             assert tokenize is False
+            assert preserve_thinking is False
             rendered = "".join(
                 f"<{message['role']}>{message['content']}</{message['role']}>"
                 for message in messages
@@ -4169,7 +4171,7 @@ def test_sft_idle_card_advice_does_not_shrink_the_memory_the_run_is_running_on()
 
     The idle-card warning fires on a rented shape the fit gate already accepted, and the ranks that
     joined are what hold the model. Dropping to the next rentable divisor is a VRAM change, not just
-    a billing one: Qwen3.6-27B sft at 32k is sized at 159 GB, a 4x H100 rental launching 3 ranks
+    a billing one: Qwen3.8-27B sft at 32k is sized at 159 GB, a 4x H100 rental launching 3 ranks
     provides 191.6 GB and runs, but batch 6 over 6 rows advised "allocate 2 card(s)" -- 130.4 GB,
     which the fit gate rejects. Acting on that remedy turns a working run into an unplaceable one.
 

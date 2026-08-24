@@ -327,14 +327,33 @@ def test_grpo_use_reentrant_true_for_moe():
 
 
 def test_grpo_use_reentrant_true_for_gdn_hybrid():
-    # dense qwen3.5/3.6 gated-deltanet hybrids also need reentrant gc under grpo: fa2 varlen-unpad +
+    # cataloged gated-deltanet hybrids need reentrant gc based on architecture, not display name: fa2 +
     # the fused gdn chunk-scan + the fused triton kernels save data-dependent tensors the non-reentrant
     # metadata-equality assert cannot reconcile (forward packed [1636,..] vs recompute padded [1024,..]),
     # crashing at step 0 exactly like moe. live-confirmed on a qwen3.5 gdn grpo run.
     from flash.engine.worker.perf.memory import grpo_use_reentrant
 
-    for gdn_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-27B"):
+    for gdn_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B"):
         assert grpo_use_reentrant(gdn_id) is True, gdn_id
+
+
+def test_grpo_use_reentrant_uses_catalog_geometry_not_model_name(monkeypatch):
+    from dataclasses import replace
+
+    from flash.core.catalog import MODELS
+    from flash.engine.worker.perf.memory import grpo_use_reentrant
+
+    renamed = replace(MODELS["Qwen/Qwen3.8-27B"], id="acme/renamed-hybrid")
+    pure_attention = replace(
+        MODELS["Qwen/Qwen3.8-27B"],
+        id="Qwen/Qwen3.8-name-only",
+        num_linear_attention_layers=0,
+    )
+    monkeypatch.setitem(MODELS, renamed.id, renamed)
+    monkeypatch.setitem(MODELS, pure_attention.id, pure_attention)
+
+    assert grpo_use_reentrant(renamed.id) is True
+    assert grpo_use_reentrant(pure_attention.id) is False
 
 
 def test_grpo_use_reentrant_false_for_non_gdn_dense():
@@ -424,7 +443,7 @@ def test_size_gate_is_offline_and_fail_safe_for_cataloged_models(monkeypatch):
 
     # every cataloged model answers from params_b, with the probe guaranteed to fail if consulted.
     assert liger_mod._liger_default_for_model("Qwen/Qwen3.6-35B-A3B") is True
-    assert liger_mod._liger_default_for_model("Qwen/Qwen3.6-27B") is True
+    assert liger_mod._liger_default_for_model("Qwen/Qwen3.8-27B") is True
     assert liger_mod._liger_default_for_model("Qwen/Qwen3.5-9B") is True
     assert liger_mod._liger_default_for_model(synthetic_id) is False
     # and the decision that matters: a short-context 35b step keeps gradient checkpointing on.

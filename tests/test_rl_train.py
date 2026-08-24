@@ -1332,6 +1332,8 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     assert "trainer.max_actor_ckpt_to_keep=1" in o
     assert "trainer.logger=[console]" in o
     assert "data.train_batch_size=16" in o
+    assert "+data.apply_chat_template_kwargs.enable_thinking=false" in o
+    assert "+data.apply_chat_template_kwargs.preserve_thinking=false" in o
     # truncated importance sampling: token-level, cap 2.0 (matches flash's tis recipe).
     assert "algorithm.rollout_correction.rollout_is=token" in o
     assert "algorithm.rollout_correction.rollout_is_threshold=2.0" in o
@@ -1940,7 +1942,7 @@ def test_multigpu_gpu_mem_util_caps_the_sizer_at_the_previous_constant(monkeypat
 
 def test_multigpu_gpu_mem_util_never_exceeds_the_previous_constant():
     default = rl_train._DEFAULT_GPU_MEM_UTIL
-    model_ids = ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-27B", "Qwen/Qwen3.6-35B-A3B")
+    model_ids = ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B")
     for model_id in model_ids:
         for gpu_type in ("H100", "H200", "B200"):
             for tensor_parallel in (2, 4, 8):
@@ -5336,6 +5338,84 @@ def test_top_level_record_image_reaches_actor_and_environment_prompts():
     assert any(block == {"type": "image"} for block in prompts[0]["env_prompt"][0]["content"])
 
 
+def test_text_prompts_freeze_qwen38_reasoning_fields_for_child_parity():
+    from flash.engine.worker.train.rl import inputs as rl_inputs
+
+    prompts = rl_inputs._build_grpo_prompts(
+        [{}],
+        [
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "<think>old</think>answer"},
+                {"role": "user", "content": "question"},
+            ]
+        ],
+        False,
+        None,
+        _CapabilityTokenizer(),
+        None,
+        32,
+    )
+
+    expected = {
+        "role": "assistant",
+        "reasoning_content": "old",
+        "content": "answer",
+    }
+    assert prompts[0]["prompt"][1] == expected
+    assert prompts[0]["env_prompt"][1] == expected
+
+
+def test_multimodal_prompts_preserve_reasoning_content_through_processor_and_child_transport(
+    tmp_path,
+):
+    from flash.engine.worker.train.rl import inputs as rl_inputs
+    from flash.engine.worker.train.rl.verl_config import (
+        build_verl_dataset_rows,
+        write_verl_grpo_parquet,
+    )
+
+    class _RecordingProcessor(_CapabilityProcessor):
+        def __init__(self):
+            super().__init__()
+            self.template_messages = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["preserve_thinking"] is False
+            self.template_messages = messages
+            return "prompt"
+
+    processor = _RecordingProcessor()
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": _capability_image_uri()}},
+            ],
+        },
+    ]
+
+    prompts = rl_inputs._build_grpo_prompts(
+        [{}], [messages], True, processor, processor.tokenizer, None, 32
+    )
+    row = build_verl_dataset_rows([prompts[0]["prompt"]], [0], [""], [prompts[0]["images"]])[0]
+
+    expected = {"role": "assistant", "reasoning_content": "old", "content": "answer"}
+    assert processor.template_messages[1]["reasoning_content"] == "old"
+    assert processor.template_messages[1]["content"] == [{"type": "text", "text": "answer"}]
+    assert prompts[0]["env_prompt"][1] == processor.template_messages[1]
+    assert row["prompt"][1] == expected
+
+    datasets = pytest.importorskip("datasets")
+    path = tmp_path / "reasoning.parquet"
+    write_verl_grpo_parquet([row], str(path))
+    restored = datasets.Dataset.from_parquet(str(path))[0]["prompt"]
+    assert restored[1] == expected
+
+
 def test_multimodal_budget_filter_measures_the_expanded_prompt(monkeypatch):
     # verl RAISES on an over-budget multimodal prompt instead of truncating, so this filter is the
     # only thing between a long image prompt and a dead run. the tokenizer says 1 token; the
@@ -5755,8 +5835,10 @@ class _BridgeGlueProcessor:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.image_counts = []
+        self.template_kwargs = []
 
     def apply_chat_template(self, messages, **kwargs):
+        self.template_kwargs.append(kwargs)
         return self.tokenizer.apply_chat_template(messages, **kwargs)
 
     def image_processor(self, *, images, return_tensors):
@@ -5815,6 +5897,70 @@ def test_bridge_start_lets_a_per_example_budget_lower_the_cap_but_never_raise_it
     assert _bridge(_BridgeEnv(max_episode_turns=0), max_turns=4).start(
         {"index": 0, "session_id": "a"}
     ) == {"max_turns": 1}
+
+
+def test_bridge_start_authenticates_reasoning_content_and_rejects_malformed_metadata():
+    from flash.engine.worker.train.rl.multi_turn import _BadRequest
+
+    env = _BridgeEnv()
+    prompt = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+        {"role": "user", "content": "question"},
+    ]
+    bridge = _bridge(env, examples=[{"index": 0}], env_prompts=[prompt])
+
+    assert bridge.start(
+        {
+            "index": 0,
+            "session_id": "reasoning",
+            "raw_prompt": prompt,
+            "prompt_ids": [],
+            "image_count": 0,
+            "image_digests": [],
+        }
+    ) == {"max_turns": 4}
+    assert bridge._sessions["reasoning"]["messages"] == prompt
+
+    with pytest.raises(_BadRequest, match="does not match the frozen environment prompt"):
+        _bridge(env, examples=[{"index": 0}], env_prompts=[prompt]).start(
+            {
+                "index": 0,
+                "session_id": "wrong-reasoning",
+                "raw_prompt": [
+                    *prompt[:1],
+                    {**prompt[1], "reasoning_content": "different"},
+                    *prompt[2:],
+                ],
+                "prompt_ids": [],
+                "image_count": 0,
+                "image_digests": [],
+            }
+        )
+
+    malformed = [*prompt[:1], {**prompt[1], "reasoning_content": ["old"]}, *prompt[2:]]
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        _bridge(env, examples=[{"index": 0}], env_prompts=[prompt]).start(
+            {
+                "index": 0,
+                "session_id": "bad-reasoning",
+                "raw_prompt": malformed,
+                "prompt_ids": [],
+                "image_count": 0,
+                "image_digests": [],
+            }
+        )
+    with pytest.raises(ValueError, match="unsupported transcript metadata"):
+        _bridge(env, examples=[{"index": 0}], env_prompts=[prompt]).start(
+            {
+                "index": 0,
+                "session_id": "bad-metadata",
+                "raw_prompt": [{**prompt[0], "name": None}, *prompt[1:]],
+                "prompt_ids": [],
+                "image_count": 0,
+                "image_digests": [],
+            }
+        )
 
 
 def test_bridge_start_passes_the_index_aligned_prepared_prompt_into_state_creation():
@@ -6143,6 +6289,7 @@ def test_bridge_normalizes_and_authenticates_every_supported_image_reply_shape(s
     assert out["image_count"] == 1
     assert out["image_digests"] == bridge._sessions["a"]["image_digests"]
     assert processor.image_counts == [1]
+    assert processor.template_kwargs[-1]["preserve_thinking"] is False
     image.close()
 
 

@@ -13,7 +13,7 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 
 _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
-_RETIRED_MODELS = ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B")
+_RETIRED_MODELS = ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B")
 
 
 def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):

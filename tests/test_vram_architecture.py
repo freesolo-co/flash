@@ -21,7 +21,7 @@ _EXPECTED_LORA_TARGET_COUNTS = {
     # 460 ordinary linears + both fused routed-expert tensors (40 layers x 256 experts each),
     # which peft wraps as 10,240 rank-r slices per tensor.
     "Qwen/Qwen3.6-35B-A3B": 460 + 2 * 10_240,
-    "Qwen/Qwen3.6-27B": 606,
+    "Qwen/Qwen3.8-27B": 606,
 }
 
 

@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from starlette.responses import StreamingResponse
 
 from flash.serving.src.adapter_routes import remove_adapter
+from flash.serving.src.context import ServingContext
 from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord
 from flash.serving.src.serving_io import _sse
@@ -40,7 +41,7 @@ def _serve(*args, **kwargs):
 
 
 QWEN = "Qwen/Qwen3.5-9B"
-QWEN_27B = "Qwen/Qwen3.6-27B"
+QWEN_27B = "Qwen/Qwen3.8-27B"
 
 
 def _revision_id(run_id: str) -> str:
@@ -224,6 +225,25 @@ def app_setup():
     pool = FakePool()
     client = _serve(pool, router, internal_key="sekret")
     return client, pool, router
+
+
+def test_unregister_safe_records_exact_gpu_cleanup_failure(capsys):
+    class _FailingPool:
+        async def unregister(self, base_model, adapter_id, expected_generation):
+            raise RuntimeError(
+                f"exact eviction failed for {base_model} {adapter_id} {expected_generation}"
+            )
+
+    context = object.__new__(ServingContext)
+    context.pool = _FailingPool()
+
+    asyncio.run(context.unregister_safe("Qwen/Qwen3.6-27B", "retired@final.sha", "generation-1"))
+
+    assert (
+        "hosted adapter gpu cleanup failed for retired@final.sha on Qwen/Qwen3.6-27B: "
+        "RuntimeError('exact eviction failed for Qwen/Qwen3.6-27B retired@final.sha generation-1')"
+        in capsys.readouterr().out
+    )
 
 
 def test_healthz_reports_one_gpu_per_base_model(app_setup):

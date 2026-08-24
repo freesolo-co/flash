@@ -15,6 +15,7 @@ import json
 from typing import TYPE_CHECKING
 
 from flash.content.multimodal import messages_with_decoded_images
+from flash.content.thinking import messages_for_chat_template
 from flash.engine.worker.train.opd.gkd import _trim_trailing_stop
 
 if TYPE_CHECKING:  # the prompt record, for annotations only -- it lives in the orchestrator
@@ -71,10 +72,11 @@ def _processor_expanded_prompt(
     images = decode_image_descriptors(list(image_descriptors), package_root)
     prepared = messages_with_decoded_images(messages, images)
     raw_prompt = processor.apply_chat_template(
-        prepared,
+        messages_for_chat_template(prepared),
         tokenize=False,
         add_generation_prompt=True,
         enable_thinking=enable_thinking,
+        preserve_thinking=False,
     )
     processor_kwargs = {
         "text": [raw_prompt],
