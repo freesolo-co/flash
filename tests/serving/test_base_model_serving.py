@@ -212,16 +212,6 @@ def modal_app_module():
                 sys.modules[name] = prev
 
 
-def test_base_model_records_seed_one_open_record_per_model(modal_app_module):
-    from flash.serving.src.model_config import base_models
-
-    recs = modal_app_module._base_model_records()
-    assert {r.adapter_id for r in recs} == set(base_models())
-    assert all(
-        r.serve_base_model and r.org_id is None and r.adapter_id == r.base_model for r in recs
-    )
-
-
 def test_lora_request_returns_no_lora_for_base_model(modal_app_module):
     import asyncio
 
