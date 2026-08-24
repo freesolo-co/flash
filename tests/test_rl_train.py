@@ -1288,21 +1288,23 @@ def test_build_verl_overrides_omits_layered_summon_for_dense_models():
     assert not [x for x in o if "layered_summon" in x]
 
 
-def test_build_verl_overrides_keeps_fused_expert_params_addressable_under_fsdp1():
-    # end-to-end through the real builder. grpo emits no `actor.strategy`, so it inherits verl's
-    # fsdp1 default (actor/dp_actor.yaml:22-26) -- unlike the sft driver, which pins fsdp2
-    # (train/sft/config.py:138) and therefore never flattens. on fsdp1 the flag is what keeps
-    # `mlp.experts.down_proj` reachable by name for PEFT's forward-time parametrization.
+def test_build_verl_overrides_puts_fused_expert_lora_on_fsdp2():
+    # end-to-end through the real builder. PEFT's forward-time parametrization needs
+    # `mlp.experts.down_proj` reachable by name AND its slot free after `delattr`; fsdp1 cannot
+    # give both, because FSDP.__getattr__ keeps resolving the name from the wrapped module. the
+    # sft driver has always pinned fsdp2 for this reason (train/sft/config.py:138).
     o = rl_train.build_verl_overrides(
         _overrides_cfg(target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
     )
-    assert "actor_rollout_ref.actor.fsdp_config.use_orig_params=true" in o
-    assert not [x for x in o if x.startswith("actor_rollout_ref.actor.strategy=")]
+    assert "actor_rollout_ref.actor.strategy=fsdp2" in o
+    # exactly one writer of the key, so the value cannot be ambiguous at merge time
+    assert len([x for x in o if x.startswith("actor_rollout_ref.actor.strategy=")]) == 1
 
 
-def test_build_verl_overrides_omits_orig_params_for_dense_models():
+def test_build_verl_overrides_keeps_dense_models_on_fsdp1():
     o = rl_train.build_verl_overrides(_overrides_cfg(target_parameters=None))
-    assert not [x for x in o if "use_orig_params" in x]
+    assert "actor_rollout_ref.actor.strategy=fsdp" in o
+    assert len([x for x in o if x.startswith("actor_rollout_ref.actor.strategy=")]) == 1
 
 
 def test_build_verl_overrides_carries_dr_grpo_recipe():
