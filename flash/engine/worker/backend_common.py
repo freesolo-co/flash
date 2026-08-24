@@ -25,13 +25,14 @@ from concurrent.futures import thread as _thread_module
 from http.server import ThreadingHTTPServer
 from typing import Self
 
-# verl 0.8.0 exactly, plus the truncation-mask, 3d position-id, and ulysses fused-label fixes.
+# verl 0.8.0 exactly, plus the truncation-mask, 3d position-id, and ulysses fused-label fixes, the
+# whole-adapter lora bucket sync, and the fused-linear grad-flag preservation.
 # it must stay on the 0.8.0 base: the opd plugin patches 0.8.0 internals and imports
 # verl.trainer.main_ppo_sync, which verl deleted after 0.8.0, and opd's exact-version gate reads the
 # version file this branch pins to the release value.
 VERL_REQUIREMENT_NAME = "verl"
 VERL_REQUIREMENT_URL = (
-    "git+https://github.com/freesolo-co/verl@32d6200de81dc484893baf8b9cf30297ebe7fa49"
+    "git+https://github.com/freesolo-co/verl@f71a02ddb32a9c6a6915f7519bda6dede92e9dd0"
 )
 # the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
 # same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
@@ -930,7 +931,7 @@ from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
     _CAPABILITIES_UNAVAILABLE,
     _CAPABILITY_PROBE,
     _CAPABILITY_PROBE_TIMEOUT_S,
-    fused_expert_orig_params_overrides,
+    actor_fsdp_strategy_overrides,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
     probe_verl_capabilities,
