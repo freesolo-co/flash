@@ -2122,7 +2122,7 @@ def test_worker_deps():
     import flash.envs.loading.base as registry
 
     env_id = "github:owner/repo@main:env/environment.py"
-    assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.4.1"]
+    assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.4.2"]
 
 
 # ============================================================================================

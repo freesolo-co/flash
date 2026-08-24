@@ -3000,7 +3000,7 @@ def test_submit_payload_carries_authored_pip_and_the_worker_appends_it(
     assert tuple(spec_payload(spec)["environment"]["pip"]) == ("pymongo>=4.6",)
     # and the submit paths install it after the worker requirement, not instead of it.
     assert worker_pip_with_extras(spec.environment.id, spec.environment.pip) == [
-        "freesolo>=0.4.1",
+        "freesolo>=0.4.2",
         "pymongo>=4.6",
     ]
 
