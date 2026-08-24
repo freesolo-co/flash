@@ -24,9 +24,30 @@ from flash.providers.artifacts.hf import make_hf_text_reader
 
 # imported at the top rather than re-exported at the bottom: these are default argument
 # values below, and a default evaluates when the `def` runs, long before a bottom import.
-from flash.providers.artifacts.preload_runpod import (
+# the rest of the runpod preload surface is re-exported here for the same reason, one step
+# further along: `main()` runs from the `__main__` guard, which sits ABOVE where these used to be
+# imported, so every CLI invocation died on `NameError: catalog_model_ids` while the library path
+# stayed green (importing the module executes the whole file, bottom import included). tests that
+# patch `weight_cache.<name>` keep working because the names still land in this module's namespace.
+from flash.providers.artifacts.preload_runpod import (  # noqa: F401
+    _NO_CAPACITY_GRACE_S,
     _PRELOAD_GPU,
     _PRELOAD_TIMEOUT_S,
+    _QUEUED,
+    _THROTTLED_GRACE_S,
+    _UNHEALTHY_GRACE_S,
+    NoCapacityError,
+    _any_worker,
+    _has_worker,
+    _only_unhealthy_workers,
+    _poll_until_done,
+    _preload_one_dc,
+    _throttled_workers,
+    _worker_counts,
+    catalog_model_ids,
+    teardown_lambda_filesystems,
+    teardown_weight_cache,
+    warm_weight_cache,
 )
 from flash.providers.base import UnreconciledCreateError
 from flash.providers.runpod import api as runpod_api  # noqa: F401
@@ -839,25 +860,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-# re-exported so the runpod preload surface stays reachable as `weight_cache.<name>`: the
-# preload tests patch and call all of these here, and `main` below dispatches to them.
-from flash.providers.artifacts.preload_runpod import (  # noqa: E402,F401
-    _NO_CAPACITY_GRACE_S,
-    _QUEUED,
-    _THROTTLED_GRACE_S,
-    _UNHEALTHY_GRACE_S,
-    NoCapacityError,
-    _any_worker,
-    _has_worker,
-    _only_unhealthy_workers,
-    _poll_until_done,
-    _preload_one_dc,
-    _throttled_workers,
-    _worker_counts,
-    catalog_model_ids,
-    teardown_lambda_filesystems,
-    teardown_weight_cache,
-    warm_weight_cache,
-)

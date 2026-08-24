@@ -60,6 +60,34 @@ def _ndc() -> int:
     return n
 
 
+def test_preload_cli_entrypoint_runs_as_a_subprocess():
+    """`python -m ...weight_cache --dry-run` must reach the planner, not die on a NameError.
+
+    MUST be a subprocess: the names `main()` needs were re-exported at the BOTTOM of the module,
+    below the `__main__` guard, so `python -m` ran `main()` before the import and every CLI
+    invocation died on `NameError: catalog_model_ids`. An in-process import cannot reproduce that --
+    importing executes the whole file, bottom import included, so the library path stayed green
+    while the only operator-facing entrypoint was dead. --dry-run provisions nothing.
+    """
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "flash.providers.artifacts.weight_cache", "--dry-run"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    combined = proc.stdout + proc.stderr
+    assert "NameError" not in combined, f"CLI died on a NameError:\n{combined}"
+    assert proc.returncode == 0, f"--dry-run exited {proc.returncode}:\n{combined}"
+    # prove it reached the RUNPOD planner specifically. a bare "would warm" also matches the Lambda
+    # plan line, which prints from a different branch and would not exercise `catalog_model_ids`.
+    assert "datacenter(s):" in proc.stdout, f"runpod planner never ran:\n{combined}"
+    # the model list is what `catalog_model_ids` produces -- the name that used to NameError.
+    assert "model(s):" in proc.stdout, f"model catalog never resolved:\n{combined}"
+
+
 # ---------------------------------------------------------------------------
 # spec carrier round-trips (network_volume is platform-managed: it must survive every
 # to_internal_dict()->from_dict() hop, the control-plane/worker carrier. it is intentionally
