@@ -414,6 +414,37 @@ def test_filtering_superseded_heartbeats_leaves_the_live_attempt_last(capsys) ->
     assert live[-1].endswith('{"stage":"rl_step","step":1,"attempt":1,"device_name":"B200"}')
 
 
+def test_the_canonical_console_cannot_reach_the_pipe_untagged(capsys) -> None:
+    """The unscoped ``console_<phase>.txt`` encodes no attempt, so it must not escape tagging.
+
+    The plane fetches BOTH console names and appends the canonical one last, so it is the final
+    section on screen. Its filename carries no ``_attemptN``, which is exactly what the tagging
+    predicate keys on -- so a name-derived rule leaves it unmarked and
+    ``runs log | grep HEARTBEAT | tail -1`` trusts it. On a retry whose terminal upload never ran
+    (``os._exit(124)`` runs no ``finally`` blocks) that file belongs to an OLDER attempt, which is
+    the precise failure ``_mark_superseded_heartbeats`` exists to prevent.
+
+    Unknown provenance is not proof of liveness: when the live attempt is known and the artifact
+    cannot name its own, it must be treated as superseded rather than silently trusted.
+    """
+    commands._print_worker_output(
+        {
+            "console_rl.txt": (
+                'HEARTBEAT {"stage":"rl_step","step":76,"attempt":0,"device_name":"H200"}\n'
+            )
+        },
+        printed_any=True,
+        current_attempt=1,
+    )
+
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if "HEARTBEAT" in line]
+    assert lines, "the canonical console must still be printed"
+    assert "[superseded" in lines[-1], (
+        f"the canonical console's heartbeat reached the pipe unmarked: {lines[-1]}"
+    )
+
+
 def test_current_attempt_heartbeats_are_left_untouched(capsys) -> None:
     """Only a SUPERSEDED attempt is tagged; the live attempt's own artifact must read normally."""
     commands._print_worker_output(

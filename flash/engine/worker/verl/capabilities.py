@@ -864,39 +864,36 @@ def rollout_layered_summon_overrides(target_parameters: Sequence[str] | None) ->
     return ["actor_rollout_ref.rollout.layered_summon=true"]
 
 
-def fused_expert_orig_params_overrides(target_parameters: Sequence[str] | None) -> list[str]:
-    """keep fsdp1 parameters addressable so peft can parametrize a fused-expert tensor.
+def actor_fsdp_strategy_overrides(target_parameters: list[str] | None) -> list[str]:
+    """select the actor's fsdp wrapper: fused-expert lora needs fsdp2, dense keeps fsdp1.
 
     PEFT implements ``target_parameters`` by registering a torch parametrization onto a NAMED
-    TENSOR of the module at forward time (``peft/tuners/lora/layer.py:2463``), unlike
-    ``target_modules``, which swaps in a wrapper layer once at injection. verl injects the adapter
-    BEFORE wrapping in fsdp (``transformer_impl.py:543-565``), so by the time that forward runs the
-    tensor has to still be reachable by name.
+    TENSOR at forward time (``peft/tuners/lora/layer.py:2463``), unlike ``target_modules``, which
+    swaps in a wrapper layer once at injection. ``register_parametrization`` calls
+    ``delattr(module, name)`` and then asserts the name is gone
+    (``torch/nn/utils/parametrize.py:387``). fsdp1 cannot satisfy that on either setting:
+    ``use_orig_params=False`` (verl's default, ``workers/config/engine.py:254``) flattens the
+    tensor away so the name never resolves (``parametrize.py:639``), and ``use_orig_params=True``
+    leaves ``FSDP.__getattr__`` resolving it from ``_fsdp_wrapped_module``, so ``hasattr`` stays
+    True after ``delattr`` and the bare assert fires (``parametrize.py:634`` -> ``:387``).
 
-    fsdp1 only keeps it reachable under ``use_orig_params=True``. verl passes the config value
-    straight through (``transformer_impl.py:392-404``) and it defaults to False
-    (``workers/config/engine.py:254``), which flattens every parameter into a FlatParameter. The
-    attribute is then gone and ``register_parametrization`` raises ``Module 'Qwen3_5MoeExperts(...)'
-    does not have a parameter, a buffer, or a parametrized element with name 'down_proj'`` -- which
-    is exactly how the first GRPO run to survive the weight sync died, in the log-prob forward.
+    no config value satisfies that assert while fsdp1 owns the module, so the strategy itself has
+    to change. fsdp2's ``fully_shard`` keeps parameters under their own names with no wrapper
+    indirection. flash's sft driver has always pinned ``engine.strategy=fsdp2``
+    (``train/sft/config.py:138``) and trains this same model with these same ``target_parameters``.
 
-    the natural control is flash's own sft driver: it pins ``engine.strategy=fsdp2``
-    (``train/sft/config.py:138``), and fsdp2's ``fully_shard`` never flattens, so the same model
-    with the same ``target_parameters`` trains fine there. grpo and opd stay on fsdp1, so they need
-    the flag instead of the strategy switch.
+    verl supports it here: ``strategy`` is declared in ``actor/dp_actor.yaml:26`` so it takes a
+    bare override, ``workers/config/engine.py:265`` accepts ``fsdp2``, the ref policy interpolates
+    the actor's value (``ref/ref.yaml:5``) so the two cannot drift, and ``layered_summon_lora_params``
+    carries an explicit fsdp2 prefix block (``utils/fsdp_utils.py:646-649``).
 
-    verl's own fused-expert lora test pins ``use_orig_params=True``
-    (``tests/utils/test_fsdp_lora_merge.py:92``) over these very targets, as does every other
-    lora-bearing fsdp1 test; only the checkpoint and activation-offload tests use False. upstream
-    has no forward-pass regression for this combination, which is why the default was never fixed.
-
-    gated on ``target_parameters`` because that is precisely the set of models whose lora lives on a
-    raw tensor rather than a wrapper module. dense models keep verl's flattened default, which is
-    the cheaper layout.
+    dense models stay on fsdp1: their lora lives on wrapper modules swapped in at injection, so no
+    parametrization is ever registered. the key is written for BOTH cases rather than omitted for
+    dense, so it has exactly one writer per config and the rl and opd drivers cannot disagree about
+    the dense default or inherit a future change to verl's yaml.
     """
-    if not target_parameters:
-        return []
-    return ["actor_rollout_ref.actor.fsdp_config.use_orig_params=true"]
+    strategy = "fsdp2" if target_parameters else "fsdp"
+    return [f"actor_rollout_ref.actor.strategy={strategy}"]
 
 
 def rollout_mm_processor_cache_overrides() -> list[str]:
