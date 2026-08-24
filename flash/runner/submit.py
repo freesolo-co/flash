@@ -159,9 +159,10 @@ def prepare_job(
         scan_packaged_environment=not environment_ref_deferred,
     )
     preflight_validate_managed_teacher(worker_spec)
+    from flash.cost.currency import usd_amount
     from flash.cost.spec import estimate_for_spec
 
-    estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
+    estimated_cost_usd = usd_amount(estimate_for_spec(worker_spec).total_usd)
     # derive the rl prompt budget from the same resolved spec the quote is built from, so the
     # reported budget describes the run that was actually priced and submitted.
     from flash.engine.plan.prompt_budget import rl_prompt_budget
@@ -226,10 +227,8 @@ def _effective_preparation_snapshot(
     }
 
 
-def _persist_effective_worker_spec(
-    worker_spec: JobSpec, *, estimated_cost_usd: float | None = None
-) -> bool:
-    """Persist the selected worker spec and exact quote before provider provisioning starts."""
+def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
+    """Persist the selected worker spec without changing the accepted customer quote."""
     status = _runner().get_status(worker_spec.run_id)
     if status.state in _runner().TERMINAL_STATES:
         return False
@@ -247,10 +246,11 @@ def _persist_effective_worker_spec(
     effective_preparation = _effective_preparation_snapshot(
         public_spec, worker_spec, adapter_identity, stored_public=status.spec
     )
-    fields = {"effective_preparation": effective_preparation}
-    if estimated_cost_usd is not None:
-        fields["estimated_cost_usd"] = float(estimated_cost_usd)
-    return _runner()._update(worker_spec.run_id, status.state, **fields)
+    return _runner()._update(
+        worker_spec.run_id,
+        status.state,
+        effective_preparation=effective_preparation,
+    )
 
 
 def submit_job(

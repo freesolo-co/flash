@@ -4745,64 +4745,33 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         assert gpus_seen == [successful_allocations[0].gpu]
 
 
-def test_selected_quote_increase_rechecks_affordability(monkeypatch):
-    import flash.runner.supervise.lifecycle as lifecycle
-    import flash.server.billing.charges as billing
+def test_prepare_job_freezes_the_displayed_whole_cent_quote(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        orch = _fresh_orchestrator(tmp, monkeypatch)
+        monkeypatch.setattr(
+            "flash.cost.spec.estimate_for_spec",
+            lambda _spec: SimpleNamespace(total_usd=1.005),
+        )
 
-    status = SimpleNamespace(
-        estimated_cost_usd=1.0,
-        billing_context={"org_id": "org-1"},
-    )
-    calls = []
-    monkeypatch.setattr(
-        "flash.server.platform.internal_client.internal_key", lambda: "internal-key"
-    )
-    monkeypatch.setattr(
-        billing,
-        "precheck_training_run",
-        lambda **kwargs: calls.append(kwargs) or {"ok": True},
-    )
+        prepared = orch.prepare_job(_spec("whole-cent-quote"))
 
-    lifecycle._recheck_selected_quote_affordability(status, 2.0, io.StringIO())
-    lifecycle._recheck_selected_quote_affordability(status, 0.5, io.StringIO())
-
-    assert calls == [{"internal_key": "internal-key", "org_id": "org-1", "estimate_usd": 2.0}]
-
-    monkeypatch.setattr(
-        billing,
-        "precheck_training_run",
-        lambda **_kwargs: (_ for _ in ()).throw(billing.BillingError(402, "insufficient")),
-    )
-    with pytest.raises(lifecycle._SelectedQuoteUnaffordable):
-        lifecycle._recheck_selected_quote_affordability(status, 2.0, io.StringIO())
+        assert prepared.estimated_cost_usd == 1.01
 
 
-def test_selected_quote_refresh_failure_retries_without_skipping_the_candidate(monkeypatch):
+def test_selected_provider_never_refreshes_the_accepted_cost_quote(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         orch = _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.jobs as jobs
         import flash.providers.runpod.serverless as flash_train
-        import flash.runner.supervise.lifecycle as lifecycle
         from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
-        selected_quote_calls = []
-        affordability_rechecks = []
-        monkeypatch.setattr(
-            lifecycle,
-            "_recheck_selected_quote_affordability",
-            lambda _status, quote, _log: affordability_rechecks.append(quote),
-        )
+        estimate_allocations = []
 
-        def flaky_estimate(_spec, *, allocation=None):
-            if allocation is None:
-                return SimpleNamespace(total_usd=1.0)
-            selected_quote_calls.append(allocation)
-            if len(selected_quote_calls) == 1:
-                raise RuntimeError("revision metadata timeout")
-            return SimpleNamespace(total_usd=1.0)
+        def fixed_estimate(_spec, *, allocation=None):
+            estimate_allocations.append(allocation)
+            return SimpleNamespace(total_usd=1.005)
 
-        monkeypatch.setattr("flash.cost.spec.estimate_for_spec", flaky_estimate)
-        monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
+        monkeypatch.setattr("flash.cost.spec.estimate_for_spec", fixed_estimate)
         submitted = []
 
         def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
@@ -4813,7 +4782,7 @@ def test_selected_quote_refresh_failure_retries_without_skipping_the_candidate(m
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
-            run_id="quote-refresh-blip",
+            run_id="immutable-cost-quote",
             model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
@@ -4821,15 +4790,12 @@ def test_selected_quote_refresh_failure_retries_without_skipping_the_candidate(m
         )
         orch.submit_job(spec, dry_run=False, background=False)
 
-        assert orch.get_status(spec.run_id).state == "done"
-        # the candidate is retried, not skipped: both refreshed quotes and the eventual submission
-        # retain the same current-catalog cheapest class one attempt later.
-        assert len(selected_quote_calls) == 2
-        selected_gpu = selected_quote_calls[0].gpu
-        assert submitted == [(selected_gpu, 1)]
-        assert affordability_rechecks == [1.0]
-        assert all(allocation.gpu == selected_gpu for allocation in selected_quote_calls)
-        assert all(allocation.min_vram_gb > 0 for allocation in selected_quote_calls)
+        status = orch.get_status(spec.run_id)
+        assert status.state == "done"
+        assert status.estimated_cost_usd == 1.01
+        assert submitted == [("A100 PCIe", 0)]
+        # the only estimate is the same offline calculation shown by `flash train --cost`.
+        assert estimate_allocations == [None]
 
 
 def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):

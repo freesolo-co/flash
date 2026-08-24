@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import math
+import os
 import time
 from dataclasses import replace
 
@@ -208,14 +210,11 @@ def cancelled_charge_usd(
 ) -> float:
     """Price a mid-training cancellation from the accepted quote, scaled by the completed work.
 
-    the persisted quote (``estimated_cost_usd``) carries the exact live rate the user accepted: the
-    lifecycle refreshes it from the selected candidate before provisioning. a spec reprice through
-    ``estimate_cost`` takes the offline static-rate path, and on live-market providers (vast,
-    lambda) those rates differ materially from the accepted one, so pricing a near-complete cancel
-    that way can bill above what the run would have been charged on success. instead the quote is
-    scaled by the completed share of the estimated billed work: partial and full spec estimates use
-    the same offline rates, so the rate cancels out of their ratio and only the work fraction
-    remains. the fraction, not a bare ``steps / planned`` ratio, is what keeps the charge honest:
+    the persisted quote (``estimated_cost_usd``) is the whole-cent submit-time amount shown by
+    ``flash train --cost``. provider selection and allocation never refresh it. instead the quote is
+    scaled by the completed share of estimated billed work: partial and full spec estimates use the
+    rented topology when available, so their ratio isolates the work fraction without replacing the
+    accepted quote. the fraction, not a bare ``steps / planned`` ratio, keeps the charge honest:
     the one-time compile and each reached save land whole in the partial estimate, unreached saves
     stay out of it, and a wall-capped plan caps both sides so the fraction is measured against the
     capped horizon the quote actually paid for rather than the uncapped step count. the fraction is
@@ -251,17 +250,18 @@ def cancelled_charge_usd(
             gpu_type=gpu_type,
             gpu_count=gpu_count,
         )
-    try:
-        quote = float(quote)
-    except (TypeError, ValueError):
+    if isinstance(quote, bool) or not isinstance(quote, (int, float)):
         # a malformed persisted quote is a pricing failure, not a license to reprice: the accepted
         # rate is unknowable, so the caller's fallback must propagate and settle the run.
         return float(fallback)
-    if quote <= 0:
-        # a non-positive quote is malformed the same way: prorating it would persist a charge the
-        # billing retry predicate (cost_usd > 0) can never settle, silently stranding the run
-        # unbilled, so the fallback propagates and the caller records the pricing failure.
+    quote = float(quote)
+    if not math.isfinite(quote) or quote < 0:
+        # negative and non-finite quotes cannot represent an accepted whole-cent amount, so the
+        # fallback propagates and the caller records the pricing failure.
         return float(fallback)
+    if quote == 0:
+        # a valid quote may round to zero cents and remains authoritative for any completed work.
+        return 0.0
     partial = runner.charge_usd_for_spec(
         spec,
         steps=n,
@@ -289,7 +289,55 @@ def cancelled_charge_usd(
     return min(repriced, quote)
 
 
+def _persisted_completed_work(spec) -> tuple[int | None, dict | None]:
+    """Authoritative completed steps and rented basis from terminal metrics."""
+    try:
+        with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as handle:
+            metrics = json.load(handle)
+    except (OSError, TypeError, ValueError):
+        return None, None
+    if not isinstance(metrics, dict):
+        return None, None
+    step = metrics.get("step")
+    valid_step = (
+        isinstance(step, (int, float))
+        and not isinstance(step, bool)
+        and (not isinstance(step, float) or (math.isfinite(step) and step.is_integer()))
+        and step >= 0
+    )
+    completed_steps = int(step) if valid_step else None
+    provider = metrics.get("allocated_provider")
+    gpu = metrics.get("allocated_gpu")
+    gpu_count = metrics.get("allocated_gpu_count")
+    rented_remote = {
+        "provider": provider,
+        "allocated_gpu": gpu,
+        "allocated_gpu_count": gpu_count,
+    }
+    if not any(value is not None for value in rented_remote.values()):
+        rented_remote = None
+    return completed_steps, rented_remote
+
+
 def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
+    """Charge the quote exactly for full work, or its estimated share for an early finish."""
+    completed_steps, persisted_basis = _persisted_completed_work(spec)
+    if completed_steps is not None:
+        # reuse cancellation's estimated-work fraction: one-time compile and reached saves stay
+        # whole, unreached saves stay out, and a wall-capped plan reaches 100% at its priced cap.
+        # a complete horizon produces a fraction of exactly 1 and therefore the accepted quote.
+        status_remote = status.remote if isinstance(status.remote, dict) else {}
+        rented_remote = {
+            key: value for key, value in (persisted_basis or {}).items() if value is not None
+        }
+        rented_remote.update(status_remote)
+        return runner.cancelled_charge_usd(
+            status,
+            spec,
+            steps=completed_steps,
+            fallback=fallback,
+            rented_remote=rented_remote or None,
+        )
     quote = getattr(status, "estimated_cost_usd", None)
     if quote is not None:
         return float(quote)

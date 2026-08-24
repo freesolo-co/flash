@@ -189,6 +189,7 @@ def test_get_status_tolerates_stale_unknown_keys(monkeypatch):
 def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_path):
     import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.cost.currency import usd_amount
     from flash.cost.spec import estimate_for_spec
 
     importlib.reload(runner)
@@ -202,7 +203,7 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
         status = runner.get_status(spec.run_id)
         priced_spec = JobSpec.from_dict(status.spec)
         seen["estimate"] = float(status.estimated_cost_usd)
-        seen["expected"] = float(estimate_for_spec(priced_spec).total_usd)
+        seen["expected"] = usd_amount(estimate_for_spec(priced_spec).total_usd)
         runner._update(
             spec.run_id,
             "done",
