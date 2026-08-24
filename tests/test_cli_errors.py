@@ -203,7 +203,7 @@ def test_dry_run_without_login_fails_fast():
     assert "Traceback (most recent call last)" not in proc.stderr
 
 
-def test_cost_needs_no_live_pricing():
+def test_cost_requires_login_for_server_dry_run_preparation():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
@@ -213,9 +213,10 @@ def test_cost_needs_no_live_pricing():
                 "[train]\nepochs = 1\nmax_examples = 1\n"
             )
         proc = _run(["train", cfg, "--cost"], env=_logged_out_env(tmp))
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "TOTAL" in proc.stdout
-    assert "live GPU pricing unavailable" not in proc.stderr
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "not logged in" in proc.stderr
+    assert f"{INVOKED_CLI_NAME} login" in proc.stderr
+    assert "Traceback (most recent call last)" not in proc.stderr
 
 
 @contextlib.contextmanager

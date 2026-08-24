@@ -16,6 +16,7 @@ from flash.cli.ui.cost import (  # noqa: F401
     cost_estimate_reason,
     run_cost,
 )
+from flash.cost.currency import format_usd
 
 # one spelling of the VRAM clause for both quote renderers: the themed panel and
 # `CostEstimate.breakdown()` must not be able to describe the same shape differently.
@@ -658,12 +659,24 @@ def cost_panel(est) -> str:
             )
         )
     panel = _kv(pairs)
-    total = f"  {_paint('TOTAL'.ljust(10), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} {_paint(f'${est.total_usd:.2f}', _TEAL, '1')}"
+    total = f"  {_paint('TOTAL'.ljust(10), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} {_paint(format_usd(est.total_usd), _TEAL, '1')}"
     out = f"{header('train', 'pre-flight cost estimate')}\n{panel}\n{_rule()}\n{total}"
     if est.notes:
         notes = "\n".join(f"  {_paint(_glyph('·', '-'), _FAINT)} {_dim(n)}" for n in est.notes)
         out += f"\n\n{_dim('notes')}\n{notes}"
     return _safe(out)
+
+
+def server_cost_panel(
+    rows: list[tuple[str, str | None]], total_usd: float, description: str
+) -> str:
+    """Server-prepared quote with no invented local hardware or timing details."""
+    panel = _kv([(key, _paint(value, _ACCENT2) if key == "run" else value) for key, value in rows])
+    total = (
+        f"  {_paint('TOTAL'.ljust(8), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} "
+        f"{_paint(format_usd(total_usd), _TEAL, '1')}"
+    )
+    return _safe(f"{header('train', description)}\n{panel}\n{_rule()}\n{total}")
 
 
 def sft_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
@@ -673,13 +686,7 @@ def sft_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
     CostEstimate, and this quote is frozen server-side, so those fields are not available here.
     Rendering them would mean inventing the numbers the exact path exists to stop guessing.
     """
-    panel = _kv([(k, _paint(v, _ACCENT2) if k == "run" else v) for k, v in rows])
-    total = (
-        f"  {_paint('TOTAL'.ljust(8), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} "
-        f"{_paint(f'${total_usd:.2f}', _TEAL, '1')}"
-    )
-    head = header("train", "cost estimate (packaged dataset rows)")
-    return _safe(f"{head}\n{panel}\n{_rule()}\n{total}")
+    return server_cost_panel(rows, total_usd, "cost estimate (packaged dataset rows)")
 
 
 def project_created(project_id: str, name: str) -> str:

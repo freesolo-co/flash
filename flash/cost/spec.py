@@ -244,10 +244,10 @@ def runconfig_from_spec(spec) -> RunConfig:
 def sft_ranking_overrides(spec) -> dict:
     """Profile-derived knobs hardware ranking must price SFT on, or ``{}`` when unavailable.
 
-    Ranking runs BEFORE the quote (``_allocate_attempt`` precedes ``_estimate_selected_quote``) and
-    must never fail a submission, so this fails OPEN where ``runconfig_from_spec`` fails closed.
-    That is the only difference between them: both read the same digest-validated profile, and the
-    keys here mirror the profile-derived fields there so the two cannot describe different work.
+    Ranking runs after the customer quote is frozen and must never change that accepted amount.
+    This therefore fails open where ``runconfig_from_spec`` fails closed: ranking may degrade to a
+    conservative shape, while the quote path still requires the digest-validated profile. The keys
+    here mirror the profile-derived fields so ranking describes the same work without repricing it.
 
     ``batch_size`` is the executed batch, not the authored one -- the profile reduces it to
     ``examples_per_update``, which every exact-unpacked run pins to 1. It and

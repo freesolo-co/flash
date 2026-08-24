@@ -1,7 +1,7 @@
 """Estimate training cost from GPU time and hourly rate.
 
-Elapsed wall clock includes non-billable setup. GRPO steps include rollout, reward grading, and
-policy/reference updates.
+Elapsed wall clock includes non-billable setup. Customer estimates exclude the identifiable SFT
+framework-init block and add no GRPO reward-function latency term.
 """
 
 from __future__ import annotations
@@ -46,7 +46,9 @@ MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # small-model overhead that peak-FLOPs scaling misses. this aggregate will drift with hardware,
 # verl, and engine changes.
 #
-# grading cost is already inside this fitted step floor and is deliberately not modelled separately.
+# every calibration arm reported timing_s/reward=0.0000, so this fitted floor contains no
+# measurable reward-function wait. it covers only recurring gpu-side work and small-model
+# inefficiency that the peak-flops terms miss. reward latency therefore has no estimate term.
 STEP_FLOOR_BASE_SECONDS = 62.7
 STEP_FLOOR_SECONDS_PER_COMPLETION = 0.805
 
@@ -87,48 +89,17 @@ def step_floor_seconds(gpu: str, completions: int) -> float:
 # by matched multi-card measurements.
 STEP_FLOOR_SHARDED_FRACTION = 0.799
 
-# --- sft training-side startup block + per-step floor -------------------------------------------
-# the flops term alone quoted sft at 28.6x UNDER the realized train wall (geometric, 17 measured
-# runpod arms, 0/17 inside the 0.70-1.43x band). it is the same structural gap the rollout floor
-# above closed for grpo, and it is NOT the cold start in `setup_seconds`: `setup_seconds` and
-# `train_wall` are DISJOINT intervals in the worker (sft_train.py stamps setup before launching the
-# training subprocess, and train_wall wraps `run_verl_training` plus the upload drain), so verl
-# startup, model load, lora wrap and fsdp init sit INSIDE the billed train wall and were priced at
-# zero.
-#
-# the block scales with model size -- measured median implied block 82s at 0.8B against 248s at 4B --
-# so a size-blind constant cannot cover both: at the same in-band count it leaves a 3.75x worst arm
-# and log-sd 0.50, against 2.13x and 0.32 for the size-scaled form below.
-#
-# fitted over 17 arms (2 cards, 2 model sizes, step counts 2/32/64/128/256, including the replicate
-# groups) and selected by holding out an ENTIRE step-count class at a time, the same methodology
-# that chose the rollout floor: a random holdout cannot test whether a form extrapolates to a shape
-# it never saw. least squares lands at (58.3, 44.3, 0.948); the shipped triple is the rounded
-# neighbour that survives holdout best. scored: 28.596x -> 1.013x geometric, 0/17 -> 14/17 in band,
-# worst arm 1135x -> 2.13x, and it holds under a model holdout in both directions (0.8B 1.005x,
-# 4B 1.033x), so the size term is not an artifact of the size that dominates the sample.
-#
-# KNOWN RESIDUAL, and the reason this is not tuned further: the same config on a different runpod
-# HOST CLASS (nvidia driver build) spans 1.56x-1.88x, while replicates within one build agree to
-# 1.01x-1.03x. the quote cannot observe which build it will be handed, so roughly half the remaining
-# per-arm error is hardware the estimator has no input for. re-fitting below that resolution would
-# be fitting the confounder. evidence: /home/azureuser/benchmark/cost-calib-20260801/ISSUES.md.
-SFT_STARTUP_BASE_SECONDS = 60.0
-SFT_STARTUP_SECONDS_PER_PARAM_B = 40.0
+# --- sft recurring per-step floor ---------------------------------------------------------------
+# the measured sft train wall includes a one-time verl/model/lora/fsdp startup block and recurring
+# per-step publish/sync work. customer policy excludes the one-time framework setup from the quote,
+# while the recurring per-step work remains billable training. setup_seconds reports cold start and
+# model initialization separately for observability and never contributes to total_usd.
 SFT_STEP_FLOOR_SECONDS = 0.8
 
 
-def sft_overhead_seconds(config: RunConfig, steps: int) -> float:
-    """Training-wall seconds an sft run pays outside its flops term.
-
-    A one-time startup block that grows with checkpoint size, plus a per-step floor. Neither is
-    divided by card count: the block is model load and framework init that every rank pays, and the
-    per-step floor is dominated by the same non-shardable publish/sync work as the rollout floor.
-    """
-    n = config.normalized()
-    params_b = total_params_b(n.model_id, n.model_revision)
-    block = SFT_STARTUP_BASE_SECONDS + SFT_STARTUP_SECONDS_PER_PARAM_B * params_b
-    return block + SFT_STEP_FLOOR_SECONDS * max(0, steps)
+def sft_step_floor_seconds(steps: int) -> float:
+    """Recurring sft training seconds outside the flops term."""
+    return SFT_STEP_FLOOR_SECONDS * max(0, steps)
 
 
 def _step_floor_seconds_for(config: RunConfig, gpu: str) -> float:
@@ -387,14 +358,15 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
         return flops / (peak * sft_mfu), overhead
 
-    # GRPO step = rollout (G completions/prompt) + policy/ref update. grading is represented in
-    # the fitted step floor rather than modelled as a separate wall.
+    # grpo step = rollout (g completions/prompt) + policy/reference update. reward-function
+    # latency is deliberately absent: all floor-calibration arms measured timing_s/reward=0.
     completions = n.batch_size * n.group_size
     gen_tokens = completions * float(n.completion_len)
     gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * MFU_DECODE)
     update_s = (GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * gen_tokens) / (peak * update_mfu)
-    # old_log_prob, weight sync, checkpointing, and grading are covered by the fitted floor. only
-    # the STEP_FLOOR_SHARDED_FRACTION part shards; callers must use sharded_step_seconds().
+    # old_log_prob, weight sync, checkpointing, and small-model inefficiency are covered by the
+    # fitted floor. reward latency is not. only STEP_FLOOR_SHARDED_FRACTION shards; callers must
+    # use sharded_step_seconds().
     floor_s = step_floor_seconds(gpu, completions)
     return gen_s + update_s + floor_s, overhead
 
@@ -685,10 +657,10 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
             launched = executed_gpu_count(config, count)
             if combined_vram_gb(info.vram_gb, launched) < need:
                 continue
-            # Provisional quoting is structural and must not touch a live market. Vast pricing is
-            # offer-backed (therefore capacity-backed), and Lambda's catalog can blip too. Use the
-            # provider's offline static rate here; the lifecycle replaces it from the selected candidate
-            # before provisioning, so the persisted/charged quote still carries the exact live rate.
+            # customer quoting is structural and must not touch a live market. vast pricing is
+            # offer-backed (therefore capacity-backed), and lambda's catalog can blip too. use the
+            # provider's offline static rate here; allocation may later select a different live rate,
+            # but that operational price never changes the accepted customer quote.
             if provider == "lambda":
                 from flash.providers.lambda_.pricing import static_hourly_rate
 
@@ -905,16 +877,17 @@ def estimate_cost(
     # training GPU time, so it belongs in the (billed) train term, not setup. Required saves are also
     # synchronous fixed overhead; neither is divided by the number of cards.
     compile_s = compile_seconds(config, gpu)
-    # sft pays a startup block and per-step floor inside its BILLED train wall that the flops term
-    # does not model (see sft_overhead_seconds); grpo/opd carry the equivalent in their step floor.
-    sft_overhead_s = sft_overhead_seconds(config, config.steps) if config.method == "sft" else 0.0
-    raw_train = compile_s + config.steps * sps + required_save_s + sft_overhead_s
+    # setup_seconds is excluded for every method. the separately identifiable sft framework-init
+    # block is excluded here too; grpo/opd retain their aggregate recurring-work floor because its
+    # calibration cannot safely split synchronization, checkpointing, and any in-train init.
+    sft_floor_s = sft_step_floor_seconds(config.steps) if config.method == "sft" else 0.0
+    raw_train = compile_s + config.steps * sps + required_save_s + sft_floor_s
     if not config.is_grpo and config.train_tokens is not None:
         raw_train = (
             compile_s
             + sft_seconds_for_tokens(config, gpu, config.train_tokens) / speedup
             + required_save_s
-            + sft_overhead_s
+            + sft_floor_s
         )
     sps = raw_train / config.steps
 
