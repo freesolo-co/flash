@@ -24,7 +24,6 @@ in the offline test env, so we stub it just enough to import and reach _build_ch
 from __future__ import annotations
 
 import hashlib
-import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -45,7 +44,7 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
 
 
 @pytest.fixture(scope="module")
-def modal_app_module():
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -58,21 +57,7 @@ def modal_app_module():
     app_mock.local_entrypoint.side_effect = _passthrough_decorator
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    _MISSING = object()
-    prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.app.modal_app", _MISSING)
-    sys.modules["modal"] = modal_stub
-
-    import flash.serving.app.modal_app as modal_app
-
-    try:
-        yield modal_app
-    finally:
-        for name, prev in (("modal", prev_modal), ("modal_app", prev_modal_app)):
-            if prev is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
+    return load_modal_app_under_stub(modal_stub)
 
 
 class _FakeResp:

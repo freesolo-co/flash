@@ -8,7 +8,6 @@ billed to the CALLING org — the backend authorizes it and returns the caller's
 
 from __future__ import annotations
 
-import sys
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -179,7 +178,7 @@ def test_adapter_record_defaults_serve_base_model_false() -> None:
 
 
 @pytest.fixture
-def modal_app_module():
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
 
     def _passthrough(*_a, **_k):
@@ -196,20 +195,7 @@ def modal_app_module():
         getattr(app_mock, attr).side_effect = _passthrough
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    _MISSING = object()
-    prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.app.modal_app", _MISSING)
-    sys.modules["modal"] = modal_stub
-    import flash.serving.app.modal_app as modal_app
-
-    try:
-        yield modal_app
-    finally:
-        for name, prev in (("modal", prev_modal), ("modal_app", prev_modal_app)):
-            if prev is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
+    return load_modal_app_under_stub(modal_stub)
 
 
 def test_base_model_records_seed_one_open_record_per_model(modal_app_module):

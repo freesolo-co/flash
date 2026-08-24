@@ -4,8 +4,9 @@ RunPod (always on) and the instance-based complements — Lambda (opt-in via LAM
 Vast (opt-in via VAST_API_KEY) — all implement the SAME ``base.Provider`` interface, so the
 orchestrator/allocator treat them interchangeably.
 
-Every provider carries the universal per-substrate surface below (``PROVIDER_MODULES``). Modules
-that only SOME providers need are divergence-driven, not part of the contract: ``gpus`` exists only
+Every provider carries the universal per-substrate client surface in ``CLIENT_MODULES`` plus the
+provider-specific jobs module returned by ``_jobs_module``. Modules that only SOME providers need
+are divergence-driven, not part of the contract: ``gpus`` exists only
 where a provider translates friendly names to substrate ids (RunPod validated classes, Lambda's
 ``instance_type_for``) — instance providers otherwise draw ``gpu_classes`` from the shared
 ``base.gpu_classes_for``; ``train`` exists only for RunPod's serverless endpoint-deploy machinery
@@ -24,7 +25,6 @@ _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 # the per-substrate client surface now lives under each provider's `client` subpackage;
 # `jobs` stays at the provider root (runpod groups its heavier job modules in `execution`).
 CLIENT_MODULES = ("api", "auth", "pricing", "preflight")
-PROVIDER_MODULES = (*CLIENT_MODULES, "jobs")
 PROVIDER_METHODS = (
     "is_configured",
     "preflight",

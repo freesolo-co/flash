@@ -32,7 +32,7 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
 
 
 @pytest.fixture(scope="module")
-def modal_app_module():
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -45,24 +45,7 @@ def modal_app_module():
     app_mock.local_entrypoint.side_effect = _passthrough_decorator
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    _MISSING = object()
-    prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.app.modal_app", _MISSING)
-    sys.modules["modal"] = modal_stub
-    # Force a fresh import UNDER the stub: if another test imported modal_app earlier (without this
-    # stub), Python would reuse the cached module and the stub wouldn't apply, making this fixture
-    # order-dependent. Drop the cached module first; the finally block restores the prior entry.
-    sys.modules.pop("flash.serving.app.modal_app", None)
-    import flash.serving.app.modal_app as modal_app  # imported after the stub is installed
-
-    try:
-        yield modal_app
-    finally:
-        for name, prev in (("modal", prev_modal), ("modal_app", prev_modal_app)):
-            if prev is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
+    return load_modal_app_under_stub(modal_stub)
 
 
 _DEVELOPMENT_CUSTOM_DOMAIN = "serve-dev.freesolo.co"
@@ -406,7 +389,7 @@ builtins.__import__ = blocked_import
 import flash.serving.src.engine.lora_engine
 
 assert "PIL" not in sys.modules
-assert "flash.serving.src.multimodal" not in sys.modules
+assert "flash.serving.src.io.multimodal" not in sys.modules
 """
     result = subprocess.run(
         [sys.executable, "-c", code],

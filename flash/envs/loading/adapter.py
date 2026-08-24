@@ -1,7 +1,7 @@
 """Adapter that runs Freesolo SDK environments on Flash.
 
-Loading / reference resolution / dataset probing live in :mod:`flash.envs.loading.loader`; the loader-side
-public names are re-exported here so existing ``flash.envs.adapter`` import paths keep working.
+Loading, reference resolution, and dataset probing live in :mod:`flash.envs.loading.loader`; this
+module keeps the environment adapter focused on episode execution and scoring.
 """
 
 from __future__ import annotations

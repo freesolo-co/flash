@@ -3124,15 +3124,13 @@ def _spec(run_id):
 def test_unstructured_prepare_does_not_import_serving_preflight(monkeypatch):
     import builtins
 
-    import flash.runner as runner
-
     class ReachedModelResolution(Exception):
         pass
 
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
-        if name == "flash.serve.preflight":
+        if name == "flash.serve.deployment.preflight":
             pytest.fail("unstructured preparation imported optional serving dependencies")
         return original_import(name, *args, **kwargs)
 
@@ -3140,6 +3138,9 @@ def test_unstructured_prepare_does_not_import_serving_preflight(monkeypatch):
         raise ReachedModelResolution
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    import flash.runner as runner
+
     monkeypatch.setattr(runner, "resolve_model", stop_at_model_resolution)
 
     with pytest.raises(ReachedModelResolution):
