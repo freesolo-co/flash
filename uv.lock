@@ -1466,20 +1466,21 @@ wheels = [
 
 [[package]]
 name = "freesolo"
-version = "0.4.1"
+version = "0.4.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "httpx" },
     { name = "openai" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f4/59/4fbc3cb6813ae2ebec51e35cf7128c4d34b2a07e34b0ec7c85053ad850e7/freesolo-0.4.1.tar.gz", hash = "sha256:7e59492a5bf30b01ac7124b2164addde1b65f14b30f87f346da6c089930b6dff", size = 331064, upload-time = "2026-08-12T10:06:26.621Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9b/f7/acb72339f2c5553248c7ac7f191a7a9e3a82999ab4937c3a9d2b87547ca9/freesolo-0.4.2.tar.gz", hash = "sha256:ce4f1f31fb65d1fd017ed76e1f859ede0fcb0b99d8b243b56b20314b438cfe40", size = 35625, upload-time = "2026-08-24T14:27:27.99Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2a/eb/468f33119b74ebc249ecf528dcfc01e3a579362ef7cb58ca929567dc0982/freesolo-0.4.1-py3-none-any.whl", hash = "sha256:65db09befc335c8004ba4c542a7040fe643e1d1aaf765e2bb9c02b22fa38c893", size = 45388, upload-time = "2026-08-12T10:06:25.364Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/05/164fcb1f8581e207d819273c3723db78d3f4c5e413fb24447c9b1e39783d/freesolo-0.4.2-py3-none-any.whl", hash = "sha256:fb2b9209cedfbf9c4f51418e74c2b5775fce5f0505cd9ad36ae30e97a9b274ee", size = 46971, upload-time = "2026-08-24T14:27:26.872Z" },
 ]
 
 [[package]]
 name = "freesolo-flash"
-version = "1.2.112"
+version = "1.2.113"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1581,9 +1582,9 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'serve-runtime'", specifier = ">=0.136,<0.137" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.136,<1" },
     { name = "fastapi", marker = "extra == 'serving'", specifier = ">=0.136,<1" },
-    { name = "freesolo", marker = "extra == 'dev'", specifier = ">=0.4.1" },
-    { name = "freesolo", marker = "extra == 'gpu'", specifier = ">=0.4.1" },
-    { name = "freesolo", marker = "extra == 'server'", specifier = ">=0.4.1" },
+    { name = "freesolo", marker = "extra == 'dev'", specifier = ">=0.4.2" },
+    { name = "freesolo", marker = "extra == 'gpu'", specifier = ">=0.4.2" },
+    { name = "freesolo", marker = "extra == 'server'", specifier = ">=0.4.2" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'server'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'serving'", specifier = ">=0.27.0" },
@@ -1636,7 +1637,7 @@ provides-extras = ["gpu", "server", "serving", "serve-runtime", "dev"]
 [package.metadata.requires-dev]
 dev = [
     { name = "datasets", specifier = ">=2.19" },
-    { name = "freesolo", specifier = ">=0.4.1" },
+    { name = "freesolo", specifier = ">=0.4.2" },
     { name = "mypy", specifier = ">=1.13.0" },
     { name = "packaging", specifier = ">=24,<27" },
     { name = "pillow", specifier = ">=11" },
