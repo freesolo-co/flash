@@ -50,6 +50,35 @@ def messages_for_chat_template(messages: list[dict[str, Any]]) -> list[dict[str,
     return normalized
 
 
+def _messages_for_content_only_serialization(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Inline reasoning that ``preserve_thinking=False`` keeps for content-only consumers."""
+    last_user = max(
+        (index for index, message in enumerate(messages) if message.get("role") == "user"),
+        default=-1,
+    )
+    serialized: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        copied = dict(message)
+        reasoning = copied.get("reasoning_content")
+        if index > last_user and copied.get("role") == "assistant":
+            prefix = (
+                f"<think>\n{reasoning.strip()}\n</think>\n\n"
+                if isinstance(reasoning, str)
+                else "<think>\n\n</think>\n\n"
+            )
+            content = copied.get("content")
+            if isinstance(content, list):
+                copied["content"] = [{"type": "text", "text": prefix}, *content]
+            elif content is None:
+                copied["content"] = prefix
+            elif isinstance(content, str):
+                copied["content"] = prefix + content
+        serialized.append(copied)
+    return serialized
+
+
 def strip_think(completion: str | None, *, prompt_opened_thinking: bool = False) -> str | None:
     """Drop <think> reasoning spans before grading. Uses LAST </think> (answer extraction);
     unclosed reasoning returns "" to score 0 (reward pressure to finish within budget)."""

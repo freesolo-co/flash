@@ -156,12 +156,8 @@ def _processor_expanded_prompt(
     return [int(token_id) for token_id in input_ids], rendered
 
 
-def _verl_grpo_parquet_features(*, include_reasoning: bool):
-    """provide an explicit arrow schema for multimodal grpo rows.
-
-    mixed text/image jobs can infer an all-empty ``images`` column as null, which verl cannot read
-    as a struct. the pinned schema keeps every row compatible.
-    """
+def _verl_grpo_parquet_features(*, multimodal: bool, include_reasoning: bool):
+    """provide one explicit arrow schema for the full grpo row set."""
     from datasets import Features, Value
 
     prompt = {
@@ -170,28 +166,38 @@ def _verl_grpo_parquet_features(*, include_reasoning: bool):
     }
     if include_reasoning:
         prompt["reasoning_content"] = Value("string")
-    return Features(
-        {
-            "data_source": Value("string"),
-            "prompt": [prompt],
-            "images": [{"image": Value("string")}],
-            "ability": Value("string"),
-            "reward_model": {"style": Value("string"), "ground_truth": Value("string")},
-            "extra_info": {"split": Value("string"), "index": Value("int64")},
-        }
-    )
+    features = {
+        "data_source": Value("string"),
+        "prompt": [prompt],
+        "ability": Value("string"),
+        "reward_model": {"style": Value("string"), "ground_truth": Value("string")},
+        "extra_info": {"split": Value("string"), "index": Value("int64")},
+    }
+    if multimodal:
+        # mixed jobs can otherwise infer an all-empty images column as null, which verl cannot read.
+        features["images"] = [{"image": Value("string")}]
+    return Features(features)
+
+
+def _grpo_reasoning_schema(rows: list[dict]) -> bool:
+    include_reasoning = False
+    for row in rows:
+        for message in row.get("prompt", []):
+            if "reasoning_content" not in message:
+                continue
+            include_reasoning = True
+            if not isinstance(message["reasoning_content"], str):
+                raise ValueError("prompt reasoning_content must be text")
+    return include_reasoning
 
 
 def write_verl_grpo_parquet(rows: list[dict], path: str) -> None:
-    """write grpo rows to parquet, pinning the schema when the job is multimodal."""
+    """write grpo rows with one explicit schema derived from the full row set."""
     from datasets import Dataset
 
-    multimodal = any("images" in row for row in rows)
-    include_reasoning = any(
-        "reasoning_content" in message for row in rows for message in row.get("prompt", [])
-    )
-    features = (
-        _verl_grpo_parquet_features(include_reasoning=include_reasoning) if multimodal else None
+    features = _verl_grpo_parquet_features(
+        multimodal=any("images" in row for row in rows),
+        include_reasoning=_grpo_reasoning_schema(rows),
     )
     Dataset.from_list(rows, features=features).to_parquet(path)
 

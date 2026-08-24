@@ -42,26 +42,16 @@ def test_sft_max_context_tokens_at_cap_allowed():
     )
 
 
-def test_27b_sft_context_at_serving_cap_allowed():
+def test_pending_hosted_candidate_retains_serving_context_metadata():
     preflight_train_context_within_serving(
         _spec(model="Qwen/Qwen3.8-27B", algorithm="sft", max_context_tokens=32768)
     )
-
-
-def test_27b_sft_context_above_serving_cap_rejected():
-    spec = _spec(model="Qwen/Qwen3.8-27B", algorithm="sft", max_context_tokens=32769)
-    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
-        preflight_train_context_within_serving(spec)
-
-
-def test_27b_grpo_effective_rollout_above_serving_cap_rejected():
-    spec = _spec(
-        model="Qwen/Qwen3.8-27B",
-        algorithm="grpo",
-        max_completion_tokens=40000,
-    )
-    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
-        preflight_train_context_within_serving(spec)
+    for spec in (
+        _spec(model="Qwen/Qwen3.8-27B", algorithm="sft", max_context_tokens=32769),
+        _spec(model="Qwen/Qwen3.8-27B", algorithm="grpo", max_completion_tokens=40000),
+    ):
+        with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
+            preflight_train_context_within_serving(spec)
 
 
 def test_sft_unset_max_context_tokens_allowed():

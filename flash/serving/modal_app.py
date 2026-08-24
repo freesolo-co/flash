@@ -317,7 +317,14 @@ def _engine_class_name(gpu: str, max_inputs: int) -> str:
     return f"{base}_c{max_inputs}"
 
 
-def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int) -> Any:
+def _build_engine(
+    gpu: str,
+    class_name: str,
+    max_inputs: int,
+    target_inputs: int,
+    *,
+    historical_cleanup_only: bool = False,
+) -> Any:
     """Register one Modal ``@app.cls`` LoraEngine pinned to ``gpu``.
 
     Modal fixes a class's GPU at decoration time, so the A100-80GB 35B model and the L4 models need
@@ -344,6 +351,8 @@ def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int
             record_dict: dict[str, Any],
             deployment_generation: str | None = None,
         ) -> dict[str, Any]:
+            if self.historical_cleanup_only:
+                raise RuntimeError("historical cleanup engines cannot register adapters")
             return await self._register(record_dict, deployment_generation)
 
         @modal.method()
@@ -353,6 +362,8 @@ def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int
             record_dict: dict[str, Any] | None = None,
             expected_checkpoint: str | None = None,
         ) -> dict[str, Any]:
+            if self.historical_cleanup_only:
+                raise RuntimeError("historical cleanup engines cannot generate")
             return await self._generate(payload_dict, record_dict, expected_checkpoint)
 
         @modal.method(is_generator=True)
@@ -362,6 +373,8 @@ def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int
             record_dict: dict[str, Any] | None = None,
             expected_checkpoint: str | None = None,
         ):
+            if self.historical_cleanup_only:
+                raise RuntimeError("historical cleanup engines cannot generate")
             async for event in self._stream_generate(
                 payload_dict, record_dict, expected_checkpoint
             ):
@@ -384,6 +397,7 @@ def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int
     # model name, so a base model accidentally routed onto the wrong tier's class surfaces in health
     # instead of being masked by the expected-tier lookup.
     _Engine.pinned_gpu = gpu
+    _Engine.historical_cleanup_only = historical_cleanup_only
     # Give the REAL class its distinct, module-level identity BEFORE decorating. A clean (no-``<locals>``)
     # __qualname__ satisfies Modal's global-scope validation, and binding it as a module attribute under
     # that name makes ``getattr(module, class_name)`` resolve the class Modal re-imports in the container.
@@ -432,13 +446,22 @@ def _engine_cls_for(base_model: str) -> Any:
     return ENGINE_BY_KEY[_engine_key(base_model)]
 
 
-_HISTORICAL_CLEANUP_ENGINE_KEYS = {"Qwen/Qwen3.6-27B": ("H100", 16)}
+_HISTORICAL_QWEN36_27B_CLEANUP_ENGINE = _build_engine(
+    "H100",
+    "LoraEngine_H100_c16_historical_cleanup",
+    16,
+    12,
+    historical_cleanup_only=True,
+)
+_HISTORICAL_CLEANUP_ENGINES = {
+    "Qwen/Qwen3.6-27B": _HISTORICAL_QWEN36_27B_CLEANUP_ENGINE,
+}
 
 
 def _cleanup_engine_cls_for(base_model: str) -> Any:
-    """Resolve active engines plus the one retired hosted engine needed for exact eviction."""
-    key = _HISTORICAL_CLEANUP_ENGINE_KEYS.get(base_model)
-    return ENGINE_BY_KEY[key] if key is not None else _engine_cls_for(base_model)
+    """Resolve active engines plus retired engines that support unregister only."""
+    cleanup_engine = _HISTORICAL_CLEANUP_ENGINES.get(base_model)
+    return cleanup_engine if cleanup_engine is not None else _engine_cls_for(base_model)
 
 
 class _ModalEnginePool:

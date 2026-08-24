@@ -1206,16 +1206,50 @@ def test_mixed_job_parquet_round_trips_the_images_column(tmp_path):
     assert table.column("prompt").to_pylist() == [row["prompt"] for row in rows]
 
 
-def test_text_only_parquet_does_not_pin_the_multimodal_schema(tmp_path):
-    # the control: a text job's rows have no images column at all, so pinning the multimodal schema
-    # would fail the write outright.
+def test_text_only_parquet_omits_multimodal_and_reasoning_fields_when_unauthored(tmp_path):
     rows = rl_train.build_verl_dataset_rows([[{"role": "user", "content": "q"}]], [0], ["a"])
     path = str(tmp_path / "train.parquet")
     rl_train.write_verl_grpo_parquet(rows, path)
 
     import pyarrow.parquet as pq
 
-    assert "images" not in pq.read_table(path).schema.names
+    table = pq.read_table(path)
+    assert "images" not in table.schema.names
+    prompt_type = table.schema.field("prompt").type.value_type
+    assert "reasoning_content" not in [field.name for field in prompt_type]
+
+
+def test_text_only_parquet_preserves_reasoning_first_authored_on_a_later_row(tmp_path):
+    rows = rl_train.build_verl_dataset_rows(
+        [
+            [{"role": "user", "content": "first"}],
+            [
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "answer", "reasoning_content": "old"},
+            ],
+        ],
+        [0, 1],
+        ["a", "b"],
+    )
+    path = str(tmp_path / "reasoning.parquet")
+
+    rl_train.write_verl_grpo_parquet(rows, path)
+
+    datasets = pytest.importorskip("datasets")
+    restored = datasets.Dataset.from_parquet(path)
+    assert restored[1]["prompt"][1]["reasoning_content"] == "old"
+    assert "reasoning_content" in restored.features["prompt"].feature
+
+
+def test_grpo_parquet_rejects_non_string_authored_reasoning(tmp_path):
+    rows = rl_train.build_verl_dataset_rows(
+        [[{"role": "assistant", "content": "answer", "reasoning_content": ["old"]}]],
+        [0],
+        ["a"],
+    )
+
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        rl_train.write_verl_grpo_parquet(rows, str(tmp_path / "invalid-reasoning.parquet"))
 
 
 # ------------------------------- override generation -------------------------------

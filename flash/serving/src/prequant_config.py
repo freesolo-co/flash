@@ -1,8 +1,9 @@
-"""Prequantized checkpoint mapping for hosted serving.
+"""Prequantized checkpoint mapping for active hosted serving.
 
-The 9B loads a Freesolo-owned compressed-tensors FP8 checkpoint. Qwen3.8 27B loads Qwen's official
-native block-FP8 checkpoint. The 35B MoE mapping remains its official FP8 default, although the
-validated engine override serves the base bf16 weights so full-expert LoRA and CUDA graphs coexist.
+The 9B loads a Freesolo-owned compressed-tensors FP8 checkpoint. The 35B MoE mapping remains its
+official FP8 default, although the validated engine override serves the base bf16 weights so
+full-expert LoRA and CUDA graphs coexist. Pending hosted candidates keep their pins in model_config
+without entering this active mapping.
 """
 
 from __future__ import annotations
@@ -12,9 +13,8 @@ OWNED_FP8_MODEL_REPOS: dict[str, str] = {
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
 }
 
-# official qwen checkpoints. qwen3.8 27b declares native fp8 with 128x128 weight blocks.
+# official qwen checkpoints active in hosted serving.
 OFFICIAL_FP8_MODEL_REPOS: dict[str, str] = {
-    "Qwen/Qwen3.8-27B": "Qwen/Qwen3.8-27B-FP8",
     "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B-FP8",
 }
 

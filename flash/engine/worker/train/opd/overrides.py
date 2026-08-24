@@ -462,7 +462,7 @@ def _build_opd_child_env(
     return child
 
 
-def _opd_multimodal_parquet_features(*, include_reasoning: bool):
+def _opd_parquet_features(*, multimodal: bool, include_reasoning: bool):
     from datasets import Features, Value
 
     prompt = {
@@ -471,18 +471,30 @@ def _opd_multimodal_parquet_features(*, include_reasoning: bool):
     }
     if include_reasoning:
         prompt["reasoning_content"] = Value("string")
-    return Features(
-        {
-            "prompt": [prompt],
-            "images": [{"image": Value("string")}],
-            "data_source": Value("string"),
-            "reward_model": {
-                "style": Value("string"),
-                "ground_truth": Value("string"),
-            },
-            "extra_info": {"index": Value("int64")},
-        }
-    )
+    features = {
+        "prompt": [prompt],
+        "data_source": Value("string"),
+        "reward_model": {
+            "style": Value("string"),
+            "ground_truth": Value("string"),
+        },
+        "extra_info": {"index": Value("int64")},
+    }
+    if multimodal:
+        features["images"] = [{"image": Value("string")}]
+    return Features(features)
+
+
+def _opd_reasoning_schema(rows: list[dict]) -> bool:
+    include_reasoning = False
+    for row in rows:
+        for message in row.get("prompt", []):
+            if "reasoning_content" not in message:
+                continue
+            include_reasoning = True
+            if not isinstance(message["reasoning_content"], str):
+                raise ValueError("prompt reasoning_content must be text")
+    return include_reasoning
 
 
 # arrow duplicates shared prompt references, so one table scales host ram with the full horizon.
@@ -497,22 +509,13 @@ def _write_opd_parquet(rows: list[dict], path: str) -> None:
     if not rows:
         raise ValueError("refusing to write an empty OPD parquet")
     multimodal = any("images" in row for row in rows)
-    include_reasoning = any(
-        "reasoning_content" in message for row in rows for message in row.get("prompt", [])
-    )
-    features = (
-        _opd_multimodal_parquet_features(include_reasoning=include_reasoning)
-        if multimodal
-        else None
-    )
-    # pin one schema for every batch. multimodal takes it from the declared features exactly as the
-    # single-table write did; text infers it from the first batch so a later batch cannot silently
-    # infer a different type and be rejected mid-file.
-    schema = (
-        features.arrow_schema
-        if features is not None
-        else pa.Table.from_pylist(rows[:_OPD_PARQUET_WRITE_BATCH_ROWS]).schema
-    )
+    include_reasoning = _opd_reasoning_schema(rows)
+    # derive one explicit schema from the full row set before opening the writer. this keeps optional
+    # reasoning authored after the first batch and the multimodal images struct stable across batches.
+    schema = _opd_parquet_features(
+        multimodal=multimodal,
+        include_reasoning=include_reasoning,
+    ).arrow_schema
     # write to a sibling temp file and rename only once every batch landed. closing a partially
     # written ParquetWriter still emits a valid footer, so failing in place would leave a READABLE
     # short file at `path` -- a truncated horizon that trains silently instead of raising.

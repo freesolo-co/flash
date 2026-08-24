@@ -773,6 +773,91 @@ def test_teacher_prompt_text_reads_content_blocks_rather_than_their_repr():
     assert opd_gkd._teacher_prompt_text([{"role": "user", "content": "hi"}]).startswith("User: hi")
 
 
+def _normalized_teacher_history(later_reasoning):
+    from flash.content.thinking import messages_for_chat_template
+
+    later_content = (
+        f"<think>{later_reasoning}</think>later answer"
+        if later_reasoning is not None
+        else "later answer"
+    )
+    messages = messages_for_chat_template(
+        [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "assistant", "content": later_content},
+        ]
+    )
+    if later_reasoning is not None:
+        assert messages[-1]["reasoning_content"] == later_reasoning
+    else:
+        assert "reasoning_content" not in messages[-1]
+    return messages
+
+
+@pytest.mark.parametrize(
+    ("later_reasoning", "later_content"),
+    [
+        ("later reasoning", "<think>\nlater reasoning\n</think>\n\nlater answer"),
+        (None, "<think>\n\n</think>\n\nlater answer"),
+    ],
+)
+def test_text_teacher_payload_matches_preserve_false_reasoning_history(
+    later_reasoning, later_content
+):
+    from flash.engine.worker.train.opd.gkd import _teacher_prompt_text
+
+    messages = _normalized_teacher_history(later_reasoning)
+
+    assert _teacher_prompt_text(messages) == (
+        "User: question\n"
+        "Assistant: <think>\n\n</think>\n\nfirst answer\n"
+        f"Assistant: {later_content}\n"
+        "Assistant: "
+    )
+
+
+@pytest.mark.parametrize(
+    ("later_reasoning", "later_content"),
+    [
+        ("later reasoning", "<think>\nlater reasoning\n</think>\n\nlater answer"),
+        (None, "<think>\n\n</think>\n\nlater answer"),
+    ],
+)
+def test_multimodal_teacher_payload_matches_preserve_false_reasoning_history(
+    later_reasoning, later_content
+):
+    from flash.content.multimodal import image_teacher_prompt_messages
+    from flash.engine.worker.teacher.client import _chat_messages
+
+    messages = _normalized_teacher_history(later_reasoning)
+    messages[0]["content"] = [
+        {"type": "image"},
+        {"type": "text", "text": "question"},
+    ]
+    teacher_messages = image_teacher_prompt_messages(messages, 1)
+
+    assert _chat_messages(
+        teacher_messages,
+        "completion",
+        ["data:image/png;base64,aW1hZ2U="],
+    ) == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+                },
+                {"type": "text", "text": "question"},
+            ],
+        },
+        {"role": "assistant", "content": "<think>\n\n</think>\n\nfirst answer"},
+        {"role": "assistant", "content": later_content},
+        {"role": "assistant", "content": "completion"},
+    ]
+
+
 def test_thinking_prefill_text_is_template_delta(monkeypatch):
     """Regression (opd.py): the thinking prefill is the DELTA a thinking-mode chat template
     opens after the generation prompt (enable_thinking True vs False). Empty when thinking is off (the

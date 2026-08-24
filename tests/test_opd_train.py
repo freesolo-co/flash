@@ -858,6 +858,38 @@ def test_opd_multimodal_parquet_preserves_reasoning_content_for_child(tmp_path):
     }
 
 
+def test_text_opd_parquet_preserves_reasoning_first_authored_after_initial_batch(tmp_path):
+    datasets = pytest.importorskip("datasets")
+    rows = [_opd_row(index, multimodal=False) for index in range(_OPD_PARQUET_WRITE_BATCH_ROWS + 1)]
+    rows[-1]["prompt"][0]["reasoning_content"] = "late reasoning"
+    path = tmp_path / "late-reasoning.parquet"
+
+    _write_opd_parquet(rows, str(path))
+
+    restored = datasets.Dataset.from_parquet(str(path))
+    assert restored[-1]["prompt"][0]["reasoning_content"] == "late reasoning"
+    assert "reasoning_content" in restored.features["prompt"].feature
+
+
+def test_text_opd_parquet_omits_reasoning_when_unauthored(tmp_path):
+    datasets = pytest.importorskip("datasets")
+    path = tmp_path / "no-reasoning.parquet"
+
+    _write_opd_parquet([_opd_row(0, multimodal=False)], str(path))
+
+    restored = datasets.Dataset.from_parquet(str(path))
+    assert "reasoning_content" not in restored.features["prompt"].feature
+    assert restored[0]["prompt"] == [{"role": "user", "content": "prompt 0"}]
+
+
+def test_opd_parquet_rejects_non_string_authored_reasoning(tmp_path):
+    row = _opd_row(0, multimodal=False)
+    row["prompt"][0]["reasoning_content"] = {"text": "not canonical"}
+
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        _write_opd_parquet([row], str(tmp_path / "invalid-reasoning.parquet"))
+
+
 class _MockMultimodalProcessor:
     image_token_id = 151655
 

@@ -124,11 +124,12 @@ def test_public_rows_prune_unset_serving_capacity_fields():
     }
 
 
-def test_serving_repos_match_current_serving_matrix() -> None:
-    # 9b is freesolo-owned fp8, 27b is official qwen fp8, and the qwen3.6 moe serves base bf16.
-    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-9B"] == "Freesolo-Co/Qwen3.5-9B-FP8"
-    assert SERVING_MODEL_REPOS["Qwen/Qwen3.8-27B"] == "Qwen/Qwen3.8-27B-FP8"
-    assert SERVING_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"] == "Qwen/Qwen3.6-35B-A3B"
+def test_serving_repos_match_current_active_serving_matrix() -> None:
+    assert SERVING_MODEL_REPOS == {
+        "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
+        "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B",
+    }
+    assert MODELS["Qwen/Qwen3.8-27B"].serving is not None
 
 
 def test_qwen38_27b_fixture_binds_checkpoint_metadata() -> None:

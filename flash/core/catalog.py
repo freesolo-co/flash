@@ -204,14 +204,10 @@ class ModelInfo:
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 
-# the checkpoint each base model's serving engine loads. the 9b uses a freesolo-owned fp8 checkpoint,
-# the 27b uses qwen's official native block-fp8 checkpoint, and the 35b-a3b moe serves its base bf16
-# checkpoint because its full-expert lora path is incompatible with fp8 on the validated h200 tier.
-# informational for the catalog mirror; adapter
-# deployment gates read max_lora_rank, and serving preflight reads max_model_len.
+# the checkpoint each active hosted base model's serving engine loads. qwen3.8-27b remains a
+# training model and a pinned hosted candidate, but does not enter this active map before its canary.
 SERVING_MODEL_REPOS: dict[str, str] = {
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
-    "Qwen/Qwen3.8-27B": "Qwen/Qwen3.8-27B-FP8",
     "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B",
 }
 
@@ -314,9 +310,11 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="A100 PCIe",
         min_disk_gb=160,
+        # candidate metadata remains available for training and customer-owned serving validation.
+        # hosted activation is controlled separately by flash.serving.src.model_config.
         serving=ServingCapacity(
             gpu="H100",
-            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.8-27B"],
+            serve_model_id="Qwen/Qwen3.8-27B-FP8",
             max_loras=16,
             max_lora_rank=64,
             max_model_len=32768,
@@ -326,8 +324,7 @@ MODELS: dict[str, ModelInfo] = {
         thinking="hybrid",
         notes="Dense 27.781427952B multimodal VL checkpoint with image-capable bf16 LoRA training. "
         "SFT fits the 80GB A100 (~55.6GB weights); colocated GRPO needs the B200 (trainer + vLLM "
-        "rollout = two copies). Serves Qwen's official native block-FP8 checkpoint on an H100 tier "
-        "(dense, so no MoE expert LoRA-buffer multiplier).",
+        "rollout = two copies). Hosted serving remains pending the exact official FP8 H100 canary.",
     ),
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",

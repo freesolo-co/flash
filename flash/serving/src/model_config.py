@@ -2,11 +2,10 @@
 
 The serving app runs one vLLM GPU engine per base model, each on the Modal GPU class set by its
 catalog ``gpu`` (see below). Adapters and routing key off the logical ``base_model``; the engine
-loads a PRE-QUANTIZED FP8 checkpoint for that model (see ``src.prequant_config``) at the checkpoint's
-own dtype. Every dense catalog model serves a pre-quantized FP8 checkpoint with no online
-quantization: the 9B is Freesolo compressed-tensors FP8 and the 27B is official native block-FP8.
-vLLM auto-detects the checkpoint format. The 35B-A3B MoE is the exception: it serves the base
-bf16 weights (the fused-MoE LoRA path won't compile on FP8), see the 35B block below.
+loads its configured checkpoint at that checkpoint's own dtype. The active dense 9B uses Freesolo
+compressed-tensors FP8. Qwen3.8-27B retains pinned candidate metadata but is excluded from active
+lookups until its exact canary passes. The active 35B-A3B MoE serves base bf16 weights because its
+fused-MoE LoRA path will not compile on FP8, as detailed below.
 """
 
 from __future__ import annotations
@@ -26,16 +25,15 @@ from flash.serving.src.prequant_config import fp8_serve_model_for as _prequant_s
 # `engine` (optional): per-model vLLM engine-arg overrides (LoRA buffer shape, scheduler/memory caps,
 # language_model_only, …). The engine's LOADED checkpoint is NOT in here — it is resolved centrally by
 # ``serve_model_for`` from ``src.prequant_config`` and injected into the overrides as ``serve_model_id``.
-# so every model loads a pre-quantized fp8 checkpoint: freesolo compressed-tensors for 9b, official
-# qwen native block-fp8 for 27b, and the 35b override to its validated base bf16 path.
+# active models resolve through prequant_config unless an exact validated override is present. the
+# pending 27b candidate carries its own immutable checkpoint pin without entering active resolution.
 # ⚠ serve_model_id is pointed only at checkpoints VERIFIED to exist (a missing repo 404-crash-loops
 # the engine — the reason this mechanism was removed once); the owned repos are VL-preserving FP8
 # checkpoints published to the operator HF org.
 #
 # sizing rationale. preallocated lora buffers and loaded checkpoint weights dominate engine vram.
-# the 9b uses 16 rank-128 slots on l40s, the 27b uses 16 rank-64 slots on h100, and the 35b moe uses
-# 6 rank-64 slots on h200. dense engines load prequantized weights with fp8 kv.
-#   - 27B -> H100 (80 GiB) at 32k context with CUDA graphs on and 16 x 64 LoRA.
+# the active 9b uses 16 rank-128 slots on l40s and the active 35b moe uses 6 rank-64 slots on h200.
+# the pending 27b candidate retains its proposed h100 shape only for the exact canary.
 #   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> H200
 #     (141 GiB) with the base bf16 weights, 6 x 64 LoRA at 32k. bf16 (not FP8) is the one path giving
 #     full-expert LoRA + CUDA graphs because the fused-MoE LoRA path won't compile on fp8e4nv. see the
@@ -68,7 +66,9 @@ SERVING_MODELS: list[dict[str, Any]] = [
         "image_input_limit": 4,
         "gpu": "H100",
         "engine": {
-            # immutable official fp8 weights and logical bf16 tokenizer/processor identity.
+            # pending hosted candidate only. immutable metadata stays here for the exact canary, but
+            # active hosted lookups exclude this model until that canary deliberately enables it.
+            "serve_model_id": "Qwen/Qwen3.8-27B-FP8",
             "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
             "tokenizer_model": "Qwen/Qwen3.8-27B",
             "tokenizer_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
@@ -131,56 +131,93 @@ SERVING_MODELS: list[dict[str, Any]] = [
     },
 ]
 
+_HOSTED_SERVING_ENABLED_MODELS = frozenset(
+    {
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-35B-A3B",
+    }
+)
 _BY_MODEL: dict[str, dict[str, Any]] = {m["base_model"]: m for m in SERVING_MODELS}
-
-
-def supports_image_input(base_model: str) -> bool:
-    return image_limit_for(base_model) is not None
-
-
-def image_limit_for(base_model: str) -> int | None:
-    return _config_for(base_model)["image_input_limit"]
+_HISTORICAL_CLEANUP_MODELS: dict[str, dict[str, Any]] = {
+    "Qwen/Qwen3.6-27B": {
+        "base_model": "Qwen/Qwen3.6-27B",
+        "image_input_limit": 4,
+        "gpu": "H100",
+        "engine": {
+            "serve_model_id": "Freesolo-Co/Qwen3.6-27B-FP8",
+            "gpu_memory_utilization": 0.90,
+            "max_loras": 16,
+            "max_lora_rank": 64,
+            "max_model_len": 32768,
+            "max_num_seqs": 8,
+            "enforce_eager": False,
+            "reasoning_parser": "qwen3",
+        },
+    }
+}
 
 
 def base_models() -> list[str]:
-    return [m["base_model"] for m in SERVING_MODELS]
+    return [
+        m["base_model"] for m in SERVING_MODELS if m["base_model"] in _HOSTED_SERVING_ENABLED_MODELS
+    ]
 
 
 def is_supported_base_model(base_model: str) -> bool:
-    return base_model in _BY_MODEL
+    return base_model in _HOSTED_SERVING_ENABLED_MODELS
 
 
-def _config_for(base_model: str) -> dict[str, Any]:
-    cfg = _BY_MODEL.get(base_model)
+def _config_for(base_model: str, *, historical_cleanup: bool = False) -> dict[str, Any]:
+    cfg = _BY_MODEL.get(base_model) if is_supported_base_model(base_model) else None
+    if cfg is None and historical_cleanup:
+        cfg = _HISTORICAL_CLEANUP_MODELS.get(base_model)
     if cfg is None:
         allowed = ", ".join(base_models())
         raise ValueError(
-            f"Unsupported base model {base_model!r}; add it to SERVING_MODELS after a "
+            f"Unsupported base model {base_model!r}; add it to hosted serving only after a "
             f"real-GPU serving canary. Supported base models: {allowed}"
         )
     return cfg
 
 
-def gpu_for(base_model: str) -> str:
-    """The Modal GPU class to run ``base_model``'s engine on (catalog ``gpu``, else ``DEFAULT_GPU``)."""
-    return _config_for(base_model).get("gpu") or DEFAULT_GPU
+def candidate_config_for(base_model: str) -> dict[str, Any]:
+    """Return immutable metadata for a pending hosted candidate without activating it."""
+    cfg = _BY_MODEL.get(base_model)
+    if cfg is None or is_supported_base_model(base_model):
+        raise ValueError(f"Unsupported pending hosted candidate {base_model!r}")
+    return cfg
+
+
+def supports_image_input(base_model: str, *, historical_cleanup: bool = False) -> bool:
+    return image_limit_for(base_model, historical_cleanup=historical_cleanup) is not None
+
+
+def image_limit_for(base_model: str, *, historical_cleanup: bool = False) -> int | None:
+    return _config_for(base_model, historical_cleanup=historical_cleanup)["image_input_limit"]
+
+
+def gpu_for(base_model: str, *, historical_cleanup: bool = False) -> str:
+    """Return the Modal GPU class for an active or cleanup-only engine."""
+    return _config_for(base_model, historical_cleanup=historical_cleanup).get("gpu") or DEFAULT_GPU
 
 
 def serve_model_for(base_model: str) -> str:
-    """Return the pre-quantized checkpoint the engine loads for ``base_model``."""
-    _config_for(base_model)  # reject uncataloged models before resolving a checkpoint
+    """Return the pre-quantized checkpoint an active hosted engine loads."""
+    _config_for(base_model)
     return _prequant_serve_model_for(base_model)
 
 
-def tokenizer_model_for(base_model: str) -> str:
-    """Return the logical tokenizer and processor repository for a hosted base model."""
-    engine = _config_for(base_model).get("engine") or {}
+def tokenizer_model_for(base_model: str, *, historical_cleanup: bool = False) -> str:
+    """Return the logical tokenizer and processor repository for a hosted engine."""
+    engine = _config_for(base_model, historical_cleanup=historical_cleanup).get("engine") or {}
     return str(engine.get("tokenizer_model") or base_model)
 
 
-def immutable_serving_revisions(base_model: str) -> dict[str, str]:
+def immutable_serving_revisions(
+    base_model: str, *, historical_cleanup: bool = False
+) -> dict[str, str]:
     """Return model/tokenizer/processor pins required by this hosted engine."""
-    engine = _config_for(base_model).get("engine") or {}
+    engine = _config_for(base_model, historical_cleanup=historical_cleanup).get("engine") or {}
     return {
         key: str(engine[key])
         for key in ("model_revision", "tokenizer_revision", "processor_revision")
@@ -188,12 +225,29 @@ def immutable_serving_revisions(base_model: str) -> dict[str, str]:
     }
 
 
-def engine_overrides_for(base_model: str) -> dict[str, Any]:
-    """Per-base-model vLLM engine-arg overrides, with the resolved pre-quantized FP8 ``serve_model_id``
-    injected. So every model carries a ``serve_model_id`` (the FP8 checkpoint to load), plus any tier
-    shape (the 35B MoE's lower max_loras, the L4 rank overrides, …)."""
-    overrides = dict(_config_for(base_model).get("engine") or {})
-    overrides.setdefault("serve_model_id", serve_model_for(base_model))
+def candidate_immutable_serving_revisions(base_model: str) -> dict[str, str]:
+    engine = candidate_config_for(base_model).get("engine") or {}
+    return {
+        key: str(engine[key])
+        for key in ("model_revision", "tokenizer_revision", "processor_revision")
+        if engine.get(key)
+    }
+
+
+def engine_overrides_for(base_model: str, *, historical_cleanup: bool = False) -> dict[str, Any]:
+    """Return vLLM overrides for an active or cleanup-only hosted engine."""
+    config = _config_for(base_model, historical_cleanup=historical_cleanup)
+    overrides = dict(config.get("engine") or {})
+    if "serve_model_id" not in overrides:
+        overrides["serve_model_id"] = serve_model_for(base_model)
+    return overrides
+
+
+def candidate_engine_overrides_for(base_model: str) -> dict[str, Any]:
+    """Return pinned engine metadata for a pending candidate without enabling routing."""
+    overrides = dict(candidate_config_for(base_model).get("engine") or {})
+    if "serve_model_id" not in overrides:
+        overrides["serve_model_id"] = _prequant_serve_model_for(base_model)
     return overrides
 
 

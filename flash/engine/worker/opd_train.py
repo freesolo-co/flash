@@ -513,7 +513,7 @@ from flash.engine.worker.train.opd.overrides import (  # noqa: E402,F401
     _OPD_PARQUET_WRITE_BATCH_ROWS,
     _build_opd_child_env,
     _build_opd_plugin_config,
-    _opd_multimodal_parquet_features,
+    _opd_parquet_features,
     _write_opd_parquet,
     build_opd_overrides,
 )

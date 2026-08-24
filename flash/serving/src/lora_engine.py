@@ -94,12 +94,7 @@ class _LoraEngineImpl:
         from vllm import AsyncEngineArgs, AsyncLLMEngine
 
         from flash.serving.src import settings as cfg
-        from flash.serving.src.engine_boot import (
-            engine_args_for,
-            load_tokenizer,
-            pin_loras_default,
-        )
-        from flash.serving.src.model_config import engine_overrides_for
+        from flash.serving.src.engine_boot import load_engine_config, pin_loras_default
         from flash.serving.src.registry import AdapterRegistry
         from flash.serving.src.settings import ADAPTER_CACHE_DIR, Settings
 
@@ -118,13 +113,13 @@ class _LoraEngineImpl:
         self.registry.hydrate(base_model_adapters)
         ADAPTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.processor, self.tokenizer = load_tokenizer(self.base_model, self.settings, cfg)
-
-        # Per-base-model engine-arg overrides. Larger pre-quantized tiers use real-GPU-validated
-        # rank-32 LoRA sizing and, where needed, tighter scheduler/memory caps.
-        overrides = engine_overrides_for(self.base_model)
+        self.processor, self.tokenizer, overrides, kwargs = load_engine_config(
+            self.base_model,
+            self.settings,
+            cfg,
+            historical_cleanup=bool(getattr(self, "historical_cleanup_only", False)),
+        )
         self._pin_loras = pin_loras_default(overrides, cfg)
-        kwargs = engine_args_for(self.base_model, overrides, cfg)
         self.reasoning_parser = kwargs.get("reasoning_parser")
         self.engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**kwargs))
         # No in-engine kernel-patching hook runs here (2026-07-05 35B outage post-mortem): under

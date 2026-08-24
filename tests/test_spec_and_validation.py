@@ -720,13 +720,12 @@ def test_lora_rank_must_fit_default_serving_cap() -> None:
         spec_from_dict(_raw(**{"train.lora_rank": 129}))
 
 
-def test_lora_rank_must_fit_large_serving_cap() -> None:
+def test_pending_hosted_candidate_retains_serving_rank_metadata() -> None:
     from flash.core.catalog import serving_lora_rank_cap
 
-    # derive the active 27b profile's lower cap from the catalog.
     cap = serving_lora_rank_cap("Qwen/Qwen3.8-27B")
-    assert cap is not None
-    with pytest.raises(ConfigError, match=f"serving max_lora_rank={cap}"):
+    assert cap == 64
+    with pytest.raises(ConfigError, match="serving max_lora_rank=64"):
         spec_from_dict(_raw(model="Qwen/Qwen3.8-27B", **{"train.lora_rank": cap + 1}))
 
 

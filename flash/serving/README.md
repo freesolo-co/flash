@@ -129,12 +129,13 @@ GPUs, so there's nothing to tune at deploy time:
   `max_num_seqs`, partial-prefill, async-scheduling, scheduling-policy, gdn-backend,
   scheduler-delay — neutral globally; only real-GPU-validated per-model caps remain in
   `model_config.py`), `performance_mode`, CUDA-graph-size, `stream_interval`, `specialize_active_lora`.
-- **Quantization: pre-quantized FP8 for the dense tiers, bf16 for the 35B MoE (memory-first).** Every
-  **dense** catalog model loads a **pre-quantized FP8 checkpoint** with no online quantization. The
-  9B uses Freesolo's compressed-tensors checkpoint. Qwen3.8-27B uses Qwen's official native E4M3
-  checkpoint at revision `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, with `[128, 128]` weight
+- **Quantization: pre-quantized FP8 for the active dense tier, bf16 for the 35B MoE (memory-first).**
+  The active 9B uses Freesolo's compressed-tensors checkpoint with no online quantization. Qwen3.8-27B
+  is a **pending hosted candidate**, not an active hosted model. Its exact official E4M3 checkpoint
+  remains pinned at revision `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, with `[128, 128]` weight
   blocks and the logical BF16 tokenizer/processor pinned to
-  `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`. The 35B-A3B vision-language MoE is the
+  `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, so the canary metadata remains testable without
+  advertising or routing the model. The 35B-A3B vision-language MoE is the
   **exception**: it serves the **official bf16
   base weights** on an H200 (`quantization=None`), because vLLM's fused-MoE LoRA path cannot run under
   FP8 at the shape a full all-expert flash adapter needs (see the GPU tiers † footnote below).
@@ -147,7 +148,8 @@ GPUs, so there's nothing to tune at deploy time:
   checkpoints are VL-preserving (each VL-unified base's vision tower + MoE router gates stay in
   original precision) and already published to the operator HF org. Native FP8 tensor cores need
   compute capability ≥ 8.9; every dense FP8 tier runs on an L4, L40S, or H100 (all native). No serving
-  tier runs on A100 now that the 35B is bf16 on H200.
+  tier runs on A100 now that the 35B is bf16 on H200. The pending Qwen3.8 candidate allocates no
+  hosted tier until its exact canary passes.
 
 - **The real memory lever — LoRA buffers:** vLLM PRE-ALLOCATES the GPU LoRA buffers at `max_loras ×
 max_lora_rank`, regardless of how many adapters load. Both are linear levers. The qualified 9B runs
@@ -170,16 +172,17 @@ cold-boot smoke test first.
 | Base model                | Checkpoint                                   | GPU       | Hot LoRA shape | Context |
 | ------------------------- | -------------------------------------------- | --------- | -------------- | ------- |
 | Qwen3.5-9B                | owned FP8 (`Freesolo-Co/*-FP8`)              | **L40S**§ | 16 × 128       | 32768   |
-| Qwen3.8-27B               | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | **H100**‡ | pending        | pending |
+| Qwen3.8-27B candidate     | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | inactive‡ | pending        | pending |
 | Qwen3.6-35B-A3B (MoE, VL) | official **bf16** (`Qwen/Qwen3.6-35B-A3B`)   | **H200**† | 6 × 64         | 32768   |
 
 § 9B (L40S) runs **16 × 128** at 32k context with `max_num_seqs=8`, CUDA graphs
 (`enforce_eager=False`), and `gpu_memory_utilization=0.90`. Its rank-128 × 16 buffer OOMed an L4 and
 2×L4 in the real-GPU sweep, so it runs on the 48 GiB L40S, the cheapest Ada card that fits it at 32k.
 
-‡ Qwen3.8-27B's H100 tier, hot LoRA capacity, context limit, CUDA-graph behavior, throughput, and
-latency remain pending qualification on the exact immutable official FP8 checkpoint. Qwen3.6-27B
-measurements do not qualify or predict the Qwen3.8 checkpoint.
+‡ Qwen3.8-27B is not in active hosted routing, registration, base-model health, or engine deployment.
+Its proposed H100 tier, hot LoRA capacity, context limit, CUDA-graph behavior, throughput, and latency
+remain pending qualification on the exact immutable official FP8 checkpoint. Qwen3.6-27B measurements
+do not qualify or predict the Qwen3.8 checkpoint.
 
 † 35B-A3B runs **bf16 on an H200** (141 GiB) at **6 × 64**, the one serving path that gives a flash
 adapter its full all-expert LoRA AND CUDA graphs at speed. It gets rank 64 like the 27B

@@ -16,6 +16,7 @@ from flash.serving.src.engine_support import (
     _require_reasoning_api_compatibility,
 )
 from flash.serving.src.model_config import (
+    engine_overrides_for,
     image_limit_for,
     immutable_serving_revisions,
     supports_image_input,
@@ -23,7 +24,13 @@ from flash.serving.src.model_config import (
 )
 
 
-def load_tokenizer(base_model: str, settings: Any, cfg: Any) -> tuple[Any, Any]:
+def load_tokenizer(
+    base_model: str,
+    settings: Any,
+    cfg: Any,
+    *,
+    historical_cleanup: bool = False,
+) -> tuple[Any, Any]:
     """Return ``(processor, tokenizer)`` for ``base_model``.
 
     An image-capable model's tokenizer must come from its processor, not from ``AutoTokenizer``:
@@ -32,11 +39,17 @@ def load_tokenizer(base_model: str, settings: Any, cfg: Any) -> tuple[Any, Any]:
     from transformers import AutoProcessor, AutoTokenizer
 
     processor = None
-    tokenizer_model = tokenizer_model_for(base_model)
-    revisions = immutable_serving_revisions(base_model)
+    tokenizer_model = tokenizer_model_for(
+        base_model,
+        historical_cleanup=historical_cleanup,
+    )
+    revisions = immutable_serving_revisions(
+        base_model,
+        historical_cleanup=historical_cleanup,
+    )
     tokenizer_revision = revisions.get("tokenizer_revision")
     processor_revision = revisions.get("processor_revision")
-    if supports_image_input(base_model):
+    if supports_image_input(base_model, historical_cleanup=historical_cleanup):
         revision_kwargs = {"revision": processor_revision} if processor_revision else {}
         processor = AutoProcessor.from_pretrained(
             tokenizer_model,
@@ -61,8 +74,12 @@ def load_tokenizer(base_model: str, settings: Any, cfg: Any) -> tuple[Any, Any]:
     return processor, tokenizer
 
 
-def _multimodal_args(base_model: str) -> dict[str, Any]:
-    image_limit = image_limit_for(base_model)
+def _multimodal_args(
+    base_model: str,
+    *,
+    historical_cleanup: bool = False,
+) -> dict[str, Any]:
+    image_limit = image_limit_for(base_model, historical_cleanup=historical_cleanup)
     if image_limit is None:
         return {}
     return {
@@ -124,7 +141,13 @@ def _build_specific_args(
     return extra
 
 
-def engine_args_for(base_model: str, overrides: dict[str, Any], cfg: Any) -> dict[str, Any]:
+def engine_args_for(
+    base_model: str,
+    overrides: dict[str, Any],
+    cfg: Any,
+    *,
+    historical_cleanup: bool = False,
+) -> dict[str, Any]:
     """The ``AsyncEngineArgs`` kwargs for ``base_model``, as a plain dict.
 
     Returning kwargs rather than the engine args object is what makes the sizing decisions
@@ -147,7 +170,12 @@ def engine_args_for(base_model: str, overrides: dict[str, Any], cfg: Any) -> dic
     # whole card and the subsequent LoRA-module creation OOMs — so the 35B caps it low.
     if "max_num_seqs" in overrides:
         extra["max_num_seqs"] = int(overrides["max_num_seqs"])
-    extra.update(_multimodal_args(base_model))
+    extra.update(
+        _multimodal_args(
+            base_model,
+            historical_cleanup=historical_cleanup,
+        )
+    )
 
     parser = overrides.get("reasoning_parser")
     reasoning_parser = str(parser) if parser else None
@@ -190,6 +218,33 @@ def engine_args_for(base_model: str, overrides: dict[str, Any], cfg: Any) -> dic
         **extra,
         **cfg.vllm_engine_kwargs(),
     }
+
+
+def load_engine_config(
+    base_model: str,
+    settings: Any,
+    cfg: Any,
+    *,
+    historical_cleanup: bool = False,
+) -> tuple[Any, Any, dict[str, Any], dict[str, Any]]:
+    """Resolve tokenizer, overrides, and engine kwargs for one engine startup."""
+    processor, tokenizer = load_tokenizer(
+        base_model,
+        settings,
+        cfg,
+        historical_cleanup=historical_cleanup,
+    )
+    overrides = engine_overrides_for(
+        base_model,
+        historical_cleanup=historical_cleanup,
+    )
+    kwargs = engine_args_for(
+        base_model,
+        overrides,
+        cfg,
+        historical_cleanup=historical_cleanup,
+    )
+    return processor, tokenizer, overrides, kwargs
 
 
 def pin_loras_default(overrides: dict[str, Any], cfg: Any) -> bool:
