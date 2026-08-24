@@ -11,7 +11,9 @@ bf16 weights (the fused-MoE LoRA path won't compile on FP8), see the 35B block b
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Self
 
 from flash.serving.src.prequant_config import fp8_serve_model_for as _prequant_serve_model_for
 
@@ -61,6 +63,67 @@ from flash.serving.src.prequant_config import fp8_serve_model_for as _prequant_s
 # NOTE: every new tier/shape needs a one-time real-GPU cold-boot smoke test with the serving canary.
 # Training GPU validation is separate; this file is only the serving vLLM engine matrix.
 DEFAULT_GPU = "L4"
+
+
+@dataclass(frozen=True, slots=True)
+class HostedTrafficPolicy:
+    """Validated per-model limits for hosted request admission and container scaling."""
+
+    min_containers: int
+    max_containers: int
+    buffer_containers: int
+    queue_capacity: int
+    retry_after_seconds: int
+    max_num_seqs: int
+    max_inputs: int
+    target_inputs: int
+
+    @classmethod
+    def from_engine(cls, engine: Mapping[str, Any]) -> Self:
+        max_num_seqs = engine.get("max_num_seqs")
+        if isinstance(max_num_seqs, bool) or not isinstance(max_num_seqs, int):
+            raise ValueError("hosted traffic policy requires an explicit positive max_num_seqs")
+        if max_num_seqs <= 0:
+            raise ValueError("hosted traffic policy requires an explicit positive max_num_seqs")
+        return cls(
+            min_containers=1,
+            max_containers=2,
+            buffer_containers=0,
+            queue_capacity=2,
+            retry_after_seconds=1,
+            max_num_seqs=max_num_seqs,
+            max_inputs=max_num_seqs,
+            target_inputs=max(1, max_num_seqs * 3 // 4),
+        )
+
+    def __post_init__(self) -> None:
+        values = (
+            self.min_containers,
+            self.max_containers,
+            self.buffer_containers,
+            self.queue_capacity,
+            self.retry_after_seconds,
+            self.max_num_seqs,
+            self.max_inputs,
+            self.target_inputs,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            raise ValueError("hosted traffic policy values must be integers")
+        if self.max_num_seqs <= 0:
+            raise ValueError("hosted traffic max_num_seqs must be positive")
+        if self.max_inputs != self.max_num_seqs:
+            raise ValueError("hosted traffic max_inputs must equal max_num_seqs")
+        if self.target_inputs != max(1, self.max_num_seqs * 3 // 4):
+            raise ValueError("hosted traffic target_inputs must equal 75 percent of max_num_seqs")
+        if self.min_containers != 1 or self.max_containers != 2:
+            raise ValueError("hosted traffic container limits must be exactly one warm and two max")
+        if self.buffer_containers != 0:
+            raise ValueError("hosted traffic buffer_containers must be zero")
+        if self.queue_capacity != 2:
+            raise ValueError("hosted traffic queue_capacity must be exactly two")
+        if self.retry_after_seconds != 1:
+            raise ValueError("hosted traffic retry_after_seconds must be exactly one")
+
 
 SERVING_MODELS: list[dict[str, Any]] = [
     # Small L4 tiers: owned pre-quantized FP8 checkpoints with rank-128 adapters, keeping 16 hot LoRAs
@@ -199,6 +262,10 @@ SERVING_MODELS: list[dict[str, Any]] = [
 ]
 
 _BY_MODEL: dict[str, dict[str, Any]] = {m["base_model"]: m for m in SERVING_MODELS}
+_HOSTED_TRAFFIC_POLICY_BY_MODEL: dict[str, HostedTrafficPolicy] = {
+    model["base_model"]: HostedTrafficPolicy.from_engine(model.get("engine") or {})
+    for model in SERVING_MODELS
+}
 
 
 def supports_image_input(base_model: str) -> bool:
@@ -215,6 +282,19 @@ def base_models() -> list[str]:
 
 def is_supported_base_model(base_model: str) -> bool:
     return base_model in _BY_MODEL
+
+
+def hosted_traffic_policy_for(base_model: str) -> HostedTrafficPolicy:
+    _config_for(base_model)
+    return _HOSTED_TRAFFIC_POLICY_BY_MODEL[base_model]
+
+
+def configured_warm_container_floor() -> int:
+    return sum(hosted_traffic_policy_for(model).min_containers for model in base_models())
+
+
+def configured_hard_gpu_ceiling() -> int:
+    return sum(hosted_traffic_policy_for(model).max_containers for model in base_models())
 
 
 def _config_for(base_model: str) -> dict[str, Any]:
