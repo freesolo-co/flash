@@ -59,28 +59,28 @@ def _run_safe_entrypoint(tmp_path, sitecustomize):
     )
 
 
-def _assert_safe_entrypoint_failure(result, secret):
-    combined = result.stdout + result.stderr
-    assert result.returncode != 0
-    assert combined.strip() == WORKER_FAILURE_LINE
-    assert secret not in combined
-    assert "Traceback" not in combined
+def _assert_safe_entrypoint_failure(result, cause):
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr.count("Traceback") == 1
+    assert cause in result.stderr
+    assert WORKER_FAILURE_LINE in result.stderr
 
 
-def test_managed_entrypoint_emits_one_safe_failure_line(tmp_path):
-    secret = "managed-private-provider-response"
+def test_managed_entrypoint_preserves_worker_main_traceback(tmp_path):
+    cause = "managed-worker-main-crash"
     result = _run_safe_entrypoint(
         tmp_path,
         "import flash.engine.worker as worker\n"
         "def fail():\n"
-        f"    raise RuntimeError({secret!r})\n"
+        f"    raise RuntimeError({cause!r})\n"
         "worker.main = fail\n",
     )
-    _assert_safe_entrypoint_failure(result, secret)
+    _assert_safe_entrypoint_failure(result, cause)
 
 
-def test_managed_entrypoint_sanitizes_worker_import_failure(tmp_path):
-    secret = "managed-private-import-response"
+def test_managed_entrypoint_preserves_worker_import_traceback(tmp_path):
+    cause = "managed-worker-import-crash"
     result = _run_safe_entrypoint(
         tmp_path,
         "import importlib.abc\n"
@@ -88,11 +88,11 @@ def test_managed_entrypoint_sanitizes_worker_import_failure(tmp_path):
         "class FailWorkerImport(importlib.abc.MetaPathFinder):\n"
         "    def find_spec(self, fullname, path, target=None):\n"
         "        if fullname == 'flash.engine.worker':\n"
-        f"            raise RuntimeError({secret!r})\n"
+        f"            raise RuntimeError({cause!r})\n"
         "        return None\n"
         "sys.meta_path.insert(0, FailWorkerImport())\n",
     )
-    _assert_safe_entrypoint_failure(result, secret)
+    _assert_safe_entrypoint_failure(result, cause)
 
 
 def test_direct_worker_module_emits_one_normal_traceback(tmp_path):
