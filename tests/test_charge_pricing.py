@@ -1,10 +1,14 @@
-"""Customer-charge pricing: a completed run is charged its QUOTE (the flash.cost estimate at planned
-steps); a run cancelled mid-training bills the persisted quote prorated by the steps it actually
-ran (never above the quote), falling back to a spec reprice only when no quote was persisted."""
+"""Customer-charge pricing from the accepted quote and completed estimated work.
+
+A full planned run pays the quote exactly. A cancelled or successfully shortened run pays the
+completed estimated-work fraction, never measured elapsed wall and never more than the quote.
+"""
 
 from __future__ import annotations
 
+import json
 import math
+import os
 
 import pytest
 
@@ -23,6 +27,14 @@ def _spec():
     from flash.schema import spec_from_dict
 
     return spec_from_dict(SPEC, run_id="run-1")
+
+
+def _write_terminal_steps(tmp_path, monkeypatch, spec, step, *, wall_seconds=1.0):
+    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path))
+    dest = runner.artifacts_dir(spec)
+    os.makedirs(dest, exist_ok=True)
+    with open(os.path.join(dest, "metrics.json"), "w") as handle:
+        json.dump({"step": step, "wall_seconds": wall_seconds}, handle)
 
 
 # --------------------------------------------------------------------------- pricing helper
@@ -589,3 +601,75 @@ def test_cancel_run_before_any_step_is_free(monkeypatch, tmp_path):
     st = runner.get_status("run-1")
     assert st.state == "cancelled"
     assert st.cost_usd == 0.0  # 0 steps -> $0
+
+
+def test_completed_full_work_charges_exactly_the_quote_despite_faster_wall(tmp_path, monkeypatch):
+    spec = _spec()
+    accepted_quote = 8.0
+    status = runner.RunStatus(
+        run_id="r",
+        state="done",
+        spec={},
+        estimated_cost_usd=accepted_quote,
+    )
+    _write_terminal_steps(tmp_path, monkeypatch, spec, 20, wall_seconds=0.001)
+
+    assert runner._status_estimated_charge(status, spec) == accepted_quote
+
+
+@pytest.mark.parametrize("completed_steps", [21, 10**1000])
+def test_completed_steps_beyond_the_horizon_still_charge_exactly_the_quote(
+    tmp_path, monkeypatch, completed_steps
+):
+    spec = _spec()
+    accepted_quote = 8.0
+    status = runner.RunStatus(
+        run_id="r",
+        state="done",
+        spec={},
+        estimated_cost_usd=accepted_quote,
+    )
+    _write_terminal_steps(tmp_path, monkeypatch, spec, completed_steps, wall_seconds=0.001)
+
+    assert runner._status_estimated_charge(status, spec) == accepted_quote
+
+
+def test_completed_early_work_uses_the_same_estimated_fraction_as_cancellation(
+    tmp_path, monkeypatch
+):
+    spec = _spec()
+    accepted_quote = 8.0
+    status = runner.RunStatus(
+        run_id="r",
+        state="done",
+        spec={},
+        estimated_cost_usd=accepted_quote,
+    )
+    _write_terminal_steps(tmp_path, monkeypatch, spec, 10, wall_seconds=99_999.0)
+
+    expected = runner.cancelled_charge_usd(status, spec, steps=10)
+    assert 0.0 < expected < accepted_quote
+    assert runner._status_estimated_charge(status, spec) == expected
+
+
+def test_completed_zero_work_charges_zero(tmp_path, monkeypatch):
+    spec = _spec()
+    status = runner.RunStatus(run_id="r", state="done", spec={}, estimated_cost_usd=8.0)
+    _write_terminal_steps(tmp_path, monkeypatch, spec, 0)
+
+    assert runner._status_estimated_charge(status, spec) == 0.0
+
+
+@pytest.mark.parametrize("step", [None, True, -1, 1.5, float("nan"), float("inf"), "10"])
+def test_completed_run_without_a_valid_step_preserves_the_quote(tmp_path, monkeypatch, step):
+    spec = _spec()
+    accepted_quote = 8.0
+    status = runner.RunStatus(
+        run_id="r",
+        state="done",
+        spec={},
+        estimated_cost_usd=accepted_quote,
+    )
+    _write_terminal_steps(tmp_path, monkeypatch, spec, step)
+
+    assert runner._status_estimated_charge(status, spec) == accepted_quote

@@ -64,8 +64,6 @@ def test_run_metrics_save_writes_sanitized_json(tmp_path) -> None:
     metrics = accounting.RunMetrics(
         phase="sft",
         train_tokens=12,
-        framework_init_seconds=14.5,
-        reward_seconds=0.0,
         notes={"hf_repo": "private/repo"},
     )
 
@@ -74,6 +72,4 @@ def test_run_metrics_save_writes_sanitized_json(tmp_path) -> None:
     saved = json.loads(path.read_text())
     assert saved["phase"] == "sft"
     assert saved["train_tokens"] == 12
-    assert saved["framework_init_seconds"] == 14.5
-    assert saved["reward_seconds"] == 0.0
     assert saved["notes"]["hf_repo"] == accounting._PRIVATE_SOURCE_MARKER

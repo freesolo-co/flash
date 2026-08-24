@@ -1,7 +1,7 @@
 """Cost accounting + the standard run-metrics record for Flash runs.
 
-The full training-loop wall remains available for analytics. Customer settlement starts from the
-accepted quote and subtracts measured framework initialization and reward-function latency.
+Customer GPU cost = training-loop GPU hours * hourly_rate; setup/cold-start time is reported
+separately for observability.
 """
 
 from __future__ import annotations
@@ -63,10 +63,8 @@ class RunMetrics:
     step: int | None = None
     seed: int = 0
     model_id: str = ""
-    wall_seconds: float = 0.0  # full training-loop wall time for analytics
+    wall_seconds: float = 0.0  # training-loop wall time used for customer cost
     setup_seconds: float = 0.0  # cold start / provisioning + model load
-    framework_init_seconds: float | None = None  # billed-wall start to first optimizer step
-    reward_seconds: float | None = None  # measured grpo/opd reward-function latency
     train_throughput_toks_per_s: float = 0.0
     train_tokens: int = 0
     generated_tokens: int = 0  # RL: total sampled completion tokens

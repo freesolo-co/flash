@@ -145,10 +145,6 @@ class _SftProgress:
     shim_markers: str = ""
     expected_shims: tuple[str, ...] = ()
     shims_verified: bool = False
-    framework_init_seconds: float | None = None
-    # the step a previous attempt already completed; 0 for a fresh run. a resumed child replays this
-    # step's metrics line from that earlier attempt, so its duration is not in this attempt's wall.
-    resume_step: int = 0
 
 
 @dataclass(frozen=True)
@@ -777,7 +773,6 @@ def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, child: _SftChil
         # like loraplus_applied above: a resume already at the horizon never launches the child,
         # so there is no marker file to verify and nothing left for the shims to patch.
         shims_verified=resume_step >= model.update_horizon,
-        resume_step=resume_step,
     )
 
 
@@ -811,7 +806,7 @@ def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_lin
     )
 
 
-def _consume_sft_marker_line(progress: _SftProgress, line: str, *, train_started_at: float) -> bool:
+def _consume_sft_marker_line(progress: _SftProgress, line: str) -> bool:
     """Fold a child log line's non-metric markers in; answer whether it is an optimizer step.
 
     False means the caller has nothing further to do with the line. A True answer additionally
@@ -823,28 +818,8 @@ def _consume_sft_marker_line(progress: _SftProgress, line: str, *, train_started
     link = _sft_train.parse_wandb_link(line)
     if link is not None:
         progress.wandb_link.update(link)
-    step_number = _sft_train.verl_step_number(line)
-    if step_number is None:
+    if _sft_train.verl_step_number(line) is None:
         return False
-    step_seconds = _sft_train.parse_verl_metric(line, "timing_s/step")
-    if (
-        progress.framework_init_seconds is None
-        and step_seconds is not None
-        and step_number > progress.resume_step
-    ):
-        # train_wall starts immediately before the child invocation, so the first parsed optimizer
-        # step closes the framework/model/fsdp initialization block inside that wall. the line lands
-        # AFTER that step ran, so subtract its own duration to end the window where the step began
-        # rather than billing a whole step as "init".
-        #
-        # requiring timing_s/step rather than defaulting to 0.0 matters because this gate is only
-        # verl_step_number: a step-tagged line carrying no duration would otherwise latch the window
-        # shut before the first line that has one, dropping the init discount entirely.
-        #
-        # a resumed child replays its resume step before the first new one, and that line reports the
-        # PREVIOUS attempt's duration (`child_io.append_step_metrics` documents the replay). that time
-        # is not inside this attempt's wall, so subtracting it would understate init or zero it.
-        progress.framework_init_seconds = max(0.0, time.time() - train_started_at - step_seconds)
     # the marker set first: a skipped sitecustomize also loses the lora+ shim, and "no fragment
     # ran at all" is the root cause worth reporting over its lora+ symptom.
     if progress.expected_shims and not progress.shims_verified:

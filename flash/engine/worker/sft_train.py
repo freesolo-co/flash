@@ -468,8 +468,6 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
         train_tokens=verified.train_tokens,
         generated_tokens=0,
         step=verified.final_step,
-        framework_init_seconds=progress.framework_init_seconds,
-        reward_seconds=0.0,
         notes={
             "epochs": options.epochs,
             "resumed": bool(child.resume_step),
@@ -616,7 +614,7 @@ def run_sft_train(spec=None) -> None:
 
     def on_line(line: str) -> None:
         child.watcher.raise_if_failed()
-        if not _consume_sft_marker_line(child_progress, line, train_started_at=train_started_at):
+        if not _consume_sft_marker_line(child_progress, line):
             return
         # these metrics are currently floats, but use the shared parser to tolerate upstream metric
         # wrapper changes and reject nan/inf before strict-json heartbeat serialization.

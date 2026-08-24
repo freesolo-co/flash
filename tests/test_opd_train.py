@@ -1209,11 +1209,10 @@ def test_failure_accounting_metadata_uses_trl_skip_reason_names():
 def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     import inspect
 
-    from flash.engine.worker.opd_train import _opd_train_notes
+    from flash.engine.worker.opd_train import run_opd_train
 
-    # the notes block is built by its own helper (run_opd_train is at the 150-line gate), so read it
-    # there. what this pins is the CONTENT of the published notes, not where it is assembled.
-    write_train_meta_source = inspect.getsource(_opd_train_notes)
+    source = inspect.getsource(run_opd_train)
+    write_train_meta_source = source[source.index("_w.write_train_meta(") :]
 
     assert "**_failure_accounting_metadata(final_accounting)" in write_train_meta_source
     assert '"teacher_transient":' not in write_train_meta_source
@@ -7347,9 +7346,10 @@ def test_deterministic_seed_uses_every_rollout_identity_component():
 def test_train_meta_records_the_optimizer_steps_that_actually_produced_a_loss():
     import inspect
 
-    from flash.engine.worker.opd_train import _opd_train_notes
+    from flash.engine.worker.opd_train import run_opd_train
 
-    notes = inspect.getsource(_opd_train_notes)
+    notes = inspect.getsource(run_opd_train)
+    notes = notes[notes.index("_w.write_train_meta(") :]
     # `steps` is the REQUESTED horizon. a step whose batch carried no teacher signal never applies
     # an update, so reporting the horizon as the work done would overstate a partly-starved run.
     assert '"steps": update_horizon,' in notes
@@ -7404,17 +7404,20 @@ def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoin
 def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
     import inspect
 
-    from flash.engine.worker.opd_train import _opd_train_notes
+    from flash.engine.worker.opd_train import run_opd_train
 
-    notes = inspect.getsource(_opd_train_notes)
+    notes = inspect.getsource(run_opd_train)
+    notes = notes[notes.index("_w.write_train_meta(") :]
     # only single-turn text uses the serial batcher; multimodal and multi-turn use bridge threads.
     # report at most the samples one step can produce.
     assert (
         '"opd_teacher_batch_size": (\n'
-        "            min(OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size))\n"
-        "            if not multimodal and not multi_turn\n"
-        "            else None\n"
-        "        ),"
+        "                    min(\n"
+        "                        OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size)\n"
+        "                    )\n"
+        "                    if not multimodal and not multi_turn\n"
+        "                    else None\n"
+        "                ),"
     ) in notes
     assert ('"opd_teacher_workers": 1 if not multimodal and not multi_turn else None,') in notes
     # the engine length handed to vllm, not a hardcoded default: prompt filtering is carved out of

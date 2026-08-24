@@ -84,13 +84,6 @@ class _StepMetricState:
     )
     sent_first_metrics: bool = False
     sent_first_timing: bool = False
-    train_started_at: float | None = None
-    framework_init_seconds: float | None = None
-    reward_seconds_by_step: dict[int, float] = field(default_factory=dict)
-
-    @property
-    def reward_seconds(self) -> float:
-        return sum(self.reward_seconds_by_step.values())
 
 
 @dataclass
@@ -450,40 +443,7 @@ def _ingest_step_metrics(
 ) -> None:
     step_metrics = parse_verl_step_metrics(line)
     if step_metrics is not None:
-        step_number = int(step_metrics["step"])
-        step_seconds = parse_verl_metric(line, "timing_s/step")
-        if (
-            state.framework_init_seconds is None
-            and state.train_started_at is not None
-            and step_seconds is not None
-            and step_number > state.resume_step
-        ):
-            # rl train_wall begins in _announce_training before the verl child launches. the first
-            # parsed optimizer metric closes the framework/model/ray initialization prefix in it.
-            #
-            # that line is emitted AFTER step 1 finishes, so the elapsed span also contains step 1's
-            # own generation, grading and update. subtract the step's native duration to end the init
-            # window where step 1 began: leaving it in would fold a whole step into "init" AND double
-            # subtract step 1's timing_s/reward, which is summed separately below. the error is not
-            # small -- rl step 0 measures ~5.6x a steady step.
-            #
-            # requiring timing_s/step rather than defaulting to 0.0 keeps a step line that carries no
-            # duration from latching the window shut before the first line that does, which would
-            # silently drop the entire init discount.
-            #
-            # skipping the replayed resume step is what makes the subtraction coherent on a resumed
-            # run: that line's duration was spent in the PREVIOUS attempt and is absent from this
-            # attempt's wall, so subtracting it undercounts init or floors it to zero. the reward
-            # accumulator below and the advantage seal already gate on the same boundary.
-            state.framework_init_seconds = max(
-                0.0, time.time() - state.train_started_at - step_seconds
-            )
-        reward_seconds = parse_verl_metric(line, "timing_s/reward")
-        if reward_seconds is not None and step_number > state.resume_step:
-            # keyed by step so a replayed or duplicated metric line cannot discount the same grading
-            # latency twice. a missing timing_s/reward contributes zero and never fails the run.
-            state.reward_seconds_by_step[step_number] = max(0.0, reward_seconds)
-        state.step_timing.record_duration(step_seconds)
+        state.step_timing.record_duration(parse_verl_metric(line, "timing_s/step"))
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]
@@ -533,6 +493,7 @@ def _ingest_step_metrics(
         # key them by optimizer step so replayed lines replace rather than duplicate terminal proof.
         adv_min = step_metrics.get("advantage_min")
         adv_max = step_metrics.get("advantage_max")
+        step_number = int(step_metrics["step"])
         # a resumed child replays its resume step before producing the first new one. that line
         # describes the PREVIOUS attempt's step, and `_finalize_advantage_evidence` expects exactly
         # `resume_step + 1 .. horizon`, so admitting it reports the resume step as an extra step.

@@ -39,8 +39,6 @@ def write_train_meta(
     notes,
     *,
     step=None,
-    framework_init_seconds=None,
-    reward_seconds=None,
     heartbeat_fields=None,
 ):
     env = _w.require_active_env()
@@ -51,8 +49,6 @@ def write_train_meta(
             "model_id": model_id,
             "train_wall": train_wall,
             "setup_seconds": setup_seconds,
-            "framework_init_seconds": framework_init_seconds,
-            "reward_seconds": reward_seconds,
             "train_tokens": train_tokens,
             "generated_tokens": generated_tokens,
             "notes": notes or {},
@@ -83,8 +79,6 @@ def write_train_meta(
         model_id=model_id,
         wall_seconds=train_wall,
         setup_seconds=setup_seconds,
-        framework_init_seconds=framework_init_seconds,
-        reward_seconds=reward_seconds,
         train_throughput_toks_per_s=(
             (generated_tokens or train_tokens) / train_wall if train_wall else 0.0
         ),

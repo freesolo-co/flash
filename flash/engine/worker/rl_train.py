@@ -211,8 +211,6 @@ def _write_terminal_metadata(
         # above, so a cancel arriving between here and DONE reprices a fully trained run at zero
         # steps (actual_steps_run returns 0 for a non-training stage with no step).
         step=steps_run,
-        framework_init_seconds=state.framework_init_seconds,
-        reward_seconds=state.reward_seconds,
         heartbeat_fields={"metrics_last": list(metrics_last)},
         generated_tokens=int(
             sum(state.resp_len_history)
@@ -400,7 +398,7 @@ def run_rl_train():
         )
         expected_steps, loggers = configured["expected_steps"], configured["loggers"]
         _w.heartbeat("rl_step", step=0, initial=True)
-        state = _StepMetricState(train_started_at=configured["t_train"])
+        state = _StepMetricState()
         # equal within-group rewards produce zero advantages and gradients. collect per-step spread;
         # reward mean and pg_loss cannot prove a signal. declare this before the uploader because its
         # publication gate closes over the histories.
