@@ -7890,6 +7890,9 @@ def test_chat_stream_preserves_upstream_error_status_and_body(api, monkeypatch):
     assert response.status_code == 429
     assert response.headers["content-type"].startswith("application/json")
     assert response.headers["retry-after"] == "3"
+    assert "x-freesolo-adapter-revision" not in response.headers
+    assert "x-freesolo-checkpoint" not in response.headers
+    assert "x-freesolo-hf-revision" not in response.headers
     assert response.json() == {"error": {"message": "rate limited"}}
 
 

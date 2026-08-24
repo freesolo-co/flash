@@ -827,14 +827,12 @@ def chat(
             )
             try:
                 content_type = upstream.headers.get("content-type", "")
+                headers = _upstream_response_headers(upstream.headers)
                 if upstream.status_code < 400:
                     if "text/event-stream" not in content_type.lower():
                         raise ValueError("serving backend returned a non-sse streaming response")
                     _validate_stream_provenance(upstream.headers, provenance)
-                headers = {
-                    **_upstream_response_headers(upstream.headers),
-                    **immutable_provenance_headers(provenance),
-                }
+                    headers.update(immutable_provenance_headers(provenance))
                 return _UpstreamStreamingResponse(
                     upstream.iter_bytes(),
                     status_code=upstream.status_code,

@@ -237,6 +237,7 @@ def _openai_sse_text(chunks: Iterator[str]) -> Iterator[str]:
 
     buffered = ""
     reasoning_open = False
+    reasoning_done = False
     terminal = False
     for chunk in chunks:
         buffered += chunk
@@ -255,7 +256,9 @@ def _openai_sse_text(chunks: Iterator[str]) -> Iterator[str]:
                 payload = json.loads(data)
             except json.JSONDecodeError as exc:
                 raise ClientError("chat stream contained invalid openai sse json") from exc
-            error = payload.get("error") if isinstance(payload, dict) else None
+            if not isinstance(payload, dict):
+                raise ClientError("chat stream contained a non-object openai sse payload")
+            error = payload.get("error")
             if isinstance(error, dict):
                 terminal = True
                 raise ClientError(str(error.get("message") or "chat stream ended with an error"))
@@ -270,7 +273,7 @@ def _openai_sse_text(chunks: Iterator[str]) -> Iterator[str]:
                     continue
                 reasoning = delta.get("reasoning_content")
                 if isinstance(reasoning, str):
-                    if not reasoning_open:
+                    if not reasoning_open and not (reasoning_done and not reasoning):
                         reasoning_open = True
                         yield "<think>"
                     if reasoning:
@@ -279,6 +282,7 @@ def _openai_sse_text(chunks: Iterator[str]) -> Iterator[str]:
                 if isinstance(content, str) and content:
                     if reasoning_open:
                         reasoning_open = False
+                        reasoning_done = True
                         yield "</think>"
                     yield content
     if buffered.strip():

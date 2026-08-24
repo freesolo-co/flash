@@ -101,6 +101,37 @@ def test_chat_stream_decodes_raw_openai_sse_for_cli_callers(
     assert "".join(chunks) == "<think>why</think>answer"
 
 
+def test_chat_stream_empty_reasoning_after_answer_does_not_reopen_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = (
+        b'data: {"choices":[{"delta":{"reasoning_content":"why"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"reasoning_content":""}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    response = _Read1Response(payload)
+    response.headers = {"Content-Type": "text/event-stream"}
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+
+    chunks = list(ApiClient("http://test").chat_stream("run-a", []))
+
+    assert "".join(chunks) == "<think>why</think>answer"
+
+
+@pytest.mark.parametrize("payload", [b"null", b"[]"])
+def test_chat_stream_rejects_non_object_sse_json(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+) -> None:
+    response = _Read1Response(b"data: " + payload + b"\n\ndata: [DONE]\n\n")
+    response.headers = {"Content-Type": "text/event-stream"}
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(ClientError, match="non-object openai sse payload"):
+        list(ApiClient("http://test").chat_stream("run-a", []))
+
+
 def test_chat_stream_rejects_complete_sse_eof_without_done(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

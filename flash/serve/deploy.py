@@ -859,10 +859,10 @@ def chat(
     expected_adapter_revision: str | None = None,
     timeout_s: float | None = None,
     retry_unavailable: bool = False,
-    top_p: float = 0.95,
     stop: list[str] | None = None,
-    chat_template_kwargs: dict | None = None,
     structured_outputs: dict | None = None,
+    top_p: float = 0.95,
+    chat_template_kwargs: dict | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 

@@ -1861,6 +1861,55 @@ def test_chat_sse_complete_frame_without_done_raises_after_preserving_bytes(monk
         next(stream)
 
 
+def test_chat_preserves_pre_managed_parity_positional_order(monkeypatch):
+    import flash.serve.deploy as d
+
+    seen = {}
+
+    class Response:
+        def __init__(self):
+            self.headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class Client:
+        def post(self, url, **kwargs):
+            seen.update({"url": url, **kwargs})
+            return Response()
+
+    monkeypatch.setattr(d, "_chat_http_client", lambda: Client())
+    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    d.chat(
+        "run-1",
+        [{"role": "user", "content": "hi"}],
+        0.2,
+        17,
+        True,
+        None,
+        None,
+        9.0,
+        False,
+        ["end"],
+        {"regex": "[ab]+"},
+    )
+
+    assert seen["timeout"] == 9.0
+    assert seen["json"] == {
+        "model": "run-1",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 17,
+        "temperature": 0.2,
+        "top_p": 0.95,
+        "chat_template_kwargs": {"enable_thinking": True},
+        "stop": ["end"],
+        "structured_outputs": {"regex": "[ab]+"},
+    }
+
+
 def test_chat_posts_supported_managed_fields(monkeypatch):
     import flash.serve.deploy as d
 
