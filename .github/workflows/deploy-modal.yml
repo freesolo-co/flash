@@ -284,7 +284,7 @@ jobs:
         env:
           FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
           FREESOLO_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-        run: modal deploy flash/serving/modal_app.py
+        run: modal deploy flash/serving/app/modal_app.py
 
       - name: Wait for production serving readiness
         if: steps.gate.outputs.deploy == 'true'

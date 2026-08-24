@@ -90,7 +90,7 @@ def test_success_marker_with_metrics_is_success():
 
 
 def test_success_marker_carries_trusted_source_attestation_into_metrics():
-    from flash.source_snapshot import TERMINAL_ATTESTATION_KEY, source_attestation
+    from flash.snapshot.source_snapshot import TERMINAL_ATTESTATION_KEY, source_attestation
 
     attestation = source_attestation(SOURCE_SNAPSHOT, run_id="run-1", attempt=0)
     resolution = _resolve(

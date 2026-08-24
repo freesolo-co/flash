@@ -11,8 +11,8 @@ import pytest
 from synchronicity import Synchronizer
 
 from flash.serve.control import ModalCredentials
-from flash.serve.provisioning.modal.planning.plan import MODAL_VOLUME_MOUNT, build_modal_create_plan
 from flash.serve.provisioning.modal.execution.sdk import ModalSdkFailure, PinnedModalSdk
+from flash.serve.provisioning.modal.planning.plan import MODAL_VOLUME_MOUNT, build_modal_create_plan
 from flash.serve.provisioning.modal.planning.wrapper import launch_modal_server
 from tests.test_serve_provisioning_modal import (
     APP_ID,

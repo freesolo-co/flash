@@ -19,8 +19,13 @@ from enum import Enum, auto
 from typing import Protocol, cast
 
 from flash.serve.control import DeploymentErrorReason, DeploymentResult, RunPodProviderHandle
-
-from flash.serve.provisioning.common.records import Clock, DeploymentBundle, LifecycleFailure, Sleeper, failed_deployment_result
+from flash.serve.provisioning.common.records import (
+    Clock,
+    DeploymentBundle,
+    LifecycleFailure,
+    Sleeper,
+    failed_deployment_result,
+)
 from flash.serve.provisioning.runpod.plan import RunPodCreatePlan
 from flash.serve.provisioning.runpod.protocol import (
     RunPodObservation,

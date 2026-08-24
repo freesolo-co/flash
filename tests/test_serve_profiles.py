@@ -7,7 +7,6 @@ from dataclasses import replace
 import pytest
 
 from flash.core.catalog import get_model, supports_image_training
-from flash.serve.control import ModalPlacement, RunPodPlacement
 from flash.serve.contract.profiles import (
     SERVE_RUNTIME_FAMILY,
     ProfileError,
@@ -16,6 +15,7 @@ from flash.serve.contract.profiles import (
     placement_for,
     supported_models,
 )
+from flash.serve.control import ModalPlacement, RunPodPlacement
 from flash.serve.provisioning import ServingImage
 from flash.serve.runtime.multimodal import _MAX_IMAGES
 from flash.serving.src.engine.model_config import reasoning_parser_for

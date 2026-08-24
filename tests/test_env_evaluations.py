@@ -366,7 +366,9 @@ def test_env_eval_reports_error_count_and_fails_overall(monkeypatch, tmp_path, c
                 raise ConnectionError("connection reset")
             yield "good"
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", PartialClient)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -403,7 +405,9 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
             yield "4"
 
     client = Client()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
     result = cli.main(
@@ -471,7 +475,9 @@ def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
 
     client = Client()
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
     _patch_upload(monkeypatch, uploader)
 
@@ -527,7 +533,9 @@ def test_env_eval_refuses_a_bare_alias_it_cannot_pin(
             raise AssertionError("no case may generate against an unpinned alias")
             yield ""
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", "flash-1"]) == 1
@@ -563,7 +571,9 @@ def test_env_eval_runs_a_pinned_step_whose_latest_deploy_failed(monkeypatch, tmp
             yield "4"
 
     client = Client()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
     assert cli.main(["env", "eval", "flash-1/step-3", "--no-upload"]) == 0
@@ -602,7 +612,9 @@ def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
             yield "4"
 
     client = Client()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
     assert cli.main(["env", "eval", "flash-1/step-3"]) == 1
@@ -646,7 +658,9 @@ def test_env_eval_never_pins_the_revision_a_rollout_is_heading_to(
 
     client = Client()
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
     _patch_upload(monkeypatch, uploader)
 
@@ -681,7 +695,9 @@ def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys
                 second_started.set()
             yield prompt
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "2", "--no-upload"]) == 0
@@ -736,7 +752,9 @@ def test_env_eval_settles_the_step_selector_capability_before_the_fan_out(
                 events.append("chat")
             yield "hi"
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", "flash-1/step-3", "--concurrency", "4", "--no-upload"]) == 0
@@ -807,7 +825,9 @@ def test_env_eval_fails_the_target_when_the_capability_prewarm_fails(
             self._unsupported()
             yield ""
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", "flash-1/step-3", "--concurrency", "4", "--no-upload"]) == 1
@@ -878,7 +898,9 @@ def test_env_eval_refuses_a_published_environment_without_a_sidecar(
         def chat_stream(self, target, messages, **kwargs):
             raise AssertionError("a missing sidecar must fail before generation")
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -955,7 +977,9 @@ def test_env_eval_records_the_published_environment_it_graded(monkeypatch, tmp_p
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     _patch_upload(monkeypatch, uploader)
 
     slugs = ["acme/example-project/easy", "acme/example-project/hard"]
@@ -994,7 +1018,9 @@ def test_env_eval_refuses_to_record_a_run_whose_project_is_unknown(
             yield ""
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1152,7 +1178,9 @@ def test_env_eval_no_upload_never_records_anything(monkeypatch, tmp_path) -> Non
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1185,7 +1213,9 @@ def test_env_eval_records_under_the_evaluated_runs_own_project(monkeypatch, tmp_
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1215,7 +1245,9 @@ def test_env_eval_project_flag_overrides_the_runs_own_project(monkeypatch, tmp_p
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1260,7 +1292,9 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1360,7 +1394,9 @@ def test_env_eval_grades_the_hub_package_over_a_same_named_local_directory(
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path, **_k: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path, **_k: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1381,7 +1417,9 @@ def test_env_eval_upload_sends_every_case_with_the_project_id(monkeypatch, tmp_p
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1424,7 +1462,9 @@ def test_env_eval_upload_keeps_duplicate_id_cases_distinct(monkeypatch, tmp_path
             yield "6" if "3+3" in str(messages) else "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1458,7 +1498,9 @@ def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path)
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", PartialClient)
     _patch_upload(monkeypatch, uploader)
 
@@ -1489,7 +1531,9 @@ def test_env_eval_upload_records_a_clean_suite_as_completed(monkeypatch, tmp_pat
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1519,7 +1563,9 @@ def test_env_eval_upload_records_suites_that_cannot_load_cases(monkeypatch, tmp_
             raise AssertionError("case loading failures must not generate")
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1576,7 +1622,9 @@ def test_env_eval_upload_keeps_duplicate_case_ids_with_their_own_input(
             yield messages[0]["content"]
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1604,7 +1652,9 @@ def test_env_eval_upload_failure_does_not_relabel_a_passing_suite(
     def failing_upload(**kwargs):
         raise ClientError("freesolo is unreachable")
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, failing_upload)
 
@@ -1639,7 +1689,9 @@ def test_env_eval_upload_reports_a_key_lost_after_the_suite_ran(
         return next(keys, ("url", None))
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     monkeypatch.setattr("flash.client.upload_eval_run", uploader, raising=False)
     monkeypatch.setattr(
@@ -1668,7 +1720,9 @@ def test_env_eval_blank_stream_errors_without_scoring(monkeypatch, tmp_path, cap
         def chat_stream(self, target, messages, **kwargs):
             yield "   "
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", BlankClient)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -1715,7 +1769,9 @@ def test_env_eval_scoring_that_exits_fails_only_its_own_case(monkeypatch, tmp_pa
         def chat_stream(self, target, messages, **kwargs):
             yield messages[0]["content"]
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -1767,7 +1823,9 @@ def test_env_eval_serializes_scoring_across_worker_threads(monkeypatch, tmp_path
             generating.wait()
             yield messages[0]["content"]
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "6", "--no-upload"]) == 0
@@ -1793,7 +1851,9 @@ def test_env_eval_empty_suite_is_not_a_pass(monkeypatch, tmp_path, capsys) -> No
         def chat_stream(self, target, messages, **kwargs):
             raise AssertionError("no cases means no generation")
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -1823,7 +1883,9 @@ def test_env_eval_disambiguates_duplicate_case_ids(monkeypatch, tmp_path, capsys
         def chat_stream(self, target, messages, **kwargs):
             yield messages[0]["content"]
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
@@ -1839,7 +1901,9 @@ def test_env_eval_debug_surfaces_the_load_traceback(monkeypatch, tmp_path) -> No
     # one-line message leaves nothing to debug with.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text("raise RuntimeError('sidecar exploded')\n")
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", _EvalClient)
 
     with pytest.raises(RuntimeError, match="sidecar exploded"):
@@ -2198,7 +2262,9 @@ def test_env_eval_abort_does_not_join_in_flight_generations(monkeypatch, tmp_pat
             assert slow_case_started.wait(timeout=10)
             raise KeyboardInterrupt
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     returned = threading.Event()
@@ -2319,7 +2385,9 @@ def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path, capsys) ->
             generation_threads.add(threading.current_thread().name)
             yield messages[0]["content"]
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "6", "--no-upload"]) == 0
@@ -2428,7 +2496,9 @@ def test_env_eval_uploads_a_suite_that_failed_to_load(monkeypatch, tmp_path, cap
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -2469,7 +2539,9 @@ def test_env_eval_reports_invalid_episode_flag_as_a_suite_failure(
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", _EvalClient)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -2504,7 +2576,9 @@ def test_env_eval_concurrent_results_stay_in_case_order(monkeypatch, tmp_path) -
             time.sleep(0.05 if content == "0" else 0.0)
             yield content
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", SlowFirstClient)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "6", "--no-upload"]) == 0
@@ -2523,7 +2597,9 @@ def test_env_eval_rejects_a_non_finite_temperature_before_paying(monkeypatch, tm
             raise AssertionError(f"paid request issued with temperature={kwargs['temperature']}")
             yield ""  # pragma: no cover - generator protocol only
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     with pytest.raises(SystemExit) as excinfo:
@@ -2546,7 +2622,9 @@ def test_env_eval_rejects_a_negative_temperature_before_paying(monkeypatch, tmp_
             raise AssertionError(f"paid request issued with temperature={kwargs['temperature']}")
             yield ""  # pragma: no cover - generator protocol only
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     with pytest.raises(SystemExit) as excinfo:
@@ -2566,7 +2644,9 @@ def test_env_eval_still_accepts_an_ordinary_temperature(monkeypatch, tmp_path) -
             seen.append(kwargs["temperature"])
             yield "4"
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--temperature", "0.7", "--no-upload"]) == 0
@@ -2610,7 +2690,9 @@ def test_env_eval_uploads_each_suite_with_its_own_start_time(monkeypatch, tmp_pa
             yield messages[0]["content"]
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -2636,7 +2718,9 @@ def test_env_eval_reports_upload_timeout_without_a_traceback(monkeypatch, tmp_pa
     def _timeout(req, timeout=None):
         raise TimeoutError("timed out")
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
     # only the upload may time out. the project preflight uses the same socket, so leaving it
@@ -2788,7 +2872,9 @@ def test_env_eval_pins_a_run_serving_a_step_checkpoint(monkeypatch, tmp_path, ca
             yield messages[-1]["content"]
 
     client = Client()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
     assert cli.main(["env", "eval", "flash-1", "--no-upload"]) == 0
@@ -2833,7 +2919,9 @@ def test_env_eval_pins_a_step_shorthand_to_its_immutable_revision(
 
     client = Client()
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
     _patch_upload(monkeypatch, uploader)
 
@@ -2887,7 +2975,9 @@ def test_env_eval_keeps_a_step_shorthand_the_live_deployment_has_moved_past(
             yield "4"
 
     client = Client()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
     assert cli.main(["env", "eval", "flash-1/step-3", "--no-upload"]) == 0
@@ -2925,7 +3015,9 @@ def test_env_eval_refuses_to_upload_a_step_it_cannot_name(monkeypatch, capsys) -
     def _uploaded(**kwargs):
         raise AssertionError("uploaded a result whose weights the report cannot name")
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: Client())
     monkeypatch.setattr("flash.client.upload_eval_run", _uploaded, raising=False)
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
@@ -2973,7 +3065,8 @@ def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> No
             yield "ok"
 
     monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path, **_kwargs: Environment()
+        "flash.envs.loading.loader.load_freesolo_environment",
+        lambda _path, **_kwargs: Environment(),
     )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
@@ -3013,7 +3106,8 @@ def test_env_eval_prompt_failure_fails_only_its_own_case(monkeypatch, tmp_path, 
             yield messages[-1]["content"]
 
     monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path, **_kwargs: Environment()
+        "flash.envs.loading.loader.load_freesolo_environment",
+        lambda _path, **_kwargs: Environment(),
     )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
@@ -3254,7 +3348,9 @@ def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path
         def chat_stream(self, target, messages, **kwargs):
             yield self._response
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
 
     # a thinking run: the reasoning is cut, so the grader sees the answer it was trained against.
     # before the fix the scorer saw the whole `<think>...` string and the case failed.
@@ -3307,7 +3403,9 @@ def test_env_eval_refuses_to_grade_when_the_plane_never_answered(
 
     client = Client()
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
     _patch_upload(monkeypatch, uploader)
 
@@ -3456,7 +3554,9 @@ def test_env_eval_drives_every_turn_of_a_multi_turn_environment(
         def chat_stream(self, target, messages, **kwargs):
             yield next(replies)
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: environment
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
@@ -3486,7 +3586,9 @@ def test_env_eval_reports_a_failed_turn_without_losing_the_case(
                 raise RuntimeError("upstream refused")
             yield "a"
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: environment
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -3516,7 +3618,9 @@ def test_env_eval_keeps_one_generation_per_case_for_single_turn(
             calls.append(messages[0]["content"])
             yield messages[0]["content"]
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
@@ -3551,7 +3655,9 @@ def test_env_eval_does_not_promote_a_first_action_suite_to_an_episode(
             calls.append("gen")
             yield "50"
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: environment
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
@@ -3581,7 +3687,9 @@ def test_env_eval_refuses_an_episode_suite_on_a_single_turn_environment(
         def chat_stream(self, target, messages, **kwargs):
             yield "x"
 
-    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1

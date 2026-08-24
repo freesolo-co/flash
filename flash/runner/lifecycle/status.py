@@ -34,7 +34,7 @@ def _runstatus_from_json(d: dict) -> RunStatus:
     # malformed persisted identity must fail closed rather than be treated as a legacy absence.
     values = {k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__}
     if d.get("source_snapshot") is not None:
-        from flash.source_snapshot import parse_descriptor
+        from flash.snapshot.source_snapshot import parse_descriptor
 
         values["source_snapshot"] = parse_descriptor(d["source_snapshot"]).to_dict()
     return RunStatus(**values)
@@ -64,7 +64,7 @@ def source_snapshot_from_status(status: RunStatus, *, required: bool = False) ->
                 "managed source identity is unavailable; descriptor-less attempts cannot be replaced"
             )
         return None
-    from flash.source_snapshot import parse_descriptor
+    from flash.snapshot.source_snapshot import parse_descriptor
 
     return parse_descriptor(raw).to_dict()
 
@@ -319,7 +319,7 @@ def validate_terminal_source_metrics(
     """Require trusted attempt-bound evidence for runs carrying a source descriptor."""
     if not isinstance(metrics, dict):
         raise RuntimeError("terminal metrics are invalid")
-    from flash.source_snapshot import (
+    from flash.snapshot.source_snapshot import (
         PUBLIC_PROVENANCE_KEY,
         TERMINAL_ATTESTATION_KEY,
         safe_public_projection,

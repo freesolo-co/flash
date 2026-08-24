@@ -28,10 +28,10 @@ import numpy as np
 import pytest
 from safetensors.numpy import save
 
-from flash.engine.worker.train.entry import backend_common as vc
-from flash.engine.worker.train.entry import rl_train
 from flash.engine.worker.perf.lifecycle import RetriableInfraError
 from flash.engine.worker.train.core.child import runtime as child_runtime
+from flash.engine.worker.train.entry import backend_common as vc
+from flash.engine.worker.train.entry import rl_train
 
 # the stamp reads the run's modality off `exclude_modules`: the language-prefix regex for a
 # text-only run, None for a multimodal one. these artifacts are text-only.

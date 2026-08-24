@@ -16,8 +16,8 @@ from typing import Any
 from flash.adapters.targets import resolve_lora_targeting
 from flash.core.catalog import get_model
 from flash.engine.plan.steps import rl_data_parallel_cards
-from flash.engine.worker.train.entry import opd_train as _opd_train
 from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
+from flash.engine.worker.train.entry import opd_train as _opd_train
 from flash.engine.worker.train.opd.orchestration.reporting import (
     _build_train_note_sections as _build_train_note_sections,
 )

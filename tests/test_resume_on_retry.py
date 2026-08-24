@@ -775,8 +775,8 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
 def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orch, monkeypatch):
     from flash.providers.core import allocator
     from flash.providers.core.base import Allocation, Candidate, PollResult
-    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs as lambda_jobs
+    from flash.providers.lambda_.client import api as lambda_api
 
     submits = []
     gc_calls = []
@@ -956,9 +956,9 @@ def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
     orch, monkeypatch, teardown_failure, status_mode
 ):
     from flash.providers.core.base import PollResult
+    from flash.providers.runpod import serverless as runpod_train
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs as rp_jobs
-    from flash.providers.runpod import serverless as runpod_train
 
     submits = []
     teardown_events = []

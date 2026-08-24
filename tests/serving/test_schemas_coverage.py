@@ -148,7 +148,7 @@ def test_generate_request_requires_exactly_one_nonempty_prompt_source(
 
 
 def test_serving_readme_uses_generate_request_field_names() -> None:
-    readme = Path(__file__).parents[2] / "flash" / "serving" / "README.md"
+    readme = Path(__file__).parents[2] / "flash" / "serving" / "app" / "README.md"
     text = readme.read_text()
 
     assert "`POST /generate` with `adapter_id`" in text

@@ -8,7 +8,10 @@ import pytest
 from fastapi import Request
 
 from flash.serving.src.http import inference_routes
-from flash.serving.src.http.inference_routes import _discard_prepared_stream, _stream_chat_completion
+from flash.serving.src.http.inference_routes import (
+    _discard_prepared_stream,
+    _stream_chat_completion,
+)
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.io.serving_io import _sse

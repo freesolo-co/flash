@@ -9,7 +9,6 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
-from flash.serving.src.store.persistence import PersistenceRecordError
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
 from flash.serving.src.io.serving_io import (
@@ -19,6 +18,7 @@ from flash.serving.src.io.serving_io import (
     _validate_alias,
     _validate_alias_target,
 )
+from flash.serving.src.store.persistence import PersistenceRecordError
 
 
 def _assert_matches_existing(existing: AdapterRecord, revision: AdapterRecord) -> None:

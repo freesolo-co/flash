@@ -124,7 +124,9 @@ def prepare_job(
         # run on one card would reject a shape the allocator would have placed -- so it
         # stays on the worker, which also keeps that check as defense in depth for any
         # path that reaches training without passing through here.
-        from flash.engine.worker.train.opd.orchestration.validation import preflight_opd_structured_outputs
+        from flash.engine.worker.train.opd.orchestration.validation import (
+            preflight_opd_structured_outputs,
+        )
 
         preflight_opd_structured_outputs(
             spec.train.structured_outputs,

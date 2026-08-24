@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-MODAL_APP = Path(__file__).resolve().parents[2] / "flash" / "serving" / "modal_app.py"
+MODAL_APP = Path(__file__).resolve().parents[2] / "flash" / "serving" / "app" / "modal_app.py"
 
 # Every catalog model currently ships a pre-quantized serve_model_id, so the online-quantization
 # default is exercised by clearing it rather than by picking a different model.
@@ -30,9 +30,9 @@ def engine_args():
     The conftest installs the vLLM stub at import, so this resolves against the same
     ``AsyncEngineArgs`` field set the engine would see on a build missing newer args.
     """
-    from flash.serving.src.store import settings as cfg
     from flash.serving.src.engine.boot import engine_args_for
     from flash.serving.src.engine.model_config import engine_overrides_for
+    from flash.serving.src.store import settings as cfg
 
     def _for(model: str, **overrides):
         resolved = {**engine_overrides_for(model), **overrides}

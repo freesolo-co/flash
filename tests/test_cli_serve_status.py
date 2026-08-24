@@ -185,7 +185,9 @@ def test_status_uses_deploy_time_identity_after_the_model_tip_advances(
     args.deployment_identity = encode_deployment_identity(deployed)
     deployed_name = build_modal_create_plan(deployed).names.app_or_pod
 
-    monkeypatch.setattr("flash.serve.deployment.resolve.resolve_base_revision", lambda *_a, **_k: "e" * 40)
+    monkeypatch.setattr(
+        "flash.serve.deployment.resolve.resolve_base_revision", lambda *_a, **_k: "e" * 40
+    )
     current_tip = serve_deploy._deployment_bundle(args)
     current_name = build_modal_create_plan(current_tip).names.app_or_pod
     assert current_name != deployed_name
@@ -197,7 +199,10 @@ def test_status_uses_deploy_time_identity_after_the_model_tip_advances(
         return _result(bundle, "absent")
 
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment", _reconcile)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        _reconcile,
+    )
 
     assert cmd_serve_status(args) == 0
     assert seen == [deployed_name]
@@ -220,8 +225,13 @@ def test_status_without_inference_key_reports_provider_observable_states(
     monkeypatch.delenv(serve_deploy.INFERENCE_KEY_ENV)
     modal_args = _args_with_identity(monkeypatch, "modal")
     runpod_args = _args_with_identity(monkeypatch, "runpod")
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment", _modal)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.lifecycle_entry.reconcile_runpod_deployment", _runpod)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        _modal,
+    )
+    monkeypatch.setattr(
+        "flash.serve.provisioning.runpod.lifecycle_entry.reconcile_runpod_deployment", _runpod
+    )
 
     assert cmd_serve_status(modal_args) == 0
     assert cmd_serve_status(runpod_args) == 0
@@ -242,8 +252,13 @@ def test_status_routes_to_the_named_read_only_provider(monkeypatch: pytest.Monke
     _stub_environment(monkeypatch)
     modal_args = _args_with_identity(monkeypatch, "modal")
     runpod_args = _args_with_identity(monkeypatch, "runpod")
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment", _modal)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.lifecycle_entry.reconcile_runpod_deployment", _runpod)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        _modal,
+    )
+    monkeypatch.setattr(
+        "flash.serve.provisioning.runpod.lifecycle_entry.reconcile_runpod_deployment", _runpod
+    )
 
     assert cmd_serve_status(modal_args) == 0
     assert cmd_serve_status(runpod_args) == 0
@@ -273,7 +288,10 @@ def test_status_surfaces_every_outcome_distinctly(
 
     _stub_environment(monkeypatch)
     args = _args_with_identity(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment", _reconcile)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        _reconcile,
+    )
 
     assert cmd_serve_status(args) == expected_code
     captured = capsys.readouterr()
@@ -293,7 +311,10 @@ def test_non_ready_status_never_prints_ready(
 
     _stub_environment(monkeypatch)
     args = _args_with_identity(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment", _reconcile)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        _reconcile,
+    )
 
     cmd_serve_status(args)
     output = capsys.readouterr().out
@@ -320,7 +341,10 @@ def test_status_credentials_never_enter_argv_output_or_artifacts(
     args = _args_with_identity(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["flash", "serve", "status"])
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment", _capture)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        _capture,
+    )
 
     assert cmd_serve_status(args) == 0
     captured = capsys.readouterr()

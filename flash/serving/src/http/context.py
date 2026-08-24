@@ -15,11 +15,11 @@ from typing import Any
 from fastapi import HTTPException, Request, status
 
 from flash.serving.src.http.headers import _bearer_token, assert_internal, is_trusted_internal
-from flash.serving.src.store.lookup import AdapterLookup
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.streaming import generate_once, openai_chat_stream, prepare_stream
 from flash.serving.src.io.usage import UsageReporter
+from flash.serving.src.store.lookup import AdapterLookup
 
 APP_STATE_ATTR = "serving_context"
 

@@ -60,10 +60,10 @@ def modal_app_module():
     modal_stub.Period.return_value = MagicMock()
     _MISSING = object()
     prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.modal_app", _MISSING)
+    prev_modal_app = sys.modules.get("flash.serving.app.modal_app", _MISSING)
     sys.modules["modal"] = modal_stub
 
-    import flash.serving.modal_app as modal_app
+    import flash.serving.app.modal_app as modal_app
 
     try:
         yield modal_app

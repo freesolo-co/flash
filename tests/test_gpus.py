@@ -266,7 +266,11 @@ def test_width_bound_rl_is_told_to_raise_its_step_not_shrink_it():
 
 @pytest.mark.parametrize(("sequence", "accepted"), [(131072, True), (262144, False)])
 def test_parse_and_allocator_agree_on_batch_bound_sft(sequence, accepted):
-    from flash.providers.core.allocator import _executed_width, _resolved_gpu_count, required_vram_gb
+    from flash.providers.core.allocator import (
+        _executed_width,
+        _resolved_gpu_count,
+        required_vram_gb,
+    )
     from flash.providers.core.base import UnsupportedGpuError
     from flash.schema import ConfigError, spec_from_dict
 

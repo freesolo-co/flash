@@ -232,8 +232,8 @@ def preflight_validate_environment_ref(spec: JobSpec) -> tuple[JobSpec, bool]:
     tokenless planes skip the request because github also returns 404 for private repositories an
     anonymous caller cannot read. a successful resolve is retained on the returned worker spec.
     """
-    from flash.envs.meta.identity import GitHubPermanentError
     from flash.envs.loading.loader import _github_token
+    from flash.envs.meta.identity import GitHubPermanentError
 
     parsed = _github_environment_ref(spec)
     if parsed is None:

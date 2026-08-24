@@ -51,10 +51,10 @@ def modal_app_module():
     # one. We also drop the imported `modal_app` so it is re-imported fresh against the real module.
     _MISSING = object()
     prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.modal_app", _MISSING)
+    prev_modal_app = sys.modules.get("flash.serving.app.modal_app", _MISSING)
     sys.modules["modal"] = modal_stub
 
-    import flash.serving.modal_app as modal_app  # imported after the stub is installed
+    import flash.serving.app.modal_app as modal_app  # imported after the stub is installed
 
     try:
         yield modal_app
@@ -573,7 +573,9 @@ def test_load_adapters_for_base_filters_records(modal_app_module, monkeypatch):
             self.is_revision = True
 
     records = [_Record("Qwen/Qwen3.5-4B"), _Record("Qwen/Qwen3.5-0.8B")]
-    monkeypatch.setattr("flash.serving.src.store.persistence.load_adapters", lambda settings: records)
+    monkeypatch.setattr(
+        "flash.serving.src.store.persistence.load_adapters", lambda settings: records
+    )
 
     assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-0.8B") == [records[1]]
 
@@ -799,8 +801,8 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
 ):
     import asyncio
 
-    from flash.serving.src.store.registry import AdapterRegistry, lora_int_id
     from flash.serving.src.io.schemas import AdapterRecord
+    from flash.serving.src.store.registry import AdapterRegistry, lora_int_id
 
     cached = AdapterRecord.model_validate(
         {
@@ -855,9 +857,9 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
 def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkeypatch, tmp_path):
     # two distinct adapters whose sha1 masks collide to the same vllm int id must not share it.
     # unconfirmed entries still occupy their id because vllm may retain the corresponding weights.
-    from flash.serving.src.store import registry as registry_mod
     from flash.serving.src.engine.lora_engine import _LoraEntry
     from flash.serving.src.io.schemas import AdapterRecord
+    from flash.serving.src.store import registry as registry_mod
 
     monkeypatch.setattr(registry_mod, "lora_int_id", lambda adapter_id: 42)
 
@@ -890,8 +892,8 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
 
 
 def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_module, monkeypatch):
-    from flash.serving.src.store import registry as registry_mod
     from flash.serving.src.engine.lora_engine import _LoraEntry
+    from flash.serving.src.store import registry as registry_mod
 
     monkeypatch.setattr(registry_mod, "lora_int_id", lambda _adapter_id: 42)
 

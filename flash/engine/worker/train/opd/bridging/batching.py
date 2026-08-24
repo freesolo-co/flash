@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import math
 
-from flash.engine.worker.train.entry.backend_common import BoundedThreadingHTTPServer
-from flash.engine.worker.train.entry.score_batcher import ScoreBatcher
 from flash.engine.worker.teacher.client import (
     _MAX_LOGPROB_ROUNDING_ERROR,
     TeacherClient,
@@ -21,6 +19,8 @@ from flash.engine.worker.teacher.client import (
     TeacherScore,
 )
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
+from flash.engine.worker.train.entry.backend_common import BoundedThreadingHTTPServer
+from flash.engine.worker.train.entry.score_batcher import ScoreBatcher
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
 # how many teacher POSTs may sit in the bridge server's accept backlog. defined here rather than

@@ -5,6 +5,7 @@ from typing import Any, ClassVar
 import httpx
 import pytest
 
+from flash.serving.src.io.schemas import AdapterRecord, PersistedAdapterRecord
 from flash.serving.src.store.persistence import (
     PERSISTED_COLUMNS,
     PersistenceConflict,
@@ -18,7 +19,6 @@ from flash.serving.src.store.persistence import (
     load_adapters,
     replace_adapter_cas,
 )
-from flash.serving.src.io.schemas import AdapterRecord, PersistedAdapterRecord
 from flash.serving.src.store.settings import Settings
 
 SHA = "a" * 40

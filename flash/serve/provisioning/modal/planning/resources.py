@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from flash.serve.control import ModalProviderHandle
 from flash.serve.control.types import validate_modal_provider_id
-
-from flash.serve.provisioning.modal.planning.plan import ModalCreatePlan
 from flash.serve.provisioning.modal.execution.sdk import (
     ModalAppObservation,
     ModalNamedResource,
     ModalObservation,
 )
+from flash.serve.provisioning.modal.planning.plan import ModalCreatePlan
 
 
 class ModalResourceConflict(RuntimeError):

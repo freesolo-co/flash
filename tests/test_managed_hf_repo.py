@@ -96,7 +96,7 @@ def test_managed_hf_repo_reuses_repo_for_same_environment():
 
 
 def test_source_archive_path_is_content_addressed():
-    from flash.source_snapshot import canonical_archive_path
+    from flash.snapshot.source_snapshot import canonical_archive_path
 
     digest = "a" * 64
     assert canonical_archive_path(digest) == f"source/{digest}/flash-source.zip"

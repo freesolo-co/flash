@@ -9,12 +9,12 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from flash._internal.channel import CLI_NAME
-from flash.cli.commands.ops import traces
 from flash.cli.commands.env.ops.retained import (
     _warn_if_environment_form_disagrees,
     _warn_if_retained_starter_files_describe_another_plane,
 )
 from flash.cli.commands.env.ops.setup_wandb import _wandb_block, _wandb_project
+from flash.cli.commands.ops import traces
 from flash.cli.scaffold import TRAINING_MD
 from flash.cli.ui import render
 from flash.envs.meta.evaluations import _DEFAULT_EVALUATIONS_PATH

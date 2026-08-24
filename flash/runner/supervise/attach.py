@@ -84,7 +84,7 @@ def _resume_after_confirmed_teardown(
         )
         return get_status(run_id)
     try:
-        from flash.source_snapshot import parse_descriptor
+        from flash.snapshot.source_snapshot import parse_descriptor
 
         source_snapshot = parse_descriptor(
             source_snapshot or source_snapshot_from_status(get_status(run_id), required=True)

@@ -17,7 +17,12 @@ import pytest
 from safetensors.numpy import save_file
 
 from flash.serve.deployment import resolve as resolve_module
-from flash.serve.deployment.resolve import ADAPTER_CONFIG, ADAPTER_WEIGHTS, ResolveError, resolve_adapter
+from flash.serve.deployment.resolve import (
+    ADAPTER_CONFIG,
+    ADAPTER_WEIGHTS,
+    ResolveError,
+    resolve_adapter,
+)
 
 BASE = "Qwen/Qwen3.5-4B"
 BASE_REVISION = "b" * 40

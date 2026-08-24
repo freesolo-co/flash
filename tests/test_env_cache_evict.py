@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from flash.envs.meta import cache_security
 from flash.envs.loading import loader as adapter
+from flash.envs.meta import cache_security
 
 
 def _make_private_cache_root(root: Path) -> None:

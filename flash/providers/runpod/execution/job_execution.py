@@ -8,13 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from flash.providers._lifecycle.net.deadline import (
-    CREATE_ALLOWANCE_S,
-    deadline_kwargs,
-    remaining_seconds,
-    require_create_allowance,
-    require_deadline_at,
-)
 from flash.providers._lifecycle.instances.poll import (
     PollErrorTracker,
     _attempt_int,
@@ -22,6 +15,13 @@ from flash.providers._lifecycle.instances.poll import (
     is_training_heartbeat,
     make_say,
     surface_heartbeat,
+)
+from flash.providers._lifecycle.net.deadline import (
+    CREATE_ALLOWANCE_S,
+    deadline_kwargs,
+    remaining_seconds,
+    require_create_allowance,
+    require_deadline_at,
 )
 from flash.providers.core.base import PollResult
 from flash.providers.runpod.execution import jobs as _jobs

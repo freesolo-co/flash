@@ -19,16 +19,16 @@ from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from flash.serving.src.http.headers import _checkpoint_headers
 from flash.serving.src.engine.model_config import (
     base_models,
     image_limit_for,
     is_supported_base_model,
     supports_image_input,
 )
+from flash.serving.src.http.headers import _checkpoint_headers
 from flash.serving.src.io.multimodal import MultimodalRequestError, normalize_chat_messages
-from flash.serving.src.store.persistence import PersistenceRecordError
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.store.persistence import PersistenceRecordError
 
 
 def _parse_generate(data: dict[str, Any]) -> GenerateRequest:
@@ -163,7 +163,10 @@ async def _insert_stored(record: AdapterRecord) -> AdapterRecord:
     try:
         return await asyncio.to_thread(insert_adapter, record, get_settings())
     except Exception as exc:
-        from flash.serving.src.store.persistence import PersistenceConflict, PersistenceReferenceError
+        from flash.serving.src.store.persistence import (
+            PersistenceConflict,
+            PersistenceReferenceError,
+        )
 
         if isinstance(exc, PersistenceConflict):
             raise

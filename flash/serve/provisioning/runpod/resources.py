@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Literal
 
 from flash.serve.control import RunPodProviderHandle
-
 from flash.serve.provisioning.runpod.plan import RunPodCreatePlan
 from flash.serve.provisioning.runpod.protocol import (
     LAUNCH_COMMAND,

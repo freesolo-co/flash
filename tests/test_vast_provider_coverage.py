@@ -13,8 +13,7 @@ from flash.providers.vast import VastProvider
 def test_vast_provider_delegates_credentials_pricing_gc_and_orphan_sweep(monkeypatch) -> None:
     """Thin provider methods must preserve arguments and return values from their Vast helpers."""
     from flash.providers.vast import jobs
-    from flash.providers.vast.client import preflight
-    from flash.providers.vast.client import pricing
+    from flash.providers.vast.client import preflight, pricing
 
     provider = VastProvider()
     calls = []

@@ -12,7 +12,6 @@ from flash.serve.control import (
     RunPodProviderHandle,
 )
 from flash.serve.control.types import validate_runpod_handle
-
 from flash.serve.provisioning.common.records import (
     Clock,
     DeploymentBundle,

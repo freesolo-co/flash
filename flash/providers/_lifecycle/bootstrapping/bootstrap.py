@@ -20,7 +20,6 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 if __package__:
-    from flash import source_snapshot as _source_snapshot
     from flash.providers._lifecycle.bootstrapping import console as _bootstrap_console
     from flash.providers._lifecycle.bootstrapping import pip as bootstrap_pip
     from flash.providers._lifecycle.bootstrapping.secrets import (
@@ -28,6 +27,7 @@ if __package__:
         _read_console_tail,
         _safe_detail,
     )
+    from flash.snapshot import source_snapshot as _source_snapshot
 else:
     # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
     # same directory, and the script directory leads sys.path.

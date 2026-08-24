@@ -11,11 +11,11 @@ the card they were found on.
 
 from typing import Any
 
+from flash.serving.src.engine.model_config import image_limit_for, supports_image_input
 from flash.serving.src.engine.support import (
     _async_engine_arg_names,
     _require_reasoning_api_compatibility,
 )
-from flash.serving.src.engine.model_config import image_limit_for, supports_image_input
 
 
 def load_tokenizer(base_model: str, settings: Any, cfg: Any) -> tuple[Any, Any]:

@@ -472,7 +472,9 @@ def test_all_worker_redactors_share_the_same_secret_corpus(monkeypatch):
     import textwrap
 
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
-    from flash.providers._lifecycle.bootstrapping.secrets import _safe_detail as bootstrap_safe_detail
+    from flash.providers._lifecycle.bootstrapping.secrets import (
+        _safe_detail as bootstrap_safe_detail,
+    )
     from flash.providers.runpod.serverless import endpoints
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
@@ -884,7 +886,7 @@ def _extra_pip_input(monkeypatch) -> dict:
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: "/source.zip")
     monkeypatch.setattr(
-        "flash.source_snapshot.materialize_verified_archive_file",
+        "flash.snapshot.source_snapshot.materialize_verified_archive_file",
         lambda *_args: None,
     )
     monkeypatch.setattr("importlib.util.spec_from_file_location", lambda *_args: None)
@@ -903,8 +905,8 @@ def _extra_pip_input(monkeypatch) -> dict:
 
 
 def test_train_body_source_verification_failure_prevents_pip(monkeypatch):
-    from flash import source_snapshot
     from flash.providers.runpod.serverless import endpoints
+    from flash.snapshot import source_snapshot
 
     input_data = _extra_pip_input(monkeypatch)
     pip_calls = []
@@ -1190,8 +1192,8 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     import inspect
 
     from flash.engine.profiling import sft_image_rows, sft_workload
-    from flash.engine.worker.train.entry import sft_train
     from flash.engine.worker.entry import sft
+    from flash.engine.worker.train.entry import sft_train
 
     # run_sft is now a pure delegation: no backend selector, no trainer of its own.
     assert "run_sft_train()" in inspect.getsource(sft.run_sft)
@@ -1205,8 +1207,8 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
 
     # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
     # this guard spans both modules. keep these in step when sft_train is split further.
-    from flash.engine.worker.train.sft.setup import config as sft_config
     from flash.engine.worker.train.sft.child import plugin as sft_plugin
+    from flash.engine.worker.train.sft.setup import config as sft_config
 
     train_src = inspect.getsource(sft_train) + inspect.getsource(sft_config)
     plugin_src = inspect.getsource(sft_plugin)
@@ -1322,8 +1324,12 @@ def test_train_body_uploads_console_on_missing_metrics(
         assert root == "/runcode"
         return run_code / f"{run_id}-attempt-{attempt}"
 
-    monkeypatch.setattr("flash.source_snapshot.attempt_materialization_path", materialization_path)
-    monkeypatch.setattr("flash.source_snapshot.materialize_verified_archive_file", materialize)
+    monkeypatch.setattr(
+        "flash.snapshot.source_snapshot.attempt_materialization_path", materialization_path
+    )
+    monkeypatch.setattr(
+        "flash.snapshot.source_snapshot.materialize_verified_archive_file", materialize
+    )
 
     class _FakeProc:
         # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.

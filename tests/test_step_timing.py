@@ -4,9 +4,9 @@ import math
 import pytest
 
 from flash.cli.ui.heartbeat import _heartbeat_pairs, _step_timing_pairs
+from flash.engine.worker.train.core.lifecycle.step_timing import StepTiming
 from flash.engine.worker.train.entry import rl_train_runner
 from flash.engine.worker.train.entry.rl_train_runner import _ingest_step_metrics, _StepMetricState
-from flash.engine.worker.train.core.lifecycle.step_timing import StepTiming
 
 
 def _line(step: int, duration: float, *, reward: float = 0.4) -> str:

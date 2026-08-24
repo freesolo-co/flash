@@ -135,13 +135,13 @@ def cmd_serve_undeploy(args) -> int:
         bundle = existing_deployment_bundle(args)
         handle = _provider_handle(args, bundle)
         if provider == "modal":
-            from flash.serve.provisioning.modal.planning.plan import build_modal_create_plan
             from flash.serve.provisioning.modal.execution.lifecycle_entry import _validate_handle
+            from flash.serve.provisioning.modal.planning.plan import build_modal_create_plan
 
             plan = build_modal_create_plan(bundle, phase="finalized")
         else:
-            from flash.serve.provisioning.runpod.plan import build_runpod_create_plan
             from flash.serve.provisioning.runpod.lifecycle_entry import _validate_handle
+            from flash.serve.provisioning.runpod.plan import build_runpod_create_plan
 
             plan = build_runpod_create_plan(bundle)
         # validate user-authored provider ids before teardown. either provider may have none only
@@ -155,7 +155,9 @@ def cmd_serve_undeploy(args) -> int:
 
     deadline_at = time.monotonic() + float(args.timeout)
     if provider == "modal":
-        from flash.serve.provisioning.modal.execution.lifecycle_entry import teardown_modal_deployment
+        from flash.serve.provisioning.modal.execution.lifecycle_entry import (
+            teardown_modal_deployment,
+        )
 
         result = teardown_modal_deployment(
             bundle,

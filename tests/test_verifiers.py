@@ -2288,9 +2288,9 @@ def _thinking_env(monkeypatch, sdk_env, *, prompt_opens_thinking: bool):
 
 
 def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monkeypatch):
+    from flash.engine.worker.model.decoding import prompt_opens_thinking
     from flash.engine.worker.train.entry import opd_train as opd_mod
     from flash.engine.worker.train.entry import opd_train_runner
-    from flash.engine.worker.model.decoding import prompt_opens_thinking
     from flash.engine.worker.train.opd.orchestration.state import _OpdRequest
 
     class _Tokenizer:

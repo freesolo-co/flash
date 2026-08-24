@@ -12,8 +12,8 @@ from flash.serving.src.engine.model_config import (
     gpu_for,
     is_supported_base_model,
 )
-from flash.serving.src.store.registry import AdapterRegistry
 from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.store.registry import AdapterRegistry
 
 
 class EnginePool(Protocol):

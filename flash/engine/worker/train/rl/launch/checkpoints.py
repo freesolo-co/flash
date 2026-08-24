@@ -16,14 +16,14 @@ import threading
 import time
 from collections.abc import Callable
 
+from flash.engine.worker.io.heartbeat import join_while_draining
+from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.train.core.lifecycle.checkpoint_lifecycle import CheckpointLedger
 from flash.engine.worker.train.entry.backend_common import (
     completed_checkpoint_step,
     stage_verl_resume,
     undiscovered_checkpoint_dirs,
 )
-from flash.engine.worker.io.heartbeat import join_while_draining
-from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.train.core.lifecycle.checkpoint_lifecycle import CheckpointLedger
 from flash.engine.worker.verl.checkpoints import (
     MergeDiskExhaustedError,
     MergeDiskHeadroomError,

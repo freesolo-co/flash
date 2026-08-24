@@ -20,6 +20,16 @@ from flash.engine.plan.steps import (
     on_policy_steps,  # noqa: F401
     resolve_update_horizon,  # noqa: F401
 )
+from flash.engine.worker.io.heartbeat import liveness_heartbeat
+
+# no call site in this module since the uploader moved to `.train.rl.checkpoints`, but it is kept
+# imported here on purpose: the resume tests patch `rl_train._deployable_adapter_on_hf`, and the
+# uploader reads it back through this module. removing it as unused would silently break them.
+from flash.engine.worker.io.hf import _deployable_adapter_on_hf  # noqa: F401
+from flash.engine.worker.model.packing import model_is_gdn_hybrid
+from flash.engine.worker.perf import gpu_diagnostics
+from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.runtime.rng import seed_training_rngs  # noqa: F401
 from flash.engine.worker.train.entry.backend_common import (  # noqa: F401
     _ORPHANED_PIPE_GRACE_S,
     _TEARDOWN_GRACE_S,
@@ -46,16 +56,6 @@ from flash.engine.worker.train.entry.backend_common import (  # noqa: F401
     verl_declares_rollout_field,
     verl_device_capability,
 )
-from flash.engine.worker.io.heartbeat import liveness_heartbeat
-
-# no call site in this module since the uploader moved to `.train.rl.checkpoints`, but it is kept
-# imported here on purpose: the resume tests patch `rl_train._deployable_adapter_on_hf`, and the
-# uploader reads it back through this module. removing it as unused would silently break them.
-from flash.engine.worker.io.hf import _deployable_adapter_on_hf  # noqa: F401
-from flash.engine.worker.model.packing import model_is_gdn_hybrid
-from flash.engine.worker.perf import gpu_diagnostics
-from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.runtime.rng import seed_training_rngs  # noqa: F401
 from flash.engine.worker.train.entry.sft_train import (  # noqa: F401
     _build_verl_child_env,
     _cached_model_path,
@@ -531,6 +531,18 @@ from flash.engine.worker.train.rl.launch.checkpoints import (  # noqa: E402,F401
 # re-exported so `rl_train._resolve_grpo_inputs` keeps working: the resolver is called and
 # source-inspected through this module by a large number of tests.
 from flash.engine.worker.train.rl.launch.inputs import _resolve_grpo_inputs  # noqa: E402,F401
+from flash.engine.worker.train.rl.launch.verl_config import (  # noqa: E402,F401
+    _DEFAULT_GPU_MEM_UTIL,
+    _build_verl_train_notes,
+    _build_verl_training_cfg,
+    _processor_expanded_prompt,
+    _verl_epochs_for_horizon,
+    _verl_grpo_parquet_features,
+    build_verl_dataset_rows,
+    build_verl_overrides,
+    resolve_gpu_mem_util,
+    write_verl_grpo_parquet,
+)
 from flash.engine.worker.train.rl.rollout.multi_turn import (  # noqa: E402,F401
     _MULTI_TURN_SCORE_BATCH_SIZE,
     _MULTI_TURN_SCORE_FLUSH_WAIT_S,
@@ -551,16 +563,4 @@ from flash.engine.worker.train.rl.rollout.single_turn import (  # noqa: E402,F40
     _single_turn_scoring_state,
     score_single_turn,
     score_single_turn_batch,
-)
-from flash.engine.worker.train.rl.launch.verl_config import (  # noqa: E402,F401
-    _DEFAULT_GPU_MEM_UTIL,
-    _build_verl_train_notes,
-    _build_verl_training_cfg,
-    _processor_expanded_prompt,
-    _verl_epochs_for_horizon,
-    _verl_grpo_parquet_features,
-    build_verl_dataset_rows,
-    build_verl_overrides,
-    resolve_gpu_mem_util,
-    write_verl_grpo_parquet,
 )

@@ -21,10 +21,10 @@ from flash.serving.src.http.adapter_routes import adapter_router
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
 from flash.serving.src.http.context import APP_STATE_ATTR, ServingContext
 from flash.serving.src.http.inference_routes import inference_router
-from flash.serving.src.store.lookup import AdapterLookup
 from flash.serving.src.http.routing import AdapterRouter, EnginePool, health_body
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.usage import UsageReporter
+from flash.serving.src.store.lookup import AdapterLookup
 
 THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 _USAGE_REPORT_DRAIN_TIMEOUT_SECONDS = 45.0

@@ -135,8 +135,13 @@ def test_deploy_routes_to_the_named_provider(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment", _fake_modal)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment", _fake_runpod)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        _fake_modal,
+    )
+    monkeypatch.setattr(
+        "flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment", _fake_runpod
+    )
 
     assert cmd_serve_deploy(_args()) == 0
     assert (
@@ -167,7 +172,9 @@ def test_runpod_storage_precondition_message_reaches_the_user(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment", _reject)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment", _reject
+    )
 
     assert (
         cmd_serve_deploy(
@@ -192,7 +199,10 @@ def test_dry_run_contacts_no_provider(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("a dry run must not reach the provider")
 
     _stub_resolution(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment", _explode)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        _explode,
+    )
     # deliberately no credentials in the environment: a dry run must not require them either.
     for name in (
         serve_deploy.MODAL_TOKEN_ID_ENV,
@@ -211,7 +221,10 @@ def test_missing_credentials_fail_before_any_provider_call(
         raise AssertionError("provisioning ran without credentials")
 
     _stub_resolution(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment", _explode)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        _explode,
+    )
     monkeypatch.delenv(serve_deploy.MODAL_TOKEN_ID_ENV, raising=False)
     monkeypatch.delenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, raising=False)
     monkeypatch.setenv(serve_deploy.INFERENCE_KEY_ENV, "inference-key")
@@ -237,7 +250,10 @@ def test_hub_token_reaches_provisioning_so_the_container_can_hydrate(
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
     monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "hf-token")
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment", _capture)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        _capture,
+    )
 
     assert cmd_serve_deploy(_args()) == 0
     assert seen == [("inference-key", "hf-token")]
@@ -246,7 +262,10 @@ def test_hub_token_reaches_provisioning_so_the_container_can_hydrate(
 @pytest.mark.parametrize(
     ("provider", "target"),
     [
-        ("modal", "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment"),
+        (
+            "modal",
+            "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        ),
         ("runpod", "flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment"),
     ],
 )
@@ -272,7 +291,10 @@ def test_tokenless_adoption_reaches_the_provider(
 @pytest.mark.parametrize(
     ("provider", "target"),
     [
-        ("modal", "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment"),
+        (
+            "modal",
+            "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        ),
         ("runpod", "flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment"),
     ],
 )
@@ -312,7 +334,10 @@ def test_the_deploy_proceeds_once_a_token_is_present(
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
     monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "hf-token")
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment", _capture)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        _capture,
+    )
 
     assert cmd_serve_deploy(_args()) == 0
     assert seen == [("inference-key", "hf-token")]
@@ -331,7 +356,9 @@ def test_resolver_validation_failures_are_cli_errors_not_tracebacks(
         raise ValueError("invalid immutable adapter revision components")
 
     monkeypatch.setattr("flash.serve.deployment.resolve.resolve_adapter", _raise_plain)
-    monkeypatch.setattr("flash.serve.deployment.resolve.resolve_base_revision", lambda *_a, **_k: "d" * 40)
+    monkeypatch.setattr(
+        "flash.serve.deployment.resolve.resolve_base_revision", lambda *_a, **_k: "d" * 40
+    )
 
     assert cmd_serve_deploy(_args()) == 1
     assert "invalid immutable adapter revision components" in capsys.readouterr().err
@@ -414,7 +441,10 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment", _unknown)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        _unknown,
+    )
 
     assert cmd_serve_deploy(_args()) == 1
     captured = capsys.readouterr()
@@ -449,7 +479,9 @@ def test_runpod_unknown_outcome_explains_idless_identity_reclaim(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment", _unknown)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment", _unknown
+    )
 
     assert cmd_serve_deploy(_args(provider="runpod")) == 1
     captured = capsys.readouterr()
@@ -489,7 +521,9 @@ def test_artifact_cleanup_timeout_reports_a_live_billing_service(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment", _timed_out)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment", _timed_out
+    )
 
     assert cmd_serve_deploy(_args(provider="runpod")) == 1
     captured = capsys.readouterr()
@@ -527,7 +561,9 @@ def test_artifact_cleanup_rejection_warns_that_the_pod_is_live_and_billing(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment", _rejected)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.runpod.lifecycle_entry.provision_runpod_deployment", _rejected
+    )
 
     assert cmd_serve_deploy(_args(provider="runpod")) == 1
     captured = capsys.readouterr()
@@ -565,7 +601,8 @@ def test_modal_artifact_cleanup_result_warns_that_the_app_is_live_and_billing(
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
     monkeypatch.setattr(
-        "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment", _cleanup_failure
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        _cleanup_failure,
     )
 
     assert cmd_serve_deploy(_args(provider="modal")) == 1
@@ -587,7 +624,10 @@ def test_interrupted_deploy_prints_recovery_identity_without_masking_interrupt(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment", _interrupted)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        _interrupted,
+    )
 
     with pytest.raises(InterruptedProvisioning):
         cmd_serve_deploy(_args())
@@ -900,7 +940,10 @@ def test_dry_run_rejects_placement_a_real_deployment_would_reject(
     def _explode(*_args, **_kwargs):
         raise AssertionError("a dry run must not reach the provider")
 
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment", _explode)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        _explode,
+    )
 
     assert cmd_serve_deploy(_args(dry_run=True, **{field: bad})) == 1
 

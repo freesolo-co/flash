@@ -1415,7 +1415,10 @@ def test_sft_configuring_is_a_setup_stage_on_the_tight_liveness_cadence():
     wide setup grace (it has not even loaded the model yet), refreshes status on the faster setup
     cadence, and is throttled so its 30s re-emit can't blow the HF commit cap."""
     import flash.engine.worker as ne
-    from flash.providers._lifecycle.instances.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+    from flash.providers._lifecycle.instances.poll import (
+        SETUP_HEARTBEAT_STAGES,
+        is_training_heartbeat,
+    )
 
     assert "sft_configuring" in SETUP_HEARTBEAT_STAGES
     assert is_training_heartbeat("sft_configuring", 0) is False
@@ -1495,7 +1498,10 @@ def test_model_load_is_a_throttled_setup_stage(stage):
     a slow cold mount spends the HF commit budget on them, and must keep the WIDE setup grace since
     no training has started."""
     import flash.engine.worker as ne
-    from flash.providers._lifecycle.instances.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+    from flash.providers._lifecycle.instances.poll import (
+        SETUP_HEARTBEAT_STAGES,
+        is_training_heartbeat,
+    )
 
     assert stage in SETUP_HEARTBEAT_STAGES
     assert is_training_heartbeat(stage, 0) is False

@@ -4,7 +4,7 @@ import copy
 
 import pytest
 
-from flash.source_snapshot import (
+from flash.snapshot.source_snapshot import (
     PUBLIC_PROVENANCE_KEY,
     TERMINAL_ATTESTATION_KEY,
     source_attestation,

@@ -36,7 +36,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         captured = {}
 
         def fake_submit(spec, seed, log=None, **kwargs):
-            from flash.source_snapshot import TERMINAL_ATTESTATION_KEY, source_attestation
+            from flash.snapshot.source_snapshot import TERMINAL_ATTESTATION_KEY, source_attestation
 
             captured["gpu"] = spec.gpu.type
             captured["seed"] = seed
@@ -191,9 +191,11 @@ def test_publish_source_snapshot_forces_private_and_captures_commit(monkeypatch,
         return str(archive_file)
 
     _install_snapshot_hub(monkeypatch, _Api, download)
-    monkeypatch.setattr("flash.source_snapshot.build_source_archive", lambda **_kwargs: archive)
     monkeypatch.setattr(
-        "flash.source_snapshot.read_verified_archive", lambda data, _desc: {"ok": data}
+        "flash.snapshot.source_snapshot.build_source_archive", lambda **_kwargs: archive
+    )
+    monkeypatch.setattr(
+        "flash.snapshot.source_snapshot.read_verified_archive", lambda data, _desc: {"ok": data}
     )
 
     descriptor = worker.publish_source_snapshot("owner/run-artifacts")
@@ -248,8 +250,10 @@ def test_publish_source_snapshot_creates_missing_repo(monkeypatch, tmp_path):
         return str(archive_file)
 
     _install_snapshot_hub(monkeypatch, _Api, download)
-    monkeypatch.setattr("flash.source_snapshot.build_source_archive", lambda **_kwargs: archive)
-    monkeypatch.setattr("flash.source_snapshot.read_verified_archive", lambda *_args: {})
+    monkeypatch.setattr(
+        "flash.snapshot.source_snapshot.build_source_archive", lambda **_kwargs: archive
+    )
+    monkeypatch.setattr("flash.snapshot.source_snapshot.read_verified_archive", lambda *_args: {})
 
     worker.publish_source_snapshot("owner/new-env-artifacts")
 
@@ -348,8 +352,10 @@ def test_publish_source_snapshot_reuses_verified_archive_at_exact_head(monkeypat
         return str(archive_file)
 
     _install_snapshot_hub(monkeypatch, _Api, download)
-    monkeypatch.setattr("flash.source_snapshot.build_source_archive", lambda **_kwargs: archive)
-    monkeypatch.setattr("flash.source_snapshot.read_verified_archive", lambda *_args: {})
+    monkeypatch.setattr(
+        "flash.snapshot.source_snapshot.build_source_archive", lambda **_kwargs: archive
+    )
+    monkeypatch.setattr("flash.snapshot.source_snapshot.read_verified_archive", lambda *_args: {})
 
     descriptor = worker.publish_source_snapshot("owner/run-artifacts")
 
@@ -391,8 +397,10 @@ def test_publish_source_snapshot_rereads_concurrent_winner(monkeypatch, tmp_path
         return str(archive_file)
 
     _install_snapshot_hub(monkeypatch, _Api, download)
-    monkeypatch.setattr("flash.source_snapshot.build_source_archive", lambda **_kwargs: archive)
-    monkeypatch.setattr("flash.source_snapshot.read_verified_archive", lambda *_args: {})
+    monkeypatch.setattr(
+        "flash.snapshot.source_snapshot.build_source_archive", lambda **_kwargs: archive
+    )
+    monkeypatch.setattr("flash.snapshot.source_snapshot.read_verified_archive", lambda *_args: {})
 
     descriptor = worker.publish_source_snapshot("owner/run-artifacts")
     assert descriptor["revision"] == "e" * 40

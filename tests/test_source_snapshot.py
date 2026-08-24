@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-import flash.source_snapshot as source_snapshot
-from flash.source_snapshot import (
+import flash.snapshot.source_snapshot as source_snapshot
+from flash.snapshot.source_snapshot import (
     SourceSnapshotDescriptor,
     SourceSnapshotError,
     attempt_materialization_path,

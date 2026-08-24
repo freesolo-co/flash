@@ -25,12 +25,12 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from flash.serving.src.engine.support import _require_reasoning_api_compatibility
 from flash.serving.src.engine.model_config import reasoning_parser_for
-from flash.serving.src.store.registry import AdapterRegistry
+from flash.serving.src.engine.support import _require_reasoning_api_compatibility
 from flash.serving.src.io.responses import openai_generate_fields
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.io.streaming import openai_chat_stream
+from flash.serving.src.store.registry import AdapterRegistry
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}
@@ -59,12 +59,12 @@ def modal_app_module():
     modal_stub.Period.return_value = MagicMock()
     _MISSING = object()
     prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.modal_app", _MISSING)
+    prev_modal_app = sys.modules.get("flash.serving.app.modal_app", _MISSING)
     sys.modules["modal"] = modal_stub
     # Force a fresh import UNDER the stub (see test_serve_thinking.py for why).
-    sys.modules.pop("flash.serving.modal_app", None)
+    sys.modules.pop("flash.serving.app.modal_app", None)
 
-    import flash.serving.modal_app as modal_app  # imported after the stub is installed
+    import flash.serving.app.modal_app as modal_app  # imported after the stub is installed
 
     try:
         yield modal_app

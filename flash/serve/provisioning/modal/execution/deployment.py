@@ -6,10 +6,16 @@ import contextlib
 from dataclasses import dataclass
 
 from flash.serve.control import DeploymentResult
-
 from flash.serve.provisioning.common.records import Clock, LifecycleFailure, Sleeper
 from flash.serve.provisioning.modal.execution.lifecycle import mutation, observe
+from flash.serve.provisioning.modal.execution.sdk import (
+    ModalNamedResource,
+    ModalObservation,
+    ModalSdk,
+    ModalSdkFailure,
+)
 from flash.serve.provisioning.modal.planning.plan import ModalCreatePlan
+from flash.serve.provisioning.modal.planning.resources import ModalResourceConflict
 from flash.serve.provisioning.modal.readiness_checks.readiness import (
     EndpointProbe,
     ExpectedResources,
@@ -22,8 +28,6 @@ from flash.serve.provisioning.modal.readiness_checks.readiness import (
     unknown_result,
     wait_for_phase,
 )
-from flash.serve.provisioning.modal.planning.resources import ModalResourceConflict
-from flash.serve.provisioning.modal.execution.sdk import ModalNamedResource, ModalObservation, ModalSdk, ModalSdkFailure
 
 _CLEANUP_RESERVE_SECONDS = 30.0
 

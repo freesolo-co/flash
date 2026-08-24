@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import Literal
 
 from flash.serve.control import ModalPlacement
-
 from flash.serve.provisioning.common.records import (
     DeploymentBundle,
     ServingResourceNames,

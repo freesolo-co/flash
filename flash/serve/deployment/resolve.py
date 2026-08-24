@@ -22,8 +22,8 @@ from flash.schema import format_adapter_revision
 from flash.serve.app import AdapterExecutionInput, ArtifactFile, ExecutionInputs
 from flash.serve.app.materialize import MaterializationError, validate_adapter_weight_structure
 from flash.serve.contract.contract import reject_non_finite_json_constant
-from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
 from flash.serve.contract.profiles import ServingProfile
+from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
 from flash.serve.provisioning import ServingImage
 
 # a peft lora adapter is exactly these files. requiring the pair (rather than accepting whatever

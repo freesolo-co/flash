@@ -8,7 +8,6 @@ import urllib.request
 
 from flash.serve.app.manifest import ManifestAdapter
 from flash.serve.control._urls import validate_modal_public_url
-
 from flash.serve.provisioning.common.records import DeploymentBundle
 
 _MAX_PROBE_RESPONSE_BYTES = 2 * 1024 * 1024

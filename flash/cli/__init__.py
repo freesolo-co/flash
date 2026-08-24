@@ -37,6 +37,9 @@ from flash.cli.commands import (  # noqa: F401
     cmd_whoami,
     verify_freesolo_key,
 )
+from flash.cli.commands.env.ops.list import cmd_env_list
+from flash.cli.commands.env.ops.push import cmd_env_delete, cmd_env_pull, cmd_env_push
+from flash.cli.commands.env.ops.setup import cmd_env_setup
 from flash.cli.commands.env.testing.eval import (
     _MAX_CONCURRENCY,
     bounded_concurrency,
@@ -44,9 +47,6 @@ from flash.cli.commands.env.testing.eval import (
     finite_float,
     positive_int,
 )
-from flash.cli.commands.env.ops.list import cmd_env_list
-from flash.cli.commands.env.ops.push import cmd_env_delete, cmd_env_pull, cmd_env_push
-from flash.cli.commands.env.ops.setup import cmd_env_setup
 from flash.cli.commands.env.testing.test import cmd_env_test
 from flash.cli.commands.ops.traces import (
     DEFAULT_EXPORT_PATH,

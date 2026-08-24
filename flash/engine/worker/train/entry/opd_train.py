@@ -17,6 +17,17 @@ from flash.engine.plan.steps import (  # noqa: F401
 from flash.engine.profiling.sft_workload import (  # noqa: F401
     _materialize_verl_images,
 )
+from flash.engine.worker.entry.opd import (  # noqa: F401
+    _resolve_opd_knobs,
+    _thinking_prefill_text,
+)
+from flash.engine.worker.io.heartbeat import liveness_heartbeat
+from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.runtime.rng import seed_training_rngs  # noqa: F401
+from flash.engine.worker.train.core.child.glue import (  # noqa: F401
+    validate_glue_template,
+    validate_transcript_messages,
+)
 from flash.engine.worker.train.entry.backend_common import (  # noqa: F401
     ChildOutputTail,
     ChildTailStaleness,
@@ -44,13 +55,6 @@ from flash.engine.worker.train.entry.backend_common import (  # noqa: F401
     verl_device_capability,
     verl_step_number,
 )
-from flash.engine.worker.entry.opd import (  # noqa: F401
-    _resolve_opd_knobs,
-    _thinking_prefill_text,
-)
-from flash.engine.worker.io.heartbeat import liveness_heartbeat
-from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.runtime.rng import seed_training_rngs  # noqa: F401
 from flash.engine.worker.train.entry.sft_train import (  # noqa: F401
     _cached_model_path,
     _export_checkpoint_adapter,
@@ -59,10 +63,6 @@ from flash.engine.worker.train.entry.sft_train import (  # noqa: F401
     _seed_resume_lifecycle,
     _verl_image_message_content,
     _warmstart_adapter_path,
-)
-from flash.engine.worker.train.core.child.glue import (  # noqa: F401
-    validate_glue_template,
-    validate_transcript_messages,
 )
 from flash.engine.worker.train.opd.orchestration.gkd import (
     generation_eos_from_cached_config,
@@ -300,11 +300,11 @@ def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[f
 
 def run_opd_train(spec=None) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
-    from flash.engine.worker.train.opd.orchestration.validation import validate_opd_structured_outputs
+    from flash.engine.worker.train.opd.orchestration import validation
 
     request = _prepare_request(spec := spec or _w.JOB_SPEC)
     knobs, model_id, model_revision = request.knobs, request.model_id, request.model_revision
-    structured_validation = validate_opd_structured_outputs(
+    structured_validation = validation.validate_opd_structured_outputs(
         knobs.structured_outputs,
         model_id=model_id,
         model_revision=model_revision,
@@ -485,6 +485,18 @@ from flash.engine.worker.train.opd.bridging.batching import (  # noqa: E402,F401
     _validate_text_teacher_batch,
 )
 from flash.engine.worker.train.opd.bridging.bridge import _TeacherAlignmentBridge  # noqa: E402
+
+# prompt fingerprinting and token-mask helpers, implemented in `.train.opd.prompts`.
+# re-exported because `run_opd_train` above and the opd tests both reach them here.
+from flash.engine.worker.train.opd.bridging.prompts import (  # noqa: E402,F401
+    _normalize_prompt_ids,
+    _processor_expanded_prompt,
+    _processor_expanded_prompt_ids,
+    _prompt_pool_fingerprint,
+    _trim_response_and_forced,
+    _validate_forced_mask,
+    encode_shifted_group_metadata,
+)
 from flash.engine.worker.train.opd.child.bridge import (  # noqa: E402,F401
     _read_rollout_failure_fallback,
 )
@@ -516,16 +528,4 @@ from flash.engine.worker.train.opd.orchestration.overrides import (  # noqa: E40
     _opd_multimodal_parquet_features,
     _write_opd_parquet,
     build_opd_overrides,
-)
-
-# prompt fingerprinting and token-mask helpers, implemented in `.train.opd.prompts`.
-# re-exported because `run_opd_train` above and the opd tests both reach them here.
-from flash.engine.worker.train.opd.bridging.prompts import (  # noqa: E402,F401
-    _normalize_prompt_ids,
-    _processor_expanded_prompt,
-    _processor_expanded_prompt_ids,
-    _prompt_pool_fingerprint,
-    _trim_response_and_forced,
-    _validate_forced_mask,
-    encode_shifted_group_metadata,
 )

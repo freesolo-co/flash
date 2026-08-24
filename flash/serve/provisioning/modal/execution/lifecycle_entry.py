@@ -10,7 +10,6 @@ from flash.serve.control import (
     ModalProviderHandle,
 )
 from flash.serve.control.types import validate_modal_handle
-
 from flash.serve.provisioning.common.records import (
     Clock,
     DeploymentBundle,
@@ -33,7 +32,19 @@ from flash.serve.provisioning.modal.execution.lifecycle import (
     validate_control_inputs,
     validate_runtime_inputs,
 )
+from flash.serve.provisioning.modal.execution.sdk import (
+    ModalObservation,
+    ModalSdk,
+    ModalSdkFactory,
+    ModalSdkFailure,
+    create_modal_sdk,
+)
 from flash.serve.provisioning.modal.planning.plan import ModalCreatePlan, build_modal_create_plan
+from flash.serve.provisioning.modal.planning.resources import (
+    ModalResourceConflict,
+    ensure_unique_resources,
+    exact_teardown_resources,
+)
 from flash.serve.provisioning.modal.readiness_checks.probe import ModalEndpointProbe
 from flash.serve.provisioning.modal.readiness_checks.readiness import (
     EndpointProbe,
@@ -44,18 +55,6 @@ from flash.serve.provisioning.modal.readiness_checks.readiness import (
     phase_proof,
     unknown_result,
     wait_for_phase,
-)
-from flash.serve.provisioning.modal.planning.resources import (
-    ModalResourceConflict,
-    ensure_unique_resources,
-    exact_teardown_resources,
-)
-from flash.serve.provisioning.modal.execution.sdk import (
-    ModalObservation,
-    ModalSdk,
-    ModalSdkFactory,
-    ModalSdkFailure,
-    create_modal_sdk,
 )
 from flash.serve.provisioning.modal.readiness_checks.teardown import (
     confirm_teardown_absence,

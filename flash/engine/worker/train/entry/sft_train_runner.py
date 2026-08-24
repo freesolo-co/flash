@@ -17,8 +17,8 @@ from math import gcd
 from flash.adapters.targets import resolve_lora_targeting
 from flash.core.catalog import get_model
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
-from flash.engine.worker.train.entry import sft_train as _sft_train
 from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
+from flash.engine.worker.train.entry import sft_train as _sft_train
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 from flash.providers.core.base import rentable_gpu_counts
 

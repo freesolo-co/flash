@@ -21,12 +21,16 @@ from flash.engine.profiling.tokenizer import load_control_plane_tokenizer
 from flash.engine.worker.entry.sft import select_sft_examples
 from flash.engine.worker.model.packing import worker_image_packing_support
 from flash.envs.loading.base import with_system_prompt
+from flash.envs.loading.loader import (
+    _load_contract_text,
+    _resolve_environment_reference,
+    _resolve_path_arg,
+)
 from flash.envs.meta.dataset_selection import (
     _packaged_dataset_file,
     _validate_packaged_dataset_split,
     select_dataset_source,
 )
-from flash.envs.loading.loader import _load_contract_text, _resolve_environment_reference, _resolve_path_arg
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"

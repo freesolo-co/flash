@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.train.opd.orchestration import failures
 from flash.engine.worker.train.opd.child import bridge, multiturn
+from flash.engine.worker.train.opd.orchestration import failures
 
 
 class _Loop:

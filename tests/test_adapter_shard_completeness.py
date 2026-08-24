@@ -302,8 +302,8 @@ def test_serving_validation_refuses_an_orphan_shard(monkeypatch):
 
     import huggingface_hub
 
-    from flash.serve.deployment.adapter_check import _verify_adapter_artifact_tensors
     from flash.serve.contract.errors import AdapterTensorMissing
+    from flash.serve.deployment.adapter_check import _verify_adapter_artifact_tensors
 
     class FakeApi:
         def list_repo_tree(self, **_kwargs):

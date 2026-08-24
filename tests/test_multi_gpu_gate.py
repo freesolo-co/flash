@@ -513,8 +513,8 @@ def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
     1-card box while the worker still starts n ranks -- the exact billing exposure the submit-path
     test guards, reached through the other door.
     """
-    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs as lj
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_.jobs.builders import LambdaInstance
 
     def _inst(region: str) -> LambdaInstance:
@@ -561,8 +561,8 @@ def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
 
 def test_vast_capacity_refresh_keeps_the_allocated_card_count():
     """Same contract on Vast: ``usable_offers`` defaults ``num_gpus`` to 1 on an omitted refresh."""
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vj
+    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast.jobs.builders import VastOffer
 
     def _offer(offer_id: int) -> VastOffer:
@@ -622,8 +622,8 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
     cards = 4
 
     if provider == "lambda":
-        from flash.providers.lambda_.client import api as lambda_api
         from flash.providers.lambda_ import jobs as lj
+        from flash.providers.lambda_.client import api as lambda_api
         from flash.providers.lambda_.jobs.builders import LambdaInstance
 
         inst = LambdaInstance(
@@ -649,8 +649,8 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
         finally:
             monkey.undo()
     else:
-        from flash.providers.vast.client import api as vast_api
         from flash.providers.vast import jobs as vj
+        from flash.providers.vast.client import api as vast_api
         from flash.providers.vast.jobs.builders import VastOffer
 
         offer = VastOffer(

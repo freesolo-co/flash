@@ -10,15 +10,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from flash._internal.channel import CLI_NAME
+from flash.cli.commands.env.ops.push import _err
 from flash.cli.commands.env.testing.eval_args import (
     _MAX_CONCURRENCY,
     bounded_concurrency,
     finite_float,
     positive_int,
 )
-from flash.cli.commands.env.ops.push import _err
-from flash.cli.commands.env.testing.test import _env_params
 from flash.cli.commands.env.testing.evaluations import _evaluation_example
+from flash.cli.commands.env.testing.test import _env_params
 from flash.cli.ui import render
 from flash.envs.meta.evaluations import (
     EvalCase,

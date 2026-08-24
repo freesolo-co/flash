@@ -20,7 +20,7 @@ chat route allows 30 minutes and gives
 first-party serving a 1,700-second request budget, leaving frontend headroom. Adapter undeploy
 returns after durable routing state is disabled, while
 best-effort gpu eviction continues as response background work. The `start_all` entrypoint (`uv run
-modal run flash/serving/modal_app.py`) remains an explicit manual diagnostic that boots engines and blocks until
+modal run flash/serving/app/modal_app.py`) remains an explicit manual diagnostic that boots engines and blocks until
 each reports healthy. Pass `--base-model ...` to check one model.
 
 The routing layer (`src/router.py`) carries no `modal`/`vllm` imports and is exhaustively
@@ -55,7 +55,7 @@ and the custom domain `https://serve.freesolo.co`. The production workflow remai
 # imports `flash.serving.src...`, so deploying from anywhere else fails at import.
 uv sync --extra serving
 set -a && source .env && set +a
-uv run modal deploy flash/serving/modal_app.py
+uv run modal deploy flash/serving/app/modal_app.py
 ```
 
 Required production wiring is `HF_TOKEN`, `FREESOLO_INTERNAL_KEY`,
@@ -101,13 +101,13 @@ export SUPABASE_URL=https://${SUPABASE_PROJECT_REF_DEV}.supabase.co
 export SUPABASE_SERVICE_ROLE_KEY="replace-with-development-server-key"
 export FREESOLO_INTERNAL_KEY="replace-with-shared-internal-key"
 export HF_TOKEN="replace-with-hugging-face-token"
-uv run modal deploy --env dev flash/serving/modal_app.py
+uv run modal deploy --env dev flash/serving/app/modal_app.py
 ```
 
 Explicitly warm one development model without changing the zero floor:
 
 ```bash
-uv run modal run --env dev flash/serving/modal_app.py --base-model Qwen/Qwen3.5-0.8B
+uv run modal run --env dev flash/serving/app/modal_app.py --base-model Qwen/Qwen3.5-0.8B
 ```
 
 ### No autoscaling or vLLM perf knobs

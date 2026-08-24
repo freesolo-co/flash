@@ -12,15 +12,15 @@ from dataclasses import dataclass
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
 from flash.core.spec import gpu_count_of
-from flash.providers._lifecycle.net.deadline import (
-    deadline_kwargs,
-    require_create_allowance,
-    require_deadline_at,
-)
 from flash.providers._lifecycle.instances.poll import (
     _attempt_int,
     heartbeat_oom_for_attempt,
     surface_heartbeat,
+)
+from flash.providers._lifecycle.net.deadline import (
+    deadline_kwargs,
+    require_create_allowance,
+    require_deadline_at,
 )
 from flash.providers.artifacts.hf import (
     make_hf_failure_detail_reader,
@@ -309,7 +309,7 @@ def submit_run(
     """Deploy, submit, persist handle via ``on_handle``, and poll to completion."""
     from flash.envs.loading.base import worker_pip_with_extras
     from flash.providers.runpod.serverless import _run_suffix, build_worker_env
-    from flash.source_snapshot import parse_descriptor
+    from flash.snapshot.source_snapshot import parse_descriptor
 
     deadline_at = require_deadline_at(deadline_at)
     attempt_id = _attempt_int(attempt)

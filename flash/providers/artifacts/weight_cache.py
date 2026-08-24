@@ -18,8 +18,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flash._internal.logging import configure_logging, get_logger
-from flash.providers._lifecycle.net.deadline import deadline_kwargs
 from flash.providers._lifecycle.instances.poll import preload_instance_run_id
+from flash.providers._lifecycle.net.deadline import deadline_kwargs
 from flash.providers.artifacts.hf import make_hf_text_reader
 
 # imported at the top rather than re-exported at the bottom: these are default argument

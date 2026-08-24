@@ -11,8 +11,8 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from flash.serving.src.engine.errors import raise_if_engine_error, terminating_on_engine_error
-from flash.serving.src.io.responses import _ReasoningStreamSplitter, _usage_block
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
+from flash.serving.src.io.responses import _ReasoningStreamSplitter, _usage_block
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.serving_io import (
     _active_checkpoint_ref,

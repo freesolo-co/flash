@@ -20,8 +20,8 @@ from verl.workers.config import model as verl_model_config
 from verl.workers.config.model import HFModelConfig
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
-from flash.engine.worker.train.entry.backend_common import VERL_REQUIREMENT_URL
 from flash.engine.worker.train.core.child import runtime as child_runtime
+from flash.engine.worker.train.entry.backend_common import VERL_REQUIREMENT_URL
 
 _PINNED_COMMIT = "32d6200de81dc484893baf8b9cf30297ebe7fa49"
 _PINNED_BLOBS = {

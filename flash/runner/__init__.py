@@ -209,7 +209,7 @@ class RunStatus:
         source_snapshot = data.pop("source_snapshot", None)
         data.pop("source_verified_attempt", None)
         if source_snapshot is not None:
-            from flash.source_snapshot import safe_public_projection
+            from flash.snapshot.source_snapshot import safe_public_projection
 
             data["source_provenance"] = safe_public_projection(
                 source_snapshot,
@@ -777,14 +777,6 @@ from flash.runner.accounting.artifacts import (  # noqa: E402,F401
     preflight_validate_environment_ref,
     stage_environment_package,
 )
-from flash.runner.lifecycle.attempts import (  # noqa: E402,F401
-    _heartbeat_attempt_is_current,
-    _infer_next_attempt,
-    _latest_reserved_attempt,
-    _reserve_attempt,
-    _verified_opd_next_attempt,
-    _verified_opd_retry_state,
-)
 from flash.runner.accounting.costs import (  # noqa: E402,F401
     _gpu_rate,
     _status_estimated_charge,
@@ -793,6 +785,37 @@ from flash.runner.accounting.costs import (  # noqa: E402,F401
     charge_usd_for_spec,
     record_billing_state,
     record_realized_cost,
+)
+from flash.runner.accounting.reconciliation import (  # noqa: E402,F401
+    _canonical_cleanup_remote,
+    _cleanup_remote_key,
+    _cleanup_remotes_from_raw,
+    _compare_and_clear_remote,
+    _compare_and_complete_remote,
+    _compare_and_fail_remote,
+    _compare_and_prepare_resubmit,
+    _compare_and_remove_cleanup_remote,
+    _drain_cleanup_remotes,
+    _expected_remote_matches,
+    _preserve_cleanup_remote,
+    _record_cleanup_remote,
+    _remote_resource_identity,
+    _snapshot_cleanup_remotes,
+)
+from flash.runner.accounting.weight_cache import (  # noqa: E402,F401
+    _assign_weight_cache_volume,
+    _download_gb,
+    _fits_weight_cache,
+    _peak_gb,
+    weight_cache_catalog_peak_gb,
+)
+from flash.runner.lifecycle.attempts import (  # noqa: E402,F401
+    _heartbeat_attempt_is_current,
+    _infer_next_attempt,
+    _latest_reserved_attempt,
+    _reserve_attempt,
+    _verified_opd_next_attempt,
+    _verified_opd_retry_state,
 )
 from flash.runner.lifecycle.deadlines import (  # noqa: E402,F401
     _canonical_run_deadline,
@@ -816,28 +839,6 @@ from flash.runner.lifecycle.preparation import (  # noqa: E402,F401
     _resolve_model_revision,
     _validate_effective_spec,
     _warmstart_source_is_authorized,
-)
-from flash.runner.accounting.reconciliation import (  # noqa: E402,F401
-    _canonical_cleanup_remote,
-    _cleanup_remote_key,
-    _cleanup_remotes_from_raw,
-    _compare_and_clear_remote,
-    _compare_and_complete_remote,
-    _compare_and_fail_remote,
-    _compare_and_prepare_resubmit,
-    _compare_and_remove_cleanup_remote,
-    _drain_cleanup_remotes,
-    _expected_remote_matches,
-    _preserve_cleanup_remote,
-    _record_cleanup_remote,
-    _remote_resource_identity,
-    _snapshot_cleanup_remotes,
-)
-from flash.runner.results.verified_revisions import (  # noqa: E402,F401
-    add_verified_adapter_revision,
-    invalidate_verified_adapter_revisions,
-    read_verified_adapter_revisions,
-    verified_adapter_revision_generation,
 )
 from flash.runner.lifecycle.status import (  # noqa: E402,F401
     _STATUS_LIST_LIMIT,
@@ -864,6 +865,12 @@ from flash.runner.lifecycle.submit import (  # noqa: E402,F401
     prepare_job,
     submit_job,
 )
+from flash.runner.results.verified_revisions import (  # noqa: E402,F401
+    add_verified_adapter_revision,
+    invalidate_verified_adapter_revisions,
+    read_verified_adapter_revisions,
+    verified_adapter_revision_generation,
+)
 from flash.runner.supervise.deploy import (  # noqa: E402,F401
     DeploymentRevocationError,
     DeploymentStatePersistenceError,
@@ -886,11 +893,4 @@ from flash.runner.supervise.transitions import (  # noqa: E402,F401
     mark_deployment_revocation_failed,
     mark_deployment_undeployed,
     mark_undeployed,
-)
-from flash.runner.accounting.weight_cache import (  # noqa: E402,F401
-    _assign_weight_cache_volume,
-    _download_gb,
-    _fits_weight_cache,
-    _peak_gb,
-    weight_cache_catalog_peak_gb,
 )

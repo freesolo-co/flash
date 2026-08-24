@@ -172,7 +172,9 @@ def test_undeploy_uses_deploy_time_names_after_the_model_tip_advances(
     deployed = serve_deploy._deployment_bundle(args)
     deployed_name = build_modal_create_plan(deployed).names.app_or_pod
 
-    monkeypatch.setattr("flash.serve.deployment.resolve.resolve_base_revision", lambda *_a, **_k: "e" * 40)
+    monkeypatch.setattr(
+        "flash.serve.deployment.resolve.resolve_base_revision", lambda *_a, **_k: "e" * 40
+    )
     current_tip = serve_deploy._deployment_bundle(args)
     current_name = build_modal_create_plan(current_tip).names.app_or_pod
     assert current_name != deployed_name
@@ -183,7 +185,10 @@ def test_undeploy_uses_deploy_time_names_after_the_model_tip_advances(
         seen.append((build_modal_create_plan(bundle).names.app_or_pod, handle.app_name))
         return _result(bundle, "absent")
 
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment", _teardown)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment",
+        _teardown,
+    )
 
     assert cmd_serve_undeploy(args) == 0
     assert seen == [(deployed_name, deployed_name)]
@@ -214,7 +219,10 @@ def test_undeploy_identity_rejects_mismatched_destructive_input(
     def _explode(*_args, **_kwargs):
         raise AssertionError("teardown ran with mismatched provider identity")
 
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment", _explode)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment",
+        _explode,
+    )
 
     assert cmd_serve_undeploy(args) == 1
     assert message in capsys.readouterr().err
@@ -231,7 +239,10 @@ def test_undeploy_hub_failure_requires_the_printed_identity_before_teardown(
     def _explode(*_args, **_kwargs):
         raise AssertionError("teardown ran without a validated deployment identity")
 
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment", _explode)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment",
+        _explode,
+    )
 
     assert cmd_serve_undeploy(args) == 1
     captured = capsys.readouterr()
@@ -291,7 +302,10 @@ def test_modal_undeploy_without_provider_ids_routes_to_identity_reclaim(
         handles.append(handle)
         return _result(bundle, "absent")
 
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment", _reclaim)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment",
+        _reclaim,
+    )
 
     assert cmd_serve_undeploy(args) == 0
     assert handles == [None]
@@ -307,7 +321,10 @@ def test_modal_undeploy_rejects_partial_provider_ids(
     def _explode(*_args, **_kwargs):
         raise AssertionError("teardown ran with a partial provider handle")
 
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment", _explode)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment",
+        _explode,
+    )
 
     assert cmd_serve_undeploy(args) == 1
     assert "modal provider ids must be supplied together or omitted" in capsys.readouterr().err
@@ -328,7 +345,9 @@ def test_runpod_undeploy_without_provider_ids_routes_to_identity_reclaim(
         handles.append(handle)
         return _result(bundle, "absent")
 
-    monkeypatch.setattr("flash.serve.provisioning.runpod.lifecycle_entry.teardown_runpod_deployment", _reclaim)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.runpod.lifecycle_entry.teardown_runpod_deployment", _reclaim
+    )
 
     assert cmd_serve_undeploy(args) == 0
     assert handles == [None]
@@ -344,7 +363,9 @@ def test_runpod_undeploy_rejects_partial_provider_ids(
     def _explode(*_args, **_kwargs):
         raise AssertionError("teardown ran with a partial provider handle")
 
-    monkeypatch.setattr("flash.serve.provisioning.runpod.lifecycle_entry.teardown_runpod_deployment", _explode)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.runpod.lifecycle_entry.teardown_runpod_deployment", _explode
+    )
 
     assert cmd_serve_undeploy(args) == 1
     assert "runpod provider ids must be supplied together or omitted" in capsys.readouterr().err
@@ -364,8 +385,12 @@ def test_undeploy_routes_to_the_named_provider(monkeypatch: pytest.MonkeyPatch) 
     _stub_credentials(monkeypatch)
     modal_args = _args_with_identity(monkeypatch, "modal")
     runpod_args = _args_with_identity(monkeypatch, "runpod")
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment", _modal)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.lifecycle_entry.teardown_runpod_deployment", _runpod)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment", _modal
+    )
+    monkeypatch.setattr(
+        "flash.serve.provisioning.runpod.lifecycle_entry.teardown_runpod_deployment", _runpod
+    )
 
     assert cmd_serve_undeploy(modal_args) == 0
     assert cmd_serve_undeploy(runpod_args) == 0
@@ -387,7 +412,10 @@ def test_unproved_undeploy_is_a_clear_nonzero_error(
 
     _stub_credentials(monkeypatch)
     args = _args_with_identity(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment", _unproved)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment",
+        _unproved,
+    )
 
     assert cmd_serve_undeploy(args) == 1
     captured = capsys.readouterr()
@@ -413,7 +441,10 @@ def test_credentials_never_enter_argv_output_or_persisted_artifacts(
     args = _args_with_identity(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["flash", "serve", "undeploy"])
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment", _capture)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.teardown_modal_deployment",
+        _capture,
+    )
 
     assert cmd_serve_undeploy(args) == 0
     captured = capsys.readouterr()
@@ -436,7 +467,10 @@ def test_deploy_output_exposes_exact_ids_needed_by_undeploy(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment", _ready)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.lifecycle_entry.provision_modal_deployment",
+        _ready,
+    )
 
     assert cmd_serve_deploy(deploy_args()) == 0
     output = capsys.readouterr().out

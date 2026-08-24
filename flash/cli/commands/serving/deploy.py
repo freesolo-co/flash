@@ -188,9 +188,13 @@ def _runtime_secrets():
 def _deployment_bundle(args):
     """rebuild the exact immutable deployment input shared by deploy and undeploy."""
 
-    from flash.serve.control import DeploymentRequest
     from flash.serve.contract.profiles import get_profile, placement_for
-    from flash.serve.deployment.resolve import execution_inputs, resolve_adapter, resolve_base_revision
+    from flash.serve.control import DeploymentRequest
+    from flash.serve.deployment.resolve import (
+        execution_inputs,
+        resolve_adapter,
+        resolve_base_revision,
+    )
     from flash.server.domain.ops.serving_resources import resolve_deployment_bundle
 
     provider = args.provider
@@ -286,7 +290,9 @@ def cmd_serve_deploy(args) -> int:
     deadline_at = time.monotonic() + float(args.timeout)
     try:
         if provider == "modal":
-            from flash.serve.provisioning.modal.execution.lifecycle_entry import provision_modal_deployment
+            from flash.serve.provisioning.modal.execution.lifecycle_entry import (
+                provision_modal_deployment,
+            )
 
             result = provision_modal_deployment(
                 bundle, credentials, runtime_secrets, deadline_at=deadline_at

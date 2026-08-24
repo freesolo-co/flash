@@ -16,6 +16,7 @@ import os
 from flash.adapters.targets import resolve_lora_targeting
 from flash.content.multimodal import messages_with_decoded_images
 from flash.content.structured_outputs import reasoning_parser_for
+from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.train.entry.backend_common import (
     agent_loop_workers,
     ray_num_cpus,
@@ -25,7 +26,6 @@ from flash.engine.worker.train.entry.backend_common import (
     rollout_sleep_unsupported,
     trainer_dtype_overrides,
 )
-from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.train.entry.sft_train import _hydra_val, _verl_image_message_content
 from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
 from flash.engine.worker.verl.parallelism import (

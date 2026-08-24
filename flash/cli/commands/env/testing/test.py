@@ -7,8 +7,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from flash.cli.commands.env.testing.episode import _effective_turn_cap
 from flash.cli.commands.env.ops.push import _err, _resolve_local_env_entrypoint
+from flash.cli.commands.env.testing.episode import _effective_turn_cap
 from flash.cli.commands.env.testing.evaluations import (
     _check_evaluation_suites,
     _normalize_prompt_images,

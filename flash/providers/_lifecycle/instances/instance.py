@@ -10,8 +10,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from flash.providers._lifecycle.net.deadline import remaining_seconds, require_deadline_at
 from flash.providers._lifecycle.instances.poll import _attempt_int
+from flash.providers._lifecycle.net.deadline import remaining_seconds, require_deadline_at
 from flash.runtime_capsule import build_capsule, sha256_bytes
 
 # the capsule the rented-box providers ship. built once and cached: the archive is deterministic,
@@ -203,7 +203,7 @@ def build_payload(
         build_worker_env,
         strip_runpod_volume_env,
     )
-    from flash.source_snapshot import parse_descriptor
+    from flash.snapshot.source_snapshot import parse_descriptor
 
     canonical_seed = require_matching_seed(spec, seed)
     # strip the runpod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.

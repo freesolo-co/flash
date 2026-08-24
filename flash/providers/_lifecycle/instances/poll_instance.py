@@ -15,11 +15,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from flash.providers._lifecycle.net.deadline import (
-    deadline_kwargs,
-    remaining_seconds,
-    require_deadline_at,
-)
 from flash.providers._lifecycle.instances.poll import (
     BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
@@ -36,6 +31,11 @@ from flash.providers._lifecycle.instances.terminal_artifacts import (
     TerminalKind,
     read_within,
     resolve_terminal_artifacts,
+)
+from flash.providers._lifecycle.net.deadline import (
+    deadline_kwargs,
+    remaining_seconds,
+    require_deadline_at,
 )
 from flash.providers.artifacts.hf import worker_flagged_retriable
 from flash.providers.core.base import PollResult

@@ -68,8 +68,8 @@ def test_lambda_terminate_is_per_id_isolated(monkeypatch):
 def test_lambda_sweep_reports_only_truly_reaped(monkeypatch):
     """sweep_orphans must log/return only the instances that ACTUALLY terminated — never a
     still-billing instance."""
-    from flash.providers.lambda_.client import api as la_api
     from flash.providers.lambda_ import jobs
+    from flash.providers.lambda_.client import api as la_api
 
     instances = [
         {"id": "i-a", "name": "flash-1700-aaaa-s0-a0"},

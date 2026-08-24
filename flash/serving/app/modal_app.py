@@ -18,10 +18,10 @@ except ImportError:  # pragma: no cover - only relevant for global modal install
 
 
 SERVING_DIR = Path(__file__).resolve().parent
-# flash/serving/ -> flash/ -> repo root. the app used to sit one level below its repo root; after the
-# move it is two, so walking up a single parent would look for .env inside the flash package and load
-# nothing, leaving a production deploy silently unconfigured.
-REPO_DIR = SERVING_DIR.parent.parent
+# flash/serving/app/ -> flash/serving/ -> flash/ -> repo root. the app used to sit one level below
+# its repo root; after the moves it is three, so walking up too few parents would look for .env
+# inside the flash package and load nothing, leaving a production deploy silently unconfigured.
+REPO_DIR = SERVING_DIR.parent.parent.parent
 
 # deployment identity is resolved before dotenv so development can never inherit production wiring.
 # modal.is_local() is true in remote child processes too, so the remote marker must also be absent.
@@ -288,7 +288,11 @@ from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
 # model_config is a pure-stdlib module (no heavy deps), so importing it at module scope is safe for
 # `modal deploy` (which imports modal_app.py locally) — unlike the vllm/transformers imports, which
 # stay lazy inside the engine methods.
-from flash.serving.src.engine.model_config import base_models, engine_overrides_for, gpu_for  # noqa: E402
+from flash.serving.src.engine.model_config import (  # noqa: E402
+    base_models,
+    engine_overrides_for,
+    gpu_for,
+)
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
@@ -740,9 +744,9 @@ def _base_model_records() -> list:
     custom_domains=[SERVING_CUSTOM_DOMAIN] if SERVING_CUSTOM_DOMAIN else None,
 )
 def router():
+    from flash.serving.src.http.router import AdapterRouter, build_serving_app
     from flash.serving.src.store import settings as cfg
     from flash.serving.src.store.persistence import get_adapter, load_adapters
-    from flash.serving.src.http.router import AdapterRouter, build_serving_app
     from flash.serving.src.store.settings import Settings
 
     settings = Settings()

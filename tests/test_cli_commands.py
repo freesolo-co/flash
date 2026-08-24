@@ -2731,8 +2731,8 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
     )
     assert (tmp_path / "evaluations.py").is_file()
 
-    from flash.envs.meta.evaluations import load_evaluation_suites
     from flash.envs.loading.loader import load_freesolo_environment
+    from flash.envs.meta.evaluations import load_evaluation_suites
 
     environment = load_freesolo_environment(str(tmp_path / "environment.py"))
     suite = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0]
@@ -2771,8 +2771,8 @@ def test_env_setup_multi_turn_eval_case_does_not_duplicate_the_episode_prompt(
         == 0
     )
 
-    from flash.envs.meta.evaluations import load_evaluation_suites
     from flash.envs.loading.loader import load_freesolo_environment
+    from flash.envs.meta.evaluations import load_evaluation_suites
 
     environment = load_freesolo_environment(str(tmp_path / "environment.py"))
     case = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0].cases()[

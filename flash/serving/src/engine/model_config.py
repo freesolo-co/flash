@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from flash.serving.src.engine.prequant_config import fp8_serve_model_for as _prequant_serve_model_for
+from flash.serving.src.engine.prequant_config import (
+    fp8_serve_model_for as _prequant_serve_model_for,
+)
 
 # base_model -> serving config. Mirrors flash/flash/catalog.py (the flash submodule).
 #

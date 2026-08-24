@@ -16,8 +16,8 @@ import pytest
 import flash.cli as cli
 import flash.client.config as client_config
 from flash.cli.commands import cmd_train, cmd_whoami
-from flash.cli.commands.env.testing.eval import cmd_env_eval
 from flash.cli.commands.env.ops.setup import cmd_env_setup
+from flash.cli.commands.env.testing.eval import cmd_env_eval
 from flash.cli.commands.ops.traces import cmd_traces_export
 
 

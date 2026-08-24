@@ -1834,8 +1834,8 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     import base64
     import json as _json
 
-    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs
+    from flash.providers.lambda_.client import api as lambda_api
 
     launched = {}
     monkeypatch.setattr(
@@ -1876,8 +1876,8 @@ def test_lambda_warm_caller_uses_source_independent_preload_payload(monkeypatch)
     import json as _json
 
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs
+    from flash.providers.lambda_.client import api as lambda_api
     from tests.test_lambda_runner import _inst
 
     launched = {}

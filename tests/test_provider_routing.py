@@ -1697,8 +1697,8 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     instance is torn down before the retry."""
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, PollResult
-    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs as lambda_jobs
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs as rp_jobs
 
@@ -1754,8 +1754,8 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
     CANADA-1 case, now caught in ~15 min instead of ~50."""
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, PollResult
-    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_ import jobs as lambda_jobs
+    from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs as rp_jobs
 
@@ -1821,8 +1821,8 @@ def test_genuine_worker_error_does_not_retry(orch, monkeypatch):
 
 
 def test_cancel_rejects_legacy_handle_without_provider_identity(orch, monkeypatch):
-    from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod import serverless as rp_train
+    from flash.providers.runpod.client import api as runpod_api
 
     cancelled_jobs, deleted_eps = [], []
     monkeypatch.setattr(

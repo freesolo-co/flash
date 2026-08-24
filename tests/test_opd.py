@@ -333,7 +333,10 @@ def test_stop_detection_and_trim_handle_special_token_delimiter():
     delimiter — _rollout_terminated would misclassify the rollout as truncated and _trim_trailing_stop
     would never remove it, skipping every usable sample for that config. Detection/trim must run on the
     special-tokens-INCLUDED decode."""
-    from flash.engine.worker.train.opd.orchestration.gkd import _rollout_terminated, _trim_trailing_stop
+    from flash.engine.worker.train.opd.orchestration.gkd import (
+        _rollout_terminated,
+        _trim_trailing_stop,
+    )
 
     IM_END = 9  # a special token; renders to "<|im_end|>" ONLY when specials are kept
 
@@ -667,7 +670,10 @@ def test_opd_filtering_stage_is_setup_not_training():
     """Regression (_poll.py): opd_filtering_prompts emits REAL progress heartbeats, so
     is_training_heartbeat would classify it as TRAINING (the tight, sticky stall window) mid-setup
     unless it's registered as a setup stage. It must be treated as cold-start setup."""
-    from flash.providers._lifecycle.instances.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+    from flash.providers._lifecycle.instances.poll import (
+        SETUP_HEARTBEAT_STAGES,
+        is_training_heartbeat,
+    )
 
     assert "opd_filtering_prompts" in SETUP_HEARTBEAT_STAGES
     assert is_training_heartbeat("opd_filtering_prompts", 0) is False
@@ -682,7 +688,10 @@ def test_opd_preprocessing_stages_are_setup_on_the_provider_side():
     stages carry a progress callback, so is_training_heartbeat classified a run that was still
     preprocessing as TRAINING and judged it by the tight (sticky) stall window instead of the
     cold-start grace -- a large split is torn down as "stalled" before its first step."""
-    from flash.providers._lifecycle.instances.poll import SETUP_HEARTBEAT_STAGES, is_training_heartbeat
+    from flash.providers._lifecycle.instances.poll import (
+        SETUP_HEARTBEAT_STAGES,
+        is_training_heartbeat,
+    )
 
     for stage in ("opd_prompt_scan", "opd_image_prep"):
         assert stage in SETUP_HEARTBEAT_STAGES

@@ -36,6 +36,7 @@ from flash.runner import (
     verified_adapter_revision_generation,
 )
 from flash.schema import parse_adapter_revision
+from flash.serve.contract.urls import public_deployment
 
 # `RetryableServingUnavailable` is raised by the serving-coverage tests as
 # `serving.RetryableServingUnavailable`, so it stays reachable here even though the smoke path
@@ -46,7 +47,6 @@ from flash.serve.deployment.deploy import (  # noqa: F401
     RetryableServingUnavailable,
     ServingError,
 )
-from flash.serve.contract.urls import public_deployment
 from flash.server.asgi import app as _app
 from flash.server.platform import auth, db
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key

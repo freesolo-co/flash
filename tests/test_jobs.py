@@ -424,7 +424,9 @@ def test_poll_job_surfaces_heartbeat_before_terminal_return(monkeypatch):
         "metrics_last": [{"step": 4, "reward": 0.75}],
     }
     forces = []
-    monkeypatch.setattr("flash.providers._lifecycle.instances.poll._record_heartbeat", recorded.append)
+    monkeypatch.setattr(
+        "flash.providers._lifecycle.instances.poll._record_heartbeat", recorded.append
+    )
     monkeypatch.setattr(jobs, "decode_output", lambda _output: {"acc": 1.0})
 
     monkeypatch.setattr(
@@ -471,7 +473,9 @@ def test_surface_heartbeat_logs_gpu_status(monkeypatch):
             "processes": [{"pid": 1234, "process_name": "/usr/bin/python", "used_memory_gb": 21.9}],
         },
     }
-    monkeypatch.setattr("flash.providers._lifecycle.instances.poll._record_heartbeat", lambda _hb: None)
+    monkeypatch.setattr(
+        "flash.providers._lifecycle.instances.poll._record_heartbeat", lambda _hb: None
+    )
 
     key, stage = surface_heartbeat(lambda: hb, None, lines.append)
 
@@ -1785,7 +1789,7 @@ def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
 def test_submit_run_rejects_malformed_source_before_deploy(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.runpod.execution import jobs
-    from flash.source_snapshot import SourceSnapshotError
+    from flash.snapshot.source_snapshot import SourceSnapshotError
 
     spec = JobSpec(
         run_id="flash-source-snapshot-invalid",
@@ -1858,8 +1862,8 @@ def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkey
 
 def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deletion(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod import serverless
+    from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs
 
     spec = JobSpec(
@@ -1908,8 +1912,8 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
 def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch, deletion_mode):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.core.base import UnreconciledCreateError
-    from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod import serverless
+    from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs
 
     spec = JobSpec(
@@ -1967,8 +1971,8 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
 def test_runpod_cancel_rejects_unconfirmed_acknowledgement(monkeypatch, response):
     from flash.providers.core.base import JobHandle
     from flash.providers.runpod import RunpodProvider
-    from flash.providers.runpod.execution import jobs
     from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(runpod_api, "cancel_job", lambda _endpoint_id, _job_id, **_kw: response)
     handle = JobHandle.from_dict(
@@ -1987,8 +1991,8 @@ def test_runpod_cancel_rejects_unconfirmed_acknowledgement(monkeypatch, response
 def test_runpod_cancel_accepts_exact_cancelled_acknowledgement(monkeypatch):
     from flash.providers.core.base import JobHandle
     from flash.providers.runpod import RunpodProvider
-    from flash.providers.runpod.execution import jobs
     from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     calls = []
 
@@ -2015,8 +2019,8 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.core.base import JobHandle, PollResult
     from flash.providers.runpod import RunpodProvider
-    from flash.providers.runpod.execution import jobs
     from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
 
     spec = JobSpec(
         run_id="runpod-shared-deadline",
@@ -5015,7 +5019,9 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
 
         monkeypatch.setattr(flash.providers, "get_provider", lambda name: Provider())
         monkeypatch.setattr(
-            flash.serve.deployment.deploy, "undeploy_adapter", lambda run_id: calls.append("undeploy")
+            flash.serve.deployment.deploy,
+            "undeploy_adapter",
+            lambda run_id: calls.append("undeploy"),
         )
         monkeypatch.setattr(
             orch, "_gc_run_endpoints", lambda spec: calls.append(("gc", spec.train.lora_rank))

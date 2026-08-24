@@ -24,7 +24,7 @@ _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 # the per-substrate client surface now lives under each provider's `client` subpackage;
 # `jobs` stays at the provider root (runpod groups its heavier job modules in `execution`).
 CLIENT_MODULES = ("api", "auth", "pricing", "preflight")
-PROVIDER_MODULES = CLIENT_MODULES + ("jobs",)
+PROVIDER_MODULES = (*CLIENT_MODULES, "jobs")
 PROVIDER_METHODS = (
     "is_configured",
     "preflight",
@@ -66,7 +66,11 @@ def test_provider_implements_the_interface(provider):
 
 def _jobs_module(pkg: str) -> str:
     """runpod groups job execution under `execution`; the others keep `jobs` at the root."""
-    return f"flash.providers.{pkg}.execution.jobs" if pkg == "runpod" else f"flash.providers.{pkg}.jobs"
+    return (
+        f"flash.providers.{pkg}.execution.jobs"
+        if pkg == "runpod"
+        else f"flash.providers.{pkg}.jobs"
+    )
 
 
 @pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
@@ -208,8 +212,8 @@ def test_static_pricing():
 
 def _stub_candidates(monkeypatch, *, runpod=(), lambda_=(), vast=()):
     """Pin allocate()'s three provider candidate lists so ranking can be tested in isolation."""
-    from flash.providers.core import allocator
     from flash.providers import get_provider
+    from flash.providers.core import allocator
     from flash.providers.core.base import Candidate
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))

@@ -204,7 +204,7 @@ def _build_context(
     attempt_start: int,
 ) -> _SubmitContext:
     from flash.runner import WEIGHT_CACHE_VOLUME_NAME, get_status, source_snapshot_from_status
-    from flash.source_snapshot import parse_descriptor
+    from flash.snapshot.source_snapshot import parse_descriptor
 
     source_snapshot = parse_descriptor(
         source_snapshot or source_snapshot_from_status(get_status(spec.run_id), required=True)

@@ -22,9 +22,9 @@ import types
 
 import pytest
 
-from flash.engine.worker.train.entry.backend_common import parse_wandb_link
 from flash.engine.worker.train.core.child import runtime as child_runtime
 from flash.engine.worker.train.core.child.runtime import install_wandb_link_reporting
+from flash.engine.worker.train.entry.backend_common import parse_wandb_link
 
 _URL = "https://wandb.ai/acme/flash/runs/abc123"
 _ID = "abc123"

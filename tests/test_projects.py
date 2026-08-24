@@ -9,7 +9,10 @@ import pytest
 from fastapi import HTTPException
 
 from flash.client import ClientError, create_project, get_project, list_projects
-from flash.server.domain.registry.projects import require_project_access, require_project_access_slug
+from flash.server.domain.registry.projects import (
+    require_project_access,
+    require_project_access_slug,
+)
 
 
 class _Response:

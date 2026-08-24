@@ -597,7 +597,11 @@ def provisional_gpu_count(
     gpu_count: int | None = None,
 ) -> int:
     """Resolve an authored ceiling or the smallest geometry-safe auto-sized count."""
-    from flash.providers.core.allocator import _executed_width, geometry_safe_gpu_cap, required_vram_gb
+    from flash.providers.core.allocator import (
+        _executed_width,
+        geometry_safe_gpu_cap,
+        required_vram_gb,
+    )
 
     ceiling = MAX_COMBINATION_CARDS if gpu_count is None else gpu_count
     geometry_revision = (

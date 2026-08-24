@@ -58,8 +58,11 @@ def test_a_child_process_oom_is_classified_from_its_output():
     So the child's own output is the only evidence, and without it the one OOM shape that happens
     DURING training (rather than at vllm startup) is never retried on a larger card.
     """
-    from flash.engine.worker.train.entry.backend_common import ChildOutputTail, raise_for_classified_verl_exit
     from flash.engine.worker.perf.lifecycle import is_cuda_oom
+    from flash.engine.worker.train.entry.backend_common import (
+        ChildOutputTail,
+        raise_for_classified_verl_exit,
+    )
 
     tail = ChildOutputTail()
     tail.record(
@@ -83,7 +86,10 @@ def test_child_output_that_merely_mentions_memory_is_not_an_oom():
     environment's own error text, or a Triton message as a CUDA OOM and burn a retry on a larger
     card for a run that would fail there identically.
     """
-    from flash.engine.worker.train.entry.backend_common import ChildOutputTail, raise_for_classified_verl_exit
+    from flash.engine.worker.train.entry.backend_common import (
+        ChildOutputTail,
+        raise_for_classified_verl_exit,
+    )
 
     for line in (
         "MemoryError: host ram: out of memory",

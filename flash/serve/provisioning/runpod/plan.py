@@ -6,7 +6,6 @@ import json
 from dataclasses import dataclass
 
 from flash.serve.control import RunPodPlacement
-
 from flash.serve.provisioning.common.records import (
     MAX_ENCODED_MANIFEST_BYTES,
     DeploymentBundle,

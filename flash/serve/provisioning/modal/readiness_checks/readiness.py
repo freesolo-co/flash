@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from flash.serve.control import DeploymentErrorReason, DeploymentResult, ModalProviderHandle
-
 from flash.serve.provisioning.common.records import (
     Clock,
     DeploymentBundle,
@@ -22,9 +21,18 @@ from flash.serve.provisioning.common.records import (
     failed_deployment_result,
 )
 from flash.serve.provisioning.modal.execution.lifecycle import observe
+from flash.serve.provisioning.modal.execution.sdk import (
+    ModalNamedResource,
+    ModalObservation,
+    ModalSdk,
+    ModalSdkFailure,
+)
 from flash.serve.provisioning.modal.planning.plan import ModalCreatePlan
-from flash.serve.provisioning.modal.planning.resources import ModalResourceConflict, build_handle, exact_core_resources
-from flash.serve.provisioning.modal.execution.sdk import ModalNamedResource, ModalObservation, ModalSdk, ModalSdkFailure
+from flash.serve.provisioning.modal.planning.resources import (
+    ModalResourceConflict,
+    build_handle,
+    exact_core_resources,
+)
 
 __all__ = [
     "MAX_PROBE_TIMEOUT_SECONDS",

@@ -200,7 +200,10 @@ def test_capsule_ships_every_bare_sibling_the_bootstrap_imports(monkeypatch):
     import ast
     from pathlib import Path
 
-    from flash.providers._lifecycle.instances.instance import INSTANCE_BOOTSTRAP_PROFILE, _instance_capsule
+    from flash.providers._lifecycle.instances.instance import (
+        INSTANCE_BOOTSTRAP_PROFILE,
+        _instance_capsule,
+    )
     from flash.providers.vast.jobs import builders
     from flash.runtime_capsule import get_profile, read_capsule
 
@@ -397,8 +400,8 @@ def test_build_payload_sets_vast_arm():
 # deploy_and_submit: offer (market) walk
 # ---------------------------------------------------------------------------
 def test_deploy_walks_taken_offers(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     rented = []
 
@@ -418,8 +421,8 @@ def test_deploy_walks_taken_offers(monkeypatch):
 
 
 def test_deploy_walks_documented_non_2xx_rejection(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     cause = urllib.error.HTTPError(
         "https://console.vast.ai/api/v0/asks/1/",
@@ -453,8 +456,8 @@ def test_deploy_walks_documented_non_2xx_rejection(monkeypatch):
 @pytest.mark.parametrize("destroy_confirmed", [True, False])
 def test_deploy_stops_on_contradictory_create_response(monkeypatch, destroy_confirmed):
     from flash.providers.core.base import UnreconciledCreateError
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     created = []
 
@@ -490,8 +493,8 @@ def test_deploy_stops_on_contradictory_create_response(monkeypatch, destroy_conf
 
 
 def test_deploy_refuses_primary_creation_below_minimum_deadline_allowance(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(vast.time, "time", lambda: 100.0)
     created = []
@@ -509,8 +512,8 @@ def test_deploy_refuses_primary_creation_below_minimum_deadline_allowance(monkey
 
 def test_deploy_success_log_failure_does_not_leak_handle(monkeypatch):
     # once create_instance rents the box, a raising success log before handle return must not leak it
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(vast_api, "create_instance", lambda offer_id, **kw: 4242)
 
@@ -527,8 +530,8 @@ def test_deploy_success_log_failure_does_not_leak_handle(monkeypatch):
 
 @pytest.mark.parametrize("argument_builder", ["vast_image", "_effective_disk_gb"])
 def test_deploy_argument_failure_precedes_create_and_cleanup(monkeypatch, argument_builder):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     original = RuntimeError(f"{argument_builder} failed")
 
@@ -560,8 +563,8 @@ def test_deploy_argument_failure_precedes_create_and_cleanup(monkeypatch, argume
 def test_post_create_baseexception_cleans_and_never_walks_offers(
     monkeypatch, interrupt_type, destroy_confirmed
 ):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     spec = _spec()
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
@@ -604,8 +607,8 @@ def test_post_create_baseexception_cleans_and_never_walks_offers(
 def test_post_create_preserves_original_baseexception_when_cleanup_raises(
     monkeypatch, interrupt_type
 ):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     class ExactCleanupFailure(BaseException):
         pass
@@ -657,8 +660,8 @@ def test_post_create_preserves_original_baseexception_when_cleanup_raises(
 
 
 def test_deploy_refreshes_once_when_all_taken(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     def fake_create(offer_id, **kw):
         if offer_id != 99:
@@ -687,8 +690,8 @@ def test_deploy_refresh_widens_the_page_it_filters(monkeypatch):
     Modelled with the real ordering (cap the rows, then exclude) rather than asserting the constant:
     a mock that excluded first would find the offer at any limit and could not fail.
     """
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     burned = set(range(300))
 
@@ -715,8 +718,8 @@ def test_deploy_refresh_widens_the_page_it_filters(monkeypatch):
 
 
 def test_deploy_refresh_uses_transient_concrete_gpu_type(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     seen: dict[str, str] = {}
 
@@ -737,8 +740,8 @@ def test_deploy_refresh_uses_transient_concrete_gpu_type(monkeypatch):
 
 
 def test_deploy_rechecks_deadline_before_refreshed_offer_creation(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     now = {"value": 100.0}
     monkeypatch.setattr(vast.time, "time", lambda: now["value"])
@@ -766,8 +769,8 @@ def test_deploy_adopts_instance_after_ambiguous_create(monkeypatch):
     import io
     import urllib.error
 
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     rented = []
 
@@ -804,8 +807,8 @@ def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
     import urllib.error
 
     from flash.providers.core.base import UnreconciledCreateError
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     rented = []
 
@@ -831,8 +834,8 @@ def test_deploy_aborts_walk_when_ambiguous_create_left_nothing(monkeypatch):
 
 
 def test_vast_failure_detail_is_bounded_and_redacts_credentials(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("HF_TOKEN", "hf-private-token")
     monkeypatch.setattr(
@@ -872,8 +875,8 @@ def test_deploy_aborts_when_adopted_row_has_unparseable_id(monkeypatch):
     import urllib.error
 
     from flash.providers.core.base import UnreconciledCreateError
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     rented = []
 
@@ -902,8 +905,8 @@ def test_deploy_adopts_only_exact_label_among_decoys(monkeypatch):
     import io
     import urllib.error
 
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     rented = []
 
@@ -936,8 +939,8 @@ def test_deploy_decoys_without_exact_match_abort_with_no_second_create(monkeypat
     import urllib.error
 
     from flash.providers.core.base import UnreconciledCreateError
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     rented = []
 
@@ -974,8 +977,8 @@ def test_vast_image_selects_the_per_sm_tag():
 
 
 def test_deploy_raises_when_pool_exhausted(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(
         vast_api,
@@ -1005,8 +1008,8 @@ def _wire_poll(
     logs=None,
     step=10.0,
 ):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     if marker is _AUTO_MARKER:
         if done is None:
@@ -1151,8 +1154,8 @@ def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
     # malformed 200 responses raise decode or HTTP exceptions outside VastApiError. treat them as
     # transient poll errors so a recoverable status read does not become a terminal host loss.
     from flash.providers._lifecycle.instances import poll as _poll
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     def boom(instance_id):
         raise exc
@@ -1329,8 +1332,8 @@ def test_poll_done_at_exact_deadline_is_fresh(monkeypatch):
 def test_poll_deadline_observes_hf_artifacts_during_bounded_reread(monkeypatch, tmp_path):
     import huggingface_hub
 
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     done = tmp_path / "DONE"
     done.write_text("9999.5")
@@ -2073,8 +2076,8 @@ def test_poll_rejects_missing_started_timestamp(monkeypatch):
 # ---------------------------------------------------------------------------
 def _wire_submit(monkeypatch, poll_result=None, poll_raises=None):
     from flash.providers.core.base import PollResult
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
@@ -2271,8 +2274,8 @@ def test_a_dry_market_is_not_blamed_on_this_runs_blacklist(monkeypatch):
     operator at the wrong fix -- "switch class or provider" when the real answer is "wait" -- and
     the count it quotes would name machines that were never in this class's pool to begin with.
     """
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     spec = _spec()
     vast.forget_dead_machines(spec.run_id)
@@ -2369,8 +2372,8 @@ def test_submit_teardown_warns_on_unconfirmed_destroy_without_raising(monkeypatc
     import logging
 
     from flash.providers.core.base import PollResult
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: False)  # unconfirmed teardown
     monkeypatch.setattr(
@@ -2398,8 +2401,8 @@ def test_submit_unconfirmed_teardown_escalates_to_run_scoped_reap(monkeypatch):
     across every remaining seed with no handle. The finally must escalate to a run-scoped reap by label
     (destroy_run_instances, NOT active-shielded) so this seed's box is cleared before the next launches."""
     from flash.providers.core.base import PollResult
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(
         vast_api, "destroy_instance", lambda iid: False
@@ -2427,8 +2430,8 @@ def test_submit_confirmed_teardown_skips_run_scoped_reap(monkeypatch):
     """The escalation fires ONLY on an unconfirmed teardown: a confirmed single-instance destroy needs no
     extra run-scoped reap (avoids a redundant list+destroy on every normal seed completion)."""
     from flash.providers.core.base import PollResult
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)  # confirmed
     monkeypatch.setattr(
@@ -2451,8 +2454,8 @@ def test_submit_no_reap_when_rejection_log_raises_baseexception(monkeypatch):
     # bugbot: a keyboardinterrupt raised by the rejection log escapes the exception-only
     # suppress; the reap flag must already be cleared for the definitive rejection so the
     # escaping interrupt does not trigger a run-label reap that could hit other seeds' boxes.
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     original = KeyboardInterrupt("interrupt during rejection log")
 
@@ -2481,8 +2484,8 @@ def test_submit_no_reap_when_rejection_log_raises_baseexception(monkeypatch):
 def test_submit_no_reap_when_failure_precedes_any_create(monkeypatch):
     # a failure before any create request (empty offer pool) must not run-label reap:
     # a concurrent worker for the same run could own a live instance under that label.
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(vast, "usable_offers", lambda *a, **k: [])
     reaped = []
@@ -2496,8 +2499,8 @@ def test_submit_no_reap_when_failure_precedes_any_create(monkeypatch):
 def test_submit_teardown_cleanup_baseexception_preserves_original_and_still_reaps(monkeypatch):
     # a cleanup-time interrupt during the finally's delete must not replace the in-flight
     # exception and must not skip the run-label fallback.
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     original = KeyboardInterrupt("original interruption")
     cleanup = SystemExit("cleanup interrupted")
@@ -2532,8 +2535,8 @@ def test_submit_teardown_cleanup_baseexception_reraised_when_no_original(monkeyp
     # with no in-flight exception, a cleanup-time interrupt must still surface after the
     # run-label fallback ran (silent swallowing would hide an operator ctrl-c).
     from flash.providers.core.base import PollResult
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     cleanup = KeyboardInterrupt("cleanup interrupted")
     reaped = []
@@ -2561,8 +2564,8 @@ def test_submit_teardown_cleanup_baseexception_reraised_when_no_original(monkeyp
 
 def test_best_effort_destroy_returns_confirmation(monkeypatch):
     """The helper returns the destroy_instance bool and only warns on False (no warn on a clean True)."""
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
     assert vast._best_effort_destroy(123, context="t") is True
@@ -2575,8 +2578,8 @@ def test_best_effort_destroy_passes_raw_id_and_never_int_raises(monkeypatch):
     its own try/except (-> False on a bad id, "never raises"), so converting in the wrapper would
     re-introduce a ValueError in the very finally/suppress paths this helper exists to keep quiet.
     Assert the id reaches destroy_instance UNCONVERTED and a non-numeric id returns False, no raise."""
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     seen = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: seen.append(iid) or False)
@@ -2585,8 +2588,8 @@ def test_best_effort_destroy_passes_raw_id_and_never_int_raises(monkeypatch):
 
 
 def test_submit_run_vast_rejects_policy_word_gpu(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     spec = _spec()
     object.__setattr__(
@@ -2632,8 +2635,8 @@ def test_provider_destroy_raises_on_unconfirmed_teardown(monkeypatch):
 def test_provider_initial_and_reattached_poll_use_same_absolute_deadline(monkeypatch):
     from flash.providers.core.base import JobHandle, PollResult
     from flash.providers.vast import VastProvider
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     deadline_at = 12_345.0
     captured = []
@@ -2664,8 +2667,8 @@ def test_provider_poll_recovery_unconfirmed_teardown_escalates_to_run_scoped_rea
     from flash.providers.artifacts import hf as _hf_artifacts
     from flash.providers.core.base import JobHandle, PollResult
     from flash.providers.vast import PROVIDER
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(
         vast_api, "destroy_instance", lambda iid: False
@@ -2688,8 +2691,8 @@ def test_provider_poll_recovery_confirmed_teardown_skips_run_scoped_reap(monkeyp
     from flash.providers.artifacts import hf as _hf_artifacts
     from flash.providers.core.base import JobHandle, PollResult
     from flash.providers.vast import PROVIDER
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)  # confirmed
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
@@ -2743,8 +2746,8 @@ def test_handle_from_dict_corrupt_instance_id_raises_clear_error():
 
 
 def test_destroy_run_instances_matches_forced_prefix(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     instances = [
         {"id": 1, "label": "flash-run1-s0-a0"},  # ours
@@ -2767,8 +2770,8 @@ def test_run_instances_remaining_confirms_clear_and_raises_on_listing_failure(mo
     # remains; a survivor (e.g. after an unconfirmed DELETE) is reported by id; it matches on the SAME
     # label boundary as destroy_run_instances (run1 must not match run10). A listing failure RAISES so
     # the caller can't mistake "couldn't list" for "clear".
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     instances = [
         {"id": 9, "label": "flash-run1-s0-a0"},  # ours -> remaining
@@ -2794,8 +2797,8 @@ def test_run_instances_remaining_raises_on_label_match_with_unparseable_id(monke
     # skipping it (as the best-effort destroy_run_instances does) would let run_instances_remaining
     # report a FALSE clear and resubmit a handle-less run over a visible box it can't destroy. A
     # label-matching row with an unparseable id must be treated as NOT clear -> raise.
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     # a matching label, but the id is non-numeric -> can't enumerate/destroy -> not clear
     monkeypatch.setattr(
@@ -2817,8 +2820,8 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
     a bare int(iid) on a non-intable id (unexpected Vast API shape) would raise mid-loop and abort the
     cleanup, leaving the remaining reapable boxes billing. A bad id must be SKIPPED, the GOOD ones still
     destroyed."""
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     instances = [
         {"id": None, "label": "flash-run1-s0-a0"},  # missing id -> skip
@@ -2836,8 +2839,8 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
     destroyed.clear()
     assert vast.sweep_orphans(active_labels=set()) == [7]
     assert destroyed == [7]
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     instances = [
         {"id": 1, "label": "flash-runA-s0-a0"},  # active -> protected
@@ -2857,8 +2860,8 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
 def test_sweep_orphans_known_labels_multiplane_guard(monkeypatch):
     """With known_labels set, an instance is reaped only if its run id is one THIS plane knows — a box
     from ANOTHER control plane (run id absent from known) is left alone (multi-plane safety)."""
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     instances = [
         {"id": 1, "label": "flash-mine-s0-a0"},  # known + not active -> reaped
@@ -2875,8 +2878,8 @@ def test_sweep_orphans_known_labels_multiplane_guard(monkeypatch):
 def test_sweep_orphans_callable_sets_resolved_after_listing(monkeypatch):
     """active_labels/known_labels may be CALLABLES resolved AFTER the instance list (closes the launch
     race). A callable that raises SKIPS the sweep (never falls through to reaping live boxes)."""
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(vast_api, "list_instances", lambda: [{"id": 1, "label": "flash-x-s0-a0"}])
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)

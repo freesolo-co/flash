@@ -12,19 +12,19 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image, ImageOps
 
+from flash.serving.src.engine.lora_engine import _LoraEngineImpl
+from flash.serving.src.engine.support import _num_prompt_tokens
+from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io import multimodal
 from flash.serving.src.io import serving_io as serving_io_module
-from flash.serving.src.engine.support import _num_prompt_tokens
-from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 from flash.serving.src.io.multimodal import (
     MultimodalRequestError,
     has_image_blocks,
     normalize_chat_messages,
     prepare_multimodal_request,
 )
-from flash.serving.src.store.registry import AdapterRegistry
-from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.store.registry import AdapterRegistry
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 QWEN_2B = "Qwen/Qwen3.5-2B"

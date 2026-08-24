@@ -33,21 +33,6 @@ from flash.serve.provisioning import (
     serving_resource_names,
 )
 from flash.serve.provisioning.modal.execution.deployment import _work_deadline
-from flash.serve.provisioning.modal.planning.plan import (
-    MODAL_APP_TAG_LIMIT,
-    MODAL_DEPLOYMENT_TAG_LIMIT,
-    MODAL_STARTUP_TIMEOUT_SECONDS,
-    build_modal_create_plan,
-)
-from flash.serve.provisioning.modal.readiness_checks.probe import ModalEndpointProbe, _provenance_matches
-from flash.serve.provisioning.modal.readiness_checks.readiness import ExpectedResources
-from flash.serve.provisioning.modal.execution.sdk import (
-    ModalAppObservation,
-    ModalNamedResource,
-    ModalObservation,
-    ModalSdkFailure,
-    PinnedModalSdk,
-)
 from flash.serve.provisioning.modal.execution.lifecycle_entry import (
     _abort_created_resources,
     _CreatedResources,
@@ -55,6 +40,24 @@ from flash.serve.provisioning.modal.execution.lifecycle_entry import (
     reconcile_modal_deployment,
     teardown_modal_deployment,
 )
+from flash.serve.provisioning.modal.execution.sdk import (
+    ModalAppObservation,
+    ModalNamedResource,
+    ModalObservation,
+    ModalSdkFailure,
+    PinnedModalSdk,
+)
+from flash.serve.provisioning.modal.planning.plan import (
+    MODAL_APP_TAG_LIMIT,
+    MODAL_DEPLOYMENT_TAG_LIMIT,
+    MODAL_STARTUP_TIMEOUT_SECONDS,
+    build_modal_create_plan,
+)
+from flash.serve.provisioning.modal.readiness_checks.probe import (
+    ModalEndpointProbe,
+    _provenance_matches,
+)
+from flash.serve.provisioning.modal.readiness_checks.readiness import ExpectedResources
 from tests.test_serve_app_manifest import _spec_and_inputs
 
 PROVIDER_ID = "provider-id-sentinel"

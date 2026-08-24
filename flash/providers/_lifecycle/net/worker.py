@@ -301,7 +301,7 @@ def publish_source_snapshot(
     from huggingface_hub import HfApi
 
     import flash
-    from flash.source_snapshot import (
+    from flash.snapshot.source_snapshot import (
         build_source_archive,
         canonical_archive_path,
         descriptor_for_archive,

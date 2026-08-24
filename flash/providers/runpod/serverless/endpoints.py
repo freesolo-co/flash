@@ -65,7 +65,7 @@ def _train_body(input_data: dict) -> dict:
     try:
         import source_snapshot as _source_snapshot
     except ModuleNotFoundError:
-        from flash import source_snapshot as _source_snapshot
+        from flash.snapshot import source_snapshot as _source_snapshot
 
     class _TransientSourceFetchError(RuntimeError):
         flash_retriable = True

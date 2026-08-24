@@ -5,12 +5,12 @@ from typing import Any
 
 import httpx
 
-from flash.serving.src.store.persisted_columns import PERSISTED_COLUMNS
 from flash.serving.src.io.schemas import (
     AdapterRecord,
     PersistedAdapterRecord,
     internal_adapter_payload,
 )
+from flash.serving.src.store.persisted_columns import PERSISTED_COLUMNS
 from flash.serving.src.store.settings import ADAPTER_TABLE, Settings
 from flash.serving.src.store.supabase_rest import (
     postgrest_error,

@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from flash.serving.src.store.registry import AdapterRegistry, lora_int_id
 from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.store.registry import AdapterRegistry, lora_int_id
 
 
 def _record(

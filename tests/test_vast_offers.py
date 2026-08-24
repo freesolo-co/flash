@@ -87,8 +87,8 @@ def test_vast_a100_pcie_offer_resolves_by_vram():
 
 
 def test_usable_offers_filters_and_order(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     captured = {}
 
@@ -124,8 +124,8 @@ def test_usable_offers_filters_and_order(monkeypatch):
 def test_usable_offers_always_datacenter_only(monkeypatch):
     """Community/marketplace hosts (hosting_type 0) are ALWAYS rejected — run secrets ship to the
     box, so even a verified community host (id=10) never makes the cut."""
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
     out = vast.usable_offers(24, disk_gb=60)
@@ -134,8 +134,8 @@ def test_usable_offers_always_datacenter_only(monkeypatch):
 
 
 def test_usable_offers_vram_gate(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: list(FIXTURE))
     out = vast.usable_offers(32, disk_gb=60)
@@ -144,8 +144,8 @@ def test_usable_offers_vram_gate(monkeypatch):
 
 
 def test_usable_offers_exclude_machines(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     rows = [_offer(id=1, machine_id=7, dph_total=0.25), _offer(id=2, machine_id=8, dph_total=0.30)]
     monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: rows)
@@ -156,8 +156,8 @@ def test_usable_offers_search_page_spans_all_classes(monkeypatch):
     # the price-sorted search page must be wide enough to span EVERY managed class (callers bucket
     # by class); the old limit=64 let a flood of one cheap class hide a larger fitting class with
     # usable offers just past the page.
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     captured = {}
 
@@ -184,8 +184,8 @@ def test_usable_offers_search_page_spans_all_classes(monkeypatch):
 
 
 def test_usable_offers_exact_h100_threads_name_and_vram_filters(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     captured = {}
 
@@ -202,8 +202,8 @@ def test_usable_offers_exact_h100_threads_name_and_vram_filters(monkeypatch):
 
 
 def test_usable_offers_exact_40gb_bounds_shared_name_server_side(monkeypatch):
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     captured = {}
 
@@ -229,8 +229,8 @@ def test_usable_offers_exact_40gb_bounds_shared_name_server_side(monkeypatch):
 def test_usable_offers_threads_duration_floor(monkeypatch):
     # when a wall cap is supplied, usable_offers does not extend it with provisioning grace.
     # a zero wall keeps the duration filter disabled.
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     captured = {}
 
@@ -394,8 +394,8 @@ def test_usable_offers_threads_and_rechecks_card_count(monkeypatch):
     divides dph_total into the per-card rate the allocator ranks on. A server that ignored the
     filter would otherwise hand back single-card rows that get priced as if they were multi-card.
     """
-    from flash.providers.vast.client import api as vast_api
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
 
     captured = {}
 

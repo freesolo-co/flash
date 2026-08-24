@@ -80,7 +80,9 @@ def cmd_serve_status(args) -> int:
         )
     deadline_at = time.monotonic() + float(args.timeout)
     if provider == "modal":
-        from flash.serve.provisioning.modal.execution.lifecycle_entry import reconcile_modal_deployment
+        from flash.serve.provisioning.modal.execution.lifecycle_entry import (
+            reconcile_modal_deployment,
+        )
 
         result = reconcile_modal_deployment(
             bundle,

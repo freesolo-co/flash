@@ -592,8 +592,8 @@ def test_export_adapter_with_out_of_bounds_non_lm_offsets_is_refused(tmp_path):
 
     The weights stay untouched on disk, but the caller gets an error instead of a silent copy of an
     adapter whose keys may never bind to anything."""
-    from flash.serve.deployment import export
     from flash.serve.contract.errors import ServingError
+    from flash.serve.deployment import export
 
     lm_key = "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.default.weight"
     vision_b = "base_model.model.model.visual.blocks.0.attn.proj.lora_B.default.weight"

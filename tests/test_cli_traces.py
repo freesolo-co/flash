@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 
 import flash.cli as cli
-from flash.cli.commands.ops import traces
 from flash.cli.commands.env.ops import setup as env_setup
+from flash.cli.commands.ops import traces
 from flash.client import ApiError, ClientError
 
 # Trace export and the hosted project directory exist only on Freesolo's own deployment, so these

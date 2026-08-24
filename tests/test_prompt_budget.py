@@ -133,8 +133,8 @@ def test_grpo_worker_keeps_clamp_and_value_error_contract(monkeypatch, capsys) -
 
 
 def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int = 32768):
-    import flash.engine.worker.train.entry.opd_train as opd_train
     import flash.engine.worker.teacher.client as teacher_client
+    import flash.engine.worker.train.entry.opd_train as opd_train
     from flash.engine.worker.entry.opd import OpdKnobs
     from flash.engine.worker.train.entry.opd_train_runner import _prepare_prompts
     from flash.engine.worker.train.opd.orchestration.state import _OpdRequest

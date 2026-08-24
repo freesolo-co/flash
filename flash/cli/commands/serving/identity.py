@@ -49,7 +49,10 @@ def _placement_payload(placement) -> dict[str, object]:
 def encode_deployment_identity(bundle) -> str:
     """encode one exact credential-free bundle for later status or teardown."""
 
-    from flash.serve.provisioning.common.records import DeploymentBundle, encode_manifest_environment
+    from flash.serve.provisioning.common.records import (
+        DeploymentBundle,
+        encode_manifest_environment,
+    )
 
     if type(bundle) is not DeploymentBundle:
         raise TypeError("deployment identity requires an exact DeploymentBundle")

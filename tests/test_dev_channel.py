@@ -96,7 +96,9 @@ def test_every_hosted_default_flips_with_the_channel():
     # Every channel-derived default, evaluated as the built dev package would.
     dev_defaults = {
         "control plane (flash.client.config.default_api_url)": default_api_url(dev_channel),
-        "serving plane (flash.serve.deployment.deploy.default_serving_url)": default_serving_url(dev_channel),
+        "serving plane (flash.serve.deployment.deploy.default_serving_url)": default_serving_url(
+            dev_channel
+        ),
     }
     assert dev_defaults, "no hosted defaults collected -- the scan would pass vacuously"
 
