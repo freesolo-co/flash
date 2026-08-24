@@ -44,10 +44,11 @@ def _patch_common(monkeypatch, fake_exit):
     monkeypatch.setattr(worker, "_ensure_fla_fastpath_on_hopper", lambda: None)
 
 
-def _run_safe_entrypoint(tmp_path, sitecustomize):
+def _run_safe_entrypoint(tmp_path, sitecustomize, env_overrides=None):
     (tmp_path / "sitecustomize.py").write_text(sitecustomize)
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
+    env.update(env_overrides or {})
     env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), str(repo_root), env.get("PYTHONPATH", "")])
     return subprocess.run(
         [sys.executable, "-m", "flash.engine.worker_entrypoint"],
@@ -93,6 +94,27 @@ def test_managed_entrypoint_preserves_worker_import_traceback(tmp_path):
         "sys.meta_path.insert(0, FailWorkerImport())\n",
     )
     _assert_safe_entrypoint_failure(result, cause)
+
+
+def test_managed_entrypoint_redacts_declared_secret_from_traceback(tmp_path):
+    cause = "managed-worker-import-crash"
+    secret = "sk-live-entrypoint-secret"
+    result = _run_safe_entrypoint(
+        tmp_path,
+        "import importlib.abc\n"
+        "import os\n"
+        "import sys\n"
+        "class FailWorkerImport(importlib.abc.MetaPathFinder):\n"
+        "    def find_spec(self, fullname, path, target=None):\n"
+        "        if fullname == 'flash.engine.worker':\n"
+        f"            raise RuntimeError({cause!r} + ' token=' + os.environ['CUSTOM_API_KEY'])\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, FailWorkerImport())\n",
+        env_overrides={"CUSTOM_API_KEY": secret},
+    )
+    _assert_safe_entrypoint_failure(result, cause)
+    assert secret not in result.stderr
+    assert "token=<redacted>" in result.stderr
 
 
 def test_direct_worker_module_emits_one_normal_traceback(tmp_path):
