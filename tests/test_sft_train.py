@@ -808,8 +808,10 @@ class _PreparedSourceProcessor:
         return_dict=False,
         return_tensors=None,
         enable_thinking=False,
+        preserve_thinking=False,
     ):
         assert enable_thinking is False
+        assert preserve_thinking is False
         prepared = any(
             isinstance(message.get("content"), list)
             and any(
