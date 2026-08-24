@@ -462,18 +462,18 @@ def _build_opd_child_env(
     return child
 
 
-def _opd_multimodal_parquet_features():
+def _opd_multimodal_parquet_features(*, include_reasoning: bool):
     from datasets import Features, Value
 
+    prompt = {
+        "role": Value("string"),
+        "content": Value("string"),
+    }
+    if include_reasoning:
+        prompt["reasoning_content"] = Value("string")
     return Features(
         {
-            "prompt": [
-                {
-                    "role": Value("string"),
-                    "content": Value("string"),
-                    "reasoning_content": Value("string"),
-                }
-            ],
+            "prompt": [prompt],
             "images": [{"image": Value("string")}],
             "data_source": Value("string"),
             "reward_model": {
@@ -496,7 +496,15 @@ def _write_opd_parquet(rows: list[dict], path: str) -> None:
 
     if not rows:
         raise ValueError("refusing to write an empty OPD parquet")
-    features = _opd_multimodal_parquet_features() if any("images" in row for row in rows) else None
+    multimodal = any("images" in row for row in rows)
+    include_reasoning = any(
+        "reasoning_content" in message for row in rows for message in row.get("prompt", [])
+    )
+    features = (
+        _opd_multimodal_parquet_features(include_reasoning=include_reasoning)
+        if multimodal
+        else None
+    )
     # pin one schema for every batch. multimodal takes it from the declared features exactly as the
     # single-table write did; text infers it from the first batch so a later batch cannot silently
     # infer a different type and be rejected mid-file.

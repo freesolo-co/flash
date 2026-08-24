@@ -1203,6 +1203,7 @@ def test_mixed_job_parquet_round_trips_the_images_column(tmp_path):
     assert [f.name for f in images_type.value_type] == ["image"]
     assert pa.types.is_string(images_type.value_type.field("image").type)
     assert table.column("extra_info").to_pylist()[1]["index"] == 1
+    assert table.column("prompt").to_pylist() == [row["prompt"] for row in rows]
 
 
 def test_text_only_parquet_does_not_pin_the_multimodal_schema(tmp_path):
