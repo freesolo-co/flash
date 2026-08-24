@@ -250,17 +250,18 @@ def cancelled_charge_usd(
             gpu_type=gpu_type,
             gpu_count=gpu_count,
         )
-    try:
-        quote = float(quote)
-    except (TypeError, ValueError):
+    if isinstance(quote, bool) or not isinstance(quote, (int, float)):
         # a malformed persisted quote is a pricing failure, not a license to reprice: the accepted
         # rate is unknowable, so the caller's fallback must propagate and settle the run.
         return float(fallback)
-    if quote <= 0:
-        # a non-positive quote is malformed the same way: prorating it would persist a charge the
-        # billing retry predicate (cost_usd > 0) can never settle, silently stranding the run
-        # unbilled, so the fallback propagates and the caller records the pricing failure.
+    quote = float(quote)
+    if not math.isfinite(quote) or quote < 0:
+        # negative and non-finite quotes cannot represent an accepted whole-cent amount, so the
+        # fallback propagates and the caller records the pricing failure.
         return float(fallback)
+    if quote == 0:
+        # a valid quote may round to zero cents and remains authoritative for any completed work.
+        return 0.0
     partial = runner.charge_usd_for_spec(
         spec,
         steps=n,

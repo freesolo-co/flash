@@ -197,24 +197,35 @@ def test_cancelled_charge_usd_prorates_and_clamps_to_the_quote():
     assert runner.cancelled_charge_usd(st, spec, steps=25) == 8.0
 
 
-def test_cancelled_charge_usd_treats_a_malformed_quote_as_a_pricing_failure():
-    # a nonnumeric persisted quote must not raise out of the cancel path, and repricing the spec
-    # instead could bill above the (unknowable) accepted rate, so the fallback propagates and the
-    # caller records a billing failure.
+@pytest.mark.parametrize(
+    "bad_quote",
+    ["not-a-number", True, float("nan"), float("inf"), float("-inf")],
+)
+def test_cancelled_charge_usd_treats_a_malformed_quote_as_a_pricing_failure(bad_quote):
+    # malformed persisted quotes must not raise out of the cancel path, and repricing the spec
+    # instead could bill above the unknowable accepted rate, so the measured fallback propagates.
     spec = _spec()
-    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd="not-a-number")
-    assert math.isnan(runner.cancelled_charge_usd(st, spec, steps=10, fallback=float("nan")))
+    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=bad_quote)
+    assert runner.cancelled_charge_usd(st, spec, steps=10, fallback=3.25) == 3.25
 
 
-def test_cancelled_charge_usd_treats_a_nonpositive_quote_as_a_pricing_failure():
-    # a negative persisted quote would prorate to a negative charge: the cancel would persist a
-    # negative cost_usd that the billing retry predicate (cost_usd > 0) can never settle, and no
-    # pricing-failure diagnostic would ever be recorded. a zero quote is the same defect with a
-    # zero product. both propagate the fallback so the caller records the billing failure.
+def test_cancelled_charge_usd_treats_a_negative_quote_as_a_pricing_failure():
+    # a negative persisted quote cannot represent the accepted whole-cent amount, so the measured
+    # fallback propagates rather than persisting a negative customer charge.
     spec = _spec()
-    for bad in (-8.0, 0.0):
-        st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=bad)
-        assert math.isnan(runner.cancelled_charge_usd(st, spec, steps=10, fallback=float("nan")))
+    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=-8.0)
+    assert runner.cancelled_charge_usd(st, spec, steps=10, fallback=3.25) == 3.25
+
+
+def test_cancelled_charge_usd_preserves_a_zero_quote_for_incomplete_work(monkeypatch):
+    spec = _spec()
+    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=0.0)
+
+    def unexpected_reprice(*_args, **_kwargs):
+        raise AssertionError("a zero accepted quote must not be repriced")
+
+    monkeypatch.setattr(runner, "charge_usd_for_spec", unexpected_reprice)
+    assert runner.cancelled_charge_usd(st, spec, steps=10, fallback=4.5) == 0.0
 
 
 def _patched_cfg_spec(monkeypatch, cfg):
@@ -640,6 +651,26 @@ def test_completed_full_work_charges_exactly_the_quote_despite_faster_wall(tmp_p
     _write_terminal_steps(tmp_path, monkeypatch, spec, 20, wall_seconds=0.001)
 
     assert runner._status_estimated_charge(status, spec) == accepted_quote
+
+
+@pytest.mark.parametrize("completed_steps", [20, 10], ids=["full-work", "incomplete-work"])
+def test_completed_work_preserves_a_zero_quote_despite_positive_measured_fallback(
+    tmp_path, monkeypatch, completed_steps
+):
+    spec = _spec()
+    status = runner.RunStatus(
+        run_id="r",
+        state="done",
+        spec={},
+        estimated_cost_usd=0.0,
+    )
+    _write_terminal_steps(tmp_path, monkeypatch, spec, completed_steps, wall_seconds=99_999.0)
+
+    def unexpected_reprice(*_args, **_kwargs):
+        raise AssertionError("a zero accepted quote must not be repriced")
+
+    monkeypatch.setattr(runner, "charge_usd_for_spec", unexpected_reprice)
+    assert runner._status_estimated_charge(status, spec, fallback=6.75) == 0.0
 
 
 @pytest.mark.parametrize("completed_steps", [21, 10**1000])
