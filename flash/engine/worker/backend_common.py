@@ -931,7 +931,7 @@ from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
     _CAPABILITIES_UNAVAILABLE,
     _CAPABILITY_PROBE,
     _CAPABILITY_PROBE_TIMEOUT_S,
-    fused_expert_orig_params_overrides,
+    actor_fsdp_strategy_overrides,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
     probe_verl_capabilities,
