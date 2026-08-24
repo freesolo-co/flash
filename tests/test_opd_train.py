@@ -625,7 +625,7 @@ def test_xgrammar_replay_uses_real_qwen_padded_model_vocab(spec, text):
     pytest.importorskip("xgrammar")
     from transformers import AutoConfig, AutoTokenizer
 
-    model_id = "Qwen/Qwen3.5-0.8B"
+    model_id = "Qwen/Qwen3.5-9B"
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     assert len(tokenizer.get_vocab()) == 248077
@@ -6229,7 +6229,7 @@ def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horiz
     )
     request = SimpleNamespace(
         knobs=knobs,
-        model_id="Qwen/Qwen3.5-4B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="revision",
         spec=SimpleNamespace(
             gpu=SimpleNamespace(count=1),
@@ -6459,7 +6459,7 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
         request=SimpleNamespace(
             multi_turn=False,
             structured_outputs=None,
-            model_id="Qwen/Qwen3.5-4B",
+            model_id="Qwen/Qwen3.5-9B",
             knobs=SimpleNamespace(
                 max_completion=512,
                 learning_rate=1e-5,
@@ -6533,7 +6533,7 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
             request=SimpleNamespace(
                 multi_turn=False,
                 structured_outputs=None,
-                model_id="Qwen/Qwen3.5-4B",
+                model_id="Qwen/Qwen3.5-9B",
                 model_revision="",
                 spec=spec,
                 knobs=SimpleNamespace(
@@ -7263,7 +7263,7 @@ def test_unstructured_validator_does_not_resolve_model_metadata(monkeypatch):
 
     result = validate_opd_structured_outputs(
         None,
-        model_id="Qwen/Qwen3.5-4B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="d" * 40,
     )
 
@@ -7593,7 +7593,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             {
                 "run_id": "r-alloc",
                 "algorithm": "opd",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "environment": {"id": "org/env"},
                 "train": {
                     "hf_repo": "a/b",
@@ -7623,7 +7623,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
         {
             "run_id": "r-sft",
             "algorithm": "sft",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "environment": {"id": "org/env"},
             "train": {
                 "hf_repo": "a/b",
@@ -7970,7 +7970,7 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
             require_active_env=lambda: env,
             JOB_SPEC=SimpleNamespace(
                 train=train,
-                model="Qwen/Qwen3.5-4B",
+                model="Qwen/Qwen3.5-9B",
                 model_revision="",
                 gpu=SimpleNamespace(type=None),
             ),

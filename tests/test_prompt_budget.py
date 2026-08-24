@@ -23,7 +23,7 @@ from flash.schema import ConfigError, spec_from_dict
 def _budget_spec(algorithm: str, train: dict | None = None, *, thinking: bool = False) -> JobSpec:
     return spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": algorithm,
             "thinking": thinking,
@@ -52,7 +52,7 @@ def _train_config(tmp_path, *, init_from_adapter: str = ""):
     config = tmp_path / "train.toml"
     warm_start = f'init_from_adapter = "{init_from_adapter}"\n' if init_from_adapter else ""
     config.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "grpo"\n'
         '[environment]\nid = "owner/project/env"\n'
@@ -160,7 +160,7 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
         multi_turn=False,
         max_turns=0,
         knobs=OpdKnobs(max_completion=512, max_length=max_length),
-        model_id="Qwen/Qwen3.5-4B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="",
     )
     state = _prepare_prompts(

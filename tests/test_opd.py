@@ -482,7 +482,7 @@ def test_opd_selects_only_managed_parasail_aliases():
     def _spec(teacher):
         return spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"epochs": 1, "max_examples": 5, "teacher_model": teacher},
@@ -521,7 +521,7 @@ def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
     def _spec(train_extra):
         return spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"epochs": 1, "max_examples": 5, **train_extra},
@@ -545,7 +545,7 @@ def test_opd_rejects_zero_kl_penalty_at_parse_time():
     def _spec(algorithm, train_extra):
         return spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": algorithm,
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"epochs": 1, "max_examples": 5, **train_extra},
@@ -1039,12 +1039,12 @@ def test_model_required_vram_uses_opd_group_default_not_grpo_default():
     from flash.engine.plan.vram import model_required_vram_gb
 
     train = {"max_length": 8192, "max_tokens": 512, "batch_size": 8, "lora_rank": 16}
-    default_group = model_required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train, headroom=1.0)
+    default_group = model_required_vram_gb("Qwen/Qwen3.5-9B", "opd", train=train, headroom=1.0)
     explicit_opd_default = model_required_vram_gb(
-        "Qwen/Qwen3.5-4B", "opd", train={**train, "group_size": 1}, headroom=1.0
+        "Qwen/Qwen3.5-9B", "opd", train={**train, "group_size": 1}, headroom=1.0
     )
     grpo_default_group = model_required_vram_gb(
-        "Qwen/Qwen3.5-4B", "opd", train={**train, "group_size": 8}, headroom=1.0
+        "Qwen/Qwen3.5-9B", "opd", train={**train, "group_size": 8}, headroom=1.0
     )
 
     assert default_group == explicit_opd_default
@@ -1133,7 +1133,7 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
     )
 
     train = {"max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
-    need = model_required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train, headroom=1.1)
+    need = model_required_vram_gb("Qwen/Qwen3.5-9B", "opd", train=train, headroom=1.1)
     assert need <= max_non_fp8_kv_vram_gb()  # stays within the non-fp8 (<= 80 GB) band...
     # ...on the A100 (sm80), which does NOT use fp8 KV
     routed_capability = _sm_capability(get_gpu_info(cheapest_gpu(need)).sm)
@@ -1324,7 +1324,7 @@ def test_rollout_fp8_kv_admits_a_gdn_hybrid_only_when_its_engine_stays_resident(
 
     # the hardware floor dominates: cc<8.9 is bf16 regardless of architecture or catalog flag.
     for gdn in (False, True):
-        for model_id in ("Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-35B-A3B", ""):
+        for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-35B-A3B", ""):
             assert not rollout_fp8_kv(False, gdn, model_id)
 
     # non-gdn on capable hardware is unconditional fp8 and must not consult the catalog at all,
@@ -1577,7 +1577,7 @@ def test_resolve_opd_knobs_trains_the_authored_prompts_per_step(monkeypatch):
     def _knobs(**train):
         spec = spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "gpu": {},
@@ -1658,7 +1658,7 @@ def test_opd_spec_json_round_trip():
 
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {
@@ -1686,7 +1686,7 @@ def test_opd_worker_resolves_the_authored_prompt_batch(monkeypatch):
     authored = int(RECIPE.opd.prompts_per_step) * 4
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "gpu": {},
@@ -1707,7 +1707,7 @@ def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
     # 240 prompts at the opd default batch of 8 is 8 steps per epoch, 30 epochs -> 240 steps.
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"epochs": 30, "max_examples": 240},
@@ -1798,7 +1798,7 @@ def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
             require_active_env=lambda: env,
             JOB_SPEC=SimpleNamespace(
                 train=train,
-                model="Qwen/Qwen3.5-4B",
+                model="Qwen/Qwen3.5-9B",
                 model_revision="",
                 gpu=SimpleNamespace(type=None),
             ),

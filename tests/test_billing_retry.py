@@ -16,7 +16,7 @@ import pytest
 from flash.server.billing import retry as billing_retry
 
 SPEC = {
-    "model": "Qwen/Qwen3.5-4B",
+    "model": "Qwen/Qwen3.5-9B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"epochs": 1, "max_examples": 1},
@@ -142,6 +142,40 @@ def test_sweep_charges_crashed_pending_run(monkeypatch, tmp_path):
     st = runner.get_status("run-1")
     assert st.billing_state == "charged"
     assert st.billing_charge == {"amountCents": 123, "replay": False}
+
+
+@pytest.mark.parametrize(
+    "retired_model",
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"],
+)
+def test_sweep_charges_historical_removed_model_without_runtime_activation(
+    monkeypatch, tmp_path, retired_model
+):
+    import json
+
+    import flash.runner as runner
+
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    _save_run(runner, tmp_path, billing_state="pending")
+    path = runner.runs_file_path("run-1", ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["model"] = retired_model
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    calls = []
+    monkeypatch.setattr(
+        "flash.server.billing.charges.charge_completed_run",
+        lambda *, internal_key, status: (
+            calls.append(status.spec["model"]) or {"amountCents": 123, "replay": False}
+        ),
+    )
+
+    assert billing_retry.retry_completion_charges_once() == 1
+    assert calls == [retired_model]
+    assert runner.get_status("run-1").billing_state == "charged"
 
 
 def test_transient_failure_then_retry_charges_exactly_once(monkeypatch, tmp_path):

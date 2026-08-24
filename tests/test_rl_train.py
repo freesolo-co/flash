@@ -1730,7 +1730,7 @@ def test_build_verl_training_cfg_carries_the_multimodal_flag():
 
 def _mem_util_inp(**over):
     inp = {
-        "model_id": "Qwen/Qwen3.5-4B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "model_revision": "",
         "engine_len": 2048,
         "group_size": 8,
@@ -1753,7 +1753,7 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
     from flash.engine.plan.vram import colocate_kv_util
     from flash.providers.base import get_gpu_info
 
-    info = MODELS["Qwen/Qwen3.5-4B"]
+    info = MODELS["Qwen/Qwen3.5-9B"]
     want = colocate_kv_util(
         float(info.params_b),
         2048,
@@ -1781,9 +1781,9 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
         lora_rank=32,
     )
     assert got == want == explicit_tp_one
-    # 9.4 gb weights + 12 gb sleep kv + 0.15597568 gb rank-32 adapter, all inside vllm's 80 gb share.
-    assert got * 80 == pytest.approx(21.55597568)
-    assert got.hex() == "0x1.13ea9f00f2d56p-2"
+    # the current 9b geometry, kv reserve, and rank-32 adapter fit inside vllm's 80 gb share.
+    assert got * 80 == pytest.approx(31.605060096)
+    assert got.hex() == "0x1.948b75ff05902p-2"
     # and it is genuinely NOT the old constant, so the test cannot pass on an unwired build.
     assert got != rl_train._DEFAULT_GPU_MEM_UTIL
     assert got < rl_train._DEFAULT_GPU_MEM_UTIL
@@ -1819,7 +1819,7 @@ def test_gpu_mem_util_sizing_reaches_the_launch_config():
         },
         train_files="/w/t.parquet",
         val_files="/w/v.parquet",
-        model_path="Qwen/Qwen3.5-4B",
+        model_path="Qwen/Qwen3.5-9B",
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
@@ -1940,7 +1940,7 @@ def test_multigpu_gpu_mem_util_caps_the_sizer_at_the_previous_constant(monkeypat
 
 def test_multigpu_gpu_mem_util_never_exceeds_the_previous_constant():
     default = rl_train._DEFAULT_GPU_MEM_UTIL
-    model_ids = ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-35B-A3B")
+    model_ids = ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-27B", "Qwen/Qwen3.6-35B-A3B")
     for model_id in model_ids:
         for gpu_type in ("H100", "H200", "B200"):
             for tensor_parallel in (2, 4, 8):
@@ -1982,7 +1982,7 @@ def test_gpu_mem_util_keeps_the_constant_where_the_model_does_not_apply(monkeypa
     assert (
         rl_train.resolve_gpu_mem_util(
             _mem_util_inp(
-                model_id="Qwen/Qwen3.5-4B",
+                model_id="Qwen/Qwen3.5-9B",
                 model_revision="a" * 40,
             ),
             gpu_type="H100",
@@ -2110,7 +2110,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
     # and the override is scoped: an ordinary model keeps verl's own sleep/wake offload, which is
     # what lets a large rollout fit alongside the training weights.
     for key in ("free_cache_engine", "enable_sleep_mode"):
-        assert not [a for a in _argv("Qwen/Qwen3.5-4B") if key in a]
+        assert not [a for a in _argv("Qwen/Qwen3.5-9B") if key in a]
 
 
 def test_build_verl_training_cfg_derives_engine_len_and_budget():
@@ -2136,7 +2136,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "ppo_epochs": 1,
         "steps": 60,
         "warmstart_adapter": "",
-        "model_id": "Qwen/Qwen3.5-4B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "verl_total_epochs": 2,
         "save_freq": 20,
         "ckpt_to_keep": 1,
@@ -2355,7 +2355,7 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, 
         required_steps=(10, 20),
         export_root=str(tmp_path / "exports"),
         python_bin="python",
-        model_id="Qwen/Qwen3.5-0.8B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="rev",
         preprocessor=_Tok(),
     )
@@ -2445,7 +2445,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"prompts_per_step": 16, "epochs": 2},
         }
@@ -5172,7 +5172,7 @@ def _capability_resolve(
     train=None,
     overrides=None,
     processor=None,
-    model="Qwen/Qwen3.5-0.8B",
+    model="Qwen/Qwen3.5-9B",
     gpu_count=1,
 ):
     """run the resolver against one env, with everything else on the supported path."""
@@ -8717,7 +8717,7 @@ def _shim_files(tmp_path):
 def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_path):
     files = _shim_files(tmp_path)
     inp = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
+        "model_id": "Qwen/Qwen3.5-9B",
         # one card: the rank/device assertion renders empty, so it owes no marker here. the
         # multi-card case is pinned by the test below.
         "dp_cards": 1,
@@ -8765,7 +8765,7 @@ def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_
 def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_cards(tmp_path):
     files = _shim_files(tmp_path)
     inp = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "dp_cards": 2,
         "reentrant_checkpointing": True,
         "multimodal": False,

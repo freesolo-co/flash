@@ -32,7 +32,7 @@ from flash.serving.src.responses import openai_generate_fields
 from flash.serving.src.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.streaming import openai_chat_stream
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}
 
 

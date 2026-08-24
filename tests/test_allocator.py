@@ -5,84 +5,35 @@ from __future__ import annotations
 import pytest
 
 
-def test_required_vram_catalog_and_open():
-    from flash.providers import allocator
-    from flash.providers.allocator import required_vram_gb
-
-    # MEASURED: tiny-model GRPO OOMs a 20 GB card (vLLM-colocate engine overhead the param
-    # estimate missed); floored to the 24 GB vLLM-colocate minimum (_VLLM_COLOCATE_FLOOR_GB).
-    assert required_vram_gb("Qwen/Qwen3.5-0.8B", "grpo") == 24
-    # chunked nll bounds the vocab projection to one verl FusedLinearForPPO chunk (512 token rows,
-    # NOT 256): 512 * 248320 * 16 B = 2.03 GB, which is what the child actually allocates.
-    assert required_vram_gb("Qwen/Qwen3.5-4B", "sft") == 20
-    # Default GRPO (no [train].max_context_tokens) sizes at the run's REAL engine length, mirroring
-    # run_rl()'s max(1024, rl.max_prompt_len + completion) = 2048 + 320 = 2368 tokens (NOT a flat
-    # 1024). At 2368 the 4.7B param estimate is ~31.8 GB raw -> 35 GB with headroom, so a 32 GB card
-    # is no longer a safe fit and the allocator escalates to the cheapest validated >=35 GB class.
-    a = allocator.allocate("Qwen/Qwen3.5-4B", "grpo")
-    assert a.min_vram_gb == 35
-    assert all(c.vram_gb >= 35 for c in a.candidates)
-
-
-def test_allocation_restricted_to_validated_pool():
-    from flash.providers import allocator
-    from flash.providers.base import VALIDATED
-
-    # The deployed control plane rejects a submit for any non-validated class, so client-side
-    # allocation must only ever pick a class in the validated pool — across ALL candidates,
-    # not just the chosen one. Offline only RunPod is available; 0.8B GRPO needs the 24 GB tier
-    # whose cheapest VALIDATED RunPod class is RTX 4090 @ $0.69. 24 GB is the floor — sub-24 GB
-    # classes were dropped.
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
-    assert a.provider == "runpod"
-    assert all(c.gpu in VALIDATED for c in a.candidates), [
-        c.gpu for c in a.candidates if c.gpu not in VALIDATED
-    ]
-    assert a.gpu == "RTX 4090"  # the cheapest VALIDATED RunPod class that fits 24 GB
-
-
 def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
-    """The allocator must skip a cheaper UNVALIDATED class for the cheapest VALIDATED one (so the
-    deployed control plane accepts the submit). The managed catalog is now fully validated, so
-    inject a synthetic unvalidated RunPod class cheaper than any real one and confirm it is
-    excluded from the candidate set."""
+    """A cheaper fitting class stays excluded until it is validated."""
     from flash.providers import allocator
     from flash.providers.base import GPU_INFO, VALIDATED, GpuClass
 
-    fake = GpuClass("FAKE Cheap", "NVIDIA_FAKE", 24, "fakecheap", "sm80", 0.10)
-    assert not fake.validated
-    monkeypatch.setitem(GPU_INFO, "FAKE Cheap", fake)
+    synthetic = GpuClass(
+        "synthetic cheap gpu",
+        "NVIDIA_SYNTHETIC_CHEAP",
+        24,
+        "syntheticcheap",
+        "sm80",
+        0.01,
+    )
+    monkeypatch.setitem(GPU_INFO, synthetic.name, synthetic)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *args, **kwargs: 24)
 
-    # 4B SFT (seq 1024, rank 8) down-routes below 24 GB in the matrix (see test_required_vram_*).
-    a = allocator.allocate(
-        "Qwen/Qwen3.5-4B", "sft", train={"max_context_tokens": 1024, "lora_rank": 8}
-    )
-    assert a.min_vram_gb < 24  # a sub-24 GB run the synthetic unvalidated card also fits
-    # The synthetic class is cheaper and fits, yet is excluded because it is unvalidated.
-    assert any(
-        (not g.validated) and g.enum_member and g.vram_gb >= a.min_vram_gb
-        for g in GPU_INFO.values()
-    )
-    assert all(c.gpu in VALIDATED for c in a.candidates)
-    assert "FAKE Cheap" not in [c.gpu for c in a.candidates]
+    allocation = allocator.allocate("test/catalog-independent-model", "sft")
+
+    assert synthetic.vram_gb >= allocation.min_vram_gb
+    assert synthetic.hourly_usd < allocation.hourly_usd
+    assert synthetic.name not in {candidate.gpu for candidate in allocation.candidates}
+    assert all(candidate.gpu in VALIDATED for candidate in allocation.candidates)
 
 
 def test_runpod_allocation_lands_on_full_validated_cards():
     """Allocation lands on the card with the cheapest dollars-per-step among validated classes."""
     from flash.providers import allocator
 
-    # ranking is on cost per step rather than $/hr, but on MEASURED throughput the RTX 4090 is also
-    # the best value in the pool (~4.2 $/PFLOP-hr vs the H100 PCIe's ~6.6), so a small SFT run stays
-    # there. it wins on both bases here; the cases where the two bases DISAGREE are covered by
-    # test_total_cost_ranking_beats_hourly_rate below.
-    a08_sft = allocator.allocate("Qwen/Qwen3.5-0.8B", "sft")
-    assert a08_sft.provider == "runpod"
-    assert a08_sft.gpu == "RTX 4090"
-    # grpo spends most of a step waiting on reward grading, which no card shortens, so the extra
-    # throughput cannot pay for itself and the ranking collapses back toward the cheapest rate.
-    a08_grpo = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
-    assert a08_grpo.provider == "runpod"
-    assert a08_grpo.gpu == "RTX 4090"
     a9 = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a9.provider == "runpod"
     assert a9.gpu == "A100 PCIe"  # cheapest validated 80 GB RunPod card
@@ -106,7 +57,7 @@ def test_total_cost_ranking_beats_hourly_rate():
     from flash.cost.analytical import step_cost_key
     from flash.cost.types import RunConfig
 
-    key = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=1))
+    key = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-9B", method="sft", steps=1))
     assert key is not None
     # A10: 125 TFLOPS at $1.29. RTX 4090: 165 TFLOPS at $0.69. The 4090 is both cheaper and faster.
     assert key("RTX 4090", 0.69) < key("A10", 1.29)
@@ -124,7 +75,7 @@ def test_step_cost_ranking_declines_unknown_classes():
     from flash.cost.analytical import step_cost_key
     from flash.cost.types import RunConfig
 
-    key = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=1))
+    key = step_cost_key(RunConfig(model_id="Qwen/Qwen3.5-9B", method="sft", steps=1))
     assert key("definitely not a real gpu", 1.00) == key("also not real", 99.00) == 0.0
 
 
@@ -169,9 +120,9 @@ def test_offline_allocates_static_cheapest():
     from flash.providers.base import cheapest_gpu
 
     # RunPod-only static rates: allocation matches cheapest_gpu.
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    a = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a.provider == "runpod"
-    assert a.gpu == cheapest_gpu(24)
+    assert a.gpu == cheapest_gpu(a.min_vram_gb)
 
 
 def test_nothing_fits_names_constraint(monkeypatch):
@@ -180,7 +131,7 @@ def test_nothing_fits_names_constraint(monkeypatch):
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 4096)
     with pytest.raises(UnsupportedGpuError, match="4096 GB"):
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+        allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
 
 
 def test_allocate_provider_constraint_never_falls_through(monkeypatch):
@@ -201,7 +152,7 @@ def test_allocate_provider_constraint_never_falls_through(monkeypatch):
     )
 
     allocation = allocator.allocate(
-        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-9B",
         "grpo",
         provider="lambda",
     )
@@ -234,7 +185,7 @@ def test_soft_provider_preference_ranks_ahead_of_cost_without_dropping_fallbacks
         lambda need, constraints: [Candidate("lambda", "A10", 0.05, 24)],
     )
 
-    allocation = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", providers=("runpod", "vast"))
+    allocation = allocator.allocate("Qwen/Qwen3.5-9B", "grpo", providers=("runpod", "vast"))
 
     assert allocation.provider == "runpod"
     assert [candidate.provider for candidate in allocation.candidates] == [
@@ -267,7 +218,7 @@ def test_soft_provider_preference_preserves_cost_order_within_one_rank(monkeypat
         lambda need, constraints: [Candidate("vast", "RTX 4090", 0.10, 24)],
     )
 
-    allocation = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", providers=("runpod",))
+    allocation = allocator.allocate("Qwen/Qwen3.5-9B", "grpo", providers=("runpod",))
 
     assert [candidate.provider for candidate in allocation.candidates] == [
         "runpod",
@@ -282,13 +233,13 @@ def test_allocate_rejects_provider_pin_with_preferences():
 
     with pytest.raises(UnsupportedGpuError, match="provider and providers cannot both be set"):
         allocator.allocate(
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-9B",
             "grpo",
             provider="runpod",
             providers=("vast",),
         )
     with pytest.raises(UnsupportedGpuError, match="must name at least one provider"):
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", providers=[])
+        allocator.allocate("Qwen/Qwen3.5-9B", "grpo", providers=[])
 
 
 def test_allocate_rejects_unconfigured_provider(monkeypatch):
@@ -297,7 +248,7 @@ def test_allocate_rejects_unconfigured_provider(monkeypatch):
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     with pytest.raises(UnsupportedGpuError, match="not configured"):
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo", provider="lambda")
+        allocator.allocate("Qwen/Qwen3.5-9B", "grpo", provider="lambda")
 
 
 def test_allocate_gpu_type_never_widens_or_escalates(monkeypatch):
@@ -321,7 +272,7 @@ def test_allocate_gpu_type_never_widens_or_escalates(monkeypatch):
     )
 
     allocation = allocator.allocate(
-        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-9B",
         "grpo",
         gpu_type="h100",
     )
@@ -351,7 +302,7 @@ def test_allocate_gpu_type_fallbacks_widen_the_search_without_dictating_the_winn
     )
 
     allocation = allocator.allocate(
-        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-9B",
         "grpo",
         gpu_type="H100",
         gpu_type_fallbacks=("A100 PCIe",),
@@ -404,7 +355,7 @@ def test_allocate_ordered_lambda_pin_classifies_impossible_shapes_as_unsupported
     for fallbacks in ((), ("H100",)):
         with pytest.raises(UnsupportedGpuError, match="lambda does not offer"):
             allocator.allocate(
-                "Qwen/Qwen3.5-0.8B",
+                "Qwen/Qwen3.5-9B",
                 "grpo",
                 provider="lambda",
                 gpu_type="A10",
@@ -429,7 +380,7 @@ def test_allocate_gpu_type_enforces_vram_and_provider_support(monkeypatch):
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     with pytest.raises(UnsupportedGpuError, match="cannot provision"):
         allocator.allocate(
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-9B",
             "grpo",
             provider="lambda",
             gpu_type="RTX 4090",
@@ -447,7 +398,7 @@ def test_exact_dynamic_provider_empty_capacity_is_retryable(monkeypatch, provide
 
     with pytest.raises(CapacityLookupError, match="currently has no capacity"):
         allocator.allocate(
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-9B",
             "grpo",
             provider=provider,
             gpu_type="H100",
@@ -486,7 +437,7 @@ def test_sft_width_that_never_fits_is_terminal_not_a_capacity_retry(monkeypatch,
 
     with pytest.raises(UnsupportedGpuError) as ei:
         allocator.allocate(
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-9B",
             "sft",
             train={"batch_size": 1},
             gpu_type=gpu_type,
@@ -522,7 +473,7 @@ def test_lookup_blip_is_only_retryable_when_a_launchable_shape_exists(monkeypatc
     # 200 GB against an sft run clamped to one rank: no advertised class holds it at any count.
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
     with pytest.raises(UnsupportedGpuError) as ei:
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "sft", train={"batch_size": 1}, max_gpu_count=8)
+        allocator.allocate("Qwen/Qwen3.5-9B", "sft", train={"batch_size": 1}, max_gpu_count=8)
     assert not isinstance(ei.value, CapacityLookupError), (
         "the blip did not cause this and cannot cure it -- no lookup makes a batch of 1 use more "
         "ranks, so retrying spends the infra budget on a shape that will never exist"
@@ -531,7 +482,7 @@ def test_lookup_blip_is_only_retryable_when_a_launchable_shape_exists(monkeypatc
     # same blip, same provider, but a need one card CAN hold: still retryable, as before.
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     with pytest.raises(CapacityLookupError):
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "sft", train={"batch_size": 1}, max_gpu_count=8)
+        allocator.allocate("Qwen/Qwen3.5-9B", "sft", train={"batch_size": 1}, max_gpu_count=8)
 
 
 def test_exact_runpod_empty_capacity_stays_terminal(monkeypatch):
@@ -544,7 +495,7 @@ def test_exact_runpod_empty_capacity_stays_terminal(monkeypatch):
 
     with pytest.raises(UnsupportedGpuError, match="no allocatable capacity"):
         allocator.allocate(
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-9B",
             "grpo",
             provider="runpod",
             gpu_type="H100",
@@ -572,7 +523,7 @@ def test_allocate_gpu_type_ignores_ineligible_provider_blip(monkeypatch):
 
     with pytest.raises(UnsupportedGpuError) as exc_info:
         allocator.allocate(
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-9B",
             "grpo",
             gpu_type="H200",
         )
@@ -621,7 +572,7 @@ def test_transient_capacity_blip_is_retryable_not_terminal(monkeypatch):
         vast=_raise_capacity_blip,  # Vast (the only possible source) blipped
     )
     with pytest.raises(CapacityLookupError) as ei:
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+        allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert not isinstance(ei.value, UnsupportedGpuError)
 
 
@@ -636,7 +587,7 @@ def test_capacity_blip_degrades_to_fitting_provider(monkeypatch):
         lambda_=lambda need: [],
         vast=_raise_capacity_blip,
     )
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+    a = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a.provider == "runpod"  # degraded past the blip, no error
 
 
@@ -652,7 +603,7 @@ def test_genuine_no_fit_without_blip_stays_terminal(monkeypatch):
         vast=lambda need, disk_gb=0.0, max_wall_seconds=0.0: [],
     )
     with pytest.raises(UnsupportedGpuError):
-        allocator.allocate("Qwen/Qwen3.5-0.8B", "grpo")
+        allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
 
 
 def test_estimator_matches_measured_seq_boundaries():
@@ -676,77 +627,6 @@ def test_estimator_matches_measured_seq_boundaries():
     assert e(9.7, "grpo", seq_len=1024) > 48
     # a 36B model in bf16 never fits 32 GB (~72 GB of weights alone)
     assert e(36.0, "sft", seq_len=4096) > 32
-
-
-def test_required_vram_policy_floors_and_downrouting():
-    """model_required_vram_gb: hard floors never under-provision; small runs down-route to
-    a cheaper card; bigger context/group/thinking only ever size UP (never down)."""
-    from flash.engine.plan.vram import model_required_vram_gb as need
-
-    m4 = "Qwen/Qwen3.5-4B"
-    # context length lifts GRPO need monotonically
-    short = need(m4, "grpo", train={"max_context_tokens": 1024, "max_completion_tokens": 256})
-    long = need(m4, "grpo", train={"max_context_tokens": 16384, "max_completion_tokens": 4096})
-    assert long > short
-    # sub-1B GRPO fits a 24 GB card; 2B GRPO OOMs 24 (MEASURED) -> needs the 32 tier; small SFT
-    # drops below the catalog default (32)
-    assert need("Qwen/Qwen3.5-0.8B", "grpo") <= 24
-    assert 24 < need("Qwen/Qwen3.5-2B", "grpo") <= 32
-    assert need(m4, "sft", train={"max_context_tokens": 1024, "lora_rank": 8}) < 32
-    # 9B GRPO is bf16 (QLoRA dropped: the 4-bit vLLM-rollout merge collapsed the GRPO
-    # importance ratio -> no learning), so colocated GRPO needs an 80GB-class card.
-    assert need("Qwen/Qwen3.5-9B", "grpo") >= 80  # bf16 colocate: 80GB floor
-    assert (
-        need(
-            "Qwen/Qwen3.5-9B",
-            "grpo",
-            train={"max_context_tokens": 8192, "max_completion_tokens": 2048, "group_size": 8},
-        )
-        >= 80
-    )
-    assert (
-        need("Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 4096, "group_size": 8}) >= 80
-    )
-    need_27b_sft = need("Qwen/Qwen3.6-27B", "sft")
-    need_27b_grpo = need("Qwen/Qwen3.6-27B", "grpo")
-    assert need_27b_sft == 80
-    assert need_27b_grpo == 150  # colocated-GRPO resident peak -> B200
-    # group size and thinking never DECREASE the requirement
-    base = need(
-        m4,
-        "grpo",
-        train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4},
-    )
-    assert (
-        need(
-            m4,
-            "grpo",
-            train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 16},
-        )
-        >= base
-    )
-    assert (
-        need(
-            m4,
-            "grpo",
-            train={"max_context_tokens": 4096, "max_completion_tokens": 1024, "group_size": 4},
-            thinking=True,
-        )
-        >= base
-    )
-    # max_tokens (completion length) lifts the fp32-logits term -> a longer completion never sizes
-    # DOWN, and a much longer one sizes UP (the term the estimator previously ignored).
-    short_c = need(
-        m4,
-        "grpo",
-        train={"max_context_tokens": 8192, "max_completion_tokens": 256, "group_size": 8},
-    )
-    long_c = need(
-        m4,
-        "grpo",
-        train={"max_context_tokens": 8192, "max_completion_tokens": 8192, "group_size": 8},
-    )
-    assert long_c >= short_c
 
 
 def test_required_vram_sizes_weights_from_curated_params_b_not_display_string():
@@ -843,27 +723,11 @@ def test_opd_uses_opd_sizing_not_grpo():
     from flash.engine.plan.vram import model_required_vram_gb
 
     train = {"max_context_tokens": 8192, "max_completion_tokens": 8192, "lora_rank": 16}
-    for model_id in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"):
+    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-27B"):
         opd_need = model_required_vram_gb(model_id, "opd", train=train)
         grpo_need = model_required_vram_gb(model_id, "grpo", train=train)
         assert opd_need != grpo_need, f"{model_id} OPD must not size as the GRPO colocate path"
         assert opd_need > 0
-
-
-def test_opd_applies_the_colocated_vllm_floor():
-    """OPD starts a resident colocated vLLM engine, so a tiny model cannot be admitted on its tiny
-    training estimate -- the engine's own footprint sets a floor the training term never reaches."""
-    from flash.engine.plan.vram import model_required_vram_gb
-
-    train = {
-        "max_context_tokens": 1536,
-        "max_completion_tokens": 128,
-        "batch_size": 1,
-        "group_size": 1,
-    }
-    # the smallest catalog model: its training estimate is far under the floor, so the 24 GB it
-    # reports IS the floor rather than a coincidence of the sizing equations.
-    assert model_required_vram_gb("Qwen/Qwen3.5-0.8B", "opd", train=train, headroom=1.0) == 24
 
 
 def test_opd_sizes_on_the_authored_prompts_per_step():
@@ -888,8 +752,8 @@ def test_opd_sizes_on_the_authored_prompts_per_step():
             **over,
         }
 
-    narrow = model_required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=_train(prompts_per_step=1))
-    wide = model_required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=_train(prompts_per_step=32))
+    narrow = model_required_vram_gb("Qwen/Qwen3.5-9B", "opd", train=_train(prompts_per_step=1))
+    wide = model_required_vram_gb("Qwen/Qwen3.5-9B", "opd", train=_train(prompts_per_step=32))
     assert wide > narrow, "an authored prompts_per_step must move the opd vram floor"
 
     # the submit path allocates from the parsed TrainSpec, not the raw dict, and that object carries
@@ -897,7 +761,7 @@ def test_opd_sizes_on_the_authored_prompts_per_step():
     def _spec_need(pps):
         spec = spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "gpu": {},
@@ -919,12 +783,12 @@ def test_vram_headroom_consistent_across_sizing_paths():
     assert allocator.vram_headroom() == 1.1
     # both paths feed model_required_vram_gb the same headroom -> identical sizing
     a_need = allocator.required_vram_gb(
-        "Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096}
+        "Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 4096}
     )
     from flash.engine.plan.vram import model_required_vram_gb
 
     direct = model_required_vram_gb(
-        "Qwen/Qwen3.5-4B", "grpo", train={"max_context_tokens": 4096}, headroom=1.1
+        "Qwen/Qwen3.5-9B", "grpo", train={"max_context_tokens": 4096}, headroom=1.1
     )
     assert a_need == direct
 
@@ -937,250 +801,25 @@ def test_allocate_never_selects_below_matrix_need():
     from flash.providers.base import get_gpu_info
 
     grid = [
-        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
-        ("Qwen/Qwen3.5-0.8B", "grpo", {"max_context_tokens": 32768, "group_size": 8}),
+        ("Qwen/Qwen3.5-9B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
+        ("Qwen/Qwen3.5-9B", "grpo", {"max_context_tokens": 32768, "group_size": 8}),
         # chunked-nll qwen sft cases across short and long contexts.
-        ("Qwen/Qwen3.5-0.8B", "sft", {"max_context_tokens": 1024}),
-        ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 1536}),
-        ("Qwen/Qwen3.5-2B", "sft", {"max_context_tokens": 8192}),
-        ("Qwen/Qwen3.5-4B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
+        ("Qwen/Qwen3.5-9B", "sft", {"max_context_tokens": 1024}),
+        ("Qwen/Qwen3.5-9B", "sft", {"max_context_tokens": 1536}),
+        ("Qwen/Qwen3.5-9B", "sft", {"max_context_tokens": 8192}),
+        ("Qwen/Qwen3.5-9B", "grpo", {"max_context_tokens": 1024, "group_size": 4}),
         (
-            "Qwen/Qwen3.5-4B",
+            "Qwen/Qwen3.5-9B",
             "grpo",
             {"max_context_tokens": 16384, "max_completion_tokens": 4096, "group_size": 8},
         ),
-        ("Qwen/Qwen3.5-4B", "sft", {"max_context_tokens": 32768}),
+        ("Qwen/Qwen3.5-9B", "sft", {"max_context_tokens": 32768}),
         ("Qwen/Qwen3.5-9B", "grpo", {"max_context_tokens": 8192, "group_size": 8}),
     ]
     for model, algo, tr in grid:
         need = required_vram_gb(model, algo, train=tr)
         alloc = allocate(model, algo, train=tr)
         assert get_gpu_info(alloc.gpu).vram_gb >= need, (model, algo, tr, alloc.gpu, need)
-
-
-def test_observed_qwen2_opd_vllm_case_routes_off_32gb_cards(monkeypatch):
-    """Regression: Qwen3.5-2B OPD with the vLLM rollout engine failed startup on RTX 5090.
-
-    The aggregate estimate said the run needed only the 28 GB colocate floor, but vLLM initializes
-    after the HF/PEFT student is already resident and requires its executor budget to be free. Keep
-    this observed shape off consumer 32 GB cards and 40 GB fallback classes."""
-    from flash.cost import RunConfig, estimate_cost
-    from flash.providers import allocator
-    from flash.providers.allocator import required_vram_gb
-    from flash.providers.base import get_gpu_info, provisional_gpu
-
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
-    train = {"epochs": 1, "max_completion_tokens": 128, "lora_rank": 32}
-
-    need = required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train)
-    assert need > 40
-
-    preview_gpu = provisional_gpu("Qwen/Qwen3.5-2B", "opd", train=train)
-    alloc = allocator.allocate("Qwen/Qwen3.5-2B", "opd", train=train)
-    estimate = estimate_cost(
-        RunConfig(
-            "Qwen/Qwen3.5-2B",
-            "opd",
-            60,
-            completion_len=128,
-            lora_rank=32,
-            provider="runpod",
-        )
-    )
-
-    assert preview_gpu == "A100 PCIe"
-    assert alloc.gpu == preview_gpu
-    assert alloc.min_vram_gb == need
-    assert estimate.required_vram_gb == need
-    assert estimate.gpu == preview_gpu
-    assert get_gpu_info(preview_gpu).vram_gb >= need
-
-
-@pytest.mark.parametrize(
-    ("label", "train", "expected_gpu"),
-    [
-        (
-            "max_completion_128",
-            {"epochs": 1, "max_completion_tokens": 128, "lora_rank": 32},
-            "A100 PCIe",
-        ),
-        (
-            "max_completion_256",
-            {"epochs": 1, "max_completion_tokens": 256, "lora_rank": 32},
-            "A100 PCIe",
-        ),
-        (
-            "max_completion_512",
-            {"epochs": 1, "max_completion_tokens": 512, "lora_rank": 32},
-            "A100 PCIe",
-        ),
-        (
-            "max_completion_1024",
-            {"epochs": 1, "max_completion_tokens": 1024, "lora_rank": 32},
-            "A100 PCIe",
-        ),
-        (
-            "max_context_2048",
-            {
-                "epochs": 1,
-                "max_context_tokens": 2048,
-                "max_completion_tokens": 128,
-                "lora_rank": 32,
-            },
-            "A100 PCIe",
-        ),
-        (
-            "max_context_8192",
-            {
-                "epochs": 1,
-                "max_context_tokens": 8192,
-                "max_completion_tokens": 128,
-                "lora_rank": 32,
-            },
-            "A100 PCIe",
-        ),
-        (
-            # the dense image fallback grows with context and keeps this mixed-modality-safe route
-            # above the 96 gb class.
-            "max_context_16384",
-            {
-                "epochs": 1,
-                "max_context_tokens": 16384,
-                "max_completion_tokens": 128,
-                "lora_rank": 32,
-            },
-            "H200",
-        ),
-        (
-            # b200, not h200: every catalog model is a gdn hybrid, so the opd rollout runs a bf16 kv
-            # cache (the worker refuses fp8 for them) and sizing must reserve the full cache.
-            "max_context_24576",
-            {
-                "epochs": 1,
-                "max_context_tokens": 24576,
-                "max_completion_tokens": 128,
-                "lora_rank": 32,
-            },
-            "B200",
-        ),
-        (
-            "group_size_8",
-            {"epochs": 1, "group_size": 8, "max_completion_tokens": 128, "lora_rank": 32},
-            "A100 PCIe",
-        ),
-    ],
-)
-def test_observed_qwen2_opd_sweep_never_downroutes_to_32_or_40gb(
-    monkeypatch, label, train, expected_gpu
-):
-    """Attachment regression: 2B OPD/vLLM dry-runs stayed on 4090/5090-class GPUs.
-
-    The submitted worker then OOMed during vLLM rollout initialization. These are the same sweep axes
-    from the report: completion length, context length, and group size. All control-plane views must
-    agree on a >40 GB requirement and a fitting non-consumer GPU before any paid worker is created.
-    """
-    from flash.cost import RunConfig, estimate_cost
-    from flash.providers import allocator
-    from flash.providers.allocator import required_vram_gb
-    from flash.providers.base import get_gpu_info, provisional_gpu
-    from flash.schema import spec_from_dict
-
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
-
-    model = "Qwen/Qwen3.5-2B"
-    need = required_vram_gb(model, "opd", train=train)
-    run_config = RunConfig(
-        model,
-        "opd",
-        int(train.get("epochs", 1)),
-        seq_len=train.get("max_context_tokens"),
-        completion_len=train.get("max_completion_tokens"),
-        group_size=train.get("group_size"),
-        lora_rank=train.get("lora_rank"),
-        provider="runpod",
-    )
-
-    assert need > 40
-    if expected_gpu is None:
-        from flash.providers.base import GPU_INFO, UnsupportedGpuError
-
-        assert need > max(g.vram_gb for g in GPU_INFO.values() if g.validated)
-        with pytest.raises(UnsupportedGpuError):
-            provisional_gpu(model, "opd", train=train)
-        with pytest.raises(UnsupportedGpuError):
-            allocator.allocate(model, "opd", train=train)
-        with pytest.raises(ValueError, match="no GPU class fits"):
-            estimate_cost(run_config)
-        return
-
-    preview_gpu = provisional_gpu(model, "opd", train=train)
-    alloc = allocator.allocate(model, "opd", train=train)
-    estimate = estimate_cost(run_config)
-    spec = spec_from_dict(
-        {
-            "model": model,
-            "algorithm": "opd",
-            "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-            "train": dict(train),
-            "gpu": {},
-        },
-        run_id=f"opd-sweep-{label}",
-    )
-
-    assert preview_gpu == expected_gpu
-    assert alloc.gpu == expected_gpu
-    assert estimate.gpu == expected_gpu
-    assert spec.gpu.type == ""
-    assert alloc.min_vram_gb == need
-    assert estimate.required_vram_gb == need
-    assert get_gpu_info(expected_gpu).vram_gb >= need
-    assert get_gpu_info(expected_gpu).vram_gb > 40
-
-
-def test_observed_qwen4b_opd_vllm_startup_case_routes_off_40gb_cards(monkeypatch):
-    """Regression: Qwen3.5-4B OPD at 8k ctx / 128 rollout tokens failed vLLM startup on 40 GB.
-
-    The trainer is resident before the colocated vLLM engine initializes, so the allocator must not
-    consider the 40 GB A100 class viable even though the rollout token budget is intentionally small.
-    """
-    from flash.cost import RunConfig, estimate_cost
-    from flash.providers import allocator
-    from flash.providers.allocator import required_vram_gb
-    from flash.providers.base import get_gpu_info, provisional_gpu
-
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
-    train = {
-        "epochs": 1,
-        "max_context_tokens": 8192,
-        "max_completion_tokens": 128,
-        "lora_rank": 32,
-    }
-
-    need = required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train)
-    # the dense image fallback keeps this run above the 80 gb class while still fitting the 96 gb
-    # rtx pro 6000.
-    assert 80 < need <= 96
-
-    preview_gpu = provisional_gpu("Qwen/Qwen3.5-4B", "opd", train=train)
-    alloc = allocator.allocate("Qwen/Qwen3.5-4B", "opd", train=train)
-    estimate = estimate_cost(
-        RunConfig(
-            "Qwen/Qwen3.5-4B",
-            "opd",
-            1,
-            seq_len=8192,
-            completion_len=128,
-            lora_rank=32,
-            provider="runpod",
-        )
-    )
-
-    assert preview_gpu == "RTX Pro 6000"
-    assert alloc.gpu == preview_gpu
-    assert alloc.min_vram_gb == need
-    assert estimate.required_vram_gb == need
-    assert estimate.gpu == preview_gpu
-    assert get_gpu_info(preview_gpu).vram_gb >= need
 
 
 def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch):
@@ -1516,67 +1155,6 @@ def test_sft_per_device_cap_keeps_unfused_logits_within_budget():
     assert vram.sft_per_device(4, seq_len=4096, vocab=V, fused=True) == 4
 
 
-def test_required_vram_qwen_chunked_nll_drops_big_vocab_logits():
-    """validated qwen sft sizing bounds vocab logits while retaining activation growth."""
-    import math
-
-    from flash.core.catalog import MODELS, vocab_size_for
-    from flash.engine.plan.vram import estimate_vram_gb
-    from flash.providers.allocator import required_vram_gb
-
-    model_id = "Qwen/Qwen3.5-0.8B"
-    info = MODELS[model_id]
-    n_short = required_vram_gb(model_id, "sft", train={"max_context_tokens": 1024})
-    expected = math.ceil(
-        estimate_vram_gb(
-            info.params_b,
-            "sft",
-            seq_len=1024,
-            vocab=vocab_size_for(model_id),
-            sft_fused_ce=True,
-        )
-        * 1.1
-    )
-    # 10, not 9: the reserved projection is one 512-row verl fused-CE chunk, not 256 rows.
-    assert n_short == expected == 10
-    n_long = required_vram_gb(model_id, "sft", train={"max_context_tokens": 2048})
-    assert n_long >= n_short
-
-
-def test_qwen4b_sft_8192_chunked_nll_routes_to_32gb_card(monkeypatch):
-    """chunked nll removes the dense-logit term that previously forced this shape onto 80 gb."""
-    from flash.cost import RunConfig, estimate_cost
-    from flash.providers import allocator
-    from flash.providers.allocator import required_vram_gb
-    from flash.providers.base import get_gpu_info, provisional_gpu
-
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
-    train = {"epochs": 1, "max_examples": 4020, "max_context_tokens": 8192, "lora_rank": 32}
-
-    need = required_vram_gb("Qwen/Qwen3.5-4B", "sft", train=train)
-    assert need == 28
-
-    preview_gpu = provisional_gpu("Qwen/Qwen3.5-4B", "sft", train=train)
-    alloc = allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=train)
-    estimate = estimate_cost(
-        RunConfig(
-            "Qwen/Qwen3.5-4B",
-            "sft",
-            1,
-            seq_len=8192,
-            lora_rank=32,
-            provider="runpod",
-        )
-    )
-
-    assert preview_gpu == "RTX 5090"
-    assert alloc.gpu == preview_gpu
-    assert alloc.min_vram_gb == need
-    assert estimate.required_vram_gb == need
-    assert estimate.gpu == preview_gpu
-    assert get_gpu_info(preview_gpu).vram_gb >= need
-
-
 def test_sft_equation_covers_honest_peak_across_seq_boundary():
     """the allocator must mirror chunked qwen and plain-nll fallback peaks across the catalog."""
     import math
@@ -1656,31 +1234,6 @@ def test_sft_logits_cap_shrinks_per_device_for_big_vocab():
     assert pd == sft_logits_per_device_cap(seq, vocab) or pd == 4
 
 
-def test_sft_chunked_nll_restores_qwen_microbatch_and_gc_gate():
-    from flash.engine.plan.vram import sft_chunked_nll_enabled, sft_grad_accum
-    from flash.engine.worker.perf import grad_checkpointing_on
-
-    model_id = "Qwen/Qwen3.5-0.8B"
-    chunked = sft_chunked_nll_enabled(model_id)
-    assert sft_grad_accum(8, seq_len=1024, vocab=248_320, fused=chunked) == (4, 2)
-    assert (
-        grad_checkpointing_on(
-            model_id,
-            1024,
-            allow_disable=True,
-            card_vram_gb=80,
-            capability=(9, 0),
-            active_params_b=0.9,
-            hidden=1024,
-            num_layers=24,
-            fused_ce=chunked,
-            per_device_bs=4,
-            lora_rank=32,
-        )
-        is False
-    )
-
-
 def test_sft_logits_cap_no_regression_small_vocab_or_fused():
     """The cap must NOT shrink the micro-batch for a small-vocab model, nor when the fused CE is
     on (Liger fuses the logits away) — those keep the fixed per-device 4."""
@@ -1697,7 +1250,6 @@ def test_sft_logits_cap_no_regression_small_vocab_or_fused():
 def test_sft_chunked_nll_model_gate_mirrors_worker():
     from flash.engine.plan.vram import sft_chunked_nll_enabled
 
-    assert sft_chunked_nll_enabled("Qwen/Qwen3.5-0.8B") is True
     assert sft_chunked_nll_enabled("Qwen/Qwen3.5-9B") is True
     assert sft_chunked_nll_enabled("Qwen/Qwen3.6-27B") is True
     assert sft_chunked_nll_enabled("Qwen/Qwen3.6-35B-A3B") is True
@@ -1928,7 +1480,7 @@ def test_explicit_two_card_pin_never_escalates_to_four(monkeypatch):
 
     with pytest.raises(UnsupportedGpuError) as exc:
         allocator.allocate(
-            "Qwen/Qwen3.5-4B",
+            "Qwen/Qwen3.5-9B",
             "sft",
             gpu_type="A100 PCIe",
             max_gpu_count=2,
@@ -2052,7 +1604,7 @@ def test_sft_default_context_tracks_thinking_mode():
     from flash.engine.plan.vram import model_required_vram_gb
 
     assert RECIPE.sft.max_seq_len_thinking > RECIPE.sft.max_seq_len
-    mid = "Qwen/Qwen3.5-4B"
+    mid = "Qwen/Qwen3.5-9B"
     plain = model_required_vram_gb(mid, "sft", thinking=False)
     thinking = model_required_vram_gb(mid, "sft", thinking=True)
     assert thinking > plain, (plain, thinking)

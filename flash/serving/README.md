@@ -107,7 +107,7 @@ uv run modal deploy --env dev flash/serving/modal_app.py
 Explicitly warm one development model without changing the zero floor:
 
 ```bash
-uv run modal run --env dev flash/serving/modal_app.py --base-model Qwen/Qwen3.5-0.8B
+uv run modal run --env dev flash/serving/modal_app.py --base-model Qwen/Qwen3.5-9B
 ```
 
 ### No autoscaling or vLLM perf knobs
@@ -121,7 +121,7 @@ GPUs, so there's nothing to tune at deploy time:
   throughput / ~10× lower TTFT for shared prompts), CUDA graphs where the per-model boot canary
   leaves enough KV headroom, `disable_log_stats`, the prompt-token cache (2048), `MAX_INPUTS=64`
   packing, multi-LoRA defaults (**16 hot** / **rank 32** / 256 CPU) with per-model rank overrides
-  (**128** for 0.8B/2B/4B/9B, **64** for the 27B; the 35B MoE runs rank 64 at only 6 hot slots,
+  (**128** for the 9B, **64** for the 27B; the 35B MoE runs rank 64 at only 6 hot slots,
   every other tier keeps 16), and `VLLM_CACHE_ROOT` on the persistent volume so vLLM's
   torch.compile cache survives scale-to-zero instead of recompiling on every cold start.
 - **Deleted (neutral or losing):** speculative decoding / ngram (−13.5% on diverse output),
@@ -132,7 +132,7 @@ GPUs, so there's nothing to tune at deploy time:
 - **Quantization: pre-quantized FP8 for the dense tiers, bf16 for the 35B MoE (memory-first).** Every
   **dense** catalog model loads a **pre-quantized FP8 checkpoint** (no online quantization, no
   community-repo dependence), resolved by `src/prequant_config.py` (`FP8_DYNAMIC` E4M3,
-  `float-quantized`): Freesolo-owned `Freesolo-Co/*-FP8` for the five dense models (including the
+  `float-quantized`): Freesolo-owned `Freesolo-Co/*-FP8` for both dense models (including the
   Qwen3.6-27B). The 35B-A3B vision-language MoE is the **exception**: it serves the **official bf16
   base weights** on an H200 (`quantization=None`), because vLLM's fused-MoE LoRA path cannot run under
   FP8 at the shape a full all-expert flash adapter needs (see the GPU tiers † footnote below).
@@ -149,10 +149,8 @@ GPUs, so there's nothing to tune at deploy time:
 
 - **The real memory lever — LoRA buffers:** vLLM PRE-ALLOCATES the GPU LoRA buffers at `max_loras ×
 max_lora_rank`, regardless of how many adapters load. Both are linear levers. **The dense tiers keep
-  `max_loras = 16`** and move the rank instead: the 0.8B/2B/4B/9B tiers run **16 × 128** (0.8B/2B/4B on
-  L4, 9B on L40S) and the 27B runs **16 × 64** on H100, while the 35B MoE is
-  the exception at **6 × 64** bf16 on H200. (Holding hot slots at 16 keeps the 4B/9B buffers _below_
-  their old 64 × 32 / 44 × 32 shapes even with rank doubled.) Adapters trained above the effective rank are rejected at load; a base regularly serving
+  `max_loras = 16`**: the 9B runs **16 × 128** on L40S and the 27B runs **16 × 64** on H100, while the
+  35B MoE is the exception at **6 × 64** bf16 on H200. Adapters trained above the effective rank are rejected at load; a base regularly serving
   more distinct adapters than its hot limit pays a swap latency from the CPU pool unless its hot
   limit equals `MAX_CPU_LORAS`.
 
@@ -169,19 +167,13 @@ cold-boot smoke test first.
 
 | Base model                | Checkpoint                                 | GPU       | Hot LoRA shape | Context |
 | ------------------------- | ------------------------------------------ | --------- | -------------- | ------- |
-| 0.8B, 2B                  | owned FP8 (`Freesolo-Co/*-FP8`)            | **L4**‡   | 16 × 128       | 32768   |
-| Qwen3.5-4B                | owned FP8 (`Freesolo-Co/*-FP8`)            | **L4**§   | 16 × 128       | 32768   |
 | Qwen3.5-9B                | owned FP8 (`Freesolo-Co/*-FP8`)            | **L40S**§ | 16 × 128       | 32768   |
 | Qwen3.6-27B               | owned FP8 (`Freesolo-Co/*-FP8`)            | **H100**§ | 16 × 64        | 32768   |
 | Qwen3.6-35B-A3B (MoE, VL) | official **bf16** (`Qwen/Qwen3.6-35B-A3B`) | **H200**† | 6 × 64         | 32768   |
 
-‡ L4 (24 GiB, Ada sm89) is the floor — the cheapest vLLM-capable card. **T4 is NOT usable** (sm75
-Turing is below vLLM V1's compute-capability ≥ 8.0 floor → vLLM ≥ 0.19 won't init; no FP8). The tiny
-models have ample L4 headroom for the 16 × 128 buffer.
-
-§ 4B (L4) and 9B (L40S) run **16 × 128**; the 27B (H100) runs **16 × 64**. All three run 32k context
-at `max_num_seqs=8` with CUDA graphs (`enforce_eager=False`). 4B pins `gpu_memory_utilization=0.98`;
-the 9B and 27B use `0.90` for CUDA-graph capture headroom. All are hybrid GatedDeltaNet models whose
+§ 9B (L40S) runs **16 × 128** and the 27B (H100) runs **16 × 64**. Both run 32k context
+at `max_num_seqs=8` with CUDA graphs (`enforce_eager=False`) and use `gpu_memory_utilization=0.90`
+for CUDA-graph capture headroom. Both are hybrid GatedDeltaNet models whose
 linear-attention layers fire many tiny per-token kernels, so eager mode costs ~10× decode (the 27B
 measured ~11 vs ~80 tok/s on its H100); the graphs are worth it. The 9B's rank-128 × 16 buffer OOMed
 an L4 and 2×L4 in the real-GPU sweep, so it runs on the 48 GiB L40S — the cheapest Ada card that fits
@@ -288,7 +280,7 @@ open `<think>` block for generation to close.
   "adapter_id": "people-search@step-20.8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f",
   "repo_id": "Freesolo-Co/people-search-lora",
   "repo_type": "model",
-  "base_model": "Qwen/Qwen3.5-0.8B",
+  "base_model": "Qwen/Qwen3.5-9B",
   "checkpoint": "people-search/step-20",
   "org_id": "org-id",
   "private": true,

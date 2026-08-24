@@ -29,7 +29,7 @@ def _spec(
 
 def test_sft_max_context_tokens_above_serving_cap_rejected():
     # 4b serves at max_model_len=32768; a 40000-token sft context exceeds that boundary.
-    spec = _spec(model="Qwen/Qwen3.5-4B", algorithm="sft", max_context_tokens=40000)
+    spec = _spec(model="Qwen/Qwen3.5-9B", algorithm="sft", max_context_tokens=40000)
     with pytest.raises(
         ValueError, match=r"train\.max_context_tokens=40000 exceeds .*max_model_len=32768"
     ):
@@ -38,7 +38,7 @@ def test_sft_max_context_tokens_above_serving_cap_rejected():
 
 def test_sft_max_context_tokens_at_cap_allowed():
     preflight_train_context_within_serving(
-        _spec(model="Qwen/Qwen3.5-4B", algorithm="sft", max_context_tokens=32768)
+        _spec(model="Qwen/Qwen3.5-9B", algorithm="sft", max_context_tokens=32768)
     )
 
 
@@ -66,7 +66,7 @@ def test_27b_grpo_effective_rollout_above_serving_cap_rejected():
 
 def test_sft_unset_max_context_tokens_allowed():
     # Unset -> the worker's small recipe default, always within the cap.
-    preflight_train_context_within_serving(_spec(model="Qwen/Qwen3.5-4B", algorithm="sft"))
+    preflight_train_context_within_serving(_spec(model="Qwen/Qwen3.5-9B", algorithm="sft"))
 
 
 def test_35b_32768_context_allowed():
@@ -90,7 +90,7 @@ def test_grpo_unset_rollout_within_35b_cap_allowed():
 
 def test_grpo_big_max_completion_tokens_pushes_rollout_over_cap_rejected():
     # a large completion budget makes prompt+completion exceed the served context.
-    spec = _spec(model="Qwen/Qwen3.5-4B", algorithm="grpo", max_completion_tokens=40000)
+    spec = _spec(model="Qwen/Qwen3.5-9B", algorithm="grpo", max_completion_tokens=40000)
     with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
         preflight_train_context_within_serving(spec)
 
@@ -126,7 +126,7 @@ def test_a_model_without_a_serving_entry_is_skipped(monkeypatch):
 
     import flash.core.catalog as catalog
 
-    model = "Qwen/Qwen3.5-4B"
+    model = "Qwen/Qwen3.5-9B"
     monkeypatch.setitem(catalog.MODELS, model, replace(catalog.MODELS[model], serving=None))
     preflight_train_context_within_serving(
         _spec(model=model, algorithm="sft", max_context_tokens=32768)

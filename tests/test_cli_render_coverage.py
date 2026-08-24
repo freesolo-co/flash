@@ -350,7 +350,7 @@ def test_object_panel_with_and_without_state(styled_plain) -> None:
 def test_cost_panel_grpo_with_teacher_and_wall_cap(styled_plain) -> None:
     est = types.SimpleNamespace(
         method="grpo",
-        model_id="Qwen/Qwen3.5-4B",
+        model_id="Qwen/Qwen3.5-9B",
         steps=100,
         gpu="RTX 5090",
         gpu_vram_gb=32,
@@ -386,7 +386,7 @@ def test_cost_panel_grpo_with_teacher_and_wall_cap(styled_plain) -> None:
 def test_cost_panel_sft_omits_optional_sections(styled_plain) -> None:
     est = types.SimpleNamespace(
         method="sft",
-        model_id="Qwen/Qwen3.5-4B",
+        model_id="Qwen/Qwen3.5-9B",
         steps=50,
         gpu="RTX 4090",
         gpu_vram_gb=24,

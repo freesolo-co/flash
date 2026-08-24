@@ -621,7 +621,7 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
         model_revision="a" * 40,
     )
 
-    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-0.8B"):
+    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-27B"):
         captured.clear()
         worker.make_lora(model_id)
         assert captured.get("init_lora_weights") is True
@@ -632,7 +632,7 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
         assert captured["exclude_modules"] == r"^(?!model\.language_model(?:\.|$)).*$"
 
     captured.clear()
-    worker.make_lora("Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=True)
+    worker.make_lora("Qwen/Qwen3.5-9B", algorithm="sft", multimodal=True)
     assert captured["target_modules"] == "all-linear"
     assert captured["exclude_modules"] is None
 

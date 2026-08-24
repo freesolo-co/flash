@@ -26,9 +26,8 @@ from flash.engine.profiling.workload_profile import (
 
 pytestmark = pytest.mark.live
 
-# the smallest catalog model that ships the thinking template; the template is shared across the
-# Qwen3.5 family, so the 0.8B render is the same rule the 4B and 27B students apply.
-MODEL = "Qwen/Qwen3.5-0.8B"
+# the active qwen3.5 checkpoint ships the family thinking template exercised by this live test.
+MODEL = "Qwen/Qwen3.5-9B"
 
 MULTITURN = [
     {"role": "system", "content": "sys"},

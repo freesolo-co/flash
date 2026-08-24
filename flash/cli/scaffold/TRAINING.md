@@ -251,7 +251,7 @@ contract should be identical — and hash the dataset files for the data half.
 ### 3. Configure the run (TOML)
 
 ```toml
-model = "Qwen/Qwen3.5-4B"   # see `flash models list`
+model = "Qwen/Qwen3.5-9B"   # see `flash models list`
 project = "PROJECT_UUID"  # required UUID from `flash projects create`
 algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-policy distillation)
 # thinking = true           # opt-in reasoning mode, for models that support it
@@ -597,7 +597,7 @@ was used: inspect the keys. For normalized keys, load with vanilla peft and
 from peft import PeftModel
 from transformers import AutoModelForCausalLM
 
-base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-0.8B")  # qwen3.5 causal-lm class
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-9B")  # qwen3.5 causal-lm class
 model = PeftModel.from_pretrained(base, "<you>/<repo>")
 ```
 
@@ -611,7 +611,7 @@ load the base with the multimodal class whose parameters live under that namespa
 # infixed keys (base_model.model.model.language_model.layers.*) need the multimodal class:
 from transformers import AutoModelForImageTextToText
 
-base = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen3.5-0.8B")
+base = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen3.5-9B")
 # qwen3.5/3.6 dense models resolve to Qwen3_5ForConditionalGeneration
 # qwen3.6-35b-a3b (moe) resolves to Qwen3_5MoeForConditionalGeneration
 model = PeftModel.from_pretrained(base, "<you>/<repo>")
@@ -992,7 +992,7 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
 
 ```toml
 # configs/opd.toml
-model = "Qwen/Qwen3.5-4B"
+model = "Qwen/Qwen3.5-9B"
 algorithm = "opd"
 
 [environment]
@@ -1031,8 +1031,7 @@ failures. This assumes the teacher is still strong at the task (vet it first, ab
 
 Reverse-KL is **mode-seeking**: it sharpens the student's next-token distribution toward the
 teacher's dominant mode, and it keeps sharpening for as long as you train. This affects **every OPD
-run, at every size** — the whole Flash catalog is small by frontier standards (0.8B-9B dense plus a
-3B-active MoE), so treat over-sharpening as a default risk, not a small-model edge case. The student's
+run, at every size**. Treat over-sharpening as a default risk, not a small-model edge case. The student's
 per-token entropy falls as training proceeds; past the point where it has learned the task, extra
 steps only over-sharpen — _lowering_ accuracy. Push it far enough and the distribution peaks so hard
 that **greedy (temperature=0) decoding falls into a repetition loop** that repeats a phrase to the
@@ -1055,19 +1054,15 @@ every run, the last two matter more the smaller the model:
   `max_steps` instead. Only when the horizon is _derived_ (no `max_steps`, or `max_steps = 0`) does
   cutting `max_examples` (or `epochs`) stop the run before the collapse. Either way,
   deploy an early **checkpoint** (`flash runs checkpoint <run>`, `flash models deploy <run>/step-N`) rather
-  than the final adapter. This helped at every size tested — a 4B went 42% acc / 44% loop at full
-  length -> **74% / 0% at step 20**, and even models that never looped came out equal-or-better at the
-  earlier checkpoint. When in doubt, sweep a few checkpoints and pick the best, don't assume the last
+  than the final adapter. This helped at every size tested, and models that never looped still came
+  out equal-or-better at the earlier checkpoint. When in doubt, sweep a few checkpoints and pick the best, don't assume the last
   step is the best.
-- **Lower the rank (more, the smaller the model).** A rank-32 adapter is a large relative perturbation
-  to a small model, giving reverse-KL more capacity to over-sharpen. Dropping `lora_rank` to 16 (or 8)
-  often clears the loop outright (a 4B sft->opd went 42%/44% at rank 32 -> 76%/2% at rank 16). Since
-  the whole catalog is small, prefer a modest rank (16) as the default for OPD and only raise it with a
-  reason.
-- **Match the teacher to the student.** A _stronger_ teacher is not universally better — the harder
-  it is for the student to match, the harder the collapse. On a 2B, a closer/weaker teacher can beat a
-  frontier one outright; a frontier `teacher_model` only earns its keep once the student is large
-  enough to track it (~9B+). Early-stopping also largely neutralizes this gap, since the teacher-driven
+- **Lower the rank (more, the smaller the model).** A rank-32 adapter is a larger relative
+  perturbation on smaller models, giving reverse-KL more capacity to over-sharpen. Prefer a modest
+  rank (16) as the default for OPD and only raise it with a reason.
+- **Match the teacher to the student.** A _stronger_ teacher is not universally better. The harder
+  it is for the student to match, the harder the collapse. Early-stopping largely neutralizes this
+  gap, since the teacher-driven
   over-sharpening only compounds over many steps.
 - **Diagnose it at serving.** Evaluate at **temperature=0** and flag
   `finish_reason=length` completions that never emit your answer token. Compare an early checkpoint

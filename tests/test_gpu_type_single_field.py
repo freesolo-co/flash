@@ -43,7 +43,7 @@ def test_reallocation_spec_restores_public_gpu_type_for_auto(monkeypatch):
         runner = fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-auto",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
@@ -64,7 +64,7 @@ def test_reallocation_spec_keeps_pin_for_pinned(monkeypatch):
         runner = fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-pinned",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="H100", max_retries=2),
@@ -90,7 +90,7 @@ def test_reallocation_spec_restores_the_authored_card_ceiling_for_an_auto_run(mo
         runner = fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-auto-count",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", count=4, max_retries=2),
@@ -122,7 +122,7 @@ def test_reallocation_spec_restores_the_authored_card_ceiling_for_a_pinned_run(m
         runner = fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-pinned-count",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="H100", count=4, max_retries=2),
@@ -155,7 +155,7 @@ def test_reallocation_preserves_auto_count_provenance(monkeypatch):
         runner = fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-auto-marker",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type=""),
@@ -183,7 +183,7 @@ def test_reallocation_keeps_an_authored_single_card_pin_hard(monkeypatch):
         runner = fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-authored-one",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", count=1),

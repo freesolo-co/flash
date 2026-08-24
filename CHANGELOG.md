@@ -21,6 +21,9 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- The active training and serving catalog now starts at `Qwen/Qwen3.5-9B`. The 0.8B, 2B, and 4B
+  Qwen3.5 tiers are no longer accepted for new or persisted runtime activation, while historical
+  status, billing, cancellation, cleanup, and identity-based undeploy operations remain available.
 - `[train] init_from_adapter` now works for every source/target algorithm pair. SFT was rejected as
   a warm-start target, so an adapter could be continued only by GRPO or OPD; that restriction
   described the retired trl SFT backend, and the verl backend that replaced it loads a warm-start

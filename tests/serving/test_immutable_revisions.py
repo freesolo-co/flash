@@ -26,8 +26,8 @@ from flash.serving.src.schemas import (
 )
 from tests.serving.conftest import attest
 
-QWEN = "Qwen/Qwen3.5-0.8B"
-QWEN_2B = "Qwen/Qwen3.5-2B"
+QWEN = "Qwen/Qwen3.5-9B"
+QWEN_27B = "Qwen/Qwen3.6-27B"
 RUN_ID = "flash-1234567890-abcdef12"
 SHA_A = "a" * 40
 SHA_B = "b" * 40
@@ -735,7 +735,7 @@ def test_exact_duplicate_is_idempotent_and_disabled_repost_retriggers_load(setup
     ("field", "value"),
     [
         ("repo_id", "org/other"),
-        ("base_model", QWEN_2B),
+        ("base_model", QWEN_27B),
         ("subfolder", "other/path"),
         ("repo_type", "dataset"),
         ("url", "https://huggingface.co/org/other"),
@@ -1417,9 +1417,9 @@ def test_generate_base_model_response_carries_no_revision_provenance(setup) -> N
     client, _, router, _ = setup
     base = AdapterRecord.model_validate(
         {
-            "adapter_id": QWEN_2B,
-            "repo_id": QWEN_2B,
-            "base_model": QWEN_2B,
+            "adapter_id": QWEN_27B,
+            "repo_id": QWEN_27B,
+            "base_model": QWEN_27B,
             "serve_base_model": True,
             "thinking": True,
             "org_id": None,
@@ -1427,7 +1427,7 @@ def test_generate_base_model_response_carries_no_revision_provenance(setup) -> N
         }
     )
     router.upsert(base)
-    response = client.post("/generate", json={"adapter_id": QWEN_2B, "prompt": "hi"})
+    response = client.post("/generate", json={"adapter_id": QWEN_27B, "prompt": "hi"})
     assert response.status_code == 200
     assert "freesolo" not in response.json()
     assert "X-Freesolo-Adapter-Revision" not in response.headers

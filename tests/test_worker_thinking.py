@@ -32,7 +32,7 @@ def _set_thinking_worker_env():
     # thinking is a run-config field (TOML `thinking`), not an env knob: drive it via the JobSpec.
     os.environ["FLASH_JOB_SPEC_JSON"] = json.dumps(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "thinking": True,
             "environment": {"id": "stub/env"},
@@ -101,7 +101,7 @@ def test_thinking_budget_selection(monkeypatch):
     # thinking off: a JobSpec with thinking=false -> original (larger) micro-batch
     os.environ["FLASH_JOB_SPEC_JSON"] = json.dumps(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "thinking": False,
             "environment": {"id": "stub/env"},

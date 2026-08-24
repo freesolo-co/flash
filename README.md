@@ -68,7 +68,7 @@ authenticated organization before Flash allocates anything:
 
 ```toml
 project = "your-project-uuid"
-model = "Qwen/Qwen3.5-4B"
+model = "Qwen/Qwen3.5-9B"
 algorithm = "sft"
 
 [environment]

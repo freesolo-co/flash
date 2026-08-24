@@ -19,9 +19,6 @@ from __future__ import annotations
 
 # Freesolo-owned FP8_DYNAMIC checkpoints (we prequantize + publish these ourselves).
 OWNED_FP8_MODEL_REPOS: dict[str, str] = {
-    "Qwen/Qwen3.5-0.8B": "Freesolo-Co/Qwen3.5-0.8B-FP8",
-    "Qwen/Qwen3.5-2B": "Freesolo-Co/Qwen3.5-2B-FP8",
-    "Qwen/Qwen3.5-4B": "Freesolo-Co/Qwen3.5-4B-FP8",
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
     "Qwen/Qwen3.6-27B": "Freesolo-Co/Qwen3.6-27B-FP8",
 }

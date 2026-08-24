@@ -32,7 +32,7 @@ from flash.schema import (
 )
 
 BASE_RAW = {
-    "model": "Qwen/Qwen3.5-0.8B",
+    "model": "Qwen/Qwen3.5-9B",
     "algorithm": "grpo",
     "project": "11111111-1111-4111-8111-111111111111",
     "environment": {"id": "freesolo/math-agent/gsm8k"},
@@ -91,7 +91,7 @@ def test_parse_adapter_revision_rejects_zero_padded_steps(step):
         ({"algorithm": "ppo"}, "unsupported algorithm"),
         # An unhashable model (TOML array / `[model]` table) used to TypeError on MODELS.get() -> 500;
         # it must be a clean ConfigError like every other scalar.
-        ({"model": ["Qwen/Qwen3.5-4B"]}, "must be a model id string"),
+        ({"model": ["Qwen/Qwen3.5-9B"]}, "must be a model id string"),
         ({"model": {"id": "x"}}, "must be a model id string"),
         ({"model": "   "}, "must be a model id string"),
         # A truthy non-string algorithm used to AttributeError on .lower() (uncaught 500); it must be
@@ -191,7 +191,7 @@ def test_credit_assignment_defaults_accepts_and_roundtrips() -> None:
 def test_toml_config_requires_project(tmp_path) -> None:
     config = tmp_path / "train.toml"
     config.write_text(
-        'model = "Qwen/Qwen3.5-0.8B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "freesolo/gsm8k"\n'
         "[train]\nepochs = 1\nmax_examples = 1\n"
@@ -210,10 +210,10 @@ def test_project_id_is_required_canonicalized_and_roundtrips() -> None:
         spec_from_dict(_raw(project="   "), project_required=True)
     with pytest.raises(ConfigError, match="project must be a valid UUID"):
         spec_from_dict(_raw(project="not-a-uuid"))
-    persisted = JobSpec(model="Qwen/Qwen3.5-0.8B").to_internal_dict()
+    persisted = JobSpec(model="Qwen/Qwen3.5-9B").to_internal_dict()
     assert JobSpec.from_dict(persisted).project == ""
 
-    synthetic = JobSpec(model="Qwen/Qwen3.5-0.8B")
+    synthetic = JobSpec(model="Qwen/Qwen3.5-9B")
     assert synthetic.project == ""
     assert synthetic.to_dict()["project"] == ""
     from flash.client.specs import spec_payload
@@ -422,7 +422,7 @@ def test_internal_from_dict_round_trips_stored_lora_alpha() -> None:
     # inherited parent alpha (which need not equal 2 x rank) survive control-plane -> worker
     # serialization; alpha falls back to 2 x rank only when the payload omits it.
     base = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "train": {
@@ -709,13 +709,13 @@ def test_hf_repo_is_managed_not_user_set() -> None:
         spec_from_dict(raw)
 
 
-def test_lora_rank_allows_rank128_for_small_serving_models() -> None:
-    # The small dense tiers (default model Qwen3.5-0.8B) now serve rank-128 LoRA buffers.
+def test_lora_rank_allows_rank128_for_default_serving_model() -> None:
+    # the default 9b serving profile supports rank-128 lora buffers.
     assert spec_from_dict(_raw(**{"train.lora_rank": 128})).train.lora_rank == 128
 
 
-def test_lora_rank_must_fit_small_serving_cap() -> None:
-    # Small-tier serving cap doubled 64 -> 128; rank 129 exceeds it.
+def test_lora_rank_must_fit_default_serving_cap() -> None:
+    # rank 129 exceeds the default 9b serving profile's rank-128 cap.
     with pytest.raises(ConfigError, match="serving max_lora_rank=128"):
         spec_from_dict(_raw(**{"train.lora_rank": 129}))
 
@@ -723,9 +723,7 @@ def test_lora_rank_must_fit_small_serving_cap() -> None:
 def test_lora_rank_must_fit_large_serving_cap() -> None:
     from flash.core.catalog import serving_lora_rank_cap
 
-    # the 27B is the rank-64 tier. this case used the 4B, which was rank-64 when it was written and
-    # is now rank-128 -- leaving it there would have made this a duplicate of the small-cap test
-    # above rather than coverage of the lower cap. derived from the catalog so it tracks the tier.
+    # derive the active 27b profile's lower cap from the catalog.
     cap = serving_lora_rank_cap("Qwen/Qwen3.6-27B")
     assert cap is not None
     with pytest.raises(ConfigError, match=f"serving max_lora_rank={cap}"):
@@ -1234,19 +1232,19 @@ def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
 
     defaults = GpuSpec()
     spec = spec_from_dict(
-        _raw(**{"gpu.provider": " RunPod ", "gpu.type": "rtx-4090"}),
+        _raw(**{"gpu.provider": " RunPod ", "gpu.type": "A100 PCIe"}),
         run_id="gpu-rt",
     )
     payload = spec_payload(spec)
     # the public payload carries the user-authorable gpu knobs and omits managed lifecycle policy.
     assert payload["gpu"]["provider"] == "runpod"
-    assert payload["gpu"]["type"] == "RTX 4090"
+    assert payload["gpu"]["type"] == "A100 PCIe"
     assert "max_retries" not in payload["gpu"]
     assert "max_wall_seconds" not in payload["gpu"]
 
     reparsed = spec_from_dict(payload, run_id="server-reparse")
     assert reparsed.gpu.provider == "runpod"
-    assert reparsed.gpu.type == "RTX 4090"
+    assert reparsed.gpu.type == "A100 PCIe"
     assert reparsed.gpu.type == spec.gpu.type
     # managed lifecycle fields reconstitute to their defaults on the server reparse.
     assert reparsed.gpu.max_retries == defaults.max_retries
@@ -1412,10 +1410,10 @@ def test_cost_quote_no_fit_error_names_every_acceptable_class() -> None:
 
 
 def test_soft_provider_preference_does_not_reject_an_ineligible_gpu_type_pair() -> None:
-    spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"], "gpu.type": "RTX 4090"}))
+    spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"], "gpu.type": "A100 PCIe"}))
 
     assert spec.gpu.providers == ("lambda",)
-    assert spec.gpu.type == "RTX 4090"
+    assert spec.gpu.type == "A100 PCIe"
 
 
 def test_persisted_gpu_provider_preferences_reject_invalid_values() -> None:
@@ -2077,7 +2075,7 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
     )
     spec = JobSpec(
         run_id="sft-no-environment",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         project="11111111-1111-4111-8111-111111111111",
     )
@@ -2102,7 +2100,7 @@ def test_adapter_continuation_preparation_is_target_algorithm_agnostic(
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
     spec = JobSpec(
         run_id=f"{algorithm}-warmstart",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm=algorithm,
         project="11111111-1111-4111-8111-111111111111",
         train=TrainSpec(epochs=1, max_examples=8, init_from_adapter="source-run"),
@@ -2192,7 +2190,7 @@ def test_removed_worker_environment_table_is_rejected(tmp_path) -> None:
     # a config that still carries it must fail loudly rather than train with the overrides dropped.
     path = tmp_path / "removed-worker-environment.toml"
     path.write_text(
-        'model = "Qwen/Qwen3.5-0.8B"\nalgorithm = "grpo"\n[worker_env]\nCUSTOM_FLAG = "value"\n'
+        'model = "Qwen/Qwen3.5-9B"\nalgorithm = "grpo"\n[worker_env]\nCUSTOM_FLAG = "value"\n'
     )
 
     with pytest.raises(ConfigError) as exc_info:

@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 SHA = "a" * 40
 
 
@@ -138,7 +138,7 @@ def test_unsupported_base_model_is_reported_and_rejected() -> None:
     response = client.post("/generate", json={"adapter_id": revision.adapter_id, "prompt": "hi"})
     assert response.status_code == 400
     assert f"Unsupported base model: {unsupported}" in response.json()["detail"]
-    assert "Qwen/Qwen3.5-0.8B" in response.json()["detail"]
+    assert "Qwen/Qwen3.5-9B" in response.json()["detail"]
 
 
 class _ReplayPool(_Pool):

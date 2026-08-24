@@ -13,9 +13,6 @@ from flash.serving.src.prequant_config import (
 )
 
 OWNED_DENSE_MODELS = (
-    "Qwen/Qwen3.5-0.8B",
-    "Qwen/Qwen3.5-2B",
-    "Qwen/Qwen3.5-4B",
     "Qwen/Qwen3.5-9B",
     "Qwen/Qwen3.6-27B",
 )

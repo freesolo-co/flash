@@ -39,8 +39,8 @@ def _serve(*args, **kwargs):
     return TestClient(build_serving_app(*args, **kwargs), headers={"Authorization": "Bearer t"})
 
 
-QWEN = "Qwen/Qwen3.5-0.8B"
-QWEN_2B = "Qwen/Qwen3.5-2B"
+QWEN = "Qwen/Qwen3.5-9B"
+QWEN_27B = "Qwen/Qwen3.6-27B"
 
 
 def _revision_id(run_id: str) -> str:
@@ -218,8 +218,8 @@ class FakePool:
 
 @pytest.fixture
 def app_setup():
-    # 2 adapters on the 0.8B base (share one GPU), 1 on the 2B base (its own GPU).
-    revisions = [_rec("qa", QWEN), _rec("qb", QWEN), _rec("mc", QWEN_2B)]
+    # two adapters share the 9b engine, while one adapter uses the separate 27b engine.
+    revisions = [_rec("qa", QWEN), _rec("qb", QWEN), _rec("mc", QWEN_27B)]
     router = AdapterRouter([*revisions, *(_alias(revision) for revision in revisions)])
     pool = FakePool()
     client = _serve(pool, router, internal_key="sekret")
@@ -236,12 +236,10 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
         "revision_provenance",
         "thinking_structured_outputs_deferred_v1",
     ]
-    assert body["base_models"] == [QWEN, QWEN_2B]  # sorted by model id
+    assert body["base_models"] == [QWEN, QWEN_27B]  # sorted by model id
     assert body["gpus"] == 2  # two configured supported base-model engines
-    # Per-model GPU tier (replaces the misleading single configuredGpu): both test models are small
-    # so they map to the cheap FP8-capable L4; gpu_tiers is the distinct set actually in use.
-    assert body["gpu_by_model"] == {QWEN: "L4", QWEN_2B: "L4"}
-    assert body["gpu_tiers"] == ["L4"]
+    assert body["gpu_by_model"] == {QWEN: "L40S", QWEN_27B: "H100"}
+    assert body["gpu_tiers"] == ["H100", "L40S"]
     assert "configuredGpu" not in body  # the single-GPU field is gone (per-model now)
     assert body["adapters"] == 6
 
@@ -333,8 +331,8 @@ def test_generate_routes_to_the_adapters_base_model(app_setup):
     client, pool, _ = app_setup
     assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 200
     assert client.post("/generate", json={"adapter_id": "mc", "prompt": "hi"}).status_code == 200
-    # qa -> 0.8B engine, mc -> 2B engine.
-    assert pool.generated == [(QWEN, _revision_id("qa")), (QWEN_2B, _revision_id("mc"))]
+    # each adapter dispatches to its own active base-model engine.
+    assert pool.generated == [(QWEN, _revision_id("qa")), (QWEN_27B, _revision_id("mc"))]
 
 
 def test_chat_template_kwargs_forwarded_on_generate(app_setup):
@@ -629,8 +627,8 @@ def test_openai_chat_completions_routes_and_shapes(app_setup):
     body = resp.json()
     assert body["object"] == "chat.completion"
     assert body["model"] == "mc"
-    assert body["choices"][0]["message"]["content"] == f"[{QWEN_2B}] reply"
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert body["choices"][0]["message"]["content"] == f"[{QWEN_27B}] reply"
+    assert pool.generated == [(QWEN_27B, _revision_id("mc"))]
 
 
 def test_external_openai_chat_forwards_system_prompts(app_setup):
@@ -645,7 +643,7 @@ def test_external_openai_chat_forwards_system_prompts(app_setup):
     )
 
     assert resp.status_code == 200, resp.text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert pool.generated == [(QWEN_27B, _revision_id("mc"))]
     assert pool.messages[-1] == messages
 
 
@@ -664,7 +662,7 @@ def test_internal_openai_chat_can_send_system_prompts(app_setup):
     )
 
     assert resp.status_code == 200, resp.text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert pool.generated == [(QWEN_27B, _revision_id("mc"))]
 
 
 def test_external_generate_forwards_system_prompts(app_setup):
@@ -700,11 +698,11 @@ def test_openai_chat_completions_streams_sse_chunks(app_setup):
 
     assert '"delta":{"role":"assistant"}' in text
     assert '"delta":{"content":"[' in text
-    assert f"{QWEN_2B}] " in text
+    assert f"{QWEN_27B}] " in text
     assert '"delta":{"content":"reply"}' in text
     assert '"finish_reason":"stop"' in text
     assert "data: [DONE]" in text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert pool.generated == [(QWEN_27B, _revision_id("mc"))]
 
 
 def test_openai_chat_completions_stream_can_include_usage(app_setup):
@@ -723,7 +721,7 @@ def test_openai_chat_completions_stream_can_include_usage(app_setup):
         text = resp.read().decode("utf-8")
 
     assert '"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}' in text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert pool.generated == [(QWEN_27B, _revision_id("mc"))]
 
 
 def test_streaming_usage_reporter_fires_and_is_not_gc_dropped(app_setup):

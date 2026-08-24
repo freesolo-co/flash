@@ -333,7 +333,7 @@ def test_lambda_sku_miss_is_provider_local_during_auto_allocation(monkeypatch):
     monkeypatch.setattr(allocator, "get_provider", providers.__getitem__)
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
 
-    chosen = allocator.allocate("Qwen/Qwen3.5-4B", "sft", gpu_type="H100", max_gpu_count=2)
+    chosen = allocator.allocate("Qwen/Qwen3.5-9B", "sft", gpu_type="H100", max_gpu_count=2)
     assert (chosen.provider, chosen.gpu, chosen.gpu_count) == ("runpod", "H100", 2)
 
 
@@ -739,7 +739,7 @@ def _submittable(
     if algorithm == "opd":
         train["teacher_model"] = "kimi-k3"
     body: dict = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": algorithm,
         "gpu": {"type": gpu, "count": count, "provider": provider},
         "train": train,
@@ -845,9 +845,9 @@ def test_geometry_cap_follows_each_models_own_head_count():
     """The cap must divide each row's RECORDED head count, never a derived stand-in.
 
     ``hidden_size // head_dim`` is not the head count: these checkpoints decouple ``head_dim`` from
-    that ratio, and the quotient is wrong for four of six rows (3.5-4B is 16 heads, not 2560/256 =
-    10). Every row is checked against ``num_attention_heads`` so a future model with, say, 20 heads
-    is capped at 4 instead of rented at 8 and failed in Ulysses init.
+    that ratio, and the quotient is wrong for two of the three surviving rows. Every row is checked
+    against ``num_attention_heads`` so a future model with, say, 20 heads is capped at 4 instead of
+    rented at 8 and failed in Ulysses init.
     """
     from flash.core.catalog import MODELS
     from flash.providers.allocator import geometry_safe_gpu_cap
@@ -859,17 +859,15 @@ def test_geometry_cap_follows_each_models_own_head_count():
         # refactor cannot quietly reintroduce it.
         assert heads % geometry_safe_gpu_cap(model_id, 8) == 0
 
-    # the derivation this replaced disagrees with the truth on four of six rows.
-    derived_wrong = [
+    # the derivation still disagrees with the recorded geometry for these surviving rows.
+    derived_wrong = {
         m for m, i in MODELS.items() if i.hidden_size // i.head_dim != i.num_attention_heads
-    ]
-    assert len(derived_wrong) == 4, derived_wrong
-    assert MODELS["Qwen/Qwen3.5-4B"].num_attention_heads == 16
-    assert MODELS["Qwen/Qwen3.5-4B"].hidden_size // MODELS["Qwen/Qwen3.5-4B"].head_dim == 10
+    }
+    assert derived_wrong == {"Qwen/Qwen3.6-27B", "Qwen/Qwen3.6-35B-A3B"}
 
     # every CURRENT row divides by 8, so no row is narrowed today. that is a property of this
     # catalog, not an invariant -- the loop above is what enforces it for whatever is added next.
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-4B", 8) == 8
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
     assert geometry_safe_gpu_cap("Qwen/Qwen3.6-27B", 8) == 8
     # an authored ceiling below the geometric limit still wins; the cap only ever narrows.
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 2) == 2
@@ -1407,7 +1405,7 @@ def test_unpinned_quote_bills_the_allocator_selected_count():
     from flash.cost.types import RunConfig
     from flash.providers.base import Candidate
 
-    config = RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=100, gpu_count=8)
+    config = RunConfig(model_id="Qwen/Qwen3.5-9B", method="sft", steps=100, gpu_count=8)
     one = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 1))
     two = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
 
@@ -1605,7 +1603,7 @@ def test_the_tensor_parallel_axis_check_fails_a_row_vllm_would_reject():
     from flash.core.catalog import MODELS
 
     row = replace(
-        MODELS["Qwen/Qwen3.5-4B"],
+        MODELS["Qwen/Qwen3.5-9B"],
         num_attention_heads=16,
         num_key_value_heads=3,
         linear_num_value_heads=12,
@@ -1624,7 +1622,7 @@ def test_the_tensor_parallel_axis_check_fails_a_row_vllm_would_reject():
     # count alone can break it. Narrow the dims instead: 1*3*2 + 1*16 = 22 fails while the value
     # heads (16) still divide 8, leaving conv_dim as the only objection.
     narrow_conv = replace(
-        MODELS["Qwen/Qwen3.5-4B"],
+        MODELS["Qwen/Qwen3.5-9B"],
         linear_key_head_dim=1,
         linear_num_key_heads=3,
         linear_value_head_dim=1,

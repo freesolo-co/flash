@@ -19,9 +19,6 @@ from flash.serving.src.model_config import (
 
 def test_catalog_has_the_expected_models() -> None:
     assert set(base_models()) == {
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
-        "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.6-27B",
         "Qwen/Qwen3.6-35B-A3B",
@@ -37,9 +34,6 @@ def test_catalog_entries_are_wellformed() -> None:
 def test_every_catalog_model_has_an_intentional_image_classification() -> None:
     image_models = {model for model in base_models() if supports_image_input(model)}
     assert image_models == {
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
-        "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.6-27B",
         "Qwen/Qwen3.6-35B-A3B",
@@ -48,7 +42,7 @@ def test_every_catalog_model_has_an_intentional_image_classification() -> None:
 
 
 def test_uncataloged_base_models_are_not_supported() -> None:
-    assert is_supported_base_model("Qwen/Qwen3.5-4B") is True
+    assert is_supported_base_model("Qwen/Qwen3.5-9B") is True
     assert is_supported_base_model("openai/gpt-oss-20b") is False
     with pytest.raises(ValueError, match="Unsupported base model"):
         gpu_for("openai/gpt-oss-20b")
@@ -93,9 +87,6 @@ def test_dense_models_serve_fp8_and_35b_serves_bf16_base() -> None:
     # every dense catalog model loads a pre-quantized FP8 checkpoint with no online quantization.
     # serve_model_for() resolves it and engine_overrides_for() injects it as serve_model_id.
     expected_fp8 = {
-        "Qwen/Qwen3.5-0.8B": "Freesolo-Co/Qwen3.5-0.8B-FP8",
-        "Qwen/Qwen3.5-2B": "Freesolo-Co/Qwen3.5-2B-FP8",
-        "Qwen/Qwen3.5-4B": "Freesolo-Co/Qwen3.5-4B-FP8",
         "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
         "Qwen/Qwen3.6-27B": "Freesolo-Co/Qwen3.6-27B-FP8",
     }
@@ -117,18 +108,6 @@ def test_no_bitsandbytes_anywhere() -> None:
     for entry in SERVING_MODELS:
         assert entry.get("quantization") != "bitsandbytes"
         assert entry.get("load_format") != "bitsandbytes"
-
-
-def test_4b_has_l4_rank128_serving_overrides() -> None:
-    ov = engine_overrides_for("Qwen/Qwen3.5-4B")
-    assert ov["max_loras"] == 16
-    assert ov["max_lora_rank"] == 128
-    assert ov["max_model_len"] == 32768
-    assert ov["max_num_seqs"] == 8
-    # 4B stays on the cheap L4 tier and uses the validated high memory fraction.
-    assert gpu_for("Qwen/Qwen3.5-4B") == "L4"
-    assert ov["gpu_memory_utilization"] == 0.98
-    assert ov["enforce_eager"] is False
 
 
 def test_9b_has_l40s_rank128_serving_overrides() -> None:
@@ -180,18 +159,3 @@ def test_35b_has_h200_bf16_rank64_six_loras_overrides() -> None:
         ov["gpu_memory_utilization"] == 0.90
     )  # headroom above the weights + 6 x 64 LoRA buffer for KV + graphs
     assert ov["enforce_eager"] is False  # CUDA graphs on for the bf16/H200 path
-
-
-def test_small_l4_models_allow_rank128_serving() -> None:
-    for model in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"):
-        ov = engine_overrides_for(model)
-        assert ov["max_lora_rank"] == 128
-        assert ov["max_model_len"] == 32768
-        assert "max_loras" not in ov  # still uses the global 16-hot-LoRA default
-        # small L4 tiers pin the same 0.98 GPU memory fraction as the 4B.
-        # the extra headroom pays for the rank-128 LoRA buffer.
-        assert ov["gpu_memory_utilization"] == 0.98
-        # ...and cap max_num_seqs to the container's concurrency ceiling (modal_app.MAX_INPUTS=64)
-        # so the engine stops over-reserving activation/graph memory for ~1000 unreachable sequences
-        # (vLLM's default) and reclaims it as KV cache.
-        assert ov["max_num_seqs"] == 64

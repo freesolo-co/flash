@@ -2264,7 +2264,7 @@ def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "thinking": True,
             "environment": {"id": "org/env"},

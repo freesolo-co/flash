@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 BASE = (
-    'model = "Qwen/Qwen3.5-4B"\n'
+    'model = "Qwen/Qwen3.5-9B"\n'
     'project = "11111111-1111-4111-8111-111111111111"\n'
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'

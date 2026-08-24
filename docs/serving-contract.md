@@ -47,7 +47,7 @@ A custom dynamic-registration backend may intentionally be keyless; advertise th
 ```json
 {
   "ok": true,
-  "base_models": ["Qwen/Qwen3.5-4B"],
+  "base_models": ["Qwen/Qwen3.5-9B"],
   "requires_key": true,
   "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"]
 }
@@ -72,7 +72,7 @@ A custom dynamic-registration backend may intentionally be keyless; advertise th
   "repo_id": "acme/artifacts",
   "repo_type": "dataset",
   "subfolder": "sft/run-abc/adapter",
-  "base_model": "Qwen/Qwen3.5-4B",
+  "base_model": "Qwen/Qwen3.5-9B",
   "checkpoint": "run-abc/step-10",
   "org_id": "org-id",
   "thinking": false,
@@ -182,7 +182,7 @@ uv run pytest tests/serving_conformance \
   --serving-url "$FREESOLO_SERVING_URL" \
   --conformance-repo acme/artifacts \
   --conformance-subfolder sft/run-abc/adapter \
-  --conformance-base-model Qwen/Qwen3.5-4B \
+  --conformance-base-model Qwen/Qwen3.5-9B \
   --conformance-hf-revision 8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f
 ```
 

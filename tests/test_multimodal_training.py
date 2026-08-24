@@ -949,14 +949,14 @@ def test_text_only_prompt_messages_drops_images_and_preserves_text_order():
 
 
 def test_multimodal_algorithm_validation_requires_a_vision_teacher_after_model_validation():
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "sft", None)
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "grpo", None)
-    mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", "qwen3-vl-235b")
+    mm.validate_multimodal_training("Qwen/Qwen3.5-9B", "sft", None)
+    mm.validate_multimodal_training("Qwen/Qwen3.5-9B", "grpo", None)
+    mm.validate_multimodal_training("Qwen/Qwen3.5-9B", "opd", "qwen3-vl-235b")
     with pytest.raises(
         ValueError,
         match=r"requires.*qwen3-vl-235b.*selected teacher \'glm-5\.2\' cannot see images",
     ):
-        mm.validate_multimodal_training("Qwen/Qwen3.5-4B", "opd", "glm-5.2")
+        mm.validate_multimodal_training("Qwen/Qwen3.5-9B", "opd", "glm-5.2")
     with pytest.raises(ValueError, match="does not support"):
         mm.validate_multimodal_training(
             "meta-llama/Llama-3.2-1B",
@@ -990,7 +990,7 @@ def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path
     )
     environment = SimpleNamespace(id=str(env_file), resolved_sha="", params={})
     supported = SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         environment=environment,
         train=SimpleNamespace(teacher_model="qwen3-vl-235b"),
@@ -998,7 +998,7 @@ def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path
     mm.preflight_validate_image_opd(supported)
 
     text_teacher = SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         environment=environment,
         train=SimpleNamespace(teacher_model="kimi-k3"),
@@ -1018,7 +1018,7 @@ def test_image_opd_preflight_rejects_packaged_dataset_before_allocation(tmp_path
 
 def test_image_opd_preflight_allows_inline_multi_turn_images_when_capabilities_match():
     spec = SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         environment=SimpleNamespace(
             id="local",
@@ -1047,7 +1047,7 @@ def test_image_opd_preflight_allows_max_turns_on_a_single_turn_env():
     # max_turns is a turn CAP, not a multi-turn declaration: the worker derives multi_turn from the
     # env CLASS, never from params. rejecting on max_turns here would fail a job the worker runs.
     spec = SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         environment=SimpleNamespace(
             id="local",
@@ -1119,7 +1119,7 @@ def test_image_opd_submit_preflight_rejects_text_teacher_before_state_mutation(
     spec = JobSpec.from_dict(
         {
             "run_id": f"image-opd-{'background' if background else 'sync'}",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "opd",
             "environment": {
                 "id": "local",
@@ -1150,7 +1150,7 @@ def test_grpo_prices_the_full_context_budget_for_image_and_mixed_rows():
 
     grpo_spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "environment": {"id": "local", "params": {"records": _MIXED_RECORDS}},
             "train": {
@@ -1178,7 +1178,7 @@ def test_image_sft_cannot_be_priced_from_an_assumed_context():
 
     sft_spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "environment": {"id": "local", "params": {"records": _MIXED_RECORDS}},
             "train": {"epochs": 1, "max_examples": 2, "max_context_tokens": 1536},
@@ -1196,7 +1196,7 @@ def test_image_sft_cannot_be_priced_from_an_assumed_context():
 def test_catalog_image_capability_does_not_change_public_rows():
     from flash.core.catalog import public_model_rows, supports_image_training
 
-    assert supports_image_training("Qwen/Qwen3.5-4B")
+    assert supports_image_training("Qwen/Qwen3.5-9B")
     assert supports_image_training("Qwen/Qwen3.6-27B")
     assert not supports_image_training("meta-llama/Llama-3.2-1B")
     forbidden = {"modalities", "multimodal", "supports_images", "image_training"}

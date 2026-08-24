@@ -1677,7 +1677,7 @@ def test_reattach_poll_reproduces_the_multi_card_capacity_grace(monkeypatch):
 
     spec = JobSpec(
         run_id="reattach-multi",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=1, hf_repo=""),
         gpu=GpuSpec(type="B200", count=2),
@@ -1715,7 +1715,7 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
 
     spec = JobSpec(
         run_id="reattach",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=1, hf_repo=""),
         gpu=GpuSpec(type="A100 PCIe"),
@@ -1752,7 +1752,7 @@ def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
 
     spec = JobSpec(
         run_id="flash-source-snapshot",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(type=""),
@@ -1789,7 +1789,7 @@ def test_submit_run_rejects_malformed_source_before_deploy(monkeypatch):
 
     spec = JobSpec(
         run_id="flash-source-snapshot-invalid",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(type=""),
@@ -1837,7 +1837,7 @@ def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkey
         captured.clear()
         spec = JobSpec(
             run_id="scaled-grace",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, hf_repo="org/repo"),
             gpu=GpuSpec(type="H200", count=count),
@@ -1863,7 +1863,7 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
 
     spec = JobSpec(
         run_id="runpod-submit-retryable",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(type=""),
@@ -1912,7 +1912,7 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
 
     spec = JobSpec(
         run_id=f"runpod-submit-unreconciled-{deletion_mode}",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(type=""),
@@ -2015,7 +2015,7 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
 
     spec = JobSpec(
         run_id="runpod-shared-deadline",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(type=""),
@@ -2061,7 +2061,7 @@ def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch)
 
     spec = JobSpec(
         run_id="runpod-deadline-boundary",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(type=""),
@@ -3102,7 +3102,7 @@ def _spec(run_id):
 
     return JobSpec(
         run_id=run_id,
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=1),
         gpu=GpuSpec(type="", max_retries=2),
@@ -3138,7 +3138,7 @@ def _adapter_config(*, rank=32, alpha=64):
     return {
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
-        "base_model_name_or_path": "Qwen/Qwen3.5-0.8B",
+        "base_model_name_or_path": "Qwen/Qwen3.5-9B",
         "r": rank,
         "lora_alpha": alpha,
         # peft>=0.19 writes this on every save, so a config without it is not a shape any supported
@@ -3290,7 +3290,7 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
         source = JobSpec.from_dict(
             {
                 "run_id": "source-run",
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "train": {
                     "epochs": 1,
@@ -3375,7 +3375,7 @@ def test_submit_rejects_cross_org_init_ref(monkeypatch):
         source = JobSpec.from_dict(
             {
                 "run_id": "source-run",
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
@@ -3416,7 +3416,7 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
         source = JobSpec.from_dict(
             {
                 "run_id": "source-run",
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
@@ -3475,7 +3475,7 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypat
         source = JobSpec.from_dict(
             {
                 "run_id": "source-run",
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
@@ -3543,7 +3543,7 @@ def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
         source = JobSpec.from_dict(
             {
                 "run_id": "source-run",
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
@@ -3579,7 +3579,7 @@ def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
         source = JobSpec.from_dict(
             {
                 "run_id": "source-run",
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
@@ -3620,7 +3620,7 @@ def test_submit_rejects_missing_source_org_without_same_owner_key(monkeypatch):
         source = JobSpec.from_dict(
             {
                 "run_id": "source-run",
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
@@ -3663,7 +3663,7 @@ def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
         source = JobSpec.from_dict(
             {
                 "run_id": "source-run",
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
@@ -3711,7 +3711,7 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
         source = JobSpec.from_dict(
             {
                 "run_id": "source-run",
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/source"},
             }
@@ -4309,7 +4309,7 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
             run_id="no-retry",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=0),
@@ -4339,7 +4339,7 @@ def test_shared_cache_zero_retry_budget_submits_exactly_once(monkeypatch, failur
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
             run_id=f"cache-zero-{failure}",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=0),
@@ -4388,7 +4388,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
 
         spec = JobSpec(
             run_id="walk",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
@@ -4405,9 +4405,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
         # higher hourly rate; asserting sorted hourly rates would pin the wrong invariant.
         from flash.providers.base import GPU_INFO, _run_cost_key
 
-        cost_key = _run_cost_key(
-            "Qwen/Qwen3.5-0.8B", "grpo", train={"epochs": 1, "max_examples": 1}
-        )
+        cost_key = _run_cost_key("Qwen/Qwen3.5-9B", "grpo", train={"epochs": 1, "max_examples": 1})
         step_costs = [cost_key(gpu, GPU_INFO[gpu].hourly_usd) for gpu in gpus_seen]
         assert step_costs == sorted(step_costs)
         # and the first attempt is the cheapest per step among the classes that fit.
@@ -4507,7 +4505,7 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
 
         spec = JobSpec(
             run_id="oom-walk",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="opd",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
@@ -4540,7 +4538,7 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
 
         spec = JobSpec(
             run_id="code-crash",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
@@ -4604,7 +4602,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
 
         spec = JobSpec(
             run_id="clamp",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
@@ -4668,7 +4666,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
 
         spec = JobSpec(
             run_id="lastgpu",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
@@ -4697,12 +4695,15 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
 
         real_allocate = allocator.allocate
         alloc_calls = {"n": 0}
+        successful_allocations = []
 
         def flaky_allocate(*a, **k):
             alloc_calls["n"] += 1
             if alloc_calls["n"] == 1:
-                raise RuntimeError("pricing API blip")  # not Unsupported -> infra-shaped retry
-            return real_allocate(*a, **k)
+                raise RuntimeError("pricing API blip")  # not unsupported -> infra-shaped retry
+            allocation = real_allocate(*a, **k)
+            successful_allocations.append(allocation)
+            return allocation
 
         monkeypatch.setattr(allocator, "allocate", flaky_allocate)
 
@@ -4729,7 +4730,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
 
         spec = JobSpec(
             run_id="alloc-blip",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
@@ -4737,10 +4738,11 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
         orch.submit_job(spec, dry_run=False, background=False)
 
         assert orch.get_status("alloc-blip").state == "done"
-        # First allocation failed (no provision); the retry provisioned the cheapest class rather
-        # than skipping it. Cheapest is per optimizer step, which is what the allocator ranks on --
-        # with `max_examples = 1` the step is latency-bound, so that is not the lowest hourly rate.
-        assert gpus_seen == ["RTX 5090"]
+        # first allocation failed without provisioning; the retry used the selected cheapest class
+        # rather than skipping it. derive the class from the successful current-catalog allocation.
+        assert len(successful_allocations) == 1
+        assert successful_allocations[0].gpu == successful_allocations[0].candidates[0].gpu
+        assert gpus_seen == [successful_allocations[0].gpu]
 
 
 def test_selected_quote_increase_rechecks_affordability(monkeypatch):
@@ -4812,7 +4814,7 @@ def test_selected_quote_refresh_failure_retries_without_skipping_the_candidate(m
 
         spec = JobSpec(
             run_id="quote-refresh-blip",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
@@ -4820,12 +4822,13 @@ def test_selected_quote_refresh_failure_retries_without_skipping_the_candidate(m
         orch.submit_job(spec, dry_run=False, background=False)
 
         assert orch.get_status(spec.run_id).state == "done"
-        # the candidate is retried, not skipped -- same class on the retry, one attempt later.
-        # (cheapest per optimizer step for a one-prompt pool, which the allocator ranks on.)
-        assert submitted == [("RTX 5090", 1)]
+        # the candidate is retried, not skipped: both refreshed quotes and the eventual submission
+        # retain the same current-catalog cheapest class one attempt later.
         assert len(selected_quote_calls) == 2
+        selected_gpu = selected_quote_calls[0].gpu
+        assert submitted == [(selected_gpu, 1)]
         assert affordability_rechecks == [1.0]
-        assert all(allocation.gpu == "RTX 5090" for allocation in selected_quote_calls)
+        assert all(allocation.gpu == selected_gpu for allocation in selected_quote_calls)
         assert all(allocation.min_vram_gb > 0 for allocation in selected_quote_calls)
 
 
@@ -7235,7 +7238,7 @@ def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch
     monkeypatch.setattr(jobs, "poll_job", fake_poll_job)
     spec = JobSpec(
         run_id="reattach-lastgpu",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=1, hf_repo=""),
         gpu=GpuSpec(type="A100 PCIe"),

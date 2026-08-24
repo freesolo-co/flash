@@ -17,7 +17,7 @@ from flash.engine.plan.steps import (
 from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 
 _BASE_TOML = """
-model = "Qwen/Qwen3.5-0.8B"
+model = "Qwen/Qwen3.5-9B"
 algorithm = "grpo"
 
 [environment]
@@ -551,7 +551,7 @@ def test_provider_worker_env_carries_control_plane_resume_revision():
 def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
     path = tmp_path / "seed-secret.toml"
     path.write_text(
-        'model = "Qwen/Qwen3.5-0.8B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
         'id = "freesolo/example-project/gsm8k"\n'
@@ -567,7 +567,7 @@ def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
 
 def _spec_with_declared_secret(algorithm: str, secret: str) -> dict:
     return {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": algorithm,
         "environment": {"id": "owner/project/env", "secrets": [secret]},
         "train": {"epochs": 1},

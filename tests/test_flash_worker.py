@@ -21,7 +21,7 @@ def _spec():
     from flash.core.spec import JobSpec, TrainSpec
 
     return JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
@@ -83,7 +83,7 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
@@ -135,7 +135,7 @@ def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monke
 
     monkeypatch.setenv("PARASAIL_API_KEY", "platform-managed-parasail")
     opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
@@ -161,7 +161,7 @@ def test_build_worker_env_does_not_accept_legacy_teacher_broker_url():
     from flash.providers.runpod.serverless import build_worker_env
 
     opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
@@ -183,7 +183,7 @@ def test_build_worker_env_rejects_managed_teacher_byo_names():
     from flash.providers.runpod.serverless import build_worker_env
 
     opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         environment=EnvironmentSpec(id="org/env", secrets=("PARASAIL_API_KEY",)),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
@@ -222,7 +222,7 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     from flash.providers.runpod.serverless import build_worker_env
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/env", secrets=("SERPAPI_API_KEY",)),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
@@ -256,7 +256,7 @@ def test_build_worker_env_lists_declared_secret_names_for_the_redactors(monkeypa
         "WANDB_USER_SECRET",
     )
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/env", secrets=declared),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
@@ -318,7 +318,7 @@ def test_grpo_worker_env_keeps_native_thread_policy_managed():
     from flash.providers.runpod.serverless import build_worker_env
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/project/env", secrets=("OMP_NUM_THREADS",)),
     )
@@ -334,7 +334,7 @@ def test_sft_worker_env_forwards_declared_native_thread_secret():
     from flash.providers.runpod.serverless import build_worker_env
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         environment=EnvironmentSpec(id="owner/project/env", secrets=("OMP_NUM_THREADS",)),
     )
@@ -360,7 +360,7 @@ def test_declared_secret_names_cannot_contain_the_metadata_delimiter():
     # and the metadata builder fails closed rather than emitting an ambiguous list, for a spec
     # constructed around the parser.
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/env", secrets=("FOO,BAR",)),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
@@ -634,7 +634,7 @@ def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
     # every removed key, not a chalk special case. FLASH_TRITON_LORA stands in for the rest.
     declared = ["FLASH_CHALK_SPEC", "FLASH_TRITON_LORA", "MY_TOKEN"]
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
@@ -668,7 +668,7 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     # an operator HF_REPO in the env must NOT leak into the worker env
     monkeypatch.setenv("HF_REPO", "operator/default")
     per_run = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="myorg/runs"),
         seed=0,
@@ -702,7 +702,7 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     spec = JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, max_examples=2),
         seed=0,

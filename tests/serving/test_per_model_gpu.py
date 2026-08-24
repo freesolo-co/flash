@@ -2,7 +2,7 @@
 
 Modal fixes a class's GPU and concurrency at decoration time, so the serving app registers one
 ``LoraEngine`` ``@app.cls`` per distinct (GPU tier, max_inputs) key and dispatches each base model to
-its class (4B -> L4, 9B -> L40S, 27B -> H100, small models -> L4, 35B -> H200). modal_app imports the ``modal`` SDK
+its class (9b -> l40s, 27b -> h100, 35b -> h200). modal_app imports the ``modal`` sdk
 at module top, which isn't installed offline, so we stub it just enough to import the module and
 reach the built engine classes.
 """
@@ -347,7 +347,7 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
     record_dict = {
         "adapter_id": adapter_id,
         "repo_id": "org/private-adapter",
-        "base_model": "Qwen/Qwen3.5-4B",
+        "base_model": "Qwen/Qwen3.5-9B",
         "org_id": "org-1",
         "checkpoint": "run-1/step-1",
         "private": True,
@@ -419,11 +419,8 @@ assert "flash.serving.src.multimodal" not in sys.modules
 
 
 def test_one_engine_class_per_distinct_engine_key(modal_app_module):
-    """A LoraEngine @app.cls is built for each distinct (GPU tier, max_inputs) key. The small models
-    share (L4, 64); 4B uses (L4, 16), 9B uses (L40S, 16), 27B uses (H100, 16), and 35B uses (H200, 16)."""
+    """a loraengine class is built for each active gpu tier and concurrency key."""
     assert set(modal_app_module.ENGINE_BY_KEY) == {
-        ("L4", 64),
-        ("L4", 16),
         ("L40S", 16),
         ("H100", 16),
         ("H200", 16),
@@ -452,24 +449,6 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
     assert modal_app_module._engine_class_name("L4", 64) == "LoraEngine_L4_c64"
     assert modal_app_module._engine_class_name("L4", 16) == "LoraEngine_L4_c16"
     assert modal_app_module._engine_class_name("A100-80GB", 16) == "LoraEngine_A100_80GB_c16"
-
-
-def test_small_models_route_to_l4(modal_app_module):
-    """Small dense models (owned pre-quant checkpoints) keep the cheap FP8-capable L4 tier."""
-    by_key = modal_app_module.ENGINE_BY_KEY
-    for bm in (
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
-    ):
-        assert modal_app_module._engine_cls_for(bm) is by_key[("L4", 64)]
-        assert gpu_for(bm) == "L4"
-
-
-def test_4b_routes_to_l4(modal_app_module):
-    """Rank-128 LoRA serving for 4B uses the L4 tier (8-seq -> (L4, 16))."""
-    by_key = modal_app_module.ENGINE_BY_KEY
-    assert gpu_for("Qwen/Qwen3.5-4B") == "L4"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-4B") is by_key[("L4", 16)]
 
 
 def test_9b_routes_to_l40s(modal_app_module):
@@ -504,12 +483,12 @@ def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module)
 def test_tier_classes_inherit_the_shared_impl(modal_app_module):
     """Each tier class subclasses _LoraEngineImpl (so _load/_generate/etc resolve) and defines the
     public Modal entrypoints itself (so Modal collects them per class)."""
-    l4 = modal_app_module.ENGINE_BY_KEY[("L4", 64)]
-    assert issubclass(l4, modal_app_module._LoraEngineImpl)
+    l40s = modal_app_module.ENGINE_BY_KEY[("L40S", 16)]
+    assert issubclass(l40s, modal_app_module._LoraEngineImpl)
     for impl in ("_load", "_register", "_generate", "_stream_generate", "_unregister", "_health"):
-        assert hasattr(l4, impl)
+        assert hasattr(l40s, impl)
     for entry in ("load", "register", "generate", "stream_generate", "unregister", "health"):
-        assert entry in l4.__dict__
+        assert entry in l40s.__dict__
 
 
 def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
@@ -519,8 +498,6 @@ def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
     # Every class records the GPU half of its (gpu, max_inputs) key.
     for (gpu, _max_inputs), cls in by_key.items():
         assert cls.pinned_gpu == gpu
-    assert by_key[("L4", 64)].pinned_gpu == "L4"
-    assert by_key[("L4", 16)].pinned_gpu == "L4"
     assert by_key[("L40S", 16)].pinned_gpu == "L40S"
     assert by_key[("H100", 16)].pinned_gpu == "H100"
     assert by_key[("H200", 16)].pinned_gpu == "H200"
@@ -539,14 +516,12 @@ def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
 
 
 def test_health_reports_pinned_gpu_over_derived_tier(modal_app_module):
-    """_health() reports the class's ACTUAL pinned tier, not gpu_for(base_model): a base model
-    instantiated on the wrong tier's class (here an A100-pinned class holding a 4B model whose
-    expected tier is L4) must surface as the real A100 tier, otherwise misrouting is masked."""
+    """_health reports the class's actual pinned tier rather than the derived model tier."""
     impl = modal_app_module._LoraEngineImpl
 
     class _Fake:
         pinned_gpu = "A100-80GB"
-        base_model = "Qwen/Qwen3.5-4B"  # gpu_for -> L4 (the EXPECTED tier)
+        base_model = "Qwen/Qwen3.5-9B"
         registry = type("R", (), {"list_ready": lambda self: []})()
 
     health = impl._health(_Fake())
@@ -556,10 +531,10 @@ def test_health_reports_pinned_gpu_over_derived_tier(modal_app_module):
 
     class _Bare:
         # No pinned_gpu (the shared impl used directly) -> fall back to the expected tier.
-        base_model = "Qwen/Qwen3.5-4B"
+        base_model = "Qwen/Qwen3.5-9B"
         registry = type("R", (), {"list_ready": lambda self: []})()
 
-    assert impl._health(_Bare())["configured_gpu"] == "L4"  # fallback to gpu_for(base_model)
+    assert impl._health(_Bare())["configured_gpu"] == "L40S"
 
 
 def test_health_reports_effective_max_model_len_override(modal_app_module):
@@ -577,7 +552,7 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
     assert impl._health(_Big())["max_model_len"] == 32768  # the override, not cfg.MAX_MODEL_LEN
 
     class _Dense:
-        base_model = "Qwen/Qwen3.5-2B"  # per-model 32k override
+        base_model = "Qwen/Qwen3.5-9B"  # per-model 32k override
         registry = type("R", (), {"list_ready": lambda self: []})()
 
     assert impl._health(_Dense())["max_model_len"] == 32768
@@ -683,7 +658,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
 
     result = asyncio.run(
         pool.generate(
-            "Qwen/Qwen3.5-4B",
+            "Qwen/Qwen3.5-9B",
             payload,
             record,
             expected_checkpoint="step-1",
@@ -694,7 +669,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
         return [
             event
             async for event in pool.stream_generate(
-                "Qwen/Qwen3.5-4B",
+                "Qwen/Qwen3.5-9B",
                 payload,
                 record,
                 expected_checkpoint="step-1",
@@ -702,14 +677,14 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
         ]
 
     stream_events = asyncio.run(_collect_stream())
-    asyncio.run(pool.register("Qwen/Qwen3.5-4B", record))
+    asyncio.run(pool.register("Qwen/Qwen3.5-9B", record))
 
     assert result == {"ok": True}
     assert stream_events == [{"delta": "hello"}, {"delta": " world"}]
     assert bound_models == [
-        "Qwen/Qwen3.5-4B",
-        "Qwen/Qwen3.5-4B",
-        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-9B",
     ]
     expected_inference_call = (
         {"messages": [{"role": "user", "content": "hello"}]},
@@ -780,39 +755,15 @@ def test_every_catalog_model_forwards_its_reasoning_parser(
     assert args.reasoning_parser == "qwen3"
 
 
-def test_load_prequant_fp8_checkpoint_for_dense_small(modal_app_module, monkeypatch, tmp_path):
-    """A small dense base (2B) now loads its owned PRE-QUANTIZED FP8 checkpoint: model =
-    serve_model_id, quantization = None (vLLM auto-detects the checkpoint's FP8 — no online quant),
-    FP8 KV, rank-128 / max_loras-16 buffers, NO moe_backend (that's MoE-only)."""
-    args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-2B")
-    assert args.model == "Freesolo-Co/Qwen3.5-2B-FP8"  # owned pre-quant checkpoint
-    assert args.quantization is None  # auto-detected from the checkpoint, not online-quantized
-    assert args.kv_cache_dtype == "fp8"
-    assert args.enable_lora is True
-    assert args.max_lora_rank == 128
-    assert args.max_loras == 16
-    assert args.max_model_len == 32768
-    assert args.gpu_memory_utilization == 0.98  # small L4 tiers pin 0.98, not the global 0.90
-    assert (
-        args.max_num_seqs == 64
-    )  # capped to the MAX_INPUTS concurrency ceiling, not vLLM's default
-    assert getattr(args, "moe_backend", None) in (None, "auto")
-    assert args.limit_mm_per_prompt == {"image": 4}
-    assert args.mm_processor_cache_gb == 0
-    assert args.enable_tower_connector_lora is True
-    assert getattr(args, "calculate_kv_scales", None) in (None, False)  # never enabled (GDN-safe)
-
-
 def test_lora_pinning_only_when_hot_pool_covers_cpu_pool(modal_app_module, monkeypatch, tmp_path):
     """Pinned LoRAs cannot be LRU-evicted, so capped hot pools must stay unpinned if 256 adapters
     are deployable through max_cpu_loras."""
-    engine, args = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-2B")
+    engine, args = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-9B")
     assert args.max_loras == 16
     assert args.max_cpu_loras == 256
     assert engine._pin_loras is False
 
     for model, max_loras in (
-        ("Qwen/Qwen3.5-4B", 16),
         ("Qwen/Qwen3.5-9B", 16),
         ("Qwen/Qwen3.6-27B", 16),
     ):

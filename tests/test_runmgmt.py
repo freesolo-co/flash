@@ -13,6 +13,7 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 
 _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
+_RETIRED_MODELS = ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B")
 
 
 def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):
@@ -60,6 +61,26 @@ def _vast_remote(instance_id=7, attempt=0, started_ts=1.0, **extra):
     }
 
 
+@pytest.mark.parametrize("retired_model", _RETIRED_MODELS)
+def test_historical_removed_model_status_remains_listable(monkeypatch, tmp_path, retired_model):
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path))
+    spec = JobSpec(run_id="historical", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner._save_status(runner.RunStatus(run_id=spec.run_id, state="done", spec=spec.to_dict()))
+    path = runner.runs_file_path(spec.run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["model"] = retired_model
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    assert runner.list_run_ids() == [spec.run_id]
+    assert runner.list_runs()[0].spec["model"] == retired_model
+    assert runner.get_status(spec.run_id).spec["model"] == retired_model
+
+
 def test_background_run_redacts_private_exception_content(monkeypatch, caplog):
     import logging
     from types import SimpleNamespace
@@ -67,7 +88,7 @@ def test_background_run_redacts_private_exception_content(monkeypatch, caplog):
     import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    spec = JobSpec(run_id="background-private", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="background-private", model="Qwen/Qwen3.5-9B", algorithm="sft")
     updates = []
 
     def fail_run(_spec):
@@ -109,7 +130,7 @@ def test_list_and_cancel(monkeypatch):
             runner.submit_job(
                 JobSpec(
                     run_id=rid,
-                    model="Qwen/Qwen3.5-4B",
+                    model="Qwen/Qwen3.5-9B",
                     algorithm="grpo",
                     train=TrainSpec(max_examples=8),
                 ),
@@ -193,7 +214,7 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
     status = runner.submit_job(
         JobSpec(
             run_id="quoted",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=2),
             gpu=GpuSpec(type=""),
@@ -219,7 +240,7 @@ def test_missing_persisted_run_deadline_is_rejected(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="missing-deadline",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=900),
     )
@@ -253,7 +274,7 @@ def test_remaining_run_wall_seconds_rejects_unsafe_current_clock(monkeypatch, tm
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="unsafe-current-clock",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         gpu=GpuSpec(max_wall_seconds=900),
     )
     runner._save_status(
@@ -277,7 +298,7 @@ def test_persisted_run_deadline_must_match_canonical_value(monkeypatch, tmp_path
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="mismatched-deadline",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=900),
     )
@@ -303,7 +324,7 @@ def test_persisted_run_deadline_rejects_nonpositive_or_nonfinite_values(
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="invalid-deadline", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="invalid-deadline", model="Qwen/Qwen3.5-9B", algorithm="sft")
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _run_deadline_at=deadline,
@@ -342,7 +363,7 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
 
         spec = JobSpec(
             run_id="hb",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             environment=EnvironmentSpec(id="team/example"),
             train=TrainSpec(max_examples=8),
@@ -399,7 +420,7 @@ def test_an_error_heartbeat_carries_gpu_diagnostics_through_to_status(monkeypatc
 
         spec = JobSpec(
             run_id="hb-oom",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             environment=EnvironmentSpec(id="team/example"),
             train=TrainSpec(max_examples=8),
@@ -451,7 +472,7 @@ def test_a_heartbeat_without_gpu_keeps_the_attempts_snapshot(monkeypatch):
 
         spec = JobSpec(
             run_id="hb-carry",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             environment=EnvironmentSpec(id="team/example"),
             train=TrainSpec(max_examples=8),
@@ -505,7 +526,7 @@ def test_record_heartbeat_persists_finalize_liveness_ping_with_step(monkeypatch)
 
         spec = JobSpec(
             run_id="hbf",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             environment=EnvironmentSpec(id="team/example"),
             train=TrainSpec(max_examples=8),
@@ -541,7 +562,7 @@ def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypa
         runner.submit_job(
             JobSpec(
                 run_id="fa",
-                model="Qwen/Qwen3.5-4B",
+                model="Qwen/Qwen3.5-9B",
                 algorithm="grpo",
                 train=TrainSpec(max_examples=8),
             ),
@@ -582,7 +603,7 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
         monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
         from flash.core.spec import JobSpec
 
-        spec = JobSpec(run_id="r0", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+        spec = JobSpec(run_id="r0", model="Qwen/Qwen3.5-9B", algorithm="grpo")
         # A zero placeholder is not a settled provider cost; use the wall-pricing fallback.
         metrics = {
             "cost_usd": 0.0,
@@ -620,7 +641,7 @@ def test_persist_metrics_attributes_the_provider_that_billed_the_run(monkeypatch
         monkeypatch.setattr(runner, "_gpu_rate", _rate)
         from flash.core.spec import JobSpec
 
-        spec = JobSpec(run_id="r-vast", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+        spec = JobSpec(run_id="r-vast", model="Qwen/Qwen3.5-9B", algorithm="grpo")
         runner._persist_metrics(
             spec,
             {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090", "allocated_provider": "vast"},
@@ -645,7 +666,7 @@ def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
         monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
         from flash.core.spec import JobSpec
 
-        spec = JobSpec(run_id="r1", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+        spec = JobSpec(run_id="r1", model="Qwen/Qwen3.5-9B", algorithm="grpo")
         # No cost_usd stamped: fall back to wall * rate.
         out = runner._persist_metrics(spec, {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090"})
         assert out == 1.0  # 1s / 3600 * 3600/hr
@@ -666,7 +687,7 @@ def test_persist_metrics_bills_training_wall_not_setup(monkeypatch):
         monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
         from flash.core.spec import JobSpec
 
-        spec = JobSpec(run_id="r-train-only", model="Qwen/Qwen3.5-4B", algorithm="sft")
+        spec = JobSpec(run_id="r-train-only", model="Qwen/Qwen3.5-9B", algorithm="sft")
         metrics = {
             "wall_seconds": 10.0,  # worker training loop only
             "setup_seconds": 590.0,  # reported for observability, not customer cost
@@ -692,7 +713,7 @@ def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec(
         run_id="quote",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=2),
         gpu=GpuSpec(type=""),
@@ -748,7 +769,7 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
     spec = attach_sft_profile(
         JobSpec(
             run_id="attempt-sequence",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_retries=1),
@@ -828,7 +849,7 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
     spec = attach_sft_profile(
         JobSpec(
             run_id="pre-handle-attempt",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_retries=1),
@@ -902,7 +923,7 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     spec = attach_sft_profile(
         JobSpec(
             run_id="wall-budget",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
@@ -993,7 +1014,7 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
     spec = attach_sft_profile(
         JobSpec(
             run_id="retry-deadline-minimum",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
@@ -1229,7 +1250,7 @@ def test_concurrent_attempt_reservations_are_unique_and_monotonic(monkeypatch, t
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="threaded-attempts", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="threaded-attempts", model="Qwen/Qwen3.5-9B", algorithm="sft")
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict()),
         _next_attempt=0,
@@ -1309,7 +1330,7 @@ def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="compare-clear", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="compare-clear", model="Qwen/Qwen3.5-9B", algorithm="sft")
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -1345,7 +1366,7 @@ def test_compare_and_clear_remote_preserves_newer_resource(monkeypatch, tmp_path
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="compare-preserve", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="compare-preserve", model="Qwen/Qwen3.5-9B", algorithm="sft")
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -1457,7 +1478,7 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     from flash.server.domain import reconcile
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id=f"recovered-{terminal_state}", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id=f"recovered-{terminal_state}", model="Qwen/Qwen3.5-9B", algorithm="sft")
     remote = _runpod_remote("endpoint-cost", "job-cost", attempt=0, started_ts=100.0)
     runner._save_status(
         runner.RunStatus(
@@ -1707,7 +1728,7 @@ def test_handleless_state_without_next_attempt_is_rejected(monkeypatch, tmp_path
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="missing-next-attempt", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="missing-next-attempt", model="Qwen/Qwen3.5-9B", algorithm="sft")
     runner._save_status(runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
     raw = runner._load_status_json(spec.run_id)
     raw.pop(runner._NEXT_ATTEMPT_KEY)
@@ -1729,7 +1750,7 @@ def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatc
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="wall-minimum",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=60),
     )
@@ -1758,7 +1779,7 @@ def test_reserved_attempt_survives_handleless_restart_without_reusing_zero(monke
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="reserved-restart",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=200),
     )
@@ -1802,7 +1823,7 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec(
         run_id=f"attach-attempt-{expected_next}",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=200),
     )
@@ -1861,7 +1882,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec(
         run_id="attach-expired-completed",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(max_wall_seconds=120),
@@ -1940,7 +1961,7 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec(
         run_id="attach-adopt-multicard",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(max_wall_seconds=120),
@@ -2054,7 +2075,7 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="attach-metrics-pending",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(hf_repo="org/repo"),
         gpu=GpuSpec(max_wall_seconds=120),
@@ -2104,7 +2125,7 @@ def test_completed_attempt_metrics_rereads_a_marker_that_is_not_visible_yet(monk
 
     spec = JobSpec(
         run_id="lagging-marker",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(hf_repo="org/repo"),
     )
@@ -2161,7 +2182,7 @@ def test_completed_attempt_metrics_never_adopts_an_unverifiable_marker(monkeypat
 
     spec = JobSpec(
         run_id="corrupt-marker",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(hf_repo="org/repo"),
     )
@@ -2211,7 +2232,7 @@ def test_completed_attempt_metrics_bounds_marker_to_wall_grace(monkeypatch, mark
 
     spec = JobSpec(
         run_id="late-marker-complete",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
     )
@@ -2254,7 +2275,7 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="attach-expired",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=120),
     )
@@ -2321,7 +2342,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="attach-expired-unconfirmed",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         gpu=GpuSpec(max_wall_seconds=120),
     )
     remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
@@ -2361,7 +2382,7 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
     from flash.core.spec import JobSpec
     from flash.providers.base import PollResult
 
-    spec = JobSpec(run_id="worker-attempt", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="worker-attempt", model="Qwen/Qwen3.5-9B", algorithm="sft")
     payloads = []
     handles = []
     monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
@@ -2401,7 +2422,7 @@ def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, 
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-    spec = JobSpec(run_id="blocked-complete", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="blocked-complete", model="Qwen/Qwen3.5-9B", algorithm="sft")
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -2433,7 +2454,7 @@ def test_fail_blocked_recovery_keeps_success_with_lagging_metrics_pending(monkey
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="blocked-pending", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="blocked-pending", model="Qwen/Qwen3.5-9B", algorithm="sft")
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -2466,7 +2487,7 @@ def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec(
         run_id="deadline-complete",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=120),
     )
@@ -2505,7 +2526,7 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="recover-pending", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="recover-pending", model="Qwen/Qwen3.5-9B", algorithm="sft")
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
     )
@@ -2555,14 +2576,14 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     assert drain_calls == [(spec.run_id,)]
 
 
-def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("retired_model", _RETIRED_MODELS)
+def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
+    monkeypatch, tmp_path, retired_model
 ):
-    # an algorithm dropped from the catalog while one of its runs is still nonterminal: the
-    # persisted spec stops parsing on the new build. attach_run parses before its except/finally
-    # exist, so dispatching it would kill the daemon thread with the run still `running` and the
-    # rented worker still billing. recovery has to decide this itself -- fail the run and remove
-    # the resource -- which is the disposition the handle-less branch already applies.
+    # a model dropped from the catalog while one of its runs is still nonterminal: the
+    # persisted spec remains structurally parseable, but catalog eligibility fails on the new build.
+    # dispatching attach_run would otherwise leave the run active long enough to reach provider work,
+    # so startup recovery must fail it and remove the resource before dispatch.
     import flash.providers as providers
     import flash.runner as runner
     import flash.server.platform.runtime as runtime
@@ -2575,23 +2596,22 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
             run_id="recover-unparseable",
             state="running",
             spec=JobSpec(
-                run_id="recover-unparseable", model="Qwen/Qwen3.5-4B", algorithm="sft"
+                run_id="recover-unparseable", model="Qwen/Qwen3.5-9B", algorithm="sft"
             ).to_dict(),
             remote=dict(remote),
         )
     )
-    # the record has to be written the way an upgrade produces one: the OLD build persisted a spec
-    # it accepted, and only the new build rejects it. _save_status parses on the way in, so it can
-    # never store this -- edit the stored json in place, which is what "the algorithm was dropped
-    # from the catalog underneath a live run" actually looks like on disk.
+    # write a current model first, then sabotage the stored public spec to match a run persisted by
+    # the old catalog. structural parsing still succeeds, so only the new eligibility guard catches it.
     stored_path = runner.runs_file_path("recover-unparseable", ".json")
     with open(stored_path, encoding="utf-8") as handle:
         stored = json.load(handle)
-    stored["spec"]["algorithm"] = "retired-algorithm"
+    stored["spec"]["model"] = retired_model
     with open(stored_path, "w", encoding="utf-8") as handle:
         json.dump(stored, handle)
-    with pytest.raises(ValueError, match="unsupported algorithm"):
-        JobSpec.from_dict(stored["spec"])  # premise: this build cannot parse it
+    assert JobSpec.from_dict(stored["spec"]).model == retired_model
+    with pytest.raises(ValueError, match="unsupported model"):
+        runner.effective_spec_from_status(runner.get_status("recover-unparseable"))
     monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": "recover-unparseable"}])
     monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
     monkeypatch.setattr(providers, "configured_providers", list)
@@ -2622,7 +2642,63 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
     assert torn == [(remote, "recover-unparseable")]
     status = runner.get_status("recover-unparseable")
     assert status.state == "failed"
-    assert "persisted spec is malformed" in (status.error or "")
+    assert "persisted spec cannot be activated" in (status.error or "")
+
+
+@pytest.mark.parametrize("retired_model", _RETIRED_MODELS)
+def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
+    monkeypatch, tmp_path, retired_model
+):
+    import flash.providers as providers
+    import flash.runner as runner
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="retired-handleless", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner._save_status(
+        runner.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    path = runner.runs_file_path(spec.run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["model"] = retired_model
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
+    monkeypatch.setattr(providers, "configured_providers", list)
+    monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(
+        runner,
+        "_gc_run_endpoints",
+        lambda _spec: pytest.fail("removed model reached active endpoint gc"),
+    )
+    monkeypatch.setattr(runner, "attach_run", lambda _run_id: pytest.fail("attach dispatched"))
+    monkeypatch.setattr(
+        runtime, "_start_resubmit", lambda *_args, **_kwargs: pytest.fail("resubmit")
+    )
+    terminated = []
+    monkeypatch.setattr(
+        "flash.providers.runpod.terminate_persisted_endpoints",
+        lambda raw_spec, run_id: terminated.append((raw_spec["model"], run_id)),
+    )
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    assert terminated == [(retired_model, spec.run_id)]
+    status = runner.get_status(spec.run_id)
+    assert status.state == "failed"
+    assert "unsupported model" in (status.error or "")
 
 
 def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):
@@ -2652,7 +2728,7 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
             run_id="recover-unconfirmed",
             state="running",
             spec=JobSpec(
-                run_id="recover-unconfirmed", model="Qwen/Qwen3.5-4B", algorithm="sft"
+                run_id="recover-unconfirmed", model="Qwen/Qwen3.5-9B", algorithm="sft"
             ).to_dict(),
             remote=dict(remote),
         )
@@ -2714,7 +2790,7 @@ def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypat
     spec = JobSpec.from_dict(
         {
             "run_id": "deferred-clear",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"epochs": 1},
         }
@@ -2754,7 +2830,7 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="deferred-minimum-window",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=120),
     )
@@ -2798,7 +2874,7 @@ def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="deferred-cas-loss", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="deferred-cas-loss", model="Qwen/Qwen3.5-9B", algorithm="sft")
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
     )
@@ -2840,7 +2916,7 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
     spec = JobSpec.from_dict(
         {
             "run_id": "deferred-deadline",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"epochs": 1},
         }
@@ -2881,7 +2957,7 @@ def test_completed_attempt_metrics_bounds_success_marker_metrics_grace(monkeypat
 
     spec = JobSpec(
         run_id="metrics-lag",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(hf_repo="org/repo"),
     )
@@ -2930,7 +3006,7 @@ def test_deferred_handleless_legacy_run_without_attempt_metadata_fails_at_deadli
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="deferred-legacy", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="deferred-legacy", model="Qwen/Qwen3.5-9B", algorithm="sft")
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -2981,7 +3057,7 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
     spec = attach_sft_profile(
         JobSpec(
             run_id=f"terminal-handle-race-{cleanup_confirmed}",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
@@ -3076,7 +3152,7 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
     spec = attach_sft_profile(
         JobSpec(
             run_id="terminal-handle-race-two-remotes",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_retries=0),
@@ -3141,7 +3217,7 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     from flash.runner.supervise import lifecycle
 
     importlib.reload(runner)
-    spec = JobSpec(run_id="cas", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+    spec = JobSpec(run_id="cas", model="Qwen/Qwen3.5-9B", algorithm="grpo")
     # Pre-check sees a live run...
     monkeypatch.setattr(
         runner,

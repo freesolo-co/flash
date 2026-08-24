@@ -9,10 +9,9 @@ def test_resolve_params_b_uses_catalog_params_b_float():
     # Curated catalog models return their numeric params_b stat directly (no HF fetch).
     from flash.engine.plan.vram import resolve_params_b
 
-    assert resolve_params_b("Qwen/Qwen3.5-0.8B") == 0.9
-    assert resolve_params_b("Qwen/Qwen3.5-4B") == 4.7
     assert resolve_params_b("Qwen/Qwen3.5-9B") == 9.7
     assert resolve_params_b("Qwen/Qwen3.6-27B") == 27.0
+    assert resolve_params_b("Qwen/Qwen3.6-35B-A3B") == 35.0
 
 
 def test_resolve_params_b_pinned_revision_reads_the_pinned_size(monkeypatch):

@@ -48,7 +48,7 @@ UNDER_SAMPLED = ["A100 SXM", "RTX Pro 6000"]
 
 def _config(method="grpo", **overrides):
     base = {
-        "model_id": "Qwen/Qwen3.5-2B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "method": method,
         "steps": 20,
         "seq_len": 2048,

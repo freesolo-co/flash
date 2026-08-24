@@ -30,7 +30,7 @@ from flash.cost.types import RunConfig
 
 def _sft(**overrides):
     base = {
-        "model_id": "Qwen/Qwen3.5-2B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "method": "sft",
         "steps": 32,
         "seq_len": 1024,
@@ -43,10 +43,10 @@ def _sft(**overrides):
 
 
 def test_the_block_has_both_a_fixed_and_a_size_scaled_part():
-    """Both halves are load-bearing: the measured block roughly triples from 0.8B to 4B, so a
-    size-blind constant cannot cover both ends of the catalog."""
-    small = sft_overhead_seconds(_sft(model_id="Qwen/Qwen3.5-0.8B"), 0)
-    large = sft_overhead_seconds(_sft(model_id="Qwen/Qwen3.5-4B"), 0)
+    """Both halves are load-bearing: two surviving checkpoint sizes must pay distinct blocks, so a
+    size-blind constant cannot cover the catalog."""
+    small = sft_overhead_seconds(_sft(model_id="Qwen/Qwen3.5-9B"), 0)
+    large = sft_overhead_seconds(_sft(model_id="Qwen/Qwen3.6-27B"), 0)
     assert large > small, "a bigger checkpoint must pay a longer startup block"
     assert small >= SFT_STARTUP_BASE_SECONDS, "the fixed part is paid at every size"
     assert SFT_STARTUP_SECONDS_PER_PARAM_B > 0.0
@@ -73,14 +73,14 @@ def test_only_sft_pays_this_block(method, monkeypatch):
     import flash.cost.analytical as analytical
 
     config = RunConfig(
-        model_id="Qwen/Qwen3.5-2B",
+        model_id="Qwen/Qwen3.5-9B",
         method=method,
         steps=8,
         seq_len=1024,
         completion_len=512,
         batch_size=8,
         group_size=4,
-        gpu_type="H100",
+        gpu_type="B200",
         provider="runpod",
     )
     before = estimate_cost(config).train_seconds
@@ -96,7 +96,7 @@ def test_a_short_sft_run_is_not_quoted_at_almost_zero():
     """The regression that motivated this: a 2-step SFT run was quoted 0.47s of training against a
     measured 533s, because a short run is almost entirely startup. The quote must be dominated by
     the block at that shape, not by the FLOPs term."""
-    quote = estimate_cost(_sft(model_id="Qwen/Qwen3.5-4B", steps=2))
+    quote = estimate_cost(_sft(model_id="Qwen/Qwen3.5-9B", steps=2))
     assert quote.train_seconds > 100.0, (
         "a 2-step SFT run is startup-dominated; quoting only its FLOPs bills a fraction of the pod"
     )

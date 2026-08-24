@@ -32,26 +32,9 @@ from flash.serving.src.prequant_config import fp8_serve_model_for as _prequant_s
 # the engine — the reason this mechanism was removed once); the owned repos are VL-preserving FP8
 # checkpoints published to the operator HF org.
 #
-# Sizing rationale. Two things dominate per-engine VRAM:
-#   1. The PRE-ALLOCATED LoRA buffers (max_loras x max_lora_rank, fixed at init, independent of how
-#      many adapters load) — they can DWARF the (now-quantized) base weights. Both are linear levers.
-#      the dense tiers keep max_loras=16 (the global default) and move the rank: rank-128 for
-#      0.8B/2B/4B/9B, rank-64 for 27B. the 35B MoE is the exception; its fused-MoE LoRA buffer is far
-#      larger per (lora, rank), so it runs rank-64 at 6 hot slots.
-#   2. Quantized base weights (FP8 ~half bf16) + FP8 KV (~half). Loaded directly from the
-#      pre-quantized serve_model_id checkpoint (no bf16 load transient).
-# Net result across native-FP8 cards (compute capability >= 8.9) and A100's Marlin FP8 fallback:
-#   - 0.8B / 2B -> L4 (24 GiB, Ada sm89, ~$0.80/hr — the cheapest vLLM-capable card on
-#     Modal), owned pre-quantized checkpoints, 16 x 128 LoRA, at gpu_memory_utilization 0.98 (same as
-#     the 4B on this card). The FP8 weights + LoRA buffer occupy only a fraction of the 24 GiB, so
-#     the small tiers previously inherited the global 0.90 and left ~2 GiB idle; pinning 0.98 turns
-#     that headroom into KV-cache blocks (more concurrent sequences / longer prefix-cache residency).
-#     They CANNOT drop to a smaller/cheaper card: T4 is the only cheaper Modal GPU and is NOT an
-#     option — sm75 (Turing) is below vLLM V1's compute-capability >= 8.0 floor, so vLLM >= 0.19 won't
-#     initialize (no V1 attention backend for Turing); the next card up, A10G, costs MORE than the L4.
-#   - 4B -> L4 with an owned PRE-QUANTIZED checkpoint, max_model_len=32768, max_num_seqs=8, and
-#     16 x 128 LoRA. CUDA graphs remain enabled.
-#   - 9B -> L40S (48 GiB, Ada sm89) at 32k context with CUDA graphs on and 16 x 128 LoRA.
+# sizing rationale. preallocated lora buffers and loaded checkpoint weights dominate engine vram.
+# the 9b uses 16 rank-128 slots on l40s, the 27b uses 16 rank-64 slots on h100, and the 35b moe uses
+# 6 rank-64 slots on h200. dense engines load prequantized weights with fp8 kv.
 #   - 27B -> H100 (80 GiB) at 32k context with CUDA graphs on and 16 x 64 LoRA.
 #   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> H200
 #     (141 GiB) with the base bf16 weights, 6 x 64 LoRA at 32k. bf16 (not FP8) is the one path giving
@@ -63,61 +46,6 @@ from flash.serving.src.prequant_config import fp8_serve_model_for as _prequant_s
 DEFAULT_GPU = "L4"
 
 SERVING_MODELS: list[dict[str, Any]] = [
-    # Small L4 tiers: owned pre-quantized FP8 checkpoints with rank-128 adapters, keeping 16 hot LoRAs
-    # resident (the global default). The loaded checkpoint is resolved centrally (serve_model_for) —
-    # the engine dict carries only the LoRA/tier shape. These tiny models have ample L4 headroom, so
-    # the 16 x 128 buffer fits comfortably; they now pin gpu_memory_utilization=0.98 (matching the
-    # 4B on the same L4) instead of inheriting the global 0.90, so the ~2 GiB the default left idle
-    # becomes KV cache — more concurrent sequences / longer prefix-cache residency per engine.
-    # They also cap max_num_seqs=64 to the container's real concurrency ceiling (modal_app.MAX_INPUTS
-    # packs at most 64 in-flight requests per engine). Left at vLLM's ~1024 default the engine
-    # over-reserved logits/activation + captured CUDA graphs for ~1000 sequences that can never
-    # arrive; capping to 64 reclaims that reservation as KV cache (thoroughly-used memory) and
-    # shortens cold-boot, with NO throughput loss — all 64 in-flight requests still decode at once.
-    {
-        "base_model": "Qwen/Qwen3.5-0.8B",
-        "image_input_limit": 4,
-        "gpu": "L4",
-        "engine": {
-            "gpu_memory_utilization": 0.98,
-            "max_lora_rank": 128,
-            "max_model_len": 32768,
-            "max_num_seqs": 64,
-            # CUDA graphs ON (explicit; was the vLLM default) — documents intent, de-risks a default change.
-            "enforce_eager": False,
-            "reasoning_parser": "qwen3",
-        },
-    },
-    {
-        "base_model": "Qwen/Qwen3.5-2B",
-        "image_input_limit": 4,
-        "gpu": "L4",
-        "engine": {
-            "gpu_memory_utilization": 0.98,
-            "max_lora_rank": 128,
-            "max_model_len": 32768,
-            "max_num_seqs": 64,
-            # CUDA graphs ON (explicit; was the vLLM default) — documents intent, de-risks a default change.
-            "enforce_eager": False,
-            "reasoning_parser": "qwen3",
-        },
-    },
-    # the 4B and 9B use rank-128 LoRA buffers, the 27B rank-64 (16 hot each) and 32k context. adapters still key
-    # off the logical base_model while the engine loads the configured pre-quantized checkpoint.
-    {
-        "base_model": "Qwen/Qwen3.5-4B",
-        "image_input_limit": 4,
-        "gpu": "L4",
-        "engine": {
-            "gpu_memory_utilization": 0.98,
-            "max_loras": 16,
-            "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (the 4 GiB FP8 4B has ample L4 headroom); 32k.
-            "max_model_len": 32768,
-            "max_num_seqs": 8,
-            "enforce_eager": False,
-            "reasoning_parser": "qwen3",
-        },
-    },
     {
         "base_model": "Qwen/Qwen3.5-9B",
         "image_input_limit": 4,

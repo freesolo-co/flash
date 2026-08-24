@@ -8,9 +8,6 @@ from flash.core.spec import JobSpec
 @pytest.mark.parametrize(
     ("model", "expected_cap"),
     [
-        ("Qwen/Qwen3.5-0.8B", 32768),
-        ("Qwen/Qwen3.5-2B", 32768),
-        ("Qwen/Qwen3.5-4B", 32768),
         ("Qwen/Qwen3.5-9B", 32768),
         ("Qwen/Qwen3.6-27B", 32768),
         ("Qwen/Qwen3.6-35B-A3B", 32768),
@@ -23,7 +20,7 @@ def test_serving_context_cap(model: str, expected_cap: int) -> None:
 def _sft_spec(max_context_tokens: int) -> JobSpec:
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "train": {"max_context_tokens": max_context_tokens},
         }

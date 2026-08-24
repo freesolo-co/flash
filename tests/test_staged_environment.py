@@ -47,7 +47,7 @@ def _spec(
         environment["package"] = package
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "run_id": run_id,
             "environment": environment,

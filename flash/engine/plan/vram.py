@@ -177,13 +177,9 @@ def _lora_memory_gb(
 
 
 _TRAIN_COEF = 0.27
-# Small-model colocated GRPO floor: 0.8B OOMs 20 GB; 2B OOMs 24 GB -> both need 32 GB tier.
 _VLLM_COLOCATE_FLOOR_GB = 28.0
-# OPD builds its resident vLLM engine after the HF/PEFT student is already loaded. A real
-# Qwen3.5-2B OPD run with vLLM failed vLLM startup on a 32 GB RTX 5090 despite the raw equation
-# estimating ~28 GB with headroom, because vLLM requires the requested executor budget to be free at
-# init time. Keep 2B+ OPD off <=40 GB classes so the allocator picks an 80 GB-class card instead of a
-# consumer GPU that passes the aggregate estimate but fails the vLLM free-memory preflight.
+# opd builds its resident vllm engine after the hf/peft student is already loaded. keep the
+# colocated engine off <=40 gb classes so allocation leaves enough free memory for vllm startup.
 _OPD_VLLM_COLOCATE_FLOOR_GB = 41.0
 _LOGITS_BUDGET_GB = 6.0
 # 16 B/elem: fp32 logits+grad + bf16 logits+grad + CE temp. 8 B/elem under-counts (live OOM confirmed).
@@ -199,9 +195,6 @@ _LIGER_LONG_CTX_TOKENS = 2048
 # add it without parity coverage.
 _SFT_CHUNKED_NLL_MODELS = frozenset(
     {
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
-        "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.6-27B",
         "Qwen/Qwen3.6-35B-A3B",

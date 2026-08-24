@@ -94,8 +94,9 @@ def test_gc_off_peak_scales_linearly_with_seq():
 def test_dense_activation_constant_matches_the_live_rtx5090_peak():
     """The dense K is a live measurement, not the MoE's safety pad.
 
-    Measured on an RTX 5090 (31.37 GB usable), Qwen3.5-0.8B (hidden 1024, 24 layers), LoRA rank 32
-    all-linear, bs 4, bf16, chunked dense-logit-free CE matching ``model.use_fused_kernels=true``:
+    Measured on an RTX 5090 (31.37 GB usable), a sub-1B dense checkpoint (hidden 1024, 24 layers),
+    LoRA rank 32 all-linear, bs 4, bf16, and chunked dense-logit-free CE matching
+    ``model.use_fused_kernels=true``:
     seq 1024 -> 15.09 GB, seq 2048 -> 28.18 GB, seq 4096 -> OOM. The shared 18.0 predicted 9.89 GB at
     seq 1024 and 20.76 GB at seq 4096 -- it called a run that OOMs a FIT, which is the failure this
     pins. A safety gate must over-reserve, so the estimate has to sit ABOVE each live peak.
@@ -326,19 +327,13 @@ def test_grpo_use_reentrant_true_for_moe():
 
 
 def test_grpo_use_reentrant_true_for_gdn_hybrid():
-    # Dense Qwen3.5/3.6 GatedDeltaNet hybrids ALSO need reentrant GC under GRPO: FA2 varlen-unpad +
-    # the fused GDN chunk-scan + the fused Triton kernels save data-dependent tensors the non-reentrant
-    # metadata-equality assert can't reconcile (forward packed [1636,..] vs recompute padded [1024,..]),
-    # crashing at step 0 exactly like MoE. Live-confirmed on Qwen3.5-0.8B GRPO / RTX 4090.
+    # dense qwen3.5/3.6 gated-deltanet hybrids also need reentrant gc under grpo: fa2 varlen-unpad +
+    # the fused gdn chunk-scan + the fused triton kernels save data-dependent tensors the non-reentrant
+    # metadata-equality assert cannot reconcile (forward packed [1636,..] vs recompute padded [1024,..]),
+    # crashing at step 0 exactly like moe. live-confirmed on a qwen3.5 gdn grpo run.
     from flash.engine.worker.perf.memory import grpo_use_reentrant
 
-    for gdn_id in (
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
-        "Qwen/Qwen3.5-4B",
-        "Qwen/Qwen3.5-9B",
-        "Qwen/Qwen3.6-27B",
-    ):
+    for gdn_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-27B"):
         assert grpo_use_reentrant(gdn_id) is True, gdn_id
 
 
@@ -404,6 +399,7 @@ def test_size_gate_is_offline_and_fail_safe_for_cataloged_models(monkeypatch):
     import types
 
     import flash.engine.worker.perf.liger as liger_mod
+    from flash.core.catalog import MODELS, ModelInfo
     from flash.engine.worker.perf.memory import _memory_mode
 
     def _explode(*a, **k):
@@ -412,10 +408,24 @@ def test_size_gate_is_offline_and_fail_safe_for_cataloged_models(monkeypatch):
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoConfig = types.SimpleNamespace(from_pretrained=_explode)
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    synthetic_id = "test/sub-3b-model"
+    monkeypatch.setitem(
+        MODELS,
+        synthetic_id,
+        ModelInfo(
+            id=synthetic_id,
+            display_name="synthetic sub-3b model",
+            params="2.3B",
+            algos=("sft",),
+            min_vram_gb=24,
+            params_b=2.3,
+        ),
+    )
 
     # every cataloged model answers from params_b, with the probe guaranteed to fail if consulted.
     assert liger_mod._liger_default_for_model("Qwen/Qwen3.6-35B-A3B") is True
     assert liger_mod._liger_default_for_model("Qwen/Qwen3.6-27B") is True
-    assert liger_mod._liger_default_for_model("Qwen/Qwen3.5-2B") is False  # 2.3B, genuinely small
-    # and the decision that matters: a short-context 35B step keeps gradient checkpointing ON.
+    assert liger_mod._liger_default_for_model("Qwen/Qwen3.5-9B") is True
+    assert liger_mod._liger_default_for_model(synthetic_id) is False
+    # and the decision that matters: a short-context 35b step keeps gradient checkpointing on.
     assert _memory_mode("Qwen/Qwen3.6-35B-A3B", 711) is True

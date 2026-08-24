@@ -113,7 +113,7 @@ def test_recovery_completion_requires_attestation_before_done(monkeypatch, tmp_p
     spec = JobSpec.from_dict(
         {
             "run_id": "run-1",
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "train": {"epochs": 1, "hf_repo": "org/repo"},
             "gpu": {"max_wall_seconds": 3600},
@@ -152,7 +152,7 @@ def test_attach_freezes_top_level_descriptor_and_discards_legacy_prefix(
     spec = JobSpec.from_dict(
         {
             "run_id": "run-1",
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "train": {"epochs": 1, "hf_repo": "org/repo"},
         }

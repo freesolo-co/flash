@@ -70,7 +70,7 @@ def test_large_grpo_plugin_config_uses_a_file_and_launches_the_child(tmp_path):
         "plugin_config_path": str(tmp_path / "flash_grpo_plugin_config.json"),
     }
     inp = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "dp_cards": 1,
         "reentrant_checkpointing": False,
         "multimodal": False,

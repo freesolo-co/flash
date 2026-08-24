@@ -501,7 +501,7 @@ def test_a_cap_that_does_not_bind_reports_no_truncation_and_stays_quiet(capsys) 
 class ThinkingTokenizer(FakeTokenizer):
     """A tokenizer whose chat template reproduces Qwen3.5's ``<think>`` placement rule.
 
-    Transcribed from ``Qwen/Qwen3.5-0.8B``'s own template rather than paraphrased, because three
+    Transcribed from ``Qwen/Qwen3.5-9B``'s own template rather than paraphrased, because three
     details are easy to get wrong from memory:
 
     * reasoning survives only on assistant turns AFTER the last non-tool user message (``loop.index0
@@ -1412,7 +1412,7 @@ def test_an_image_rows_visual_tokens_are_charged_against_the_reasoning_cap() -> 
         ImageEnvironment(),
         max_context_tokens=200,
         # image-bearing rows are refused outright for a model the catalog says cannot train on them
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         processor_loader=lambda _model, _revision: ExpandingProcessor(),
     )
 

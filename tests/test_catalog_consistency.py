@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 from flash.core.catalog import (
     DEFAULT_MODEL,
     MODELS,
@@ -62,29 +64,6 @@ def test_serving_capacity_matches_validated_matrix():
     # `expected` is a transcription guard, not a cross-repo lockstep check. flash CI has no
     # freesolo tree; compare both repos in the pinned freesolo-co/tests checkout.
     expected = {
-        "Qwen/Qwen3.5-0.8B": {
-            "gpu": "L4",
-            "serve_model_id": "Freesolo-Co/Qwen3.5-0.8B-FP8",
-            "max_loras": 16,
-            "max_lora_rank": 128,
-            "max_model_len": 32768,
-        },
-        "Qwen/Qwen3.5-2B": {
-            "gpu": "L4",
-            "serve_model_id": "Freesolo-Co/Qwen3.5-2B-FP8",
-            "max_loras": 16,
-            "max_lora_rank": 128,
-            "max_model_len": 32768,
-        },
-        "Qwen/Qwen3.5-4B": {
-            "gpu": "L4",
-            "serve_model_id": "Freesolo-Co/Qwen3.5-4B-FP8",
-            "max_loras": 16,
-            "max_lora_rank": 128,
-            "max_model_len": 32768,
-            "max_num_seqs": 8,
-            "gpu_memory_utilization": 0.98,
-        },
         "Qwen/Qwen3.5-9B": {
             "gpu": "L40S",
             "serve_model_id": "Freesolo-Co/Qwen3.5-9B-FP8",
@@ -122,30 +101,29 @@ def test_serving_capacity_matches_validated_matrix():
 
 
 def test_public_rows_include_serving_capacity():
-    row = get_model("Qwen/Qwen3.5-4B").to_dict()
-    assert row["serving"]["gpu"] == "L4"
+    row = get_model("Qwen/Qwen3.5-9B").to_dict()
+    assert row["serving"]["gpu"] == "L40S"
     assert row["serving"]["max_loras"] == 16
     assert row["serving"]["max_lora_rank"] == 128
-    assert row["serving"]["serve_model_id"] == "Freesolo-Co/Qwen3.5-4B-FP8"
+    assert row["serving"]["serve_model_id"] == "Freesolo-Co/Qwen3.5-9B-FP8"
 
 
 def test_public_rows_prune_unset_serving_capacity_fields():
-    row = get_model("Qwen/Qwen3.5-0.8B").to_dict()
+    row = get_model("Qwen/Qwen3.5-9B").to_dict()
     # serve_model_id survives while zero-valued optional capacity fields are pruned.
     assert row["serving"] == {
-        "gpu": "L4",
-        "serve_model_id": "Freesolo-Co/Qwen3.5-0.8B-FP8",
+        "gpu": "L40S",
+        "serve_model_id": "Freesolo-Co/Qwen3.5-9B-FP8",
         "max_loras": 16,
         "max_lora_rank": 128,
         "max_model_len": 32768,
+        "max_num_seqs": 8,
+        "gpu_memory_utilization": 0.90,
     }
 
 
 def test_serving_repos_match_current_serving_matrix() -> None:
     # dense models serve freesolo-owned fp8 checkpoints; the qwen3.6 moe serves base bf16 on h200.
-    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-0.8B"] == "Freesolo-Co/Qwen3.5-0.8B-FP8"
-    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-2B"] == "Freesolo-Co/Qwen3.5-2B-FP8"
-    assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-4B"] == "Freesolo-Co/Qwen3.5-4B-FP8"
     assert SERVING_MODEL_REPOS["Qwen/Qwen3.5-9B"] == "Freesolo-Co/Qwen3.5-9B-FP8"
     assert SERVING_MODEL_REPOS["Qwen/Qwen3.6-27B"] == "Freesolo-Co/Qwen3.6-27B-FP8"
     assert SERVING_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"] == "Qwen/Qwen3.6-35B-A3B"
@@ -162,6 +140,17 @@ def test_qwen36_27b_geometry_is_dense_hybrid():
     assert info.params_b == 27.0
 
 
+@pytest.mark.parametrize(
+    "model_id",
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"],
+)
+def test_retired_models_are_absent_from_every_active_catalog(model_id):
+    assert model_id not in MODELS
+    assert model_id not in SERVING_MODEL_REPOS
+    with pytest.raises(ValueError, match="unsupported model"):
+        get_model(model_id)
+
+
 def test_default_model_is_thinking_capable():
     # The thinking flag defaults OFF, but the default model should stay thinking-capable
     # ("hybrid" or "always") so a plain default run can still opt into thinking = true
@@ -172,7 +161,7 @@ def test_default_model_is_thinking_capable():
 def test_default_model_is_a_dense_text_model():
     # Guard against regressing the default back to a multimodal / novel-arch model: the
     # default should be the proven dense instruction model.
-    assert DEFAULT_MODEL == "Qwen/Qwen3.5-4B"
+    assert DEFAULT_MODEL == "Qwen/Qwen3.5-9B"
 
 
 def test_every_catalog_entry_sets_params_b():

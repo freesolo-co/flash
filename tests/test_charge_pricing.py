@@ -11,7 +11,7 @@ import pytest
 import flash.runner as runner
 
 SPEC = {
-    "model": "Qwen/Qwen3.5-4B",
+    "model": "Qwen/Qwen3.5-9B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"epochs": 20, "max_examples": 20, "prompts_per_step": 20},
@@ -56,7 +56,7 @@ def test_charge_usd_for_spec_prorates_sft_cancel_by_tokens(monkeypatch):
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
 
-    cfg = RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=20, train_tokens=4_000_000)
+    cfg = RunConfig(model_id="Qwen/Qwen3.5-9B", method="sft", steps=20, train_tokens=4_000_000)
     monkeypatch.setattr(cost_spec, "runconfig_from_spec", lambda spec: cfg)
 
     full = float(estimate_cost(cfg).total_usd)  # the 20-step / full-token quote
@@ -86,7 +86,7 @@ def _unbounded_on_policy_spec(algorithm: str):
 
     return spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": algorithm,
             "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
             "train": {"epochs": 1, "prompts_per_step": 8, "group_size": 4},
@@ -197,7 +197,7 @@ def test_cancelled_charge_usd_prices_against_the_capped_horizon(monkeypatch):
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
 
-    cfg = RunConfig("Qwen/Qwen3.5-4B", "grpo", 100_000, max_wall_seconds=3600)
+    cfg = RunConfig("Qwen/Qwen3.5-9B", "grpo", 100_000, max_wall_seconds=3600)
     assert estimate_cost(cfg).wall_capped
     spec = _patched_cfg_spec(monkeypatch, cfg)
     st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
@@ -214,7 +214,7 @@ def test_cancelled_charge_usd_excludes_unreached_required_saves(monkeypatch):
     from flash.cost.analytical import required_save_overhead_seconds
     from flash.cost.types import RunConfig
 
-    cfg = RunConfig("Qwen/Qwen3.5-4B", "grpo", 20, save_at_steps=(20,))
+    cfg = RunConfig("Qwen/Qwen3.5-9B", "grpo", 20, save_at_steps=(20,))
     assert required_save_overhead_seconds(cfg) > 0
     spec = _patched_cfg_spec(monkeypatch, cfg)
     st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
