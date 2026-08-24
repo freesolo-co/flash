@@ -176,6 +176,14 @@ def test_quoting_an_unbounded_on_policy_run_still_refuses_to_guess():
         assert math.isnan(runner.charge_usd_for_spec(spec, fallback=float("nan")))
 
 
+def test_cancelled_charge_usd_prorates_against_the_whole_cent_quote():
+    spec = _spec()
+    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=1.01)
+
+    assert runner.cancelled_charge_usd(st, spec, steps=10) == 0.505
+    assert runner.cancelled_charge_usd(st, spec, steps=20) == 1.01
+
+
 def test_cancelled_charge_usd_prorates_and_clamps_to_the_quote():
     # the persisted quote carries the accepted live rate, so a cancel bills the completed share of
     # it and can never exceed it. this plan is uniform (no saves, dense model, no wall cap), so the

@@ -210,14 +210,11 @@ def cancelled_charge_usd(
 ) -> float:
     """Price a mid-training cancellation from the accepted quote, scaled by the completed work.
 
-    the persisted quote (``estimated_cost_usd``) carries the exact live rate the user accepted: the
-    lifecycle refreshes it from the selected candidate before provisioning. a spec reprice through
-    ``estimate_cost`` takes the offline static-rate path, and on live-market providers (vast,
-    lambda) those rates differ materially from the accepted one, so pricing a near-complete cancel
-    that way can bill above what the run would have been charged on success. instead the quote is
-    scaled by the completed share of the estimated billed work: partial and full spec estimates use
-    the same offline rates, so the rate cancels out of their ratio and only the work fraction
-    remains. the fraction, not a bare ``steps / planned`` ratio, is what keeps the charge honest:
+    the persisted quote (``estimated_cost_usd``) is the whole-cent submit-time amount shown by
+    ``flash train --cost``. provider selection and allocation never refresh it. instead the quote is
+    scaled by the completed share of estimated billed work: partial and full spec estimates use the
+    rented topology when available, so their ratio isolates the work fraction without replacing the
+    accepted quote. the fraction, not a bare ``steps / planned`` ratio, keeps the charge honest:
     the one-time compile and each reached save land whole in the partial estimate, unreached saves
     stay out of it, and a wall-capped plan caps both sides so the fraction is measured against the
     capped horizon the quote actually paid for rather than the uncapped step count. the fraction is

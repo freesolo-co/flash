@@ -657,10 +657,10 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
             launched = executed_gpu_count(config, count)
             if combined_vram_gb(info.vram_gb, launched) < need:
                 continue
-            # Provisional quoting is structural and must not touch a live market. Vast pricing is
-            # offer-backed (therefore capacity-backed), and Lambda's catalog can blip too. Use the
-            # provider's offline static rate here; the lifecycle replaces it from the selected candidate
-            # before provisioning, so the persisted/charged quote still carries the exact live rate.
+            # customer quoting is structural and must not touch a live market. vast pricing is
+            # offer-backed (therefore capacity-backed), and lambda's catalog can blip too. use the
+            # provider's offline static rate here; allocation may later select a different live rate,
+            # but that operational price never changes the accepted customer quote.
             if provider == "lambda":
                 from flash.providers.lambda_.pricing import static_hourly_rate
 

@@ -21,45 +21,6 @@ RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
 
 
-class _SelectedQuoteUnaffordable(RuntimeError):
-    """The selected live candidate costs more than the owning organization can afford."""
-
-
-def _recheck_selected_quote_affordability(status, selected_quote: float, log) -> None:
-    """Recheck only a live quote that increases the amount accepted before allocation."""
-    accepted_quote = float(getattr(status, "estimated_cost_usd", 0.0) or 0.0)
-    if selected_quote <= accepted_quote:
-        return
-    context = getattr(status, "billing_context", None)
-    if not isinstance(context, dict):
-        return
-    org_id = str(context.get("org_id") or "").strip()
-    if not org_id:
-        return
-
-    from flash.server.platform.internal_client import internal_key
-
-    key = internal_key()
-    if not key:
-        return
-    try:
-        from flash.server.billing.charges import precheck_training_run
-
-        precheck_training_run(internal_key=key, org_id=org_id, estimate_usd=selected_quote)
-    except Exception as exc:
-        from flash.server.billing.charges import BillingError
-
-        if isinstance(exc, BillingError) and exc.status_code == 402:
-            raise _SelectedQuoteUnaffordable(
-                "selected live GPU quote exceeds the organization's available training balance"
-            ) from exc
-        print(
-            f"budget recheck skipped for selected quote (billing service error: {type(exc).__name__})",
-            file=log,
-            flush=True,
-        )
-
-
 @dataclass
 class _RetryBudget:
     infra_retries: int

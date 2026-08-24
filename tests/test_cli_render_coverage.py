@@ -383,6 +383,11 @@ def test_cost_panel_grpo_with_teacher_and_wall_cap(styled_plain) -> None:
     assert "heads up: capped" in out  # notes section rendered
 
 
+def test_server_backed_sft_total_uses_billing_round_half_up(styled_plain) -> None:
+    assert f"{1.005:.2f}" == "1.00", "the fixture must expose half-even formatting"
+    assert "$1.01" in render.sft_cost_panel([("run", "model  [SFT]")], 1.005)
+
+
 def test_cost_panel_sft_omits_optional_sections(styled_plain) -> None:
     est = types.SimpleNamespace(
         method="sft",
