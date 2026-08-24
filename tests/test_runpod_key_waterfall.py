@@ -156,7 +156,7 @@ def test_is_failover_error(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# REST client waterfall (flash.providers.runpod.api)
+# REST client waterfall (flash.providers.runpod.client.api)
 # ---------------------------------------------------------------------------
 def _fake_urlopen_by_key(monkeypatch, behavior):
     """Route urlopen by the bearer key. ``behavior(key) -> bytes | Exception``."""

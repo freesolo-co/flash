@@ -298,7 +298,9 @@ def test_print_baked_arches_cli_exits_before_fingerprint_work(tmp_path):
 def test_baked_arch_workflows_match_canonical_source():
     from flash.providers._lifecycle.net.worker import BAKED_PER_SM_ARCHES
 
-    worker_source = (ROOT / "flash" / "providers" / "_lifecycle" / "worker.py").read_text()
+    worker_source = (
+        ROOT / "flash" / "providers" / "_lifecycle" / "net" / "worker.py"
+    ).read_text()
     source_arches = kf.parse_baked_per_sm_arches(worker_source)
     canonical_arches = set(BAKED_PER_SM_ARCHES)
 

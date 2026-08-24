@@ -778,7 +778,7 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
     deadline = b.time.time() + 100
     rc = b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=deadline)
     assert rc == 0
-    assert popen_calls[0][0][0] == [sys.executable, "-m", "flash.engine.worker_entrypoint"]
+    assert popen_calls[0][0][0] == [sys.executable, "-m", "flash.engine.support.worker_entrypoint"]
     upload_deadline, _reaping_deadline = b._upload_cleanup_deadlines(deadline)
     expected_worker_deadline = b._worker_execution_deadline(upload_deadline)
     assert float(popen_calls[0][1]["env"]["FLASH_RUN_DEADLINE_AT"]) == pytest.approx(

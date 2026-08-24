@@ -661,7 +661,7 @@ def _train_body(input_data: dict) -> dict:
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "flash.engine.worker_entrypoint"],
+                    [sys.executable, "-m", "flash.engine.support.worker_entrypoint"],
                     cwd=code_dir,
                     env={**env, "RUN_MODE": mode},
                     stdout=subprocess.PIPE,

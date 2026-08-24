@@ -1,4 +1,4 @@
-"""Unit tests for shared provider-poll helpers (flash.providers._lifecycle.poll)."""
+"""Unit tests for shared provider-poll helpers (flash.providers._lifecycle.instances.poll)."""
 
 from __future__ import annotations
 

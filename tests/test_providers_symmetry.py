@@ -21,7 +21,10 @@ _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 
 # The universal per-provider surface: concerns every substrate must implement itself (no shared
 # default fits). ``gpus``/``train`` are intentionally NOT here — they're per-provider by necessity.
-PROVIDER_MODULES = ("api", "auth", "pricing", "jobs", "preflight")
+# the per-substrate client surface now lives under each provider's `client` subpackage;
+# `jobs` stays at the provider root (runpod groups its heavier job modules in `execution`).
+CLIENT_MODULES = ("api", "auth", "pricing", "preflight")
+PROVIDER_MODULES = CLIENT_MODULES + ("jobs",)
 PROVIDER_METHODS = (
     "is_configured",
     "preflight",
@@ -61,11 +64,17 @@ def test_provider_implements_the_interface(provider):
         assert callable(getattr(prov, meth)), f"{provider} missing {meth}"
 
 
+def _jobs_module(pkg: str) -> str:
+    """runpod groups job execution under `execution`; the others keep `jobs` at the root."""
+    return f"flash.providers.{pkg}.execution.jobs" if pkg == "runpod" else f"flash.providers.{pkg}.jobs"
+
+
 @pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
 def test_module_layout(provider):
     """Every provider subpackage exposes the SAME public module set (the symmetry contract)."""
-    for mod in PROVIDER_MODULES:
-        importlib.import_module(f"flash.providers.{_PKG[provider]}.{mod}")
+    for mod in CLIENT_MODULES:
+        importlib.import_module(f"flash.providers.{_PKG[provider]}.client.{mod}")
+    importlib.import_module(_jobs_module(_PKG[provider]))
     pkg = importlib.import_module(f"flash.providers.{_PKG[provider]}")
     assert hasattr(pkg, "PROVIDER")
 
@@ -154,8 +163,9 @@ def test_runpod_provider_implements_the_interface():
 
 
 def test_runpod_module_layout():
-    for mod in PROVIDER_MODULES:
-        importlib.import_module(f"flash.providers.runpod.{mod}")
+    for mod in CLIENT_MODULES:
+        importlib.import_module(f"flash.providers.runpod.client.{mod}")
+    importlib.import_module(_jobs_module("runpod"))
     pkg = importlib.import_module("flash.providers.runpod")
     assert hasattr(pkg, "PROVIDER")
 

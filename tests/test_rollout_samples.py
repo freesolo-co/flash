@@ -337,7 +337,7 @@ def test_format_heartbeat_defensively_neutralizes_control_characters() -> None:
 
 @pytest.mark.parametrize(
     "module",
-    ["flash.providers._lifecycle.poll", "flash.runner", "flash.cli.commands"],
+    ["flash.providers._lifecycle.instances.poll", "flash.runner", "flash.cli.commands"],
 )
 def test_control_plane_modules_import_without_running_worker_init(module: str) -> None:
     """The control plane must not execute worker startup just by being imported.

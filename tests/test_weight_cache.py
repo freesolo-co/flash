@@ -251,7 +251,8 @@ def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
     import runpod_flash
     import runpod_flash.core.resources.resource_manager as rm_mod
 
-    from flash.providers.runpod.client import auth, jobs
+    from flash.providers.runpod.client import auth
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     auth.reset()
@@ -291,7 +292,8 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
     import runpod_flash
     import runpod_flash.core.resources.resource_manager as rm_mod
 
-    from flash.providers.runpod.client import auth, jobs
+    from flash.providers.runpod.client import auth
+    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     auth.reset()

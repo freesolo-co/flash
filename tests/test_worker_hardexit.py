@@ -50,7 +50,7 @@ def _run_safe_entrypoint(tmp_path, sitecustomize):
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), str(repo_root), env.get("PYTHONPATH", "")])
     return subprocess.run(
-        [sys.executable, "-m", "flash.engine.worker_entrypoint"],
+        [sys.executable, "-m", "flash.engine.support.worker_entrypoint"],
         cwd=repo_root,
         env=env,
         capture_output=True,

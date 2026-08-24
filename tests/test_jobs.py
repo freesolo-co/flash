@@ -1860,7 +1860,7 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod import serverless
-from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import jobs
 
     spec = JobSpec(
         run_id="runpod-submit-retryable",
@@ -1910,7 +1910,7 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
     from flash.providers.core.base import UnreconciledCreateError
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod import serverless
-from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import jobs
 
     spec = JobSpec(
         run_id=f"runpod-submit-unreconciled-{deletion_mode}",

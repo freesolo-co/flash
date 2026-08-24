@@ -205,18 +205,26 @@ def test_capsule_ships_every_bare_sibling_the_bootstrap_imports(monkeypatch):
     from flash.runtime_capsule import get_profile, read_capsule
 
     lifecycle = Path(builders.__file__).parent.parent.parent / "_lifecycle"
-    tree = ast.parse((lifecycle / "bootstrap.py").read_text())
+    # the bare-script branch imports the capsule's DESTINATION names (bootstrap_secrets, ...),
+    # which the profile maps from bootstrapping/{secrets,console,pip}.py. Resolve a bare name
+    # against those destinations rather than against a sibling file, which no longer exists.
+    shipped = {dest for _src, dest in get_profile(INSTANCE_BOOTSTRAP_PROFILE).sources}
+
+    def _is_shipped_sibling(name: str) -> bool:
+        return f"{name}.py" in shipped
+
+    tree = ast.parse((lifecycle / "bootstrapping" / "bootstrap.py").read_text())
     required: set[str] = set()
     for node in ast.walk(tree):
         # the bare-script branch of `if __package__:` -- plain `import x` and `from x import ...`
         # whose module is a file sitting next to bootstrap.py.
         if isinstance(node, ast.Import):
-            required |= {a.name for a in node.names if (lifecycle / f"{a.name}.py").exists()}
+            required |= {a.name for a in node.names if _is_shipped_sibling(a.name)}
         elif (
             isinstance(node, ast.ImportFrom)
             and node.level == 0
             and node.module
-            and (lifecycle / f"{node.module}.py").exists()
+            and _is_shipped_sibling(node.module)
         ):
             required.add(node.module)
     assert required, "expected bootstrap.py to import at least one bare sibling"

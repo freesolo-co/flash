@@ -621,7 +621,7 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         if worker_deadline_at - _finite_positive_number(time.time(), "current clock") <= 0:
             raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
         proc = subprocess.Popen(
-            [sys.executable, "-m", "flash.engine.worker_entrypoint"],
+            [sys.executable, "-m", "flash.engine.support.worker_entrypoint"],
             cwd=code_dir,
             env={
                 **env,
