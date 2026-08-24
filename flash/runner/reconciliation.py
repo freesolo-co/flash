@@ -56,6 +56,17 @@ def _remote_resource_identity(remote: object) -> tuple | None:
                 handle.machine_id,
                 handle.label,
             )
+        if provider == "modal":
+            from flash.providers.modal.jobs import ModalJobHandle
+
+            handle = ModalJobHandle.from_dict(remote)
+            return (
+                provider,
+                handle.attempt,
+                handle.instance_id,
+                handle.label,
+                handle.gpu_request,
+            )
     except (TypeError, ValueError):
         return None
     return None
@@ -221,6 +232,10 @@ def _canonical_cleanup_remote(remote: object) -> dict | None:
             from flash.providers.vast.jobs.builders import VastJobHandle
 
             return VastJobHandle.from_dict(remote).to_dict()
+        if provider == "modal":
+            from flash.providers.modal.jobs import ModalJobHandle
+
+            return ModalJobHandle.from_dict(remote).to_dict()
     except (TypeError, ValueError):
         return None
     return None

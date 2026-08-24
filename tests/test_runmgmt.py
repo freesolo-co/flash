@@ -60,6 +60,20 @@ def _vast_remote(instance_id=7, attempt=0, started_ts=1.0, **extra):
     }
 
 
+def _modal_remote(instance_id="sandbox", attempt=0, started_ts=1.0, **extra):
+    return {
+        "provider": "modal",
+        "instance_id": instance_id,
+        "label": f"flash-{instance_id}",
+        "gpu_request": "B200:1",
+        "gpu": "B200",
+        "hourly_usd": 6.25,
+        "attempt": attempt,
+        "started_ts": started_ts,
+        **extra,
+    }
+
+
 def test_background_run_redacts_private_exception_content(monkeypatch, caplog):
     import logging
     from types import SimpleNamespace
@@ -1300,6 +1314,7 @@ def test_multiprocess_attempt_reservations_preserve_concurrent_status_update(mon
         _runpod_remote(attempt=2),
         _runpod_remote(job_id=None, attempt=2),
         _vast_remote(attempt=2),
+        _modal_remote(attempt=2),
     ],
 )
 def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
@@ -1394,13 +1409,19 @@ def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
     assert reloaded[runner._CLEANUP_REMOTES_KEY] == [cleanup_remote]
 
 
-def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "remote",
+    [
+        _runpod_remote("endpoint-cleanup", "job-cleanup", attempt=1),
+        _modal_remote("sandbox-cleanup", attempt=1),
+    ],
+)
+def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_path, remote):
     import flash.runner as runner
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-record", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    remote = _runpod_remote("endpoint-cleanup", "job-cleanup", attempt=1)
     runner._save_status(runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
 
     assert runner._record_cleanup_remote(spec.run_id, remote) is True
