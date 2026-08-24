@@ -1563,6 +1563,39 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     assert raw["remote"] == confirmed
 
 
+def test_cleanup_drain_destroys_and_removes_modal_sandbox(monkeypatch, tmp_path):
+    import flash.providers as providers
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="cleanup-modal", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    remote = _modal_remote("sandbox-cleanup", attempt=2)
+    runner._save_status(
+        runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
+    )
+    assert runner._record_cleanup_remote(spec.run_id, remote) is True
+
+    events = []
+
+    class Provider:
+        def destroy(self, handle):
+            events.append(("destroy", handle.to_dict()))
+
+        def run_instances_remaining(self, run_id):
+            events.append(("remaining", run_id))
+            return []
+
+    monkeypatch.setattr(providers, "get_provider", lambda name: Provider())
+
+    attempted = runner._drain_cleanup_remotes(spec.run_id)
+
+    assert attempted == {("modal", 2, "sandbox-cleanup", "flash-sandbox-cleanup", "B200:1")}
+    assert events == [("destroy", remote), ("remaining", spec.run_id)]
+    raw = runner._load_status_json(spec.run_id)
+    assert raw.get(runner._CLEANUP_REMOTES_KEY, []) == []
+
+
 def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
     monkeypatch, tmp_path
 ):

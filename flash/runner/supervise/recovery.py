@@ -58,6 +58,10 @@ def _canonical_provider_handle(handle):
         from flash.providers.vast.jobs.builders import VastJobHandle
 
         return JobHandle.from_dict(VastJobHandle.from_dict(data).to_dict())
+    if provider == "modal":
+        from flash.providers.modal.jobs import ModalJobHandle
+
+        return JobHandle.from_dict(ModalJobHandle.from_dict(data).to_dict())
     raise ValueError("persisted provider identity is missing or unsupported")
 
 
