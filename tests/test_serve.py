@@ -1680,6 +1680,230 @@ def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkey
     assert second["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
 
 
+def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch):
+    import flash.serve.deploy as d
+
+    seen = {}
+    exits = []
+
+    class _StreamResp:
+        status_code = 200
+
+        def __init__(self):
+            self.headers = {
+                "content-type": "text/event-stream",
+                "x-freesolo-adapter-revision": "run-1@final." + "a" * 40,
+            }
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b'data: {"id":"one","choices":[{"index":3,"delta":{"content":"a"}}]}\n'
+            yield b'\ndata: {"id":"one","choices":[{"index":3,"finish_reason":"length"}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    class _Context:
+        def __enter__(self):
+            return _StreamResp()
+
+        def __exit__(self, *exc):
+            exits.append(exc)
+            return False
+
+    class _FakeClient:
+        def stream(self, method, url, **kwargs):
+            seen.update({"method": method, "url": url, **kwargs})
+            return _Context()
+
+    monkeypatch.setattr(d, "_stream_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    response = d.chat_sse(
+        "run-1",
+        [{"role": "user", "content": "hi"}],
+        temperature=0.2,
+        max_tokens=9,
+        top_p=0.7,
+        stop=["end"],
+        chat_template_kwargs={"enable_thinking": False, "custom": 1},
+        structured_outputs={"json_object": True},
+        stream_options={"include_usage": True},
+    )
+
+    frames = list(response.iter_bytes())
+
+    assert frames == [
+        b'data: {"id":"one","choices":[{"index":3,"delta":{"content":"a"}}]}\n\n',
+        b'data: {"id":"one","choices":[{"index":3,"finish_reason":"length"}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    assert response.status_code == 200
+    assert seen["json"] == {
+        "model": "run-1",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 9,
+        "temperature": 0.2,
+        "top_p": 0.7,
+        "chat_template_kwargs": {"enable_thinking": False, "custom": 1},
+        "stream": True,
+        "stop": ["end"],
+        "structured_outputs": {"json_object": True},
+        "stream_options": {"include_usage": True},
+    }
+    assert len(exits) == 1
+
+
+def test_chat_sse_close_before_first_byte_releases_upstream(monkeypatch):
+    import flash.serve.deploy as d
+
+    exits = []
+
+    class _StreamResp:
+        status_code = 200
+
+        def __init__(self):
+            self.headers = {"content-type": "text/event-stream"}
+
+        def iter_bytes(self):
+            yield b"data: [DONE]\n\n"
+
+    class _Context:
+        def __enter__(self):
+            return _StreamResp()
+
+        def __exit__(self, *exc):
+            exits.append(exc)
+            return False
+
+    class _FakeClient:
+        def stream(self, *_args, **_kwargs):
+            return _Context()
+
+    monkeypatch.setattr(d, "_stream_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    response = d.chat_sse("run-1", [{"role": "user", "content": "hi"}])
+    body = response.iter_bytes()
+
+    body.close()
+
+    assert len(exits) == 1
+
+
+def test_chat_sse_close_without_exhaustion_releases_upstream(monkeypatch):
+    import flash.serve.deploy as d
+
+    exits = []
+
+    class _StreamResp:
+        status_code = 200
+
+        def __init__(self):
+            self.headers = {"content-type": "text/event-stream"}
+
+        def iter_bytes(self):
+            yield b'data: {"choices":[]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    class _Context:
+        def __enter__(self):
+            return _StreamResp()
+
+        def __exit__(self, *exc):
+            exits.append(exc)
+            return False
+
+    class _FakeClient:
+        def stream(self, *_args, **_kwargs):
+            return _Context()
+
+    monkeypatch.setattr(d, "_stream_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    response = d.chat_sse("run-1", [{"role": "user", "content": "hi"}])
+    body = response.iter_bytes()
+
+    assert next(body) == b'data: {"choices":[]}\n\n'
+    body.close()
+    assert len(exits) == 1
+
+
+def test_chat_sse_complete_frame_without_done_raises_after_preserving_bytes(monkeypatch):
+    import flash.serve.deploy as d
+    from flash.client.http import ClientError
+
+    frame = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+
+    class _StreamResp:
+        status_code = 200
+
+        def __init__(self):
+            self.headers = {"content-type": "text/event-stream"}
+
+        def iter_bytes(self):
+            yield frame
+
+    class _Context:
+        def __enter__(self):
+            return _StreamResp()
+
+        def __exit__(self, *_exc):
+            return False
+
+    class _FakeClient:
+        def stream(self, *_args, **_kwargs):
+            return _Context()
+
+    monkeypatch.setattr(d, "_stream_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    stream = d.chat_sse("run-1", [{"role": "user", "content": "hi"}]).iter_bytes()
+
+    assert next(stream) == frame
+    with pytest.raises(ClientError, match=r"terminal \[DONE\]"):
+        next(stream)
+
+
+def test_chat_posts_supported_managed_fields(monkeypatch):
+    import flash.serve.deploy as d
+
+    seen = {}
+
+    class _Response:
+        def __init__(self):
+            self.headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class _Client:
+        def post(self, url, **kwargs):
+            seen.update({"url": url, **kwargs})
+            return _Response()
+
+    monkeypatch.setattr(d, "_chat_http_client", lambda: _Client())
+    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    d.chat(
+        "run-1",
+        [{"role": "user", "content": "hi"}],
+        top_p=0.6,
+        stop=["end"],
+        chat_template_kwargs={"enable_thinking": True, "custom": 2},
+        structured_outputs={"regex": "[ab]+"},
+    )
+
+    assert seen["json"] == {
+        "model": "run-1",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 512,
+        "temperature": 0.0,
+        "top_p": 0.6,
+        "chat_template_kwargs": {"enable_thinking": True, "custom": 2},
+        "stop": ["end"],
+        "structured_outputs": {"regex": "[ab]+"},
+    }
+
+
 def test_chat_stream_yields_openai_sse_content(monkeypatch):
     """A terminal /v1 override produces one OpenAI path for streaming chat."""
     import flash.serve.deploy as d
@@ -1750,6 +1974,35 @@ def test_chat_stream_yields_openai_sse_content(monkeypatch):
     assert seen["json"]["stream"] is True
     assert seen["json"]["model"] == "flash-7-abcd"
     assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def test_chat_stream_rejects_sse_eof_without_done(monkeypatch):
+    import flash.serve.deploy as d
+    from flash.client.http import ClientError
+
+    class _StreamResp:
+        def __init__(self):
+            self.headers = {"content-type": "text/event-stream"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"partial"}}]}'
+
+    class _Context:
+        def __enter__(self):
+            return _StreamResp()
+
+        def __exit__(self, *_exc):
+            return False
+
+    _erroring_stream_seams(monkeypatch, _Context())
+    stream = d.chat_stream("run-1", [{"role": "user", "content": "hi"}])
+
+    assert next(stream) == "partial"
+    with pytest.raises(ClientError, match=r"terminal \[DONE\]"):
+        next(stream)
 
 
 def test_chat_stream_accepts_json_fallback(monkeypatch):

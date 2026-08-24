@@ -7,7 +7,6 @@ Service functions are resolved through ``flash.server.app`` at call time so test
 from __future__ import annotations
 
 import contextlib
-import math
 
 # `multiprocessing` has no call site left here since the smoke validation moved to
 # `.serving_smoke`, but the schema coverage tests patch `get_context` through THIS module and the
@@ -51,6 +50,13 @@ from flash.server import app as _app
 from flash.server.platform import auth, db
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
 from flash.server.platform.internal_client import run_org_id
+from flash.server.routes.chat_contract import (
+    attach_immutable_provenance,
+    combined_stop_sequences,
+    immutable_provenance,
+    immutable_provenance_headers,
+    parse_managed_chat_request,
+)
 
 router = APIRouter()
 
@@ -652,10 +658,87 @@ def deployments(
     return {"deployments": out}
 
 
+_UPSTREAM_RESPONSE_HEADER_EXCLUSIONS = frozenset(
+    {
+        "connection",
+        "content-encoding",
+        "content-length",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "x-freesolo-adapter-revision",
+        "x-freesolo-checkpoint",
+        "x-freesolo-hf-revision",
+    }
+)
+
+
+def _upstream_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    connection_tokens = {
+        token.strip().lower()
+        for key, value in headers.items()
+        if key.lower() == "connection"
+        for token in value.split(",")
+        if token.strip()
+    }
+    excluded = _UPSTREAM_RESPONSE_HEADER_EXCLUSIONS | connection_tokens
+    return {key: value for key, value in headers.items() if key.lower() not in excluded}
+
+
+def _validate_stream_provenance(headers: dict[str, str], expected: dict[str, str]) -> None:
+    normalized = {key.lower(): value for key, value in headers.items()}
+    candidates = {
+        "adapter_revision": (
+            "x-freesolo-adapter-revision",
+            "x-flash-adapter-revision",
+        ),
+        "checkpoint": ("x-freesolo-checkpoint", "x-flash-checkpoint"),
+        "hf_revision": (
+            "x-freesolo-hf-revision",
+            "x-flash-source-revision",
+        ),
+    }
+    for field, names in candidates.items():
+        values = [normalized[name] for name in names if name in normalized]
+        if not values:
+            raise ValueError(f"serving backend omitted {field} provenance")
+        if any(value != expected[field] for value in values):
+            raise ValueError(f"serving backend returned mismatched {field} provenance")
+
+
+class _UpstreamStreamingResponse(StreamingResponse):
+    def __init__(self, *args, upstream, **kwargs):
+        self._upstream = upstream
+        super().__init__(*args, **kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._upstream.close()
+
+
 @router.post("/v1/runs/{run_id}/chat")
-def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)]):
+def chat(
+    run_id: str,
+    payload: dict,
+    key: Annotated[dict, Depends(require_key)],
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+    x_freesolo_project_id: Annotated[str | None, Header()] = None,
+):
+    status = manageable_run(
+        run_id,
+        key,
+        x_freesolo_org_id,
+        x_freesolo_project_id,
+    )
     messages = _chat_messages_from_payload(payload)
-    status = owned_run(run_id, key)
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages must be a non-empty list")
     adapter_revision = payload.get("adapter_revision")
     step = payload.get("step")
     verified_revisions = _verified_adapter_revisions(status)
@@ -671,13 +754,14 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
         verified_revisions,
         preferred_revision=ready_revision if isinstance(ready_revision, str) else None,
     )
-    serving_model = pinned_revision or run_id
     try:
         effective_spec = effective_spec_from_status(status)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    request = parse_managed_chat_request(payload, thinking=effective_spec.thinking)
     deployment_state = deployment.get("state")
     has_ready_deploy = pinned_revision is not None or ready_deployment is not None
+    authorized_revision = pinned_revision
     if pinned_revision is None and ready_deployment is not None:
         ready_revision = ready_deployment.get("adapter_revision")
         parsed_ready_revision = (
@@ -688,10 +772,11 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             and parsed_ready_revision[0] == run_id
             and ready_revision in verified_revisions
         )
-    # A cancelled run can still serve a per-step checkpoint it deployed: checkpoint deploy records
-    # a live adapter that /v1/deployments lists as active without requiring a final adapter.
-    # Only block chat when there's no active deployment to serve.
-    if not has_ready_deploy:
+        if has_ready_deploy:
+            authorized_revision = ready_revision
+    # a cancelled run can still serve a per-step checkpoint it deployed. only block chat when there
+    # is no active immutable deployment to serve.
+    if not has_ready_deploy or authorized_revision is None:
         if deployment_state in _DEPLOYMENT_BUSY_STATES:
             raise HTTPException(
                 status_code=409,
@@ -722,59 +807,59 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
             status_code=409,
             detail=f"run {run_id} has no [train].hf_repo; its adapter cannot be served",
         )
-    # Parse sampling params before the broad try so bad values are 400, not 502.
+    mandatory_stops = tuple(getattr(effective_spec.train, "stop_sequences", ()) or ())
+    stop_sequences = combined_stop_sequences(mandatory_stops, request.stop)
+    provenance = immutable_provenance(authorized_revision)
+    serving_model = authorized_revision
     try:
-        temperature = float(payload.get("temperature") or 0.0)
-        # Avoid `or 512`: that silently coerces an explicit 0 to 512.
-        raw_max_tokens = payload.get("max_tokens")
-        # OverflowError (int(inf), an ArithmeticError) is NOT a TypeError/ValueError — catch it too so a
-        # JSON `Infinity`/`1e400` max_tokens is a clean 400, not an uncaught 500.
-        max_tokens = 512 if raw_max_tokens is None else int(raw_max_tokens)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise HTTPException(
-            status_code=400, detail=f"invalid temperature/max_tokens: {exc}"
-        ) from exc
-    if not math.isfinite(temperature):
-        raise HTTPException(
-            status_code=400, detail=f"temperature must be a finite number, got {temperature}"
-        )
-    if max_tokens <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"max_tokens must be a positive integer, got {max_tokens}",
-        )
-    # the same stops the deployment smoke verified with: a run trained to terminate on a delimiter
-    # rather than EOS would otherwise pass verification and then run to max_tokens, or emit trailing
-    # text past its answer, on every real request.
-    stop_sequences = [
-        str(value) for value in (getattr(effective_spec.train, "stop_sequences", ()) or ())
-    ] or None
-    try:
-        if payload.get("stream") is True:
-            # serve_chat_stream sends the upstream request and validates its status at call
-            # time, so an upstream 4xx/5xx raises here, inside the try, and becomes a real 502
-            # before the 200 headers are flushed. a failure after the first byte propagates out
-            # of the body iterator instead, which aborts the chunked response so the client
-            # cannot mistake the truncation for a finished answer.
-            return StreamingResponse(
-                _app.serve_chat_stream(
-                    run_id=serving_model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    thinking=effective_spec.thinking,
-                    stop=stop_sequences,
-                ),
-                media_type="text/plain; charset=utf-8",
+        if request.stream:
+            upstream = _app.serve_chat_sse(
+                run_id=serving_model,
+                messages=messages,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                thinking=effective_spec.thinking,
+                top_p=request.top_p,
+                stop=stop_sequences,
+                chat_template_kwargs=request.chat_template_kwargs,
+                structured_outputs=request.structured_outputs,
+                stream_options=request.stream_options,
             )
-        return _app.serve_chat(
+            try:
+                content_type = upstream.headers.get("content-type", "")
+                if upstream.status_code < 400:
+                    if "text/event-stream" not in content_type.lower():
+                        raise ValueError("serving backend returned a non-sse streaming response")
+                    _validate_stream_provenance(upstream.headers, provenance)
+                headers = {
+                    **_upstream_response_headers(upstream.headers),
+                    **immutable_provenance_headers(provenance),
+                }
+                return _UpstreamStreamingResponse(
+                    upstream.iter_bytes(),
+                    status_code=upstream.status_code,
+                    headers=headers,
+                    upstream=upstream,
+                )
+            except BaseException:
+                upstream.close()
+                raise
+        response = _app.serve_chat(
             run_id=serving_model,
             messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
             thinking=effective_spec.thinking,
+            top_p=request.top_p,
             stop=stop_sequences,
+            chat_template_kwargs=request.chat_template_kwargs,
+            structured_outputs=request.structured_outputs,
         )
+        if not isinstance(response, dict):
+            raise ValueError("serving backend returned a non-object chat response")
+        return attach_immutable_provenance(response, provenance)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"inference failure: {exc}") from exc
 

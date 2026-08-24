@@ -232,6 +232,63 @@ def _prepare_chat_request(
     return base_run_id, body
 
 
+def _openai_sse_text(chunks: Iterator[str]) -> Iterator[str]:
+    """decode raw openai sse into the text stream used by cli and env evaluation."""
+
+    buffered = ""
+    reasoning_open = False
+    terminal = False
+    for chunk in chunks:
+        buffered += chunk
+        while "\n" in buffered:
+            line, buffered = buffered.split("\n", 1)
+            line = line.rstrip("\r")
+            if not line.startswith("data:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if not data:
+                continue
+            if data == "[DONE]":
+                terminal = True
+                continue
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError as exc:
+                raise ClientError("chat stream contained invalid openai sse json") from exc
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if isinstance(error, dict):
+                terminal = True
+                raise ClientError(str(error.get("message") or "chat stream ended with an error"))
+            for choice in payload.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                if choice.get("finish_reason") == "error":
+                    terminal = True
+                    raise ClientError("chat stream ended with an engine error")
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+                reasoning = delta.get("reasoning_content")
+                if isinstance(reasoning, str):
+                    if not reasoning_open:
+                        reasoning_open = True
+                        yield "<think>"
+                    if reasoning:
+                        yield reasoning
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    if reasoning_open:
+                        reasoning_open = False
+                        yield "</think>"
+                    yield content
+    if buffered.strip():
+        raise ClientError("chat stream ended with an incomplete server-sent event frame")
+    if reasoning_open:
+        yield "</think>"
+    if not terminal:
+        raise ClientError("chat stream ended before the terminal [DONE] event")
+
+
 def _parse_adapter_target(target: str) -> tuple[str, int | None]:
     from flash.schema import parse_checkpoint_ref
 
@@ -829,7 +886,8 @@ class ApiClient:
             read1 = getattr(resp, "read1", None)
             read = read1 if read1 is not None else resp.read
             read_size = 4096 if read1 is not None else 1
-            try:
+
+            def decoded_chunks() -> Iterator[str]:
                 while raw := read(read_size):
                     state = decoder.getstate()
                     try:
@@ -844,6 +902,13 @@ class ApiClient:
                         raise exc
                     yield from decoded
                 yield from decoder.decode(b"", final=True)
+
+            try:
+                chunks = decoded_chunks()
+                if "text/event-stream" in content_type:
+                    yield from _openai_sse_text(chunks)
+                else:
+                    yield from chunks
             except (http.client.IncompleteRead, ConnectionError) as exc:
                 # the server aborts the chunked response when the serving backend fails
                 # mid-generation; urllib reports the missing terminating chunk (or reset) here.

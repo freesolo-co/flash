@@ -7,6 +7,7 @@ distinct token resolves to its own run-ownership identity via ``db.ensure_extern
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import itertools
 import json
@@ -6145,7 +6146,7 @@ def test_chat_forwards_trained_stop_sequences(api, monkeypatch):
 
     def serve_chat(**kwargs):
         seen.update(kwargs)
-        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+        return _managed_chat_result(kwargs["run_id"], content="4")
 
     monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
 
@@ -6182,7 +6183,7 @@ def test_chat_sends_no_stop_when_run_configured_none(api, monkeypatch):
 
     def serve_chat(**kwargs):
         seen.update(kwargs)
-        return {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]}
+        return _managed_chat_result(kwargs["run_id"], content="4")
 
     monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
 
@@ -6837,7 +6838,7 @@ def test_cancel_restores_owned_previous_checkpoint_and_bare_chat_authority(api, 
 
     def serve_chat(**kwargs):
         served.append(kwargs["run_id"])
-        return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        return _managed_chat_result(kwargs["run_id"])
 
     monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
 
@@ -6856,7 +6857,7 @@ def test_cancel_restores_owned_previous_checkpoint_and_bare_chat_authority(api, 
     )
 
     assert chat.status_code == 200, chat.text
-    assert served == [run_id]
+    assert served == [previous_revision]
     assert runner.read_verified_adapter_revisions(run_id) == frozenset({previous_revision})
 
 
@@ -7215,6 +7216,112 @@ def test_deployments_listing_requires_internal_scope_and_filters_to_it(api):
     assert snoop.json()["deployments"] == []
 
 
+def _managed_chat_result(revision: str, content: str = "ok") -> dict:
+    target, source_revision = revision.rsplit(".", 1)
+    run_id, selector = target.rsplit("@", 1)
+    checkpoint = run_id if selector == "final" else f"{run_id}/{selector}"
+    return {
+        "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+        "flash_provenance": {
+            "adapter_revision": revision,
+            "checkpoint": checkpoint,
+            "source_revision": source_revision,
+        },
+    }
+
+
+def _managed_stream_headers(revision: str) -> dict[str, str]:
+    target, source_revision = revision.rsplit(".", 1)
+    run_id, selector = target.rsplit("@", 1)
+    checkpoint = run_id if selector == "final" else f"{run_id}/{selector}"
+    return {
+        "content-type": "text/event-stream",
+        "x-flash-adapter-revision": revision,
+        "x-flash-checkpoint": checkpoint,
+        "x-flash-source-revision": source_revision,
+    }
+
+
+class _RawManagedChatResponse:
+    def __init__(self, chunks, *, status_code=200, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {"content-type": "text/event-stream"}
+        self.chunks = chunks
+        self.closed = False
+
+    def iter_bytes(self):
+        try:
+            yield from self.chunks
+        finally:
+            self.closed = True
+
+    def close(self):
+        self.closed = True
+
+
+def test_managed_stream_response_closes_upstream_before_first_body_byte() -> None:
+    from flash.server.routes.serving import _UpstreamStreamingResponse
+
+    upstream = _RawManagedChatResponse([b"data: [DONE]\n\n"])
+    response = _UpstreamStreamingResponse(
+        upstream.iter_bytes(),
+        upstream=upstream,
+        media_type="text/event-stream",
+    )
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    async def send(message):
+        assert message["type"] == "http.response.start"
+        raise RuntimeError("downstream disconnected before the first body byte")
+
+    with pytest.raises(RuntimeError, match="before the first body byte"):
+        asyncio.run(
+            response(
+                {"type": "http", "asgi": {"spec_version": "2.4"}, "method": "POST"},
+                receive,
+                send,
+            )
+        )
+
+    assert upstream.closed
+
+
+def test_managed_stream_response_closes_upstream_after_midstream_disconnect() -> None:
+    from flash.server.routes.serving import _UpstreamStreamingResponse
+
+    upstream = _RawManagedChatResponse([b"first", b"second"])
+    response = _UpstreamStreamingResponse(
+        upstream.iter_bytes(),
+        upstream=upstream,
+        media_type="text/event-stream",
+    )
+    body_sends = 0
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    async def send(message):
+        nonlocal body_sends
+        if message["type"] != "http.response.body":
+            return
+        body_sends += 1
+        raise RuntimeError("downstream disconnected midstream")
+
+    with pytest.raises(RuntimeError, match="disconnected midstream"):
+        asyncio.run(
+            response(
+                {"type": "http", "asgi": {"spec_version": "2.4"}, "method": "POST"},
+                receive,
+                send,
+            )
+        )
+
+    assert body_sends == 1
+    assert upstream.closed
+
+
 def test_chat_streams_deployed_run(api, monkeypatch):
     import flash.runner as runner
     import flash.server.app as app_mod
@@ -7241,10 +7348,16 @@ def test_chat_streams_deployed_run(api, monkeypatch):
 
     def fake_stream(**kwargs):
         seen.update(kwargs)
-        yield "hi"
-        yield " there"
+        return _RawManagedChatResponse(
+            [
+                b'data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n',
+                b'data: {"choices":[{"index":0,"delta":{"content":" there"},"finish_reason":null}]}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+            headers=_managed_stream_headers(revision),
+        )
 
-    monkeypatch.setattr(app_mod, "serve_chat_stream", fake_stream)
+    monkeypatch.setattr(app_mod, "serve_chat_sse", fake_stream)
 
     with api.stream(
         "POST",
@@ -7255,8 +7368,12 @@ def test_chat_streams_deployed_run(api, monkeypatch):
         text = resp.read().decode()
 
     assert resp.status_code == 200, text
-    assert text == "hi there"
-    assert seen["run_id"] == run_id
+    assert text == (
+        'data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"index":0,"delta":{"content":" there"},"finish_reason":null}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    assert seen["run_id"] == revision
     assert seen["messages"] == [{"role": "user", "content": "hello"}]
 
 
@@ -7287,9 +7404,15 @@ def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
 
     def fake_stream(**kwargs):
         seen.update(kwargs)
-        yield "verified"
+        return _RawManagedChatResponse(
+            [
+                b'data: {"choices":[{"index":0,"delta":{"content":"verified"}}]}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+            headers=_managed_stream_headers(revision),
+        )
 
-    monkeypatch.setattr(app_mod, "serve_chat_stream", fake_stream)
+    monkeypatch.setattr(app_mod, "serve_chat_sse", fake_stream)
 
     with api.stream(
         "POST",
@@ -7304,7 +7427,9 @@ def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
         text = response.read().decode()
 
     assert response.status_code == 200, text
-    assert text == "verified"
+    assert text == (
+        'data: {"choices":[{"index":0,"delta":{"content":"verified"}}]}\n\ndata: [DONE]\n\n'
+    )
     assert seen["run_id"] == revision
 
 
@@ -7330,6 +7455,496 @@ def _deployed_chat_run(api):
         verification_generation=runner.verified_adapter_revision_generation(run_id),
     )
     return key, run_id
+
+
+def test_chat_forwards_supported_openai_fields_and_enforces_run_contract(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    spec = json.loads(json.dumps(SPEC))
+    spec["train"] = {**spec["train"], "stop_sequences": ["</answer>", "shared"]}
+    run_id = api.post(
+        "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+    seen = {}
+
+    def fake_chat(**kwargs):
+        seen.update(kwargs)
+        return {
+            "id": "chatcmpl-native",
+            "object": "chat.completion",
+            "model": "backend-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "flash_provenance": {
+                "adapter_revision": revision,
+                "checkpoint": run_id,
+                "source_revision": "a" * 40,
+                "native": True,
+            },
+        }
+
+    monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "model": "caller-must-not-select-this",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.2,
+            "max_tokens": 17,
+            "top_p": 0.8,
+            "stop": ["shared", "caller-stop"],
+            "response_format": {"type": "json_object"},
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "custom_template_flag": "kept",
+                "return_tensors": "must-be-dropped",
+            },
+        },
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 200, response.text
+    deployed_revision = runner.get_status(run_id).deployment["adapter_revision"]
+    assert seen == {
+        "run_id": deployed_revision,
+        "messages": [{"role": "user", "content": "hello"}],
+        "temperature": 0.2,
+        "max_tokens": 17,
+        "thinking": False,
+        "top_p": 0.8,
+        "stop": ["</answer>", "shared", "caller-stop"],
+        "chat_template_kwargs": {
+            "custom_template_flag": "kept",
+            "enable_thinking": False,
+        },
+        "structured_outputs": {"json_object": True},
+    }
+    payload = response.json()
+    assert payload["id"] == "chatcmpl-native"
+    assert payload["model"] == "backend-model"
+    assert payload["flash_provenance"]["native"] is True
+    assert payload["freesolo"] == {
+        "adapter_revision": deployed_revision,
+        "checkpoint": run_id,
+        "hf_revision": "a" * 40,
+    }
+
+
+def test_chat_rejects_success_without_backend_provenance(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **_kwargs: {"choices": [{"message": {"content": "ok"}}]},
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 502
+    assert "omitted immutable provenance" in response.json()["detail"]
+
+
+def test_chat_rejects_mismatched_backend_provenance(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    payload = _managed_chat_result(revision)
+    payload["flash_provenance"]["source_revision"] = "b" * 40
+    monkeypatch.setattr(app_mod, "serve_chat", lambda **_kwargs: payload)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 502
+    assert "mismatched immutable source revision" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        "tools",
+        "tool_choice",
+        "n",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "logprobs",
+        "top_logprobs",
+        "service_tier",
+        "modalities",
+        "enable_thinking",
+        "unknown_field",
+    ],
+)
+def test_chat_rejects_unsupported_top_level_fields(api, monkeypatch, unsupported):
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **_kwargs: pytest.fail("unsupported fields must not reach serving"),
+    )
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            unsupported: [] if unsupported in {"tools", "modalities"} else True,
+        },
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 400
+    assert unsupported in response.json()["detail"]
+
+
+def test_chat_rejects_conflicting_structured_forms_and_invalid_stop(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **_kwargs: pytest.fail("invalid chat contracts must not reach serving"),
+    )
+    cases = [
+        {
+            "structured_outputs": {"json_object": True},
+            "response_format": {"type": "text"},
+        },
+        {"stop": ""},
+        {"stop": ["ok", ""]},
+        {"stop": 3},
+        {"chat_template_kwargs": []},
+        {"stream_options": {"include_usage": True}},
+    ]
+    for extra in cases:
+        response = api.post(
+            f"/v1/runs/{run_id}/chat",
+            json={"messages": [{"role": "user", "content": "hello"}], **extra},
+            headers=_bearer(key),
+        )
+        assert response.status_code == 400, (extra, response.text)
+
+    raw = '{"messages":[{"role":"user","content":"hello"}],"chat_template_kwargs":{"bad":NaN}}'
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        content=raw,
+        headers={**_bearer(key), "content-type": "application/json"},
+    )
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize("strict", [None, True])
+def test_chat_accepts_strict_json_schema_response_format(api, monkeypatch, strict):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    seen = {}
+
+    def fake_chat(**kwargs):
+        seen.update(kwargs)
+        return _managed_chat_result(kwargs["run_id"])
+
+    monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
+    declaration = {
+        "name": "answer",
+        "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+    }
+    if strict is not None:
+        declaration["strict"] = strict
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {"type": "json_schema", "json_schema": declaration},
+        },
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 200, response.text
+    assert seen["run_id"] == revision
+    assert seen["structured_outputs"] == {"json": declaration["schema"]}
+
+
+def test_chat_rejects_non_strict_json_schema_response_format(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **_kwargs: pytest.fail("strict=false must not reach serving"),
+    )
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"},
+                    "strict": False,
+                },
+            },
+        },
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 400
+    assert "strict=false is not supported" in response.json()["detail"]
+
+
+def test_chat_stream_preserves_raw_openai_sse_and_provenance_headers(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    frames = [
+        b'data: {"id":"chatcmpl-1","choices":[{"index":2,"delta":{"content":"hi"},"finish_reason":null}]}\n\n',
+        b'data: {"id":"chatcmpl-1","choices":[{"index":2,"delta":{},"finish_reason":"length"}]}\n\n',
+        b'data: {"id":"chatcmpl-1","choices":[],"usage":{"total_tokens":9}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    seen = {}
+    closed = []
+
+    class RawResponse:
+        status_code = 200
+
+        def __init__(self):
+            self.headers = {
+                **_managed_stream_headers(revision),
+                "x-backend-native": "preserved",
+            }
+
+        def iter_bytes(self):
+            try:
+                yield from frames
+            finally:
+                self.close()
+
+        def close(self):
+            if not closed:
+                closed.append(True)
+
+    def fake_sse(**kwargs):
+        seen.update(kwargs)
+        return RawResponse()
+
+    monkeypatch.setattr(app_mod, "serve_chat_sse", fake_sse)
+    with api.stream(
+        "POST",
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "model": "ignored",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "top_p": 0.7,
+            "stream_options": {"include_usage": True},
+        },
+        headers=_bearer(key),
+    ) as response:
+        body = response.read()
+
+    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["x-backend-native"] == "preserved"
+    assert response.headers["x-freesolo-adapter-revision"] == revision
+    assert response.headers["x-freesolo-checkpoint"] == run_id
+    assert response.headers["x-freesolo-hf-revision"] == "a" * 40
+    assert body == b"".join(frames)
+    assert closed == [True]
+    assert seen["run_id"] == revision
+    assert seen["top_p"] == 0.7
+    assert seen["stream_options"] == {"include_usage": True}
+
+
+def test_chat_stream_strips_hop_by_hop_and_connection_extension_headers(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    upstream = _RawManagedChatResponse(
+        [b"data: [DONE]\n\n"],
+        headers={
+            **_managed_stream_headers(revision),
+            "connection": "keep-alive, X-Remove-Me",
+            "keep-alive": "timeout=5",
+            "proxy-authenticate": "Basic realm=test",
+            "proxy-authorization": "secret",
+            "te": "trailers",
+            "trailer": "x-checksum",
+            "transfer-encoding": "chunked",
+            "upgrade": "websocket",
+            "x-remove-me": "connection extension",
+            "x-preserved": "yes",
+        },
+    )
+    monkeypatch.setattr(app_mod, "serve_chat_sse", lambda **_kwargs: upstream)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.headers["x-preserved"] == "yes"
+    for header in (
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "x-remove-me",
+    ):
+        assert header not in response.headers
+
+
+@pytest.mark.parametrize("case", ["missing", "mismatch"])
+def test_chat_stream_rejects_incomplete_backend_provenance(api, monkeypatch, case):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    headers = _managed_stream_headers(revision)
+    if case == "missing":
+        del headers["x-flash-source-revision"]
+    else:
+        headers["x-flash-source-revision"] = "b" * 40
+    upstream = _RawManagedChatResponse([b"data: [DONE]\n\n"], headers=headers)
+    monkeypatch.setattr(app_mod, "serve_chat_sse", lambda **_kwargs: upstream)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 502
+    expected = (
+        "omitted hf_revision provenance"
+        if case == "missing"
+        else "mismatched hf_revision provenance"
+    )
+    assert expected in response.json()["detail"]
+    assert upstream.closed
+
+
+def test_chat_stream_preserves_upstream_error_status_and_body(api, monkeypatch):
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+
+    class RawResponse:
+        status_code = 429
+
+        def __init__(self):
+            self.headers = {"content-type": "application/json", "retry-after": "3"}
+
+        def iter_bytes(self):
+            yield b'{"error":{"message":"rate limited"}}'
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(app_mod, "serve_chat_sse", lambda **_kwargs: RawResponse())
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 429
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.headers["retry-after"] == "3"
+    assert response.json() == {"error": {"message": "rate limited"}}
+
+
+def test_chat_internal_key_requires_matching_org_and_project_scope(api, monkeypatch):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    internal = _bearer("fslo-internal-test")
+    project = "33333333-3333-4333-8333-333333333333"
+    run_id = api.post(
+        "/v1/runs",
+        json={"spec": {**SPEC, "project": project}, "dry_run": True},
+        headers=internal,
+    ).json()["run_id"]
+    status = runner.get_status(run_id)
+    status.state = "done"
+    status.platform_context = {"org_id": "org-chat"}
+    status.billing_context = None
+    runner._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+    runner.mark_deployed(
+        run_id,
+        {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
+        verification_generation=runner.verified_adapter_revision_generation(run_id),
+    )
+    calls = []
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **kwargs: calls.append(kwargs) or _managed_chat_result(kwargs["run_id"]),
+    )
+    body = {"messages": [{"role": "user", "content": "hello"}]}
+    for headers in (
+        internal,
+        {**internal, "X-Freesolo-Org-Id": "org-wrong", "X-Freesolo-Project-Id": project},
+        {**internal, "X-Freesolo-Org-Id": "org-chat"},
+        {
+            **internal,
+            "X-Freesolo-Org-Id": "org-chat",
+            "X-Freesolo-Project-Id": "project-wrong",
+        },
+    ):
+        response = api.post(f"/v1/runs/{run_id}/chat", json=body, headers=headers)
+        assert response.status_code == 404
+        assert response.json() == {"detail": f"unknown run_id: {run_id}"}
+    assert calls == []
+
+    matched = {
+        **internal,
+        "X-Freesolo-Org-Id": "org-chat",
+        "X-Freesolo-Project-Id": project,
+    }
+    response = api.post(f"/v1/runs/{run_id}/chat", json=body, headers=matched)
+    assert response.status_code == 200, response.text
+    assert len(calls) == 1
 
 
 def test_chat_stream_upstream_error_before_first_byte_is_502(api, monkeypatch):
@@ -7381,15 +7996,24 @@ def test_chat_stream_midstream_failure_aborts_response(api, monkeypatch):
     body: the exception must propagate out of the response iterator (uvicorn then drops the
     connection without the terminating chunk) rather than being swallowed into an eof the
     client would read as a finished answer."""
+    import flash.runner as runner
     import flash.server.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
+    revision = runner.get_status(run_id).deployment["adapter_revision"]
 
-    def fake_stream(**kwargs):
-        yield "partial "
+    def chunks():
+        yield b'data: {"choices":[{"index":0,"delta":{"content":"partial "}}]}\n\n'
         raise RuntimeError("upstream failed mid-generation")
 
-    monkeypatch.setattr(app_mod, "serve_chat_stream", fake_stream)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat_sse",
+        lambda **_kwargs: _RawManagedChatResponse(
+            chunks(),
+            headers=_managed_stream_headers(revision),
+        ),
+    )
 
     with (
         pytest.raises(RuntimeError, match="upstream failed mid-generation"),
@@ -7430,7 +8054,7 @@ def test_chat_step_selector_prefers_current_revision_for_redeployed_step(api, mo
 
     def fake_chat(**kwargs):
         seen.update(kwargs)
-        return {"choices": [{"message": {"content": "ok"}}]}
+        return _managed_chat_result(kwargs["run_id"])
 
     monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
 
@@ -7688,7 +8312,7 @@ def test_chat_reconciling_alias_rejects_bare_and_allows_verified_revision(api, m
 
     def serve_chat(**kwargs):
         served_revisions.append(kwargs["run_id"])
-        return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        return _managed_chat_result(kwargs["run_id"])
 
     monkeypatch.setattr(app_mod, "serve_chat", serve_chat)
 
@@ -7743,7 +8367,7 @@ def test_chat_selects_immutable_revisions_independently(api, monkeypatch):
 
     def fake_chat(**kwargs):
         seen.append(kwargs["run_id"])
-        return {"choices": [{"message": {"content": "ok"}}]}
+        return _managed_chat_result(kwargs["run_id"])
 
     monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
 
@@ -7829,7 +8453,7 @@ def test_chat_uses_saved_thinking_flag_not_payload_override(api, monkeypatch):
 
     def fake_chat(**kwargs):
         seen.update(kwargs)
-        return {"choices": [{"message": {"content": "ok"}}]}
+        return _managed_chat_result(kwargs["run_id"])
 
     monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
 
@@ -7838,7 +8462,6 @@ def test_chat_uses_saved_thinking_flag_not_payload_override(api, monkeypatch):
         json={
             "messages": [{"role": "user", "content": "hello"}],
             "chat_template_kwargs": {"enable_thinking": False},
-            "enable_thinking": False,
         },
         headers=_bearer(key),
     )
@@ -7874,7 +8497,7 @@ def test_chat_forwards_user_supplied_system_prompt(api, monkeypatch):
 
     def fake_chat(**kwargs):
         seen.update(kwargs)
-        return {"choices": [{"message": {"content": "ok"}}]}
+        return _managed_chat_result(kwargs["run_id"])
 
     monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
 
@@ -7887,7 +8510,6 @@ def test_chat_forwards_user_supplied_system_prompt(api, monkeypatch):
         json={
             "messages": messages,
             "chat_template_kwargs": {"enable_thinking": True},
-            "enable_thinking": True,
         },
         headers=_bearer(key),
     )
@@ -7922,7 +8544,17 @@ def test_chat_serves_cancelled_run_with_active_checkpoint_deployment(api, monkey
         verification_generation=runner.verified_adapter_revision_generation(run_id),
     )
 
-    monkeypatch.setattr(app_mod, "serve_chat_stream", lambda **k: iter(["hi", " there"]))
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat_sse",
+        lambda **_kwargs: _RawManagedChatResponse(
+            [
+                b'data: {"choices":[{"index":0,"delta":{"content":"hi there"}}]}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+            headers=_managed_stream_headers(revision),
+        ),
+    )
     with api.stream(
         "POST",
         f"/v1/runs/{run_id}/chat",
@@ -7931,7 +8563,9 @@ def test_chat_serves_cancelled_run_with_active_checkpoint_deployment(api, monkey
     ) as resp:
         text = resp.read().decode()
     assert resp.status_code == 200, text
-    assert text == "hi there"
+    assert text == (
+        'data: {"choices":[{"index":0,"delta":{"content":"hi there"}}]}\n\ndata: [DONE]\n\n'
+    )
 
 
 def test_chat_cancelled_run_without_deployment_is_409(api):

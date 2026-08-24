@@ -859,7 +859,9 @@ def chat(
     expected_adapter_revision: str | None = None,
     timeout_s: float | None = None,
     retry_unavailable: bool = False,
+    top_p: float = 0.95,
     stop: list[str] | None = None,
+    chat_template_kwargs: dict | None = None,
     structured_outputs: dict | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
@@ -875,7 +877,10 @@ def chat(
         "messages": messages,
         "max_tokens": int(max_tokens),
         "temperature": float(temperature),
-        "chat_template_kwargs": {"enable_thinking": bool(thinking)},
+        "top_p": float(top_p),
+        "chat_template_kwargs": chat_template_kwargs
+        if chat_template_kwargs is not None
+        else {"enable_thinking": bool(thinking)},
     }
     if stop:
         body["stop"] = [str(value) for value in stop]
@@ -930,6 +935,7 @@ from flash.serve.adapter_check import (  # noqa: E402,F401
 # and the CLI through the client) keeps resolving.
 from flash.serve.streaming import (  # noqa: E402,F401
     _openai_stream_content,
+    chat_sse,
     chat_stream,
 )
 

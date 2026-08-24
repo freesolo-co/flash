@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import Any
 
 from flash.client.http import ClientError
 from flash.serve.thinking import (
@@ -65,6 +67,7 @@ def _raise_for_stream_error(chunk: dict) -> None:
 
 
 def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[str]:
+    terminal = False
     # reasoning arrives on its own delta field (see _balanced_thinking_content). re-open the block
     # around it and close it at the answer boundary, so the streamed text matches the balanced
     # string the non-streaming path returns.
@@ -95,6 +98,7 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
             continue
         data = line.removeprefix("data:").strip()
         if data == "[DONE]":
+            terminal = True
             break
         if not data:
             continue
@@ -198,6 +202,158 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
         # no delimiter ever arrived, so nothing marked a reasoning phase: a plain answer. release
         # it as sent rather than wrapping it, which would label a valid answer as reasoning.
         yield from held
+    if not terminal:
+        raise ClientError("chat stream ended before the terminal [DONE] event")
+
+
+def _sse_frame_is_terminal(frame: bytes) -> bool:
+    data_lines = [
+        line.removeprefix(b"data:").strip()
+        for line in frame.replace(b"\r\n", b"\n").split(b"\n")
+        if line.startswith(b"data:")
+    ]
+    if not data_lines:
+        return False
+    data = b"\n".join(data_lines)
+    if data == b"[DONE]":
+        return True
+    try:
+        payload = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("error"), dict):
+        return True
+    return any(
+        isinstance(choice, dict) and choice.get("finish_reason") == "error"
+        for choice in payload.get("choices") or []
+    )
+
+
+def _complete_sse_frames(chunks: Iterator[bytes]) -> Iterator[bytes]:
+    """yield only complete sse frames while preserving every upstream byte."""
+
+    buffered = bytearray()
+    terminal = False
+    for chunk in chunks:
+        buffered.extend(chunk)
+        while True:
+            lf = buffered.find(b"\n\n")
+            crlf = buffered.find(b"\r\n\r\n")
+            ends = [end for end in (lf, crlf) if end >= 0]
+            if not ends:
+                break
+            end = min(ends)
+            delimiter_length = 4 if buffered[end : end + 4] == b"\r\n\r\n" else 2
+            frame = bytes(buffered[: end + delimiter_length])
+            yield frame
+            del buffered[: end + delimiter_length]
+            if _sse_frame_is_terminal(frame):
+                terminal = True
+    if buffered:
+        raise ClientError("chat stream ended with an incomplete server-sent event frame")
+    if not terminal:
+        raise ClientError("chat stream ended before the terminal [DONE] event")
+
+
+class _OwnedByteIterator:
+    def __init__(self, chunks: Iterator[bytes], close) -> None:
+        self._chunks = chunks
+        self._close = close
+
+    def __iter__(self) -> _OwnedByteIterator:
+        return self
+
+    def __next__(self) -> bytes:
+        try:
+            return next(self._chunks)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        close = self._close
+        if close is None:
+            return
+        self._close = None
+        try:
+            close_chunks = getattr(self._chunks, "close", None)
+            if close_chunks is not None:
+                close_chunks()
+        finally:
+            close()
+
+
+@dataclass(slots=True)
+class OpenAIStreamResponse:
+    """an entered upstream response whose bytes remain owned by the caller."""
+
+    status_code: int
+    headers: dict[str, str]
+    _ctx: Any
+    _response: Any
+
+    def iter_bytes(self) -> Iterator[bytes]:
+        chunks = iter(self._response.iter_bytes())
+        content_type = self.headers.get("content-type", "").lower()
+        if "text/event-stream" in content_type:
+            chunks = _complete_sse_frames(chunks)
+        return _OwnedByteIterator(chunks, self.close)
+
+    def close(self) -> None:
+        ctx = self._ctx
+        if ctx is None:
+            return
+        self._ctx = None
+        ctx.__exit__(None, None, None)
+
+
+def chat_sse(
+    run_id: str,
+    messages: list[dict],
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+    thinking: bool = False,
+    top_p: float = 0.95,
+    stop: list[str] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    structured_outputs: dict[str, Any] | None = None,
+    stream_options: dict[str, bool] | None = None,
+) -> OpenAIStreamResponse:
+    """open a raw openai stream while preserving status, headers, and sse bytes."""
+
+    body: dict[str, Any] = {
+        "model": run_id,
+        "messages": messages,
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "chat_template_kwargs": chat_template_kwargs
+        if chat_template_kwargs is not None
+        else {"enable_thinking": bool(thinking)},
+        "stream": True,
+    }
+    if stop:
+        body["stop"] = [str(value) for value in stop]
+    if structured_outputs is not None:
+        body["structured_outputs"] = structured_outputs
+    if stream_options is not None:
+        body["stream_options"] = stream_options
+    ctx = _stream_http_client().stream(
+        "POST",
+        f"{serving_openai_base_url()}/chat/completions",
+        json=body,
+        headers=_internal_key_header(),
+        timeout=30 * 60.0,
+    )
+    response = ctx.__enter__()
+    return OpenAIStreamResponse(
+        status_code=response.status_code,
+        headers=dict(response.headers),
+        _ctx=ctx,
+        _response=response,
+    )
 
 
 def chat_stream(

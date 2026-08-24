@@ -82,6 +82,39 @@ def test_chat_stream_reads_match_bytewise_utf8_chunks(
     assert all(call == (reader_name, read_size) for call in response.calls)
 
 
+def test_chat_stream_decodes_raw_openai_sse_for_cli_callers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = (
+        b'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"why"},"finish_reason":null}]}\n\n'
+        b'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}\n\n'
+        b'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+        b'data: {"id":"chatcmpl-1","choices":[],"usage":{"total_tokens":4}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    response = _Read1Response(payload)
+    response.headers = {"Content-Type": "text/event-stream"}
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+
+    chunks = list(ApiClient("http://test").chat_stream("run-a", []))
+
+    assert "".join(chunks) == "<think>why</think>answer"
+
+
+def test_chat_stream_rejects_complete_sse_eof_without_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+    response = _Read1Response(payload)
+    response.headers = {"Content-Type": "text/event-stream"}
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+    stream = ApiClient("http://test").chat_stream("run-a", [])
+
+    assert next(stream) == "partial"
+    with pytest.raises(ClientError, match=r"terminal \[DONE\]"):
+        next(stream)
+
+
 def test_chat_stream_json_fallback_rejects_a_wrong_service_object(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
