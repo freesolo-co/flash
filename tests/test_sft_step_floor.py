@@ -82,7 +82,7 @@ def test_rollout_quotes_do_not_pay_the_sft_step_floor(method, monkeypatch):
         completion_len=512,
         batch_size=8,
         group_size=4,
-        gpu_type="H100",
+        gpu_type="B200",
         provider="runpod",
     )
     before = estimate_cost(config).train_seconds
