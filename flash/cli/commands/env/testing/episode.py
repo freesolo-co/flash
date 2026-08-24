@@ -253,11 +253,11 @@ def _run_episode_cases(
     state_style = _state_argument(scorer)
     _warn_if_episode_state_is_hidden(suite, state_style)
     results = []
-    # The adapter defaults to `thinking = False` (flash/envs/loading/adapter.py), and with it off
-    # `_scored_turn_text` returns the turn unstripped -- so `state["response_text"]` keeps its
-    # `<think>...</think>` wrapper. Scoring the separate `response` argument hides that, because
-    # `_score_case` strips it; a suite that reads the STATE instead sees raw reasoning and marks a
-    # correct answer wrong. Training sets this on the env, so eval has to as well.
+    # the adapter defaults to `thinking = false` (flash/envs/loading/adapter.py), and with it off
+    # `_scored_turn_text` returns the turn unstripped, so `state["response_text"]` keeps its
+    # `<think>...</think>` wrapper. scoring the separate `response` argument hides that, because
+    # `_score_case` strips it; a suite that reads the state instead sees raw reasoning and marks a
+    # correct answer wrong. training sets this on the env, so eval has to as well.
     with _reasoning_mode(environment, thinking):
         for case, case_id in zip(cases, case_ids, strict=True):
             try:

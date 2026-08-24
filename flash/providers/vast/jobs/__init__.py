@@ -91,11 +91,11 @@ _DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
 # set and merely re-learns. Persisting it would put market trivia in the run record and still not
 # be authoritative, since offer ids churn.
 _run_dead_machines: dict[str, set[int]] = {}
-# Supervision runs on background threads (flash/server/asgi/app.py, supervise/attach.py), so two runs can
-# reach the map at once. Its mutations are read-modify-write (size check then evict; setdefault then
-# add), which is not atomic under the GIL.
+# supervision runs on background threads (flash/server/asgi/app.py, supervise/attach.py), so two runs can
+# reach the map at once. its mutations are read-modify-write (size check then evict; setdefault then
+# add), which is not atomic under the gil.
 _dead_machines_lock = threading.Lock()
-# Bound the per-process footprint of the map above: a long-lived control plane submits unboundedly
+# bound the per-process footprint of the map above: a long-lived control plane submits unboundedly
 # many runs, and nothing else would ever evict a finished run's entry.
 _DEAD_MACHINE_RUNS_MAX = 512
 # widened row cap for the one re-search that separates "this run burned the cheap page" from "the

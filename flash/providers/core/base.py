@@ -445,9 +445,9 @@ def _run_cost_key(
         return None
 
 
-# The FSDP sharding model lives in a sibling module (this file is at its size limit) and is
+# the fsdp sharding model lives in a sibling module (this file is at its size limit) and is
 # re-exported here so every existing `from flash.providers.core.base import ...` keeps resolving to the
-# one definition. See `flash/providers/core/sharding.py` for the measured constants.
+# one definition. see `flash/providers/core/sharding.py` for the measured constants.
 from flash.providers.core.sharding import (  # noqa: E402,F401
     MAX_COMBINATION_CARDS,
     REPLICATED_PER_CARD_GB,

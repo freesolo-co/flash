@@ -831,12 +831,12 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
     )
     try:
         if package_root:
-            # The shared managed hub can be much larger than one environment. Download only the
+            # the shared managed hub can be much larger than one environment. download only the
             # requested package so worker cache/extraction limits apply to that env, not the hub.
             extracted = _download_github_directory(resolved, package_root, tmp_parent)
         else:
-            # Generic GitHub refs keep repo-level sidecars available to relative paths/imports.
-            # User-facing pulls filter to the requested env subtree in flash.envs.loading.pull.
+            # generic github refs keep repo-level sidecars available to relative paths/imports.
+            # user-facing pulls filter to the requested env subtree in flash.envs.loading.pull.
             extracted = _extract_github_tarball(resolved, tmp_parent)
         candidate = extracted / parsed.path
         if candidate.is_dir():

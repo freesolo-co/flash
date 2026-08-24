@@ -366,10 +366,11 @@ def create_app():
             if _instance_providers_configured()
             else None
         )
-        # Periodic artifact GC: delete aged (>7d), undeployed run prefixes inside the per-environment
-        # HF repos (<artifact namespace>/flashrun-*) so old runs' checkpoints/adapters don't pile up against
-        # the org's storage quota. Only on a plane with an operator HF_TOKEN (it deletes operator-owned
-        # repos); fails closed on any live-set uncertainty. See flash.server.domain.ops.repo_cleanup.
+        # periodic artifact gc: delete aged (>7d), undeployed run prefixes inside the per-environment
+        # hf repos (<artifact namespace>/flashrun-*) so old runs' checkpoints/adapters don't pile up
+        # against the org's storage quota. only on a plane with an operator `hf_token` (it deletes
+        # operator-owned repos); fails closed on any live-set uncertainty. see
+        # flash.server.domain.ops.repo_cleanup.
         from flash.server.domain.ops.repo_cleanup import repo_cleanup_enabled
 
         cleanup_task = asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None

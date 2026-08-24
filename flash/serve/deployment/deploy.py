@@ -925,9 +925,9 @@ from flash.serve.deployment.adapter_check import (  # noqa: E402,F401
     validate_serving_lora_rank,
 )
 
-# `chat_stream` and its SSE decoder live in `flash.serve.streaming`, which imports the client
-# helpers above. Re-exported so `from flash.serve.deployment.deploy import chat_stream` (flash.server.app,
-# and the CLI through the client) keeps resolving.
+# `chat_stream` and its sse decoder live in `flash.serve.streaming`, which imports the client
+# helpers above. re-exported so `from flash.serve.deployment.deploy import chat_stream`
+# (flash.server.app, and the cli through the client) keeps resolving.
 from flash.serve.request.streaming import (  # noqa: E402,F401
     _openai_stream_content,
     chat_stream,
