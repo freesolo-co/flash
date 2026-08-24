@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     internal_key: str | None = Field(
         default=None,
         validation_alias="FREESOLO_INTERNAL_KEY",
+    )
+    deployment_mode: Literal["production", "development"] = Field(
+        default="production",
+        validation_alias="SERVING_DEPLOYMENT_MODE",
     )
     deployment_sha: str = Field(
         default="",

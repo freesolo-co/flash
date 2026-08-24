@@ -10,6 +10,7 @@ through ``ServingContext``, which this builder attaches to ``app.state``.
 # Do NOT add `from __future__ import annotations`: the FastAPI handlers use closure-local body
 # models as annotations, which the future import turns into unresolvable strings -> silent 422.
 
+import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -122,7 +123,13 @@ def _lifespan_for(
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: "FastAPI"):
-        yield
+        refresh_task = asyncio.create_task(context.lookup.refresh_periodically())
+        try:
+            yield
+        finally:
+            refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await refresh_task
         # drain detached usage reports before closing their shared client.
         await context.usage.drain()
 

@@ -703,31 +703,6 @@ def _build_chat_authorizer(settings: Any) -> Any:
     return authorize
 
 
-def _base_model_records() -> list:
-    """One open, no-LoRA record per served base model, seeded into the router IN MEMORY.
-
-    Each base model already has its weights loaded by the per-model engine, so a base serve needs no
-    LoRA download and no registration/DB row — we just make the base model addressable by name. These
-    records are never persisted and never org-owned; ``serve_base_model`` marks them so the engine
-    generates against the base weights (lora_request=None) and the router serves them openly.
-    """
-    from flash.serving.src.model_config import base_models
-    from flash.serving.src.schemas import AdapterRecord
-
-    return [
-        AdapterRecord(
-            adapter_id=m,
-            repo_id=m,
-            base_model=m,
-            serve_base_model=True,
-            thinking=True,
-            org_id=None,
-            status="ready",
-        )
-        for m in base_models()
-    ]
-
-
 @app.function(
     secrets=runtime_secrets,
     min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
@@ -742,14 +717,21 @@ def _base_model_records() -> list:
 )
 def router():
     from flash.serving.src import settings as cfg
-    from flash.serving.src.persistence import get_adapter, load_adapters
+    from flash.serving.src.persistence import get_adapter
+    from flash.serving.src.readiness import load_routing_snapshot
     from flash.serving.src.router import AdapterRouter, build_serving_app
     from flash.serving.src.settings import Settings
 
     settings = Settings()
-    # Seed the base-model records alongside the persisted LoRA adapters so every base model is
-    # reachable by name with no adapter. Re-seed on every reload (hydrate replaces the registry).
-    adapter_router = AdapterRouter(load_adapters(settings) + _base_model_records())
+    try:
+        initial_records = load_routing_snapshot(settings)
+    except Exception as exc:
+        # readiness is fail-closed, but existing persisted adapter routing remains available.
+        from flash.serving.src.persistence import load_adapters
+
+        print(f"hosted model readiness startup skipped: {exc!r}", flush=True)
+        initial_records = load_adapters(settings)
+    adapter_router = AdapterRouter(initial_records, require_base_qualification=True)
     pool = _ModalEnginePool()
     return build_serving_app(
         pool,
@@ -757,8 +739,8 @@ def router():
         internal_key=settings.internal_key,
         deployment_sha=settings.deployment_sha,
         deployment_id=settings.deployment_id,
-        # Reload on a routing miss so a stale router still resolves a just-registered adapter.
-        reload_records=lambda: load_adapters(settings) + _base_model_records(),
+        # one atomic storage snapshot drives both persisted adapters and qualified base models.
+        reload_records=lambda: load_routing_snapshot(settings),
         lookup_record=lambda adapter_id: get_adapter(adapter_id, settings),
         reload_interval_seconds=cfg.RELOAD_INTERVAL_SECONDS,
         # Meter each generation to the backend (fire-and-forget); None disables it.

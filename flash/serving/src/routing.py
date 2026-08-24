@@ -54,8 +54,14 @@ class EnginePool(Protocol):
 class AdapterRouter:
     """Tracks adapter -> base_model so a request naming an adapter routes to its engine."""
 
-    def __init__(self, records: list[AdapterRecord] | None = None) -> None:
+    def __init__(
+        self,
+        records: list[AdapterRecord] | None = None,
+        *,
+        require_base_qualification: bool = False,
+    ) -> None:
         self._registry = AdapterRegistry()
+        self._require_base_qualification = require_base_qualification
         if records:
             self._registry.hydrate(records)
 
@@ -74,12 +80,24 @@ class AdapterRouter:
     def remove(self, adapter_id: str) -> AdapterRecord | None:
         return self._registry.remove(adapter_id)
 
-    def resolve(self, adapter_id: str) -> tuple[AdapterRecord, AdapterRecord] | None:
-        requested = self._registry.get(adapter_id)
-        if requested is None or requested.status != "ready":
+    def _qualified_base(self, base_model: str) -> AdapterRecord | None:
+        record = self._registry.get(base_model)
+        if (
+            record is None
+            or record.status != "ready"
+            or not record.serve_base_model
+            or record.adapter_id != base_model
+            or record.base_model != base_model
+            or record.repo_id != base_model
+            or record.org_id is not None
+        ):
             return None
-        if requested.serve_base_model:
-            return requested, requested
+        return record
+
+    def _resolve_adapter(self, adapter_id: str) -> tuple[AdapterRecord, AdapterRecord] | None:
+        requested = self._registry.get(adapter_id)
+        if requested is None or requested.status != "ready" or requested.serve_base_model:
+            return None
         if requested.is_revision and requested.org_id is not None:
             return requested, requested
         if not requested.is_alias or requested.org_id is None or requested.alias_of is None:
@@ -95,6 +113,27 @@ class AdapterRouter:
         ):
             return None
         return requested, target
+
+    def resolve(self, adapter_id: str) -> tuple[AdapterRecord, AdapterRecord] | None:
+        requested = self._registry.get(adapter_id)
+        if requested is not None and requested.status == "ready" and requested.serve_base_model:
+            qualified = self._qualified_base(adapter_id)
+            return (qualified, qualified) if qualified is not None else None
+        resolved = self._resolve_adapter(adapter_id)
+        if resolved is None:
+            return None
+        if (
+            self._require_base_qualification
+            and self._qualified_base(resolved[1].base_model) is None
+        ):
+            return None
+        return resolved
+
+    def is_unqualified_adapter(self, adapter_id: str) -> bool:
+        if not self._require_base_qualification:
+            return False
+        resolved = self._resolve_adapter(adapter_id)
+        return resolved is not None and self._qualified_base(resolved[1].base_model) is None
 
     def base_models(self) -> list[str]:
         return sorted({target.base_model for _, target in self._resolved_ready()})

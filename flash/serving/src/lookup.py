@@ -70,6 +70,13 @@ class AdapterLookup:
             return False
         return True
 
+    async def refresh_periodically(self) -> None:
+        if self._reload_records is None:
+            return
+        while True:
+            await asyncio.sleep(self._reload_interval_seconds)
+            await self._reload_safe()
+
     def _schedule_reload(self) -> None:
         task = self._last_reload.get("task")
         if task is not None and not task.done():
@@ -91,9 +98,17 @@ class AdapterLookup:
             elif stale:
                 self._schedule_reload()
         elif resolved is None and self._reload_records is not None:
-            await self.reload()
+            if self._router.is_unqualified_adapter(adapter_id):
+                await self._reload_safe()
+            else:
+                await self.reload()
             resolved = self._router.resolve(adapter_id)
         if resolved is None:
+            if self._router.is_unqualified_adapter(adapter_id):
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "adapter base model is not qualified for this deployment",
+                )
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
         if require_supported_base_model:
             _assert_supported_base_model(resolved[1].base_model)
