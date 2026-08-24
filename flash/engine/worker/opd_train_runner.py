@@ -238,9 +238,8 @@ def _prepare_prompts(
             else:
                 teacher_messages = student_messages
                 if processor is not None:
-                    # mixed job: the verl child tokenizes every row through the multimodal dataset
-                    # path (the processor), so text-only rows must freeze via the same path or the
-                    # bridge's exact prompt-id check trips on tokenizer-vs-processor differences.
+                    # mixed jobs must freeze text rows through the same processor path as the verl child
+                    # or the bridge's exact prompt-id check trips on tokenizer-vs-processor differences.
                     prompt_ids, rendered_prompt = _opd_train._processor_expanded_prompt(
                         processor,
                         student_messages,
