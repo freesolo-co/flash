@@ -57,6 +57,15 @@ def _payload(archive: bytes) -> dict[str, bytes]:
         return {info.filename: source.read(info) for info in source.infolist()}
 
 
+def test_default_archive_root_is_the_flash_package() -> None:
+    payload = _payload(build_source_archive())
+    assert "flash/__init__.py" in payload
+    assert "flash/cli/__init__.py" in payload
+    assert "flash/providers/__init__.py" in payload
+    assert "flash/snapshot/source_snapshot.py" in payload
+    assert len(payload) > 100
+
+
 def test_archive_is_deterministic_and_contains_only_canonical_package_files(tmp_path: Path) -> None:
     package = _package(tmp_path)
     first = build_source_archive(package_dir=package)

@@ -298,7 +298,7 @@ def _zip_bytes(payload: dict[str, bytes]) -> bytes:
 
 def build_source_archive(*, package_dir: Path | None = None) -> bytes:
     if package_dir is None:
-        package_dir = Path(__file__).resolve().parent
+        package_dir = Path(__file__).resolve().parents[1]
     return _zip_bytes(_enumerate_package_files(package_dir))
 
 
