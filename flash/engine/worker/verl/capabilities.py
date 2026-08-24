@@ -21,7 +21,7 @@ from flash.engine.worker.train.entry.backend_common import (
     CAUSAL_CONV1D_REQUIREMENT,
     FLA_REQUIREMENT,
     FLASH_QLA_REQUIREMENT,
-    TRANSFORMERS_REQUIREMENT,
+    TRANSFORMERS_INSTALL_REQUIREMENT,
     VERL_REQUIREMENT_NAME,
     VERL_REQUIREMENT_URL,
     VERL_VENV_PYTHON,
@@ -438,7 +438,10 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # and transformers owns the gdn modelling code the boundary-reset shim patches.
         overrides = os.path.join(workdir, "verl-overrides.txt")
         with open(overrides, "w") as f:
-            f.write(f"numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n{TRANSFORMERS_REQUIREMENT}\n")
+            f.write(
+                f"numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n"
+                f"{TRANSFORMERS_INSTALL_REQUIREMENT}\n"
+            )
         subprocess.run(
             [
                 "uv",
@@ -454,25 +457,25 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 f"{VERL_REQUIREMENT_NAME}[vllm] @ {VERL_REQUIREMENT_URL}",
                 "vllm==0.19.1",
                 "numpy==2.2.6",
-                TRANSFORMERS_REQUIREMENT,
-                # NOT transitively guaranteed: verl imports these at MODULE level on the launch path
+                TRANSFORMERS_INSTALL_REQUIREMENT,
+                # not transitively guaranteed: verl imports these at module level on the launch path
                 # (main_ppo -> ppo.ray_trainer -> rollout.llm_server imports cachetools, and
                 # rollout.utils imports uvicorn + fastapi), yet declares none of them. vllm happens
                 # to pull cachetools and fastapi today, but that is vllm's dependency choice, not a
-                # contract verl states -- name them so a vllm respin cannot silently break launch.
-                "cachetools",
-                "uvicorn",
-                "fastapi",
+                # contract verl states -- exact pins mirror the worker dockerfile's resolved venv.
+                "cachetools==7.1.7",
+                "uvicorn==0.52.4",
+                "fastapi==0.141.1",
                 # opd's entrypoint calls tq.init()/tq.close(); absent from verl's setup.py.
                 "TransferQueue==0.1.7",
                 # older raises AttributeError on PyArrow PyExtensionType.
-                "datasets>=4.7,<6",
-                "bitsandbytes>=0.49",
-                "qwen-vl-utils",
-                "torchvision",
+                "datasets==5.0.1",
+                "bitsandbytes==0.50.1",
+                "qwen-vl-utils==0.0.14",
+                "torchvision==0.25.0",
                 "xgrammar==0.1.25",
-                "tqdm",
-                "pyarrow",
+                "tqdm==4.70.0",
+                "pyarrow==25.0.1",
                 # gated-deltanet kernels, in LOCKSTEP with Dockerfile.worker's
                 # verl-venv layer (same fla sha, same tilelang pins). the model
                 # trains in THIS interpreter, so fla being installed in the
@@ -536,7 +539,8 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # keep wandb outside the stamped rebuild branch. wandb is absent from the stamp, so reused venvs
         # and transient failures must retry it on later runs; installing an already satisfied package
         # is a cheap no-op.
-        subprocess.run(["uv", "pip", "install", "--python", py, "wandb"], check=False)
+        # exact-pinned to the same version baked into Dockerfile.worker's verl venv.
+        subprocess.run(["uv", "pip", "install", "--python", py, "wandb==0.28.2"], check=False)
     return py
 
 
@@ -858,6 +862,38 @@ def rollout_layered_summon_overrides(target_parameters: Sequence[str] | None) ->
     if not target_parameters:
         return []
     return ["actor_rollout_ref.rollout.layered_summon=true"]
+
+
+def actor_fsdp_strategy_overrides(target_parameters: list[str] | None) -> list[str]:
+    """select the actor's fsdp wrapper: fused-expert lora needs fsdp2, dense keeps fsdp1.
+
+    PEFT implements ``target_parameters`` by registering a torch parametrization onto a NAMED
+    TENSOR at forward time (``peft/tuners/lora/layer.py:2463``), unlike ``target_modules``, which
+    swaps in a wrapper layer once at injection. ``register_parametrization`` calls
+    ``delattr(module, name)`` and then asserts the name is gone
+    (``torch/nn/utils/parametrize.py:387``). fsdp1 cannot satisfy that on either setting:
+    ``use_orig_params=False`` (verl's default, ``workers/config/engine.py:254``) flattens the
+    tensor away so the name never resolves (``parametrize.py:639``), and ``use_orig_params=True``
+    leaves ``FSDP.__getattr__`` resolving it from ``_fsdp_wrapped_module``, so ``hasattr`` stays
+    True after ``delattr`` and the bare assert fires (``parametrize.py:634`` -> ``:387``).
+
+    no config value satisfies that assert while fsdp1 owns the module, so the strategy itself has
+    to change. fsdp2's ``fully_shard`` keeps parameters under their own names with no wrapper
+    indirection. flash's sft driver has always pinned ``engine.strategy=fsdp2``
+    (``train/sft/config.py:138``) and trains this same model with these same ``target_parameters``.
+
+    verl supports it here: ``strategy`` is declared in ``actor/dp_actor.yaml:26`` so it takes a
+    bare override, ``workers/config/engine.py:265`` accepts ``fsdp2``, the ref policy interpolates
+    the actor's value (``ref/ref.yaml:5``) so the two cannot drift, and ``layered_summon_lora_params``
+    carries an explicit fsdp2 prefix block (``utils/fsdp_utils.py:646-649``).
+
+    dense models stay on fsdp1: their lora lives on wrapper modules swapped in at injection, so no
+    parametrization is ever registered. the key is written for BOTH cases rather than omitted for
+    dense, so it has exactly one writer per config and the rl and opd drivers cannot disagree about
+    the dense default or inherit a future change to verl's yaml.
+    """
+    strategy = "fsdp2" if target_parameters else "fsdp"
+    return [f"actor_rollout_ref.actor.strategy={strategy}"]
 
 
 def rollout_mm_processor_cache_overrides() -> list[str]:

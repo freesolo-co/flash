@@ -6377,6 +6377,26 @@ def test_overrides_omit_layered_summon_for_dense_models():
     ]
 
 
+def test_overrides_put_fused_expert_lora_on_fsdp2():
+    # opd used to pin `actor.strategy=fsdp` unconditionally. the strategy is now derived from the
+    # targets in one place shared with the rl driver, so a fused-expert model gets the only
+    # wrapper PEFT can parametrize.
+    built = build_opd_overrides(
+        _config(target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
+    )
+    overrides = dict(value.split("=", 1) for value in built)
+    assert overrides["actor_rollout_ref.actor.strategy"] == "fsdp2"
+    # dict() would silently keep the last of a duplicated key, so count on the raw list
+    assert len([v for v in built if v.startswith("actor_rollout_ref.actor.strategy=")]) == 1
+
+
+def test_overrides_keep_dense_models_on_fsdp1():
+    built = build_opd_overrides(_config(target_parameters=None))
+    overrides = dict(value.split("=", 1) for value in built)
+    assert overrides["actor_rollout_ref.actor.strategy"] == "fsdp"
+    assert len([v for v in built if v.startswith("actor_rollout_ref.actor.strategy=")]) == 1
+
+
 def test_overrides_match_verl_0_8_sync_distillation_contract():
     overrides = dict(value.split("=", 1) for value in build_opd_overrides(_config()))
     assert overrides["distillation._target_"] == "flash_opd_plugin.FlashRemoteDistillationConfig"

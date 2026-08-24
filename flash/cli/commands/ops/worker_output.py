@@ -55,7 +55,7 @@ def _worker_section_name(name: str, current_attempt: int | str | None) -> str:
 _HEARTBEAT_LINE_RE = re.compile(r"(?m)^(HEARTBEAT )(?!\[superseded)")
 
 
-def _mark_superseded_heartbeats(text: str, attempt: int, current_attempt: int | str) -> str:
+def _mark_superseded_heartbeats(text: str, attempt: int | None, current_attempt: int | str) -> str:
     """Tag every HEARTBEAT line in a dead attempt's console dump.
 
     The section heading already says which attempt produced this text, but a heading is only read
@@ -71,13 +71,19 @@ def _mark_superseded_heartbeats(text: str, attempt: int, current_attempt: int | 
     Tagging the line itself means the provenance survives the pipe. A consumer that filters on the
     tag gets only live heartbeats; one that does not at least sees the attempt in the line it
     printed rather than silently trusting a dead worker's last words.
+
+    ``attempt`` is ``None`` for the canonical ``console_<phase>.txt``, which encodes no attempt in
+    its name. That is reported as ``attempt=unknown`` rather than guessed: the file is written at
+    teardown, so on a retry whose terminal upload never ran it belongs to an OLDER attempt, and
+    naming a number the filename does not carry would be a second wrong answer rather than a fix.
     """
     current = (
         "worker torn down"
         if current_attempt == _NO_LIVE_WORKER
         else f"current attempt={current_attempt}"
     )
-    return _HEARTBEAT_LINE_RE.sub(f"\\1[superseded attempt={attempt}; {current}] ", text)
+    which = "unknown" if attempt is None else attempt
+    return _HEARTBEAT_LINE_RE.sub(f"\\1[superseded attempt={which}; {current}] ", text)
 
 
 def _worker_sections(client: ApiClient, run_id: str) -> dict[str, str]:
@@ -133,11 +139,15 @@ def _print_worker_output(
         # heartbeats carry their own provenance into the pipe. `_NO_LIVE_WORKER` tags every
         # attempt: during teardown the plane has PROVEN no worker is live, so every heartbeat on
         # screen is a dead one and none of them may reach a monitor unmarked.
+        # an artifact whose name encodes NO attempt (the canonical `console_<phase>.txt`) is tagged
+        # too. it is fetched alongside the scoped snapshot and appended last, so it is what a pipe
+        # sees -- and being written at teardown it can belong to an older attempt on a retry.
+        # unknown provenance is not evidence of liveness, so it does not earn an untagged pass.
         attempt = _artifact_attempt(name)
         supersedes = current_attempt is not None and (
             current_attempt == _NO_LIVE_WORKER or attempt != current_attempt
         )
-        if attempt is not None and supersedes:
+        if supersedes:
             text = _mark_superseded_heartbeats(text, attempt, current_attempt)
         sep = "\n" if printed_any else ""
         if render.styled():

@@ -143,11 +143,12 @@ jobs:
           # `working-directory` default) is what makes `from flash.serving.src...` resolve at deploy
           # time. Installing flash here would instead risk importing a DIFFERENT copy than the one
           # `add_local_python_source("flash")` ships to the container.
-          python -m pip install --upgrade pip
+          # exact pins keep the deploy client bootstrap reproducible across runner image changes.
+          python -m pip install --upgrade "pip==26.2.1"
           # pinned to the exact client pyproject declares and the provisioning path was validated
           # against: deploy behaviour (app lifecycle, tags, lookup) is client-version sensitive, so
           # an unbounded range lets a future release change deploys with no diff here.
-          python -m pip install "modal==1.5.4" "python-dotenv>=1.0.0"
+          python -m pip install "modal==1.5.4" "python-dotenv==1.2.3"
 
       - name: Verify Modal auth is configured
         if: steps.gate.outputs.deploy == 'true'

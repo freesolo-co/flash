@@ -204,7 +204,8 @@ image = (
     # gpu. `Dockerfile.serve` pairs this same pin with a cuda 13 base and asserts the linkage at
     # build time -- this image resolves the same bounds, so it needs the same pairing.
     modal.Image.from_registry(
-        "nvidia/cuda:13.0.0-devel-ubuntu22.04",
+        # digest-pinned so modal rebuilds use the exact cuda runtime validated here.
+        "nvidia/cuda:13.0.0-devel-ubuntu22.04@sha256:1470d2d7904fac4e5cb3bdfd4993305c46d3ee76deb0213eaaf248e5cf9c7400",
         add_python="3.12",
     )
     .apt_install("build-essential", "git", "ninja-build")

@@ -15,6 +15,7 @@ import os
 
 from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.worker.train.entry.backend_common import (
+    actor_fsdp_strategy_overrides,
     agent_loop_workers,
     ray_num_cpus,
     rollout_layered_summon_overrides,
@@ -131,7 +132,6 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
             else []
         ),
         f"actor_rollout_ref.model.lora_adapter_path={_hydra_val(config.get('lora_adapter_path'))}",
-        "actor_rollout_ref.actor.strategy=fsdp",
         "actor_rollout_ref.actor.use_kl_loss=false",
         "actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean",
         "actor_rollout_ref.actor.use_dynamic_bsz=true",
@@ -149,6 +149,9 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         # absent -> True, verl's own default: a config built without the gate must render the
         # lower-memory strategy, never fall into zero-2 by omission.
         f"actor_rollout_ref.actor.fsdp_config.reshard_after_forward={_hydra_val(bool(config.get('reshard_after_forward', True)))}",
+        # fused-expert lora is a parametrization on a named tensor, which only fsdp2 can host.
+        # writes `actor.strategy` for both cases, so the dense default lands here too.
+        *actor_fsdp_strategy_overrides(config.get("target_parameters")),
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the rl driver.
         *trainer_dtype_overrides(),
         "actor_rollout_ref.rollout.name=vllm",

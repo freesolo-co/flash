@@ -502,6 +502,19 @@ def _worker_artifacts(spec) -> dict[str, str]:
     prefix = adapter_prefix(spec)
     out: dict[str, str] = {}
     error_name = _latest_error_artifact_name(repo, prefix, spec.phase)
+    # both console names, never a choice between them. the periodic snapshot and the terminal tail
+    # are written to DIFFERENT destinations on purpose (a late periodic upload must not clobber the
+    # terminal one), and each can be the only copy of the evidence: the scoped snapshot is the newest
+    # when the worker was killed before its terminal upload ran, while the canonical name holds the
+    # tail that contains the crash itself. `_latest_worker_artifact_name` scores the canonical name
+    # -1, so preferring it by rank would surface a stale attempt on a retry -- and preferring the
+    # scoped one alone is what hid the traceback. fetching both leaves the choice to the reader.
+    console_names = dict.fromkeys(
+        (
+            _latest_worker_artifact_name(repo, prefix, spec.phase, "console"),
+            f"console_{spec.phase}.txt",
+        )
+    )
     # ray's own session logs. the traceback beside them records only the downstream symptom of a
     # raylet death ("Failed to register worker to Raylet: ... End of file"), so without this the
     # collector that exists to disambiguate it uploads a diagnosis nothing ever reads back
@@ -510,7 +523,7 @@ def _worker_artifacts(spec) -> dict[str, str]:
     # non-ray failure, and the loop below skips it.
     ray_name = _ray_log_name_for_attempt(spec.phase, error_name)
     for name in (
-        _latest_worker_artifact_name(repo, prefix, spec.phase, "console"),
+        *console_names,
         error_name,
         *([ray_name] if ray_name else []),
     ):

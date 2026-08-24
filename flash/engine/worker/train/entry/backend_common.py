@@ -25,13 +25,14 @@ from concurrent.futures import thread as _thread_module
 from http.server import ThreadingHTTPServer
 from typing import Self
 
-# verl 0.8.0 exactly, plus the truncation-mask, 3d position-id, and ulysses fused-label fixes.
+# verl 0.8.0 exactly, plus the truncation-mask, 3d position-id, and ulysses fused-label fixes, the
+# whole-adapter lora bucket sync, and the fused-linear grad-flag preservation.
 # it must stay on the 0.8.0 base: the opd plugin patches 0.8.0 internals and imports
 # verl.trainer.main_ppo_sync, which verl deleted after 0.8.0, and opd's exact-version gate reads the
 # version file this branch pins to the release value.
 VERL_REQUIREMENT_NAME = "verl"
 VERL_REQUIREMENT_URL = (
-    "git+https://github.com/freesolo-co/verl@32d6200de81dc484893baf8b9cf30297ebe7fa49"
+    "git+https://github.com/freesolo-co/verl@f71a02ddb32a9c6a6915f7519bda6dede92e9dd0"
 )
 # the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
 # same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
@@ -92,11 +93,13 @@ CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
 # installed version. An earlier revision of this comment claimed a 5.13 import-path move made them
 # answer False; that mechanism does not exist. See Dockerfile.worker's sanity block.
 TRANSFORMERS_REQUIREMENT = "transformers>=5.6,<5.13"
+# exact deployed install and override pin; the range above remains public package metadata.
+TRANSFORMERS_INSTALL_REQUIREMENT = "transformers==5.12.1"
 
 # the stamp must identify every separately installed package the venv holds. omitting flash-attn,
-# fla, causal_conv1d, or the transformers range lets an older partial venv match forever; conv1d
+# fla, causal_conv1d, or the exact transformers pin lets an older partial venv match forever; conv1d
 # leaves GRPO/OPD failing ``require_gdn_boundary_resets`` with no rebuild path, and a stale venv
-# resolved before the transformers pin keeps training on an out-of-range transformers indefinitely.
+# resolved before the transformers pin keeps training on a different transformers indefinitely.
 # bump when a repair applied at build time changes what a fully provisioned venv looks like. the
 # libcudart repair runs only on the rebuild path, so a venv stamped by a release that predates it
 # matches, is reused, and keeps tilelang's original stub -- vLLM then aborts its import in the child
@@ -110,7 +113,8 @@ VERL_VENV_BUILD_REPAIRS = "libcudart-stub-neutralized-v1"
 # digest instead of letting it match forever and reuse an install that was never re-verified.
 VERL_VENV_STAMP = (
     f"{VERL_REQUIREMENT}\n{FLASH_ATTN_INSTALL_SPEC}\n{FLA_REQUIREMENT}\n{FLASH_QLA_REQUIREMENT}\n"
-    f"{CAUSAL_CONV1D_REQUIREMENT}\n{TRANSFORMERS_REQUIREMENT}\n{VERL_VENV_BUILD_REPAIRS}"
+    f"{CAUSAL_CONV1D_REQUIREMENT}\n{TRANSFORMERS_INSTALL_REQUIREMENT}\n"
+    f"{VERL_VENV_BUILD_REPAIRS}"
 )
 
 
@@ -927,6 +931,7 @@ from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
     _CAPABILITIES_UNAVAILABLE,
     _CAPABILITY_PROBE,
     _CAPABILITY_PROBE_TIMEOUT_S,
+    actor_fsdp_strategy_overrides,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
     probe_verl_capabilities,

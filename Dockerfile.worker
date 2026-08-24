@@ -11,9 +11,10 @@
 #   # then make the GHCR package public (org packages settings) once.
 #
 # Base is torch 2.10 / cu12.8 / cudnn9 (-devel = has nvcc for any source builds); it ships the
-# CUDA 12.8 runtime libs the PyPI wheels link against. The pinned stack mirrors
-# flash/providers/_lifecycle/net/worker.py:WORKER_DEPS.
-FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
+# CUDA 12.8 runtime libs the PyPI wheels link against. The exact install block below is the deployed
+# worker stack source of truth; the fallback verl venv is kept in lockstep in capabilities.py.
+# digest-pinned so worker rebuilds reuse the exact torch and cuda base image bytes.
+FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel@sha256:b574d4ccf6d8856a5d87dcadc667aa4f95dc18d337ef3a28d02b7b01897d7081
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
@@ -47,23 +48,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && rm -rf /var/lib/apt/lists/*
 
 # The pinned worker stack (torch already in the base image, version-matched so pip skips it).
+# exact pins preserve the already-resolved worker environment across image rebuilds.
 RUN pip install --no-cache-dir \
-    "transformers>=5.6,<5.13" \
-    "peft>=0.19" \
+    "transformers==5.12.1" \
+    "peft==0.20.0" \
     "vllm==0.19.1" \
     "flashinfer-python==0.6.6" \
-    "bitsandbytes>=0.49" \
-    "datasets>=4.7,<6" \
-    "huggingface_hub>=1.2.0" \
-    "accelerate>=1.4" \
-    "wandb>=0.17" \
+    "bitsandbytes==0.50.1" \
+    "datasets==5.0.1" \
+    "huggingface_hub==1.28.0" \
+    "accelerate==1.14.0" \
+    "wandb==0.28.2" \
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@9c8e42e762fce087c27b673af4922795d9edb85e" \
     "flash-qla==0.1.2" \
     "tilelang==0.1.9" \
     "apache-tvm-ffi==0.1.9" \
-    "hf_transfer" \
-    "freesolo>=0.4.1" \
-    "runpod"
+    "hf_transfer==0.1.9" \
+    "freesolo==0.4.1" \
+    "runpod==1.12.0"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
 # miscomputed with Triton>=3.4 (fla #640) — the fix is fla's TILELANG backend (correct there), so
@@ -310,22 +312,22 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # fallback protects nobody and a vllm respin breaks launch on the default image alone. Keep them in
 # lockstep with verl/capabilities.py's install list.
 #
-# transformers is pinned to the SAME range as the main interpreter (>=5.6,<5.13) and in the override
-# file, not just the direct list -- verl and vllm both depend on transformers, so without the
-# override a transitive requirement re-widens it. The venv is the interpreter that TRAINS, and
-# transformers owns the gdn modelling code the boundary-reset shim patches (chunk_gated_delta_rule,
-# the causal conv, and the kwargs they read), so leaving it unbounded means the training path rides
-# a transformers line nothing validated. The main interpreter carrying the pin protects nothing in
-# here (/opt/verl-venv is built without --system-site-packages). Raising this ceiling means
-# re-validating the gdn shim against the new line, not just bumping the number.
+# transformers is exact-pinned in both the direct list and override file to the version this image
+# already resolved. verl and vllm both depend on transformers, so without the exact override a
+# transitive requirement can re-widen even an exact direct pin. the
+# venv is the interpreter that trains, and transformers owns the gdn modelling code the boundary-
+# reset shim patches (chunk_gated_delta_rule, the causal conv, and the kwargs they read). the main
+# interpreter carrying an exact pin protects nothing in here (/opt/verl-venv is built without
+# --system-site-packages). changing this exact pin means re-validating the gdn shim against the new
+# version, not just bumping the number.
 #
 # This pin is NOT what makes the sanity block below pass. is_flash_linear_attention_available() and
 # is_causal_conv1d_available() are byte-identical in 5.12.1 and 5.14.1, and both begin with
 # is_torch_cuda_available() -- they answer False on this cpu builder at every version. An earlier
 # revision of this comment blamed a 5.13 import-path move; no such move exists.
-ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@32d6200de81dc484893baf8b9cf30297ebe7fa49
+ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@f71a02ddb32a9c6a6915f7519bda6dede92e9dd0
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
-RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers>=5.6,<5.13" > /tmp/verl-overrides.txt \
+RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers==5.12.1" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
     && VIRTUAL_ENV=/opt/verl-venv uv pip install --python /opt/verl-venv/bin/python \
         --override /tmp/verl-overrides.txt \
@@ -333,12 +335,13 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
         "vllm==0.19.1" \
         "xgrammar==0.1.25" \
         "numpy==2.2.6" \
-        "transformers>=5.6,<5.13" \
-        "datasets>=4.7,<6" \
+        "transformers==5.12.1" \
+        "datasets==5.0.1" \
         "TransferQueue==0.1.7" \
-        "bitsandbytes>=0.49" qwen-vl-utils \
-        "wandb>=0.17" \
-        cachetools uvicorn fastapi torchvision tqdm pyarrow \
+        "bitsandbytes==0.50.1" "qwen-vl-utils==0.0.14" \
+        "wandb==0.28.2" \
+        "cachetools==7.1.7" "uvicorn==0.52.4" "fastapi==0.141.1" \
+        "torchvision==0.25.0" "tqdm==4.70.0" "pyarrow==25.0.1" \
         "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@9c8e42e762fce087c27b673af4922795d9edb85e" \
         "flash-qla==0.1.2" \
         "tilelang==0.1.9" \

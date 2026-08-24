@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.2.111"
+version = "1.2.112"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -24,8 +24,8 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# heavy deps for running the fine-tuning worker locally (on the gpu worker these are
-# installed by runpod flash from the dependency list in flash/providers/_lifecycle/net/worker.py).
+# heavy deps for running the fine-tuning worker locally (the deployed gpu worker installs its exact
+# stack in Dockerfile.worker, with the fallback verl venv mirrored in capabilities.py).
 gpu = [
     "torch==2.10.0",
     "transformers>=5.6,<5.13",
@@ -55,11 +55,13 @@ gpu = [
 # sft cost, dry-run, and submit statically read packaged rows plus the defined training contract.
 # environment.py is not imported; other environment prompt transformations remain estimate gaps.
 server = [
-    "fastapi",
-    "uvicorn",
+    # 0.136 floor keeps modal's serving+serve-runtime pair solvable under vllm's resolver-only <0.137
+    # ceiling (omitted from its registry metadata); server alone still resolves fastapi 0.141.1.
+    "fastapi>=0.136,<1",
+    "uvicorn>=0.52,<1",
     # customer-owned modal lifecycle mutations execute in the control plane.
     "modal==1.5.4",
-    "runpod-flash",
+    "runpod-flash>=1.19,<2",
     "httpx>=0.27",
     "jsonschema>=4.23",
     "referencing>=0.28.4",
@@ -89,7 +91,9 @@ serving = [
     # nothing else here guarantees it -- modal does not depend on fastapi -- so installing this
     # extra alone could not import the app it exists to run. CI only passed because it also
     # installs `server`, which happens to carry fastapi.
-    "fastapi",
+    # modal installs this beside serve-runtime, whose vllm resolver-only ceiling is fastapi<0.137;
+    # the shared 0.136 floor is required even though serving alone would resolve fastapi 0.141.1.
+    "fastapi>=0.136,<1",
     # the same exact pin as `server`, deliberately. both extras drive the same modal lifecycle, and
     # this one is what the serving image installs ALONE -- so a range here lets the container
     # resolve a different modal than the control plane was validated against, on a rebuild that
@@ -111,10 +115,12 @@ serving = [
 # dependencies validated by the current production serving image. vllm stays exact until a real-gpu
 # base plus lora canary validates a replacement.
 serve-runtime = [
-    "fastapi",
-    "uvicorn",
+    # vllm==0.23.0 has a resolver-only fastapi<0.137 ceiling omitted from its registry metadata;
+    # modal installs this with serving, so both share the 0.136 floor while this extra keeps the ceiling.
+    "fastapi>=0.136,<0.137",
+    "uvicorn>=0.52,<1",
     "huggingface-hub>=1.2.0",
-    "safetensors",
+    "safetensors>=0.8,<1",
     "pillow>=11.0.0",
     # same range as every other extra: the serving image resolves from these bounds rather than the
     # lockfile, so an unbounded declaration silently rides a transformers line nothing validated.
@@ -125,14 +131,17 @@ serve-runtime = [
 dev = [
     "mypy>=1.13.0",
     "pytest>=9.0.3",
+    # dependency contract tests parse exact pins without relying on a transitive install.
+    "packaging>=24,<27",
     # Upper bound tracks uv.lock (ruff 0.16.x), which is what CI lints with. Without it, an
     # install that ignores the lockfile (`uv pip install -e '.[dev]'`, plain pip) resolves whatever
     # ruff is newest, whose added rules fail on a tree CI calls clean. Raise both sites together
     # with the lockfile, never ahead of it.
     "ruff>=0.6,<0.17",
-    "fastapi",
-    "uvicorn",
-    "runpod-flash",
+    # mirror server's 0.136 floor so dev remains compatible with the deployed serving extra pair.
+    "fastapi>=0.136,<1",
+    "uvicorn>=0.52,<1",
+    "runpod-flash>=1.19,<2",
     "httpx>=0.27",
     "jsonschema>=4.23",
     "referencing>=0.28.4",
@@ -169,7 +178,8 @@ flash-cli = "flash.cli:main"
 flash-server = "flash.server.__main__:main"
 
 [build-system]
-requires = ["hatchling"]
+# bound the build backend to the validated major line for reproducible package builds.
+requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -185,7 +195,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.2.111"
+version = "1.2.112"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -218,6 +228,8 @@ conflicts = [
 dev = [
     "mypy>=1.13.0",
     "pytest>=9.0.3",
+    # dependency contract tests parse exact pins without relying on a transitive install.
+    "packaging>=24,<27",
     # Keep in lockstep with the `dev` extra above and with uv.lock.
     "ruff>=0.6,<0.17",
     # Offline worker/env tests import these without the heavy `gpu` stack; the CI test env
