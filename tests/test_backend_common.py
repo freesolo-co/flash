@@ -4866,29 +4866,31 @@ def test_fused_expert_targets_select_fsdp2():
     # (raise at parametrize.py:639), True leaves FSDP.__getattr__ resolving it from the wrapped
     # module so `hasattr` stays True and the bare assert fires (parametrize.py:634). only fsdp2's
     # fully_shard keeps the parameter under its own name with no wrapper indirection.
-    from flash.engine.worker.verl.capabilities import fused_expert_strategy_overrides
+    from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
 
-    assert fused_expert_strategy_overrides(
-        ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
-    ) == ["actor_rollout_ref.actor.strategy=fsdp2"]
+    assert actor_fsdp_strategy_overrides(["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]) == [
+        "actor_rollout_ref.actor.strategy=fsdp2"
+    ]
 
 
-@pytest.mark.parametrize("empty", [None, [], (), ""])
+@pytest.mark.parametrize("empty", [None, []])
 def test_dense_models_stay_on_fsdp1(empty):
     # a dense model's lora lives on wrapper MODULES swapped in at injection, so no parametrization
     # is ever registered and fsdp1 is fine. the key is still written rather than omitted, so the
     # dense default is stated once here instead of being inherited from verl's yaml.
-    from flash.engine.worker.verl.capabilities import fused_expert_strategy_overrides
+    # only None and [] are exercised: resolve_lora_targeting hands back a list or None, so a bare
+    # string or tuple is not a shape this boundary can produce.
+    from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
 
-    assert fused_expert_strategy_overrides(empty) == ["actor_rollout_ref.actor.strategy=fsdp"]
+    assert actor_fsdp_strategy_overrides(empty) == ["actor_rollout_ref.actor.strategy=fsdp"]
 
 
-def test_fused_expert_strategy_uses_a_bare_override_not_an_append():
+def test_actor_fsdp_strategy_uses_a_bare_override_not_an_append():
     # `strategy` is declared in verl's actor/dp_actor.yaml:26, so hydra already has the key. a '+'
     # prefix would be an append to an existing key and fail the config merge.
-    from flash.engine.worker.verl.capabilities import fused_expert_strategy_overrides
+    from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
 
-    (override,) = fused_expert_strategy_overrides(["mlp.experts.gate_up_proj"])
+    (override,) = actor_fsdp_strategy_overrides(["mlp.experts.gate_up_proj"])
     assert not override.startswith("+")
     assert override.startswith("actor_rollout_ref.actor.strategy=")
 
