@@ -2298,11 +2298,18 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
         eos_token = "<eos>"
 
         def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+            self,
+            messages,
+            *,
+            tokenize,
+            add_generation_prompt,
+            enable_thinking,
+            preserve_thinking,
         ):
             assert messages == [{"role": "user", "content": "go"}]
             assert add_generation_prompt is True
             assert enable_thinking is True
+            assert preserve_thinking is False
             if tokenize:
                 return [10, 11]
             return "<|im_start|>assistant\n<think>\n"
