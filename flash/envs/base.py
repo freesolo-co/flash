@@ -180,7 +180,7 @@ def with_system_prompt(messages: list[dict], contract_text: str) -> list[dict]:
     return [{"role": "system", "content": system_text}, *out]
 
 
-FREESOLO_WORKER_SPEC = "freesolo>=0.4.1"
+FREESOLO_WORKER_SPEC = "freesolo>=0.4.2"
 
 
 def worker_pip_for_env(env_id: str) -> list[str]:
