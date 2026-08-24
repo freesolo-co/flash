@@ -145,12 +145,7 @@ def _retry_target(
     # guarantee. a cache-drop retry projects too: it leaves both sets untouched and so reuses
     # this class cold, which is exactly the escalation the generic line failed to describe.
     projected = None
-    if (
-        will_retry
-        and ctx.oom_vram_floor <= 0
-        and outcome.chosen is not None
-        and not outcome.quote_refresh_failed
-    ):
+    if will_retry and ctx.oom_vram_floor <= 0 and outcome.chosen is not None:
         projected = _lifecycle._projected_retry_class(
             outcome.candidates,
             ctx.failed_providers,

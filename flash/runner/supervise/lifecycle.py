@@ -21,45 +21,6 @@ RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
 
 
-class _SelectedQuoteUnaffordable(RuntimeError):
-    """The selected live candidate costs more than the owning organization can afford."""
-
-
-def _recheck_selected_quote_affordability(status, selected_quote: float, log) -> None:
-    """Recheck only a live quote that increases the amount accepted before allocation."""
-    accepted_quote = float(getattr(status, "estimated_cost_usd", 0.0) or 0.0)
-    if selected_quote <= accepted_quote:
-        return
-    context = getattr(status, "billing_context", None)
-    if not isinstance(context, dict):
-        return
-    org_id = str(context.get("org_id") or "").strip()
-    if not org_id:
-        return
-
-    from flash.server.platform.internal_client import internal_key
-
-    key = internal_key()
-    if not key:
-        return
-    try:
-        from flash.server.billing.charges import precheck_training_run
-
-        precheck_training_run(internal_key=key, org_id=org_id, estimate_usd=selected_quote)
-    except Exception as exc:
-        from flash.server.billing.charges import BillingError
-
-        if isinstance(exc, BillingError) and exc.status_code == 402:
-            raise _SelectedQuoteUnaffordable(
-                "selected live GPU quote exceeds the organization's available training balance"
-            ) from exc
-        print(
-            f"budget recheck skipped for selected quote (billing service error: {type(exc).__name__})",
-            file=log,
-            flush=True,
-        )
-
-
 @dataclass
 class _RetryBudget:
     infra_retries: int
@@ -337,8 +298,9 @@ def _run_training(
     metrics, verified_attempt = validate_terminal_source_metrics(get_status(spec.run_id), metrics)
     # measured wall x $/hr is recorded in metrics.json for analytics, but is not what we charge.
     measured_cost = prior_cost + _persist_metrics(spec, metrics)
-    # The customer is charged the submit-time QUOTE, not measured wall. Legacy runs without a
-    # persisted quote are re-priced from the spec, falling back only for old/unpriceable records.
+    # full planned work is charged at the submit-time quote, never measured wall. a worker that
+    # finishes fewer optimizer steps pays the matching estimated-work fraction; legacy records
+    # without a completed-step metric preserve the quote exactly.
     charge_usd = _status_estimated_charge(get_status(spec.run_id), spec, fallback=measured_cost)
     # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
     # Re-read before the terminal "done" so a late worker success doesn't resurrect a cancelled run.

@@ -951,7 +951,7 @@ from flash.cli.commands.prompt_budget import (  # noqa: E402
 from flash.cli.commands.train_cost import (  # noqa: E402,F401
     _client_train_schema,
     _cmd_train_cost,
-    _cmd_train_cost_offline,
+    _cmd_train_cost_rl,
     _cmd_train_cost_sft,
     _print_published_sft_environment_note,
     _print_reasoning_loss_warning,

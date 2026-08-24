@@ -317,3 +317,18 @@ def test_multi_card_still_beats_single_card(method):
     seconds = [sharded_step_seconds(config, "H100", n) for n in (1, 2, 4, 8)]
     for narrow, wide in pairwise(seconds):
         assert wide < narrow, f"{method}: adding cards must still shorten the step ({seconds})"
+
+
+def test_grpo_estimate_has_no_reward_latency_allowance():
+    """reward execution is customer code, so neither its identity nor latency can move the quote."""
+    from dataclasses import fields, replace
+
+    config = _config(method="grpo", environment="github:org/fast-reward")
+    names = {field.name for field in fields(RunConfig)}
+    assert not any("reward" in name and "model" not in name for name in names)
+    fast = seconds_per_step(config, "H100")
+    slow_identity = seconds_per_step(
+        replace(config, environment="github:org/arbitrarily-slow-reward"),
+        "H100",
+    )
+    assert slow_identity == fast
