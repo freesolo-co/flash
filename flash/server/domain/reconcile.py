@@ -2,17 +2,25 @@
 
 Reports provider COGS with the operator key, best-effort and off-path. Attribution uses the last
 `RunStatus.remote`, so multi-resource retries may be undercounted.
+
+The reported figure is the provider bill with the run's measured startup removed: the quote bills
+training wall only (cold start is reported, never charged), so comparing it against a bill that
+includes boot, model load and engine init would misread the unbilled policy as estimator error.
+The gross bill, the provider wall and the startup seconds ride along in ``source`` for audit.
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
+import math
+import os
 import time
 import urllib.request
+from dataclasses import replace
 
 from flash import runner
-from flash.providers.realized import realized_cost_for_remote
+from flash.providers.realized import RealizedCost, realized_cost_for_remote
 from flash.server.platform.auth import freesolo_base_url
 from flash.server.platform.internal_client import internal_key
 
@@ -59,6 +67,60 @@ def _report(body: dict) -> bool:
         return False
 
 
+def _measured_setup_seconds(status: runner.RunStatus) -> float | None:
+    """Worker-measured cold start (worker start -> first optimizer step) for this run.
+
+    Read from the ``metrics.json`` the lifecycle persists at ``status.artifacts_dir`` when the run
+    finishes; the worker stamps ``setup_seconds`` disjoint from its training-loop ``wall_seconds``.
+    None when the record is missing or unparseable (pre-instrumentation runs, runs that never
+    reached training), in which case the bill is reported un-stripped."""
+    if not status.artifacts_dir:
+        return None
+    try:
+        with open(os.path.join(status.artifacts_dir, "metrics.json")) as f:
+            metrics = json.load(f)
+    except (OSError, ValueError):
+        return None
+    value = metrics.get("setup_seconds") if isinstance(metrics, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def _exclude_startup(
+    realized: RealizedCost, *, setup_seconds: float | None, provider_wall: float | None
+) -> RealizedCost:
+    """Strip the measured startup from the provider bill at the run's realized $/s.
+
+    The bill is prorated by ``(wall - setup) / wall``, so the result is what the provider would
+    have charged for the training loop alone. ``wall`` is the provider's own billed wall when the
+    realized pull carries one, else the instance lifetime (``started_ts`` -> teardown). Startup is
+    clamped to the wall, so a run whose cold start swallowed the whole instance nets to $0 and is
+    still reported (the quote for such a run is the real miss, and hiding it would be worse).
+    Every itemized resource is scaled by the same share; the gross figures stay in ``source``."""
+    wall = realized.wall_seconds if realized.wall_seconds else provider_wall
+    audit = {
+        **realized.source,
+        "grossRealizedUsd": realized.realized_usd,
+        "providerWallSeconds": wall,
+        "setupSeconds": setup_seconds,
+    }
+    if setup_seconds is None or not wall or wall <= 0:
+        return replace(realized, source={**audit, "startupExcluded": False})
+    setup = min(setup_seconds, wall)
+    share = (wall - setup) / wall
+    return replace(
+        realized,
+        realized_usd=round(realized.realized_usd * share, 6),
+        by_resource={k: round(float(v) * share, 6) for k, v in realized.by_resource.items()},
+        wall_seconds=wall - setup,
+        source={**audit, "startupExcluded": True},
+    )
+
+
 def _terminal_ts(status: runner.RunStatus) -> float:
     """Return the immutable training-teardown time used for billing and eligibility."""
     if status.finished_at is None:
@@ -84,8 +146,9 @@ def _due(status: runner.RunStatus, now: float) -> bool:
 
 def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool:
     """Pull + report realized cost for one run; mark it reconciled on success. Returns True when
-    a positive realized cost was reported. A zero/None result leaves the run unreconciled so a
-    later cycle (within the window) retries once the provider invoice settles."""
+    a positive provider bill was pulled and reported (net of startup, which may round the
+    reported figure to $0). A zero/None pull leaves the run unreconciled so a later cycle
+    (within the window) retries once the provider invoice settles."""
     now = time.time() if now is None else now
     remote = status.remote or {}
     spec = status.spec or {}
@@ -104,6 +167,13 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     )
     if realized is None or realized.realized_usd <= 0:
         return False
+    # Drop the measured startup so the reported figure matches what the quote prices (training
+    # wall only). The gross bill is preserved in ``source``; see _exclude_startup.
+    realized = _exclude_startup(
+        realized,
+        setup_seconds=_measured_setup_seconds(status),
+        provider_wall=max(0.0, run_end - start),
+    )
 
     body = {
         "runId": status.run_id,

@@ -21,6 +21,11 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- Realized-cost reconciliation now strips the worker-measured startup (boot, model load, engine
+  init) from the provider bill before reporting it, so the estimator-accuracy comparison sees the
+  training-only cost the quote actually prices. The gross bill, the provider wall and the startup
+  seconds are kept in the report's `source` for audit; records without a measured startup are
+  reported un-stripped and flagged.
 - `[train] init_from_adapter` now works for every source/target algorithm pair. SFT was rejected as
   a warm-start target, so an adapter could be continued only by GRPO or OPD; that restriction
   described the retired trl SFT backend, and the verl backend that replaced it loads a warm-start
