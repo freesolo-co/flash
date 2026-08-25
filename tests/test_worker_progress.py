@@ -48,3 +48,44 @@ def test_failed_upload_reuses_sequence_and_chain_head(monkeypatch) -> None:
     assert [record.sequence for record, _required in records] == [1, 1]
     assert all(record.previous_digest is None for record, _required in records)
     assert progress_io._PROGRESS_SEQUENCE == 1
+
+
+def test_checkpoint_failure_is_sticky_until_a_successful_checkpoint(monkeypatch) -> None:
+    _reset(monkeypatch)
+    records = []
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda record, *, required: records.append(record) or True,
+    )
+    failure = {"step": 50, "operation": "resume", "error": "quota denied"}
+
+    progress_io.publish_progress(
+        "checkpoint_upload_failed", step=50, checkpoint_failure=failure
+    )
+    progress_io.publish_progress("sft_step", step=60)
+    assert records[-1].checkpoint == failure
+
+    progress_io.publish_progress("checkpoint_uploaded", step=75)
+    progress_io.publish_progress("sft_step", step=80)
+    assert records[-1].checkpoint == {}
+
+
+def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
+    long_name = "x" * 100_000
+
+    bounded = progress_io._bounded_reward_metrics(
+        {
+            long_name: 1.0,
+            "line\nbreak": 2.0,
+            "reward": 3.0,
+            "step": 4.0,
+        }
+    )
+
+    assert "x" * 64 in bounded
+    assert all(len(name) <= 64 for name in bounded)
+    assert "linebreak" in bounded
+    assert all("\n" not in name for name in bounded)
+    assert "reward" not in bounded
+    assert "step" not in bounded

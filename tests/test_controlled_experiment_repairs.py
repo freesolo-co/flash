@@ -290,15 +290,15 @@ def test_prefetch_error_classification():
 
 
 def test_prefetch_pinned_revision_does_not_swallow_download_failure(monkeypatch):
-    import flash.engine.worker.io.heartbeat as worker_heartbeat
     import flash.engine.worker.io.hf as worker_hf
     import flash.engine.worker.io.prefetch as worker_prefetch
+    import flash.engine.worker.io.progress as worker_progress
     import flash.engine.worker.perf as worker_perf
 
     monkeypatch.setattr(worker_prefetch, "_shared_weight_cache_dir", lambda: None)
     monkeypatch.setattr(worker_hf, "_require_hf_deadline_allowance", lambda: None)
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_progress, "publish_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
         lambda **kwargs: (_ for _ in ()).throw(ValueError("revision not found")),
@@ -311,9 +311,9 @@ def test_prefetch_pinned_revision_does_not_swallow_download_failure(monkeypatch)
 def test_prefetch_pinned_revision_wraps_transient_download_failure(monkeypatch):
     from requests.exceptions import Timeout
 
-    import flash.engine.worker.io.heartbeat as worker_heartbeat
     import flash.engine.worker.io.hf as worker_hf
     import flash.engine.worker.io.prefetch as worker_prefetch
+    import flash.engine.worker.io.progress as worker_progress
     import flash.engine.worker.perf as worker_perf
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
 
@@ -321,7 +321,7 @@ def test_prefetch_pinned_revision_wraps_transient_download_failure(monkeypatch):
     monkeypatch.setattr(worker_prefetch, "_shared_weight_cache_dir", lambda: None)
     monkeypatch.setattr(worker_hf, "_require_hf_deadline_allowance", lambda: None)
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_progress, "publish_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
         lambda **kwargs: (_ for _ in ()).throw(transient),
