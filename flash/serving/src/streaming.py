@@ -147,6 +147,8 @@ class _StreamOutput:
                 with contextlib.suppress(asyncio.QueueEmpty):
                     while True:
                         self._output.get_nowait()
+            elif self._output.full():
+                self._output.get_nowait()
             self._output.put_nowait((None, None))
             return
         await self._output.put((None, None))
@@ -268,6 +270,7 @@ async def _produce_openai_chat_stream(
         except UsageOutboxError:
             with contextlib.suppress(UsageOutboxError):
                 await usage_session.capture(final)
+            usage_session.relinquish()
             await stream_output.terminal(
                 stream_output.error(
                     "Durable serving accounting finalization failed.",

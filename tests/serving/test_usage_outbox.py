@@ -15,13 +15,18 @@ from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord
 from flash.serving.src.serving_io import _sse
 from flash.serving.src.settings import Settings
-from flash.serving.src.streaming import _produce_openai_chat_stream, openai_chat_stream
+from flash.serving.src.streaming import (
+    _produce_openai_chat_stream,
+    _StreamOutput,
+    openai_chat_stream,
+)
 from flash.serving.src.usage import (
     _FREESOLO_USD_PER_MTOK,
     build_usage_session,
     freesolo_price,
     new_generation_id,
 )
+from flash.serving.src.usage_facts import usage_facts
 from flash.serving.src.usage_outbox import (
     AcceptedPriceSnapshot,
     AuthoritativeProviderDay,
@@ -269,6 +274,27 @@ def test_durable_identity_rejects_reused_correlation_or_public_id() -> None:
             correlation_id="correlation-1",
             openai_completion_id=generation_id,
         )
+
+
+@pytest.mark.parametrize("token_ids", [{}, {"prompt_token_ids": [], "completion_token_ids": []}])
+def test_empty_or_omitted_token_ids_preserve_resolved_scalar_counts(
+    token_ids: dict[str, list[int]],
+) -> None:
+    facts = usage_facts(
+        {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "cached_tokens": 2,
+            "cached_tokens_reported": True,
+            "reasoning_tokens": 0,
+            **token_ids,
+        }
+    )
+
+    assert facts.prompt_tokens == 5
+    assert facts.completion_tokens == 3
+    assert facts.cached_tokens == 2
+    assert facts.cached_tokens <= facts.prompt_tokens
 
 
 def test_nonstream_capture_is_awaited_before_successful_response() -> None:
@@ -523,6 +549,8 @@ def _usage_event() -> UsageEvent:
         {
             "prompt_token_ids": [1, 2],
             "completion_token_ids": [],
+            "prompt_tokens": 2,
+            "completion_tokens": 0,
             "cached_tokens": 0,
             "cached_tokens_reported": True,
             "reasoning_tokens": 0,
@@ -844,24 +872,26 @@ def test_heartbeat_batches_exact_active_generation_authority() -> None:
 
 
 @pytest.mark.parametrize("terminal_operation", ["finalize", "fail"])
-def test_heartbeat_ignores_generation_terminalized_during_inflight_rpc(
+def test_heartbeat_ignores_generation_terminalized_before_terminal_rpc_returns(
     terminal_operation: str,
 ) -> None:
     event = _usage_event()
     heartbeat_entered = asyncio.Event()
+    terminal_effect_committed = asyncio.Event()
     release_heartbeat = asyncio.Event()
+    release_terminal_response = asyncio.Event()
 
     async def delayed_heartbeat() -> tuple[int, Any]:
         heartbeat_entered.set()
         await release_heartbeat.wait()
         return 200, []
 
-    client = _QueuedClient(
-        [
-            delayed_heartbeat,
-            (200, [{"state": "pending", "replay": False}]),
-        ]
-    )
+    async def delayed_terminal_response() -> tuple[int, Any]:
+        terminal_effect_committed.set()
+        await release_terminal_response.wait()
+        return 200, [{"state": "pending", "replay": False}]
+
+    client = _QueuedClient([delayed_heartbeat, delayed_terminal_response])
     outbox = DurableUsageOutbox(
         _outbox_settings(), client=client, worker_id="worker-1", sleep=_no_sleep
     )
@@ -870,16 +900,22 @@ def test_heartbeat_ignores_generation_terminalized_during_inflight_rpc(
     async def run() -> None:
         heartbeat = asyncio.create_task(outbox._heartbeat_active_generations())
         await heartbeat_entered.wait()
-        if terminal_operation == "finalize":
-            await outbox.finalize(event)
-        else:
-            await outbox.fail(event, "client_disconnected")
+        terminal = asyncio.create_task(
+            outbox.finalize(event)
+            if terminal_operation == "finalize"
+            else outbox.fail(event, "client_disconnected")
+        )
+        await terminal_effect_committed.wait()
         release_heartbeat.set()
         await heartbeat
+        assert not terminal.done()
+        release_terminal_response.set()
+        await terminal
 
     asyncio.run(run())
 
     assert event.identity.request_id not in outbox._active_generations
+    assert event.identity.request_id not in outbox._terminal_generations
     assert outbox._background_error is None
 
 
@@ -1319,6 +1355,7 @@ class _StreamSession:
         self.captured: list[dict[str, Any]] = []
         self.finalized: list[dict[str, Any]] = []
         self.failed: list[tuple[dict[str, Any], str]] = []
+        self.relinquished = 0
 
     async def capture(self, result: dict[str, Any]) -> None:
         self.captured.append(result.copy())
@@ -1330,6 +1367,9 @@ class _StreamSession:
 
     async def fail(self, result: dict[str, Any], code: str) -> None:
         self.failed.append((result.copy(), code))
+
+    def relinquish(self) -> None:
+        self.relinquished += 1
 
 
 def _stream_events(generation_id: str):
@@ -1488,6 +1528,70 @@ def test_stream_finalization_failure_emits_terminal_sse_error_and_snapshot() -> 
     assert any(b'"type":"accounting_error"' in chunk for chunk in chunks)
     assert chunks[-1] == _sse("[DONE]")
     assert session.captured[-1]["type"] == "final"
+    assert session.relinquished == 1
+
+
+def test_failed_stream_finalization_relinquishes_heartbeat_for_stale_recovery() -> None:
+    event = _usage_event()
+    record = _revision()
+    client = _QueuedClient(
+        [
+            (500, {"error": "finalize failed"}),
+            (
+                200,
+                [
+                    {
+                        "state": "in_progress",
+                        "lease_seconds": 120,
+                        "heartbeat_seconds": 20,
+                    }
+                ],
+            ),
+            (200, []),
+        ]
+    )
+    outbox = DurableUsageOutbox(_outbox_settings(), client=client, worker_id="worker-1")
+    outbox._active_generations.add(event.identity.request_id)
+    session = build_usage_session(
+        outbox,
+        event.identity,
+        event.principal,
+        record,
+        record,
+        {"checkpoint": record.checkpoint, "lora_request_adapter": record.adapter_id},
+        deployment_id="deployment-1",
+        serving_release="release-1",
+        captured_at=event.captured_at,
+    )
+
+    async def run() -> list[bytes]:
+        chunks = [
+            chunk
+            async for chunk in openai_chat_stream(
+                AdapterRouter([record]),
+                record=record,
+                events=_stream_events(event.identity.request_id),
+                adapter_id=record.adapter_id,
+                completion_id="chatcmpl-stream",
+                created=123,
+                include_usage=True,
+                usage_session=session,
+            )
+        ]
+        await outbox._heartbeat_active_generations()
+        await outbox.recover_stale_in_progress()
+        return chunks
+
+    chunks = asyncio.run(run())
+
+    assert any(b'"type":"accounting_error"' in chunk for chunk in chunks)
+    assert event.identity.request_id not in outbox._active_generations
+    assert event.identity.request_id not in outbox._generation_lease_deadlines
+    assert [call[0].rsplit("/", 1)[-1] for call in client.calls] == [
+        "finalize_serving_usage",
+        "capture_serving_usage",
+        "recover_stale_serving_generations",
+    ]
 
 
 def test_pre_response_disconnect_persists_ready_snapshot_and_closes_iterator() -> None:
@@ -1517,6 +1621,35 @@ def test_pre_response_disconnect_persists_ready_snapshot_and_closes_iterator() -
     assert session.failed[-1][0]["type"] == "ready"
     assert session.failed[-1][1] == "client_disconnected"
     assert session.finalized == []
+
+
+def test_finish_makes_sentinel_space_after_blocked_terminal_refills_queue() -> None:
+    output: asyncio.Queue[tuple[bytes | None, Exception | None]] = asyncio.Queue(maxsize=3)
+    disconnected = asyncio.Event()
+    stream_output = _StreamOutput(
+        output,
+        disconnected,
+        completion_id="chatcmpl-blocked",
+        created=123,
+        adapter_id="adapter-1",
+    )
+
+    async def run() -> list[bytes | None]:
+        for chunk in (b"old-1", b"old-2", b"old-3"):
+            output.put_nowait((chunk, None))
+        terminal = asyncio.create_task(stream_output.terminal(b"terminal"))
+        await asyncio.sleep(0)
+        assert not terminal.done()
+        disconnected.set()
+        output.get_nowait()
+        await terminal
+        assert output.full()
+        await stream_output.finish()
+        return [output.get_nowait()[0] for _ in range(output.qsize())]
+
+    queued = asyncio.run(run())
+
+    assert queued == [b"old-3", b"terminal", None]
 
 
 def test_full_stream_queue_disconnect_does_not_block_cleanup_sentinel() -> None:

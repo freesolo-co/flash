@@ -697,7 +697,7 @@ def _base_model_records() -> list:
             repo_id=m,
             base_model=m,
             serve_base_model=True,
-            thinking=True,
+            thinking=False,
             org_id=None,
             status="ready",
         )

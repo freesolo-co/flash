@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import Request
 
 from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.usage_facts import usage_facts
 from flash.serving.src.usage_outbox import (
     CapturedPrice,
     FreesoloOrgTrafficPrincipal,
@@ -20,7 +21,6 @@ from flash.serving.src.usage_outbox import (
     TrustedInternalTrafficPrincipal,
     UsageEvent,
     UsageStore,
-    usage_facts,
 )
 
 FREESOLO_PRICING_SOURCE = "freesolo_backend_catalog"
@@ -89,6 +89,10 @@ class UsageSession:
     async def fail(self, result: dict[str, Any], code: str) -> None:
         if self.store.enabled:
             await self.store.fail(self.event(result), code)
+
+    def relinquish(self) -> None:
+        if self.store.enabled:
+            self.store.relinquish(self.identity.request_id)
 
 
 def new_generation_id() -> str:

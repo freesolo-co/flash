@@ -149,6 +149,44 @@ def test_base_model_serve_records_the_authorized_org_principal() -> None:
     assert event.target.base_model == QWEN
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/generate", {"adapter_id": QWEN, "prompt": "hi"}),
+        (
+            "/v1/chat/completions",
+            {"model": QWEN, "messages": [{"role": "user", "content": "hi"}]},
+        ),
+    ],
+)
+def test_default_base_model_request_shapes_are_settleable(path, payload) -> None:
+    client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
+
+    response = client.post(path, json=payload, headers={"Authorization": "Bearer k"})
+
+    assert response.status_code == 200
+    assert len(store.finalized) == 1
+    assert store.finalized[0].facts.reasoning_tokens == 0
+
+
+def test_explicit_base_model_thinking_remains_rejected_before_settlement() -> None:
+    client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
+
+    response = client.post(
+        "/generate",
+        json={
+            "adapter_id": QWEN,
+            "prompt": "hi",
+            "chat_template_kwargs": {"enable_thinking": True},
+        },
+        headers={"Authorization": "Bearer k"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "thinking generation accounting is unavailable"}
+    assert store.finalized == []
+
+
 def test_base_model_via_internal_key_is_durably_unattributed() -> None:
     client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
     resp = _chat(client, QWEN, **{"X-Freesolo-Internal-Key": INTERNAL_KEY})
@@ -243,7 +281,8 @@ def test_base_model_records_seed_one_open_record_per_model(modal_app_module):
     recs = modal_app_module._base_model_records()
     assert {r.adapter_id for r in recs} == set(base_models())
     assert all(
-        r.serve_base_model and r.org_id is None and r.adapter_id == r.base_model for r in recs
+        r.serve_base_model and not r.thinking and r.org_id is None and r.adapter_id == r.base_model
+        for r in recs
     )
 
 

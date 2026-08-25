@@ -241,6 +241,7 @@ class UsageStore(Protocol):
     async def capture(self, event: UsageEvent) -> None: ...
     async def finalize(self, event: UsageEvent) -> None: ...
     async def fail(self, event: UsageEvent, code: str) -> None: ...
+    def relinquish(self, request_id: str) -> None: ...
     async def snapshot(self) -> OutboxSnapshot: ...
     async def recover_stale_in_progress(self) -> None: ...
     async def aclose(self) -> None: ...
@@ -262,6 +263,9 @@ class OfflineUsageStore:
 
     async def fail(self, event: UsageEvent, code: str) -> None:
         del event, code
+
+    def relinquish(self, request_id: str) -> None:
+        del request_id
 
     async def snapshot(self) -> OutboxSnapshot:
         raise UsageOutboxError("usage_outbox_disabled")
@@ -417,6 +421,7 @@ class DurableUsageOutbox:
         self._heartbeat_seconds: int | None = None
         self._generation_lease_seconds: int | None = None
         self._active_generations: set[str] = set()
+        self._terminal_generations: set[str] = set()
         self._generation_lease_deadlines: dict[str, datetime] = {}
         self._active_leases: set[str] = set()
         self._background_error: BaseException | None = None
@@ -444,19 +449,31 @@ class DurableUsageOutbox:
             self._heartbeat_wake.set()
 
     async def finalize(self, event: UsageEvent) -> None:
-        self._raise_background_error()
-        await self._generation_rpc("finalize_serving_usage", event)
-        request_id = event.identity.request_id
-        self._active_generations.discard(request_id)
-        self._generation_lease_deadlines.pop(request_id, None)
+        await self._terminal_rpc("finalize_serving_usage", event)
         self._wake.set()
-        self._heartbeat_wake.set()
 
     async def fail(self, event: UsageEvent, code: str) -> None:
+        await self._terminal_rpc("fail_serving_generation", event, failure_code=code)
+
+    async def _terminal_rpc(
+        self, name: str, event: UsageEvent, *, failure_code: str | None = None
+    ) -> None:
         self._raise_background_error()
-        await self._generation_rpc("fail_serving_generation", event, failure_code=code)
         request_id = event.identity.request_id
+        self._terminal_generations.add(request_id)
+        try:
+            await self._generation_rpc(name, event, failure_code=failure_code)
+        except asyncio.CancelledError:
+            self.relinquish(request_id)
+            raise
+        except Exception:
+            self._terminal_generations.discard(request_id)
+            raise
+        self.relinquish(request_id)
+
+    def relinquish(self, request_id: str) -> None:
         self._active_generations.discard(request_id)
+        self._terminal_generations.discard(request_id)
         self._generation_lease_deadlines.pop(request_id, None)
         self._heartbeat_wake.set()
 
@@ -699,7 +716,9 @@ class DurableUsageOutbox:
                 expires_at = row.get("generation_lease_expires_at")
                 if request_id in self._active_generations and expires_at is not None:
                     self._generation_lease_deadlines[request_id] = _parse_datetime(expires_at)
-            missing = (set(batch) - renewed) & self._active_generations
+            missing = (
+                (set(batch) - renewed) & self._active_generations
+            ) - self._terminal_generations
             if missing:
                 self._active_generations.difference_update(missing)
                 for request_id in missing:
@@ -941,50 +960,6 @@ def _parse_datetime(value: Any) -> datetime:
     if parsed.tzinfo is None:
         raise UsageOutboxError("usage_snapshot_timestamp_invalid")
     return parsed
-
-
-def exact_reasoning_tokens(result: Mapping[str, Any]) -> int:
-    """Return an exact count or refuse to guess from rendered text or delimiters."""
-    exact = result.get("reasoning_tokens")
-    if isinstance(exact, int) and not isinstance(exact, bool) and exact >= 0:
-        return exact
-    if result.get("thinking") is False:
-        return 0
-    raise ReasoningSettlementUnavailable("exact_reasoning_tokens_unavailable")
-
-
-def usage_facts(result: Mapping[str, Any]) -> UsageFacts:
-    prompt_ids = result.get("prompt_token_ids")
-    completion_ids = result.get("completion_token_ids", result.get("token_ids"))
-    prompt_tokens = result.get("prompt_tokens")
-    completion_tokens = result.get("completion_tokens")
-    if isinstance(prompt_ids, list):
-        prompt_tokens = len(prompt_ids)
-    if isinstance(completion_ids, list):
-        completion_tokens = len(completion_ids)
-    if not isinstance(prompt_tokens, int) or not isinstance(completion_tokens, int):
-        raise UsageOutboxError("native_token_ids_unavailable")
-    cached = result.get("cached_tokens")
-    cached_tokens = int(cached) if isinstance(cached, int) and not isinstance(cached, bool) else 0
-    cached_reported = result.get("cached_tokens_reported")
-    cached_tokens_reported = type(cached_reported) is bool and cached_reported
-    if min(prompt_tokens, completion_tokens, cached_tokens) < 0 or cached_tokens > prompt_tokens:
-        raise UsageOutboxError("usage_counters_invalid")
-    duration = result.get("inference_time_seconds")
-    if duration is not None:
-        duration = float(duration)
-        if duration < 0:
-            raise UsageOutboxError("usage_duration_invalid")
-    replica = result.get("engine_replica_id")
-    return UsageFacts(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        cached_tokens=cached_tokens,
-        cached_tokens_reported=cached_tokens_reported,
-        reasoning_tokens=exact_reasoning_tokens(result),
-        generation_duration_seconds=duration,
-        engine_replica_id=replica if isinstance(replica, str) and replica else None,
-    )
 
 
 def accepted_price_micro_usd(snapshot: AcceptedPriceSnapshot, facts: UsageFacts) -> int:

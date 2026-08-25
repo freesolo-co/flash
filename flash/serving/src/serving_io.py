@@ -115,6 +115,7 @@ def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> J
     provenance = _revision_provenance(target, active_checkpoint)
     internal_fields = {
         "cached_tokens_reported",
+        "completion_token_ids",
         "engine_replica_id",
         "lora_request_adapter",
         "prompt_token_ids",

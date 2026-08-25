@@ -169,6 +169,7 @@ class FakePool:
                 "text": f"[{base_model}] reply",
                 "finish_reason": "stop",
                 "prompt_token_ids": [4, 5],
+                "completion_token_ids": [1, 2, 3],
                 "token_ids": [1, 2, 3],
                 "inference_time_seconds": 0.01,
                 "checkpoint": checkpoint,
@@ -635,6 +636,7 @@ def test_raw_generate_responses_exclude_internal_fields(app_setup, path, payload
     assert body["token_ids"] == [1, 2, 3]
     assert body["text"] == f"[{QWEN}] reply"
     assert "prompt_token_ids" not in body
+    assert "completion_token_ids" not in body
     # none of the old camelcase spellings survive anywhere in the response.
     for camel in ("adapterId", "finishReason", "tokenIds", "inferenceTimeSeconds", "requestId"):
         assert camel not in body
