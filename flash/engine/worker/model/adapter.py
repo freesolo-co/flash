@@ -8,6 +8,7 @@ import shutil
 from collections.abc import Mapping
 from typing import Any
 
+import flash.engine.worker.runtime.state as _worker_state
 from flash.adapters.fused_experts import (
     has_complete_fused_expert_tensors,
     lora_target_parameters,
@@ -27,7 +28,6 @@ from flash.engine.worker.model.lora import (
     _read_adapter_tensor_keys,
     _read_adapter_tensor_metadata,
 )
-from flash.engine.worker.runtime.pkg_proxy import W as _w
 
 _ADAPTER_DOWNLOAD_RETRIES = 4
 _ADAPTER_DOWNLOAD_BACKOFF_S = 5.0
@@ -71,9 +71,11 @@ def make_lora(model_id: str, *, algorithm: str = "sft", multimodal: bool = False
     from peft import LoraConfig
 
     targeting = resolve_lora_targeting(model_id, algorithm=algorithm, multimodal=multimodal)
-    rank = _w.JOB_SPEC.train.lora_rank if _w.JOB_SPEC else RECIPE.lora.rank
-    alpha = _w.JOB_SPEC.train.lora_alpha if _w.JOB_SPEC else RECIPE.lora.alpha
-    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
+    rank = _worker_state.JOB_SPEC.train.lora_rank if _worker_state.JOB_SPEC else RECIPE.lora.rank
+    alpha = _worker_state.JOB_SPEC.train.lora_alpha if _worker_state.JOB_SPEC else RECIPE.lora.alpha
+    model_revision = (
+        getattr(_worker_state.JOB_SPEC, "model_revision", "") if _worker_state.JOB_SPEC else ""
+    )
     kwargs = {
         "r": rank,
         "lora_alpha": alpha,
@@ -138,7 +140,11 @@ def _download_adapter(adapter_prefix: str | None) -> str | None:
                 allow_patterns=[f"{prefix}/adapter/*"],
                 local_dir="/tmp/evdl",
                 token=os.environ.get("HF_TOKEN"),
-                revision=(_w.JOB_SPEC.train.init_from_adapter_revision if _w.JOB_SPEC else None)
+                revision=(
+                    _worker_state.JOB_SPEC.train.init_from_adapter_revision
+                    if _worker_state.JOB_SPEC
+                    else None
+                )
                 or None,
             )
         except Exception as error:

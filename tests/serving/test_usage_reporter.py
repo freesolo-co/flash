@@ -1,11 +1,4 @@
-"""Serving->backend usage reporter gating: a serving deployment must only post metered usage to
-the billing API it was EXPLICITLY pointed at. Regression guard for the bug where backend_url
-defaulted to production and reporting turned on as soon as FREESOLO_INTERNAL_KEY was present, so a
-non-prod deployment that merely had that key could silently bill real orgs for dev traffic.
-
-modal_app imports the `modal` SDK at module top (decorators run at import), which isn't installed
-in the offline test env, so we stub it just enough to import and reach _build_usage_reporter.
-"""
+"""Engine-side token telemetry, adapter cache, and Modal construction regressions."""
 
 from __future__ import annotations
 
@@ -18,8 +11,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from flash.serving.src import engine_support
-from flash.serving.src.settings import Settings
+from flash.serving.src.accounting.usage_outbox import DurableUsageOutbox, UsageOutboxError
+from flash.serving.src.engine import support as engine_support
+from flash.serving.src.store.settings import Settings
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -32,7 +26,7 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
 
 
 @pytest.fixture(scope="module")
-def modal_app_module():
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -45,37 +39,55 @@ def modal_app_module():
     app_mock.local_entrypoint.side_effect = _passthrough_decorator
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    # Save + restore the prior sys.modules entries so this stub doesn't leak into other tests
-    # (which would hide a real `modal`/`modal_app` import error or make the suite order-dependent).
-    # _MISSING marks "was not present" so teardown removes our stub instead of reinserting a stale
-    # one. We also drop the imported `modal_app` so it is re-imported fresh against the real module.
-    _MISSING = object()
-    prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.modal_app", _MISSING)
-    sys.modules["modal"] = modal_stub
-
-    import flash.serving.modal_app as modal_app  # imported after the stub is installed
-
-    try:
-        yield modal_app
-    finally:
-        for name, prev in (("modal", prev_modal), ("modal_app", prev_modal_app)):
-            if prev is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
+    return load_modal_app_under_stub(modal_stub)
 
 
-def _settings(*, backend_url: str | None = None, internal_key: str | None = None) -> Settings:
-    # Build Settings without reading a stray on-disk .env. The fields use validation_alias, so we
-    # set them via their env-var aliases (which is also the real configuration path). Omit an alias
-    # entirely to exercise its field default.
-    kwargs: dict[str, Any] = {"_env_file": None}
-    if backend_url is not None:
-        kwargs["PLATFORM_BACKEND_URL"] = backend_url
-    if internal_key is not None:
-        kwargs["FREESOLO_INTERNAL_KEY"] = internal_key
-    return Settings(**kwargs)
+def test_hosted_usage_outbox_fails_closed_on_partial_configuration(modal_app_module):
+    settings = Settings(
+        _env_file=None,
+        PLATFORM_BACKEND_URL="https://api.example.com",
+        FREESOLO_INTERNAL_KEY="internal-key",
+        FREESOLO_DEPLOYMENT_ID="deployment-1",
+    )
+
+    with pytest.raises(UsageOutboxError, match="durable_usage_outbox_not_configured"):
+        modal_app_module._build_usage_outbox(settings)
+
+
+def test_hosted_usage_outbox_builds_only_with_complete_configuration(modal_app_module):
+    settings = Settings(
+        _env_file=None,
+        PLATFORM_BACKEND_URL="https://api.example.com",
+        FREESOLO_INTERNAL_KEY="internal-key",
+        FREESOLO_DEPLOYMENT_ID="deployment-1",
+        SUPABASE_URL="https://project.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="service-role",
+    )
+
+    outbox = modal_app_module._build_usage_outbox(settings)
+
+    assert isinstance(outbox, DurableUsageOutbox)
+    asyncio.run(outbox.aclose())
+
+
+def test_hosted_usage_outbox_worker_id_is_unique_per_instance(modal_app_module):
+    settings = Settings(
+        _env_file=None,
+        PLATFORM_BACKEND_URL="https://api.example.com",
+        FREESOLO_INTERNAL_KEY="internal-key",
+        FREESOLO_DEPLOYMENT_ID="deployment-1",
+        SUPABASE_URL="https://project.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="service-role",
+    )
+
+    first = modal_app_module._build_usage_outbox(settings)
+    second = modal_app_module._build_usage_outbox(settings)
+
+    assert first._worker_id != second._worker_id
+    assert first._generation_owner_id == second._generation_owner_id
+    assert first._generation_owner_epoch != second._generation_owner_epoch
+    asyncio.run(first.aclose())
+    asyncio.run(second.aclose())
 
 
 def test_stream_text_delta_keeps_native_delta_chunks(modal_app_module):
@@ -114,7 +126,7 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
 def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app_module):
     # The whole point of the table: an idle container bills at the full gpu rate, so a cheap
     # fast-booting tier must not hold a card as long as the 35B's ~1010s-boot H200 does.
-    from flash.serving.src.model_config import base_models, gpu_for
+    from flash.serving.src.engine.model_config import base_models, gpu_for
 
     window_for = modal_app_module.scaledown_window_for
     default = modal_app_module.DEFAULT_SCALEDOWN_WINDOW_SECONDS
@@ -190,6 +202,7 @@ def test_lora_engine_builds_tokenized_chat_prompt(modal_app_module):
                 "add_generation_prompt": True,
                 "return_dict": False,
                 "enable_thinking": True,
+                "preserve_thinking": False,
             }
             return [1, 2, 3]
 
@@ -283,6 +296,7 @@ def test_lora_engine_filters_reserved_chat_template_kwargs(modal_app_module):
         "add_generation_prompt": True,
         "return_dict": False,
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
 
 
@@ -384,6 +398,7 @@ def test_lora_engine_drops_return_shape_chat_template_kwargs(modal_app_module):
         "add_generation_prompt": True,
         "return_dict": False,
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
 
     # A non-dict chat_template_kwargs is ignored entirely (no crash). enable_thinking still comes
@@ -396,6 +411,7 @@ def test_lora_engine_drops_return_shape_chat_template_kwargs(modal_app_module):
         "add_generation_prompt": True,
         "return_dict": False,
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
 
 
@@ -435,7 +451,7 @@ def test_lora_engine_cache_key_ignores_reserved_chat_template_kwargs(modal_app_m
 
 def test_lora_engine_health_reports_served_model_and_baked_config(modal_app_module, monkeypatch):
     engine = object.__new__(modal_app_module._LoraEngineImpl)
-    engine.base_model = "Qwen/Qwen3.5-2B"
+    engine.base_model = "Qwen/Qwen3.5-9B"
     engine._prompt_cache_size = 2048
 
     class _Registry:
@@ -458,19 +474,20 @@ def test_lora_engine_health_reports_served_model_and_baked_config(modal_app_modu
     engine._prompt_token_cache = OrderedDict([(("prompt", "cached"), (1, 2, 3))])
     monkeypatch.setitem(sys.modules, "torch", _Torch())
 
-    # Health reports the served PRE-QUANTIZED checkpoint (owned FP8 for 2B) + baked-in config.
+    # health reports the served pre-quantized checkpoint and baked-in 9b config.
     assert engine._health() == {
         "ok": True,
         # No engine built on this bare instance -> not dead -> ok stays True.
         "engine_dead": False,
-        "base_model": "Qwen/Qwen3.5-2B",
-        "served_model": "Freesolo-Co/Qwen3.5-2B-FP8",
+        "base_model": "Qwen/Qwen3.5-9B",
+        "served_model": "Freesolo-Co/Qwen3.5-9B-FP8",
+        "immutable_identity": None,
         # A pre-quant FP8 checkpoint carries fp8 weights (auto-detected) + the global fp8 KV cache.
         "quantization": "fp8",
         "kv_cache_dtype": "fp8",
         "adapters": 2,
-        # configured_gpu now reflects the per-model GPU tier (2B -> L4), not a single global.
-        "configured_gpu": modal_app_module.gpu_for("Qwen/Qwen3.5-2B"),
+        # configured_gpu reflects the active model's per-model gpu tier.
+        "configured_gpu": modal_app_module.gpu_for("Qwen/Qwen3.5-9B"),
         "cuda_available": True,
         "device_name": "NVIDIA H100",
         "enable_prefix_caching": True,
@@ -572,30 +589,32 @@ def test_load_adapters_for_base_filters_records(modal_app_module, monkeypatch):
             self.status = "ready"
             self.is_revision = True
 
-    records = [_Record("Qwen/Qwen3.5-4B"), _Record("Qwen/Qwen3.5-0.8B")]
-    monkeypatch.setattr("flash.serving.src.persistence.load_adapters", lambda settings: records)
+    records = [_Record("Qwen/Qwen3.8-27B"), _Record("Qwen/Qwen3.5-9B")]
+    monkeypatch.setattr(
+        "flash.serving.src.store.persistence.load_adapters", lambda settings: records
+    )
 
-    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-0.8B") == [records[1]]
+    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-9B") == [records[1]]
 
 
 def test_load_adapters_for_base_skips_hydration_failures(modal_app_module, monkeypatch, capsys):
     def _boom(_settings):
         raise TimeoutError("supabase timeout")
 
-    monkeypatch.setattr("flash.serving.src.persistence.load_adapters", _boom)
+    monkeypatch.setattr("flash.serving.src.store.persistence.load_adapters", _boom)
 
-    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-0.8B") == []
+    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-9B") == []
     assert "adapter hydration skipped" in capsys.readouterr().out
 
 
 def test_adapter_source_cache_dir_ignores_adapter_id(modal_app_module):
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.io.schemas import AdapterRecord
 
     first = AdapterRecord.model_validate(
         {
             "adapter_id": "a",
             "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "subfolder": "sft/run/seed0/adapter",
             "repo_type": "dataset",
             "thinking": True,
@@ -616,7 +635,7 @@ def test_adapter_source_cache_dir_ignores_adapter_id(modal_app_module):
 def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monkeypatch, tmp_path):
     import asyncio
 
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.io.schemas import AdapterRecord
 
     calls: list[dict[str, Any]] = []
 
@@ -643,7 +662,7 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
             self.paths[record.adapter_id] = path
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.registry = _Registry()
@@ -656,7 +675,7 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
         {
             "adapter_id": "a",
             "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "subfolder": "sft/run/seed0/adapter",
             "repo_type": "dataset",
             "thinking": True,
@@ -681,7 +700,7 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
 def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monkeypatch, tmp_path):
     import asyncio
 
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.io.schemas import AdapterRecord
 
     class _Registry:
         def __init__(self) -> None:
@@ -700,13 +719,13 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
         raise AssertionError("cached adapter should not call Hugging Face")
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     record = AdapterRecord.model_validate(
         {
             "adapter_id": "a",
             "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "subfolder": "sft/run/seed0/adapter",
             "repo_type": "dataset",
             "thinking": True,
@@ -736,7 +755,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
 ):
     import asyncio
 
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.io.schemas import AdapterRecord
 
     class _Registry:
         def __init__(self) -> None:
@@ -755,7 +774,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
         {
             "adapter_id": "a",
             "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "subfolder": "sft/run/seed0/adapter",
             "repo_type": "dataset",
             "thinking": True,
@@ -777,7 +796,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
         return str(local_dir)
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.registry = _Registry()
@@ -799,14 +818,14 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
 ):
     import asyncio
 
-    from flash.serving.src.registry import AdapterRegistry, lora_int_id
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.io.schemas import AdapterRecord
+    from flash.serving.src.store.registry import AdapterRegistry, lora_int_id
 
     cached = AdapterRecord.model_validate(
         {
             "adapter_id": "cached",
             "repo_id": "org/cached",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "subfolder": "sft/cached/seed0/adapter",
             "repo_type": "dataset",
             "thinking": True,
@@ -818,7 +837,7 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
     cache_path.mkdir(parents=True)
     (cache_path / "adapter_config.json").write_text("{}", encoding="utf-8")
     (cache_path / "adapter_model.safetensors").write_bytes(b"weights")
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     class _Engine:
         def __init__(self) -> None:
@@ -855,9 +874,9 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
 def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkeypatch, tmp_path):
     # two distinct adapters whose sha1 masks collide to the same vllm int id must not share it.
     # unconfirmed entries still occupy their id because vllm may retain the corresponding weights.
-    from flash.serving.src import registry as registry_mod
-    from flash.serving.src.lora_engine import _LoraEntry
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.engine.lora_engine import _LoraEntry
+    from flash.serving.src.io.schemas import AdapterRecord
+    from flash.serving.src.store import registry as registry_mod
 
     monkeypatch.setattr(registry_mod, "lora_int_id", lambda adapter_id: 42)
 
@@ -866,7 +885,7 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
             {
                 "adapter_id": adapter_id,
                 "repo_id": repo,
-                "base_model": "Qwen/Qwen3.5-0.8B",
+                "base_model": "Qwen/Qwen3.5-9B",
                 "thinking": True,
             }
         )
@@ -890,8 +909,8 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
 
 
 def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_module, monkeypatch):
-    from flash.serving.src import registry as registry_mod
-    from flash.serving.src.lora_engine import _LoraEntry
+    from flash.serving.src.engine.lora_engine import _LoraEntry
+    from flash.serving.src.store import registry as registry_mod
 
     monkeypatch.setattr(registry_mod, "lora_int_id", lambda _adapter_id: 42)
 
@@ -915,215 +934,3 @@ def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_modu
 
     assert engine.engine.removed == []
     assert "tenant-b" in engine._lora_entries
-
-
-def test_reporter_disabled_when_only_internal_key_is_set(modal_app_module):
-    # The exact bug: a non-prod deployment has FREESOLO_INTERNAL_KEY but never set
-    # PLATFORM_BACKEND_URL. With the prod default gone, reporting must be DISABLED (None), not
-    # silently pointed at production billing.
-    s = _settings(internal_key="secret-key")
-    assert s.backend_url == ""
-    assert modal_app_module._build_usage_reporter(s) is None
-
-
-def test_reporter_disabled_when_key_unset_even_with_url(modal_app_module):
-    s = _settings(backend_url="https://staging.example.com")
-    assert modal_app_module._build_usage_reporter(s) is None
-
-
-def test_reporter_enabled_only_when_both_url_and_key_set_explicitly(modal_app_module):
-    # Reporting turns on only when BOTH are explicitly configured -> a real reporter callable.
-    s = _settings(
-        backend_url="https://staging.example.com",
-        internal_key="secret-key",
-    )
-    reporter = modal_app_module._build_usage_reporter(s)
-    assert reporter is not None
-    assert callable(reporter)
-
-
-def test_reporter_posts_to_the_configured_backend(modal_app_module, monkeypatch):
-    # When enabled, it POSTs usage to {backend_url}/api/billing/serving-usage with the internal key
-    # -- and to the configured backend, never a hardcoded prod fallback.
-    # The reporter now uses a single persistent httpx.AsyncClient (headers set at init time,
-    # not per call) to avoid TCP/TLS handshake overhead across bursts of usage reports.
-    import asyncio
-
-    captured: dict[str, Any] = {}
-
-    class _FakeResp:
-        def raise_for_status(self) -> None:
-            return None
-
-    class _FakeClient:
-        def __init__(self, *_a: Any, **_k: Any) -> None:
-            # Headers are set at client construction time (not per-call) in the persistent client.
-            captured["init_headers"] = _k.get("headers", {})
-
-        async def post(self, url: str, json: Any) -> _FakeResp:
-            captured["url"] = url
-            captured["json"] = json
-            return _FakeResp()
-
-        async def aclose(self) -> None:
-            captured["closed"] = True
-
-    import httpx
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-
-    s = _settings(
-        backend_url="https://staging.example.com/",  # trailing slash must be normalized
-        internal_key="secret-key",
-    )
-    reporter = modal_app_module._build_usage_reporter(s)
-    assert reporter is not None
-
-    usage = {"adapter_id": "a1", "base_model": "Qwen/Qwen3.5-0.8B", "promptTokens": 1}
-    asyncio.run(reporter(usage))
-
-    assert captured["url"] == "https://staging.example.com/api/billing/serving-usage"
-    assert captured["json"] == usage
-    assert captured["init_headers"]["Authorization"] == "Bearer secret-key"
-
-
-def test_reporter_reuses_single_client_across_calls(modal_app_module, monkeypatch):
-    # The persistent client must be created ONCE per reporter, not once per report() call —
-    # otherwise the TCP/TLS handshake cost is paid on every generation.
-    import asyncio
-
-    init_count = {"n": 0}
-
-    class _FakeResp:
-        def raise_for_status(self) -> None:
-            return None
-
-    class _FakeClient:
-        def __init__(self, *_a: Any, **_k: Any) -> None:
-            init_count["n"] += 1
-
-        async def post(self, url: str, json: Any) -> _FakeResp:
-            return _FakeResp()
-
-        async def aclose(self) -> None:
-            return None
-
-    import httpx
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-
-    s = _settings(backend_url="https://staging.example.com", internal_key="secret-key")
-    reporter = modal_app_module._build_usage_reporter(s)
-    assert reporter is not None
-
-    async def _run():
-        for _ in range(5):
-            await reporter({"adapter_id": "a", "promptTokens": 1})
-
-    asyncio.run(_run())
-    assert init_count["n"] == 1  # one client for all five calls
-
-
-@pytest.mark.parametrize("status_code", [408, 429, 500])
-def test_reporter_retries_retryable_statuses_three_times(
-    modal_app_module, monkeypatch, status_code: int
-):
-    import httpx
-
-    calls: list[dict[str, Any]] = []
-
-    class _FakeClient:
-        def __init__(self, *_a: Any, **_k: Any) -> None:
-            pass
-
-        async def post(self, url: str, json: Any) -> httpx.Response:
-            calls.append(json)
-            response_status = status_code if len(calls) <= 3 else 204
-            return httpx.Response(response_status, request=httpx.Request("POST", url))
-
-        async def aclose(self) -> None:
-            pass
-
-    async def _no_sleep(_delay: float) -> None:
-        pass
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-    monkeypatch.setattr(modal_app_module.asyncio, "sleep", _no_sleep)
-    reporter = modal_app_module._build_usage_reporter(
-        _settings(backend_url="https://staging.example.com", internal_key="secret-key")
-    )
-    usage = {"requestId": "generation-1", "promptTokens": 1}
-
-    asyncio.run(reporter(usage))
-
-    assert calls == [usage, usage, usage, usage]
-
-
-def test_reporter_retries_transport_failures_three_times(modal_app_module, monkeypatch):
-    import httpx
-
-    calls = 0
-
-    class _FakeClient:
-        def __init__(self, *_a: Any, **_k: Any) -> None:
-            pass
-
-        async def post(self, url: str, json: Any) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            if calls <= 3:
-                raise httpx.ConnectError("backend unavailable")
-            return httpx.Response(204, request=httpx.Request("POST", url))
-
-        async def aclose(self) -> None:
-            pass
-
-    async def _no_sleep(_delay: float) -> None:
-        pass
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-    monkeypatch.setattr(modal_app_module.asyncio, "sleep", _no_sleep)
-    reporter = modal_app_module._build_usage_reporter(
-        _settings(backend_url="https://staging.example.com", internal_key="secret-key")
-    )
-
-    asyncio.run(reporter({"requestId": "generation-1", "promptTokens": 1}))
-
-    assert calls == 4
-
-
-@pytest.mark.parametrize(
-    ("usage", "status_code"),
-    [
-        ({"requestId": "generation-1", "promptTokens": 1}, 402),
-        ({"promptTokens": 1}, 500),
-    ],
-)
-def test_reporter_does_not_retry_non_idempotent_or_non_retryable_failures(
-    modal_app_module, monkeypatch, usage: dict[str, Any], status_code: int
-):
-    import httpx
-
-    calls = 0
-
-    class _FakeClient:
-        def __init__(self, *_a: Any, **_k: Any) -> None:
-            pass
-
-        async def post(self, url: str, json: Any) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(status_code, request=httpx.Request("POST", url))
-
-        async def aclose(self) -> None:
-            pass
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-    reporter = modal_app_module._build_usage_reporter(
-        _settings(backend_url="https://staging.example.com", internal_key="secret-key")
-    )
-
-    with pytest.raises(httpx.HTTPStatusError):
-        asyncio.run(reporter(usage))
-
-    assert calls == 1

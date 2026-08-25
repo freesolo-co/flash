@@ -123,7 +123,7 @@ jobs:
           FP_BASE: ${{ steps.base.outputs.fp_base }}
           REV: ${{ steps.base.outputs.revision }}
         run: |
-          # flash/providers/_lifecycle/worker.py is the single source of truth for the arch list; the bake
+          # flash/providers/_lifecycle/net/worker.py is the single source of truth for the arch list; the bake
           # matrix mirrors it. read the canonical assignment statically without importing flash.
           arches=$(python3 docker/kernel_fingerprint.py --print-baked-arches)
           relayer=(); gpu=()
@@ -232,7 +232,7 @@ jobs:
           sudo docker image prune -af || true
           df -h /
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0

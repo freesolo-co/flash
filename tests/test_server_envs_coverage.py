@@ -22,7 +22,9 @@ from typing import ClassVar
 
 import pytest
 
-from flash.server.domain import envs
+import flash.runner.lifecycle.reporting as runner_reporting
+import flash.runner.supervise.transitions as runner_transitions
+from flash.server.domain.registry import envs
 
 pytest.importorskip("fastapi")
 from fastapi import HTTPException
@@ -32,7 +34,8 @@ import flash.server.routes.serving_completion as serving_completion
 import flash.server.routes.serving_smoke as serving_smoke
 from flash.content import multimodal
 from flash.engine.plan.recipe import RECIPE
-from flash.serve.deploy import AliasThinkingSilent, ServingError
+from flash.serve.contract.errors import AliasThinkingSilent, ServingError
+from flash.serve.request import transport as serving_transport
 
 
 def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
@@ -48,7 +51,7 @@ def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
 
 
 # ===========================================================================
-# flash.server.domain.envs
+# flash.server.domain.registry.envs
 # ===========================================================================
 
 
@@ -552,9 +555,6 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
         return statuses[run_id]
 
     monkeypatch.setattr(serving._app, "get_status", fake_get_status)
-
-    import flash.runner as runner
-
     marked: list[tuple[str, dict]] = []
     reported = []
 
@@ -563,8 +563,8 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
         return types.SimpleNamespace(run_id=run_id, state="done", deployment=failed)
 
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
-    monkeypatch.setattr(runner, "_report_status", reported.append)
+    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner_reporting, "_report_status", reported.append)
 
     from flash.server.platform.locks import _RunLock
 
@@ -574,7 +574,7 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
         # r-stale and r-fresh both recover: the lock is the ownership proof, so a busy record whose
         # lock this pass can take has no live lifecycle whatever its timestamp says. r-held is the
         # one that must survive -- its lock is genuinely held, so a live owner still has it.
-        assert serving.recover_deployments() == 2
+        assert serving_completion.recover_deployments() == 2
     finally:
         held_lock.release()
     assert sorted(run_id for run_id, _failed in marked) == ["r-fresh", "r-stale"]
@@ -590,18 +590,18 @@ def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
         types.SimpleNamespace(
             run_id="r-settled",
             deployment={"state": "ready"},
-            spec={"run_id": "r-settled", "model": "Qwen/Qwen3.5-4B", "algorithm": "sft"},
+            spec={"run_id": "r-settled", "model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
         ),
     ]
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
     monkeypatch.setattr(serving._app, "get_status", lambda _run_id: statuses.pop(0))
     monkeypatch.setattr(
-        serving,
+        runner_transitions,
         "mark_deployment_failed",
         lambda *_args: pytest.fail("a deployment that settled under the lock must not be failed"),
     )
 
-    assert serving.recover_deployments() == 0
+    assert serving_completion.recover_deployments() == 0
     assert statuses == []
 
 
@@ -622,7 +622,7 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
             deployment={"state": "ready"},
             spec={
                 "run_id": "r-retired",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "opsd",
                 "project": project,
             },
@@ -635,16 +635,13 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
             deployment={"state": "ready"},
             spec={
                 "run_id": "r-servable",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "project": project,
             },
         ),
     }
     monkeypatch.setattr(serving._app, "get_status", lambda run_id: statuses[run_id])
-
-    import flash.runner as runner
-
     marked: list[tuple[str, dict]] = []
 
     def mark_failed(run_id, failed):
@@ -652,10 +649,10 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
         return types.SimpleNamespace(run_id=run_id, state="done", deployment=failed)
 
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
-    monkeypatch.setattr(runner, "_report_status", lambda status: None)
+    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda status: None)
 
-    assert serving.recover_deployments() == 1
+    assert serving_completion.recover_deployments() == 1
     assert [run_id for run_id, _failed in marked] == ["r-retired"]
     for _run_id, failed in marked:
         assert failed["state"] == "failed"
@@ -664,8 +661,6 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
 
 
 def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):
-    import flash.runner as runner
-
     previous = {
         "state": "ready",
         "endpoint_name": "https://serve.example",
@@ -694,10 +689,10 @@ def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):
     reported = []
 
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
-    monkeypatch.setattr(runner, "_report_status", reported.append)
+    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner_reporting, "_report_status", reported.append)
 
-    assert serving.recover_deployments() == 1
+    assert serving_completion.recover_deployments() == 1
     assert len(reported) == 1
     assert reported[0].deployment["state"] == "ready"
     assert "control-plane restart" in reported[0].deployment["last_deploy_error"]
@@ -796,7 +791,7 @@ def test_real_image_capable_model_with_text_adapter_uses_fixed_prompt(monkeypatc
         def __getattribute__(self, name):
             pytest.fail(f"control-plane smoke accessed user environment field {name!r}")
 
-    spec = _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B")
+    spec = _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B")
     spec.environment = UntrustedEnvironment()
     calls = []
 
@@ -845,7 +840,7 @@ def test_image_deployment_smoke_uses_valid_trusted_image_without_persisting_it(m
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
     out = _run_smoke(
-        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
         adapter_targets_images=True,
     )
 
@@ -866,7 +861,7 @@ def test_smoke_uses_the_capability_set_deploy_gated_on_not_a_second_healthz(monk
     the smoke would let a mid-rollout replica that does not advertise the attestation -- or one
     transient failure -- accept a response that omits a header this deployment WAS promised.
     """
-    from flash.serve import deploy as deploy_mod
+    from flash.serve.deployment import deploy as deploy_mod
 
     healthz_calls = 0
 
@@ -882,13 +877,13 @@ def test_smoke_uses_the_capability_set_deploy_gated_on_not_a_second_healthz(monk
     # the handed-down set still enforces the contract strictly...
     with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             advertised=_ATTESTING,
             adapter_targets_images=True,
         )
     # ...and a backend that never claimed the header still degrades rather than failing.
     out = _run_smoke(
-        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
         advertised=frozenset(),
         adapter_targets_images=True,
     )
@@ -909,7 +904,7 @@ def test_image_deployment_smoke_rejects_missing_lora_request_attestation(monkeyp
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
     with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             advertised=_ATTESTING,
             adapter_targets_images=True,
         )
@@ -925,7 +920,7 @@ def test_image_deployment_smoke_allows_missing_attestation_when_not_advertised(m
     response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
     out = _run_smoke(
-        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
         advertised=frozenset(),
         adapter_targets_images=True,
     )
@@ -942,7 +937,7 @@ def test_image_deployment_smoke_rejects_wrong_adapter_even_when_not_advertised(m
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
     with pytest.raises(ServingError, match="wrong LoRA request adapter"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             advertised=frozenset(),
             adapter_targets_images=True,
         )
@@ -954,7 +949,7 @@ def test_image_deployment_smoke_rejects_mismatched_lora_request_adapter(monkeypa
 
     with pytest.raises(ServingError, match="wrong LoRA request adapter"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             adapter_targets_images=True,
         )
 
@@ -966,7 +961,7 @@ def test_image_deployment_smoke_still_rejects_wrong_provenance(monkeypatch):
 
     with pytest.raises(ServingError, match="wrong checkpoint"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             adapter_targets_images=True,
         )
 
@@ -987,7 +982,7 @@ def test_image_deployment_smoke_rejects_an_answer_that_is_not_the_shown_square(m
 
     with pytest.raises(ServingError, match="did not identify the trusted"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             adapter_targets_images=True,
         )
 
@@ -1031,7 +1026,7 @@ def test_image_deployment_smoke_rejects_the_other_trusted_colours(monkeypatch):
         monkeypatch.setattr(serving._app, "serve_chat", lambda _r=response, **_kwargs: _r)
         with pytest.raises(ServingError, match="did not identify the trusted"):
             _run_smoke(
-                _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+                _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
                 adapter_targets_images=True,
             )
 
@@ -1046,7 +1041,7 @@ def test_unavailable_adapter_modality_defaults_to_nonblocking_text_smoke(monkeyp
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
 
-    out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+    out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"))
 
     assert out["verify_kind"] == "fixed_prompt"
     assert calls[0]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
@@ -1074,7 +1069,7 @@ def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(m
     out = _run_smoke(
         _smoke_spec(
             thinking=False,
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             constraint={"json_object": True},
         ),
         adapter_targets_images=True,
@@ -1115,7 +1110,7 @@ def test_image_structured_smoke_requires_attestation_on_second_request(
         _run_smoke(
             _smoke_spec(
                 thinking=False,
-                model="Qwen/Qwen3.5-4B",
+                model="Qwen/Qwen3.5-9B",
                 constraint={"json_object": True},
             ),
             advertised=_ATTESTING if advertised else frozenset(),
@@ -1334,7 +1329,7 @@ def test_run_deployment_smoke_sends_no_stop_when_none_configured(monkeypatch):
 
 def test_chat_body_carries_stop_sequences(monkeypatch):
     """The stop sequences must reach the wire body, not just the flash-side call."""
-    from flash.serve import deploy as _deploy
+    from flash.serve.deployment import deploy as _deploy
 
     sent = {}
 
@@ -1353,9 +1348,11 @@ def test_chat_body_carries_stop_sequences(monkeypatch):
             sent.update(json or {})
             return _Resp()
 
-    monkeypatch.setattr(_deploy, "serving_openai_base_url", lambda: "https://serving.example/v1")
-    monkeypatch.setattr(_deploy, "_internal_key_header", dict)
-    monkeypatch.setattr(_deploy, "_chat_http_client", _Client)
+    monkeypatch.setattr(
+        serving_transport, "serving_openai_base_url", lambda: "https://serving.example/v1"
+    )
+    monkeypatch.setattr(serving_transport, "_internal_key_header", dict)
+    monkeypatch.setattr(serving_transport, "_chat_http_client", _Client)
 
     _deploy.chat("run-1", [{"role": "user", "content": "hi"}], stop=["</answer>"])
     assert sent["stop"] == ["</answer>"]
@@ -1366,7 +1363,7 @@ def test_chat_body_carries_stop_sequences(monkeypatch):
 
 
 def test_chat_captures_lora_request_adapter_attestation_for_smoke(monkeypatch):
-    from flash.serve import deploy as _deploy
+    from flash.serve.deployment import deploy as _deploy
 
     class _Resp:
         status_code = 200
@@ -1394,9 +1391,11 @@ def test_chat_captures_lora_request_adapter_attestation_for_smoke(monkeypatch):
         def post(self, url, json=None, headers=None, timeout=None):
             return _Resp()
 
-    monkeypatch.setattr(_deploy, "serving_openai_base_url", lambda: "https://serving.example/v1")
-    monkeypatch.setattr(_deploy, "_internal_key_header", dict)
-    monkeypatch.setattr(_deploy, "_chat_http_client", _Client)
+    monkeypatch.setattr(
+        serving_transport, "serving_openai_base_url", lambda: "https://serving.example/v1"
+    )
+    monkeypatch.setattr(serving_transport, "_internal_key_header", dict)
+    monkeypatch.setattr(serving_transport, "_chat_http_client", _Client)
 
     out = _deploy.chat(
         _SMOKE_REVISION,
@@ -1410,7 +1409,7 @@ def test_chat_captures_lora_request_adapter_attestation_for_smoke(monkeypatch):
 
 
 def test_zero_completion_budget_resolves_to_thinking_recipe_default():
-    from flash.serve.preflight import resolve_effective_completion_tokens
+    from flash.serve.deployment.preflight import resolve_effective_completion_tokens
 
     spec = _smoke_spec(
         thinking=True,
@@ -1422,7 +1421,7 @@ def test_zero_completion_budget_resolves_to_thinking_recipe_default():
 
 
 def test_thinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default():
-    from flash.serve.preflight import resolve_smoke_completion_tokens
+    from flash.serve.deployment.preflight import resolve_smoke_completion_tokens
 
     spec = _smoke_spec(thinking=True, algorithm="sft")
 
@@ -1433,7 +1432,7 @@ def test_thinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default(
 
 
 def test_sft_smoke_budget_follows_an_explicit_context_over_the_recipe_default():
-    from flash.serve.preflight import resolve_smoke_completion_tokens
+    from flash.serve.deployment.preflight import resolve_smoke_completion_tokens
 
     # the worker bounds the packed block by max_context_tokens and only falls back to the recipe
     # when it is unset (flash/engine/worker/entry/sft.py), so below the ceiling the smoke resolves
@@ -1467,7 +1466,7 @@ def test_smoke_budget_is_capped_independently_of_the_training_context():
     also coupled the knobs backwards, since raising max_context_tokens to avoid training truncation
     made the run HARDER to deploy.
     """
-    from flash.serve.preflight import (
+    from flash.serve.deployment.preflight import (
         SMOKE_COMPLETION_TOKEN_CEILING,
         resolve_smoke_completion_tokens,
     )
@@ -1496,7 +1495,7 @@ def test_a_configured_grammar_keeps_the_runs_own_budget():
     correctly becomes undeployable. That case passes today on an explicit budget, so the ceiling
     must not reach it.
     """
-    from flash.serve.preflight import (
+    from flash.serve.deployment.preflight import (
         SMOKE_COMPLETION_TOKEN_CEILING,
         resolve_smoke_completion_tokens,
     )
@@ -1514,7 +1513,7 @@ def test_a_configured_grammar_keeps_the_runs_own_budget():
 
 
 def test_nonthinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_default():
-    from flash.serve.preflight import resolve_smoke_completion_tokens
+    from flash.serve.deployment.preflight import resolve_smoke_completion_tokens
 
     spec = _smoke_spec(thinking=False, algorithm="sft")
 
@@ -1522,7 +1521,7 @@ def test_nonthinking_sft_smoke_budget_comes_from_the_sft_recipe_not_the_rl_defau
 
 
 def test_sft_contributes_no_completion_budget_to_the_serving_context_guard():
-    from flash.serve.preflight import resolve_effective_completion_tokens
+    from flash.serve.deployment.preflight import resolve_effective_completion_tokens
 
     # max_context_tokens spans prompt AND completion for sft, so handing it to the guard as a
     # completion budget double-counts the prompt: a 4096-context run that fits a 4096 serving cap
@@ -1546,7 +1545,7 @@ def test_sft_contributes_no_completion_budget_to_the_serving_context_guard():
 
 def test_rollout_budget_ignores_context_tokens():
     from flash.engine.plan.recipe import RECIPE
-    from flash.serve.preflight import resolve_effective_completion_tokens
+    from flash.serve.deployment.preflight import resolve_effective_completion_tokens
 
     # grpo budgets the completion, not the whole rollout, so max_context_tokens must not become
     # its completion budget the way it does for sft.
@@ -1652,7 +1651,7 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
         lambda **_k: _smoke_response("<think>still reasoning"),
     )
     with pytest.raises(ServingError, match="never closed its reasoning"):
-        _run_smoke(_smoke_spec(thinking=True, model="Qwen/Qwen3.5-4B"))
+        _run_smoke(_smoke_spec(thinking=True, model="Qwen/Qwen3.5-9B"))
 
     monkeypatch.setattr(
         serving._app,
@@ -1677,7 +1676,7 @@ def test_unconstrained_thinking_smoke_rejects_a_reconstructed_empty_answer(monke
 
     `_smoke_provenance` rejects an empty generation, but flash now folds the split-out
     `reasoning_content` back into a balanced block before it gets there
-    (flash/serve/deploy.py::_balanced_thinking_content). `_thinking_answer` asserts an answer exists
+    (flash/serve/deployment/deploy.py::_balanced_thinking_content). `_thinking_answer` asserts an answer exists
     for every thinking smoke; before it did, only the grammar-constrained path checked, so an
     unconstrained deployment could go live on a smoke that produced no answer at all.
     """
@@ -1726,7 +1725,7 @@ def test_thinking_smoke_accepts_a_tagless_answer_only_for_an_uncataloged_model(m
     """
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("4"))
 
-    strict = _smoke_spec(thinking=True, model="Qwen/Qwen3.5-4B")
+    strict = _smoke_spec(thinking=True, model="Qwen/Qwen3.5-9B")
     with pytest.raises(ServingError, match="never closed its reasoning"):
         _run_smoke(strict)
 
@@ -2058,7 +2057,7 @@ def test_thinking_structured_smoke_rejects_invalid_output(
             _smoke_spec(
                 thinking=True,
                 constraint=constraint,
-                model="Qwen/Qwen3.5-4B",
+                model="Qwen/Qwen3.5-9B",
             ),
             adapter_targets_images=True,
         )
@@ -2121,7 +2120,7 @@ def test_alias_thinking_verification_matches_the_smoke_request_shape(monkeypatch
         constraint={"json_object": True},
         max_completion_tokens=40000,
         stop_sequences=("</answer>",),
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
     )
     calls = []
     responses = iter(
@@ -2171,7 +2170,7 @@ def test_alias_thinking_verification_rejects_a_silent_reasoning_channel(monkeypa
 def test_alias_thinking_verification_accepts_an_empty_reasoning_block(monkeypatch):
     """A model that thought briefly still proves the parser ran, so it must not be failed.
 
-    `flash.serve.thinking` folds an empty `reasoning_content` to `<think></think>`, which is what
+    `flash.serve.request.thinking` folds an empty `reasoning_content` to `<think></think>`, which
     separates "thought little" from "the reasoning field never arrived".
     """
     monkeypatch.setattr(

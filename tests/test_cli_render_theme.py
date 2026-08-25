@@ -11,9 +11,12 @@ import json
 
 import pytest
 
-import flash.cli as cli
+import flash.cli.commands.ops.deploy as cli_deploy
+import flash.cli.commands.ops.runs as cli_runs
+import flash.cli.parsing.main as cli
 from flash import __version__
-from flash.cli.ui import render
+from flash.cli.ui import env_panels, render, tables
+from flash.cli.ui import heartbeat as heartbeat_ui
 
 
 class _Client:
@@ -25,7 +28,7 @@ class _Client:
             "error": None,
             "spec": {
                 "project": "11111111-1111-4111-8111-111111111111",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
             },
         }
@@ -33,7 +36,7 @@ class _Client:
 
 @pytest.fixture
 def fake_client(monkeypatch) -> None:
-    monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _Client())
+    monkeypatch.setattr(cli_runs, "client_from_config", lambda *a, **k: _Client())
 
 
 def test_styled_flag_overrides_tty(monkeypatch) -> None:
@@ -52,7 +55,7 @@ def test_plain_path_stays_machine_readable(monkeypatch, fake_client, capsys) -> 
     assert cli.main(["models", "list"]) == 0
     out = capsys.readouterr().out
     # plain output is bare model ids, one per line, with no themed header or detail columns
-    assert "Qwen/Qwen3.5-0.8B" in out
+    assert "Qwen/Qwen3.5-9B" in out
     assert "supported base models" not in out
     assert "Qwen/Qwen3.5-9B" in out
     assert "\t" not in out
@@ -72,7 +75,7 @@ def test_styled_path_is_themed_but_lossless(monkeypatch, fake_client, capsys) ->
     assert cli.main(["models", "list"]) == 0
     out = capsys.readouterr().out
     assert "supported base models" in out  # themed header
-    assert "Qwen/Qwen3.5-0.8B" in out
+    assert "Qwen/Qwen3.5-9B" in out
     assert "PARAMS" not in out  # ids only — no reintroduced detail columns
 
     assert cli.main(["runs", "status", "flash-1"]) == 0
@@ -103,7 +106,7 @@ def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
         },
         "remote": {"allocated_gpu": "RTX 4090", "provider": "runpod", "flash_arm": "runpod"},
     }
-    runs = render.runs_table([run])
+    runs = tables.runs_table([run])
     status = render.run_status(run)
     assert "RTX 4090" in runs
     assert "RTX 4090" in status
@@ -128,7 +131,7 @@ def test_runs_and_status_prefer_allocated_gpu(monkeypatch) -> None:
         },
         "remote": {"allocated_gpu": "B200"},
     }
-    runs = render.runs_table([allocated_run])
+    runs = tables.runs_table([allocated_run])
     status = render.run_status(allocated_run)
     status_panel = status.split("details", 1)[0]
     assert "B200" in runs
@@ -141,7 +144,7 @@ def test_runs_and_status_prefer_allocated_gpu(monkeypatch) -> None:
         "state": "done",
         "spec": {"gpu": {"type": "RTX Pro 6000"}},
     }
-    assert "RTX Pro 6000" in render.runs_table([spec_only_run])
+    assert "RTX Pro 6000" in tables.runs_table([spec_only_run])
     assert "RTX Pro 6000" in render.run_status(spec_only_run)
 
     # the removed legacy remote["gpu"] key is no longer honored: the label resolves from the
@@ -152,8 +155,8 @@ def test_runs_and_status_prefer_allocated_gpu(monkeypatch) -> None:
         "spec": {"gpu": {"type": "RTX Pro 6000"}},
         "remote": {"gpu": "B200"},
     }
-    assert "B200" not in render.runs_table([legacy_key_run])
-    assert "RTX Pro 6000" in render.runs_table([legacy_key_run])
+    assert "B200" not in tables.runs_table([legacy_key_run])
+    assert "RTX Pro 6000" in tables.runs_table([legacy_key_run])
 
 
 def test_color_respects_no_color(monkeypatch) -> None:
@@ -216,19 +219,19 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
 
     monkeypatch.setattr(render.sys, "stdout", _AsciiStdout())
     outputs = [
-        render.models_table([{"id": "acme/x"}]),
-        render.gpus_table([("RTX 5090", 32, 0.99)], "Tip: selection is automatic — no pinning"),
-        render.runs_table([{"run_id": "r", "state": "done", "spec": {}}]),
-        render.deployments_table([{"run_id": "r", "deployment": {"state": "ready"}}]),
+        tables.models_table([{"id": "acme/x"}]),
+        tables.gpus_table([("RTX 5090", 32, 0.99)], "Tip: selection is automatic — no pinning"),
+        tables.runs_table([{"run_id": "r", "state": "done", "spec": {}}]),
+        tables.deployments_table([{"run_id": "r", "deployment": {"state": "ready"}}]),
         render.env_setup(
             ["environment.py", "dataset/train.jsonl", "configs/rl.toml"],
             "11111111-1111-4111-8111-111111111111",
         ),
-        render.env_list([]),
+        env_panels.env_list([]),
         render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"),
         render.submitted("flash-xyz"),
         render.run_status({"run_id": "r", "state": "failed", "spec": {}, "error": "boom — bad"}),
-        render.checkpoints_table(
+        tables.checkpoints_table(
             "r", [{"step": 8, "repo_id": "acme/x", "subfolder": "grpo/step-8"}]
         ),
         render.cancelled({"run_id": "r", "state": "cancelled"}),
@@ -252,7 +255,7 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
 
-    ck = render.checkpoints_table(
+    ck = tables.checkpoints_table(
         "flash-1", [{"step": 8, "repo_id": "acme/x", "subfolder": "grpo/step-8"}]
     )
     # themed header + table, not a bare `step N` list
@@ -353,20 +356,20 @@ def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:
     monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.setattr(runtime_secrets, "resolve_hf_token", lambda *a, **k: "hf_x")
     monkeypatch.setattr(
-        "flash.cli.commands.deploy._hf_identity_and_write_access", lambda *_: "acme"
+        "flash.cli.commands.ops.deploy._hf_identity_and_write_access", lambda *_: "acme"
     )
-    monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _ExportClient())
+    monkeypatch.setattr(cli_deploy, "client_from_config", lambda *a, **k: _ExportClient())
 
     # default export (no --public) is private; the card must say so, not "public"
     args = argparse.Namespace(adapter_id="flash-1", repository="acme/x", public=False, api_key=None)
-    assert cli.commands.cmd_export(args) == 0
+    assert cli_deploy.cmd_export(args) == 0
     out = capsys.readouterr().out
     assert "private" in out
     assert "public" not in out
 
     # an explicit --public export is reported as public
     args.public = True
-    assert cli.commands.cmd_export(args) == 0
+    assert cli_deploy.cmd_export(args) == 0
     assert "public" in capsys.readouterr().out
 
 
@@ -377,7 +380,7 @@ def test_error_path_themed_on_tty_plain_on_machine(monkeypatch, capsys) -> None:
     def _boom(*a, **k):
         raise ValueError("bad [environment] id")
 
-    monkeypatch.setattr(cli.commands, "client_from_config", _boom)
+    monkeypatch.setattr(cli_runs, "client_from_config", _boom)
 
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
@@ -428,7 +431,7 @@ def test_unexpected_error_themed_on_tty_traceback_on_machine(monkeypatch, capsys
     def _boom(*a, **k):
         raise OSError("disk full")  # not in _USER_ERRORS (a plain OSError, not FileNotFoundError)
 
-    monkeypatch.setattr(cli.commands, "client_from_config", _boom)
+    monkeypatch.setattr(cli_runs, "client_from_config", _boom)
 
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
@@ -672,7 +675,7 @@ def test_a_repeated_short_root_flag_is_recognized_under_every_parse_optional_sha
     parse loop reads this same value: reshaping it parser-wide fails inside argparse and would
     prove nothing about our handling.
     """
-    from flash.cli.errors import _is_repeated_root_short_option
+    from flash.cli.parsing.errors import _is_repeated_root_short_option
 
     root = argparse.ArgumentParser()
     root.add_argument("-v", action="count")
@@ -884,7 +887,7 @@ def test_run_status_explains_warmup_when_heartbeat_matches_attempt(monkeypatch, 
 
 
 def test_heartbeat_is_current_attempt_rejects_malformed_identities() -> None:
-    is_current = render.heartbeat_is_current_attempt
+    is_current = heartbeat_ui.heartbeat_is_current_attempt
 
     # a malformed heartbeat attempt cannot prove it is the live attempt, so it earns no reassurance
     # and must never crash the display path (e.g. on inf, which the old int() coercion raised on).
@@ -906,7 +909,7 @@ def test_live_attempt_is_one_rule_for_every_surface_that_names_an_attempt() -> N
     They are read within one screen of each other, so two provenance rules read as a run that is on
     two attempts at once -- and the artifact labels would call the live attempt's console "previous".
     """
-    live = render.live_attempt
+    live = heartbeat_ui.live_attempt
 
     # the plane's live attempt wins over the ping, which may be the superseded worker's.
     assert live({"remote": {"attempt": 2}, "last_heartbeat": {"attempt": 1}}) == 2
@@ -935,7 +938,7 @@ def test_progress_age_always_adds_to_heartbeat_age(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"},
     }
     heartbeat = {
         "stage": "rl_step",
@@ -962,9 +965,8 @@ def test_progress_age_always_adds_to_heartbeat_age(monkeypatch):
 
 
 def test_fresh_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch):
-    from flash.cli.ui import heartbeat
 
-    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
     obj = {
         "state": "running",
         "last_heartbeat": {
@@ -976,20 +978,19 @@ def test_fresh_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch
         },
     }
 
-    pairs = heartbeat._heartbeat_pairs(obj)
+    pairs = heartbeat_ui._heartbeat_pairs(obj)
     assert ("worker", "rl_step · step 14 · alive ping") in pairs
     assert ("heartbeat", "10s ago") in pairs
     progress = dict(pairs)["progress"]
     assert "last known progress can be as old as 1810.0s" in progress
     assert "upload throttling no longer explains the gap" in progress
-    assert heartbeat._QUIET_HEARTBEAT_HINT not in progress
+    assert heartbeat_ui._QUIET_HEARTBEAT_HINT not in progress
     assert len([label for label, _ in pairs if label == "progress"]) == 1
 
 
 def test_fresh_opd_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch):
-    from flash.cli.ui import heartbeat
 
-    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
     obj = {
         "state": "running",
         "last_heartbeat": {
@@ -1001,7 +1002,7 @@ def test_fresh_opd_liveness_upload_surfaces_worker_measured_progress_gap(monkeyp
         },
     }
 
-    pairs = heartbeat._heartbeat_pairs(obj)
+    pairs = heartbeat_ui._heartbeat_pairs(obj)
     assert ("worker", "opd_step · step 1 · alive ping") in pairs
     assert ("heartbeat", "10s ago") in pairs
     progress = dict(pairs)["progress"]
@@ -1010,9 +1011,8 @@ def test_fresh_opd_liveness_upload_surfaces_worker_measured_progress_gap(monkeyp
 
 
 def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
-    from flash.cli.ui import heartbeat
 
-    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
     base = {
         "state": "running",
         "remote": {"attempt": 2},
@@ -1025,7 +1025,7 @@ def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch)
     }
 
     def progress(hb: dict) -> str:
-        return dict(heartbeat._heartbeat_pairs(dict(base, last_heartbeat=hb)))["progress"]
+        return dict(heartbeat_ui._heartbeat_pairs(dict(base, last_heartbeat=hb)))["progress"]
 
     old_hint = progress(old_worker)
     assert progress({**old_worker, "progress_age_s": 220.0}) == old_hint
@@ -1036,9 +1036,8 @@ def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch)
     "bad_progress_age", [10**400, float("inf"), float("nan"), -1.0, True, "bad"]
 )
 def test_invalid_progress_age_falls_back_to_legacy_hint(monkeypatch, bad_progress_age):
-    from flash.cli.ui import heartbeat
 
-    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
     base = {
         "state": "running",
         "remote": {"attempt": 2},
@@ -1050,11 +1049,11 @@ def test_invalid_progress_age_falls_back_to_legacy_hint(monkeypatch, bad_progres
         "ts": 800.0,
     }
 
-    legacy = dict(heartbeat._heartbeat_pairs({**base, "last_heartbeat": heartbeat_base}))[
+    legacy = dict(heartbeat_ui._heartbeat_pairs({**base, "last_heartbeat": heartbeat_base}))[
         "progress"
     ]
     invalid = dict(
-        heartbeat._heartbeat_pairs(
+        heartbeat_ui._heartbeat_pairs(
             {
                 **base,
                 "last_heartbeat": {**heartbeat_base, "progress_age_s": bad_progress_age},
@@ -1065,9 +1064,8 @@ def test_invalid_progress_age_falls_back_to_legacy_hint(monkeypatch, bad_progres
 
 
 def test_missing_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
-    from flash.cli.ui import heartbeat
 
-    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
     obj = {
         "state": "running",
         "remote": {"attempt": 2},
@@ -1079,7 +1077,7 @@ def test_missing_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
         },
     }
 
-    assert heartbeat._heartbeat_pairs(obj) == [
+    assert heartbeat_ui._heartbeat_pairs(obj) == [
         ("worker", "rl_step · step 14"),
         ("heartbeat", "20m ago"),
         (
@@ -1102,6 +1100,7 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     """
     import time as _time
 
+    from flash.cli.ui import heartbeat as heartbeat_ui
     from flash.cli.ui import render
 
     monkeypatch.setenv("FLASH_STYLE", "1")
@@ -1110,7 +1109,7 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"},
     }
 
     stale = dict(base, last_heartbeat={"stage": "rl_step", "step": 1, "ts": _time.time() - 1200})
@@ -1141,7 +1140,7 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
 
     # one explanation for one silence: the quiet hint points at `runs log`, which reads the same
     # frozen heartbeats, so it must not ride along with the progress row.
-    assert render._QUIET_HEARTBEAT_HINT not in out
+    assert heartbeat_ui._QUIET_HEARTBEAT_HINT not in out
 
     # a SETUP stage has no step to be stale about -- it gets the warmup/quiet hints instead.
     setup = dict(base, last_heartbeat={"stage": "sft_initializing", "ts": _time.time() - 1200})
@@ -1199,6 +1198,7 @@ def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
     """
     import time as _time
 
+    from flash.cli.ui import heartbeat as heartbeat_ui
     from flash.cli.ui import render
 
     monkeypatch.setenv("FLASH_STYLE", "1")
@@ -1207,7 +1207,7 @@ def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
     }
 
     # model_prefetching is the stage that actually pulls base weights, so it is the one whose
@@ -1224,7 +1224,7 @@ def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
     # sends that user to wait for an attempt change that is never coming.
     assert "uploads may be failing" in out
     # one explanation per silence: the generic hint must not ride along with the specific one.
-    assert render._QUIET_HEARTBEAT_HINT not in out
+    assert heartbeat_ui._QUIET_HEARTBEAT_HINT not in out
 
     # inside the cadence, silence is ordinary and must stay unremarked by this hint.
     fresh = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 300})
@@ -1274,7 +1274,7 @@ def test_setup_hint_does_not_blame_a_download_on_a_stage_that_never_downloads(mo
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
     }
 
     frozen = dict(base, last_heartbeat={"stage": "sft_configuring", "ts": _time.time() - 1200})
@@ -1304,7 +1304,7 @@ def test_warmup_reassurance_yields_once_the_silence_is_unexplained(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "rl"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "rl"},
     }
 
     # inside the overlap: the specific hint wins, the reassurance stands down.
@@ -1337,7 +1337,7 @@ def test_opd_model_load_is_not_described_as_a_weight_download(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "opd"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "opd"},
     }
 
     opd = dict(base, last_heartbeat={"stage": "opd_model_load", "ts": _time.time() - 1200})
@@ -1377,7 +1377,7 @@ def test_stale_datacenter_is_labelled_as_the_previous_attempt(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
     }
 
     superseded = dict(
@@ -1471,7 +1471,7 @@ def test_finalizing_silence_is_not_called_unusual(stage, monkeypatch):
     obj = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
         "last_heartbeat": {"stage": stage, "ts": _time.time() - 1200},
     }
     out = render.run_status(obj)
@@ -1496,7 +1496,7 @@ def test_setup_hint_cites_the_datacenter_only_when_the_row_is_rendered(monkeypat
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
     }
 
     without_dc = dict(
@@ -1552,6 +1552,7 @@ def test_quiet_hint_does_not_send_users_to_an_hourly_log(monkeypatch):
     """
     import time as _time
 
+    from flash.cli.ui import heartbeat as heartbeat_ui
     from flash.cli.ui import render
 
     monkeypatch.setenv("FLASH_STYLE", "1")
@@ -1560,12 +1561,12 @@ def test_quiet_hint_does_not_send_users_to_an_hourly_log(monkeypatch):
     quiet = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"},
         "last_heartbeat": {"stage": "rl_train_start", "ts": _time.time() - 400},
     }
     out = render.run_status(quiet).split("details")[0]
 
-    assert render._QUIET_HEARTBEAT_HINT in out
+    assert heartbeat_ui._QUIET_HEARTBEAT_HINT in out
     assert "runs log" not in out
     # it has to name the surfaces that do update while the run is live.
     assert "the age above" in out
@@ -1593,7 +1594,7 @@ def test_a_cleared_remote_does_not_present_a_dead_attempts_region_as_live(monkey
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
     }
     heartbeat = {
         "stage": "sft_model_load",
@@ -1630,7 +1631,7 @@ def test_a_superseded_ping_is_not_called_alive_by_the_quiet_hint(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"},
     }
     # rl_train_start is deliberate: it is in neither hint's stage set, so before this fix nothing
     # suppressed the quiet hint and the contradiction was reachable.

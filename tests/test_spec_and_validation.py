@@ -11,6 +11,11 @@ from dataclasses import fields, replace
 
 import pytest
 
+import flash.runner.lifecycle.preparation as runner_preparation
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as runner_submit
+import flash.runner.supervise.deploy as runner_deploy
 from flash.core.spec import (
     GpuSpec,
     JobSpec,
@@ -32,7 +37,7 @@ from flash.schema import (
 )
 
 BASE_RAW = {
-    "model": "Qwen/Qwen3.5-0.8B",
+    "model": "Qwen/Qwen3.5-9B",
     "algorithm": "grpo",
     "project": "11111111-1111-4111-8111-111111111111",
     "environment": {"id": "freesolo/math-agent/gsm8k"},
@@ -91,7 +96,7 @@ def test_parse_adapter_revision_rejects_zero_padded_steps(step):
         ({"algorithm": "ppo"}, "unsupported algorithm"),
         # An unhashable model (TOML array / `[model]` table) used to TypeError on MODELS.get() -> 500;
         # it must be a clean ConfigError like every other scalar.
-        ({"model": ["Qwen/Qwen3.5-4B"]}, "must be a model id string"),
+        ({"model": ["Qwen/Qwen3.5-9B"]}, "must be a model id string"),
         ({"model": {"id": "x"}}, "must be a model id string"),
         ({"model": "   "}, "must be a model id string"),
         # A truthy non-string algorithm used to AttributeError on .lower() (uncaught 500); it must be
@@ -191,7 +196,7 @@ def test_credit_assignment_defaults_accepts_and_roundtrips() -> None:
 def test_toml_config_requires_project(tmp_path) -> None:
     config = tmp_path / "train.toml"
     config.write_text(
-        'model = "Qwen/Qwen3.5-0.8B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "freesolo/gsm8k"\n'
         "[train]\nepochs = 1\nmax_examples = 1\n"
@@ -210,10 +215,10 @@ def test_project_id_is_required_canonicalized_and_roundtrips() -> None:
         spec_from_dict(_raw(project="   "), project_required=True)
     with pytest.raises(ConfigError, match="project must be a valid UUID"):
         spec_from_dict(_raw(project="not-a-uuid"))
-    persisted = JobSpec(model="Qwen/Qwen3.5-0.8B").to_internal_dict()
+    persisted = JobSpec(model="Qwen/Qwen3.5-9B").to_internal_dict()
     assert JobSpec.from_dict(persisted).project == ""
 
-    synthetic = JobSpec(model="Qwen/Qwen3.5-0.8B")
+    synthetic = JobSpec(model="Qwen/Qwen3.5-9B")
     assert synthetic.project == ""
     assert synthetic.to_dict()["project"] == ""
     from flash.client.specs import spec_payload
@@ -422,7 +427,7 @@ def test_internal_from_dict_round_trips_stored_lora_alpha() -> None:
     # inherited parent alpha (which need not equal 2 x rank) survive control-plane -> worker
     # serialization; alpha falls back to 2 x rank only when the payload omits it.
     base = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "train": {
@@ -493,7 +498,7 @@ def test_gpu_sizing_consumes_the_canonical_warmstart_reference() -> None:
 
 
 def test_warmstart_placeholder_rank_does_not_reject_a_source_rank_that_fits_b200() -> None:
-    from flash.providers.allocator import required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb
 
     train = {
         "epochs": 1,
@@ -709,27 +714,25 @@ def test_hf_repo_is_managed_not_user_set() -> None:
         spec_from_dict(raw)
 
 
-def test_lora_rank_allows_rank128_for_small_serving_models() -> None:
-    # The small dense tiers (default model Qwen3.5-0.8B) now serve rank-128 LoRA buffers.
+def test_lora_rank_allows_rank128_for_default_serving_model() -> None:
+    # the default 9b serving profile supports rank-128 lora buffers.
     assert spec_from_dict(_raw(**{"train.lora_rank": 128})).train.lora_rank == 128
 
 
-def test_lora_rank_must_fit_small_serving_cap() -> None:
-    # Small-tier serving cap doubled 64 -> 128; rank 129 exceeds it.
+def test_lora_rank_must_fit_default_serving_cap() -> None:
+    # rank 129 exceeds the default 9b serving profile's rank-128 cap.
     with pytest.raises(ConfigError, match="serving max_lora_rank=128"):
         spec_from_dict(_raw(**{"train.lora_rank": 129}))
 
 
-def test_lora_rank_must_fit_large_serving_cap() -> None:
+def test_inactive_qwen38_serving_candidate_does_not_cap_training_rank() -> None:
     from flash.core.catalog import serving_lora_rank_cap
 
-    # the 27B is the rank-64 tier. this case used the 4B, which was rank-64 when it was written and
-    # is now rank-128 -- leaving it there would have made this a duplicate of the small-cap test
-    # above rather than coverage of the lower cap. derived from the catalog so it tracks the tier.
-    cap = serving_lora_rank_cap("Qwen/Qwen3.6-27B")
-    assert cap is not None
-    with pytest.raises(ConfigError, match=f"serving max_lora_rank={cap}"):
-        spec_from_dict(_raw(model="Qwen/Qwen3.6-27B", **{"train.lora_rank": cap + 1}))
+    assert serving_lora_rank_cap("Qwen/Qwen3.8-27B") is None
+    assert (
+        spec_from_dict(_raw(model="Qwen/Qwen3.8-27B", **{"train.lora_rank": 128})).train.lora_rank
+        == 128
+    )
 
 
 def test_bare_environment_id_is_rejected() -> None:
@@ -768,7 +771,7 @@ def test_env_ref_validator_matches_adapter_acceptor() -> None:
     # they must agree exactly (accept <-> no raise, reject <-> raise) or a ref accepted at submit
     # could fail on the worker (or vice-versa). _require_environment_ref now delegates to the
     # adapter's is_freesolo_environment_id; this pins that alignment across the grammar's corners.
-    from flash.envs.adapter import is_freesolo_environment_id
+    from flash.envs.loading.adapter import is_freesolo_environment_id
     from flash.schema.fields import _require_environment_ref
 
     corpus = [
@@ -1234,19 +1237,19 @@ def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
 
     defaults = GpuSpec()
     spec = spec_from_dict(
-        _raw(**{"gpu.provider": " RunPod ", "gpu.type": "rtx-4090"}),
+        _raw(**{"gpu.provider": " RunPod ", "gpu.type": "A100 PCIe"}),
         run_id="gpu-rt",
     )
     payload = spec_payload(spec)
     # the public payload carries the user-authorable gpu knobs and omits managed lifecycle policy.
     assert payload["gpu"]["provider"] == "runpod"
-    assert payload["gpu"]["type"] == "RTX 4090"
+    assert payload["gpu"]["type"] == "A100 PCIe"
     assert "max_retries" not in payload["gpu"]
     assert "max_wall_seconds" not in payload["gpu"]
 
     reparsed = spec_from_dict(payload, run_id="server-reparse")
     assert reparsed.gpu.provider == "runpod"
-    assert reparsed.gpu.type == "RTX 4090"
+    assert reparsed.gpu.type == "A100 PCIe"
     assert reparsed.gpu.type == spec.gpu.type
     # managed lifecycle fields reconstitute to their defaults on the server reparse.
     assert reparsed.gpu.max_retries == defaults.max_retries
@@ -1284,9 +1287,9 @@ def test_cost_quote_preserves_soft_provider_preference(monkeypatch) -> None:
     to be made reachable explicitly -- quoting lambda on the bare fixture plane would assert the
     very defect `test_cost_quote_skips_a_preference_this_plane_cannot_provision` guards against.
     """
-    import flash.providers as providers_registry
     from flash.cost.analytical import estimate_cost
     from flash.cost.spec import runconfig_from_spec
+    from flash.providers.core import registry as providers_registry
 
     spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda", "vast"]}))
     config = runconfig_from_spec(spec)
@@ -1307,9 +1310,9 @@ def test_cost_quote_skips_a_preference_this_plane_cannot_provision(monkeypatch) 
     get, and the server's affordability check runs on that estimate -- so a balance that covers the
     real allocation can be refused with a 402.
     """
-    import flash.providers as providers_registry
     from flash.cost.analytical import estimate_cost
     from flash.cost.spec import runconfig_from_spec
+    from flash.providers.core import registry as providers_registry
 
     spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"]}))
     config = runconfig_from_spec(spec)
@@ -1330,9 +1333,9 @@ def test_cost_quote_refuses_a_shape_no_configured_provider_can_rent(monkeypatch)
     for hardware this plane has no credentials for, which then passes the affordability check and
     only fails once live allocation runs -- after the run is recorded.
     """
-    import flash.providers as providers_registry
     from flash.cost.analytical import estimate_cost
     from flash.cost.spec import runconfig_from_spec
+    from flash.providers.core import registry as providers_registry
 
     spec = spec_from_dict(_raw(**{"gpu.providers": ["vast"], "gpu.type": "B200"}))
     config = runconfig_from_spec(spec)
@@ -1412,10 +1415,10 @@ def test_cost_quote_no_fit_error_names_every_acceptable_class() -> None:
 
 
 def test_soft_provider_preference_does_not_reject_an_ineligible_gpu_type_pair() -> None:
-    spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"], "gpu.type": "RTX 4090"}))
+    spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"], "gpu.type": "A100 PCIe"}))
 
     assert spec.gpu.providers == ("lambda",)
-    assert spec.gpu.type == "RTX 4090"
+    assert spec.gpu.type == "A100 PCIe"
 
 
 def test_persisted_gpu_provider_preferences_reject_invalid_values() -> None:
@@ -1801,7 +1804,7 @@ def test_model_revision_force_pin_rejects_invalid_internal_states(overrides) -> 
 
 
 def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:
-    from flash.runner.preparation import _preparation_digest
+    from flash.runner.lifecycle.preparation import _preparation_digest
 
     scalar = JobSpec(
         model="Qwen/Qwen3.5-9B",
@@ -1823,7 +1826,7 @@ def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:
 
 def test_resubmitting_a_public_spec_gets_a_fresh_runner_pin(monkeypatch) -> None:
     """Round-tripping an auto-pinned run's public spec must keep the pin platform-managed."""
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     resolved_sha = "d" * 40
 
@@ -1849,7 +1852,7 @@ def test_resubmitting_a_public_spec_gets_a_fresh_runner_pin(monkeypatch) -> None
 
 
 def test_forced_sft_model_revision_verifies_and_retains_the_exact_pin(monkeypatch) -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     exact = "a" * 40
     moving_head = "b" * 40
@@ -1884,7 +1887,7 @@ def test_forced_sft_model_revision_verifies_and_retains_the_exact_pin(monkeypatc
 
 @pytest.mark.parametrize("reported", ["b" * 40, "A" * 40])
 def test_forced_model_revision_rejects_a_mismatched_hub_resolution(monkeypatch, reported) -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     class _Api:
         def __init__(self, *a, **k) -> None: ...
@@ -1907,7 +1910,7 @@ def test_forced_model_revision_rejects_a_mismatched_hub_resolution(monkeypatch, 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "opd"])
 def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algorithm) -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     exact = "c" * 40
     asked_for = []
@@ -1937,8 +1940,48 @@ def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algo
     assert resolved.model_revision_force_pin is False
 
 
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_qwen38_catalog_revision_is_forced_and_verified(monkeypatch, algorithm) -> None:
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
+
+    exact = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+    asked_for = []
+
+    class _Api:
+        def __init__(self, *a, **k) -> None: ...
+
+        def model_info(self, model, revision=None):
+            asked_for.append((model, revision))
+            return type("_Info", (), {"sha": exact})
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+    spec = _job_from_dict({"model": "Qwen/Qwen3.8-27B", "algorithm": algorithm})
+
+    resolved = _resolve_model_revision(spec, required=algorithm == "sft")
+
+    assert asked_for == [("Qwen/Qwen3.8-27B", exact)]
+    assert resolved.model_revision == exact
+    assert resolved.model_revision_auto is True
+    assert resolved.model_revision_force_pin is False
+
+
+def test_qwen38_catalog_revision_rejects_inherited_qwen36_pin() -> None:
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
+
+    inherited = _job_from_dict(
+        {
+            "model": "Qwen/Qwen3.8-27B",
+            "algorithm": "grpo",
+            "model_revision": "a" * 40,
+            "model_revision_auto": True,
+        }
+    )
+    with pytest.raises(ValueError, match="requires immutable revision"):
+        _resolve_model_revision(inherited)
+
+
 def test_unmanaged_model_revision_is_rejected_and_runner_pin_is_unchanged() -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     with pytest.raises(ValueError, match="model_revision requires model_revision_auto=True"):
         _job_from_dict({"model_revision": "release-tag"})
@@ -1949,7 +1992,7 @@ def test_unmanaged_model_revision_is_rejected_and_runner_pin_is_unchanged() -> N
 
 
 def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() -> None:
-    from flash.runner.preparation import _preparation_digest
+    from flash.runner.lifecycle.preparation import _preparation_digest
 
     public = spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft"))
     worker = replace(public, model_revision="a" * 40, model_revision_auto=True)
@@ -1973,7 +2016,7 @@ def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> No
     Built by round-tripping through to_dict() rather than by hand, so the test cannot assert a
     shape that submit does not actually produce.
     """
-    from flash.runner.preparation import _validate_effective_spec
+    from flash.runner.lifecycle.preparation import _validate_effective_spec
 
     public = spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft"))
     worker = replace(public, model_revision="a" * 40, model_revision_auto=True)
@@ -2029,36 +2072,36 @@ def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fresh_orchestrator(tmp_path, monkeypatch):
+def _fresh_orchestrator(tmp_path, monkeypatch) -> None:
     from tests._helpers.runner import fresh_runner
 
-    return fresh_runner(tmp_path, monkeypatch)
+    fresh_runner(tmp_path, monkeypatch)
 
 
 def test_runs_file_path_rejects_traversal(tmp_path, monkeypatch) -> None:
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     for bad in ("../escape", "a/b", "", "x" * 200, ".hidden"):
         with pytest.raises(ValueError, match="invalid run_id"):
-            orch.runs_file_path(bad, ".json")
-    good = orch.runs_file_path("flash-123-abc", ".log")
+            runner_state.runs_file_path(bad, ".json")
+    good = runner_state.runs_file_path("flash-123-abc", ".log")
     assert good.endswith("flash-123-abc.log")
 
 
 def test_dry_run_submit_get_list_logs_cancel(tmp_path, monkeypatch) -> None:
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     spec = spec_from_dict(_raw())
 
-    status = orch.submit_job(spec, dry_run=True)
+    status = runner_submit.submit_job(spec, dry_run=True)
     assert status.state == "dry_run"
-    assert orch.get_status(status.run_id).state == "dry_run"
-    assert status.run_id in [r.run_id for r in orch.list_runs()]
-    assert orch.get_logs(status.run_id) == ""  # no log yet, no crash
+    assert runner_status.get_status(status.run_id).state == "dry_run"
+    assert status.run_id in [r.run_id for r in runner_status.list_runs()]
+    assert runner_status.get_logs(status.run_id) == ""  # no log yet, no crash
 
     # terminal runs cancel as a no-op (state preserved)
-    assert orch.cancel_run(status.run_id).state == "dry_run"
+    assert runner_deploy.cancel_run(status.run_id).state == "dry_run"
 
     with pytest.raises(FileNotFoundError, match="unknown run_id"):
-        orch.get_status("flash-000-nope")
+        runner_status.get_status("flash-000-nope")
 
 
 def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
@@ -2069,22 +2112,24 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
     # to an assumed row count -- including on the dry-run preview, which previews a real submit.
     from flash.core.spec import JobSpec
 
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        orch,
+        runner_preparation,
         "_resolve_model_revision",
         lambda s, **_kw: replace(s, model_revision="a" * 40, model_revision_auto=True),
     )
     spec = JobSpec(
         run_id="sft-no-environment",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         project="11111111-1111-4111-8111-111111111111",
     )
-    with pytest.raises(orch.WorkloadProfileUnavailable, match="requires an environment id"):
-        orch.submit_job(spec, dry_run=True)
+    with pytest.raises(
+        runner_preparation.WorkloadProfileUnavailable, match="requires an environment id"
+    ):
+        runner_submit.submit_job(spec, dry_run=True)
     with pytest.raises(FileNotFoundError):
-        orch.get_status(spec.run_id)
+        runner_status.get_status(spec.run_id)
 
 
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
@@ -2099,32 +2144,34 @@ def test_adapter_continuation_preparation_is_target_algorithm_agnostic(
     """
     from flash.core.spec import JobSpec, TrainSpec
 
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     spec = JobSpec(
         run_id=f"{algorithm}-warmstart",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm=algorithm,
         project="11111111-1111-4111-8111-111111111111",
         train=TrainSpec(epochs=1, max_examples=8, init_from_adapter="source-run"),
     )
 
     with pytest.raises(ValueError, match="references unknown run 'source-run'"):
-        orch._prepare_init_from_adapter(spec)
+        runner_preparation._prepare_init_from_adapter(spec)
 
 
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     spec = spec_from_dict(_raw(), run_id="flash-1-x")
-    assert orch.artifacts_dir(spec).endswith(os.path.join("results", "runpod", "rl", "flash-1-x"))
-    assert orch.adapter_prefix(spec) == "rl/flash-1-x"
-    assert orch.adapter_ref(spec) is None
+    assert runner_state.artifacts_dir(spec).endswith(
+        os.path.join("results", "runpod", "rl", "flash-1-x")
+    )
+    assert runner_state.adapter_prefix(spec) == "rl/flash-1-x"
+    assert runner_state.adapter_ref(spec) is None
 
     # hf_repo and run_id are platform-managed: they survive the INTERNAL round trip
     # (to_internal_dict -> from_dict), which is what the worker/control plane use, not to_dict().
     d = spec.to_internal_dict()
     d["train"] = {**d["train"], "hf_repo": "Freesolo-Co/flashrun-flash-1-x"}
     spec_with_repo = _job_from_dict(d)
-    assert orch.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
+    assert runner_state.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
 
 
 # ---------------------------------------------------------------------------
@@ -2192,7 +2239,7 @@ def test_removed_worker_environment_table_is_rejected(tmp_path) -> None:
     # a config that still carries it must fail loudly rather than train with the overrides dropped.
     path = tmp_path / "removed-worker-environment.toml"
     path.write_text(
-        'model = "Qwen/Qwen3.5-0.8B"\nalgorithm = "grpo"\n[worker_env]\nCUSTOM_FLAG = "value"\n'
+        'model = "Qwen/Qwen3.5-9B"\nalgorithm = "grpo"\n[worker_env]\nCUSTOM_FLAG = "value"\n'
     )
 
     with pytest.raises(ConfigError) as exc_info:

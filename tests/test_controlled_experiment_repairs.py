@@ -6,13 +6,15 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.runner.lifecycle.submit as runner_submit
+
 
 def _prepared_spec(*, revision: str = "a" * 40):
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
     from tests._helpers.profile import attach_sft_profile
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         model_revision=revision,
         model_revision_auto=True,
         algorithm="sft",
@@ -25,9 +27,8 @@ def _prepared_spec(*, revision: str = "a" * 40):
 
 def _stub_prepare_dependencies(monkeypatch, spec=None):
     import flash.core.catalog as catalog
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "resolve_model", lambda *args, **kwargs: catalog.MODELS[args[0]])
+    monkeypatch.setattr(catalog, "resolve_model", lambda *args, **kwargs: catalog.MODELS[args[0]])
     if spec is not None:
         # sft preparation profiles the packaged dataset itself, which resolves the environment
         # package over the network. these tests are about revision resolution, so the profile is
@@ -35,7 +36,7 @@ def _stub_prepare_dependencies(monkeypatch, spec=None):
         # which is what preparation re-derives before it profiles.
         from tests._helpers.profile import record_sft_profile
 
-        record_sft_profile(runner, spec, monkeypatch)
+        record_sft_profile(spec, monkeypatch)
     monkeypatch.setattr(
         "flash.cost.spec.estimate_for_spec", lambda _spec: SimpleNamespace(total_usd=1.0)
     )
@@ -49,14 +50,14 @@ def _stub_prepare_dependencies(monkeypatch, spec=None):
         lambda _spec, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
+        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
         lambda _spec: None,
     )
 
 
 def _minimal_spec_dict() -> dict:
     return {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "environment": {"id": "freesolo/example-project/gsm8k"},
         "train": {"epochs": 1, "max_examples": 1},
@@ -97,7 +98,6 @@ def test_spec_parsers_accept_valid_spec_without_execution_controls():
 def test_prepare_job_retains_runner_forced_sft_revision_and_clears_request(monkeypatch):
     import huggingface_hub
 
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
     exact = "d" * 40
@@ -117,7 +117,7 @@ def test_prepare_job_retains_runner_forced_sft_revision_and_clears_request(monke
     internal = _prepared_spec(revision=exact).to_internal_dict()
     internal.update(model_revision_auto=True, model_revision_force_pin=True)
 
-    prepared = runner.prepare_job(JobSpec.from_dict(internal))
+    prepared = runner_submit.prepare_job(JobSpec.from_dict(internal))
 
     assert seen == [exact]
     for spec in (prepared.public_spec, prepared.worker_spec):
@@ -130,6 +130,24 @@ def test_prepare_job_retains_runner_forced_sft_revision_and_clears_request(monke
 
 def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(monkeypatch, tmp_path):
     import flash.engine.plan.vram as vram
+    from flash.core.catalog import MODELS, ModelInfo
+
+    model_id = "test/revision-geometry"
+    monkeypatch.setitem(
+        MODELS,
+        model_id,
+        ModelInfo(
+            id=model_id,
+            display_name="synthetic revision geometry",
+            params="0.9B",
+            params_b=0.9,
+            algos=("sft",),
+            min_vram_gb=12,
+            vocab_size=248_320,
+            hidden_size=1024,
+            num_layers=24,
+        ),
+    )
 
     config = tmp_path / "config.json"
     config.write_text(
@@ -151,7 +169,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(mon
             return SimpleNamespace(safetensors=SimpleNamespace(total=int(0.9e9)))
 
     monkeypatch.setattr("huggingface_hub.HfApi", Api)
-    need = vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="d" * 40)
+    need = vram.model_required_vram_gb(model_id, "sft", model_revision="d" * 40)
     assert need > 0
 
     captured = {}
@@ -162,7 +180,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(mon
 
     with monkeypatch.context() as scoped:
         scoped.setattr(vram, "estimate_vram_gb", capture_estimate)
-        vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="d" * 40)
+        vram.model_required_vram_gb(model_id, "sft", model_revision="d" * 40)
     assert captured["model_info"] is None
     assert captured["active_params_b"] == 0.0
 
@@ -172,7 +190,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(mon
 
     monkeypatch.setattr("huggingface_hub.HfApi", DriftApi)
     with pytest.raises(ValueError, match="geometry incompatible"):
-        vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="e" * 40)
+        vram.model_required_vram_gb(model_id, "sft", model_revision="e" * 40)
 
 
 def test_revision_sizing_fails_closed_when_pinned_commit_lacks_param_metadata(
@@ -198,7 +216,7 @@ def test_revision_sizing_fails_closed_when_pinned_commit_lacks_param_metadata(
 
     monkeypatch.setattr("huggingface_hub.HfApi", NoParamApi)
     with pytest.raises(ValueError, match="no parameter-count metadata"):
-        vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="f" * 40)
+        vram.model_required_vram_gb("Qwen/Qwen3.5-9B", "sft", model_revision="f" * 40)
 
 
 def test_pinned_metadata_failure_keeps_sizing_strict(monkeypatch):
@@ -219,13 +237,13 @@ def test_pinned_metadata_failure_keeps_sizing_strict(monkeypatch):
 
     with pytest.raises(RuntimeError, match="metadata unavailable"):
         vram.model_required_vram_gb(
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-9B",
             "sft",
             model_revision="a" * 40,
         )
     # the same model WITHOUT a pin sizes fine from the catalog, so the raise above is the pinned
     # path failing closed rather than sizing being broken for this model.
-    assert vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft") > 0
+    assert vram.model_required_vram_gb("Qwen/Qwen3.5-9B", "sft") > 0
 
 
 def test_prefetch_error_classification():
@@ -272,39 +290,45 @@ def test_prefetch_error_classification():
 
 
 def test_prefetch_pinned_revision_does_not_swallow_download_failure(monkeypatch):
-    import flash.engine.worker.io.hf as hf
+    import flash.engine.worker.io.heartbeat as worker_heartbeat
+    import flash.engine.worker.io.hf as worker_hf
+    import flash.engine.worker.io.prefetch as worker_prefetch
+    import flash.engine.worker.perf as worker_perf
 
-    monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: None)
-    monkeypatch.setattr(hf, "_require_hf_deadline_allowance", lambda: None)
-    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(hf._w, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_prefetch, "_shared_weight_cache_dir", lambda: None)
+    monkeypatch.setattr(worker_hf, "_require_hf_deadline_allowance", lambda: None)
+    monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
         lambda **kwargs: (_ for _ in ()).throw(ValueError("revision not found")),
     )
 
     with pytest.raises(ValueError, match="revision not found"):
-        hf.prefetch_model("owner/model", revision="f" * 40)
+        worker_prefetch.prefetch_model("owner/model", revision="f" * 40)
 
 
 def test_prefetch_pinned_revision_wraps_transient_download_failure(monkeypatch):
     from requests.exceptions import Timeout
 
-    import flash.engine.worker.io.hf as hf
+    import flash.engine.worker.io.heartbeat as worker_heartbeat
+    import flash.engine.worker.io.hf as worker_hf
+    import flash.engine.worker.io.prefetch as worker_prefetch
+    import flash.engine.worker.perf as worker_perf
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
 
     transient = Timeout("timed out")
-    monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: None)
-    monkeypatch.setattr(hf, "_require_hf_deadline_allowance", lambda: None)
-    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(hf._w, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_prefetch, "_shared_weight_cache_dir", lambda: None)
+    monkeypatch.setattr(worker_hf, "_require_hf_deadline_allowance", lambda: None)
+    monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
         lambda **kwargs: (_ for _ in ()).throw(transient),
     )
 
     with pytest.raises(RetriableInfraError, match="pinned model prefetch failed") as exc_info:
-        hf.prefetch_model("owner/model", revision="f" * 40)
+        worker_prefetch.prefetch_model("owner/model", revision="f" * 40)
 
     assert exc_info.value.__cause__ is transient
 
@@ -315,8 +339,8 @@ def test_opd_model_revision_is_keyword_only():
     # controlled comparison this file exists to protect. the guard moved from trl's rollout engine
     # (OpdVllmRolloutEngine, deleted) to the verl checkpoint watcher, which is what carries the
     # revision through opd now -- it re-exports each checkpoint adapter under that pin.
-    from flash.engine.worker.opd_train import _OpdVerlCheckpointWatcher
-    from flash.engine.worker.sft_train import _VerlCheckpointWatcher
+    from flash.engine.worker.train.entry.sft_train import _VerlCheckpointWatcher
+    from flash.engine.worker.train.opd.orchestration.failures import _OpdVerlCheckpointWatcher
 
     # the opd subclass forwards **kwargs, so the binding it inherits is what has to be keyword-only.
     assert issubclass(_OpdVerlCheckpointWatcher, _VerlCheckpointWatcher)
@@ -340,7 +364,7 @@ def test_resolve_vocab_size_is_revision_aware_for_open_policy_model(monkeypatch,
     from flash.core.catalog import _DEFAULT_VOCAB_SIZE, resolve_vocab_size
 
     # cataloged model, no revision -> catalog vocab (unchanged default path).
-    assert resolve_vocab_size("Qwen/Qwen3.5-0.8B") == 248320
+    assert resolve_vocab_size("Qwen/Qwen3.5-9B") == 248320
 
     config = tmp_path / "config.json"
     config.write_text(
@@ -387,7 +411,7 @@ def _structured_opd_spec(structured_outputs: str):
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
 
     return JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         model_revision="a" * 40,
         model_revision_auto=True,
         algorithm="opd",
@@ -411,8 +435,6 @@ def test_structured_opd_guidance_only_feature_is_rejected_before_allocation(monk
     The generic serving preflight does not catch it: it validates the schema's shape,
     and this schema is perfectly valid.
     """
-    import flash.runner as runner
-
     _stub_prepare_dependencies(monkeypatch)
     _stub_structured_opd_hub(monkeypatch)
     # allocation-side work must not be reached. estimate_for_spec is the last step of preparation
@@ -431,7 +453,7 @@ def test_structured_opd_guidance_only_feature_is_rejected_before_allocation(monk
     spec = _structured_opd_spec(json.dumps({"json": schema}))
 
     with pytest.raises(ValueError, match="guidance fallback"):
-        runner.prepare_job(spec)
+        runner_submit.prepare_job(spec)
 
 
 def test_structured_opd_mistral_tokenizer_model_is_rejected_before_allocation(monkeypatch):
@@ -439,8 +461,6 @@ def test_structured_opd_mistral_tokenizer_model_is_rejected_before_allocation(mo
 
     Decided by the model id alone, so it needs no allocation to judge either.
     """
-    import flash.runner as runner
-
     _stub_prepare_dependencies(monkeypatch)
     _stub_structured_opd_hub(monkeypatch)
     monkeypatch.setattr(
@@ -448,13 +468,13 @@ def test_structured_opd_mistral_tokenizer_model_is_rejected_before_allocation(mo
         lambda _spec: (_ for _ in ()).throw(AssertionError("preparation must reject first")),
     )
     monkeypatch.setattr(
-        "flash.engine.worker.train.opd.validation._resolve_structured_model_metadata",
+        "flash.engine.worker.train.opd.orchestration.validation._resolve_structured_model_metadata",
         lambda _model, _rev: (151936, ("tekken.json",)),
     )
     spec = _structured_opd_spec(json.dumps({"json": {"type": "object"}}))
 
     with pytest.raises(ValueError, match="MistralTokenizer"):
-        runner.prepare_job(spec)
+        runner_submit.prepare_job(spec)
 
 
 def test_a_valid_structured_opd_constraint_still_prepares(monkeypatch):
@@ -463,12 +483,10 @@ def test_a_valid_structured_opd_constraint_still_prepares(monkeypatch):
     A constraint xgrammar can compile has to pass preparation untouched -- otherwise the fix trades
     a paid failure for a submission that refuses valid work, which is worse.
     """
-    import flash.runner as runner
-
     _stub_prepare_dependencies(monkeypatch)
     _stub_structured_opd_hub(monkeypatch)
     monkeypatch.setattr(
-        "flash.engine.worker.train.opd.validation._resolve_structured_model_metadata",
+        "flash.engine.worker.train.opd.orchestration.validation._resolve_structured_model_metadata",
         lambda _model, _rev: (151936, ("tokenizer.json",)),
     )
     schema = {
@@ -479,7 +497,7 @@ def test_a_valid_structured_opd_constraint_still_prepares(monkeypatch):
     }
     spec = _structured_opd_spec(json.dumps({"json": schema}))
 
-    prepared = runner.prepare_job(spec)
+    prepared = runner_submit.prepare_job(spec)
 
     assert prepared.public_spec.algorithm == "opd"
     assert prepared.public_spec.train.structured_outputs

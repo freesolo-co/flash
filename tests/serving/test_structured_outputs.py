@@ -15,8 +15,8 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
-from flash.serving.src.structured_outputs import (
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.structured_outputs import (
     StructuredOutputsError,
     normalize_structured_outputs,
 )
@@ -335,7 +335,7 @@ def _record(**extra) -> AdapterRecord:
         {
             "adapter_id": "a",
             "repo_id": "org/a",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "thinking": True,
             **extra,
         }

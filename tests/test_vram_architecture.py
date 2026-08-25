@@ -17,14 +17,11 @@ from flash.engine.plan.vram import (
 )
 
 _EXPECTED_LORA_TARGET_COUNTS = {
-    "Qwen/Qwen3.5-0.8B": 236,
-    "Qwen/Qwen3.5-2B": 284,
-    "Qwen/Qwen3.5-4B": 346,
     "Qwen/Qwen3.5-9B": 358,
     # 460 ordinary linears + both fused routed-expert tensors (40 layers x 256 experts each),
     # which peft wraps as 10,240 rank-r slices per tensor.
     "Qwen/Qwen3.6-35B-A3B": 460 + 2 * 10_240,
-    "Qwen/Qwen3.6-27B": 606,
+    "Qwen/Qwen3.8-27B": 606,
 }
 
 
@@ -137,7 +134,7 @@ def test_9b_rank64_sft_is_sized_off_the_rtx_5090():
 
 
 def test_gdn_state_page_and_attention_kv_use_real_geometry():
-    gdn = MODELS["Qwen/Qwen3.5-0.8B"]
+    gdn = MODELS["Qwen/Qwen3.5-9B"]
     gdn_raw = _architecture_kv_raw_gb(gdn, 4096, 8, False)
     attention_expected = (
         gdn.num_attention_layers * 8 * 4096 * 2 * gdn.num_key_value_heads * gdn.head_dim * 2 / 1e9
@@ -165,116 +162,59 @@ def test_gdn_state_page_and_attention_kv_use_real_geometry():
     )
 
 
-def test_sizing_accuracy_matrix_preserves_safe_boundaries_and_removes_overrouting():
-    cases = {
-        "gdn_vl_small_grpo": (
-            "Qwen/Qwen3.5-0.8B",
-            "grpo",
-            {"max_context_tokens": 32768, "group_size": 8, "lora_rank": 32},
-            72,
-        ),
-        "gdn_vl_high_rank_sft": (
-            "Qwen/Qwen3.5-2B",
-            "sft",
-            {"max_context_tokens": 4096, "batch_size": 4, "lora_rank": 128},
-            32,
-        ),
-        "gdn_vl_4b_grpo": (
-            "Qwen/Qwen3.5-4B",
-            "grpo",
-            {
-                "max_context_tokens": 16384,
-                "max_completion_tokens": 4096,
-                "group_size": 8,
-                "lora_rank": 32,
-            },
-            98,
-        ),
-        "gdn_vl_9b_grpo": (
+def test_9b_grpo_stays_within_its_validated_placement_tier(monkeypatch):
+    from flash.cost import RunConfig, estimate_cost
+    from flash.providers.core import allocator
+
+    train = {
+        "max_context_tokens": 4096,
+        "max_completion_tokens": 320,
+        "group_size": 8,
+        "lora_rank": 64,
+    }
+    need = model_required_vram_gb("Qwen/Qwen3.5-9B", "grpo", train=train)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    allocation = allocator.allocate("Qwen/Qwen3.5-9B", "grpo", train=train)
+    quote = estimate_cost(
+        RunConfig(
             "Qwen/Qwen3.5-9B",
             "grpo",
-            {"max_context_tokens": 4096, "group_size": 8, "lora_rank": 64},
-            80,
-        ),
-        # the two moe ceilings sit above the pre-expert numbers (103 and 180) on purpose: the routed
-        # experts are real trainable parameters, so an estimate that excluded them under-reserved.
-        # the sft ceiling is 155 rather than 154 for the same reason one level down:
-        # _SFT_CHUNKED_NLL_TOKENS now tracks verl's real FusedLinearForPPO chunk_size of 512, and
-        # the extra 256 rows of vocab projection are 1.017 GB the child was always spending. the
-        # card is unchanged (B200 before and after), so nothing reroutes.
-        "moe_sft": (
-            "Qwen/Qwen3.6-35B-A3B",
-            "sft",
-            {"max_context_tokens": 4096, "batch_size": 4, "lora_rank": 64},
-            155,
-        ),
-        "moe_grpo": (
-            "Qwen/Qwen3.6-35B-A3B",
-            "grpo",
-            {
-                "max_context_tokens": 4096,
-                "max_completion_tokens": 384,
-                "group_size": 8,
-                "lora_rank": 16,
-            },
-            190,
-        ),
-    }
+            1,
+            seq_len=train["max_context_tokens"],
+            completion_len=train["max_completion_tokens"],
+            group_size=train["group_size"],
+            lora_rank=train["lora_rank"],
+            provider="runpod",
+        )
+    )
 
-    sized = {
-        name: model_required_vram_gb(model_id, algorithm, train=train)
-        for name, (model_id, algorithm, train, _old_need) in cases.items()
-    }
-    for name, (_model_id, _algorithm, _train, old_need) in cases.items():
-        assert sized[name] <= old_need
+    assert 48 < need <= 80
+    assert allocation.min_vram_gb == quote.required_vram_gb == need
+    assert (allocation.gpu, allocation.gpu_count) == (quote.gpu, quote.gpu_count)
+    assert allocation.gpu == "A100 PCIe"
 
-    # 0.8B @ 32k ctx is NOT a 24/32 GB run despite the tiny weights: the long-context KV dominates.
-    # The resident peak is ~38.5 GB and the sleep pool the worker reserves -- max(_KV_CAP, 1.5 * arch
-    # KV) at group 8 -- is likewise > 32 GB. The
-    # old <= 24 bound encoded the sleep-KV under-count this PR removes (preflight would have admitted a
-    # 24 GB card the sleep-mode vLLM executor then OOMs); the run correctly sizes onto the 48 GB tier.
-    assert 32 < sized["gdn_vl_small_grpo"] <= 48
-    assert sized["gdn_vl_high_rank_sft"] <= 32
-    assert model_required_vram_gb("Qwen/Qwen3.5-2B", "grpo") <= 32
-    assert model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"group_size": 8}) <= 48
-    assert sized["gdn_vl_9b_grpo"] <= 80
-    # training the routed experts adds ~3.7B trainable parameters at rank 64, so the 35B no longer
-    # fits one card for these shapes; it routes to two. sizing it back under a single-card tier would
-    # mean under-reserving a run that really does need the memory.
-    assert sized["moe_sft"] <= 2 * 141
-    assert sized["moe_grpo"] <= 2 * 180
 
-    assert sized["gdn_vl_small_grpo"] < cases["gdn_vl_small_grpo"][3]
-    assert sized["gdn_vl_4b_grpo"] < cases["gdn_vl_4b_grpo"][3]
+def test_grpo_estimator_grows_with_context_and_completion():
+    from flash.engine.plan.vram import estimate_vram_gb
+
+    short_context = estimate_vram_gb(
+        9.7, "grpo", seq_len=1024, max_tokens=512, group_size=8, use_vllm=False
+    )
+    long_context = estimate_vram_gb(
+        9.7, "grpo", seq_len=8192, max_tokens=512, group_size=8, use_vllm=False
+    )
+    short_completion = estimate_vram_gb(
+        9.7, "grpo", seq_len=4096, max_tokens=128, group_size=8, use_vllm=False
+    )
+    long_completion = estimate_vram_gb(
+        9.7, "grpo", seq_len=4096, max_tokens=2048, group_size=8, use_vllm=False
+    )
+
+    assert long_context > short_context
+    assert long_completion > short_completion
 
 
 def test_sizing_accuracy_matrix_does_not_accept_known_oom_boundaries():
-    assert model_required_vram_gb("Qwen/Qwen3.5-0.8B", "grpo") > 20
-    assert model_required_vram_gb("Qwen/Qwen3.5-2B", "grpo") > 24
-    assert (
-        model_required_vram_gb(
-            "Qwen/Qwen3.5-4B",
-            "grpo",
-            train={"max_context_tokens": 4096, "group_size": 16},
-        )
-        > 31
-    )
-    assert (
-        model_required_vram_gb(
-            "Qwen/Qwen3.5-4B",
-            "grpo",
-            train={
-                "max_context_tokens": 32768,
-                "max_completion_tokens": 8192,
-                "group_size": 8,
-            },
-        )
-        > 32
-    )
-    # NOTE: 4B SFT @ 8192 is NOT a >32GB OOM boundary anymore -- chunked-NLL (enabled+validated for
-    # Qwen3.5-4B via #582) drops dense logits, so it fits a 32GB card (~27GB). That fits-32GB behavior is
-    # asserted by test_qwen4b_sft_8192_chunked_nll_routes_to_32gb_card; keeping a >32 boundary here would
-    # test a boundary chunked-NLL legitimately removed.
     assert model_required_vram_gb("Qwen/Qwen3.5-9B", "grpo") > 48
     assert (
         model_required_vram_gb(

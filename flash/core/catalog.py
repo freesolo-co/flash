@@ -13,11 +13,8 @@ ALGORITHMS = ("sft", "grpo", "opd")
 _ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd"})
 _IMAGE_TRAINING_MODELS = frozenset(
     {
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
-        "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
-        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
 )
@@ -102,6 +99,9 @@ class ModelInfo:
     # module prefix containing every language layer on the loaded conditional-generation model.
     # required by text-only lora targeting; kept out of the public catalog rows below.
     lora_language_prefix: str = ""
+    # runner-managed immutable training revision for the one model that requires an exact hub pin.
+    # this is internal preparation policy, not a public catalog field.
+    managed_revision: str = ""
     quant: str = "bf16"
     recommended_gpu: str = DEFAULT_GPU
     # 0 => GRPO uses min_vram_gb like SFT; set when colocated vLLM rollout needs a bigger card.
@@ -136,8 +136,8 @@ class ModelInfo:
     num_linear_attention_layers: int = 0
     num_key_value_heads: int = 0
     # QUERY heads, from the checkpoint's own config. NOT derivable as hidden_size // head_dim: these
-    # models decouple head_dim from that ratio (3.5-4B is hidden 2560 / head_dim 256 but has 16
-    # heads, not 10). vllm TENSOR parallelism requires this to divide the rented card count -- grpo
+    # models decouple head_dim from that ratio (3.5-9b is hidden 4096 / head_dim 256 and has 16
+    # heads). vllm tensor parallelism requires this to divide the rented card count -- grpo
     # and opd hand that count to the rollout engine as tensor_model_parallel_size -- so a derived
     # value silently caps runs on a number that is not the constraint. no longer a sequence-parallel
     # constraint: all three algorithms pin ulysses off and shard by data.
@@ -181,6 +181,7 @@ class ModelInfo:
             "linear_value_head_dim",
             "linear_conv_kernel_dim",
             "lora_language_prefix",
+            "managed_revision",
             "lora_target_shapes",
             "lora_expert_count",
         ):
@@ -201,164 +202,16 @@ class ModelInfo:
         return data
 
 
-DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
+DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 
-# the checkpoint each base model's serving engine loads. dense models serve freesolo-owned fp8
-# checkpoints; the 35b-a3b moe serves the base bf16 checkpoint because its full-expert lora path is
-# incompatible with fp8 on the validated h200 tier. informational for the catalog mirror; adapter
-# deployment gates read max_lora_rank, and serving preflight reads max_model_len.
+# the checkpoint each active hosted base model's serving engine loads. qwen3.8-27b remains a
+# training model and a pinned hosted candidate, but does not enter this active map before its canary.
 SERVING_MODEL_REPOS: dict[str, str] = {
-    "Qwen/Qwen3.5-0.8B": "Freesolo-Co/Qwen3.5-0.8B-FP8",
-    "Qwen/Qwen3.5-2B": "Freesolo-Co/Qwen3.5-2B-FP8",
-    "Qwen/Qwen3.5-4B": "Freesolo-Co/Qwen3.5-4B-FP8",
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
-    "Qwen/Qwen3.6-27B": "Freesolo-Co/Qwen3.6-27B-FP8",
     "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B",
 }
 
 MODELS: dict[str, ModelInfo] = {
-    "Qwen/Qwen3.5-0.8B": ModelInfo(
-        id="Qwen/Qwen3.5-0.8B",
-        display_name="Qwen3.5 0.8B",
-        params="0.9B",
-        params_b=0.9,
-        lora_language_prefix="model.language_model",
-        vocab_size=248_320,
-        num_layers=24,
-        hidden_size=1024,
-        num_attention_layers=6,
-        num_linear_attention_layers=18,
-        num_key_value_heads=2,
-        num_attention_heads=8,
-        head_dim=256,
-        linear_num_key_heads=16,
-        linear_num_value_heads=16,
-        linear_key_head_dim=128,
-        linear_value_head_dim=128,
-        linear_conv_kernel_dim=4,
-        lora_target_shapes=(
-            (768, 768, 12),
-            (768, 2304, 12),
-            (768, 3072, 12),
-            (1024, 16, 36),
-            (1024, 512, 12),
-            (1024, 2048, 18),
-            (1024, 3584, 48),
-            (1024, 4096, 6),
-            (1024, 6144, 18),
-            (2048, 1024, 24),
-            (3072, 768, 12),
-            (3072, 1024, 1),
-            (3072, 3072, 1),
-            (3584, 1024, 24),
-        ),
-        algos=ALGORITHMS,
-        min_vram_gb=12,
-        recommended_gpu="RTX 4090",
-        serving=ServingCapacity(
-            gpu="L4",
-            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-0.8B"],
-            max_loras=16,
-            max_lora_rank=128,
-            max_model_len=32768,
-        ),
-        thinking="hybrid",
-        notes="Smallest Qwen3.5; cheap smoke/dev runs with the modern arch.",
-    ),
-    "Qwen/Qwen3.5-2B": ModelInfo(
-        id="Qwen/Qwen3.5-2B",
-        display_name="Qwen3.5 2B",
-        params="2.3B",
-        params_b=2.3,
-        lora_language_prefix="model.language_model",
-        vocab_size=248_320,
-        num_layers=24,
-        hidden_size=2048,
-        num_attention_layers=6,
-        num_linear_attention_layers=18,
-        num_key_value_heads=2,
-        num_attention_heads=8,
-        head_dim=256,
-        linear_num_key_heads=16,
-        linear_num_value_heads=16,
-        linear_key_head_dim=128,
-        linear_value_head_dim=128,
-        linear_conv_kernel_dim=4,
-        lora_target_shapes=(
-            (1024, 1024, 24),
-            (1024, 3072, 24),
-            (1024, 4096, 24),
-            (2048, 16, 36),
-            (2048, 512, 12),
-            (2048, 2048, 42),
-            (2048, 4096, 6),
-            (2048, 6144, 66),
-            (4096, 1024, 24),
-            (4096, 2048, 1),
-            (4096, 4096, 1),
-            (6144, 2048, 24),
-        ),
-        algos=ALGORITHMS,
-        min_vram_gb=16,
-        recommended_gpu="RTX 4090",
-        serving=ServingCapacity(
-            gpu="L4",
-            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-2B"],
-            max_loras=16,
-            max_lora_rank=128,
-            max_model_len=32768,
-        ),
-        thinking="hybrid",
-    ),
-    "Qwen/Qwen3.5-4B": ModelInfo(
-        id="Qwen/Qwen3.5-4B",
-        display_name="Qwen3.5 4B",
-        params="4.7B",
-        params_b=4.7,
-        lora_language_prefix="model.language_model",
-        vocab_size=248_320,
-        num_layers=32,
-        hidden_size=2560,
-        num_attention_layers=8,
-        num_linear_attention_layers=24,
-        num_key_value_heads=4,
-        num_attention_heads=16,
-        head_dim=256,
-        linear_num_key_heads=16,
-        linear_num_value_heads=32,
-        linear_key_head_dim=128,
-        linear_value_head_dim=128,
-        linear_conv_kernel_dim=4,
-        lora_target_shapes=(
-            (1024, 1024, 24),
-            (1024, 3072, 24),
-            (1024, 4096, 24),
-            (2560, 32, 48),
-            (2560, 1024, 16),
-            (2560, 4096, 24),
-            (2560, 8192, 32),
-            (2560, 9216, 64),
-            (4096, 1024, 24),
-            (4096, 2560, 33),
-            (4096, 4096, 1),
-            (9216, 2560, 32),
-        ),
-        algos=ALGORITHMS,
-        min_vram_gb=32,
-        recommended_gpu="RTX 5090",
-        serving=ServingCapacity(
-            gpu="L4",
-            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-4B"],
-            max_loras=16,
-            max_lora_rank=128,
-            max_model_len=32768,
-            max_num_seqs=8,
-            gpu_memory_utilization=0.98,
-        ),
-        thinking="hybrid",
-        notes="Current-gen 4B. GRPO uses the sleep-mode memory recipe (hybrid arch needs "
-        "extra engine state-cache); fused DeltaNet kernels ship in the default stack.",
-    ),
     "Qwen/Qwen3.5-9B": ModelInfo(
         id="Qwen/Qwen3.5-9B",
         display_name="Qwen3.5 9B",
@@ -414,12 +267,13 @@ MODELS: dict[str, ModelInfo] = {
         "(two bf16 copies + KV + the 248k-vocab fp32 logits) needs an 80 GB-class card "
         "(grpo_min_vram_gb floor).",
     ),
-    "Qwen/Qwen3.6-27B": ModelInfo(
-        id="Qwen/Qwen3.6-27B",
-        display_name="Qwen3.6 27B",
-        params="27B dense (multimodal VL, hybrid GDN)",
-        params_b=27.0,
+    "Qwen/Qwen3.8-27B": ModelInfo(
+        id="Qwen/Qwen3.8-27B",
+        display_name="Qwen3.8 27B",
+        params="27.781427952B dense (multimodal VL, hybrid GDN)",
+        params_b=27.781427952,
         lora_language_prefix="model.language_model",
+        managed_revision="1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
         num_layers=64,
         hidden_size=5120,
         vocab_size=248_320,
@@ -456,20 +310,10 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="A100 PCIe",
         min_disk_gb=160,
-        serving=ServingCapacity(
-            gpu="H100",
-            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.6-27B"],
-            max_loras=16,
-            max_lora_rank=64,
-            max_model_len=32768,
-            max_num_seqs=8,
-            gpu_memory_utilization=0.90,
-        ),
         thinking="hybrid",
-        notes="Dense 27B multimodal VL checkpoint with image-capable bf16 LoRA training. SFT fits "
-        "the 80GB A100 (~54GB weights); colocated GRPO needs the B200 (trainer + vLLM rollout = two "
-        "~54GB copies). Serves the owned VL-preserving FP8 on an H100 tier (dense, so no MoE expert "
-        "LoRA-buffer multiplier).",
+        notes="Dense 27.781427952B multimodal VL checkpoint with image-capable bf16 LoRA training. "
+        "SFT fits the 80GB A100 (~55.6GB weights); colocated GRPO needs the B200 (trainer + vLLM "
+        "rollout = two copies). Hosted serving remains pending the exact official FP8 H100 canary.",
     ),
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",

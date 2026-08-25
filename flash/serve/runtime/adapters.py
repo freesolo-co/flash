@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from flash.serve.runtime_support import is_adapter_tensor_file as _is_adapter_tensor_file
+from flash.serve.request.runtime_support import is_adapter_tensor_file as _is_adapter_tensor_file
 
 from .errors import (
     AdapterConflictError,

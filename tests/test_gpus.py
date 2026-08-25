@@ -6,7 +6,7 @@ import pytest
 
 
 def test_canonical_gpu_aliases():
-    from flash.providers.base import canonical_gpu
+    from flash.providers.core.base import canonical_gpu
 
     for alias in ("RTX 5090", "rtx5090", "5090", "RTX_5090", "NVIDIA GeForce RTX 5090"):
         assert canonical_gpu(alias) == "RTX 5090"
@@ -16,7 +16,7 @@ def test_canonical_gpu_aliases():
 
 
 def test_ambiguous_provider_aliases_are_not_user_canonicalizable():
-    from flash.providers.base import UnsupportedGpuError, canonical_gpu, vast_gpu_for_offer
+    from flash.providers.core.base import UnsupportedGpuError, canonical_gpu, vast_gpu_for_offer
 
     for alias in ("A100 SXM4", "NVIDIA A100 SXM4"):
         with pytest.raises(UnsupportedGpuError):
@@ -29,7 +29,7 @@ def test_ambiguous_provider_aliases_are_not_user_canonicalizable():
 
 
 def test_unknown_gpu_rejected():
-    from flash.providers.base import UnsupportedGpuError, canonical_gpu
+    from flash.providers.core.base import UnsupportedGpuError, canonical_gpu
 
     for bad in ("", "TPU v5", "RTX 9090", "Tesla T4"):
         with pytest.raises(UnsupportedGpuError):
@@ -37,7 +37,7 @@ def test_unknown_gpu_rejected():
 
 
 def test_providers_for():
-    from flash.providers.base import providers_for
+    from flash.providers.core.base import providers_for
 
     # Consumer GeForce cards are RunPod + Vast (Vast's verified-datacenter market carries GeForce;
     # Lambda's datacenter fleet does not). Order follows the registry: runpod, lambda, vast.
@@ -55,7 +55,7 @@ def test_providers_for():
 def test_vast_gpu_for_offer_accepts_h100_pcie_alias():
     # Vast lists PCIe H100s as "H100 PCIE" (distinct from the SXM "H100 SXM"). Both must map to the
     # canonical H100 class, else a PCIe-only market is dropped as unknown capacity.
-    from flash.providers.base import vast_gpu_for_offer
+    from flash.providers.core.base import vast_gpu_for_offer
 
     h100_ram = 80 * 1024  # MB
     assert vast_gpu_for_offer("H100 SXM", h100_ram) == "H100"
@@ -67,7 +67,7 @@ def test_vast_gpu_for_offer_accepts_h100_pcie_alias():
 def test_removed_gpu_class_is_unmanaged():
     # RTX A6000 was a retired class kept only to resolve legacy records; it is now fully removed, so
     # it is not a managed class and resolves nowhere (no special retired-but-known status remains).
-    from flash.providers.base import KNOWN, UnsupportedGpuError, canonical_gpu
+    from flash.providers.core.base import KNOWN, UnsupportedGpuError, canonical_gpu
 
     assert "RTX A6000" not in KNOWN
     with pytest.raises(UnsupportedGpuError):
@@ -75,7 +75,7 @@ def test_removed_gpu_class_is_unmanaged():
 
 
 def test_expanded_gpu_table():
-    from flash.providers.base import GPU_INFO, canonical_gpu, get_gpu_info, gpu_short
+    from flash.providers.core.base import GPU_INFO, canonical_gpu, get_gpu_info, gpu_short
 
     # Cheap-capacity classes the cheapest policy exists for are all mapped.
     assert canonical_gpu("A100") == "A100 PCIe"
@@ -92,7 +92,7 @@ def test_sm_capability_and_fp8_kv_support():
     """fp8 KV cache is a cc >= 8.9 feature the OPD/GRPO workers enable off get_device_capability();
     sizing infers it from a class's ``sm`` string. Ada (4090, sm89), Hopper (H100/H200, sm90) and
     Blackwell (B200 sm100, RTX Pro 6000/5090 sm120) qualify; Ampere (A100 sm80, A10 sm86) does not."""
-    from flash.providers.base import (
+    from flash.providers.core.base import (
         _FP8_KV_MIN_CAPABILITY,
         _sm_capability,
         get_gpu_info,
@@ -121,7 +121,7 @@ def test_sm_capability_and_fp8_kv_support():
 
 
 def test_blackwell_min_cuda_pin():
-    from flash.providers.base import min_cuda_modern
+    from flash.providers.core.base import min_cuda_modern
 
     assert min_cuda_modern("RTX 5090") == "13.0"
     assert min_cuda_modern("RTX Pro 6000") == "13.0"
@@ -130,8 +130,8 @@ def test_blackwell_min_cuda_pin():
 
 
 def test_cheapest_gpu_policy(monkeypatch):
-    from flash.providers import base as gpus
-    from flash.providers.runpod import pricing
+    from flash.providers.core import base as gpus
+    from flash.providers.runpod.client import pricing
 
     # Validated-only by default: the cheapest validated enum class that fits each VRAM tier
     # wins on static rates. 24 GB is the floor now (sub-24 GB classes dropped), and the cheapest
@@ -161,11 +161,11 @@ def test_cheapest_gpu_policy(monkeypatch):
 
 
 def test_sft_provisional_count_credits_only_the_batch_bound_width():
-    from flash.providers.allocator import _executed_width, required_vram_gb
-    from flash.providers.base import provisional_gpu_count
+    from flash.providers.core.allocator import _executed_width, required_vram_gb
+    from flash.providers.core.base import provisional_gpu_count
 
-    model_id = "Qwen/Qwen3.6-27B"
-    expected_needs = {131072: 159, 262144: 247, 400000: 339, 600000: 473}
+    model_id = "Qwen/Qwen3.8-27B"
+    expected_needs = {131072: 162, 262144: 251, 400000: 344, 600000: 480}
     for sequence, expected_need in expected_needs.items():
         train = {"batch_size": 1, "lora_rank": 32, "max_context_tokens": sequence}
         count = provisional_gpu_count(model_id, "sft", train=train)
@@ -178,7 +178,7 @@ def test_batch_bound_sft_is_rejected_at_parse_time():
     from flash.schema import ConfigError, spec_from_dict
 
     raw = {
-        "model": "Qwen/Qwen3.6-27B",
+        "model": "Qwen/Qwen3.8-27B",
         "algorithm": "sft",
         "environment": {"id": "freesolo/example/example"},
         "train": {
@@ -190,7 +190,7 @@ def test_batch_bound_sft_is_rejected_at_parse_time():
     with pytest.raises(ConfigError) as exc:
         spec_from_dict(raw, run_id="parse-width")
     message = str(exc.value)
-    assert "sft needs >= 247 GB VRAM" in message
+    assert "sft needs >= 251 GB VRAM" in message
     assert "1 of which joins this run" in message
     assert "batch and retained rows bound the rank count" in message
 
@@ -219,10 +219,10 @@ def test_batch_bound_sft_is_rejected_at_parse_time():
     ],
 )
 def test_non_sft_provisional_count_is_unchanged(algorithm, train, expected_count):
-    from flash.providers.allocator import _executed_width
-    from flash.providers.base import provisional_gpu_count
+    from flash.providers.core.allocator import _executed_width
+    from flash.providers.core.base import provisional_gpu_count
 
-    count = provisional_gpu_count("Qwen/Qwen3.6-27B", algorithm, train=train)
+    count = provisional_gpu_count("Qwen/Qwen3.8-27B", algorithm, train=train)
     assert count == expected_count
     assert _executed_width(algorithm, train, None)(count) == count
 
@@ -240,7 +240,7 @@ def test_width_bound_rl_is_told_to_raise_its_step_not_shrink_it():
     from flash.schema import ConfigError, spec_from_dict
 
     raw = {
-        "model": "Qwen/Qwen3.6-27B",
+        "model": "Qwen/Qwen3.8-27B",
         "algorithm": "opd",
         "environment": {"id": "freesolo/example/example"},
         "train": {
@@ -266,11 +266,15 @@ def test_width_bound_rl_is_told_to_raise_its_step_not_shrink_it():
 
 @pytest.mark.parametrize(("sequence", "accepted"), [(131072, True), (262144, False)])
 def test_parse_and_allocator_agree_on_batch_bound_sft(sequence, accepted):
-    from flash.providers.allocator import _executed_width, _resolved_gpu_count, required_vram_gb
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core.allocator import (
+        _executed_width,
+        _resolved_gpu_count,
+        required_vram_gb,
+    )
+    from flash.providers.core.base import UnsupportedGpuError
     from flash.schema import ConfigError, spec_from_dict
 
-    model_id = "Qwen/Qwen3.6-27B"
+    model_id = "Qwen/Qwen3.8-27B"
     train = {"batch_size": 1, "lora_rank": 32, "max_context_tokens": sequence}
     raw = {
         "model": model_id,
@@ -307,24 +311,11 @@ def test_parse_and_allocator_agree_on_batch_bound_sft(sequence, accepted):
             assert "batch and retained rows bound the rank count" in str(error)
 
 
-def test_provisional_gpu_cheapest_for_model(monkeypatch):
-    from flash.providers.base import provisional_gpu
-
-    # provisional_gpu remains the offline auto-sizing path and returns the cheapest fitting
-    # validated class. 0.8B GRPO -> cheapest validated >=24G (RTX 4090). 9B is now bf16 (QLoRA dropped: the
-    # 4-bit vLLM-rollout merge broke GRPO learning), so colocated 9B GRPO needs an 80G-class card
-    # -> the cheapest validated 80G class (A100 PCIe).
-    assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX 4090"
-    assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "A100 PCIe"
-    assert provisional_gpu("Qwen/Qwen3.6-27B", algorithm="sft") == "A100 PCIe"
-    assert provisional_gpu("Qwen/Qwen3.6-27B", algorithm="grpo") == "B200"
-
-
 def test_config_gpu_type_is_empty_for_auto_and_preserves_pins():
     from flash.schema import ConfigError, spec_from_dict
 
     raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
         "train": {"epochs": 1, "max_examples": 8},
@@ -332,7 +323,7 @@ def test_config_gpu_type_is_empty_for_auto_and_preserves_pins():
     }
     assert spec_from_dict(raw, run_id="x").gpu.type == ""
 
-    for klass in ("RTX 4090", "A100 SXM", "H100"):
+    for klass in ("A100 PCIe", "A100 SXM", "H100"):
         raw["gpu"] = {"type": klass}
         assert spec_from_dict(raw, run_id="x").gpu.type == klass
 
@@ -344,7 +335,7 @@ def test_config_gpu_type_is_empty_for_auto_and_preserves_pins():
 def test_flash_gpu_enum_members():
     pytest.importorskip("runpod_flash")
 
-    from flash.providers.runpod.gpus import flash_gpu
+    from flash.providers.runpod.client.gpus import flash_gpu
 
     assert flash_gpu("RTX 5090").name == "NVIDIA_GEFORCE_RTX_5090"
     assert flash_gpu("4090").name == "NVIDIA_GEFORCE_RTX_4090"
@@ -364,7 +355,7 @@ def test_explicit_gpu_pin_cannot_widen_to_its_whole_pool():
 
     from runpod_flash.core.resources.gpu import GpuGroup
 
-    from flash.providers.runpod.gpus import flash_gpu
+    from flash.providers.runpod.client.gpus import flash_gpu
 
     ids = GpuGroup.to_gpu_ids_str([flash_gpu("H100")])
     assert "-NVIDIA H100 NVL" in ids
@@ -380,7 +371,7 @@ def test_explicit_gpu_pin_cannot_widen_to_its_whole_pool():
 
 
 def test_gpu_short():
-    from flash.providers.base import gpu_short
+    from flash.providers.core.base import gpu_short
 
     assert gpu_short("RTX 5090") == "5090"
     assert gpu_short("rtx_4090") == "4090"
@@ -401,46 +392,20 @@ def test_config_defaults_gpu_to_auto():
 
 def test_build_worker_env():
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(
         run_id="r1",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=8),
         seed=0,
     )
     env = build_worker_env(spec, 0)
     assert env["RUN_ID"] == "r1"
-    assert env["BENCH_HF_MODEL"] == "Qwen/Qwen3.5-4B"
+    assert env["BENCH_HF_MODEL"] == "Qwen/Qwen3.5-9B"
     assert "RL_STEPS" not in env
     assert "SFT_EPOCHS" not in env
-
-
-def test_grpo_kv_floor_escalates_large_group_long_context():
-    """vLLM KV-cache init preflight: a rollout whose concurrent-group KV cannot fit under the
-    colocate utilization cap on a small card must size onto a bigger one — previously such runs
-    passed preflight and died at vLLM init with 'No available memory for the cache blocks'."""
-    from flash.core.catalog import MODELS
-    from flash.engine.plan.vram import grpo_kv_floor_gb, model_required_vram_gb
-
-    info = MODELS["Qwen/Qwen3.5-4B"]
-    floor = grpo_kv_floor_gb(
-        info.params_b,
-        4096,
-        16,
-        active_params_b=info.active_params_b,
-        model_info=info,
-    )
-    # the architecture-aware cache and profiled overhead still exceed the rtx 5090 class.
-    assert floor > 32
-    need = model_required_vram_gb(
-        info.id, "grpo", train={"group_size": 16, "max_context_tokens": 4096}
-    )
-    assert need >= floor
-
-    # The validated lean default (group 8, short context) stays on the 32 GB tier.
-    assert model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", train={"group_size": 8}) <= 36
 
 
 def test_opd_kv_floor_keeps_the_bf16_floor_for_a_gdn_hybrid():
@@ -454,9 +419,9 @@ def test_opd_kv_floor_keeps_the_bf16_floor_for_a_gdn_hybrid():
     """
     from flash.core.catalog import MODELS
     from flash.engine.plan.vram import grpo_kv_floor_gb, model_required_vram_gb
-    from flash.providers.base import max_non_fp8_kv_vram_gb
+    from flash.providers.core.base import max_non_fp8_kv_vram_gb
 
-    info = MODELS["Qwen/Qwen3.5-2B"]
+    info = MODELS["Qwen/Qwen3.5-9B"]
     assert info.num_linear_attention_layers > 0
     concurrency = 8 * 16
     ceiling = max_non_fp8_kv_vram_gb()
@@ -492,7 +457,7 @@ def test_opd_kv_floor_keeps_the_bf16_floor_for_a_gdn_hybrid():
 def test_35b_expert_lora_shapes_and_multicard_sizing():
     from flash.core.catalog import MODELS
     from flash.engine.plan.vram import model_required_vram_gb
-    from flash.providers.base import UnsupportedGpuError, provisional_gpu
+    from flash.providers.core.base import UnsupportedGpuError, provisional_gpu
 
     model_id = "Qwen/Qwen3.6-35B-A3B"
     info = MODELS[model_id]
@@ -537,7 +502,7 @@ def test_35b_expert_lora_shapes_and_multicard_sizing():
 
 
 def test_grpo_terminal_vram_error_names_only_effective_knobs(monkeypatch):
-    from flash.providers.base import UnsupportedGpuError, provisional_gpu
+    from flash.providers.core.base import UnsupportedGpuError, provisional_gpu
 
     monkeypatch.setattr("flash.engine.plan.vram.model_required_vram_gb", lambda *_a, **_k: 2000)
     with pytest.raises(UnsupportedGpuError) as exc:

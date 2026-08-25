@@ -23,7 +23,7 @@ from flash.engine.worker.train.core.child.runtime import (
     resolve_text_lora_target_modules,
 )
 
-_FIXTURE = Path(__file__).parent / "fixtures" / "qwen35_08b_target_metadata.json"
+_FIXTURE = Path(__file__).parent / "fixtures" / "qwen35_9b_target_metadata.json"
 _CAMPAIGN_MODELS = tuple(MODELS)
 
 
@@ -63,7 +63,7 @@ def _runtime_topology(wrapper: str = "") -> _FakeModule:
     )
 
 
-def test_actual_qwen35_08b_metadata_resolves_the_language_subtree_without_torch():
+def test_actual_qwen35_9b_metadata_resolves_the_language_subtree_without_torch():
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 
     metadata = _metadata()
@@ -187,7 +187,7 @@ def test_every_campaign_multimodal_trainer_keeps_the_existing_all_linear_surface
 def test_unmarked_warmstart_adapter_is_rejected_without_tensor_inference(monkeypatch, tmp_path):
     import flash.engine.worker.model.adapter as adapter_module
 
-    targeting = resolve_lora_targeting("Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=False)
+    targeting = resolve_lora_targeting("Qwen/Qwen3.5-9B", algorithm="sft", multimodal=False)
 
     def unexpected_tensor_read(_path):
         raise AssertionError("unmarked adapters must be rejected before tensor inspection")
@@ -196,7 +196,7 @@ def test_unmarked_warmstart_adapter_is_rejected_without_tensor_inference(monkeyp
     with pytest.raises(ValueError, match="required exclude_modules modality marker"):
         adapter_module.validate_warmstart_adapter(
             {"target_modules": "all-linear"},
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-9B",
             str(tmp_path),
             targeting,
         )
@@ -211,7 +211,7 @@ def test_modern_adapter_modality_stays_authoritative(
 ):
     import flash.engine.worker.model.adapter as adapter_module
 
-    model_id = "Qwen/Qwen3.5-0.8B"
+    model_id = "Qwen/Qwen3.5-9B"
     targeting = resolve_lora_targeting(model_id, algorithm="sft", multimodal=multimodal)
     source_config = {
         "target_modules": "all-linear",
@@ -225,7 +225,7 @@ def test_modern_adapter_modality_stays_authoritative(
     adapter_module.validate_warmstart_adapter(source_config, model_id, str(tmp_path), targeting)
 
 
-@pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.6-35B-A3B"])
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-35B-A3B"])
 def test_modern_multimodal_adapter_still_cannot_warmstart_a_text_run(tmp_path, model_id):
     from flash.engine.worker.model.adapter import validate_warmstart_adapter
 
@@ -448,15 +448,15 @@ def test_runtime_installer_rejects_stale_or_non_dataclass_configs_and_incomplete
 
 
 def test_sft_grpo_and_opd_plugins_install_text_targeting_only_for_text_jobs(tmp_path):
-    importlib.import_module("flash.engine.worker.sft_train")
-    from flash.engine.worker import sft_train_runner
-    from flash.engine.worker.train.opd.overrides import _build_opd_plugin_config
+    importlib.import_module("flash.engine.worker.train.entry.sft_train")
+    from flash.engine.worker.train.entry import sft_train_runner
+    from flash.engine.worker.train.opd.orchestration.overrides import _build_opd_plugin_config
     from flash.engine.worker.train.rl.child.plugin import required_patch_names
 
     shim_dir = tmp_path / "sft-text-shim"
     shim_dir.mkdir()
     _marker, expected, raw_sft = sft_train_runner._write_sft_child_shims(
-        SimpleNamespace(model_id="Qwen/Qwen3.5-0.8B", save_at_steps=()),
+        SimpleNamespace(model_id="Qwen/Qwen3.5-9B", save_at_steps=()),
         SimpleNamespace(
             update_horizon=1,
             reentrant_gradient_checkpointing=False,
@@ -474,7 +474,7 @@ def test_sft_grpo_and_opd_plugins_install_text_targeting_only_for_text_jobs(tmp_
     multimodal_dir = tmp_path / "sft-multimodal-shim"
     multimodal_dir.mkdir()
     _marker, expected, raw_sft = sft_train_runner._write_sft_child_shims(
-        SimpleNamespace(model_id="Qwen/Qwen3.5-0.8B", save_at_steps=()),
+        SimpleNamespace(model_id="Qwen/Qwen3.5-9B", save_at_steps=()),
         SimpleNamespace(
             update_horizon=1,
             reentrant_gradient_checkpointing=False,
@@ -523,11 +523,11 @@ def test_exact_verl_hf_model_reproduces_old_peft_failure_and_attaches_new_target
     from transformers import AutoModelForImageTextToText
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 
-    from flash.engine.worker.train.sft.config import _hydra_val
+    from flash.engine.worker.train.sft.setup.config import _hydra_val
 
     config = Qwen3_5Config.from_dict(_metadata()["config"])
     intended_regex = resolve_lora_targeting(
-        "Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=False
+        "Qwen/Qwen3.5-9B", algorithm="sft", multimodal=False
     ).exclude_modules
     override = f"model.exclude_modules={_hydra_val(intended_regex)}"
     broken_hydra_regex = hydra.OverridesParser.create().parse_override(override).value()
@@ -604,13 +604,13 @@ def _write_adapter_from_targeting(path: Path, targeting: LoraTargeting) -> set[s
 def test_text_export_passes_only_when_training_targeting_omits_the_visual_tensor(tmp_path):
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 
-    targeting = resolve_lora_targeting("Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=False)
+    targeting = resolve_lora_targeting("Qwen/Qwen3.5-9B", algorithm="sft", multimodal=False)
     good = tmp_path / "good"
     good_keys = _write_adapter_from_targeting(good, targeting)
 
     stamp_adapter_dir_provenance(
         str(good),
-        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-9B",
         exclude_modules=targeting.exclude_modules,
     )
 
@@ -628,7 +628,7 @@ def test_text_export_passes_only_when_training_targeting_omits_the_visual_tensor
         # stamped with the same real exclude regex the good case used. dropping it here would
         # make the call announce a multimodal run and legitimize the vision tensors.
         stamp_adapter_dir_provenance(
-            str(bad), "Qwen/Qwen3.5-0.8B", exclude_modules=targeting.exclude_modules
+            str(bad), "Qwen/Qwen3.5-9B", exclude_modules=targeting.exclude_modules
         )
 
 
@@ -641,7 +641,7 @@ def test_multimodal_export_publishes_the_vision_tensors_it_was_told_to_train(tmp
     """
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 
-    targeting = resolve_lora_targeting("Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=True)
+    targeting = resolve_lora_targeting("Qwen/Qwen3.5-9B", algorithm="sft", multimodal=True)
     assert targeting.exclude_modules is None
 
     adapter = tmp_path / "multimodal"
@@ -651,7 +651,7 @@ def test_multimodal_export_publishes_the_vision_tensors_it_was_told_to_train(tmp
 
     stamp_adapter_dir_provenance(
         str(adapter),
-        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-9B",
         exclude_modules=targeting.exclude_modules,
     )
 
@@ -682,7 +682,7 @@ def test_multimodal_export_still_requires_a_trained_language_tensor(tmp_path):
     )
 
     with pytest.raises(RuntimeError, match="no language-stack LoRA pair"):
-        stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", exclude_modules=None)
+        stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-9B", exclude_modules=None)
 
 
 def test_multimodal_export_requires_the_language_stack_to_have_actually_trained(tmp_path):
@@ -719,7 +719,7 @@ def test_multimodal_export_requires_the_language_stack_to_have_actually_trained(
     )
 
     with pytest.raises(RuntimeError, match="no nonzero composed LoRA delta in its language stack"):
-        stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", exclude_modules=None)
+        stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-9B", exclude_modules=None)
 
 
 def test_multimodal_export_publishes_when_only_the_language_stack_trained(tmp_path):
@@ -752,7 +752,7 @@ def test_multimodal_export_publishes_when_only_the_language_stack_trained(tmp_pa
         encoding="utf-8",
     )
 
-    stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-0.8B", exclude_modules=None)
+    stamp_adapter_dir_provenance(str(adapter), "Qwen/Qwen3.5-9B", exclude_modules=None)
     saved = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
     assert saved["exclude_modules"] is None
 

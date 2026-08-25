@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from flash.serving.src.schemas import (
+from flash.serving.src.io.schemas import (
     AdapterRecord,
     ImmutableAdapterRegistration,
     PersistedAdapterRecord,
@@ -18,7 +18,7 @@ def _payload(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "adapter_id": REVISION_ID,
         "repo_id": "org/run",
-        "base_model": "Qwen/Qwen3.5-0.8B",
+        "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "checkpoints/step-20",
         "repo_type": "model",
         "org_id": "org-1",

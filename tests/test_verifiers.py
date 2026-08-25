@@ -19,6 +19,8 @@ from typing import ClassVar
 
 import pytest
 
+import flash.engine.worker.runtime.state as worker_state
+
 
 @dataclass
 class _TaskExample:
@@ -217,7 +219,7 @@ def test_start_episode_image_choice_reaches_single_turn_scoring(monkeypatch):
     """
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     sdk_env = _PerEpisodeImageEnv(picks=["pool/red.png", "pool/blue.png"])
     # no "metadata" key on the record: task_example_from_record substitutes a FRESH {} for such a
@@ -255,7 +257,7 @@ def test_per_episode_state_survives_every_single_turn_scoring_entry_point(monkey
     episode that was generated -- one rebuilt task on any of them is a silently wrong reward."""
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     sdk_env = _PerEpisodeImageEnv(picks=["pool/red.png"])
     env = FreesoloEnvironment(
@@ -288,7 +290,7 @@ def test_unprepared_rollout_preserves_nested_prompt_identity(monkeypatch):
     sdk_env = _NestedPromptEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(
         sdk_env,
@@ -306,7 +308,7 @@ def test_sibling_rollouts_get_isolated_tasks(monkeypatch):
     sdk_env = _FakeMultiTurnEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(
         sdk_env,
@@ -376,8 +378,8 @@ def test_bridge_clones_the_prepared_task_for_each_sibling_rollout(monkeypatch):
 
     _install_fake_freesolo(monkeypatch)
 
-    from flash.engine.worker.train.rl.multi_turn import MultiTurnBridge
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.engine.worker.train.rl.rollout.multi_turn import MultiTurnBridge
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     sdk_env = _PreparedTaskNonceEnv()
     env = FreesoloEnvironment(
@@ -468,7 +470,7 @@ def test_batched_scoring_uses_each_siblings_own_task(monkeypatch):
     """
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     class _SessionScoringEnv(_EnvironmentMultiTurn):
         """Scores an episode by the session recorded on the task it is handed."""
@@ -532,7 +534,7 @@ def test_each_row_keeps_its_own_episode_and_non_dataset_rows_are_not_retained(mo
     """
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     sdk_env = _PerEpisodeImageEnv(picks=["pool/red.png", "pool/blue.png"])
     env = FreesoloEnvironment(
@@ -564,7 +566,7 @@ def test_single_turn_reward_many_batches_by_example_value_identical(monkeypatch)
     completion batch with serial per-rollout reward() calls (one blocking judge round-trip each)."""
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     class _CountingSingleTurnEnv(_FakeSingleTurnEnv):
         def __init__(self):
@@ -606,7 +608,7 @@ def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
     byte-identical and in input order — the pre-batching serial behavior."""
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     class _UnsafeCountingSingleTurnEnv(_FakeSingleTurnEnv):
         reward_thread_safe = False  # scorer keeps mutable/thread-bound state -> never race it
@@ -641,7 +643,7 @@ def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
 def test_single_turn_scores_breakdown_many_batches_named_metrics_in_order(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     class _CountingSingleTurnEnv(_FakeSingleTurnEnv):
         def __init__(self):
@@ -675,7 +677,7 @@ def test_single_turn_scores_breakdown_many_batches_named_metrics_in_order(monkey
 def test_single_turn_scores_breakdown_many_is_serial_when_not_thread_safe(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     class _UnsafeSingleTurnEnv(_FakeSingleTurnEnv):
         reward_thread_safe = False
@@ -706,7 +708,7 @@ def test_single_turn_scores_breakdown_many_is_serial_when_not_thread_safe(monkey
 def test_single_turn_scores_breakdown_many_rejects_wrong_length(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     class _ShortSingleTurnEnv(_FakeSingleTurnEnv):
         def score_responses(self, example, response_texts):
@@ -729,7 +731,7 @@ def test_single_turn_scoring_gets_completion_thinking_and_raw(monkeypatch):
     structured thinking/raw fields for scorers that need them."""
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     class _ThinkingAwareEnv(_EnvironmentSingleTurn):
         def start_episode(self, example, prompt_text):
@@ -781,7 +783,7 @@ def test_single_turn_scoring_gets_completion_thinking_and_raw(monkeypatch):
 def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
     # A record whose `output` is a chat-message list -> the full gold trajectory (multi-turn SFT).
@@ -811,7 +813,7 @@ def test_freesolo_sft_completion_full_gold_trajectory(monkeypatch):
 def test_freesolo_sft_completion_reports_raw_output_fallback_provenance(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     class _HookEnv(_FakeSingleTurnEnv):
         def __init__(self):
@@ -851,7 +853,7 @@ def test_freesolo_sft_completion_does_not_flag_structured_targets_as_coerced(mon
     """
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
     single = [{"role": "assistant", "content": "structured"}]
@@ -901,7 +903,7 @@ def test_freesolo_sft_completion_rejects_malformed_message_containers(
 ):
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
     embedded_image = "data:image/png;base64," + "A" * 4096
@@ -920,7 +922,7 @@ def test_freesolo_sft_completion_rejects_malformed_message_containers(
 def test_freesolo_sft_completion_error_handles_missing_row_id(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
 
@@ -931,7 +933,7 @@ def test_freesolo_sft_completion_error_handles_missing_row_id(monkeypatch):
 def test_freesolo_multiturn_respects_per_example_budget(monkeypatch):
     _install_fake_freesolo(monkeypatch, sdk_env=_BudgetMultiTurnEnv())
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(
         _BudgetMultiTurnEnv(),
@@ -1046,7 +1048,7 @@ def test_freesolo_adapter_mapping(monkeypatch, tmp_path):
         '"image":"dataset/red.png","reward_metadata":{"kind":"exact"}}\n'
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(
         str(env_file),
@@ -1113,7 +1115,7 @@ def test_freesolo_adapter_split_param_selects_split_dataset(monkeypatch, tmp_pat
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
     assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
@@ -1134,7 +1136,7 @@ def test_freesolo_adapter_forwards_the_normalized_split_to_the_env(monkeypatch, 
         "    assert kwargs.get('split') == 'oracle', repr(kwargs.get('split'))\n"
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), split=" oracle ", contract_text="c")
     assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
@@ -1146,7 +1148,7 @@ def test_freesolo_adapter_missing_split_file_refuses_silent_train_fallback(monke
         tmp_path, {"dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     with pytest.raises(ValueError, match="split='oracle'"):
         load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
@@ -1158,7 +1160,7 @@ def test_freesolo_adapter_rejects_unsafe_split_names(monkeypatch, tmp_path):
         tmp_path, {"dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     with pytest.raises(ValueError, match="split must be a simple dataset name"):
         load_freesolo_environment(str(env_file), split="../oracle", contract_text="c")
@@ -1170,7 +1172,7 @@ def test_freesolo_adapter_split_train_uses_default_dataset(monkeypatch, tmp_path
         tmp_path, {"dataset/train.jsonl": '{"id":"t","input":"train?","output":"no"}\n'}
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), split="train", contract_text="c")
     assert env.dataset() == [{"id": "t", "input": "train?", "output": "no"}]
@@ -1184,7 +1186,7 @@ def test_freesolo_adapter_datasets_plural_dir_raises_actionable_error(monkeypatc
         tmp_path, {"datasets/train.jsonl": '{"id":"legacy","input":"old?","output":"old"}\n'}
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     with pytest.raises(ValueError, match="'datasets/' directory"):
         load_freesolo_environment(str(env_file), split="train", contract_text="c")
@@ -1200,7 +1202,7 @@ def test_freesolo_adapter_datasets_plural_dir_allowed_with_explicit_dataset_path
         tmp_path, {"datasets/train.jsonl": '{"id":"t","input":"x","output":"y"}\n'}
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(
         str(env_file), dataset_path="datasets/train.jsonl", contract_text="c"
@@ -1222,7 +1224,7 @@ def test_freesolo_adapter_datasets_plural_dir_allowed_beside_a_probeable_split(
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), contract_text="c")
     assert env.dataset() == [{"id": "t", "input": "2+2?", "output": "4"}]
@@ -1245,7 +1247,7 @@ def test_freesolo_adapter_env_built_dataset_wins_over_packaged_file(monkeypatch,
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), contract_text="c")
     assert env.dataset() == [{"id": "kept", "input": "2+2?", "output": "4"}]
@@ -1257,7 +1259,7 @@ def test_freesolo_adapter_env_built_dataset_wins_over_packaged_file(monkeypatch,
 def test_freesolo_adapter_skips_the_row_count_of_a_large_json_file(monkeypatch, tmp_path, capsys):
     """the override diagnostic has to parse a whole .json file to count it, and the env has
     already replaced it: past the cap it gives the count up instead of materializing the file."""
-    from flash.envs import adapter as adapter_module
+    from flash.envs.loading import adapter as adapter_module
 
     monkeypatch.setattr(adapter_module, "_MAX_ROW_COUNT_JSON_BYTES", 8)
     sdk_env = _FakeSingleTurnEnv()
@@ -1286,7 +1288,7 @@ def test_freesolo_adapter_env_dataset_matching_file_logs_nothing(monkeypatch, tm
         tmp_path, {"dataset/train.jsonl": '{"id":"t","input":"2+2?","output":"4"}\n'}
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), contract_text="c")
     assert env.dataset() == [{"id": "t", "input": "2+2?", "output": "4"}]
@@ -1307,7 +1309,7 @@ def test_freesolo_adapter_requested_split_wins_over_a_hardcoded_env_dataset(monk
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
     assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
@@ -1330,7 +1332,7 @@ def test_freesolo_adapter_explicit_dataset_path_wins_over_a_hardcoded_env_datase
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(
         str(env_file), dataset_path="dataset/oracle.jsonl", contract_text="c"
@@ -1354,7 +1356,7 @@ def test_freesolo_adapter_default_dataset_path_keeps_env_precedence(monkeypatch,
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(
         str(env_file), dataset_path="dataset/train.jsonl", contract_text="c"
@@ -1371,7 +1373,7 @@ def test_freesolo_adapter_empty_env_dataset_is_a_hard_error(monkeypatch, tmp_pat
     hard failure the operator sees on the first step. `examples` still reads the same way as
     `dataset`, so neither attribute can be the quiet one.
     """
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     rows = '{"id":"t","input":"2+2?","output":"4"}\n'
     for attribute in ("dataset", "examples"):
@@ -1405,7 +1407,7 @@ def test_freesolo_adapter_empty_env_dataset_errors_under_default_dataset_path(
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(
         str(env_file), dataset_path="dataset/train.jsonl", contract_text="c"
@@ -1430,7 +1432,7 @@ def test_freesolo_adapter_empty_env_dataset_yields_to_an_explicit_dataset_path(
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(
         str(env_file), dataset_path="dataset/oracle.jsonl", contract_text="c"
@@ -1443,7 +1445,7 @@ def test_freesolo_adapter_absent_env_dataset_still_falls_back_to_the_packaged_fi
 ):
     """no dataset attribute (or an explicit None) is "no in-code dataset", not "zero rows": the
     packaged file stays the source, which is the common env and must not start erroring."""
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     rows = '{"id":"t","input":"2+2?","output":"4"}\n'
     for label in ("absent", "none"):
@@ -1472,7 +1474,7 @@ def test_freesolo_adapter_datasets_plural_dir_allowed_when_the_env_owns_its_rows
         tmp_path, {"datasets/raw.jsonl": '{"id":"raw","input":"raw?","output":"raw"}\n'}
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), contract_text="c")
     assert env.dataset() == [{"id": "built", "input": "2+2?", "output": "4"}]
@@ -1484,7 +1486,7 @@ def test_freesolo_adapter_datasets_plural_dir_raises_when_the_env_needs_the_file
     """the guard is deferred, not dropped: an env with no rows of its own still depends on the
     file the datasets/ layout hid, and an env whose dataset came back empty does too. both get
     the layout message, which names the fix, over the adapter's generic empty-dataset one."""
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     for label, rows in (("absent", None), ("empty", [])):
         sdk_env = _FakeSingleTurnEnv()
@@ -1515,7 +1517,7 @@ def test_freesolo_adapter_datasets_plural_dir_raises_for_a_requested_side_split(
         tmp_path, {"datasets/oracle.jsonl": '{"id":"o","input":"o?","output":"o"}\n'}
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     with pytest.raises(ValueError, match="'datasets/' directory"):
         load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
@@ -1539,7 +1541,7 @@ def test_freesolo_adapter_datasets_plural_split_raises_beside_a_singular_dataset
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     with pytest.raises(ValueError, match="'datasets/' directory") as excinfo:
         load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
@@ -1563,7 +1565,7 @@ def test_freesolo_adapter_datasets_plural_split_raises_beside_a_packaged_train_f
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     with pytest.raises(ValueError, match="'datasets/' directory") as excinfo:
         load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
@@ -1586,7 +1588,7 @@ def test_freesolo_adapter_datasets_plural_dir_allowed_beside_a_probeable_split_d
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), split="oracle", contract_text="c")
     assert env.dataset() == [{"id": "o", "input": "2+2?", "output": "4"}]
@@ -1600,7 +1602,7 @@ def test_freesolo_adapter_records_param_wins_over_env_dataset(monkeypatch, tmp_p
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
     env_file = _split_env(tmp_path, {})
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(
         str(env_file),
@@ -1620,7 +1622,7 @@ def test_freesolo_adapter_explicit_dataset_path_wins_over_split(monkeypatch, tmp
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(
         str(env_file),
@@ -1650,7 +1652,7 @@ def test_freesolo_adapter_explicit_default_train_path_beats_env_rows_under_side_
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(
         str(env_file),
@@ -1673,7 +1675,7 @@ def test_freesolo_adapter_preserves_top_level_record_keys(monkeypatch, tmp_path)
         },
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), contract_text="c")
     rows = env.dataset()
@@ -1691,7 +1693,7 @@ def test_freesolo_adapter_preserves_top_level_record_keys(monkeypatch, tmp_path)
 def test_freesolo_adapter_no_longer_requires_record_id(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
 
@@ -1710,7 +1712,7 @@ def test_freesolo_adapter_allows_missing_output(monkeypatch, tmp_path):
         {"dataset/train.jsonl": '{"id":"t","input":"x","difficulty":"easy"}\n'},
     )
 
-    from flash.envs.adapter import load_freesolo_environment
+    from flash.envs.loading.adapter import load_freesolo_environment
 
     env = load_freesolo_environment(str(env_file), contract_text="c")
     assert env.dataset() == [{"id": "t", "input": "x", "difficulty": "easy"}]
@@ -1728,7 +1730,7 @@ def test_freesolo_adapter_prepends_missing_contract_system_prompt(monkeypatch):
 
     _install_fake_freesolo(monkeypatch, sdk_env=NoSystemEnv())
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(
         NoSystemEnv(),
@@ -1758,7 +1760,7 @@ def test_freesolo_adapter_fills_blank_contract_system_prompt(monkeypatch):
 
     _install_fake_freesolo(monkeypatch, sdk_env=BlankSystemEnv())
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(
         BlankSystemEnv(),
@@ -1783,7 +1785,7 @@ def test_freesolo_adapter_fills_blank_contract_system_prompt(monkeypatch):
 def test_freesolo_adapter_uses_env_dataset_when_no_source(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     sdk_env = _FakeSingleTurnEnv()
     sdk_env.dataset = [{"id": "ex-1", "input": "2+2?", "output": "4"}]
@@ -1810,7 +1812,7 @@ def test_freesolo_adapter_exports_sdk_examples_as_input_output(monkeypatch):
 
     _install_fake_freesolo(monkeypatch, sdk_env=SdkExampleEnv())
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(
         SdkExampleEnv(),
@@ -1835,7 +1837,7 @@ def test_freesolo_adapter_stamps_example_id_onto_record(monkeypatch):
 
     _install_fake_freesolo(monkeypatch, sdk_env=SdkExampleEnv())
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(SdkExampleEnv(), "owner/env", source=None, contract_text="")
     # The record carries no id; the SDK-assigned (auto-generated) example id is
@@ -1846,7 +1848,7 @@ def test_freesolo_adapter_stamps_example_id_onto_record(monkeypatch):
 def test_freesolo_adapter_does_not_accept_record_aliases(monkeypatch):
     _install_fake_freesolo(monkeypatch)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(
         _FakeSingleTurnEnv(),
@@ -1863,7 +1865,7 @@ def test_freesolo_adapter_does_not_accept_record_aliases(monkeypatch):
 def test_freesolo_multiturn_hooks(monkeypatch):
     _install_fake_freesolo(monkeypatch, sdk_env=_FakeMultiTurnEnv())
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(
         _FakeMultiTurnEnv(),
@@ -1894,7 +1896,7 @@ def test_freesolo_multiturn_hooks(monkeypatch):
 
 
 def test_github_environment_ref_parsing():
-    from flash.envs.adapter import (
+    from flash.envs.loading.adapter import (
         is_freesolo_environment_id,
         is_github_environment_ref,
         is_managed_environment_slug,
@@ -1929,7 +1931,7 @@ def test_github_environment_ref_parsing():
 
 
 def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
-    import flash.envs.loader as adapter
+    import flash.envs.loading.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(
@@ -1954,7 +1956,7 @@ def test_github_environment_resolves_by_commit_sha(tmp_path, monkeypatch):
 
 
 def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, monkeypatch):
-    import flash.envs.loader as adapter
+    import flash.envs.loading.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -1974,7 +1976,7 @@ def test_github_environment_directory_ref_uses_environment_entrypoint(tmp_path, 
 
 
 def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path, monkeypatch):
-    import flash.envs.loader as adapter
+    import flash.envs.loading.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -1999,7 +2001,7 @@ def test_github_tree_url_ending_at_freesolo_dir_uses_single_entrypoint(tmp_path,
 
 
 def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, monkeypatch):
-    import flash.envs.loader as adapter
+    import flash.envs.loading.loader as adapter
 
     monkeypatch.setattr(adapter, "_CACHE_ROOT", tmp_path / "cache")
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, **_: "b" * 40)
@@ -2014,7 +2016,7 @@ def test_github_environment_directory_ref_missing_entrypoint_error(tmp_path, mon
 
 
 def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tmp_path):
-    from flash.envs.loader import _safe_extract_archive
+    from flash.envs.loading.loader import _safe_extract_archive
 
     def make_members_tar(members: list[tuple[str, bytes | None]]):
         tar = io.BytesIO()
@@ -2032,14 +2034,14 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
 
     dest = tmp_path / "extract_many"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_MEMBERS", 0)
+    monkeypatch.setattr("flash.envs.loading.loader._MAX_ARCHIVE_MEMBERS", 0)
     with pytest.raises(RuntimeError, match="too many members"):
         _safe_extract_archive(make_members_tar([("a", b"")]), dest)
 
     dest = tmp_path / "extract_big"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_MEMBERS", 5)
-    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_BYTES", 1)
+    monkeypatch.setattr("flash.envs.loading.loader._MAX_ARCHIVE_MEMBERS", 5)
+    monkeypatch.setattr("flash.envs.loading.loader._MAX_ARCHIVE_BYTES", 1)
     with pytest.raises(RuntimeError, match="too large"):
         _safe_extract_archive(
             make_members_tar([("repo-root/", None), ("repo-root/keep.txt", b"xx")]), dest
@@ -2047,7 +2049,7 @@ def test_safe_extract_archive_rejects_unbounded_members_and_size(monkeypatch, tm
 
     dest = tmp_path / "extract_pax"
     dest.mkdir()
-    monkeypatch.setattr("flash.envs.loader._MAX_ARCHIVE_BYTES", 100)
+    monkeypatch.setattr("flash.envs.loading.loader._MAX_ARCHIVE_BYTES", 100)
     tar = io.BytesIO()
     with tarfile.open(fileobj=tar, mode="w:gz") as handle:
         pax = tarfile.TarInfo("pax_global_header")
@@ -2068,7 +2070,7 @@ def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
     # A GNU LONGNAME header payload is consumed inside tarfile.next() and never yielded, so per-member
     # accounting can't see it. A tiny gzip declaring a 400MB name must be rejected with memory bounded
     # near the limit, not OOM the worker.
-    from flash.envs.loader import _safe_extract_archive
+    from flash.envs.loading.loader import _safe_extract_archive
 
     def header(name: str, size: int, typeflag: str) -> bytes:
         h = bytearray(512)
@@ -2119,7 +2121,7 @@ def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
 
 
 def test_worker_deps():
-    import flash.envs.base as registry
+    import flash.envs.loading.base as registry
 
     env_id = "github:owner/repo@main:env/environment.py"
     assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.4.2"]
@@ -2187,7 +2189,7 @@ def test_multi_turn_scoring_strips_thinking_like_the_single_turn_path(monkeypatc
     sdk_env = _ThinkingRecordingMultiTurnEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     env.thinking = True
@@ -2206,7 +2208,7 @@ def test_multi_turn_scored_text_keeps_the_reasoning_available(monkeypatch):
     sdk_env = _ThinkingRecordingMultiTurnEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     env.thinking = True
@@ -2225,7 +2227,7 @@ def test_multi_turn_transcript_keeps_the_raw_turn(monkeypatch):
     sdk_env = _ThinkingRecordingMultiTurnEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     env.thinking = True
@@ -2242,7 +2244,7 @@ def test_non_thinking_run_scores_the_completion_unchanged(monkeypatch):
     sdk_env = _ThinkingRecordingMultiTurnEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     assert env.thinking is False  # default: a CLI-side load grades raw text
@@ -2256,7 +2258,6 @@ def test_non_thinking_run_scores_the_completion_unchanged(monkeypatch):
 
 def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
     """The worker is what knows whether the run samples <think>; it must tell the env."""
-    import flash.engine.worker as worker
     from flash.core.spec import JobSpec
 
     class _Env:
@@ -2264,22 +2265,24 @@ def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "thinking": True,
             "environment": {"id": "org/env"},
         }
     )
-    monkeypatch.setattr(worker, "JOB_SPEC", spec)
-    monkeypatch.setattr(worker, "load_staged_freesolo_environment", lambda *a, **k: (_Env(), None))
+    monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
+    monkeypatch.setattr(
+        worker_state, "load_staged_freesolo_environment", lambda *a, **k: (_Env(), None)
+    )
 
-    assert worker._load_active_env().thinking is True
+    assert worker_state._load_active_env().thinking is True
 
 
 def _thinking_env(monkeypatch, sdk_env, *, prompt_opens_thinking: bool):
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     env.thinking = True
@@ -2288,21 +2291,26 @@ def _thinking_env(monkeypatch, sdk_env, *, prompt_opens_thinking: bool):
 
 
 def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monkeypatch):
-    from flash.engine.worker import opd_train as opd_mod
-    from flash.engine.worker import opd_train_runner
-    from flash.engine.worker.model.decoding import prompt_opens_thinking
-    from flash.engine.worker.train.opd.state import _OpdRequest
+    from flash.engine.worker.train.opd.orchestration import prompt_preparation
+    from flash.engine.worker.train.opd.orchestration.state import _OpdRequest
 
     class _Tokenizer:
         pad_token = "<pad>"
         eos_token = "<eos>"
 
         def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+            self,
+            messages,
+            *,
+            tokenize,
+            add_generation_prompt,
+            enable_thinking,
+            preserve_thinking,
         ):
             assert messages == [{"role": "user", "content": "go"}]
             assert add_generation_prompt is True
             assert enable_thinking is True
+            assert preserve_thinking is False
             if tokenize:
                 return [10, 11]
             return "<|im_start|>assistant\n<think>\n"
@@ -2313,25 +2321,38 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
 
     sdk_env = _SteppingMultiTurnEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     tokenizer = _Tokenizer()
+    monkeypatch.setattr(prompt_preparation._worker_state, "THINKING", True)
     monkeypatch.setattr(
-        opd_mod,
-        "_w",
-        types.SimpleNamespace(
-            THINKING=True,
-            load_tokenizer=lambda model_id, revision: tokenizer,
-            prompt_opens_thinking=prompt_opens_thinking,
-        ),
+        prompt_preparation._worker_hf,
+        "load_tokenizer",
+        lambda model_id, revision: tokenizer,
     )
-    monkeypatch.setattr(opd_mod, "_thinking_prefill_text", lambda _tokenizer: "<think>\n")
-    monkeypatch.setattr(opd_mod, "clamp_engine_len", lambda requested, _limit: requested)
-    monkeypatch.setattr(opd_mod, "model_max_position_embeddings", lambda *_args: None)
-    monkeypatch.setattr(opd_mod, "validate_glue_template", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        opd_mod,
+        prompt_preparation,
+        "_thinking_prefill_text",
+        lambda _tokenizer: "<think>\n",
+    )
+    monkeypatch.setattr(
+        prompt_preparation._backend,
+        "clamp_engine_len",
+        lambda requested, _limit: requested,
+    )
+    monkeypatch.setattr(
+        prompt_preparation._backend,
+        "model_max_position_embeddings",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        prompt_preparation,
+        "validate_glue_template",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        prompt_preparation,
         "liveness_heartbeat",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
@@ -2351,7 +2372,7 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
         model_id="model",
         model_revision="revision",
     )
-    opd_train_runner._prepare_prompts(
+    prompt_preparation.prepare_prompts(
         request,
         [
             (
@@ -2454,7 +2475,7 @@ def test_the_env_defaults_to_no_prompt_opened_thinking(monkeypatch):
     sdk_env = _ThinkingRecordingMultiTurnEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     assert env.prompt_opens_thinking is False
@@ -2634,7 +2655,7 @@ def test_rl_hands_the_derived_opener_flag_to_the_env():
     """
     import inspect
 
-    from flash.engine.worker.rl_train import _resolve_grpo_inputs
+    from flash.engine.worker.train.rl.launch.inputs import _resolve_grpo_inputs
 
     src = inspect.getsource(_resolve_grpo_inputs)
     assert 'hasattr(env, "prompt_opens_thinking")' in src
@@ -2691,7 +2712,7 @@ def test_reward_task_groups_are_scored_concurrently(monkeypatch):
     sdk_env = _SlowGroupedEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     rewards = env.reward_many(_grouped_items())
@@ -2751,7 +2772,7 @@ def test_reward_group_concurrency_is_skipped_for_a_non_thread_safe_env(monkeypat
     sdk_env.reward_thread_safe = False
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     rewards = env.rollout_rewards_many(_multiturn_grouped_items())
@@ -2769,7 +2790,7 @@ def test_multi_turn_reward_groups_are_scored_concurrently(monkeypatch):
     sdk_env = _SlowGroupedMultiTurnEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     rewards = env.rollout_rewards_many(_multiturn_grouped_items())
@@ -2874,7 +2895,7 @@ def test_a_failing_scorer_group_wastes_at_most_a_pool_width(
     sdk_env = _FailingGroupedEnv(fail_on, slow_head=slow_head, fast=fast, slow_error=slow_error)
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     items = [
@@ -2897,7 +2918,7 @@ def test_a_single_task_group_still_scores_inline(monkeypatch):
     sdk_env = _SlowGroupedEnv()
     _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     example = {"id": "ex-1", "input": "2+2?", "output": "4"}

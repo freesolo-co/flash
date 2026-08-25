@@ -34,7 +34,7 @@ class _FakeResponse:
 
 def _capture_urlopen(monkeypatch, responses):
     """Mock the REST transport urlopen; each response is a payload to return or an Exception to raise."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     calls = []
     seq = iter(responses)
@@ -69,7 +69,7 @@ class _LogResp:
 
 def _fake_log_urlopen(monkeypatch, seq):
     """Mock the direct ``urlopen(result_url)`` log poll; items are bytes (a body) or an Exception."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     it = iter(seq)
 
@@ -91,7 +91,7 @@ def test_create_instance_success_body_without_contract_is_ambiguous(monkeypatch)
     NON-IDEMPOTENT create means Vast accepted the create but returned no handle — a contract may be
     billing. It must raise VastAmbiguousCreate (classified ambiguous), not a plain VastApiError, so
     the caller reconciles by label instead of leaking the box."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     kwargs = {
@@ -119,7 +119,7 @@ def test_create_instance_success_body_without_contract_is_ambiguous(monkeypatch)
 def test_get_instance_returns_bare_dict_without_instances_key(monkeypatch):
     """A 200 dict that has no ``instances`` key and is NOT a ``success: false`` error envelope is
     passed through as-is (best-effort detail) rather than raising."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [{"foo": "bar"}])
@@ -132,7 +132,7 @@ def test_get_instance_returns_bare_dict_without_instances_key(monkeypatch):
 def test_get_instance_none_when_response_not_a_dict(monkeypatch):
     """A 200 whose top-level JSON is not an object (e.g. a bare list) is treated as 'no detail' ->
     None, never crashing on a ``.get`` of a non-dict."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [[1, 2, 3]])
@@ -145,7 +145,7 @@ def test_get_instance_none_when_response_not_a_dict(monkeypatch):
 def test_list_instances_non_dict_page_strict_raises(monkeypatch):
     """A page whose body is not a dict (e.g. a bare JSON list) is an incomplete listing: strict must
     raise rather than silently treating it as 'nothing more'."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [[1, 2, 3]])
@@ -156,7 +156,7 @@ def test_list_instances_non_dict_page_strict_raises(monkeypatch):
 def test_list_instances_non_dict_page_lenient_breaks_with_partial(monkeypatch):
     """The lenient default stops at a non-dict later page and returns what was already collected
     (a best-effort sweep still acts on the instances it saw)."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(
@@ -169,7 +169,7 @@ def test_list_instances_non_dict_page_lenient_breaks_with_partial(monkeypatch):
 def test_list_instances_strict_raises_when_page_cap_exceeded(monkeypatch):
     """If the keyset walk never exhausts ``next_token`` and falls off the 200-page runaway guard with
     more pages pending, a strict caller must treat the listing as incomplete and raise."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     pages = {"n": 0}
@@ -191,7 +191,7 @@ def test_list_instances_strict_raises_when_page_cap_exceeded(monkeypatch):
 def test_instance_logs_returns_body_on_first_poll(monkeypatch):
     """Happy path: request_logs yields a result_url, the first fetch has a non-empty body -> it is
     returned verbatim (decoded)."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(
         vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
@@ -203,7 +203,7 @@ def test_instance_logs_returns_body_on_first_poll(monkeypatch):
 def test_instance_logs_none_without_result_url(monkeypatch):
     """No usable result_url -> None. Covers both an empty/absent url in the dict and a non-dict
     response from the logs request."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(vast_api, "request_with_retries", lambda *a, **k: {"other": "field"})
     assert vast_api.instance_logs(42) is None
@@ -214,7 +214,7 @@ def test_instance_logs_none_without_result_url(monkeypatch):
 def test_instance_logs_none_on_non_404_http_error(monkeypatch):
     """A non-404 HTTP error while fetching the result URL is terminal (not 'not materialized yet')
     -> stop polling and return None."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(
         vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
@@ -226,7 +226,7 @@ def test_instance_logs_none_on_non_404_http_error(monkeypatch):
 def test_instance_logs_polls_past_404_and_empty_then_returns_body(monkeypatch):
     """404 means 'log file not materialized yet' and an empty body means 'nothing yet' — both keep
     polling; a later non-empty body is returned. Exercises the 404-continue and empty-body branches."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(
         vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
@@ -237,7 +237,7 @@ def test_instance_logs_polls_past_404_and_empty_then_returns_body(monkeypatch):
 
 
 def test_instance_logs_caps_requests_and_sleep_at_run_deadline(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     clock = {"now": 100.0}
     request_kwargs = {}
@@ -270,7 +270,7 @@ def test_instance_logs_caps_requests_and_sleep_at_run_deadline(monkeypatch):
 def test_instance_logs_none_when_deadline_exhausted(monkeypatch):
     """If the 20s poll deadline has already elapsed before the first fetch, the loop body never runs
     and the function returns None (no fetch attempted)."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(
         vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
@@ -298,7 +298,7 @@ def test_instance_logs_none_when_deadline_exhausted(monkeypatch):
 def test_instance_logs_never_raises_when_request_fails(monkeypatch):
     """instance_logs is best-effort: if the underlying request itself raises, it swallows the error
     and returns None rather than propagating."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     def boom(*a, **k):
         raise vast_api.VastApiError("request_logs failed")

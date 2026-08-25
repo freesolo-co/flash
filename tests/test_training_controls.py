@@ -6,6 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.io.heartbeat as worker_heartbeat
+import flash.engine.worker.io.hf as worker_hf
+import flash.engine.worker.runtime.state as worker_state
 from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.plan.steps import (
@@ -17,7 +20,7 @@ from flash.engine.plan.steps import (
 from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 
 _BASE_TOML = """
-model = "Qwen/Qwen3.5-0.8B"
+model = "Qwen/Qwen3.5-9B"
 algorithm = "grpo"
 
 [environment]
@@ -183,8 +186,6 @@ def test_positive_save_every_is_preserved():
 
 
 def test_resume_first_companion_retries_without_reuploading_full_state(monkeypatch, tmp_path):
-    import flash.engine.worker as worker
-    from flash.engine.worker.io import hf as worker_hf
 
     calls = {"resume": 0, "deployable": 0}
 
@@ -201,9 +202,9 @@ def test_resume_first_companion_retries_without_reuploading_full_state(monkeypat
         if calls["deployable"] == 1:
             raise ConnectionError("hf deployable upload unavailable")
 
-    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker, "hf_api", lambda: Api())
-    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
     assert worker_hf.upload_resume_checkpoint(
@@ -213,8 +214,6 @@ def test_resume_first_companion_retries_without_reuploading_full_state(monkeypat
 
 
 def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatch, tmp_path):
-    import flash.engine.worker as worker
-    from flash.engine.worker.io import hf as worker_hf
 
     secret = "hf_checkpoint_upload_secret"
     calls = 0
@@ -227,10 +226,10 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
             raise PermissionError(f"hf quota refused credential {secret} " + "x" * 400)
 
     monkeypatch.setenv("HF_TOKEN", secret)
-    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
     monkeypatch.setattr(
-        worker, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+        worker_heartbeat, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
     )
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
@@ -251,8 +250,6 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
 
 @pytest.mark.parametrize("failure_stage", ["before", "after"])
 def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path, failure_stage):
-    import flash.engine.worker as worker
-    from flash.engine.worker.io import hf as worker_hf
 
     calls = {"resume": 0, "companion": 0}
     heartbeats: list[tuple[str, dict]] = []
@@ -269,10 +266,10 @@ def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path,
         raise RuntimeError(f"{failure_stage} companion failed")
 
     callbacks = {f"{failure_stage}_upload": fail_companion}
-    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
     monkeypatch.setattr(
-        worker, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+        worker_heartbeat, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
     )
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
@@ -295,7 +292,7 @@ def test_upload_failure_cause_reaches_the_rendered_run_log():
     The formatter emits a fixed list of numeric metric keys, so a stage whose entire content is an
     explanation rather than a measurement committed the cause and printed `stage=... step=50` alone.
     """
-    from flash.providers._lifecycle.poll import _format_heartbeat
+    from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
     line = _format_heartbeat(
         {
@@ -323,7 +320,7 @@ def test_a_failure_cause_cannot_rewrite_the_log_it_is_printed_in():
     raw would let a `\\x1b[2J` clear the screen or a `\\r` overwrite the line the user is reading
     the failure in -- and the failure report is exactly when the log has to stay legible.
     """
-    from flash.providers._lifecycle.poll import _format_heartbeat
+    from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
     line = _format_heartbeat(
         {
@@ -344,7 +341,7 @@ def test_a_failure_cause_cannot_rewrite_the_log_it_is_printed_in():
 
 def test_a_heartbeat_without_a_failure_cause_is_unchanged():
     """The failure fields are additive: an ordinary step line must not grow an empty `error=`."""
-    from flash.providers._lifecycle.poll import _format_heartbeat
+    from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
     line = _format_heartbeat(
         {"stage": "sft_step", "step": 12, "error": "   ", "checkpoint_failure": {}}
@@ -437,7 +434,7 @@ def test_seed_host_rngs_reaches_the_dataset_generators_without_importing_torch(m
 
 
 def test_worker_seed_prefers_jobspec_when_present():
-    from flash.engine.worker import _resolve_worker_seed
+    from flash.engine.worker.runtime.state import _resolve_worker_seed
 
     assert _resolve_worker_seed(SimpleNamespace(seed=123), "999") == 123
     assert _resolve_worker_seed(None, "999") == 999
@@ -447,7 +444,7 @@ def test_worker_seed_prefers_jobspec_when_present():
 
 
 def test_provider_worker_env_emits_authoritative_spec_seed():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(model="model", seed=987)
     assert build_worker_env(spec, 987)["SEED"] == "987"
@@ -483,7 +480,7 @@ def test_grpo_under_ran_only_fails_a_genuine_under_run():
     import inspect
     import textwrap
 
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
     compares = [
@@ -522,7 +519,7 @@ def test_from_dict_rejects_misspelled_train_key():
 
 
 def test_runtime_secret_cannot_override_control_plane_seed():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     # a directly-constructed spec can declare a seed env secret (the toml schema rejects it, but
     # json/direct construction does not). the built worker env must still hold the canonical seed.
@@ -532,7 +529,7 @@ def test_runtime_secret_cannot_override_control_plane_seed():
 
 
 def test_provider_worker_env_carries_control_plane_resume_revision():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
     from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
     spec = JobSpec(model="m", algorithm="opd", seed=987)
@@ -551,7 +548,7 @@ def test_provider_worker_env_carries_control_plane_resume_revision():
 def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
     path = tmp_path / "seed-secret.toml"
     path.write_text(
-        'model = "Qwen/Qwen3.5-0.8B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
         'id = "freesolo/example-project/gsm8k"\n'
@@ -567,7 +564,7 @@ def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
 
 def _spec_with_declared_secret(algorithm: str, secret: str) -> dict:
     return {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": algorithm,
         "environment": {"id": "owner/project/env", "secrets": [secret]},
         "train": {"epochs": 1},

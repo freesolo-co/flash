@@ -12,22 +12,24 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image, ImageOps
 
-from flash.serving.src import multimodal
-from flash.serving.src import serving_io as serving_io_module
-from flash.serving.src.engine_support import _num_prompt_tokens
-from flash.serving.src.lora_engine import _LoraEngineImpl
-from flash.serving.src.multimodal import (
+from flash.serving.src.engine.lora_engine import _LoraEngineImpl
+from flash.serving.src.engine.support import _num_prompt_tokens
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.http.router import build_serving_app as build_durable_serving_app
+from flash.serving.src.io import multimodal
+from flash.serving.src.io.multimodal import (
     MultimodalRequestError,
     has_image_blocks,
     normalize_chat_messages,
     prepare_multimodal_request,
 )
-from flash.serving.src.registry import AdapterRegistry
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.store.registry import AdapterRegistry
+from tests.serving.conftest import RecordingUsageStore
 
-QWEN = "Qwen/Qwen3.5-0.8B"
-QWEN_2B = "Qwen/Qwen3.5-2B"
+QWEN = "Qwen/Qwen3.5-9B"
+QWEN_35B = "Qwen/Qwen3.6-35B-A3B"
 RUN_ID = "flash-1234567890-abcdef12"
 SHA = "a" * 40
 REVISION_ID = f"{RUN_ID}@step-20.{SHA}"
@@ -560,6 +562,7 @@ def test_engine_processor_render_and_vllm_multimodal_input_shape() -> None:
         "add_generation_prompt": True,
         "custom": "value",
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
     prompt_input = engine.engine.prompt_inputs[0]
     assert prompt_input["prompt"] == "rendered multimodal prompt"
@@ -747,8 +750,8 @@ class _Pool:
         return None
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
-    return None
+async def _allow(_token: str, _adapter_id: str) -> str:
+    return "org-1"
 
 
 def _client(base_model: str) -> tuple[TestClient, _Pool]:
@@ -774,14 +777,14 @@ def test_text_only_tool_history_skips_image_decoding(monkeypatch) -> None:
         raise AssertionError("text-only requests must not decode images")
 
     monkeypatch.setattr(multimodal, "_decode_images", unexpected_image_work)
-    client, pool = _client(QWEN_2B)
+    client, pool = _client(QWEN_35B)
     response = client.post(
         "/v1/chat/completions",
         json={"model": RUN_ID, "messages": _tool_history_messages(with_image=False)},
     )
     assert response.status_code == 200
     assert response.json()["model"] == RUN_ID
-    assert pool.calls == [(QWEN_2B, REVISION_ID, REVISION_ID)]
+    assert pool.calls == [(QWEN_35B, REVISION_ID, REVISION_ID)]
 
 
 @pytest.mark.parametrize("model", [REVISION_ID, RUN_ID])
@@ -820,9 +823,9 @@ def test_all_message_entry_points_validate_against_resolved_model(
     validated: list[dict[str, Any]] = []
     supports_args: list[str] = []
     limit_args: list[str] = []
-    real_validate = serving_io_module.normalize_chat_messages
-    real_supports = serving_io_module.supports_image_input
-    real_limit = serving_io_module.image_limit_for
+    real_validate = multimodal.normalize_chat_messages
+    real_supports = multimodal.supports_image_input
+    real_limit = multimodal.image_limit_for
 
     def spy_validate(messages: Any, **kwargs: Any) -> None:
         validated.append(kwargs)
@@ -836,22 +839,22 @@ def test_all_message_entry_points_validate_against_resolved_model(
         limit_args.append(base_model)
         return real_limit(base_model)
 
-    monkeypatch.setattr(serving_io_module, "normalize_chat_messages", spy_validate)
-    monkeypatch.setattr(serving_io_module, "supports_image_input", spy_supports)
-    monkeypatch.setattr(serving_io_module, "image_limit_for", spy_limit)
-    client, pool = _client(QWEN_2B)
+    monkeypatch.setattr(multimodal, "normalize_chat_messages", spy_validate)
+    monkeypatch.setattr(multimodal, "supports_image_input", spy_supports)
+    monkeypatch.setattr(multimodal, "image_limit_for", spy_limit)
+    client, pool = _client(QWEN_35B)
     response = client.post(path, json=body)
 
     assert response.status_code == 200
     # image capabilities were resolved from the resolved target model, not the requested id.
-    assert supports_args == [QWEN_2B]
-    assert limit_args == [QWEN_2B]
+    assert supports_args == [QWEN_35B]
+    assert limit_args == [QWEN_35B]
     # and multimodal validation was invoked exactly once with those resolved capabilities.
     assert validated == [
-        {"supports_images": real_supports(QWEN_2B), "image_limit": real_limit(QWEN_2B)}
+        {"supports_images": real_supports(QWEN_35B), "image_limit": real_limit(QWEN_35B)}
     ]
     assert len(pool.calls) == 1
-    assert pool.calls[0][0] == QWEN_2B
+    assert pool.calls[0][0] == QWEN_35B
 
 
 def test_bad_streaming_image_is_json_400_before_sse() -> None:
@@ -987,24 +990,22 @@ def test_a_refused_attestation_is_never_metered(monkeypatch) -> None:
     # already been billed for a generation we then rejected with a 502. the check has to run
     # before metering, not after it.
     _unattesting_pool(monkeypatch)
-    reported: list[dict[str, Any]] = []
-
-    async def record_usage(payload: dict[str, Any]) -> None:
-        reported.append(payload)
-
-    revision = _revision(QWEN)
-    app = build_serving_app(
+    store = RecordingUsageStore()
+    revision = _revision(QWEN).model_copy(update={"thinking": False})
+    app = build_durable_serving_app(
         _Pool(),
         AdapterRouter([revision, _alias(revision)]),
         chat_authorizer=_allow,
-        usage_reporter=record_usage,
+        usage_store=store,
     )
     client = TestClient(app, headers={"Authorization": "Bearer test"})
 
     response = client.post("/generate", json={"adapter_id": REVISION_ID, "prompt": "hi"})
 
     assert response.status_code == 502
-    assert reported == []
+    assert store.captured == []
+    assert store.finalized == []
+    assert store.failed == []
 
 
 def test_mismatched_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> None:
@@ -1069,7 +1070,7 @@ def test_malformed_text_only_messages_are_rejected_before_gpu_dispatch(
     `GenerateRequest` only checks "list of dicts", and the engine hands the list straight to the
     chat template, so `{"role": "user"}` rendered as an empty prompt and still charged the caller.
     """
-    client, pool = _client(QWEN_2B)
+    client, pool = _client(QWEN_35B)
     response = client.post("/v1/chat/completions", json={"model": RUN_ID, "messages": messages})
     assert response.status_code == 400
     assert expect in response.text
@@ -1082,7 +1083,7 @@ def test_developer_role_is_rewritten_to_system_for_text_only_requests() -> None:
     It was only rewritten when a request also carried list-form content, so a plain text chat
     reached the tokenizer with a role the template may reject -- after gpu dispatch.
     """
-    client, pool = _client(QWEN_2B)
+    client, pool = _client(QWEN_35B)
     response = client.post(
         "/v1/chat/completions",
         json={
@@ -1094,7 +1095,7 @@ def test_developer_role_is_rewritten_to_system_for_text_only_requests() -> None:
         },
     )
     assert response.status_code == 200
-    assert pool.calls == [(QWEN_2B, REVISION_ID, REVISION_ID)]
+    assert pool.calls == [(QWEN_35B, REVISION_ID, REVISION_ID)]
     sent = pool.payloads[-1].messages
     assert [m["role"] for m in sent] == ["system", "user"], (
         "the engine must template the normalized roles, not the original spelling"
@@ -1109,10 +1110,10 @@ def test_image_request_reaches_the_engine_with_its_sources_intact() -> None:
     it back would route to the image path and then fail there with "must contain exactly one image
     source" -- after the request had already been accepted.
     """
-    client, pool = _client(QWEN_2B)
+    client, pool = _client(QWEN_35B)
     response = client.post("/v1/chat/completions", json={"model": RUN_ID, "messages": _messages()})
     assert response.status_code == 200
-    assert pool.calls == [(QWEN_2B, REVISION_ID, REVISION_ID)]
+    assert pool.calls == [(QWEN_35B, REVISION_ID, REVISION_ID)]
     sent = pool.payloads[-1].messages
     blocks = sent[0]["content"]
     image_blocks = [b for b in blocks if b.get("type") in {"image_url", "input_image", "image"}]

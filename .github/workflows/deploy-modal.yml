@@ -11,9 +11,6 @@ name: Deploy serving Modal app
 #   FREESOLO_INTERNAL_KEY                - shared platform internal key (backend + serving)
 #   PLATFORM_BACKEND_URL                 - platform backend base URL
 #   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY - serving startup hydration (durable adapter registry)
-#   OPENROUTER_INFERENCE_KEY_SHA256_CURRENT_PROD, OPENROUTER_SETTLEMENT_ORG_ID_PROD
-#                                         - provisional OpenRouter auth and settlement
-#   OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS_PROD - optional rotation overlap
 # modal_app.py reads these from the environment (load_dotenv only supplements os.environ), so no
 # .env file is written in CI. the "Verify required runtime secrets" step below hard-fails the deploy
 # if a required secret is absent, preventing a broken production config with external chat failures,
@@ -89,7 +86,7 @@ jobs:
       SERVING_CUSTOM_DOMAIN: serve.freesolo.co
 
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # the deploy gate diffs against the revision reported by the currently deployed app.
           fetch-depth: 0
@@ -141,7 +138,7 @@ jobs:
           echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
           echo "Deploy serving: $deploy"
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         if: steps.gate.outputs.deploy == 'true'
         with:
           python-version: "3.12"
@@ -212,7 +209,7 @@ jobs:
           python - <<'PY'
           import os
 
-          from flash.serving.src.openrouter_auth import OpenRouterAuthorization
+          from flash.serving.src.http.openrouter_auth import OpenRouterAuthorization
 
 
           authorization = OpenRouterAuthorization.from_environment(
@@ -240,7 +237,7 @@ jobs:
           # import the constants module, not persistence.py: this job installs only modal and
           # python-dotenv, while persistence.py imports httpx at module scope, so importing it
           # would raise ModuleNotFoundError and the guard below would block every prod deploy.
-          if ! columns="$(python -c 'from flash.serving.src.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
+          if ! columns="$(python -c 'from flash.serving.src.store.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
             # failing closed matters here: an empty list would degrade the query back to a bare
             # existence check and this gate would pass while proving nothing.
             echo "::error::Could not read PERSISTED_COLUMNS; refusing to deploy against an unverified schema."
@@ -322,9 +319,9 @@ jobs:
           if [ "$DEPLOYMENT_STRATEGY" = "recreate" ]; then
             PYTHONWARNINGS="error::UserWarning:modal.runner:318" \
               python -c 'import warnings; warnings.filterwarnings("error", message=r"^App updated successfully, but containers did not all terminate", category=UserWarning, module=r"^modal\.runner$"); from modal.__main__ import main; main()' \
-              deploy --strategy recreate flash/serving/modal_app.py
+              deploy --strategy recreate flash/serving/app/modal_app.py
           else
-            modal deploy --strategy rolling flash/serving/modal_app.py
+            modal deploy --strategy rolling flash/serving/app/modal_app.py
           fi
 
       - name: Wait for production serving readiness

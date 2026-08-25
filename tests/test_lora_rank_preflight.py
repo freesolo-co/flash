@@ -21,7 +21,7 @@ from flash.schema import spec_from_dict
 _ADAPTER_REF = "owner/runs:sft/sft-run"
 
 
-def _spec(*, rank: int = 16, model: str = "Qwen/Qwen3.5-4B"):
+def _spec(*, rank: int = 16, model: str = "Qwen/Qwen3.5-9B"):
     # a warm-start child cannot author rank or alpha, so the child spec only carries the rank
     # default; the adapter-side alpha the preflight inspects comes from the loaded
     # adapter_config.json, independent of the child spec.
@@ -44,7 +44,7 @@ def _config(**overrides):
     config = {
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
-        "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+        "base_model_name_or_path": "Qwen/Qwen3.5-9B",
         "r": 16,
         "lora_alpha": 32,
         # every peft>=0.19 save carries this key, null for a multimodal run, so a config without it
@@ -76,12 +76,11 @@ def test_preflight_accepts_child_rank_and_alpha_mismatches():
     assert metadata.alpha == 128
 
 
-@pytest.mark.parametrize("model", ["Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"])
-def test_preflight_rejects_adapter_rank_above_serving_cap(model):
+def test_preflight_rejects_adapter_rank_above_serving_cap():
     from flash.core.catalog import serving_lora_rank_cap
 
-    # each tier's own cap, read from the catalog. these were pinned to a shared literal 64, which
-    # silently stopped testing the 4B once its cap rose to 128 -- rank 96 then FITS.
+    model = "Qwen/Qwen3.5-9B"
+    # read the active hosted model's cap so catalog changes cannot make the rejection case fit.
     cap = serving_lora_rank_cap(model)
     assert cap is not None
     adapter_rank = cap + 1
@@ -92,6 +91,23 @@ def test_preflight_rejects_adapter_rank_above_serving_cap(model):
                 r=adapter_rank, base_model_name_or_path=model
             ),
         )
+
+
+def test_inactive_hosted_candidate_has_no_serving_rank_cap():
+    from flash.core.catalog import serving_lora_rank_cap
+
+    model = "Qwen/Qwen3.8-27B"
+    assert serving_lora_rank_cap(model) is None
+    metadata = preflight_init_adapter_lora_rank(
+        _spec(model=model),
+        config_loader=lambda _ref, _token, _revision: _config(
+            r=256,
+            lora_alpha=512,
+            base_model_name_or_path=model,
+        ),
+    )
+    assert metadata is not None
+    assert metadata.rank == 256
 
 
 @pytest.mark.parametrize("field", ["rank_pattern", "alpha_pattern"])
@@ -107,23 +123,23 @@ def test_preflight_rejects_invalid_patterns(field, value):
 def test_inspection_requires_lora_peft_type(value):
     with pytest.raises(ValueError, match="peft_type must be LORA"):
         inspect_adapter_config(
-            _config(peft_type=value), source="adapter", target_model="Qwen/Qwen3.5-4B"
+            _config(peft_type=value), source="adapter", target_model="Qwen/Qwen3.5-9B"
         )
 
 
 def test_inspection_rejects_incompatible_task_type():
     with pytest.raises(ValueError, match="task_type must be CAUSAL_LM"):
         inspect_adapter_config(
-            _config(task_type="SEQ_CLS"), source="adapter", target_model="Qwen/Qwen3.5-4B"
+            _config(task_type="SEQ_CLS"), source="adapter", target_model="Qwen/Qwen3.5-9B"
         )
 
 
 def test_inspection_rejects_incompatible_base_model():
     with pytest.raises(ValueError, match=r"base model.*does not match target model"):
         inspect_adapter_config(
-            _config(base_model_name_or_path="Qwen/Qwen3.5-0.8B"),
+            _config(base_model_name_or_path="Qwen/Qwen3.8-27B"),
             source="adapter",
-            target_model="Qwen/Qwen3.5-4B",
+            target_model="Qwen/Qwen3.5-9B",
         )
 
 
@@ -136,7 +152,7 @@ def test_inspection_requires_the_adapter_to_name_its_base_model():
         inspect_adapter_config(
             _config(base_model_name_or_path=""),
             source="adapter",
-            target_model="Qwen/Qwen3.5-4B",
+            target_model="Qwen/Qwen3.5-9B",
         )
 
 
@@ -146,7 +162,7 @@ def test_inspection_requires_a_causal_lm_task_type():
         inspect_adapter_config(
             _config(task_type=""),
             source="adapter",
-            target_model="Qwen/Qwen3.5-4B",
+            target_model="Qwen/Qwen3.5-9B",
         )
 
 
@@ -154,7 +170,7 @@ def test_inspection_requires_alpha_metadata():
     config = _config()
     config.pop("lora_alpha")
     with pytest.raises(ValueError, match="no LoRA alpha metadata"):
-        inspect_adapter_config(config, source="adapter", target_model="Qwen/Qwen3.5-4B")
+        inspect_adapter_config(config, source="adapter", target_model="Qwen/Qwen3.5-9B")
 
 
 @pytest.mark.parametrize(
@@ -206,7 +222,7 @@ def test_rank_metadata_rejects_non_positive_decimal_values(value):
 
 _FLOAT_CONFIG_JSON = (
     '{"peft_type": "LORA", "task_type": "CAUSAL_LM",'
-    ' "base_model_name_or_path": "Qwen/Qwen3.5-4B",'
+    ' "base_model_name_or_path": "Qwen/Qwen3.5-9B",'
     ' "r": 16.0, "lora_alpha": 64.0, "lora_dropout": 0.05}'
 )
 
@@ -560,7 +576,7 @@ def _patch_fused_submit_preflight(
 ):
     import flash.adapters.fused_experts as fused_experts
     import flash.adapters.lora_rank as lora_rank
-    import flash.runner.preparation as preparation
+    import flash.runner.lifecycle.preparation as preparation
     import flash.runner.results.checkpoints as checkpoints
 
     target_spec = _spec(rank=child_rank, model=_FUSED_MODEL)
@@ -577,11 +593,6 @@ def _patch_fused_submit_preflight(
         ),
     )
     status = SimpleNamespace(state="done")
-    runner = SimpleNamespace(
-        get_status=lambda _run_id: status,
-        _warmstart_source_is_authorized=lambda *_args, **_kwargs: True,
-        effective_spec_from_status=lambda _status: source_spec,
-    )
     events = []
 
     def load_config(_ref, _token, _revision):
@@ -602,7 +613,17 @@ def _patch_fused_submit_preflight(
         events.append(("preflight", seen))
         return SimpleNamespace(rank=resolved_rank, alpha=2 * resolved_rank)
 
-    monkeypatch.setattr(preparation, "_runner", lambda: runner)
+    monkeypatch.setattr(preparation.status_ops, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(
+        preparation,
+        "_warmstart_source_is_authorized",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        preparation.status_ops,
+        "effective_spec_from_status",
+        lambda _status: source_spec,
+    )
     monkeypatch.setattr(preparation, "_adopted_warmstart_revision", lambda spec, _source: spec)
     monkeypatch.setattr(checkpoints, "adapter_artifact_exists", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(lora_rank, "resolve_hf_dataset_revision", lambda *_args: "revision")
@@ -667,7 +688,7 @@ def test_submit_passes_the_loaded_config_to_validation_then_rank_preflight(monke
 
 
 def test_preparation_returns_resolved_source_rank_on_worker_spec(monkeypatch):
-    from flash.providers.allocator import required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb
 
     config = _config(target_parameters=list(_FUSED_TARGETS))
     preparation, target_spec, _events = _patch_fused_submit_preflight(

@@ -5,7 +5,8 @@ from typing import Any, ClassVar
 import httpx
 import pytest
 
-from flash.serving.src.persistence import (
+from flash.serving.src.io.schemas import AdapterRecord, PersistedAdapterRecord
+from flash.serving.src.store.persistence import (
     PERSISTED_COLUMNS,
     PersistenceConflict,
     PersistenceRecordError,
@@ -18,8 +19,7 @@ from flash.serving.src.persistence import (
     load_adapters,
     replace_adapter_cas,
 )
-from flash.serving.src.schemas import AdapterRecord, PersistedAdapterRecord
-from flash.serving.src.settings import Settings
+from flash.serving.src.store.settings import Settings
 
 SHA = "a" * 40
 RUN_ID = "flash-1234567890-abcdef12"
@@ -39,7 +39,7 @@ def _row(**overrides: object) -> dict[str, object]:
         "repo_id": "org/run",
         "org_id": "org-1",
         "url": "https://huggingface.co/org/run",
-        "base_model": "Qwen/Qwen3.5-0.8B",
+        "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "checkpoints/step-20",
         "repo_type": "model",
         "checkpoint": f"{RUN_ID}/step-20",
@@ -132,7 +132,7 @@ class FakeClient:
 @pytest.fixture(autouse=True)
 def fake_http(monkeypatch) -> None:
     FakeClient.reset()
-    monkeypatch.setattr("flash.serving.src.persistence.httpx.Client", FakeClient)
+    monkeypatch.setattr("flash.serving.src.store.persistence.httpx.Client", FakeClient)
 
 
 def test_load_uses_explicit_projected_columns_and_ready_filter() -> None:

@@ -7,8 +7,7 @@ from dataclasses import replace
 import pytest
 
 from flash.core.catalog import get_model, supports_image_training
-from flash.serve.control import ModalPlacement, RunPodPlacement
-from flash.serve.profiles import (
+from flash.serve.contract.profiles import (
     SERVE_RUNTIME_FAMILY,
     ProfileError,
     ServingProfile,
@@ -16,10 +15,11 @@ from flash.serve.profiles import (
     placement_for,
     supported_models,
 )
+from flash.serve.control import ModalPlacement, RunPodPlacement
 from flash.serve.provisioning import ServingImage
 from flash.serve.runtime.multimodal import _MAX_IMAGES
-from flash.serving.src.model_config import reasoning_parser_for
-from flash.serving.src.settings import KV_CACHE_DTYPE
+from flash.serving.src.engine.model_config import reasoning_parser_for
+from flash.serving.src.store.settings import KV_CACHE_DTYPE
 
 MODEL = "Qwen/Qwen3.5-9B"
 DIGEST = "sha256:" + "a" * 64
@@ -173,7 +173,7 @@ def test_profile_drifting_from_the_catalog_is_rejected(
 ) -> None:
     # the catalog is the advertised serving capacity contract. a profile that quietly serves a
     # longer context or a higher rank than the catalog would deploy a shape no gate checked.
-    from flash.serve import profiles
+    from flash.serve.contract import profiles
 
     drifted = replace(get_profile(MODEL), **{field: value})
     monkeypatch.setitem(profiles._PROFILES, MODEL, drifted)

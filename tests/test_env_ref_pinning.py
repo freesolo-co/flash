@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 
+import flash.runner.accounting.artifacts as runner_artifacts
 from flash.core.spec import JobSpec
 from tests._helpers.source_snapshot import valid_source_snapshot
 
@@ -16,7 +17,7 @@ _MANIFEST = "d" * 64
 def _staged_spec() -> JobSpec:
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "seed": 0,
             "run_id": "flash-staged-pin-test",
@@ -43,11 +44,10 @@ def test_worker_retry_path_has_no_github_pin_fallback() -> None:
 
 
 def test_submit_context_preserves_controller_staged_identity_without_resolving(monkeypatch) -> None:
-    import flash.runner as runner
     from flash.runner.supervise import seed_submission
 
     monkeypatch.setattr(
-        runner,
+        runner_artifacts,
         "_assign_resolved_env_sha",
         lambda _spec: (_ for _ in ()).throw(AssertionError("worker retry must not resolve github")),
     )

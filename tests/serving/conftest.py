@@ -8,9 +8,43 @@ logic (engine-arg construction, LoRA request building, sampling params).
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import sys
 import types
+from collections.abc import Callable, Iterator
 from typing import Any
+
+import pytest
+
+from flash.serving.src.accounting.usage_outbox import (
+    OfflineUsageStore,
+    UsageEvent,
+    UsageOutboxError,
+)
+
+
+@pytest.fixture(scope="module")
+def load_modal_app_under_stub() -> Iterator[Callable[[Any], Any]]:
+    module_name = "flash.serving.app.modal_app"
+    missing = object()
+    previous_modal = sys.modules.get("modal", missing)
+    previous_app = sys.modules.get(module_name, missing)
+
+    def load(modal_stub: Any) -> Any:
+        sys.modules["modal"] = modal_stub
+        sys.modules.pop(module_name, None)
+        return importlib.import_module(module_name)
+
+    try:
+        yield load
+    finally:
+        sys.modules.pop(module_name, None)
+        if previous_app is not missing:
+            sys.modules[module_name] = previous_app
+        if previous_modal is missing:
+            sys.modules.pop("modal", None)
+        else:
+            sys.modules["modal"] = previous_modal
 
 
 def _install_vllm_stub() -> None:
@@ -34,6 +68,9 @@ def _install_vllm_stub() -> None:
     @dataclasses.dataclass
     class AsyncEngineArgs:
         model: str | None = None
+        revision: str | None = None
+        tokenizer: str | None = None
+        tokenizer_revision: str | None = None
         trust_remote_code: bool = False
         dtype: str = "auto"
         quantization: str | None = None
@@ -180,6 +217,35 @@ def _install_vllm_stub() -> None:
 
 
 _install_vllm_stub()
+
+
+class RecordingUsageStore(OfflineUsageStore):
+    enabled = True
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail_writes = fail
+        self.captured: list[UsageEvent] = []
+        self.finalized: list[UsageEvent] = []
+        self.failed: list[tuple[UsageEvent, str]] = []
+        self.closed = False
+
+    async def capture(self, event: UsageEvent) -> None:
+        if self.fail_writes:
+            raise UsageOutboxError("usage store failure")
+        self.captured.append(event)
+
+    async def finalize(self, event: UsageEvent) -> None:
+        if self.fail_writes:
+            raise UsageOutboxError("usage store failure")
+        self.finalized.append(event)
+
+    async def fail(self, event: UsageEvent, code: str) -> None:
+        if self.fail_writes:
+            raise UsageOutboxError("usage store failure")
+        self.failed.append((event, code))
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def attest(record: Any, result: dict[str, Any]) -> dict[str, Any]:

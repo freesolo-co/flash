@@ -13,7 +13,8 @@ import threading
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
 from flash.core.spec import JobSpec
-from flash.runner import adapter_prefix, get_status, runs_file_path
+from flash.runner.lifecycle.state import adapter_prefix, runs_file_path
+from flash.runner.lifecycle.status import get_status
 from flash.server.platform import db
 
 _log = logging.getLogger("flash.server")
@@ -27,7 +28,7 @@ async def _reconcile_cost_loop() -> None:
     report it to the freesolo backend for estimator accuracy. The provider billing calls are
     blocking urllib, so each sweep is offloaded to a thread; failures are swallowed and retried
     next cycle. Off entirely when FREESOLO_INTERNAL_KEY is unset (see reconcile_enabled)."""
-    from flash.server.domain.reconcile import reconcile_once
+    from flash.server.domain.ops.reconcile import reconcile_once
 
     interval = 3600.0  # COGS reconcile sweep interval (fixed; flash is fully managed)
     while True:
@@ -54,7 +55,7 @@ async def _repo_cleanup_loop() -> None:
     The 7-day age and daily cadence are fixed in ``flash.server.domain.repo_cleanup``. Each threaded sweep
     fails closed when the live serving set is unconfirmed and requires operator ``HF_TOKEN``.
     """
-    from flash.server.domain.repo_cleanup import CleanupAborted, run_scheduled_cleanup
+    from flash.server.domain.ops.repo_cleanup import CleanupAborted, run_scheduled_cleanup
 
     interval = (
         24.0 * 3600.0
@@ -157,7 +158,7 @@ def _confirm_run_clear(spec) -> bool:
     ``submitted_instance_providers`` also blocks when it is now unconfigurable, because a lost
     non-idempotent create such as Vast ``PUT /asks`` may still be billing without a handle.
     """
-    from flash.providers import INSTANCE_PROVIDERS, configured_providers, get_provider
+    from flash.providers.core.registry import INSTANCE_PROVIDERS, configured_providers, get_provider
 
     try:
         recorded_raw = getattr(get_status(spec.run_id), "submitted_instance_providers", None)
@@ -207,7 +208,7 @@ def _confirm_run_clear(spec) -> bool:
 
 
 def _recovery_block_reason(spec) -> str | None:
-    from flash.runner import _spec_with_remaining_wall
+    from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
 
     try:
         _spec_with_remaining_wall(spec, require_provider_minimum=True)
@@ -217,7 +218,7 @@ def _recovery_block_reason(spec) -> str | None:
 
 
 def _recovery_wall_deadline_is_open(spec) -> bool:
-    from flash.runner import _remaining_run_wall_seconds
+    from flash.runner.lifecycle.deadlines import _remaining_run_wall_seconds
 
     try:
         return _remaining_run_wall_seconds(spec.run_id) > 0
@@ -231,7 +232,8 @@ def _fail_blocked_recovery(
     *,
     expected_remote: dict | None = None,
 ) -> bool:
-    from flash.runner import _compare_and_fail_remote, _load_run_deadline_at
+    from flash.runner.accounting.reconciliation import _compare_and_fail_remote
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt, _CompletedAttemptPending
 
     status = get_status(spec.run_id)
@@ -273,12 +275,10 @@ def _start_resubmit(
     expected_remote: dict | None = None,
     expected_state: str | None = None,
 ) -> bool:
-    from flash.runner import (
-        _compare_and_prepare_resubmit,
-        _run_job_background,
-        _verified_opd_next_attempt,
-        source_snapshot_from_status,
-    )
+    from flash.runner.accounting.reconciliation import _compare_and_prepare_resubmit
+    from flash.runner.lifecycle.attempts import _verified_opd_next_attempt
+    from flash.runner.lifecycle.status import source_snapshot_from_status
+    from flash.runner.supervise.lifecycle import _run_job_background
 
     try:
         source_snapshot_from_status(get_status(spec.run_id), required=True)
@@ -313,7 +313,7 @@ def _start_resubmit(
 
 
 def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
-    from flash.runner import _latest_reserved_attempt
+    from flash.runner.lifecycle.attempts import _latest_reserved_attempt
     from flash.runner.supervise.lifecycle import _completed_attempt_metrics
 
     attempt = _latest_reserved_attempt(spec.run_id)
@@ -341,11 +341,9 @@ def _deferred_resubmit_loop(spec) -> None:
     """Reconcile a handle-less maybe-live instance through the run wall deadline."""
     import time
 
-    from flash.runner import (
-        TERMINAL_STATES,
-        _compare_and_fail_remote,
-        _load_run_deadline_at,
-    )
+    from flash.runner.accounting.reconciliation import _compare_and_fail_remote
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
     while True:
@@ -548,13 +546,13 @@ def _worker_artifacts(spec) -> dict[str, str]:
 
 
 def _teardown_unrecoverable_remote(status) -> None:
-    """Stop the billable worker of a handle-backed run whose spec this build cannot parse.
+    """Stop the billable worker of a handle-backed run this build cannot activate.
 
     The run is already marked failed by the caller; what remains is the rented resource. Teardown
     runs off the persisted handle alone, so it works for exactly the spec the parse rejected.
     Best-effort and fully suppressed: recovery must finish for every other run regardless.
     """
-    from flash.runner import _record_cleanup_remote
+    from flash.runner.accounting.reconciliation import _record_cleanup_remote
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
     remote = dict(status.remote or {})
@@ -592,7 +590,7 @@ def recover_runs() -> None:
 
 
 def _drain_cleanup_remotes_bg(run_id: str) -> None:
-    from flash.runner import _drain_cleanup_remotes
+    from flash.runner.accounting.reconciliation import _drain_cleanup_remotes
 
     with contextlib.suppress(Exception):
         _drain_cleanup_remotes(run_id)
@@ -607,14 +605,15 @@ def _classify_recoverable_runs(
     don't-touch scope), ``active`` only the handle-backed ones the sweep must keep, and ``resubmit``
     the handle-less ones, deferred so the orphan sweep runs before their fresh allocation.
     """
-    from flash.runner import (
-        _gc_run_endpoints,
-        _mark_warmstart_source,
+    from flash.runner.lifecycle.preparation import _mark_warmstart_source
+    from flash.runner.lifecycle.status import (
         _update,
-        attach_run,
+        effective_spec_from_status,
         get_status,
         reallocation_spec_from_status,
     )
+    from flash.runner.supervise.attach import attach_run
+    from flash.runner.supervise.recovery import _gc_run_endpoints
 
     for row in db.all_runs():
         known.add(row["run_id"])
@@ -641,14 +640,14 @@ def _classify_recoverable_runs(
             # handle and the run id, never a parsed spec, so removal does not depend on the parse
             # that just failed.
             try:
-                JobSpec.from_dict(status.spec)
+                effective_spec_from_status(status)
             except Exception as exc:
                 _log.warning(
-                    "marking run %s failed: persisted spec could not be parsed for reattach",
+                    "marking run %s failed: persisted spec could not be activated for reattach",
                     status.run_id,
                     exc_info=True,
                 )
-                detail = f"unrecoverable: persisted spec is malformed: {exc}"
+                detail = f"unrecoverable: persisted spec cannot be activated: {exc}"
                 with contextlib.suppress(Exception):
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):
@@ -678,13 +677,14 @@ def _classify_recoverable_runs(
             # otherwise GC any half-made endpoint and resubmit from scratch.
             try:
                 spec = JobSpec.from_dict(status.spec)
+                effective_spec_from_status(status)
             except Exception as exc:
                 _log.warning(
-                    "marking run %s failed: persisted spec could not be parsed",
+                    "marking run %s failed: persisted spec could not be activated",
                     status.run_id,
                     exc_info=True,
                 )
-                detail = f"unrecoverable: persisted spec is malformed: {exc}"
+                detail = f"unrecoverable: persisted spec cannot be activated: {exc}"
                 with contextlib.suppress(Exception):
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):
@@ -699,7 +699,7 @@ def _classify_recoverable_runs(
                 # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
                 # persisted status without parsing the spec. Terminate by that reconstructed
                 # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
-                from flash.providers.runpod import terminate_persisted_endpoints
+                from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
 
                 terminate_persisted_endpoints(status.spec, status.run_id)
                 continue
@@ -728,7 +728,7 @@ def _classify_recoverable_runs(
 
 def _sweep_provider_orphans(active: set[str], known: set[str]) -> None:
     """Reap orphaned per-run provider resources; each provider sweeps its own."""
-    from flash.providers import configured_providers
+    from flash.providers.core.registry import configured_providers
 
     for prov in configured_providers():
         with contextlib.suppress(Exception):
@@ -737,7 +737,7 @@ def _sweep_provider_orphans(active: set[str], known: set[str]) -> None:
 
 def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
     """Relaunch the handle-less runs, deferring any whose teardown could not be confirmed."""
-    from flash.runner import get_status
+    from flash.runner.lifecycle.status import get_status
 
     for spec, prior_state in resubmit:
         reason = _recovery_block_reason(spec)

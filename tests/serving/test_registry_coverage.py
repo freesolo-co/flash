@@ -8,8 +8,8 @@ from __future__ import annotations
 from datetime import UTC
 from pathlib import Path
 
-from flash.serving.src.registry import AdapterRegistry, _parse_iso
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.store.registry import AdapterRegistry, _parse_iso
 
 
 def _alias() -> AdapterRecord:
@@ -17,7 +17,7 @@ def _alias() -> AdapterRecord:
         {
             "adapter_id": "run",
             "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "org_id": "org-1",
             "thinking": False,
             "metadata": {
@@ -54,7 +54,7 @@ def test_alias_local_path_is_never_stale() -> None:
         {
             "adapter_id": "run",
             "repo_id": "org/old-run",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "org_id": "org-1",
             "thinking": False,
             "metadata": {"hf_revision": "b" * 40},

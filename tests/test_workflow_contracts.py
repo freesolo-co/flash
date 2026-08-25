@@ -188,8 +188,8 @@ def test_every_job_bounds_its_runtime(path: Path):
                 "OPENROUTER_SETTLEMENT_ORG_ID",
             ),
             "Deploy serving",
-            "deploy --strategy recreate flash/serving/modal_app.py",
-            "modal deploy --strategy rolling flash/serving/modal_app.py",
+            "deploy --strategy recreate flash/serving/app/modal_app.py",
+            "modal deploy --strategy rolling flash/serving/app/modal_app.py",
         ),
         (
             "deploy-modal-dev.yml",
@@ -207,8 +207,8 @@ def test_every_job_bounds_its_runtime(path: Path):
                 "OPENROUTER_SETTLEMENT_ORG_ID",
             ),
             "Deploy development serving",
-            "deploy --env dev --strategy recreate flash/serving/modal_app.py",
-            "modal deploy --env dev --strategy rolling flash/serving/modal_app.py",
+            "deploy --env dev --strategy recreate flash/serving/app/modal_app.py",
+            "modal deploy --env dev --strategy rolling flash/serving/app/modal_app.py",
         ),
     ],
 )
@@ -262,7 +262,8 @@ def test_modal_deploy_openrouter_contract(
     preflight_name = "Validate OpenRouter authorization configuration"
     preflight_script = _named_step(job, preflight_name)["run"]
     assert (
-        "from flash.serving.src.openrouter_auth import OpenRouterAuthorization" in preflight_script
+        "from flash.serving.src.http.openrouter_auth import OpenRouterAuthorization"
+        in preflight_script
     )
     assert "OpenRouterAuthorization.from_environment(" in preflight_script
     assert "os.environ" in preflight_script

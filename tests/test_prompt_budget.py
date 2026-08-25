@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.cli.commands.ops.train as cli_train
 from flash.core.spec import JobSpec
 from flash.engine.plan.prompt_budget import rl_prompt_budget
 from flash.engine.plan.recipe import RECIPE
@@ -23,7 +24,7 @@ from flash.schema import ConfigError, spec_from_dict
 def _budget_spec(algorithm: str, train: dict | None = None, *, thinking: bool = False) -> JobSpec:
     return spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": algorithm,
             "thinking": thinking,
@@ -52,7 +53,7 @@ def _train_config(tmp_path, *, init_from_adapter: str = ""):
     config = tmp_path / "train.toml"
     warm_start = f'init_from_adapter = "{init_from_adapter}"\n' if init_from_adapter else ""
     config.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "grpo"\n'
         '[environment]\nid = "owner/project/env"\n'
@@ -74,11 +75,10 @@ def _train_args(config, *, dry_run: bool = False):
 
 
 def test_reporter_matches_grpo_worker_for_authored_and_default_lengths(monkeypatch) -> None:
-    import flash.engine.worker.rl_train as rl_train
-    from flash.engine.worker.train.rl import inputs
+    from flash.engine.worker.train.rl.launch import inputs
 
-    monkeypatch.setattr(inputs._w, "THINKING", False)
-    monkeypatch.setattr(rl_train, "model_max_position_embeddings", lambda *_args: 32768)
+    monkeypatch.setattr(inputs._worker_state, "THINKING", False)
+    monkeypatch.setattr(inputs, "model_max_position_embeddings", lambda *_args: 32768)
 
     for context in (0, 8192):
         train = {"max_completion_tokens": 512}
@@ -102,11 +102,10 @@ def test_reporter_matches_grpo_worker_for_authored_and_default_lengths(monkeypat
 
 
 def test_grpo_worker_keeps_clamp_and_value_error_contract(monkeypatch, capsys) -> None:
-    import flash.engine.worker.rl_train as rl_train
-    from flash.engine.worker.train.rl import inputs
+    from flash.engine.worker.train.rl.launch import inputs
 
-    monkeypatch.setattr(inputs._w, "THINKING", False)
-    monkeypatch.setattr(rl_train, "model_max_position_embeddings", lambda *_args: 1024)
+    monkeypatch.setattr(inputs._worker_state, "THINKING", False)
+    monkeypatch.setattr(inputs, "model_max_position_embeddings", lambda *_args: 1024)
     spec = _budget_spec("grpo", {"max_context_tokens": 2048, "max_completion_tokens": 512})
     lengths = inputs._resolve_sequence_lengths(
         spec.model,
@@ -133,11 +132,10 @@ def test_grpo_worker_keeps_clamp_and_value_error_contract(monkeypatch, capsys) -
 
 
 def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int = 32768):
-    import flash.engine.worker.opd_train as opd_train
     import flash.engine.worker.teacher.client as teacher_client
     from flash.engine.worker.entry.opd import OpdKnobs
-    from flash.engine.worker.opd_train_runner import _prepare_prompts
-    from flash.engine.worker.train.opd.state import _OpdRequest
+    from flash.engine.worker.train.opd.orchestration import prompt_preparation
+    from flash.engine.worker.train.opd.orchestration.state import _OpdRequest
 
     class Tokenizer:
         pad_token = None
@@ -146,13 +144,23 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
         def apply_chat_template(self, *_args, **_kwargs):
             return list(range(100))
 
-    monkeypatch.setattr(opd_train._w, "THINKING", False)
-    monkeypatch.setattr(opd_train._w, "load_tokenizer", lambda *_args, **_kwargs: Tokenizer())
-    monkeypatch.setattr(opd_train, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(prompt_preparation._worker_state, "THINKING", False)
     monkeypatch.setattr(
-        opd_train, "model_max_position_embeddings", lambda *_args: architecture_limit
+        prompt_preparation._worker_hf,
+        "load_tokenizer",
+        lambda *_args, **_kwargs: Tokenizer(),
     )
-    monkeypatch.setattr(opd_train, "liveness_heartbeat", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(prompt_preparation, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(
+        prompt_preparation._backend,
+        "model_max_position_embeddings",
+        lambda *_args: architecture_limit,
+    )
+    monkeypatch.setattr(
+        prompt_preparation,
+        "liveness_heartbeat",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
     monkeypatch.setattr(teacher_client, "TeacherClient", lambda *_args, **_kwargs: object())
     request = _OpdRequest(
         spec=None,
@@ -160,10 +168,10 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
         multi_turn=False,
         max_turns=0,
         knobs=OpdKnobs(max_completion=512, max_length=max_length),
-        model_id="Qwen/Qwen3.5-4B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="",
     )
-    state = _prepare_prompts(
+    state = prompt_preparation.prepare_prompts(
         request,
         [({}, [{"role": "user", "content": "question"}])],
         False,
@@ -208,7 +216,7 @@ def test_rollout_helpers_preserve_omitted_zero_and_thinking_behavior() -> None:
 
 
 def test_defaulted_budget_warning_and_authored_silence(capsys) -> None:
-    from flash.cli.commands.prompt_budget import (
+    from flash.cli.commands.ops.prompt_budget import (
         print_status_prompt_budget_warning,
         prompt_budget_warning,
     )
@@ -234,7 +242,7 @@ def test_defaulted_budget_warning_and_authored_silence(capsys) -> None:
 
 
 def test_malformed_status_budget_is_not_treated_as_validated(capsys) -> None:
-    from flash.cli.commands.prompt_budget import (
+    from flash.cli.commands.ops.prompt_budget import (
         print_status_prompt_budget_warning,
         prompt_budget_validation_suffix,
     )
@@ -252,7 +260,7 @@ def test_malformed_status_budget_is_not_treated_as_validated(capsys) -> None:
 
 
 def test_sft_has_no_drop_semantics_prompt_budget() -> None:
-    from flash.cli.commands.prompt_budget import prompt_budget_warning
+    from flash.cli.commands.ops.prompt_budget import prompt_budget_warning
 
     budget = rl_prompt_budget(_budget_spec("sft", {"max_context_tokens": 8192}))
     assert budget is None
@@ -262,8 +270,7 @@ def test_sft_has_no_drop_semantics_prompt_budget() -> None:
 def test_paid_submit_owner_warning_precedes_create_and_names_source(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    from flash.cli import commands
-    from flash.cli.commands import prompt_budget as cli_prompt_budget
+    from flash.cli.commands.ops import prompt_budget as cli_prompt_budget
 
     events = []
 
@@ -281,9 +288,9 @@ def test_paid_submit_owner_warning_precedes_create_and_names_source(
                 "prompt_budget": _serialized_budget(warm_start_context=8192),
             }
 
-    monkeypatch.setattr(commands, "client_from_config", lambda: Client())
+    monkeypatch.setattr(cli_train, "client_from_config", lambda: Client())
     monkeypatch.setattr(cli_prompt_budget.render, "styled", lambda: False)
-    result = commands.cmd_train(
+    result = cli_train.cmd_train(
         _train_args(_train_config(tmp_path, init_from_adapter="source-run"))
     )
     captured = capsys.readouterr()
@@ -301,8 +308,7 @@ def test_paid_submit_owner_warning_precedes_create_and_names_source(
 def test_paid_submit_org_peer_prints_only_supplement_after_create(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    from flash.cli import commands
-    from flash.cli.commands import prompt_budget as cli_prompt_budget
+    from flash.cli.commands.ops import prompt_budget as cli_prompt_budget
 
     events = []
 
@@ -320,9 +326,9 @@ def test_paid_submit_org_peer_prints_only_supplement_after_create(
                 "prompt_budget": _serialized_budget(warm_start_context=8192),
             }
 
-    monkeypatch.setattr(commands, "client_from_config", lambda: Client())
+    monkeypatch.setattr(cli_train, "client_from_config", lambda: Client())
     monkeypatch.setattr(cli_prompt_budget.render, "styled", lambda: False)
-    result = commands.cmd_train(
+    result = cli_train.cmd_train(
         _train_args(_train_config(tmp_path, init_from_adapter="org-peer-run"))
     )
     captured = capsys.readouterr()
@@ -338,7 +344,7 @@ def test_paid_submit_org_peer_prints_only_supplement_after_create(
 
 
 def test_source_lookup_failure_is_non_fatal() -> None:
-    from flash.cli.commands.prompt_budget import warmstart_source_context
+    from flash.cli.commands.ops.prompt_budget import warmstart_source_context
 
     class Client:
         def get_run(self, _run_id):
@@ -353,8 +359,7 @@ def test_source_lookup_failure_is_non_fatal() -> None:
 
 
 def test_dry_run_keeps_budget_in_machine_readable_stdout(monkeypatch, tmp_path, capsys) -> None:
-    from flash.cli import commands
-    from flash.cli.commands import prompt_budget as cli_prompt_budget
+    from flash.cli.commands.ops import prompt_budget as cli_prompt_budget
 
     class Client:
         def create_run(self, *_args, **_kwargs):
@@ -366,9 +371,9 @@ def test_dry_run_keeps_budget_in_machine_readable_stdout(monkeypatch, tmp_path, 
                 "affordability_verified": True,
             }
 
-    monkeypatch.setattr(commands, "client_from_config", lambda: Client())
+    monkeypatch.setattr(cli_train, "client_from_config", lambda: Client())
     monkeypatch.setattr(cli_prompt_budget.render, "styled", lambda: False)
-    result = commands.cmd_train(_train_args(_train_config(tmp_path), dry_run=True))
+    result = cli_train.cmd_train(_train_args(_train_config(tmp_path), dry_run=True))
     captured = capsys.readouterr()
 
     assert result == 0
@@ -379,7 +384,7 @@ def test_dry_run_keeps_budget_in_machine_readable_stdout(monkeypatch, tmp_path, 
 
 
 def test_status_serialization_keeps_prompt_budget_payload_identical() -> None:
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
     budget = rl_prompt_budget(_budget_spec("grpo"))
     assert budget is not None

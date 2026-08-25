@@ -49,14 +49,14 @@ def _passthrough_decorator(*_args: Any, **_kwargs: Any):
 @pytest.fixture(autouse=True)
 def _restore_modal_app_module():
     missing = object()
-    previous = sys.modules.get("flash.serving.modal_app", missing)
-    sys.modules.pop("flash.serving.modal_app", None)
+    previous = sys.modules.get("flash.serving.app.modal_app", missing)
+    sys.modules.pop("flash.serving.app.modal_app", None)
     try:
         yield
     finally:
-        sys.modules.pop("flash.serving.modal_app", None)
+        sys.modules.pop("flash.serving.app.modal_app", None)
         if previous is not missing:
-            sys.modules["flash.serving.modal_app"] = previous
+            sys.modules["flash.serving.app.modal_app"] = previous
 
 
 def _import_modal_app(monkeypatch: pytest.MonkeyPatch, *, is_local: bool, environment: str):
@@ -76,8 +76,8 @@ def _import_modal_app(monkeypatch: pytest.MonkeyPatch, *, is_local: bool, enviro
     modal_stub.Period.return_value = MagicMock()
 
     monkeypatch.setitem(sys.modules, "modal", modal_stub)
-    monkeypatch.delitem(sys.modules, "flash.serving.modal_app", raising=False)
-    return importlib.import_module("flash.serving.modal_app")
+    monkeypatch.delitem(sys.modules, "flash.serving.app.modal_app", raising=False)
+    return importlib.import_module("flash.serving.app.modal_app")
 
 
 def _clear_deployment_environment(monkeypatch: pytest.MonkeyPatch) -> None:

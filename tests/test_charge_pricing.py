@@ -12,10 +12,13 @@ import os
 
 import pytest
 
-import flash.runner as runner
+import flash.runner.accounting.costs as runner_costs
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.supervise.recovery as runner_recovery
 
 SPEC = {
-    "model": "Qwen/Qwen3.5-4B",
+    "model": "Qwen/Qwen3.5-9B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"epochs": 20, "max_examples": 20, "prompts_per_step": 20},
@@ -40,8 +43,8 @@ def _write_terminal_steps(
     allocated_gpu=None,
     allocated_gpu_count=None,
 ):
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path))
-    dest = runner.artifacts_dir(spec)
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path))
+    dest = runner_state.artifacts_dir(spec)
     os.makedirs(dest, exist_ok=True)
     metrics = {"step": step, "wall_seconds": wall_seconds}
     if allocated_provider is not None:
@@ -61,7 +64,7 @@ def test_charge_usd_for_spec_is_the_submit_quote():
     from flash.cost.spec import estimate_for_spec
 
     spec = _spec()
-    quote = runner.charge_usd_for_spec(spec)
+    quote = runner_costs.charge_usd_for_spec(spec)
     assert quote > 0
     # pricing the spec's planned steps == exactly the submit quote
     assert quote == float(estimate_for_spec(spec).total_usd)
@@ -69,11 +72,11 @@ def test_charge_usd_for_spec_is_the_submit_quote():
 
 def test_charge_usd_for_spec_scales_with_actual_steps():
     spec = _spec()  # 20 planned steps
-    full = runner.charge_usd_for_spec(spec)  # the quote
-    half = runner.charge_usd_for_spec(spec, steps=10)  # cancelled at 10 steps
+    full = runner_costs.charge_usd_for_spec(spec)  # the quote
+    half = runner_costs.charge_usd_for_spec(spec, steps=10)  # cancelled at 10 steps
     assert 0 < half < full
     # cancelled before any step -> $0
-    assert runner.charge_usd_for_spec(spec, steps=0) == 0.0
+    assert runner_costs.charge_usd_for_spec(spec, steps=0) == 0.0
 
 
 def test_charge_usd_for_spec_prorates_sft_cancel_by_tokens(monkeypatch):
@@ -85,14 +88,14 @@ def test_charge_usd_for_spec_prorates_sft_cancel_by_tokens(monkeypatch):
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
 
-    cfg = RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=20, train_tokens=4_000_000)
+    cfg = RunConfig(model_id="Qwen/Qwen3.5-9B", method="sft", steps=20, train_tokens=4_000_000)
     monkeypatch.setattr(cost_spec, "runconfig_from_spec", lambda spec: cfg)
 
     full = float(estimate_cost(cfg).total_usd)  # the 20-step / full-token quote
     naive = float(
         estimate_cost(replace(cfg, steps=10)).total_usd
     )  # steps lowered, tokens NOT scaled
-    half = runner.charge_usd_for_spec(object(), steps=10)  # cancelled at 10 of 20 steps
+    half = runner_costs.charge_usd_for_spec(object(), steps=10)  # cancelled at 10 of 20 steps
     assert 0 < half < full
     # the token scaling is what prorates SFT: a steps-only replace (naive) barely moves the price.
     assert half < naive
@@ -100,8 +103,8 @@ def test_charge_usd_for_spec_prorates_sft_cancel_by_tokens(monkeypatch):
 
 def test_charge_usd_for_spec_falls_back_when_unpriceable():
     # a spec that can't be priced returns the fallback rather than raising (a charge is never blocked)
-    assert runner.charge_usd_for_spec(object(), fallback=1.5) == 1.5
-    assert runner.charge_usd_for_spec(object(), steps=5, fallback=2.0) == 2.0
+    assert runner_costs.charge_usd_for_spec(object(), fallback=1.5) == 1.5
+    assert runner_costs.charge_usd_for_spec(object(), steps=5, fallback=2.0) == 2.0
 
 
 def _unbounded_on_policy_spec(algorithm: str):
@@ -115,7 +118,7 @@ def _unbounded_on_policy_spec(algorithm: str):
 
     return spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": algorithm,
             "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
             "train": {"epochs": 1, "prompts_per_step": 8, "group_size": 4},
@@ -133,16 +136,16 @@ def test_cancel_prices_an_unbounded_on_policy_run_from_its_completed_steps():
     # rented the GPU. both algorithms derive the same way, so both regressed.
     for algorithm in ("grpo", "opd"):
         spec = _unbounded_on_policy_spec(algorithm)
-        charge = runner.charge_usd_for_spec(spec, steps=7, fallback=float("nan"))
+        charge = runner_costs.charge_usd_for_spec(spec, steps=7, fallback=float("nan"))
         assert math.isfinite(charge), f"{algorithm} cancel was unpriceable"
         assert charge > 0
         # priced from the completed count, not a guess: more steps run == more owed, and a cancel
         # before the first step is still free.
-        assert runner.charge_usd_for_spec(spec, steps=14, fallback=float("nan")) > charge
-        assert runner.charge_usd_for_spec(spec, steps=0, fallback=float("nan")) == 0.0
+        assert runner_costs.charge_usd_for_spec(spec, steps=14, fallback=float("nan")) > charge
+        assert runner_costs.charge_usd_for_spec(spec, steps=0, fallback=float("nan")) == 0.0
         # and the quote-anchored path reaches the same estimate instead of discarding the quote.
-        st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=12.0)
-        assert runner.cancelled_charge_usd(st, spec, steps=7, fallback=float("nan")) == charge
+        st = runner_state.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=12.0)
+        assert runner_costs.cancelled_charge_usd(st, spec, steps=7, fallback=float("nan")) == charge
 
 
 def test_cancelled_unbounded_on_policy_run_never_exceeds_its_quote():
@@ -150,16 +153,17 @@ def test_cancelled_unbounded_on_policy_run_never_exceeds_its_quote():
     # reprice. that fallback still cannot exceed the price the customer accepted at submission.
     for algorithm in ("grpo", "opd"):
         spec = _unbounded_on_policy_spec(algorithm)
-        repriced = runner.charge_usd_for_spec(spec, steps=7, fallback=float("nan"))
+        repriced = runner_costs.charge_usd_for_spec(spec, steps=7, fallback=float("nan"))
         accepted_quote = repriced / 2
-        st = runner.RunStatus(
+        st = runner_state.RunStatus(
             run_id="r",
             state="cancelled",
             spec={},
             estimated_cost_usd=accepted_quote,
         )
         assert (
-            runner.cancelled_charge_usd(st, spec, steps=7, fallback=float("nan")) == accepted_quote
+            runner_costs.cancelled_charge_usd(st, spec, steps=7, fallback=float("nan"))
+            == accepted_quote
         )
 
 
@@ -173,15 +177,15 @@ def test_quoting_an_unbounded_on_policy_run_still_refuses_to_guess():
         spec = _unbounded_on_policy_spec(algorithm)
         with pytest.raises(UnknownPromptPoolSize):
             spec_steps(spec)
-        assert math.isnan(runner.charge_usd_for_spec(spec, fallback=float("nan")))
+        assert math.isnan(runner_costs.charge_usd_for_spec(spec, fallback=float("nan")))
 
 
 def test_cancelled_charge_usd_prorates_against_the_whole_cent_quote():
     spec = _spec()
-    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=1.01)
+    st = runner_state.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=1.01)
 
-    assert runner.cancelled_charge_usd(st, spec, steps=10) == 0.505
-    assert runner.cancelled_charge_usd(st, spec, steps=20) == 1.01
+    assert runner_costs.cancelled_charge_usd(st, spec, steps=10) == 0.505
+    assert runner_costs.cancelled_charge_usd(st, spec, steps=20) == 1.01
 
 
 def test_cancelled_charge_usd_prorates_and_clamps_to_the_quote():
@@ -189,12 +193,12 @@ def test_cancelled_charge_usd_prorates_and_clamps_to_the_quote():
     # it and can never exceed it. this plan is uniform (no saves, dense model, no wall cap), so the
     # work share reduces to the bare step fraction.
     spec = _spec()  # 20 planned steps
-    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
-    assert runner.cancelled_charge_usd(st, spec, steps=0) == 0.0
-    assert runner.cancelled_charge_usd(st, spec, steps=10) == 4.0
-    assert runner.cancelled_charge_usd(st, spec, steps=20) == 8.0
+    st = runner_state.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
+    assert runner_costs.cancelled_charge_usd(st, spec, steps=0) == 0.0
+    assert runner_costs.cancelled_charge_usd(st, spec, steps=10) == 4.0
+    assert runner_costs.cancelled_charge_usd(st, spec, steps=20) == 8.0
     # a step count beyond the plan still caps at the full quote.
-    assert runner.cancelled_charge_usd(st, spec, steps=25) == 8.0
+    assert runner_costs.cancelled_charge_usd(st, spec, steps=25) == 8.0
 
 
 @pytest.mark.parametrize(
@@ -205,27 +209,29 @@ def test_cancelled_charge_usd_treats_a_malformed_quote_as_a_pricing_failure(bad_
     # malformed persisted quotes must not raise out of the cancel path, and repricing the spec
     # instead could bill above the unknowable accepted rate, so the measured fallback propagates.
     spec = _spec()
-    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=bad_quote)
-    assert runner.cancelled_charge_usd(st, spec, steps=10, fallback=3.25) == 3.25
+    st = runner_state.RunStatus(
+        run_id="r", state="cancelled", spec={}, estimated_cost_usd=bad_quote
+    )
+    assert runner_costs.cancelled_charge_usd(st, spec, steps=10, fallback=3.25) == 3.25
 
 
 def test_cancelled_charge_usd_treats_a_negative_quote_as_a_pricing_failure():
     # a negative persisted quote cannot represent the accepted whole-cent amount, so the measured
     # fallback propagates rather than persisting a negative customer charge.
     spec = _spec()
-    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=-8.0)
-    assert runner.cancelled_charge_usd(st, spec, steps=10, fallback=3.25) == 3.25
+    st = runner_state.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=-8.0)
+    assert runner_costs.cancelled_charge_usd(st, spec, steps=10, fallback=3.25) == 3.25
 
 
 def test_cancelled_charge_usd_preserves_a_zero_quote_for_incomplete_work(monkeypatch):
     spec = _spec()
-    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=0.0)
+    st = runner_state.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=0.0)
 
     def unexpected_reprice(*_args, **_kwargs):
         raise AssertionError("a zero accepted quote must not be repriced")
 
-    monkeypatch.setattr(runner, "charge_usd_for_spec", unexpected_reprice)
-    assert runner.cancelled_charge_usd(st, spec, steps=10, fallback=4.5) == 0.0
+    monkeypatch.setattr(runner_costs, "charge_usd_for_spec", unexpected_reprice)
+    assert runner_costs.cancelled_charge_usd(st, spec, steps=10, fallback=4.5) == 0.0
 
 
 def _patched_cfg_spec(monkeypatch, cfg):
@@ -245,12 +251,16 @@ def test_cancelled_charge_usd_prices_against_the_capped_horizon(monkeypatch):
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
 
-    cfg = RunConfig("Qwen/Qwen3.5-4B", "grpo", 100_000, max_wall_seconds=3600)
+    cfg = RunConfig("Qwen/Qwen3.5-9B", "grpo", 100_000, max_wall_seconds=3600)
     assert estimate_cost(cfg).wall_capped
     spec = _patched_cfg_spec(monkeypatch, cfg)
-    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
-    charge = runner.cancelled_charge_usd(st, spec, steps=1)
-    expected = 8.0 * runner.charge_usd_for_spec(spec, steps=1) / runner.charge_usd_for_spec(spec)
+    st = runner_state.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
+    charge = runner_costs.cancelled_charge_usd(st, spec, steps=1)
+    expected = (
+        8.0
+        * runner_costs.charge_usd_for_spec(spec, steps=1)
+        / runner_costs.charge_usd_for_spec(spec)
+    )
     assert charge == expected
     # far above the bare-step fraction, at or under the quote.
     assert 8.0 / 100_000 < charge <= 8.0
@@ -262,11 +272,11 @@ def test_cancelled_charge_usd_excludes_unreached_required_saves(monkeypatch):
     from flash.cost.analytical import required_save_overhead_seconds
     from flash.cost.types import RunConfig
 
-    cfg = RunConfig("Qwen/Qwen3.5-4B", "grpo", 20, save_at_steps=(20,))
+    cfg = RunConfig("Qwen/Qwen3.5-9B", "grpo", 20, save_at_steps=(20,))
     assert required_save_overhead_seconds(cfg) > 0
     spec = _patched_cfg_spec(monkeypatch, cfg)
-    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
-    charge = runner.cancelled_charge_usd(st, spec, steps=19)
+    st = runner_state.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
+    charge = runner_costs.cancelled_charge_usd(st, spec, steps=19)
     assert 0 < charge < 8.0 * 19 / 20
 
 
@@ -279,8 +289,8 @@ def test_cancelled_charge_usd_bills_the_one_time_compile_with_the_first_step(mon
     cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000)
     assert compile_seconds(cfg, "H100") > 0
     spec = _patched_cfg_spec(monkeypatch, cfg)
-    st = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
-    charge = runner.cancelled_charge_usd(st, spec, steps=1)
+    st = runner_state.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
+    charge = runner_costs.cancelled_charge_usd(st, spec, steps=1)
     assert 8.0 / 1000 < charge <= 8.0
 
 
@@ -293,32 +303,36 @@ def test_cancelled_charge_usd_prices_the_rented_topology(monkeypatch):
 
     cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000, gpu_type="H100", gpu_count=2)
     spec = _patched_cfg_spec(monkeypatch, cfg)
-    st = runner.RunStatus(
+    st = runner_state.RunStatus(
         run_id="r",
         state="cancelled",
         spec={},
         estimated_cost_usd=8.0,
         remote={"provider": "vast"},
     )
-    charge = runner.cancelled_charge_usd(st, spec, steps=1)
-    partial = runner.charge_usd_for_spec(spec, steps=1, provider="vast")
-    full = runner.charge_usd_for_spec(spec, provider="vast")
+    charge = runner_costs.cancelled_charge_usd(st, spec, steps=1)
+    partial = runner_costs.charge_usd_for_spec(spec, steps=1, provider="vast")
+    full = runner_costs.charge_usd_for_spec(spec, provider="vast")
     assert charge == 8.0 * partial / full
     # the auto reprice credits nvlink scaling, so its step time, fixed-cost weighting, and wall-cap
     # decision all differ from the pcie substrate the run rented: on this plan the slower pcie
     # steps trip the wall cap, shrinking the paid horizon and raising the first-step share.
-    auto = 8.0 * runner.charge_usd_for_spec(spec, steps=1) / runner.charge_usd_for_spec(spec)
+    auto = (
+        8.0
+        * runner_costs.charge_usd_for_spec(spec, steps=1)
+        / runner_costs.charge_usd_for_spec(spec)
+    )
     assert charge != auto
     assert 0 < charge <= 8.0
     # an unknown handle provider must degrade to the spec's own pricing, never fail the charge.
-    stale = runner.RunStatus(
+    stale = runner_state.RunStatus(
         run_id="r",
         state="cancelled",
         spec={},
         estimated_cost_usd=8.0,
         remote={"provider": "gone-provider"},
     )
-    assert runner.cancelled_charge_usd(stale, spec, steps=1) == auto
+    assert runner_costs.cancelled_charge_usd(stale, spec, steps=1) == auto
 
 
 def test_cancelled_charge_usd_pins_the_rented_card_count(monkeypatch):
@@ -331,25 +345,25 @@ def test_cancelled_charge_usd_pins_the_rented_card_count(monkeypatch):
 
     cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000, gpu_type="H100", gpu_count=4)
     spec = _patched_cfg_spec(monkeypatch, cfg)
-    st = runner.RunStatus(
+    st = runner_state.RunStatus(
         run_id="r",
         state="cancelled",
         spec={},
         estimated_cost_usd=8.0,
         remote={"provider": "runpod", "allocated_gpu": "H100", "allocated_gpu_count": 4},
     )
-    charge = runner.cancelled_charge_usd(st, spec, steps=1)
+    charge = runner_costs.cancelled_charge_usd(st, spec, steps=1)
     # the ceiling search picks a different (cheaper) shape, so its fraction is not the rented one.
     ceiling = (
         8.0
-        * runner.charge_usd_for_spec(spec, steps=1, provider="runpod")
-        / runner.charge_usd_for_spec(spec, provider="runpod")
+        * runner_costs.charge_usd_for_spec(spec, steps=1, provider="runpod")
+        / runner_costs.charge_usd_for_spec(spec, provider="runpod")
     )
     assert charge != ceiling
-    partial = runner.charge_usd_for_spec(
+    partial = runner_costs.charge_usd_for_spec(
         spec, steps=1, provider="runpod", gpu_type="H100", gpu_count=4
     )
-    full = runner.charge_usd_for_spec(spec, provider="runpod", gpu_type="H100", gpu_count=4)
+    full = runner_costs.charge_usd_for_spec(spec, provider="runpod", gpu_type="H100", gpu_count=4)
     assert charge == 8.0 * partial / full
     assert 0 < charge <= 8.0
 
@@ -364,40 +378,40 @@ def test_cancelled_charge_usd_degrades_without_an_allocation_stamp(monkeypatch):
     spec = _patched_cfg_spec(monkeypatch, cfg)
     expected = (
         8.0
-        * runner.charge_usd_for_spec(spec, steps=1, provider="runpod")
-        / runner.charge_usd_for_spec(spec, provider="runpod")
+        * runner_costs.charge_usd_for_spec(spec, steps=1, provider="runpod")
+        / runner_costs.charge_usd_for_spec(spec, provider="runpod")
     )
     for legacy_remote in (
         {"provider": "runpod"},
         {"provider": "runpod", "allocated_gpu_count": 4},
     ):
-        st = runner.RunStatus(
+        st = runner_state.RunStatus(
             run_id="r",
             state="cancelled",
             spec={},
             estimated_cost_usd=8.0,
             remote=legacy_remote,
         )
-        charge = runner.cancelled_charge_usd(st, spec, steps=1)
+        charge = runner_costs.cancelled_charge_usd(st, spec, steps=1)
         assert charge == expected
         assert 0 < charge <= 8.0
     # no handle at all (never-allocated run): the spec's own pricing, still clamped.
-    bare = runner.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
-    charge = runner.cancelled_charge_usd(bare, spec, steps=1)
-    assert charge == 8.0 * runner.charge_usd_for_spec(spec, steps=1) / runner.charge_usd_for_spec(
-        spec
-    )
+    bare = runner_state.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
+    charge = runner_costs.cancelled_charge_usd(bare, spec, steps=1)
+    assert charge == 8.0 * runner_costs.charge_usd_for_spec(
+        spec, steps=1
+    ) / runner_costs.charge_usd_for_spec(spec)
     assert 0 < charge <= 8.0
 
 
 def test_cancelled_charge_usd_falls_back_to_reprice_without_a_quote():
     # a run persisted before quotes existed has nothing to prorate; the spec reprice still bills it.
     spec = _spec()
-    st = runner.RunStatus(run_id="r", state="cancelled", spec={})
-    assert runner.cancelled_charge_usd(st, spec, steps=10) == runner.charge_usd_for_spec(
-        spec, steps=10
-    )
-    assert runner.cancelled_charge_usd(st, spec, steps=0) == 0.0
+    st = runner_state.RunStatus(run_id="r", state="cancelled", spec={})
+    assert runner_costs.cancelled_charge_usd(
+        st, spec, steps=10
+    ) == runner_costs.charge_usd_for_spec(spec, steps=10)
+    assert runner_costs.cancelled_charge_usd(st, spec, steps=0) == 0.0
 
 
 # --------------------------------------------------------------------------- actual steps
@@ -405,31 +419,33 @@ def test_cancelled_charge_usd_falls_back_to_reprice_without_a_quote():
 
 def test_actual_steps_run_reads_last_heartbeat_step():
     def st(hb):
-        return runner.RunStatus(run_id="r", state="cancelled", spec={}, last_heartbeat=hb)
+        return runner_state.RunStatus(run_id="r", state="cancelled", spec={}, last_heartbeat=hb)
 
-    assert runner.actual_steps_run(st({"stage": "rl_step", "step": 7})) == 7
+    assert runner_costs.actual_steps_run(st({"stage": "rl_step", "step": 7})) == 7
     # no heartbeat / setup stage -> 0 (cancelled during cold-start, no GPU training yet)
-    assert runner.actual_steps_run(st(None)) == 0
-    assert runner.actual_steps_run(st({"stage": "setup"})) == 0
+    assert runner_costs.actual_steps_run(st(None)) == 0
+    assert runner_costs.actual_steps_run(st({"stage": "setup"})) == 0
     # training started but no step completed yet (the ~17-min first GRPO rollout emits no `step`) ->
     # floor to 1 so real GPU time isn't billed as $0.
-    assert runner.actual_steps_run(st({"stage": "rl_step", "step": 0})) == 1
-    assert runner.actual_steps_run(st({"stage": "rl_step"})) == 1
-    assert runner.actual_steps_run(st({"stage": "sft_step"})) == 1
+    assert runner_costs.actual_steps_run(st({"stage": "rl_step", "step": 0})) == 1
+    assert runner_costs.actual_steps_run(st({"stage": "rl_step"})) == 1
+    assert runner_costs.actual_steps_run(st({"stage": "sft_step"})) == 1
     # A completed OPD run's final pre-DONE heartbeats (opd_trained / opd_train_done) are NOT
     # training stages, so a STEPLESS one floors a cancel-between-publish-and-DONE to 0 -- re-pricing
     # a fully trained run as $0. opd.py/finalize.py attach step=opt_steps so the true count bills.
     assert (
-        runner.actual_steps_run(st({"stage": "opd_trained"})) == 0
+        runner_costs.actual_steps_run(st({"stage": "opd_trained"})) == 0
     )  # the bug the step guards against
-    assert runner.actual_steps_run(st({"stage": "opd_train_done"})) == 0
-    assert runner.actual_steps_run(st({"stage": "opd_trained", "step": 12})) == 12
-    assert runner.actual_steps_run(st({"stage": "opd_train_done", "step": 12})) == 12
+    assert runner_costs.actual_steps_run(st({"stage": "opd_train_done"})) == 0
+    assert runner_costs.actual_steps_run(st({"stage": "opd_trained", "step": 12})) == 12
+    assert runner_costs.actual_steps_run(st({"stage": "opd_train_done", "step": 12})) == 12
     # Terminal `done` heartbeat: a cancel racing the DONE upload (done recorded, run not yet
     # transitioned) reads a STEPLESS done and floors a fully-trained run to 0. _finalize carries
     # opt_steps onto `done` so the true count bills.
-    assert runner.actual_steps_run(st({"stage": "done"})) == 0  # the bug the step guards against
-    assert runner.actual_steps_run(st({"stage": "done", "step": 12})) == 12
+    assert (
+        runner_costs.actual_steps_run(st({"stage": "done"})) == 0
+    )  # the bug the step guards against
+    assert runner_costs.actual_steps_run(st({"stage": "done", "step": 12})) == 12
 
 
 # --------------------------------------------------------------------------- cancel re-pricing
@@ -438,11 +454,11 @@ def test_actual_steps_run_reads_last_heartbeat_step():
 def test_cancel_run_prices_mid_training_cancel_at_actual_steps(monkeypatch, tmp_path):
     from flash.runner.supervise import deploy
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda spec: None)
     spec = _spec()
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id="run-1",
             state="running",
             spec=spec.to_dict(),
@@ -454,12 +470,12 @@ def test_cancel_run_prices_mid_training_cancel_at_actual_steps(monkeypatch, tmp_
 
     deploy.cancel_run("run-1")
 
-    st = runner.get_status("run-1")
+    st = runner_status.get_status("run-1")
     assert st.state == "cancelled"
     # no persisted quote on this status, so the cancel falls back to re-pricing the spec at the
     # 10 steps it ran: > 0 and less than the full 20-step quote.
-    assert st.cost_usd == runner.charge_usd_for_spec(spec, steps=10)
-    assert 0 < st.cost_usd < runner.charge_usd_for_spec(spec)
+    assert st.cost_usd == runner_costs.charge_usd_for_spec(spec, steps=10)
+    assert 0 < st.cost_usd < runner_costs.charge_usd_for_spec(spec)
 
 
 def test_cancel_near_completion_never_bills_above_the_accepted_quote(monkeypatch, tmp_path):
@@ -467,15 +483,15 @@ def test_cancel_near_completion_never_bills_above_the_accepted_quote(monkeypatch
     a prorated share of the persisted quote, not the (higher) offline static-rate reprice."""
     from flash.runner.supervise import deploy
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda spec: None)
     spec = _spec()  # 20 planned steps
-    static_reprice = runner.charge_usd_for_spec(spec, steps=19)
+    static_reprice = runner_costs.charge_usd_for_spec(spec, steps=19)
     # the user accepted a live-market quote at half the static rate for the full run.
-    accepted_quote = runner.charge_usd_for_spec(spec) / 2
+    accepted_quote = runner_costs.charge_usd_for_spec(spec) / 2
     assert static_reprice > accepted_quote  # the overbilling hazard the proration guards against
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id="run-1",
             state="running",
             spec=spec.to_dict(),
@@ -488,11 +504,11 @@ def test_cancel_near_completion_never_bills_above_the_accepted_quote(monkeypatch
 
     deploy.cancel_run("run-1")
 
-    st = runner.get_status("run-1")
+    st = runner_status.get_status("run-1")
     assert st.state == "cancelled"
     # the completed share of the accepted quote, strictly under both the quote and the static
     # reprice.
-    assert st.cost_usd == accepted_quote * static_reprice / runner.charge_usd_for_spec(spec)
+    assert st.cost_usd == accepted_quote * static_reprice / runner_costs.charge_usd_for_spec(spec)
     assert st.cost_usd < accepted_quote
     assert st.cost_usd < static_reprice
 
@@ -500,11 +516,11 @@ def test_cancel_near_completion_never_bills_above_the_accepted_quote(monkeypatch
 def test_cancel_run_prorates_the_persisted_quote(monkeypatch, tmp_path):
     from flash.runner.supervise import deploy
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda spec: None)
     spec = _spec()  # 20 planned steps
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id="run-1",
             state="running",
             spec=spec.to_dict(),
@@ -517,7 +533,7 @@ def test_cancel_run_prorates_the_persisted_quote(monkeypatch, tmp_path):
 
     deploy.cancel_run("run-1")
 
-    st = runner.get_status("run-1")
+    st = runner_status.get_status("run-1")
     assert st.state == "cancelled"
     # half the steps -> half the accepted quote.
     assert st.cost_usd == 4.0
@@ -530,8 +546,8 @@ def test_cancel_run_prices_the_rented_basis_after_teardown_clears_the_handle(mon
     from flash.cost.types import RunConfig
     from flash.runner.supervise import deploy, lifecycle
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000, gpu_type="H100", gpu_count=2)
     spec_stub = _patched_cfg_spec(monkeypatch, cfg)
     torn_down = []
@@ -542,8 +558,8 @@ def test_cancel_run_prices_the_rented_basis_after_teardown_clears_the_handle(mon
 
     monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
     spec = _spec()
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id="run-1",
             state="running",
             spec=spec.to_dict(),
@@ -569,20 +585,24 @@ def test_cancel_run_prices_the_rented_basis_after_teardown_clears_the_handle(mon
 
     deploy.cancel_run("run-1")
 
-    st = runner.get_status("run-1")
+    st = runner_status.get_status("run-1")
     assert st.state == "cancelled"
     # the scenario under test: the teardown really cleared the handle before billing ran.
     assert torn_down == ["vast"]
     assert st.remote is None
     # not the auto/offline-shape fraction the cleared handle would degrade to.
     auto = (
-        8.0 * runner.charge_usd_for_spec(spec_stub, steps=1) / runner.charge_usd_for_spec(spec_stub)
+        8.0
+        * runner_costs.charge_usd_for_spec(spec_stub, steps=1)
+        / runner_costs.charge_usd_for_spec(spec_stub)
     )
     assert st.cost_usd != auto
-    partial = runner.charge_usd_for_spec(
+    partial = runner_costs.charge_usd_for_spec(
         spec_stub, steps=1, provider="vast", gpu_type="H100", gpu_count=2
     )
-    full = runner.charge_usd_for_spec(spec_stub, provider="vast", gpu_type="H100", gpu_count=2)
+    full = runner_costs.charge_usd_for_spec(
+        spec_stub, provider="vast", gpu_type="H100", gpu_count=2
+    )
     assert st.cost_usd == 8.0 * partial / full
     assert 0 < st.cost_usd <= 8.0
 
@@ -592,11 +612,11 @@ def test_cancel_run_with_malformed_quote_still_settles_as_a_billing_failure(monk
     # the cancelled transition and record the $0 pricing-failure diagnostic instead of raising.
     from flash.runner.supervise import deploy
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda spec: None)
     spec = _spec()
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id="run-1",
             state="running",
             spec=spec.to_dict(),
@@ -609,7 +629,7 @@ def test_cancel_run_with_malformed_quote_still_settles_as_a_billing_failure(monk
 
     deploy.cancel_run("run-1")
 
-    st = runner.get_status("run-1")
+    st = runner_status.get_status("run-1")
     assert st.state == "cancelled"
     assert st.cost_usd == 0.0
     assert st.billing_state == "failed"
@@ -618,11 +638,11 @@ def test_cancel_run_with_malformed_quote_still_settles_as_a_billing_failure(monk
 def test_cancel_run_before_any_step_is_free(monkeypatch, tmp_path):
     from flash.runner.supervise import deploy
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda spec: None)
     spec = _spec()
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id="run-1",
             state="running",
             spec=spec.to_dict(),
@@ -634,7 +654,7 @@ def test_cancel_run_before_any_step_is_free(monkeypatch, tmp_path):
 
     deploy.cancel_run("run-1")
 
-    st = runner.get_status("run-1")
+    st = runner_status.get_status("run-1")
     assert st.state == "cancelled"
     assert st.cost_usd == 0.0  # 0 steps -> $0
 
@@ -642,7 +662,7 @@ def test_cancel_run_before_any_step_is_free(monkeypatch, tmp_path):
 def test_completed_full_work_charges_exactly_the_quote_despite_faster_wall(tmp_path, monkeypatch):
     spec = _spec()
     accepted_quote = 8.0
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         run_id="r",
         state="done",
         spec={},
@@ -650,7 +670,7 @@ def test_completed_full_work_charges_exactly_the_quote_despite_faster_wall(tmp_p
     )
     _write_terminal_steps(tmp_path, monkeypatch, spec, 20, wall_seconds=0.001)
 
-    assert runner._status_estimated_charge(status, spec) == accepted_quote
+    assert runner_costs._status_estimated_charge(status, spec) == accepted_quote
 
 
 @pytest.mark.parametrize("completed_steps", [20, 10], ids=["full-work", "incomplete-work"])
@@ -658,7 +678,7 @@ def test_completed_work_preserves_a_zero_quote_despite_positive_measured_fallbac
     tmp_path, monkeypatch, completed_steps
 ):
     spec = _spec()
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         run_id="r",
         state="done",
         spec={},
@@ -669,8 +689,8 @@ def test_completed_work_preserves_a_zero_quote_despite_positive_measured_fallbac
     def unexpected_reprice(*_args, **_kwargs):
         raise AssertionError("a zero accepted quote must not be repriced")
 
-    monkeypatch.setattr(runner, "charge_usd_for_spec", unexpected_reprice)
-    assert runner._status_estimated_charge(status, spec, fallback=6.75) == 0.0
+    monkeypatch.setattr(runner_costs, "charge_usd_for_spec", unexpected_reprice)
+    assert runner_costs._status_estimated_charge(status, spec, fallback=6.75) == 0.0
 
 
 @pytest.mark.parametrize("completed_steps", [21, 10**1000])
@@ -679,7 +699,7 @@ def test_completed_steps_beyond_the_horizon_still_charge_exactly_the_quote(
 ):
     spec = _spec()
     accepted_quote = 8.0
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         run_id="r",
         state="done",
         spec={},
@@ -687,7 +707,7 @@ def test_completed_steps_beyond_the_horizon_still_charge_exactly_the_quote(
     )
     _write_terminal_steps(tmp_path, monkeypatch, spec, completed_steps, wall_seconds=0.001)
 
-    assert runner._status_estimated_charge(status, spec) == accepted_quote
+    assert runner_costs._status_estimated_charge(status, spec) == accepted_quote
 
 
 def test_completed_early_work_uses_the_same_estimated_fraction_as_cancellation(
@@ -695,7 +715,7 @@ def test_completed_early_work_uses_the_same_estimated_fraction_as_cancellation(
 ):
     spec = _spec()
     accepted_quote = 8.0
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         run_id="r",
         state="done",
         spec={},
@@ -703,9 +723,9 @@ def test_completed_early_work_uses_the_same_estimated_fraction_as_cancellation(
     )
     _write_terminal_steps(tmp_path, monkeypatch, spec, 10, wall_seconds=99_999.0)
 
-    expected = runner.cancelled_charge_usd(status, spec, steps=10)
+    expected = runner_costs.cancelled_charge_usd(status, spec, steps=10)
     assert 0.0 < expected < accepted_quote
-    assert runner._status_estimated_charge(status, spec) == expected
+    assert runner_costs._status_estimated_charge(status, spec) == expected
 
 
 def test_completed_early_work_uses_the_persisted_rented_topology(tmp_path, monkeypatch):
@@ -714,14 +734,14 @@ def test_completed_early_work_uses_the_persisted_rented_topology(tmp_path, monke
     cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000, gpu_type="H100", gpu_count=4)
     spec = _patched_cfg_spec(monkeypatch, cfg)
     accepted_quote = 8.0
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         run_id="r",
         state="done",
         spec={},
         estimated_cost_usd=accepted_quote,
         remote=None,
     )
-    monkeypatch.setattr(runner, "artifacts_dir", lambda _spec: str(tmp_path / "metrics"))
+    monkeypatch.setattr(runner_state, "artifacts_dir", lambda _spec: str(tmp_path / "metrics"))
     _write_terminal_steps(
         tmp_path,
         monkeypatch,
@@ -732,16 +752,16 @@ def test_completed_early_work_uses_the_persisted_rented_topology(tmp_path, monke
         allocated_gpu_count=4,
     )
 
-    charge = runner._status_estimated_charge(status, spec)
-    partial = runner.charge_usd_for_spec(
+    charge = runner_costs._status_estimated_charge(status, spec)
+    partial = runner_costs.charge_usd_for_spec(
         spec, steps=1, provider="runpod", gpu_type="H100", gpu_count=4
     )
-    full = runner.charge_usd_for_spec(spec, provider="runpod", gpu_type="H100", gpu_count=4)
+    full = runner_costs.charge_usd_for_spec(spec, provider="runpod", gpu_type="H100", gpu_count=4)
     expected = accepted_quote * partial / full
     ceiling = (
         accepted_quote
-        * runner.charge_usd_for_spec(spec, steps=1)
-        / runner.charge_usd_for_spec(spec)
+        * runner_costs.charge_usd_for_spec(spec, steps=1)
+        / runner_costs.charge_usd_for_spec(spec)
     )
 
     assert charge == expected
@@ -750,17 +770,17 @@ def test_completed_early_work_uses_the_persisted_rented_topology(tmp_path, monke
 
 def test_completed_zero_work_charges_zero(tmp_path, monkeypatch):
     spec = _spec()
-    status = runner.RunStatus(run_id="r", state="done", spec={}, estimated_cost_usd=8.0)
+    status = runner_state.RunStatus(run_id="r", state="done", spec={}, estimated_cost_usd=8.0)
     _write_terminal_steps(tmp_path, monkeypatch, spec, 0)
 
-    assert runner._status_estimated_charge(status, spec) == 0.0
+    assert runner_costs._status_estimated_charge(status, spec) == 0.0
 
 
 @pytest.mark.parametrize("step", [None, True, -1, 1.5, float("nan"), float("inf"), "10"])
 def test_completed_run_without_a_valid_step_preserves_the_quote(tmp_path, monkeypatch, step):
     spec = _spec()
     accepted_quote = 8.0
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         run_id="r",
         state="done",
         spec={},
@@ -768,4 +788,4 @@ def test_completed_run_without_a_valid_step_preserves_the_quote(tmp_path, monkey
     )
     _write_terminal_steps(tmp_path, monkeypatch, spec, step)
 
-    assert runner._status_estimated_charge(status, spec) == accepted_quote
+    assert runner_costs._status_estimated_charge(status, spec) == accepted_quote

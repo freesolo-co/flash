@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any
 
 import pytest
 from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
-from flash.serving.src.model_config import base_models
-from flash.serving.src.openrouter_auth import OpenRouterAuthorization
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
-from tests.serving.conftest import attest
+from flash.serving.src.accounting.usage_outbox import OfflineUsageStore, UsageEvent
+from flash.serving.src.engine.model_config import base_models
+from flash.serving.src.http.openrouter_auth import OpenRouterAuthorization
+from flash.serving.src.http.router import AdapterRouter, build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
+from tests.serving.conftest import RecordingUsageStore, attest
 
 INTERNAL_KEY = "test-internal-key"
 CURRENT_TOKEN = "fsor_v1_current-test-token"
@@ -52,7 +52,7 @@ def _base_record(model_id: str = QWEN) -> AdapterRecord:
         repo_id=model_id,
         base_model=model_id,
         serve_base_model=True,
-        thinking=True,
+        thinking=False,
         org_id=None,
         status="ready",
     )
@@ -108,19 +108,31 @@ class _Pool:
                 "finish_reason": "stop",
                 "prompt_tokens": 3,
                 "completion_tokens": 2,
+                "cached_tokens_reported": False,
+                "reasoning_tokens": 0,
+                "request_id": _payload.generation_id,
                 "checkpoint": record.checkpoint or "",
             },
         )
 
     async def stream_generate(self, _base_model, _payload, record, *, expected_checkpoint=None):
         self.stream_calls += 1
-        yield {"type": "ready", "checkpoint": record.checkpoint or ""}
-        yield {"type": "delta", "text": "ok"}
+        common = {
+            "prompt_tokens": 3,
+            "prompt_token_ids": [1, 2, 3],
+            "reasoning_tokens": 0,
+            "thinking": False,
+            "request_id": _payload.generation_id,
+            "checkpoint": record.checkpoint or "",
+        }
+        yield {"type": "ready", "completion_tokens": 0, "completion_token_ids": [], **common}
+        yield {"type": "delta", "text": "ok", "completion_token_ids": [4, 5], **common}
         yield {
             "type": "final",
             "finish_reason": "stop",
-            "prompt_tokens": 3,
             "completion_tokens": 2,
+            "completion_token_ids": [4, 5],
+            **common,
         }
 
     async def register(self, _base_model, _record) -> None:
@@ -153,15 +165,22 @@ def _client(
     *,
     authorization: OpenRouterAuthorization | None = None,
     authorizer: _FreesoloAuthorizer | None = None,
-    usage_reports: list[dict[str, Any]] | None = None,
+    usage_reports: list[UsageEvent] | None = None,
     pool: _Pool | None = None,
 ) -> tuple[TestClient, _Pool, _FreesoloAuthorizer]:
     actual_pool = pool or _Pool()
     actual_authorizer = authorizer or _FreesoloAuthorizer()
 
-    async def capture(payload: dict[str, Any]) -> None:
-        assert usage_reports is not None
-        usage_reports.append(payload)
+    if usage_reports is None:
+        usage_store = OfflineUsageStore()
+    else:
+
+        class _CaptureStore(RecordingUsageStore):
+            async def finalize(self, event: UsageEvent) -> None:
+                await super().finalize(event)
+                usage_reports.append(event)
+
+        usage_store = _CaptureStore()
 
     app = build_serving_app(
         actual_pool,
@@ -169,7 +188,7 @@ def _client(
         internal_key=INTERNAL_KEY,
         chat_authorizer=actual_authorizer,
         openrouter_authorization=authorization,
-        usage_reporter=capture if usage_reports is not None else None,
+        usage_store=usage_store,
     )
     return TestClient(app), actual_pool, actual_authorizer
 
@@ -206,7 +225,7 @@ def test_both_key_slots_authorize_every_catalog_base(token: str, model_id: str) 
 def test_matcher_hashes_once_and_compares_both_slots_on_every_request(
     monkeypatch, previous: str | None
 ) -> None:
-    import flash.serving.src.openrouter_auth as module
+    import flash.serving.src.http.openrouter_auth as module
 
     authorization = _authorization(previous=previous)
     real_sha256 = hashlib.sha256
@@ -312,6 +331,25 @@ def test_matching_openrouter_is_denied_on_other_inference_routes(path: str) -> N
     )
 
     assert response.status_code == 403
+    assert pool.generate_calls == 0
+    assert freesolo.calls == []
+
+
+def test_openrouter_uses_the_canonical_chat_parser_before_dispatch() -> None:
+    client, pool, freesolo = _client([_base_record()], authorization=_authorization())
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": QWEN,
+            "messages": [{"role": "user", "content": "hi"}],
+            "unsupported": True,
+        },
+        headers={"Authorization": f"Bearer {CURRENT_TOKEN}"},
+    )
+
+    assert response.status_code == 422
+    assert "unsupported chat request field" in response.text
     assert pool.generate_calls == 0
     assert freesolo.calls == []
 
@@ -425,8 +463,8 @@ def test_forged_catalog_records_are_403_without_dispatch(forged: AdapterRecord) 
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["nonstream", "stream"])
-def test_usage_is_attributed_to_settlement_org_without_adapter_id(stream: bool) -> None:
-    reports: list[dict[str, Any]] = []
+def test_usage_is_attributed_to_typed_settlement_principal(stream: bool) -> None:
+    reports: list[UsageEvent] = []
     client, _pool, _freesolo = _client(
         [_base_record()],
         authorization=_authorization(),
@@ -440,9 +478,12 @@ def test_usage_is_attributed_to_settlement_org_without_adapter_id(stream: bool) 
             assert "[DONE]" in response.text
 
     assert len(reports) == 1
-    assert reports[0]["orgId"] == SETTLEMENT_ORG
-    assert reports[0]["baseModel"] == QWEN
-    assert "adapterId" not in reports[0]
+    event = reports[0]
+    assert event.principal.kind == "freesolo_org"
+    assert event.principal.orgId == SETTLEMENT_ORG
+    assert _authorization().principal.authorized_traffic().credential_principal == "openrouter"
+    assert event.target.base_model == QWEN
+    assert event.target.requested_adapter_id == QWEN
 
 
 def test_freesolo_401_gets_bearer_challenge() -> None:
@@ -463,7 +504,7 @@ def test_freesolo_401_gets_bearer_challenge() -> None:
 
 def test_existing_freesolo_and_internal_auth_are_preserved() -> None:
     freesolo = _FreesoloAuthorizer(org_id="existing-org")
-    reports: list[dict[str, Any]] = []
+    reports: list[UsageEvent] = []
     client, pool, freesolo = _client(
         [_base_record()],
         authorization=_authorization(),
@@ -485,7 +526,8 @@ def test_existing_freesolo_and_internal_auth_are_preserved() -> None:
     assert internal_response.status_code == 200
     assert freesolo.calls == [("existing-user-key", QWEN)]
     assert pool.generate_calls == 2
-    assert reports[0]["orgId"] == "existing-org"
+    assert reports[0].principal.kind == "freesolo_org"
+    assert reports[0].principal.orgId == "existing-org"
 
 
 def test_configuration_absent_partial_malformed_distinct_and_collision_rules() -> None:
@@ -546,6 +588,7 @@ def test_configuration_errors_and_repr_do_not_expose_credentials_or_digests() ->
 
     assert raw_secret not in repr(authorization)
     assert digest not in repr(authorization)
+    assert authorization.principal.capability == "canonical_hosted_base_chat"
     with pytest.raises(ValueError, match="must differ") as exc:
         OpenRouterAuthorization.from_environment(
             {

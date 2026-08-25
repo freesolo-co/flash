@@ -2,17 +2,34 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 import tempfile
 
 import pytest
 
+import flash.engine.worker.entry.worker as worker_entry
+import flash.runner.accounting.artifacts as runner_artifacts
+import flash.runner.accounting.costs as runner_costs
+import flash.runner.accounting.reconciliation as runner_reconciliation
+import flash.runner.lifecycle.attempts as runner_attempts
+import flash.runner.lifecycle.deadlines as runner_deadlines
+import flash.runner.lifecycle.preparation as runner_preparation
+import flash.runner.lifecycle.reporting as runner_reporting
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as runner_submit
+import flash.runner.supervise.attach as runner_attach
+import flash.runner.supervise.deploy as runner_deploy
+import flash.runner.supervise.errors as runner_errors
+import flash.runner.supervise.lifecycle as runner_lifecycle
+import flash.runner.supervise.recovery as runner_recovery
+from flash.providers._lifecycle.net import worker as provider_worker
 from tests._helpers.runner import provisioned_status
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
+_RETIRED_MODELS = ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B")
 
 
 def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):
@@ -60,29 +77,51 @@ def _vast_remote(instance_id=7, attempt=0, started_ts=1.0, **extra):
     }
 
 
+@pytest.mark.parametrize("retired_model", _RETIRED_MODELS)
+def test_historical_removed_model_status_remains_listable(monkeypatch, tmp_path, retired_model):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
+    spec = JobSpec(run_id="historical", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="done", spec=spec.to_dict())
+    )
+    path = runner_state.runs_file_path(spec.run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["model"] = retired_model
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    assert runner_status.list_run_ids() == [spec.run_id]
+    assert runner_status.list_runs()[0].spec["model"] == retired_model
+    assert runner_status.get_status(spec.run_id).spec["model"] == retired_model
+
+
 def test_background_run_redacts_private_exception_content(monkeypatch, caplog):
     import logging
     from types import SimpleNamespace
 
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    spec = JobSpec(run_id="background-private", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="background-private", model="Qwen/Qwen3.5-9B", algorithm="sft")
     updates = []
 
     def fail_run(_spec):
         raise RuntimeError("private provider response")
 
-    monkeypatch.setattr(runner, "_run_job", fail_run)
-    monkeypatch.setattr(runner, "get_status", lambda _run_id: SimpleNamespace(state="running"))
+    monkeypatch.setattr(runner_lifecycle, "_run_job", fail_run)
     monkeypatch.setattr(
-        runner,
+        runner_status, "get_status", lambda _run_id: SimpleNamespace(state="running")
+    )
+    monkeypatch.setattr(
+        runner_status,
         "_update",
         lambda run_id, state, **kwargs: updates.append((run_id, state, kwargs)),
     )
 
     with caplog.at_level(logging.WARNING):
-        runner._run_job_background(spec)
+        runner_lifecycle._run_job_background(spec)
 
     assert updates == [
         (
@@ -97,38 +136,35 @@ def test_background_run_redacts_private_exception_content(monkeypatch, caplog):
 
 def test_list_and_cancel(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
         # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
-        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
         from flash.core.spec import JobSpec, TrainSpec
 
         # two dry-run records
         for rid in ("a", "b"):
-            runner.submit_job(
+            runner_submit.submit_job(
                 JobSpec(
                     run_id=rid,
-                    model="Qwen/Qwen3.5-4B",
+                    model="Qwen/Qwen3.5-9B",
                     algorithm="grpo",
                     train=TrainSpec(max_examples=8),
                 ),
                 dry_run=True,
             )
-        runs = {r.run_id for r in runner.list_runs()}
+        runs = {r.run_id for r in runner_status.list_runs()}
         assert {"a", "b"} <= runs
 
         # cancel a non-terminal run (force it to a running-ish state first; go through
         # _save_status, not _update, since _update now refuses to resurrect a terminal
         # state like the submitted dry_run).
-        running = runner.get_status("a")
+        running = runner_status.get_status("a")
         running.state = "running"
-        runner._save_status(running)
-        status = runner.cancel_run("a")
+        runner_state._save_status(running)
+        status = runner_deploy.cancel_run("a")
         assert status.state == "cancelled"
 
         # cancelling a terminal run is a no-op
-        same = runner.cancel_run("b")  # b is dry_run (terminal-ish)
+        same = runner_deploy.cancel_run("b")  # b is dry_run (terminal-ish)
         assert same.state in {"dry_run", "cancelled"}
 
 
@@ -141,10 +177,7 @@ def test_get_status_tolerates_stale_unknown_keys(monkeypatch):
     import os
 
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
         stale = {
             "run_id": "old",
             "state": "done",
@@ -154,47 +187,47 @@ def test_get_status_tolerates_stale_unknown_keys(monkeypatch):
             "totally_unknown_future_key": "x",  # forward-compat unknown field
         }
         os.makedirs(tmp, exist_ok=True)
-        with open(runner.runs_file_path("old", ".json"), "w") as f:
+        with open(runner_state.runs_file_path("old", ".json"), "w") as f:
             json.dump(stale, f)
 
-        s = runner.get_status("old")
+        s = runner_status.get_status("old")
         assert s.run_id == "old"
         assert s.state == "done"
         assert s.cost_usd == 2.0
         assert not hasattr(s, "resume_seed_index")
-        assert "old" in {r.run_id for r in runner.list_runs()}
+        assert "old" in {r.run_id for r in runner_status.list_runs()}
 
 
 def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_path):
-    import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.cost.currency import usd_amount
     from flash.cost.spec import estimate_for_spec
 
-    importlib.reload(runner)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_assign_resolved_env_sha", lambda spec: spec)
-    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_artifacts, "_assign_resolved_env_sha", lambda spec: spec)
+    monkeypatch.setattr(
+        provider_worker, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT
+    )
 
     seen: dict[str, float] = {}
 
     def fake_run(spec, runtime_secrets=None):
-        status = runner.get_status(spec.run_id)
+        status = runner_status.get_status(spec.run_id)
         priced_spec = JobSpec.from_dict(status.spec)
         seen["estimate"] = float(status.estimated_cost_usd)
         seen["expected"] = usd_amount(estimate_for_spec(priced_spec).total_usd)
-        runner._update(
+        runner_status._update(
             spec.run_id,
             "done",
-            cost_usd=runner._status_estimated_charge(status, priced_spec, fallback=0.01),
+            cost_usd=runner_costs._status_estimated_charge(status, priced_spec, fallback=0.01),
         )
 
-    monkeypatch.setattr(runner, "_run_job", fake_run)
+    monkeypatch.setattr(runner_lifecycle, "_run_job", fake_run)
 
-    status = runner.submit_job(
+    status = runner_submit.submit_job(
         JobSpec(
             run_id="quoted",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=2),
             gpu=GpuSpec(type=""),
@@ -204,43 +237,42 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
     assert seen["estimate"] == pytest.approx(seen["expected"])
     assert status.estimated_cost_usd == pytest.approx(seen["expected"])
     assert status.cost_usd == pytest.approx(seen["expected"])
-    raw = runner._load_status_json(status.run_id)
-    assert raw[runner._RUN_DEADLINE_AT_KEY] == pytest.approx(
+    raw = runner_status._load_status_json(status.run_id)
+    assert raw[runner_state._RUN_DEADLINE_AT_KEY] == pytest.approx(
         status.created_at + JobSpec.from_dict(status.spec).gpu.max_wall_seconds
     )
-    assert raw[runner._NEXT_ATTEMPT_KEY] == 0
+    assert raw[runner_state._NEXT_ATTEMPT_KEY] == 0
 
 
 def test_missing_persisted_run_deadline_is_rejected(monkeypatch, tmp_path):
     import os
 
-    import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="missing-deadline",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=900),
     )
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="running",
             spec=spec.to_dict(),
             created_at=123.0,
         )
     )
-    path = runner.runs_file_path(spec.run_id, ".json")
-    raw = runner._load_status_json(spec.run_id)
-    raw.pop(runner._RUN_DEADLINE_AT_KEY)
+    path = runner_state.runs_file_path(spec.run_id, ".json")
+    raw = runner_status._load_status_json(spec.run_id)
+    raw.pop(runner_state._RUN_DEADLINE_AT_KEY)
     with open(path, "w") as file:
         json.dump(raw, file)
     assert os.path.exists(path)
 
     with pytest.raises(RuntimeError, match="persisted run wall deadline is missing"):
-        runner._load_run_deadline_at(spec.run_id)
+        runner_deadlines._load_run_deadline_at(spec.run_id)
 
 
 @pytest.mark.parametrize(
@@ -248,17 +280,16 @@ def test_missing_persisted_run_deadline_is_rejected(monkeypatch, tmp_path):
     [True, 0.0, -1.0, float("nan"), float("inf"), float("-inf"), "1000"],
 )
 def test_remaining_run_wall_seconds_rejects_unsafe_current_clock(monkeypatch, tmp_path, unsafe_now):
-    import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="unsafe-current-clock",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         gpu=GpuSpec(max_wall_seconds=900),
     )
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="running",
             spec=spec.to_dict(),
@@ -268,22 +299,21 @@ def test_remaining_run_wall_seconds_rejects_unsafe_current_clock(monkeypatch, tm
     )
 
     with pytest.raises(ValueError, match="current clock is invalid"):
-        runner._remaining_run_wall_seconds(spec.run_id, now=unsafe_now)
+        runner_deadlines._remaining_run_wall_seconds(spec.run_id, now=unsafe_now)
 
 
 def test_persisted_run_deadline_must_match_canonical_value(monkeypatch, tmp_path):
-    import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="mismatched-deadline",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=900),
     )
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="running",
             spec=spec.to_dict(),
@@ -293,37 +323,35 @@ def test_persisted_run_deadline_must_match_canonical_value(monkeypatch, tmp_path
     )
 
     with pytest.raises(RuntimeError, match="does not match canonical"):
-        runner._load_run_deadline_at(spec.run_id)
+        runner_deadlines._load_run_deadline_at(spec.run_id)
 
 
 @pytest.mark.parametrize("deadline", [0, -1, float("nan"), float("inf"), float("-inf")])
 def test_persisted_run_deadline_rejects_nonpositive_or_nonfinite_values(
     monkeypatch, tmp_path, deadline
 ):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="invalid-deadline", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="invalid-deadline", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _run_deadline_at=deadline,
     )
 
     with pytest.raises(RuntimeError, match="run wall deadline is invalid"):
-        runner._load_run_deadline_at(spec.run_id)
+        runner_deadlines._load_run_deadline_at(spec.run_id)
 
 
 @pytest.mark.parametrize("created_at", [0, -1, float("nan"), float("inf"), float("-inf")])
 def test_status_save_rejects_invalid_creation_time(monkeypatch, tmp_path, created_at):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="invalid-legacy-deadline", model="Qwen/Qwen3.5-4B", algorithm="sft")
     with pytest.raises(RuntimeError, match="run wall deadline is invalid"):
-        runner._save_status(
-            runner.RunStatus(
+        runner_state._save_status(
+            runner_state.RunStatus(
                 run_id=spec.run_id,
                 state="running",
                 spec=spec.to_dict(),
@@ -334,25 +362,22 @@ def test_status_save_rejects_invalid_creation_time(monkeypatch, tmp_path, create
 
 def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
         from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
         from tests._helpers.profile import satisfy_sft_profile
 
         spec = JobSpec(
             run_id="hb",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             environment=EnvironmentSpec(id="team/example"),
             train=TrainSpec(max_examples=8),
         )
-        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
+        status = runner_submit.submit_job(satisfy_sft_profile(monkeypatch, spec), dry_run=True)
         status.state = "running"
-        runner._save_status(status)
+        runner_state._save_status(status)
 
-        runner.record_heartbeat(
+        runner_status.record_heartbeat(
             "hb",
             {
                 "stage": "sft_step",
@@ -367,7 +392,7 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
             },
         )
 
-        out = runner.get_status("hb")
+        out = runner_status.get_status("hb")
         assert out.state == "running"
         assert out.last_heartbeat["stage"] == "sft_step"
         assert out.last_heartbeat["step"] == 20
@@ -385,37 +410,32 @@ def test_an_error_heartbeat_carries_gpu_diagnostics_through_to_status(monkeypatc
     import inspect
     import tempfile as _tempfile
 
-    import flash.engine.worker as worker
-
     # the producer half: the error path must not reintroduce a spelling the consumer ignores.
-    assert "diag=gpu_diagnostics()" not in inspect.getsource(worker)
+    assert "diag=gpu_diagnostics()" not in inspect.getsource(worker_entry)
 
     with _tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
         from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
         from tests._helpers.profile import satisfy_sft_profile
 
         spec = JobSpec(
             run_id="hb-oom",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             environment=EnvironmentSpec(id="team/example"),
             train=TrainSpec(max_examples=8),
         )
-        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
+        status = runner_submit.submit_job(satisfy_sft_profile(monkeypatch, spec), dry_run=True)
         status.state = "running"
-        runner._save_status(status)
+        runner_state._save_status(status)
 
-        runner.record_heartbeat(
+        runner_status.record_heartbeat(
             "hb-oom",
             {"stage": "sft_step", "step": 20, "gpu": {"device_name": "B200", "gpu_util_pct": 99}},
         )
         # the consumer half: the failure heartbeat's own diagnostics must survive, and must not be
         # replaced by None just because the run is now failing.
-        runner.record_heartbeat(
+        runner_status.record_heartbeat(
             "hb-oom",
             {
                 "stage": "error_sft",
@@ -424,7 +444,7 @@ def test_an_error_heartbeat_carries_gpu_diagnostics_through_to_status(monkeypatc
             },
         )
 
-        out = runner.get_status("hb-oom")
+        out = runner_status.get_status("hb-oom")
         assert out.gpu_status is not None, "the oom heartbeat cleared the gpu snapshot"
         assert out.gpu_status["memory_used_gb"] == 179.4
 
@@ -443,48 +463,46 @@ def test_a_heartbeat_without_gpu_keeps_the_attempts_snapshot(monkeypatch):
     import tempfile as _tempfile
 
     with _tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
         from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
         from tests._helpers.profile import satisfy_sft_profile
 
         spec = JobSpec(
             run_id="hb-carry",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             environment=EnvironmentSpec(id="team/example"),
             train=TrainSpec(max_examples=8),
         )
-        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
+        status = runner_submit.submit_job(satisfy_sft_profile(monkeypatch, spec), dry_run=True)
         status.state = "running"
-        runner._save_status(status)
+        runner_state._save_status(status)
 
-        runner.record_heartbeat(
+        runner_status.record_heartbeat(
             "hb-carry",
             {"stage": "sft_step", "attempt": 1, "gpu": {"device_name": "B200", "gpu_util_pct": 91}},
         )
         # the long silent stretch: a checkpoint upload, which sends no gpu sample at all.
-        runner.record_heartbeat("hb-carry", {"stage": "checkpoint_uploading", "attempt": 1})
+        runner_status.record_heartbeat("hb-carry", {"stage": "checkpoint_uploading", "attempt": 1})
 
-        out = runner.get_status("hb-carry")
+        out = runner_status.get_status("hb-carry")
         assert out.gpu_status is not None, "a checkpoint heartbeat blanked the gpu snapshot"
         assert out.gpu_status["device_name"] == "B200"
         assert out.gpu_status["gpu_util_pct"] == 91
 
         # a retry is a different card; nothing from attempt 1 may describe it.
-        runner.record_heartbeat("hb-carry", {"stage": "boot", "attempt": 2})
-        assert runner.get_status("hb-carry").gpu_status is None, (
+        runner_status.record_heartbeat("hb-carry", {"stage": "boot", "attempt": 2})
+        assert runner_status.get_status("hb-carry").gpu_status is None, (
             "attempt 2 inherited attempt 1's gpu snapshot"
         )
 
 
 def test_status_sanitizer_preserves_metric_backlog_and_bounds_other_lists():
-    import flash.runner as runner
 
     metrics = [{"step": step, "reward": step / 1025} for step in range(1025)]
-    sanitized = runner._sanitize_status_value({"metrics_last": metrics, "other": list(range(32))})
+    sanitized = runner_status._sanitize_status_value(
+        {"metrics_last": metrics, "other": list(range(32))}
+    )
 
     assert len(sanitized["metrics_last"]) == 1024
     assert sanitized["metrics_last"][0]["step"] == 1
@@ -497,33 +515,30 @@ def test_record_heartbeat_persists_finalize_liveness_ping_with_step(monkeypatch)
     land in status.last_heartbeat intact: cancel billing reads .step from the freshest persisted
     heartbeat, and the CLI reads .stage/.ts/.liveness for the status panel."""
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
         from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
         from tests._helpers.profile import satisfy_sft_profile
 
         spec = JobSpec(
             run_id="hbf",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             environment=EnvironmentSpec(id="team/example"),
             train=TrainSpec(max_examples=8),
         )
-        status = runner.submit_job(satisfy_sft_profile(runner, monkeypatch, spec), dry_run=True)
+        status = runner_submit.submit_job(satisfy_sft_profile(monkeypatch, spec), dry_run=True)
         status.state = "running"
-        runner._save_status(status)
+        runner_state._save_status(status)
 
-        runner.record_heartbeat(
+        runner_status.record_heartbeat(
             "hbf",
             {"stage": "sft_finalizing", "step": 126, "ts": 123.0, "liveness": True},
         )
-        out = runner.get_status("hbf")
+        out = runner_status.get_status("hbf")
         assert out.last_heartbeat["stage"] == "sft_finalizing"
         assert out.last_heartbeat["step"] == 126
         assert out.last_heartbeat["liveness"] is True
-        assert runner.actual_steps_run(out) == 126, (
+        assert runner_costs.actual_steps_run(out) == 126, (
             "a cancel during finalize must bill the actual steps trained"
         )
 
@@ -533,42 +548,39 @@ def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypa
     moved by later updated_at bumps (heartbeat/deploy/reconcile) — so reconciliation has an
     immutable instance run_end even for a run deployed (or heartbeat-touched) after completion."""
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
         from flash.core.spec import JobSpec, TrainSpec
 
-        runner.submit_job(
+        runner_submit.submit_job(
             JobSpec(
                 run_id="fa",
-                model="Qwen/Qwen3.5-4B",
+                model="Qwen/Qwen3.5-9B",
                 algorithm="grpo",
                 train=TrainSpec(max_examples=8),
             ),
             dry_run=True,
         )
-        s = runner.get_status("fa")
+        s = runner_status.get_status("fa")
         s.state = "running"
         s.finished_at = None  # dry_run created via direct state set, never stamped finished_at
-        runner._save_status(s)
+        runner_state._save_status(s)
 
         # first terminal transition stamps finished_at to the teardown time
-        assert runner._update("fa", "done", cost_usd=1.0) is True
-        done = runner.get_status("fa")
+        assert runner_status._update("fa", "done", cost_usd=1.0) is True
+        done = runner_status.get_status("fa")
         assert done.finished_at is not None
         teardown = done.finished_at
         assert teardown == done.updated_at
 
         # a later updated_at bump (a late heartbeat after terminal) must NOT move finished_at
-        runner.record_heartbeat("fa", {"stage": "rl", "step": 1, "ts": 123.0})
-        bumped = runner.get_status("fa")
+        runner_status.record_heartbeat("fa", {"stage": "rl", "step": 1, "ts": 123.0})
+        bumped = runner_status.get_status("fa")
         assert bumped.updated_at >= done.updated_at
         assert bumped.finished_at == teardown
 
         # a same-state terminal re-write (e.g. terminal cost fields) keeps the original too
-        runner._update("fa", "done", cost_usd=2.0)
-        assert runner.get_status("fa").finished_at == teardown
+        runner_status._update("fa", "done", cost_usd=2.0)
+        assert runner_status.get_status("fa").finished_at == teardown
 
 
 def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
@@ -576,22 +588,19 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
     import os
 
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
-        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", tmp)
+        monkeypatch.setattr(runner_costs, "_gpu_rate", lambda gpu, provider="": 3600.0)
         from flash.core.spec import JobSpec
 
-        spec = JobSpec(run_id="r0", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+        spec = JobSpec(run_id="r0", model="Qwen/Qwen3.5-9B", algorithm="grpo")
         # A zero placeholder is not a settled provider cost; use the wall-pricing fallback.
         metrics = {
             "cost_usd": 0.0,
             "wall_seconds": 1.0,
         }
-        out = runner._persist_metrics(spec, metrics)
+        out = runner_status._persist_metrics(spec, metrics)
         assert out == 1.0
-        with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
+        with open(os.path.join(runner_state.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["cost_usd"] == 1.0
         # No allocated_provider stamped -> say so, rather than attributing the cost to RunPod.
@@ -608,26 +617,23 @@ def test_persist_metrics_attributes_the_provider_that_billed_the_run(monkeypatch
     import os
 
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", tmp)
         seen = {}
 
         def _rate(gpu, provider=""):
             seen["gpu"], seen["provider"] = gpu, provider
             return 3600.0
 
-        monkeypatch.setattr(runner, "_gpu_rate", _rate)
+        monkeypatch.setattr(runner_costs, "_gpu_rate", _rate)
         from flash.core.spec import JobSpec
 
-        spec = JobSpec(run_id="r-vast", model="Qwen/Qwen3.5-4B", algorithm="grpo")
-        runner._persist_metrics(
+        spec = JobSpec(run_id="r-vast", model="Qwen/Qwen3.5-9B", algorithm="grpo")
+        runner_status._persist_metrics(
             spec,
             {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090", "allocated_provider": "vast"},
         )
         assert seen == {"gpu": "RTX 5090", "provider": "vast"}
-        with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
+        with open(os.path.join(runner_state.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["notes"]["provider"] == "vast"
         assert on_disk["notes"]["gpu"] == "RTX 5090"
@@ -639,18 +645,17 @@ def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
     import os
 
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
-        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", tmp)
+        monkeypatch.setattr(runner_costs, "_gpu_rate", lambda gpu, provider="": 3600.0)
         from flash.core.spec import JobSpec
 
-        spec = JobSpec(run_id="r1", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+        spec = JobSpec(run_id="r1", model="Qwen/Qwen3.5-9B", algorithm="grpo")
         # No cost_usd stamped: fall back to wall * rate.
-        out = runner._persist_metrics(spec, {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090"})
+        out = runner_status._persist_metrics(
+            spec, {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090"}
+        )
         assert out == 1.0  # 1s / 3600 * 3600/hr
-        with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
+        with open(os.path.join(runner_state.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["notes"]["provider"] == "unknown"
 
@@ -660,23 +665,20 @@ def test_persist_metrics_bills_training_wall_not_setup(monkeypatch):
     import os
 
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
-        monkeypatch.setattr(runner, "RESULTS_DIR", tmp)
-        monkeypatch.setattr(runner, "_gpu_rate", lambda gpu, provider="": 3600.0)
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", tmp)
+        monkeypatch.setattr(runner_costs, "_gpu_rate", lambda gpu, provider="": 3600.0)
         from flash.core.spec import JobSpec
 
-        spec = JobSpec(run_id="r-train-only", model="Qwen/Qwen3.5-4B", algorithm="sft")
+        spec = JobSpec(run_id="r-train-only", model="Qwen/Qwen3.5-9B", algorithm="sft")
         metrics = {
             "wall_seconds": 10.0,  # worker training loop only
             "setup_seconds": 590.0,  # reported for observability, not customer cost
             "train_tokens": 190_679,
             "allocated_gpu": "RTX 5090",
         }
-        out = runner._persist_metrics(spec, metrics)
+        out = runner_status._persist_metrics(spec, metrics)
         assert out == pytest.approx(10.0)  # 10s / 3600 * $3600/hr
-        with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
+        with open(os.path.join(runner_state.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["cost_usd"] == pytest.approx(10.0)
         assert on_disk["setup_seconds"] == pytest.approx(590.0)
@@ -685,21 +687,20 @@ def test_persist_metrics_bills_training_wall_not_setup(monkeypatch):
 def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
     import io
 
-    import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.runner.supervise import lifecycle
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec(
         run_id="quote",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=2),
         gpu=GpuSpec(type=""),
     )
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="queued",
             spec=spec.to_dict(),
@@ -707,24 +708,24 @@ def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
         )
     )
     monkeypatch.setattr(
-        runner,
+        runner_lifecycle,
         "_submit_seed_supervised",
         lambda *a, **k: {"wall_seconds": 1.0, "cost_usd": 0.01},
     )
     monkeypatch.setattr(
-        runner,
+        runner_costs,
         "charge_usd_for_spec",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must use submit quote")),
     )
 
     monkeypatch.setattr(
-        runner,
+        runner_status,
         "validate_terminal_source_metrics",
         lambda _status, metrics, expected_attempt=None: (metrics, expected_attempt),
     )
     lifecycle._run_training(spec, io.StringIO(), prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
 
-    st = runner.get_status(spec.run_id)
+    st = runner_status.get_status(spec.run_id)
     assert st.state == "done"
     assert st.cost_usd == pytest.approx(7.77)
 
@@ -734,29 +735,28 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
 ):
     import io
 
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
+    import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     # the attached profile pins a model revision, which makes the post-allocation quote refresh
     # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
     stub_revision_geometry(monkeypatch)
     spec = attach_sft_profile(
         JobSpec(
             run_id="attempt-sequence",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_retries=1),
         )
     )
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _next_attempt=0,
     )
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
@@ -808,35 +808,34 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
 
     assert metrics["wall_seconds"] == 1.0
     assert provider.attempts == [0, 1]
-    assert runner.get_status(spec.run_id).remote["attempt"] == 1
+    assert runner_status.get_status(spec.run_id).remote["attempt"] == 1
 
 
 def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
+    import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     # the attached profile pins a model revision, which makes the post-allocation quote refresh
     # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
     stub_revision_geometry(monkeypatch)
     spec = attach_sft_profile(
         JobSpec(
             run_id="pre-handle-attempt",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_retries=1),
         )
     )
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _next_attempt=0,
     )
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
@@ -881,41 +880,40 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
     )
 
     assert provider.attempts == [0, 1]
-    assert runner.get_status(spec.run_id).remote["attempt"] == 1
-    assert runner._load_status_json(spec.run_id)[runner._NEXT_ATTEMPT_KEY] == 2
+    assert runner_status.get_status(spec.run_id).remote["attempt"] == 1
+    assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 2
 
 
 def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
+    import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate, PollResult
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     # the attached profile pins a model revision, which makes the post-allocation quote refresh
     # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
     stub_revision_geometry(monkeypatch)
     spec = attach_sft_profile(
         JobSpec(
             run_id="wall-budget",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
         )
     )
-    runner._save_status(
-        provisioned_status(runner, spec, state="running", created_at=100.0),
+    runner_state._save_status(
+        provisioned_status(spec, state="running", created_at=100.0),
         _run_deadline_at=300.0,
         _next_attempt=0,
     )
     now = {"value": 100.0}
-    monkeypatch.setattr(runner.time, "time", lambda: now["value"])
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: now["value"])
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
     allocation_walls = []
 
@@ -971,43 +969,42 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     assert provider.attempts == [0, 1]
     assert allocation_walls == [200.0, 120.0]
     assert provider.walls == [200, 120]
-    raw = runner._load_status_json(spec.run_id)
-    assert raw[runner._RUN_DEADLINE_AT_KEY] == 300.0
-    assert raw[runner._NEXT_ATTEMPT_KEY] == 2
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._RUN_DEADLINE_AT_KEY] == 300.0
+    assert raw[runner_state._NEXT_ATTEMPT_KEY] == 2
 
 
 def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
+    import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     # the attached profile pins a model revision, which makes the post-allocation quote refresh
     # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
     stub_revision_geometry(monkeypatch)
     spec = attach_sft_profile(
         JobSpec(
             run_id="retry-deadline-minimum",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
         )
     )
-    runner._save_status(
-        provisioned_status(runner, spec, state="running", created_at=100.0),
+    runner_state._save_status(
+        provisioned_status(spec, state="running", created_at=100.0),
         _run_deadline_at=300.0,
         _next_attempt=0,
     )
     clock = {"now": 230.0}
     sleeps = []
-    monkeypatch.setattr(runner.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: clock["now"])
 
     def sleep(seconds):
         sleeps.append(seconds)
@@ -1052,24 +1049,23 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
     assert sleeps == [10.0]
     assert "provider body secret" not in str(exc_info.value)
     assert "provider body secret" not in log.getvalue()
-    assert runner._load_status_json(spec.run_id)[runner._NEXT_ATTEMPT_KEY] == 1
+    assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 1
 
 
 def test_save_status_flushes_file_and_directory_before_return(monkeypatch, tmp_path):
     import os
 
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="durable-status", model="Qwen/Qwen3.5-4B", algorithm="sft")
     events = []
     directory_fd = 987654
     file_fd = {"value": None}
-    original_fdopen = runner.os.fdopen
-    original_open = runner.os.open
-    original_close = runner.os.close
-    original_replace = runner.os.replace
+    original_fdopen = runner_state.os.fdopen
+    original_open = runner_state.os.open
+    original_close = runner_state.os.close
+    original_replace = runner_state.os.replace
 
     class _RecordingFile:
         def __init__(self, wrapped):
@@ -1103,7 +1099,7 @@ def test_save_status_flushes_file_and_directory_before_return(monkeypatch, tmp_p
         return original_replace(source, destination)
 
     def _open(path, flags, *args, **kwargs):
-        if path == runner.RUNS_DIR and flags == os.O_RDONLY:
+        if path == runner_state.RUNS_DIR and flags == os.O_RDONLY:
             events.append("open-directory")
             return directory_fd
         return original_open(path, flags, *args, **kwargs)
@@ -1114,14 +1110,14 @@ def test_save_status_flushes_file_and_directory_before_return(monkeypatch, tmp_p
             return None
         return original_close(fd)
 
-    monkeypatch.setattr(runner.os, "fdopen", _fdopen)
-    monkeypatch.setattr(runner.os, "fsync", _fsync)
-    monkeypatch.setattr(runner.os, "replace", _replace)
-    monkeypatch.setattr(runner.os, "open", _open)
-    monkeypatch.setattr(runner.os, "close", _close)
+    monkeypatch.setattr(runner_state.os, "fdopen", _fdopen)
+    monkeypatch.setattr(runner_state.os, "fsync", _fsync)
+    monkeypatch.setattr(runner_state.os, "replace", _replace)
+    monkeypatch.setattr(runner_state.os, "open", _open)
+    monkeypatch.setattr(runner_state.os, "close", _close)
 
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict()),
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict()),
         _run_deadline_at=500.0,
         _next_attempt=0,
     )
@@ -1142,18 +1138,17 @@ def test_save_status_closes_directory_and_cleans_temp_when_directory_fsync_fails
 ):
     import os
 
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="durable-failure", model="Qwen/Qwen3.5-4B", algorithm="sft")
     directory_fd = 987655
     closed = []
     temp_paths = []
-    original_mkstemp = runner.tempfile.mkstemp
-    original_open = runner.os.open
-    original_close = runner.os.close
-    original_fsync = runner.os.fsync
+    original_mkstemp = runner_state.tempfile.mkstemp
+    original_open = runner_state.os.open
+    original_close = runner_state.os.close
+    original_fsync = runner_state.os.fsync
 
     def _mkstemp(*args, **kwargs):
         fd, path = original_mkstemp(*args, **kwargs)
@@ -1161,7 +1156,7 @@ def test_save_status_closes_directory_and_cleans_temp_when_directory_fsync_fails
         return fd, path
 
     def _open(path, flags, *args, **kwargs):
-        if path == runner.RUNS_DIR and flags == os.O_RDONLY:
+        if path == runner_state.RUNS_DIR and flags == os.O_RDONLY:
             return directory_fd
         return original_open(path, flags, *args, **kwargs)
 
@@ -1176,14 +1171,14 @@ def test_save_status_closes_directory_and_cleans_temp_when_directory_fsync_fails
             return None
         return original_close(fd)
 
-    monkeypatch.setattr(runner.tempfile, "mkstemp", _mkstemp)
-    monkeypatch.setattr(runner.os, "open", _open)
-    monkeypatch.setattr(runner.os, "fsync", _fsync)
-    monkeypatch.setattr(runner.os, "close", _close)
+    monkeypatch.setattr(runner_state.tempfile, "mkstemp", _mkstemp)
+    monkeypatch.setattr(runner_state.os, "open", _open)
+    monkeypatch.setattr(runner_state.os, "fsync", _fsync)
+    monkeypatch.setattr(runner_state.os, "close", _close)
 
     with pytest.raises(OSError, match="directory fsync failed"):
-        runner._save_status(
-            runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        runner_state._save_status(
+            runner_state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
         )
 
     assert closed == [directory_fd]
@@ -1194,29 +1189,28 @@ def test_save_status_closes_directory_and_cleans_temp_when_directory_fsync_fails
 def test_save_status_cleans_temp_when_replace_fails(monkeypatch, tmp_path):
     import os
 
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="replace-failure", model="Qwen/Qwen3.5-4B", algorithm="sft")
     temp_paths = []
-    original_mkstemp = runner.tempfile.mkstemp
+    original_mkstemp = runner_state.tempfile.mkstemp
 
     def _mkstemp(*args, **kwargs):
         fd, path = original_mkstemp(*args, **kwargs)
         temp_paths.append(path)
         return fd, path
 
-    monkeypatch.setattr(runner.tempfile, "mkstemp", _mkstemp)
+    monkeypatch.setattr(runner_state.tempfile, "mkstemp", _mkstemp)
     monkeypatch.setattr(
-        runner.os,
+        runner_state.os,
         "replace",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("replace failed")),
     )
 
     with pytest.raises(OSError, match="replace failed"):
-        runner._save_status(
-            runner.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        runner_state._save_status(
+            runner_state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
         )
 
     assert temp_paths
@@ -1226,34 +1220,34 @@ def test_save_status_cleans_temp_when_replace_fails(monkeypatch, tmp_path):
 def test_concurrent_attempt_reservations_are_unique_and_monotonic(monkeypatch, tmp_path):
     from concurrent.futures import ThreadPoolExecutor
 
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="threaded-attempts", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict()),
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="threaded-attempts", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict()),
         _next_attempt=0,
     )
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        attempts = list(pool.map(lambda _index: runner._reserve_attempt(spec.run_id), range(16)))
+        attempts = list(
+            pool.map(lambda _index: runner_attempts._reserve_attempt(spec.run_id), range(16))
+        )
 
     assert sorted(attempts) == list(range(16))
-    assert runner._load_status_json(spec.run_id)[runner._NEXT_ATTEMPT_KEY] == 16
+    assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 16
 
 
 def test_multiprocess_attempt_reservations_preserve_concurrent_status_update(monkeypatch, tmp_path):
     import multiprocessing
 
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
     runs_dir = str(tmp_path / "runs")
-    monkeypatch.setattr(runner, "RUNS_DIR", runs_dir)
+    monkeypatch.setattr(runner_state, "RUNS_DIR", runs_dir)
     spec = JobSpec(run_id="multiprocess-attempts", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict()),
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict()),
         _next_attempt=0,
     )
     context = multiprocessing.get_context("fork")
@@ -1263,20 +1257,22 @@ def test_multiprocess_attempt_reservations_preserve_concurrent_status_update(mon
     def reserve(worker_index):
         import time
 
-        import flash.runner as child_runner
+        import flash.runner.lifecycle.attempts as child_runner_attempts
+        import flash.runner.lifecycle.state as child_runner_state
+        import flash.runner.lifecycle.status as child_runner_status
 
-        child_runner.RUNS_DIR = runs_dir
-        original_save = child_runner._save_status_unlocked
+        child_runner_state.RUNS_DIR = runs_dir
+        original_save = child_runner_state._save_status_unlocked
 
         def slow_save(*args, **kwargs):
             time.sleep(0.005)
             return original_save(*args, **kwargs)
 
-        child_runner._save_status_unlocked = slow_save
+        child_runner_state._save_status_unlocked = slow_save
         start.wait()
         if worker_index == 0:
-            child_runner._update(spec.run_id, "provisioning", error="concurrent-update")
-        attempts = [child_runner._reserve_attempt(spec.run_id) for _ in range(4)]
+            child_runner_status._update(spec.run_id, "provisioning", error="concurrent-update")
+        attempts = [child_runner_attempts._reserve_attempt(spec.run_id) for _ in range(4)]
         results.put(attempts)
 
     processes = [context.Process(target=reserve, args=(index,)) for index in range(4)]
@@ -1289,9 +1285,9 @@ def test_multiprocess_attempt_reservations_preserve_concurrent_status_update(mon
         process.join(timeout=10)
         assert process.exitcode == 0
 
-    raw = runner._load_status_json(spec.run_id)
+    raw = runner_status._load_status_json(spec.run_id)
     assert sorted(attempts) == list(range(16))
-    assert raw[runner._NEXT_ATTEMPT_KEY] == 16
+    assert raw[runner_state._NEXT_ATTEMPT_KEY] == 16
     assert raw["error"] == "concurrent-update"
 
 
@@ -1306,13 +1302,12 @@ def test_multiprocess_attempt_reservations_preserve_concurrent_status_update(mon
 def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
     monkeypatch, tmp_path, remote
 ):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="compare-clear", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="compare-clear", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="running",
             spec=spec.to_dict(),
@@ -1320,8 +1315,8 @@ def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
         )
     )
 
-    assert runner._compare_and_clear_remote(spec.run_id, remote) is True
-    assert runner.get_status(spec.run_id).remote is None
+    assert runner_reconciliation._compare_and_clear_remote(spec.run_id, remote) is True
+    assert runner_status.get_status(spec.run_id).remote is None
 
 
 @pytest.mark.parametrize(
@@ -1342,13 +1337,12 @@ def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
     ],
 )
 def test_compare_and_clear_remote_preserves_newer_resource(monkeypatch, tmp_path, original, newer):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="compare-preserve", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="compare-preserve", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="running",
             spec=spec.to_dict(),
@@ -1356,23 +1350,22 @@ def test_compare_and_clear_remote_preserves_newer_resource(monkeypatch, tmp_path
         )
     )
 
-    assert runner._compare_and_clear_remote(spec.run_id, original) is False
-    assert runner.get_status(spec.run_id).remote == newer
+    assert runner_reconciliation._compare_and_clear_remote(spec.run_id, original) is False
+    assert runner_status.get_status(spec.run_id).remote == newer
 
 
 def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
     monkeypatch, tmp_path
 ):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
     runs_dir = str(tmp_path / "runs")
-    monkeypatch.setattr(runner, "RUNS_DIR", runs_dir)
+    monkeypatch.setattr(runner_state, "RUNS_DIR", runs_dir)
     spec = JobSpec(run_id="cleanup-dedup", model="Qwen/Qwen3.5-4B", algorithm="sft")
     public_remote = _runpod_remote("endpoint-a", "job-a", attempt=0)
     cleanup_remote = _runpod_remote("endpoint-b", None, attempt=1, started_ts=2.0)
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="cancelled",
             spec=spec.to_dict(),
@@ -1380,88 +1373,92 @@ def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
         )
     )
 
-    assert runner._preserve_cleanup_remote(spec.run_id, cleanup_remote) is True
-    assert runner._preserve_cleanup_remote(spec.run_id, cleanup_remote) is True
-    assert runner._update(spec.run_id, "cancelled", error="unchanged terminal state") is True
+    assert runner_reconciliation._preserve_cleanup_remote(spec.run_id, cleanup_remote) is True
+    assert runner_reconciliation._preserve_cleanup_remote(spec.run_id, cleanup_remote) is True
+    assert runner_status._update(spec.run_id, "cancelled", error="unchanged terminal state") is True
 
-    raw = runner._load_status_json(spec.run_id)
+    raw = runner_status._load_status_json(spec.run_id)
     assert raw["remote"] == public_remote
-    assert raw[runner._CLEANUP_REMOTES_KEY] == [cleanup_remote]
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [cleanup_remote]
 
-    importlib.reload(runner)
-    monkeypatch.setattr(runner, "RUNS_DIR", runs_dir)
-    reloaded = runner._load_status_json(spec.run_id)
+    monkeypatch.setattr(runner_state, "RUNS_DIR", runs_dir)
+    reloaded = runner_status._load_status_json(spec.run_id)
     assert reloaded["remote"] == public_remote
-    assert reloaded[runner._CLEANUP_REMOTES_KEY] == [cleanup_remote]
+    assert reloaded[runner_state._CLEANUP_REMOTES_KEY] == [cleanup_remote]
 
 
 def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_path):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-record", model="Qwen/Qwen3.5-4B", algorithm="sft")
     remote = _runpod_remote("endpoint-cleanup", "job-cleanup", attempt=1)
-    runner._save_status(runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
+    )
 
-    assert runner._record_cleanup_remote(spec.run_id, remote) is True
-    assert runner._record_cleanup_remote(spec.run_id, remote) is True
+    assert runner_reconciliation._record_cleanup_remote(spec.run_id, remote) is True
+    assert runner_reconciliation._record_cleanup_remote(spec.run_id, remote) is True
 
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert status.remote is None
-    assert runner._load_status_json(spec.run_id)[runner._CLEANUP_REMOTES_KEY] == [remote]
+    assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
+        remote
+    ]
 
 
 def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, tmp_path):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="completion-cancel", model="Qwen/Qwen3.5-4B", algorithm="sft")
     remote = _runpod_remote("endpoint-active", "job-active", attempt=0)
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="running",
             spec=spec.to_dict(),
             remote=remote,
         )
     )
-    real_record = runner._record_cleanup_remote
+    real_record = runner_reconciliation._record_cleanup_remote
 
     def clear_then_record(run_id, cleanup_remote):
-        with runner._status_guard(run_id):
-            status = runner.get_status(run_id)
+        with runner_state._status_guard(run_id):
+            status = runner_status.get_status(run_id)
             status.remote = None
-            runner._save_status_unlocked(status)
+            runner_state._save_status_unlocked(status)
         return real_record(run_id, cleanup_remote)
 
-    monkeypatch.setattr(runner, "_record_cleanup_remote", clear_then_record)
-    monkeypatch.setattr(runner, "_persist_metrics", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(runner_reconciliation, "_record_cleanup_remote", clear_then_record)
+    monkeypatch.setattr(runner_status, "_persist_metrics", lambda *_args, **_kwargs: 0.0)
 
-    assert runner._compare_and_complete_remote(spec.run_id, remote, spec, {}) is False
-    assert runner.get_status(spec.run_id).state == "running"
-    assert runner._update(spec.run_id, "cancelled")
+    assert (
+        runner_reconciliation._compare_and_complete_remote(spec.run_id, remote, spec, {}) is False
+    )
+    assert runner_status.get_status(spec.run_id).state == "running"
+    assert runner_status._update(spec.run_id, "cancelled")
 
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert status.state == "cancelled"
     assert status.remote is None
-    assert runner._load_status_json(spec.run_id)[runner._CLEANUP_REMOTES_KEY] == [remote]
+    assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
+        remote
+    ]
 
 
 @pytest.mark.parametrize("terminal_state", ["done", "failed"])
 def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     monkeypatch, tmp_path, terminal_state
 ):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
-    from flash.server.domain import reconcile
+    from flash.server.domain.ops import reconcile
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id=f"recovered-{terminal_state}", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id=f"recovered-{terminal_state}", model="Qwen/Qwen3.5-9B", algorithm="sft")
     remote = _runpod_remote("endpoint-cost", "job-cost", attempt=0, started_ts=100.0)
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="running",
             spec=spec.to_dict(),
@@ -1470,26 +1467,31 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
         )
     )
     if terminal_state == "done":
-        monkeypatch.setattr(runner, "_persist_metrics", lambda *_args, **_kwargs: 0.5)
-        assert runner._compare_and_complete_remote(spec.run_id, remote, spec, {}) is True
+        monkeypatch.setattr(runner_status, "_persist_metrics", lambda *_args, **_kwargs: 0.5)
+        assert (
+            runner_reconciliation._compare_and_complete_remote(spec.run_id, remote, spec, {})
+            is True
+        )
     else:
-        assert runner._compare_and_fail_remote(spec.run_id, remote, "provider failed") is True
+        assert (
+            runner_reconciliation._compare_and_fail_remote(spec.run_id, remote, "provider failed")
+            is True
+        )
 
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert status.state == terminal_state
     assert status.remote == remote
     assert reconcile._due(status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0)
 
 
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):
-    import flash.providers as providers
-    import flash.runner as runner
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-drain", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
     )
     confirmed = _runpod_remote("endpoint-confirmed", "job-confirmed", attempt=1)
     endpoint_only = _runpod_remote(
@@ -1505,7 +1507,7 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
         started_ts=3.0,
     )
     for remote in (confirmed, endpoint_only, unconfirmed):
-        assert runner._preserve_cleanup_remote(spec.run_id, remote) is True
+        assert runner_reconciliation._preserve_cleanup_remote(spec.run_id, remote) is True
 
     events = []
 
@@ -1524,7 +1526,7 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
 
-    attempted = runner._drain_cleanup_remotes(spec.run_id)
+    attempted = runner_reconciliation._drain_cleanup_remotes(spec.run_id)
 
     assert attempted == {
         ("runpod", 1, "endpoint-confirmed", "job-confirmed", _RUNPOD_FINGERPRINT),
@@ -1538,8 +1540,8 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
         ("cancel", "endpoint-unconfirmed"),
         ("destroy", "endpoint-unconfirmed"),
     ]
-    raw = runner._load_status_json(spec.run_id)
-    assert raw[runner._CLEANUP_REMOTES_KEY] == [unconfirmed]
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [unconfirmed]
     assert raw["remote"] == confirmed
 
 
@@ -1557,23 +1559,22 @@ def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
     """
     import json as _json
 
-    import flash.runner as runner
     from flash.core.spec import JobSpec
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-legacy", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
     )
     legacy_fingerprint = "rpk-" + "0" * 12
     resolved_fingerprint = "rpk-" + "a" * 64
     legacy = _runpod_remote("endpoint-legacy", None, attempt=1, key_fingerprint=legacy_fingerprint)
     # the strict writer rejects the legacy record, so seed the status file directly.
-    path = runner.runs_file_path(spec.run_id, ".json")
+    path = runner_state.runs_file_path(spec.run_id, ".json")
     with open(path) as f:
         raw = _json.load(f)
-    raw[runner._CLEANUP_REMOTES_KEY] = [legacy]
+    raw[runner_state._CLEANUP_REMOTES_KEY] = [legacy]
     with open(path, "w") as f:
         _json.dump(raw, f)
 
@@ -1595,7 +1596,7 @@ def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
     monkeypatch.setattr(runpod_api, "resolve_prefix_key_fingerprint", resolve_legacy)
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
 
-    attempted = runner._drain_cleanup_remotes(spec.run_id)
+    attempted = runner_reconciliation._drain_cleanup_remotes(spec.run_id)
 
     assert resolved == [("endpoint-legacy", legacy_fingerprint)], (
         "the legacy fingerprint resolver was never reached"
@@ -1608,20 +1609,19 @@ def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
     # the same record the drain admitted, so a strict-only derivation would return None here and
     # clear nothing -- leaving every later sweep to tear down an endpoint that is already gone.
     with open(path) as f:
-        assert not _json.load(f).get(runner._CLEANUP_REMOTES_KEY), (
+        assert not _json.load(f).get(runner_state._CLEANUP_REMOTES_KEY), (
             "the confirmed-deleted record survived, so every later sweep retries a deleted endpoint"
         )
 
 
 def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypatch, tmp_path):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-absent", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
     )
     other_fingerprint = "rpk-" + "f" * 64
     confirmed = _runpod_remote("endpoint-shared", "job-confirmed", attempt=1)
@@ -1645,7 +1645,7 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypat
         started_ts=4.0,
     )
     for remote in (confirmed, different_owner, different_job, different_attempt):
-        assert runner._preserve_cleanup_remote(spec.run_id, remote) is True
+        assert runner_reconciliation._preserve_cleanup_remote(spec.run_id, remote) is True
 
     monkeypatch.setattr(
         runpod_api,
@@ -1670,7 +1670,7 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypat
 
     monkeypatch.setattr(runpod_api, "endpoint_absent_for_fingerprint", exact_lookup)
 
-    attempted = runner._drain_cleanup_remotes(spec.run_id)
+    attempted = runner_reconciliation._drain_cleanup_remotes(spec.run_id)
 
     assert attempted == {
         ("runpod", 1, "endpoint-shared", "job-confirmed", _RUNPOD_FINGERPRINT),
@@ -1684,8 +1684,8 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypat
         ("endpoint-shared", _RUNPOD_FINGERPRINT),
         ("endpoint-shared", _RUNPOD_FINGERPRINT),
     ]
-    raw = runner._load_status_json(spec.run_id)
-    assert raw[runner._CLEANUP_REMOTES_KEY] == [
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [
         different_owner,
         different_job,
         different_attempt,
@@ -1694,52 +1694,51 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypat
 
 
 def test_next_attempt_requires_persisted_integer_identity():
-    import flash.runner as runner
 
-    assert runner._infer_next_attempt({"next_attempt": 0}) == 0
-    assert runner._infer_next_attempt({"next_attempt": 7}) == 7
+    assert runner_attempts._infer_next_attempt({"next_attempt": 0}) == 0
+    assert runner_attempts._infer_next_attempt({"next_attempt": 7}) == 7
     for raw in ({}, {"next_attempt": True}, {"next_attempt": -1}, {"next_attempt": "1"}):
         with pytest.raises(RuntimeError, match="next attempt identity"):
-            runner._infer_next_attempt(raw)
+            runner_attempts._infer_next_attempt(raw)
 
 
 def test_handleless_state_without_next_attempt_is_rejected(monkeypatch, tmp_path):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="missing-next-attempt", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
-    raw = runner._load_status_json(spec.run_id)
-    raw.pop(runner._NEXT_ATTEMPT_KEY)
-    with open(runner.runs_file_path(spec.run_id, ".json"), "w") as file:
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="missing-next-attempt", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
+    )
+    raw = runner_status._load_status_json(spec.run_id)
+    raw.pop(runner_state._NEXT_ATTEMPT_KEY)
+    with open(runner_state.runs_file_path(spec.run_id, ".json"), "w") as file:
         json.dump(raw, file)
 
     with pytest.raises(RuntimeError, match="next attempt identity is missing"):
-        runner._reserve_attempt(spec.run_id)
+        runner_attempts._reserve_attempt(spec.run_id)
 
 
 def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatch, tmp_path):
     import io
 
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
+    import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec
     from flash.runner.supervise import lifecycle
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="wall-minimum",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=60),
     )
-    runner._save_status(
-        provisioned_status(runner, spec, state="running", created_at=99.0),
+    runner_state._save_status(
+        provisioned_status(spec, state="running", created_at=99.0),
         _run_deadline_at=159.0,
         _next_attempt=0,
     )
-    monkeypatch.setattr(runner.time, "time", lambda: 100.0)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 100.0)
     allocations = []
     monkeypatch.setattr(allocator, "allocate", lambda *_args, **_kwargs: allocations.append(True))
 
@@ -1749,44 +1748,43 @@ def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatc
         )
 
     assert allocations == []
-    assert runner._load_status_json(spec.run_id)[runner._NEXT_ATTEMPT_KEY] == 0
+    assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 0
 
 
 def test_reserved_attempt_survives_handleless_restart_without_reusing_zero(monkeypatch, tmp_path):
-    import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="reserved-restart",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=200),
     )
-    runner._save_status(
-        provisioned_status(runner, spec, state="provisioning", created_at=100.0),
+    runner_state._save_status(
+        provisioned_status(spec, state="provisioning", created_at=100.0),
         _run_deadline_at=300.0,
         _next_attempt=0,
     )
 
     assert (
-        runner._spec_with_remaining_wall(
+        runner_deadlines._spec_with_remaining_wall(
             spec, require_provider_minimum=True, now=100.0
         ).gpu.max_wall_seconds
         == 200
     )
-    assert runner._reserve_attempt(spec.run_id) == 0
-    assert runner.get_status(spec.run_id).remote is None
+    assert runner_attempts._reserve_attempt(spec.run_id) == 0
+    assert runner_status.get_status(spec.run_id).remote is None
     assert (
-        runner._spec_with_remaining_wall(
+        runner_deadlines._spec_with_remaining_wall(
             spec, require_provider_minimum=True, now=180.0
         ).gpu.max_wall_seconds
         == 120
     )
-    assert runner._reserve_attempt(spec.run_id) == 1
-    raw = runner._load_status_json(spec.run_id)
-    assert raw[runner._NEXT_ATTEMPT_KEY] == 2
-    assert raw[runner._RUN_DEADLINE_AT_KEY] == 300.0
+    assert runner_attempts._reserve_attempt(spec.run_id) == 1
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._NEXT_ATTEMPT_KEY] == 2
+    assert raw[runner_state._RUN_DEADLINE_AT_KEY] == 300.0
 
 
 def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tmp_path):
@@ -1794,16 +1792,15 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
     expected_next = 2
     import io
 
-    import flash.providers as providers
-    import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec
-    from flash.providers.base import PollResult
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import PollResult
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec(
         run_id=f"attach-attempt-{expected_next}",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=200),
     )
@@ -1812,14 +1809,14 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
         "job-old",
         attempt=persisted_attempt,
     )
-    status = provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote)
+    status = provisioned_status(spec, state="running", created_at=100.0, remote=remote)
     status.source_snapshot = _SOURCE_SNAPSHOT
-    runner._save_status(
+    runner_state._save_status(
         status,
         _run_deadline_at=300.0,
         _next_attempt=2,
     )
-    monkeypatch.setattr(runner.time, "time", lambda: 100.0)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 100.0)
     poll_walls = []
 
     class FailedProvider:
@@ -1834,15 +1831,15 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
             return None
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: FailedProvider())
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     resumed = []
 
     def fake_run_training(_spec, _log, **kwargs):
         resumed.append(kwargs["attempt_start"])
 
-    monkeypatch.setattr(runner, "_run_training", fake_run_training)
+    monkeypatch.setattr(runner_lifecycle, "_run_training", fake_run_training)
 
-    status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
 
     assert resumed == [expected_next]
     assert poll_walls == [200]
@@ -1854,26 +1851,25 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     import io
 
     import flash.providers.artifacts.hf as hf_artifacts
-    import flash.runner as runner
     import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec(
         run_id="attach-expired-completed",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(max_wall_seconds=120),
     )
     remote = _vast_remote(instance_id=7, attempt=0, started_ts=101.0)
-    runner._save_status(
-        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
+    runner_state._save_status(
+        provisioned_status(spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
-    monkeypatch.setattr(runner.time, "time", lambda: 221.0)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
     completion_checks = []
     real_completed_metrics = lifecycle._completed_attempt_metrics
 
@@ -1896,7 +1892,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
 
     monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
     monkeypatch.setattr(lifecycle, "_completed_attempt_metrics", completed_metrics)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(
         lifecycle,
         "_strict_teardown_handle",
@@ -1906,7 +1902,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     )
     log = io.StringIO()
 
-    status = runner.attach_run(spec.run_id, log_stream=log)
+    status = runner_attach.attach_run(spec.run_id, log_stream=log)
 
     assert len(completion_checks) == 1
     _, kwargs = completion_checks[0]
@@ -1920,7 +1916,9 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     assert status.state == "done"
     assert status.remote == remote
     assert status.error is None
-    assert runner._load_status_json(spec.run_id)[runner._CLEANUP_REMOTES_KEY] == [remote]
+    assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
+        remote
+    ]
     assert "adopted a completed attempt at the wall deadline" in log.getvalue()
 
 
@@ -1933,15 +1931,14 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
     import io
 
     import flash.providers.artifacts.hf as hf_artifacts
-    import flash.runner as runner
     import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec(
         run_id="attach-adopt-multicard",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(max_wall_seconds=120),
@@ -1953,12 +1950,12 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
         allocated_gpu="RTX 4090",
         allocated_gpu_count=4,
     )
-    runner._save_status(
-        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
+    runner_state._save_status(
+        provisioned_status(spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
-    monkeypatch.setattr(runner.time, "time", lambda: 221.0)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
 
     def artifact_reader(_repo, path):
         def read(force=False):
@@ -1983,9 +1980,9 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
 
     monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
     monkeypatch.setattr(lifecycle, "_adopt_completed_attempt", capture_adopt)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
 
-    status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
 
     assert status.state == "done"
     assert adopted["allocated_gpu_count"] == 4, (
@@ -2010,7 +2007,7 @@ def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
     from types import SimpleNamespace
 
     import flash.runner.supervise.attach as attach
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
 
     remote = _vast_remote(allocated_gpu="RTX 4090", allocated_gpu_count=4)
     context = attach._AttachContext(
@@ -2047,26 +2044,25 @@ def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
 def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, tmp_path):
     import io
 
-    import flash.runner as runner
-    import flash.runner.supervise.deploy as deploy
+    import flash.runner.supervise.attach as attach
     import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="attach-metrics-pending",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(hf_repo="org/repo"),
         gpu=GpuSpec(max_wall_seconds=120),
     )
     remote = _vast_remote(instance_id=7, attempt=0, started_ts=101.0)
-    runner._save_status(
-        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
+    runner_state._save_status(
+        provisioned_status(spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
-    monkeypatch.setattr(runner.time, "time", lambda: 221.0)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
     monkeypatch.setattr(
         lifecycle,
         "_completed_attempt_metrics",
@@ -2076,12 +2072,12 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     )
     scheduled = []
     monkeypatch.setattr(
-        deploy,
+        attach,
         "_schedule_attach_reconciliation",
         lambda *args, **kwargs: scheduled.append((args, kwargs)) or True,
     )
 
-    status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
 
     assert status.state == "running"
     assert status.remote == remote
@@ -2097,15 +2093,15 @@ def test_completed_attempt_metrics_rereads_a_marker_that_is_not_visible_yet(monk
     """
     import io
 
-    import flash.providers._lifecycle.poll_instance as instance_poll
-    import flash.providers._lifecycle.terminal_artifacts as ta
+    import flash.providers._lifecycle.instances.poll_instance as instance_poll
+    import flash.providers._lifecycle.instances.terminal_artifacts as ta
     import flash.providers.artifacts.hf as hf_artifacts
     import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import JobSpec, TrainSpec
 
     spec = JobSpec(
         run_id="lagging-marker",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(hf_repo="org/repo"),
     )
@@ -2162,7 +2158,7 @@ def test_completed_attempt_metrics_never_adopts_an_unverifiable_marker(monkeypat
 
     spec = JobSpec(
         run_id="corrupt-marker",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(hf_repo="org/repo"),
     )
@@ -2212,7 +2208,7 @@ def test_completed_attempt_metrics_bounds_marker_to_wall_grace(monkeypatch, mark
 
     spec = JobSpec(
         run_id="late-marker-complete",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
     )
@@ -2247,21 +2243,19 @@ def test_completed_attempt_metrics_bounds_marker_to_wall_grace(monkeypatch, mark
 def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
-    import flash.runner as runner
     import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core import registry as providers
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="attach-expired",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=120),
     )
-    runner._save_status(
+    runner_state._save_status(
         provisioned_status(
-            runner,
             spec,
             state="running",
             created_at=100.0,
@@ -2270,7 +2264,7 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
-    monkeypatch.setattr(runner.time, "time", lambda: 221.0)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
     polled = []
     resumed = []
     teardown = []
@@ -2295,11 +2289,15 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
     monkeypatch.setattr(
-        runner, "_gc_run_endpoints", lambda cleanup_spec: gc_runs.append(cleanup_spec.run_id)
+        runner_recovery,
+        "_gc_run_endpoints",
+        lambda cleanup_spec: gc_runs.append(cleanup_spec.run_id),
     )
-    monkeypatch.setattr(runner, "_run_training", lambda *_args, **_kwargs: resumed.append(True))
+    monkeypatch.setattr(
+        runner_lifecycle, "_run_training", lambda *_args, **_kwargs: resumed.append(True)
+    )
 
-    status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
 
     assert polled == []
     assert resumed == []
@@ -2315,23 +2313,22 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
 def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
-    import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core import registry as providers
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="attach-expired-unconfirmed",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         gpu=GpuSpec(max_wall_seconds=120),
     )
     remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
-    runner._save_status(
-        provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
+    runner_state._save_status(
+        provisioned_status(spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
-    monkeypatch.setattr(runner.time, "time", lambda: 221.0)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
 
     class Provider:
         def cancel(self, _handle):
@@ -2344,11 +2341,13 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
             raise AssertionError("expired recovery must not poll")
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     resumed = []
-    monkeypatch.setattr(runner, "_run_training", lambda *_args, **_kwargs: resumed.append(True))
+    monkeypatch.setattr(
+        runner_lifecycle, "_run_training", lambda *_args, **_kwargs: resumed.append(True)
+    )
 
-    status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
 
     assert resumed == []
     assert status.state == "failed"
@@ -2357,32 +2356,33 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
 
 
 def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monkeypatch):
-    import flash.providers.runpod.jobs as jobs
-    import flash.providers.runpod.serverless as train
+    import flash.providers._lifecycle.net.worker as train
+    import flash.providers.runpod.execution.job_execution as job_execution
+    import flash.providers.runpod.execution.polling as polling
     from flash.core.spec import JobSpec
-    from flash.providers.base import PollResult
+    from flash.providers.core.base import PollResult
 
-    spec = JobSpec(run_id="worker-attempt", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="worker-attempt", model="Qwen/Qwen3.5-9B", algorithm="sft")
     payloads = []
     handles = []
     monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
-        jobs,
+        job_execution,
         "deploy_train_endpoint",
         lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT),
     )
     monkeypatch.setattr(
-        jobs.runpod_api,
+        job_execution.runpod_api,
         "submit_job",
         lambda _endpoint, payload, **_kwargs: payloads.append(payload) or "job",
     )
     monkeypatch.setattr(
-        jobs,
+        polling,
         "poll_job",
         lambda *_args, **_kwargs: PollResult(True, metrics={"wall_seconds": 1.0}),
     )
 
-    jobs.submit_run(
+    job_execution.submit_run(
         spec,
         0,
         attempt=2,
@@ -2396,15 +2396,14 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
 
 
 def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, tmp_path):
-    import flash.runner as runner
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-    spec = JobSpec(run_id="blocked-complete", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(run_id="blocked-complete", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="provisioning",
             spec=spec.to_dict(),
@@ -2421,22 +2420,21 @@ def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, 
 
     assert runtime._fail_blocked_recovery(spec, "recovery blocked") is True
 
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert status.state == "done"
     assert status.remote is None
     assert status.error is None
 
 
 def test_fail_blocked_recovery_keeps_success_with_lagging_metrics_pending(monkeypatch, tmp_path):
-    import flash.runner as runner
     import flash.runner.supervise.lifecycle as lifecycle
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="blocked-pending", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="blocked-pending", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="provisioning",
             spec=spec.to_dict(),
@@ -2452,27 +2450,26 @@ def test_fail_blocked_recovery_keeps_success_with_lagging_metrics_pending(monkey
     )
 
     assert runtime._fail_blocked_recovery(spec, "recovery blocked") is False
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert status.state == "provisioning"
     assert status.remote is None
     assert status.error is None
 
 
 def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch, tmp_path):
-    import flash.runner as runner
     import flash.server.platform.runtime as runtime
     from flash.core.spec import GpuSpec, JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec(
         run_id="deadline-complete",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=120),
     )
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="provisioning",
             spec=spec.to_dict(),
@@ -2481,7 +2478,7 @@ def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch
         _run_deadline_at=220.0,
         _next_attempt=1,
     )
-    monkeypatch.setattr(runner.time, "time", lambda: 221.0)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
     monkeypatch.setattr(
         runtime,
         "_handleless_completed_metrics",
@@ -2490,7 +2487,7 @@ def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch
 
     assert runtime._start_resubmit(spec, expected_remote=None) is False
 
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert status.state == "done"
     assert status.remote is None
     assert status.error is None
@@ -2500,21 +2497,24 @@ def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch
 def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     monkeypatch, tmp_path, status_read_fails
 ):
-    import flash.providers as providers
-    import flash.runner as runner
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="recover-pending", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="recover-pending", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
     )
     monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
-    monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(runner, "_mark_warmstart_source", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(runner, "effective_spec_from_status", lambda _status, **_kwargs: spec)
+    monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        runner_preparation, "_mark_warmstart_source", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        runner_status, "effective_spec_from_status", lambda _status, **_kwargs: spec
+    )
     monkeypatch.setattr(providers, "configured_providers", list)
     monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
@@ -2556,45 +2556,43 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     assert drain_calls == [(spec.run_id,)]
 
 
-def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("retired_model", _RETIRED_MODELS)
+def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
+    monkeypatch, tmp_path, retired_model
 ):
-    # an algorithm dropped from the catalog while one of its runs is still nonterminal: the
-    # persisted spec stops parsing on the new build. attach_run parses before its except/finally
-    # exist, so dispatching it would kill the daemon thread with the run still `running` and the
-    # rented worker still billing. recovery has to decide this itself -- fail the run and remove
-    # the resource -- which is the disposition the handle-less branch already applies.
-    import flash.providers as providers
-    import flash.runner as runner
+    # a model dropped from the catalog while one of its runs is still nonterminal: the
+    # persisted spec remains structurally parseable, but catalog eligibility fails on the new build.
+    # dispatching attach_run would otherwise leave the run active long enough to reach provider work,
+    # so startup recovery must fail it and remove the resource before dispatch.
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     remote = {"provider": "runpod", "endpoint_id": "ep-stale", "attempt": 0}
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id="recover-unparseable",
             state="running",
             spec=JobSpec(
-                run_id="recover-unparseable", model="Qwen/Qwen3.5-4B", algorithm="sft"
+                run_id="recover-unparseable", model="Qwen/Qwen3.5-9B", algorithm="sft"
             ).to_dict(),
             remote=dict(remote),
         )
     )
-    # the record has to be written the way an upgrade produces one: the OLD build persisted a spec
-    # it accepted, and only the new build rejects it. _save_status parses on the way in, so it can
-    # never store this -- edit the stored json in place, which is what "the algorithm was dropped
-    # from the catalog underneath a live run" actually looks like on disk.
-    stored_path = runner.runs_file_path("recover-unparseable", ".json")
+    # write a current model first, then sabotage the stored public spec to match a run persisted by
+    # the old catalog. structural parsing still succeeds, so only the new eligibility guard catches it.
+    stored_path = runner_state.runs_file_path("recover-unparseable", ".json")
     with open(stored_path, encoding="utf-8") as handle:
         stored = json.load(handle)
-    stored["spec"]["algorithm"] = "retired-algorithm"
+    stored["spec"]["model"] = retired_model
     with open(stored_path, "w", encoding="utf-8") as handle:
         json.dump(stored, handle)
-    with pytest.raises(ValueError, match="unsupported algorithm"):
-        JobSpec.from_dict(stored["spec"])  # premise: this build cannot parse it
+    assert JobSpec.from_dict(stored["spec"]).model == retired_model
+    with pytest.raises(ValueError, match="unsupported model"):
+        runner_status.effective_spec_from_status(runner_status.get_status("recover-unparseable"))
     monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": "recover-unparseable"}])
-    monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
     monkeypatch.setattr(providers, "configured_providers", list)
     torn: list[tuple[dict, str]] = []
 
@@ -2605,7 +2603,7 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
     monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
     attached: list[str] = []
     # recover_runs imports attach_run from flash.runner inside the function, so patch it there.
-    monkeypatch.setattr(runner, "attach_run", lambda rid: attached.append(rid))
+    monkeypatch.setattr(runner_attach, "attach_run", lambda rid: attached.append(rid))
 
     class Thread:
         def __init__(self, *, target, args=(), daemon=False):
@@ -2621,9 +2619,66 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
 
     assert attached == []
     assert torn == [(remote, "recover-unparseable")]
-    status = runner.get_status("recover-unparseable")
+    status = runner_status.get_status("recover-unparseable")
     assert status.state == "failed"
-    assert "persisted spec is malformed" in (status.error or "")
+    assert "persisted spec cannot be activated" in (status.error or "")
+
+
+@pytest.mark.parametrize("retired_model", _RETIRED_MODELS)
+def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
+    monkeypatch, tmp_path, retired_model
+):
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="retired-handleless", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    path = runner_state.runs_file_path(spec.run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["model"] = retired_model
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
+    monkeypatch.setattr(providers, "configured_providers", list)
+    monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(
+        runner_recovery,
+        "_gc_run_endpoints",
+        lambda _spec: pytest.fail("removed model reached active endpoint gc"),
+    )
+    monkeypatch.setattr(
+        runner_attach, "attach_run", lambda _run_id: pytest.fail("attach dispatched")
+    )
+    monkeypatch.setattr(
+        runtime, "_start_resubmit", lambda *_args, **_kwargs: pytest.fail("resubmit")
+    )
+    terminated = []
+    monkeypatch.setattr(
+        "flash.providers.runpod.execution.provider.terminate_persisted_endpoints",
+        lambda raw_spec, run_id: terminated.append((raw_spec["model"], run_id)),
+    )
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    assert terminated == [(retired_model, spec.run_id)]
+    status = runner_status.get_status(spec.run_id)
+    assert status.state == "failed"
+    assert "unsupported model" in (status.error or "")
 
 
 def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):
@@ -2631,12 +2686,11 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
     # cleanup drain -- but this run's drain was already dispatched at the top of the loop and had
     # snapshotted an empty list, and it returns early on empty. so the record sat there with nothing
     # scheduled to retry it, and the worker kept billing until the next restart.
-    import flash.providers as providers
-    import flash.runner as runner
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     # a COMPLETE handle: `_record_cleanup_remote` drops anything it cannot resolve to an exact
     # provider resource identity, so a partial one would make this test pass for the wrong reason.
     remote = {
@@ -2647,18 +2701,18 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
         "attempt": 0,
         "started_ts": 1.0,
     }
-    assert runner._remote_resource_identity(remote) is not None
-    runner._save_status(
-        runner.RunStatus(
+    assert runner_reconciliation._remote_resource_identity(remote) is not None
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id="recover-unconfirmed",
             state="running",
             spec=JobSpec(
-                run_id="recover-unconfirmed", model="Qwen/Qwen3.5-4B", algorithm="sft"
+                run_id="recover-unconfirmed", model="Qwen/Qwen3.5-9B", algorithm="sft"
             ).to_dict(),
             remote=dict(remote),
         )
     )
-    stored_path = runner.runs_file_path("recover-unconfirmed", ".json")
+    stored_path = runner_state.runs_file_path("recover-unconfirmed", ".json")
     with open(stored_path, encoding="utf-8") as handle:
         stored = json.load(handle)
     stored["spec"]["algorithm"] = "retired-algorithm"
@@ -2676,10 +2730,10 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
         return False  # unconfirmed, both times: this is the case that records for the drain
 
     monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
-    monkeypatch.setattr(runner, "attach_run", lambda rid: None)
+    monkeypatch.setattr(runner_attach, "attach_run", lambda rid: None)
     # persisting a cleanup record reports the new status, which blocks on its reporter thread. that
     # thread is real in production; here the fake below would stand in for it and never run.
-    monkeypatch.setattr(runner, "_report_status", lambda status: None)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda status: None)
 
     class Thread:
         def __init__(self, *, target, args=(), daemon=False):
@@ -2707,25 +2761,24 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
 def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypatch, tmp_path):
     import time as time_mod
 
-    import flash.runner as runner
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec.from_dict(
         {
             "run_id": "deferred-clear",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"epochs": 1},
         }
     )
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
     )
     checks = iter([False, True])
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: next(checks))
-    monkeypatch.setattr(runner, "_load_run_deadline_at", lambda _run_id: 1000.0)
+    monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1000.0)
     monkeypatch.setattr(time_mod, "time", lambda: 100.0)
     monkeypatch.setattr(time_mod, "sleep", lambda _seconds: None)
     started = []
@@ -2742,26 +2795,25 @@ def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypat
         "expected_remote": None,
         "expected_state": "provisioning",
     }
-    assert runner.get_status(spec.run_id).state == "provisioning"
+    assert runner_status.get_status(spec.run_id).state == "provisioning"
 
 
 def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypatch, tmp_path):
     import time as time_mod
 
-    import flash.runner as runner
     import flash.server.platform.runtime as runtime
     from flash.core.spec import GpuSpec, JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
         run_id="deferred-minimum-window",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=120),
     )
-    status = provisioned_status(runner, spec, state="provisioning", created_at=10.0)
+    status = provisioned_status(spec, state="provisioning", created_at=10.0)
     status.source_snapshot = _SOURCE_SNAPSHOT
-    runner._save_status(
+    runner_state._save_status(
         status,
         _run_deadline_at=130.0,
         _next_attempt=0,
@@ -2771,22 +2823,22 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
     monkeypatch.setattr(runtime, "_handleless_completed_metrics", lambda *a, **k: None)
     failures = []
-    real_fail = runner._compare_and_fail_remote
+    real_fail = runner_reconciliation._compare_and_fail_remote
 
     def record_failure(*args, **kwargs):
         failures.append(clock["now"])
         return real_fail(*args, **kwargs)
 
     def advance(seconds):
-        assert runner.get_status(spec.run_id).state == "provisioning"
+        assert runner_status.get_status(spec.run_id).state == "provisioning"
         clock["now"] += seconds
 
-    monkeypatch.setattr(runner, "_compare_and_fail_remote", record_failure)
+    monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", record_failure)
     monkeypatch.setattr(time_mod, "sleep", advance)
 
     runtime._deferred_resubmit_loop(spec)
 
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert failures == [130.0]
     assert status.state == "failed"
 
@@ -2794,17 +2846,16 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
 def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch, tmp_path):
     import time as time_mod
 
-    import flash.runner as runner
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="deferred-cas-loss", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="deferred-cas-loss", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
     )
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
-    monkeypatch.setattr(runner, "_load_run_deadline_at", lambda _run_id: 1000.0)
+    monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1000.0)
     monkeypatch.setattr(time_mod, "time", lambda: 100.0)
     sleeps = []
     monkeypatch.setattr(time_mod, "sleep", sleeps.append)
@@ -2833,27 +2884,26 @@ def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch
 def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp_path):
     import time as time_mod
 
-    import flash.runner as runner
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec.from_dict(
         {
             "run_id": "deferred-deadline",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"epochs": 1},
         }
     )
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
     )
-    monkeypatch.setattr(runner, "_load_run_deadline_at", lambda _run_id: 100.0)
+    monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 100.0)
     monkeypatch.setattr(time_mod, "time", lambda: 101.0)
     monkeypatch.setattr(time_mod, "sleep", lambda _seconds: None)
     monkeypatch.setattr(runtime, "_handleless_completed_metrics", lambda *a, **k: None)
-    real_fail = runner._compare_and_fail_remote
+    real_fail = runner_reconciliation._compare_and_fail_remote
     attempts = []
 
     def flaky_fail(*args, **kwargs):
@@ -2862,11 +2912,11 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
             raise PermissionError("status store unavailable")
         return real_fail(*args, **kwargs)
 
-    monkeypatch.setattr(runner, "_compare_and_fail_remote", flaky_fail)
+    monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", flaky_fail)
 
     runtime._deferred_resubmit_loop(spec)
 
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert len(attempts) == 2
     assert status.state == "failed"
     assert status.remote is None
@@ -2875,14 +2925,14 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
 
 @pytest.mark.parametrize(("now", "pending"), [(201.0, True), (321.0, False)])
 def test_completed_attempt_metrics_bounds_success_marker_metrics_grace(monkeypatch, now, pending):
-    import flash.providers._lifecycle.poll_instance as instance_poll
+    import flash.providers._lifecycle.instances.poll_instance as instance_poll
     import flash.providers.artifacts.hf as hf_artifacts
     import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import JobSpec, TrainSpec
 
     spec = JobSpec(
         run_id="metrics-lag",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(hf_repo="org/repo"),
     )
@@ -2926,14 +2976,13 @@ def test_deferred_handleless_legacy_run_without_attempt_metadata_fails_at_deadli
 ):
     import time as time_mod
 
-    import flash.runner as runner
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="deferred-legacy", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="deferred-legacy", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="provisioning",
             spec=spec.to_dict(),
@@ -2941,9 +2990,9 @@ def test_deferred_handleless_legacy_run_without_attempt_metadata_fails_at_deadli
         ),
         _run_deadline_at=86500.0,
     )
-    raw = runner._load_status_json(spec.run_id)
-    raw.pop(runner._NEXT_ATTEMPT_KEY, None)
-    with open(runner.runs_file_path(spec.run_id, ".json"), "w") as file:
+    raw = runner_status._load_status_json(spec.run_id)
+    raw.pop(runner_state._NEXT_ATTEMPT_KEY, None)
+    with open(runner_state.runs_file_path(spec.run_id, ".json"), "w") as file:
         json.dump(raw, file)
 
     monkeypatch.setattr(time_mod, "time", lambda: 86501.0)
@@ -2955,7 +3004,7 @@ def test_deferred_handleless_legacy_run_without_attempt_metadata_fails_at_deadli
 
     runtime._deferred_resubmit_loop(spec)
 
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert status.state == "failed"
     assert status.remote is None
     assert "deadline exhausted" in (status.error or "")
@@ -2967,29 +3016,28 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
 ):
     import io
 
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
+    import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     # the attached profile pins a model revision, which makes the post-allocation quote refresh
     # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
     stub_revision_geometry(monkeypatch)
     spec = attach_sft_profile(
         JobSpec(
             run_id=f"terminal-handle-race-{cleanup_confirmed}",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
         )
     )
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _next_attempt=0,
     )
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
@@ -3014,7 +3062,7 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
 
         def submit_run(self, _spec, _seed, *, attempt, on_handle, **_kwargs):
             self.submits.append(attempt)
-            runner._update(spec.run_id, "cancelled")
+            runner_status._update(spec.run_id, "cancelled")
             on_handle(
                 _runpod_remote(
                     "endpoint-race",
@@ -3035,7 +3083,7 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    with pytest.raises(runner._TerminalHandleRace):
+    with pytest.raises(runner_errors._TerminalHandleRace):
         lifecycle._submit_seed_supervised(
             spec,
             spec.seed,
@@ -3043,7 +3091,7 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
             source_snapshot=_SOURCE_SNAPSHOT,
         )
 
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert provider.submits == [0]
     assert [event for event, _handle in provider.teardown] == ["cancel", "destroy"]
     assert status.state == "cancelled"
@@ -3053,8 +3101,8 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
         assert status.remote["endpoint_id"] == "endpoint-race"
         assert status.remote["job_id"] == "job-race"
         assert status.remote["attempt"] == 0
-        raw = runner._load_status_json(spec.run_id)
-        assert raw[runner._CLEANUP_REMOTES_KEY] == [
+        raw = runner_status._load_status_json(spec.run_id)
+        assert raw[runner_state._CLEANUP_REMOTES_KEY] == [
             _runpod_remote("endpoint-race", "job-race", attempt=0)
         ]
 
@@ -3062,29 +3110,28 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
 def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
+    import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     # the attached profile pins a model revision, which makes the post-allocation quote refresh
     # resolve revision-specific geometry from the hub. read the catalog's numbers instead.
     stub_revision_geometry(monkeypatch)
     spec = attach_sft_profile(
         JobSpec(
             run_id="terminal-handle-race-two-remotes",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_examples=1),
             gpu=GpuSpec(type="", max_retries=0),
         )
     )
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _next_attempt=0,
     )
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
@@ -3106,7 +3153,7 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
         supports_weight_cache = False
 
         def submit_run(self, _spec, _seed, *, on_handle, **_kwargs):
-            runner._update(spec.run_id, "cancelled", remote=remote_a)
+            runner_status._update(spec.run_id, "cancelled", remote=remote_a)
             on_handle(remote_b)
             raise AssertionError("terminal handle callback must not return")
 
@@ -3118,7 +3165,7 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
 
-    with pytest.raises(runner._TerminalHandleRace):
+    with pytest.raises(runner_errors._TerminalHandleRace):
         lifecycle._submit_seed_supervised(
             spec,
             spec.seed,
@@ -3126,9 +3173,9 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
             source_snapshot=_SOURCE_SNAPSHOT,
         )
 
-    raw = runner._load_status_json(spec.run_id)
+    raw = runner_status._load_status_json(spec.run_id)
     assert raw["remote"] == remote_a
-    assert raw[runner._CLEANUP_REMOTES_KEY] == [remote_b]
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [remote_b]
 
 
 def test_run_training_bails_when_running_cas_rejects(monkeypatch):
@@ -3137,27 +3184,25 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     _update's return value (False == rejected by terminal-stickiness)."""
     import pytest
 
-    import flash.runner as runner
     from flash.core.spec import JobSpec
     from flash.runner.supervise import lifecycle
 
-    importlib.reload(runner)
-    spec = JobSpec(run_id="cas", model="Qwen/Qwen3.5-4B", algorithm="grpo")
+    spec = JobSpec(run_id="cas", model="Qwen/Qwen3.5-9B", algorithm="grpo")
     # Pre-check sees a live run...
     monkeypatch.setattr(
-        runner,
+        runner_status,
         "get_status",
-        lambda rid: runner.RunStatus(run_id=rid, state="running", spec={}),
+        lambda rid: runner_state.RunStatus(run_id=rid, state="running", spec={}),
     )
     # ...but the CAS rejects because the run went terminal concurrently.
-    monkeypatch.setattr(runner, "_update", lambda *a, **k: False)
+    monkeypatch.setattr(runner_status, "_update", lambda *a, **k: False)
     submitted: list[bool] = []
     monkeypatch.setattr(
-        runner,
+        runner_lifecycle,
         "_submit_seed_supervised",
         lambda *a, **k: submitted.append(True) or {},
     )
 
-    with pytest.raises(runner._RunCancelled):
+    with pytest.raises(runner_errors._RunCancelled):
         lifecycle._run_training(spec, None, prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
     assert submitted == []  # never charged a GPU for an already-terminal run

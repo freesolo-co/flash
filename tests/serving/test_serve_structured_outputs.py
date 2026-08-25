@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-import sys
 import types
 import uuid
 from typing import Any
@@ -25,14 +24,14 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from flash.serving.src.engine_support import _require_reasoning_api_compatibility
-from flash.serving.src.model_config import reasoning_parser_for
-from flash.serving.src.registry import AdapterRegistry
-from flash.serving.src.responses import openai_generate_fields
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
-from flash.serving.src.streaming import openai_chat_stream
+from flash.serving.src.engine.model_config import reasoning_parser_for
+from flash.serving.src.engine.support import _require_reasoning_api_compatibility
+from flash.serving.src.io.responses import openai_generate_fields
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.streaming import openai_chat_stream
+from flash.serving.src.store.registry import AdapterRegistry
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}
 
 
@@ -44,7 +43,7 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
 
 
 @pytest.fixture(scope="module")
-def modal_app_module():
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -57,23 +56,7 @@ def modal_app_module():
     app_mock.local_entrypoint.side_effect = _passthrough_decorator
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    _MISSING = object()
-    prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.modal_app", _MISSING)
-    sys.modules["modal"] = modal_stub
-    # Force a fresh import UNDER the stub (see test_serve_thinking.py for why).
-    sys.modules.pop("flash.serving.modal_app", None)
-
-    import flash.serving.modal_app as modal_app  # imported after the stub is installed
-
-    try:
-        yield modal_app
-    finally:
-        for name, prev in (("modal", prev_modal), ("modal_app", prev_modal_app)):
-            if prev is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
+    return load_modal_app_under_stub(modal_stub)
 
 
 class _Tok:
@@ -333,7 +316,7 @@ def test_reasoning_state_matches_effective_thinking_mode(modal_app_module):
     _generate(non_thinking, structured_outputs={"json": SCHEMA})
     assert non_thinking.engine.reasoning_ended[-1] is True
     assert non_thinking.engine.reasoning_parser_kwargs[-1] == {
-        "chat_template_kwargs": {"enable_thinking": False}
+        "chat_template_kwargs": {"enable_thinking": False, "preserve_thinking": False}
     }
 
     thinking = _engine(modal_app_module, thinking=False, default={"json": SCHEMA})
@@ -344,7 +327,11 @@ def test_reasoning_state_matches_effective_thinking_mode(modal_app_module):
     )
     assert thinking.engine.reasoning_ended[-1] is False
     assert thinking.engine.reasoning_parser_kwargs[-1] == {
-        "chat_template_kwargs": {"tools": ["search"], "enable_thinking": True}
+        "chat_template_kwargs": {
+            "tools": ["search"],
+            "enable_thinking": True,
+            "preserve_thinking": False,
+        }
     }
 
 
@@ -439,6 +426,45 @@ def test_thinking_constraint_requires_configured_parser(modal_app_module):
     assert eng.engine.sampling_params == []
 
 
+def test_stream_generate_attests_the_resolved_revision_before_deltas(modal_app_module):
+    eng = _engine(modal_app_module)
+    revision_id = "run-1@final." + "a" * 40
+    revision = AdapterRecord.model_validate(
+        {
+            "adapter_id": revision_id,
+            "repo_id": "org/run-1",
+            "org_id": "org-1",
+            "base_model": QWEN,
+            "checkpoint": "run-1",
+            "status": "ready",
+            "thinking": False,
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "run-1",
+                "checkpoint_step": None,
+                "hf_revision": "a" * 40,
+            },
+        }
+    )
+
+    async def resolved_lora(_adapter_id, _record_dict=None):
+        return types.SimpleNamespace(lora_name=revision_id), revision
+
+    eng._lora_request = resolved_lora
+
+    async def first_event():
+        stream = eng._stream_generate({"adapter_id": revision_id, "prompt": "hi"})
+        try:
+            return await anext(stream)
+        finally:
+            await stream.aclose()
+
+    ready = asyncio.run(first_event())
+
+    assert ready["type"] == "ready"
+    assert ready["lora_request_adapter"] == revision_id
+
+
 def test_stream_generate_carries_structured_outputs(modal_app_module):
     eng = _engine(modal_app_module)
 
@@ -458,15 +484,18 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     # dict would compare the value to itself and pin nothing at all.
     request_id = ready.pop("request_id")
     replica_id = ready.pop("engine_replica_id")
-    assert uuid.UUID(request_id).version == 4
+    assert uuid.UUID(hex=request_id.removeprefix("fsgen-")).version == 4
     assert uuid.UUID(hex=replica_id).version == 4
     assert ready == {
         "type": "ready",
         "thinking": False,
+        "prompt_token_ids": [1],
+        "completion_token_ids": [1, 2],
         "prompt_tokens": 1,
         "completion_tokens": 2,
         "cached_tokens": 0,
         "cached_tokens_reported": True,
+        "reasoning_tokens": 0,
         "checkpoint": "",
     }
     delta = events[1].copy()
@@ -474,10 +503,14 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     assert delta == {
         "type": "delta",
         "text": "ok",
+        "thinking": False,
+        "prompt_token_ids": [1],
+        "completion_token_ids": [1, 2],
         "prompt_tokens": 1,
         "completion_tokens": 2,
         "cached_tokens": 0,
         "cached_tokens_reported": True,
+        "reasoning_tokens": 0,
         "request_id": request_id,
         "engine_replica_id": replica_id,
         "checkpoint": "",
@@ -536,11 +569,20 @@ def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
         for event in events:
             yield event
 
+    class UsageSession:
+        async def finalize(self, _result):
+            return None
+
+        async def capture(self, _result):
+            return None
+
+        async def fail(self, _result, _code):
+            return None
+
     async def drain():
         return [
             chunk
             async for chunk in openai_chat_stream(
-                MagicMock(),
                 MagicMock(),
                 record=record,
                 events=event_stream(),
@@ -548,7 +590,7 @@ def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
                 completion_id="completion-1",
                 created=1,
                 include_usage=True,
-                caller_org=None,
+                usage_session=UsageSession(),
             )
         ]
 
@@ -581,10 +623,13 @@ def test_stream_close_after_ready_closes_inner_generator(modal_app_module):
         assert ready == {
             "type": "ready",
             "thinking": False,
+            "prompt_token_ids": [1],
+            "completion_token_ids": [1],
             "prompt_tokens": 1,
             "completion_tokens": 1,
             "cached_tokens": 0,
             "cached_tokens_reported": True,
+            "reasoning_tokens": 0,
             "request_id": ready["request_id"],
             "engine_replica_id": ready["engine_replica_id"],
             "checkpoint": "",
@@ -608,8 +653,18 @@ def test_streaming_and_non_streaming_reasoning_state_match(modal_app_module):
     assert events[-1]["type"] == "final"
     assert eng.engine.reasoning_ended == [False, False]
     assert eng.engine.reasoning_parser_kwargs == [
-        {"chat_template_kwargs": {"enable_thinking": True}},
-        {"chat_template_kwargs": {"enable_thinking": True}},
+        {
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "preserve_thinking": False,
+            }
+        },
+        {
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "preserve_thinking": False,
+            }
+        },
     ]
     assert (
         eng.engine.sampling_params[0].structured_outputs

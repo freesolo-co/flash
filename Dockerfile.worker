@@ -1,7 +1,7 @@
 # Flash prebuilt WORKER image — the full training stack baked in for RunPod workers.
 # the worker fetches one pinned source archive at runtime; the trusted verifier is baked here.
 #
-# this image name is defined in flash/providers/_lifecycle/worker.py. it must be
+# this image name is defined in flash/providers/_lifecycle/net/worker.py. it must be
 # published to GHCR and the package set PUBLIC (no registry login is configured) so RunPod can
 # pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
@@ -80,7 +80,7 @@ RUN pip install --no-cache-dir \
 # pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
 # seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
 # (no fla.modules). The git URL is PINNED to a commit (not the moving default branch) for
-# reproducible image builds; keep this sha in lockstep with the worker dependencies in flash/providers/_lifecycle/worker.py.
+# reproducible image builds; keep this sha in lockstep with the worker dependencies in flash/providers/_lifecycle/net/worker.py.
 # tilelang is 0.1.9, not the newest release: flash-qla (added for the sm90 GDN backend) hard-requires
 # tilelang==0.1.9 AND apache-tvm-ffi==0.1.9, so 0.1.11 made this layer unsatisfiable and every image
 # build failed from 2026-08-12 until the downgrade. 0.1.11 was only ever "latest stable at the time"
@@ -161,7 +161,7 @@ RUN set -eu; \
 # example boundaries. Together with fla's ``cu_seqlens`` (which resets the DeltaNet recurrence) it
 # lets the GatedDeltaNet hybrids (Qwen3.5/3.6) PACK boundary-correctly — a 4D block-diagonal mask
 # alone only fixes the full-attention layers (the verl child's capability probe gates the
-# SFT packing path on this import). GPU-validated (RTX 5090, Qwen3.5-0.8B): a packed example's output
+# sft packing path on this import). gpu-validated on the qwen3.5 hybrid architecture: a packed example's output
 # is byte-identical regardless of its neighbors' content (zero cross-example leakage).
 # Arch-bounded to the catalog GPUs to cap build time. PINNED (compiled CUDA extension) for
 # reproducible image builds — an unpinned upstream release could silently change behavior or break
@@ -181,7 +181,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
     && echo "causal_conv1d: installed (GDN packing enabled)"
 
 # weight cache (runtime, not baked): when the shared weight-cache network volume is attached,
-# flash/providers/_lifecycle/worker.py:weight_cache_env redirects only base-model prefetching through
+# flash/providers/_lifecycle/net/worker.py:weight_cache_env redirects only base-model prefetching through
 # FLASH_WEIGHT_CACHE_DIR to the persistent volume for reuse across runs. HF_HOME remains ephemeral,
 # so environment and reward downloads are not shared. executable kernel-jit caches are deliberately
 # not shared because the volume is multi-tenant; a poisoned compiled artifact could affect another
@@ -270,7 +270,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
 # That deliberately exceeds verl's declared vllm<=0.12.0 ceiling. The metadata-clean alternative
 # (0.11.2, which satisfies the ceiling and makes `uv pip check` green) was rejected on a model-
-# contract fact: Qwen/Qwen3.5-4B is flash's DEFAULT_MODEL and enables GRPO+OPD, both of which set
+# contract fact: Qwen/Qwen3.5-9B is flash's DEFAULT_MODEL and enables GRPO+OPD, both of which set
 # rollout.name=vllm, and 0.11.2 registers neither Qwen3_5ForConditionalGeneration nor
 # Qwen3_5MoeForConditionalGeneration, so it cannot run rollouts for the default model at all.
 # The ceiling is stale for the async rollout path regardless: verl 0.8.0's own stable Dockerfile
@@ -360,7 +360,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
 # This is /opt/verl-venv/bin/python -- FLASH_VERL_PYTHON, the interpreter that actually trains -- and
 # a separate network fetch from the verified main-interpreter download above (that wheel is gone by
 # now, --no-cache-dir). uv honours a `#sha256=` url fragment and refuses to install a mismatching
-# artifact, the same mechanism flash/engine/worker/backend_common.py's FLASH_ATTN_INSTALL_SPEC
+# artifact, the same mechanism flash/engine/worker/train/entry/backend_common.py's FLASH_ATTN_INSTALL_SPEC
 # already relies on, so appending it here closes the gap: a replaced release asset is rejected before
 # it lands in the venv that trains, not just in the main interpreter. Unlike that block this install
 # has no `|| echo` fallback, so a mismatch already fails the build outright.
@@ -470,8 +470,8 @@ print('  gdn boundary resets: fla', M.version('flash-linear-attention'), 'and ca
 # from the real _train_body source in providers/runpod/serverless/endpoints.py (single source of truth;
 # _train_body is self-contained — every name is imported inside its body) and run it as the CMD so the
 # image is a self-contained RunPod Serverless worker. Build context is the repo root.
-COPY flash/providers/runpod/serverless/endpoints.py flash/source_snapshot.py docker/make_rp_handler.py /tmp/rpgen/
-RUN cp /tmp/rpgen/source_snapshot.py /source_snapshot.py \
-    && python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/endpoints.py /tmp/rpgen/source_snapshot.py /rp_handler.py \
+COPY flash/providers/runpod/serverless/endpoints.py flash/snapshot/archive.py docker/make_rp_handler.py /tmp/rpgen/
+RUN cp /tmp/rpgen/archive.py /archive.py \
+    && python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/endpoints.py /tmp/rpgen/archive.py /rp_handler.py \
     && python -c "import ast; ast.parse(open('/rp_handler.py').read()); print('rp_handler OK')"
 CMD ["python", "-u", "/rp_handler.py"]
