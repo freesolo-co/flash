@@ -184,8 +184,15 @@ def _optional_string_tuple(value: object, field: str) -> tuple[str, ...] | None:
 def _payload_env_identity(value: object) -> tuple[str | None, str | None]:
     if value is None:
         return None, None
-    if type(value) is not dict or set(value) != {"FLASH_INSTANCE_PAYLOAD"}:
+    if type(value) is not dict:
         raise RunpodApiError("runpod Pod environment identity is invalid")
+    keys = set(value)
+    if not keys <= {"FLASH_INSTANCE_PAYLOAD", "PUBLIC_KEY"}:
+        raise RunpodApiError("runpod Pod environment identity is invalid")
+    if "PUBLIC_KEY" in value:
+        _strict_string(value["PUBLIC_KEY"], "Pod environment identity")
+    if "FLASH_INSTANCE_PAYLOAD" not in value:
+        return None, None
     payload_reference = value["FLASH_INSTANCE_PAYLOAD"]
     if type(payload_reference) is not str or not payload_reference:
         raise RunpodApiError("runpod Pod environment identity is invalid")

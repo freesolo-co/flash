@@ -133,32 +133,133 @@ def _handle(
     )
 
 
-def test_api_parses_only_redacted_pod_fields():
-    parsed = api._pod_rows(
-        [
-            {
-                "id": "pod123456",
-                "name": "flash-0123456789ab-s0-a0",
-                "desiredStatus": "RUNNING",
-                "imageName": "image:tag",
-                "gpuCount": 2,
-                "containerDiskInGb": 120,
-                "costPerHr": 5.0,
-                "machine": {"gpuTypeId": "NVIDIA H100", "dataCenterId": "US-KS-2"},
-                "networkVolume": {"id": "volume123"},
-                "env": {
-                    "FLASH_INSTANCE_PAYLOAD": ("{{ RUNPOD_SECRET_FLASH_PAYLOAD_0123456789abcdef }}")
-                },
-            }
-        ]
-    )
+def _api_pod_row(env: object) -> dict:
+    return {
+        "id": "pod123456",
+        "name": "flash-0123456789ab-s0-a0",
+        "desiredStatus": "RUNNING",
+        "imageName": "image:tag",
+        "gpuCount": 2,
+        "containerDiskInGb": 120,
+        "costPerHr": 5.0,
+        "machine": {"gpuTypeId": "NVIDIA H100", "dataCenterId": "US-KS-2"},
+        "networkVolume": {"id": "volume123"},
+        "env": env,
+    }
+
+
+def test_api_parses_payload_only_env_identity():
+    reference = "{{ RUNPOD_SECRET_FLASH_PAYLOAD_0123456789abcdef }}"
+    parsed = api._pod_rows([_api_pod_row({"FLASH_INSTANCE_PAYLOAD": reference})])
     assert len(parsed) == 1
     assert parsed[0].id == "pod123456"
     assert parsed[0].gpu_type_id == "NVIDIA H100"
-    reference = "{{ RUNPOD_SECRET_FLASH_PAYLOAD_0123456789abcdef }}"
     assert parsed[0].payload_env_sha256 == hashlib.sha256(reference.encode()).hexdigest()
     assert parsed[0].payload_secret_name == "FLASH_PAYLOAD_0123456789abcdef"
     assert reference not in repr(parsed)
+
+
+def test_api_accepts_provider_managed_public_key_without_retaining_it():
+    reference = "{{ RUNPOD_SECRET_FLASH_PAYLOAD_0123456789abcdef }}"
+    public_key = "ssh-ed25519 provider-managed-raw-value"
+    parsed = api._pod_rows(
+        [
+            _api_pod_row(
+                {
+                    "FLASH_INSTANCE_PAYLOAD": reference,
+                    "PUBLIC_KEY": public_key,
+                }
+            )
+        ]
+    )
+    assert parsed[0].payload_env_sha256 == hashlib.sha256(reference.encode()).hexdigest()
+    assert parsed[0].payload_secret_name == "FLASH_PAYLOAD_0123456789abcdef"
+    assert public_key not in repr(parsed)
+
+
+def test_api_rejects_unknown_env_key_without_exposing_value():
+    raw_value = "provider-managed-sensitive-value"
+    with pytest.raises(api.RunpodApiError) as exc_info:
+        api._pod_rows(
+            [
+                _api_pod_row(
+                    {
+                        "FLASH_INSTANCE_PAYLOAD": (
+                            "{{ RUNPOD_SECRET_FLASH_PAYLOAD_0123456789abcdef }}"
+                        ),
+                        "UNKNOWN": raw_value,
+                    }
+                )
+            ]
+        )
+    assert raw_value not in str(exc_info.value)
+    assert raw_value not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize("public_key", [None, 1, [], {}, "", " ", " padded"])
+def test_api_rejects_malformed_provider_managed_public_key(public_key):
+    with pytest.raises(api.RunpodApiError, match="environment identity"):
+        api._pod_rows(
+            [
+                _api_pod_row(
+                    {
+                        "FLASH_INSTANCE_PAYLOAD": (
+                            "{{ RUNPOD_SECRET_FLASH_PAYLOAD_0123456789abcdef }}"
+                        ),
+                        "PUBLIC_KEY": public_key,
+                    }
+                )
+            ]
+        )
+
+
+@pytest.mark.parametrize("env", [[], {"FLASH_INSTANCE_PAYLOAD": "not-a-secret-reference"}])
+def test_api_rejects_malformed_payload_env_identity(env):
+    with pytest.raises(api.RunpodApiError, match="environment identity"):
+        api._pod_rows([_api_pod_row(env)])
+
+
+@pytest.mark.parametrize("env", [None, {}, {"PUBLIC_KEY": "provider-managed-raw-value"}])
+def test_api_preserves_pending_pod_with_incomplete_provider_env(env):
+    pending = _handle()
+    payload = pods._payload_for_handle(pending)
+    row = _api_pod_row(env)
+    row.update(
+        {
+            "name": pending.label,
+            "desiredStatus": "PENDING",
+            "imageName": payload["imageName"],
+            "gpuCount": payload["gpuCount"],
+            "containerDiskInGb": payload["containerDiskInGb"],
+            "dockerStartCmd": payload["dockerStartCmd"],
+            "interruptible": False,
+            "supportPublicIp": False,
+            "volumeMountPath": payload["volumeMountPath"],
+        }
+    )
+    row["machine"] = {
+        "gpuTypeId": payload["gpuTypeIds"][0],
+        "dataCenterId": pending.data_center_id,
+        "secureCloud": True,
+    }
+    observed = api._pod_rows([row])[0]
+    assert observed.payload_env_sha256 is None
+    assert observed.payload_secret_name is None
+    assert pods._pod_identity_is_incomplete(
+        observed,
+        payload,
+        network_volume_id=pending.network_volume_id,
+        data_center_id=pending.data_center_id,
+        allow_preplacement=True,
+    )
+    assert not pods._pod_matches(
+        observed,
+        payload,
+        network_volume_id=pending.network_volume_id,
+        data_center_id=pending.data_center_id,
+        allow_preplacement=True,
+    )
+    assert "provider-managed-raw-value" not in repr(observed)
 
 
 @pytest.mark.parametrize(
