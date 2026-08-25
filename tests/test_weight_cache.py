@@ -400,13 +400,12 @@ def test_build_worker_env_no_cache_without_volume():
 # per-worker ephemeral cache and never touch the shared multi-tenant mount.
 # ---------------------------------------------------------------------------
 def _patch_prefetch_io(monkeypatch, ephemeral_hub):
-    """Stub the side effects of prefetch_model: a fake snapshot_download that records its call and
-    materializes a repo dir under cache_dir, the heartbeat/gpu probes, and the ephemeral hub cache."""
+    """stub prefetch downloads, progress observations, gpu probes, and the ephemeral cache."""
     import huggingface_hub
     import huggingface_hub.constants
 
-    import flash.engine.worker.io.heartbeat as worker_heartbeat
     import flash.engine.worker.io.prefetch as worker_prefetch
+    import flash.engine.worker.io.progress as worker_progress
     import flash.engine.worker.perf as worker_perf
 
     calls = []
@@ -430,9 +429,9 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot)
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(ephemeral_hub))
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(worker_progress, "publish_progress", lambda *a, **k: None)
     monkeypatch.setattr(
-        worker_heartbeat, "liveness_heartbeat", lambda *_args, **_kwargs: contextlib.nullcontext()
+        worker_progress, "observe_phase", lambda *_args, **_kwargs: contextlib.nullcontext()
     )
     return worker_prefetch, calls
 
@@ -923,8 +922,8 @@ def test_cache_drop_does_not_advance_gpu_walk(monkeypatch):
 
 
 def test_cache_drop_then_walks_on_next_failure(monkeypatch):
-    # After the cache is dropped, a SUBSEQUENT failure still walks to the next-cheapest GPU.
-    seen = _supervised_walk(monkeypatch, {0: "no_capacity", 1: "stalled"})
+    # after the cache is dropped, a later failure still walks to the next-cheapest gpu
+    seen = _supervised_walk(monkeypatch, {0: "no_capacity", 1: "job_preempted"})
     assert seen[0][0] == "flash-weights"
     assert seen[1][0] is None
     assert seen[2][0] is None
@@ -933,12 +932,11 @@ def test_cache_drop_then_walks_on_next_failure(monkeypatch):
 
 
 def test_non_capacity_failure_keeps_weight_cache(monkeypatch):
-    # An ordinary infra flake (stall) on a volume attempt must NOT drop the cache — the warm-weights
-    # benefit should survive ordinary retries, and the GPU walk advances as usual.
-    seen = _supervised_walk(monkeypatch, {0: "stalled"})
+    # explicit preemption keeps the cache and advances the gpu walk normally
+    seen = _supervised_walk(monkeypatch, {0: "job_preempted"})
     assert seen[0][0] == "flash-weights"
     assert seen[1][0] == "flash-weights"
-    assert seen[1][1] != seen[0][1]  # stall walks to the next GPU (cache retained)
+    assert seen[1][1] != seen[0][1]
 
 
 # ---------------------------------------------------------------------------

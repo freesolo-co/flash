@@ -20,8 +20,8 @@ import pytest
 
 import flash.engine.worker.entry.sft as worker_sft
 import flash.engine.worker.entry.worker as worker_entry
-import flash.engine.worker.io.heartbeat as worker_heartbeat
 import flash.engine.worker.io.hf as worker_hf
+import flash.engine.worker.io.progress as worker_progress
 import flash.engine.worker.perf as worker_perf
 import flash.engine.worker.runtime.kernel_warmup as worker_kernel_warmup
 import flash.engine.worker.runtime.state as worker_state
@@ -741,7 +741,9 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
     monkeypatch.setattr(
         "flash.providers.core.registry.get_provider",
         lambda _name: SimpleNamespace(
-            poll=lambda *_args, **_kwargs: PollResult(False, failure="stalled", detail="lost")
+            poll=lambda *_args, **_kwargs: PollResult(
+                False, failure="job_preempted", detail="resource lost"
+            )
         ),
     )
     monkeypatch.setattr(
@@ -829,10 +831,12 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
     monkeypatch.setattr(
         "flash.providers.core.registry.get_provider",
         lambda _name: SimpleNamespace(
-            poll=lambda *_args, **_kwargs: PollResult(False, failure="stalled", detail="lost")
+            poll=lambda *_args, **_kwargs: PollResult(
+                False, failure="job_preempted", detail="resource lost"
+            )
         ),
     )
-    monkeypatch.setattr(supervise_lifecycle, "_runpod_completed_metrics", lambda *_a, **_k: None)
+    monkeypatch.setattr(supervise_lifecycle, "_attempt_result_metrics", lambda *_a, **_k: None)
     monkeypatch.setattr(supervise_lifecycle, "_strict_teardown_handle", lambda *_a, **_k: True)
     monkeypatch.setattr(runner_artifacts, "stage_environment_package", transient_stage)
     monkeypatch.setattr(runner_reconciliation, "_compare_and_clear_remote", record_clear)
@@ -887,7 +891,7 @@ def test_worker_cleans_materialized_package_after_training_handler(
     monkeypatch.setattr(worker_perf, "_ensure_fla_fastpath_on_hopper", lambda: None)
     monkeypatch.setattr(worker_perf, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_progress, "publish_progress", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker_kernel_warmup, "load_mega_cache", lambda: None)
     monkeypatch.setattr(
         worker_entry.os,

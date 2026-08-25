@@ -7,7 +7,6 @@ import tempfile
 
 import pytest
 
-import flash.engine.worker.entry.worker as worker_entry
 import flash.runner.accounting.artifacts as runner_artifacts
 import flash.runner.accounting.costs as runner_costs
 import flash.runner.accounting.reconciliation as runner_reconciliation
@@ -360,193 +359,20 @@ def test_status_save_rejects_invalid_creation_time(monkeypatch, tmp_path, create
         )
 
 
-def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
-        from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-        from tests._helpers.profile import satisfy_sft_profile
+def test_status_projection_sanitizer_bounds_lists():
+    from flash.runner.lifecycle.protocol import bounded_json
 
-        spec = JobSpec(
-            run_id="hb",
-            model="Qwen/Qwen3.5-9B",
-            algorithm="sft",
-            environment=EnvironmentSpec(id="team/example"),
-            train=TrainSpec(max_examples=8),
-        )
-        status = runner_submit.submit_job(satisfy_sft_profile(monkeypatch, spec), dry_run=True)
-        status.state = "running"
-        runner_state._save_status(status)
+    metrics = [{"step": step, "reward": step / 100} for step in range(100)]
+    sanitized = bounded_json({"metrics": metrics, "other": list(range(100))})
 
-        runner_status.record_heartbeat(
-            "hb",
-            {
-                "stage": "sft_step",
-                "step": 20,
-                "ts": 123.0,
-                "gpu": {
-                    "device_name": "RTX 5090",
-                    "gpu_util_pct": 94,
-                    "memory_used_gb": 19.5,
-                    "processes": [{"pid": 42, "process_name": "python", "used_memory_gb": 19.0}],
-                },
-            },
-        )
-
-        out = runner_status.get_status("hb")
-        assert out.state == "running"
-        assert out.last_heartbeat["stage"] == "sft_step"
-        assert out.last_heartbeat["step"] == 20
-        assert out.gpu_status["device_name"] == "RTX 5090"
-        assert out.gpu_status["gpu_util_pct"] == 94
-
-
-def test_an_error_heartbeat_carries_gpu_diagnostics_through_to_status(monkeypatch):
-    """The failure heartbeat must spell its diagnostics `gpu`, the key the consumer reads.
-
-    a wrong spelling loses the FAILURE's own diagnostics -- the memory figure that says whether an
-    oom was the cause -- and leaves `gpu_status` showing the last healthy sample instead, which
-    reads as if nothing was wrong. every other producer already spells it `gpu`.
-    """
-    import inspect
-    import tempfile as _tempfile
-
-    # the producer half: the error path must not reintroduce a spelling the consumer ignores.
-    assert "diag=gpu_diagnostics()" not in inspect.getsource(worker_entry)
-
-    with _tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
-        from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-        from tests._helpers.profile import satisfy_sft_profile
-
-        spec = JobSpec(
-            run_id="hb-oom",
-            model="Qwen/Qwen3.5-9B",
-            algorithm="sft",
-            environment=EnvironmentSpec(id="team/example"),
-            train=TrainSpec(max_examples=8),
-        )
-        status = runner_submit.submit_job(satisfy_sft_profile(monkeypatch, spec), dry_run=True)
-        status.state = "running"
-        runner_state._save_status(status)
-
-        runner_status.record_heartbeat(
-            "hb-oom",
-            {"stage": "sft_step", "step": 20, "gpu": {"device_name": "B200", "gpu_util_pct": 99}},
-        )
-        # the consumer half: the failure heartbeat's own diagnostics must survive, and must not be
-        # replaced by None just because the run is now failing.
-        runner_status.record_heartbeat(
-            "hb-oom",
-            {
-                "stage": "error_sft",
-                "oom": True,
-                "gpu": {"device_name": "B200", "memory_used_gb": 179.4},
-            },
-        )
-
-        out = runner_status.get_status("hb-oom")
-        assert out.gpu_status is not None, "the oom heartbeat cleared the gpu snapshot"
-        assert out.gpu_status["memory_used_gb"] == 179.4
-
-
-def test_a_heartbeat_without_gpu_keeps_the_attempts_snapshot(monkeypatch):
-    """Only 8 of the ~51 heartbeat producers send `gpu`; the rest must not blank the snapshot.
-
-    the periodic liveness tick samples the card, but a checkpoint upload can run for minutes
-    between two of them, and every heartbeat in that window omits `gpu`. assigning it
-    unconditionally made `flash runs status` and the `gpuStatus` API field report no GPU for a
-    healthy running job -- and the longer the upload, the longer the blank.
-
-    a NEW attempt still starts clean: it is a different card, so carrying the old one forward would
-    describe hardware this attempt never touched.
-    """
-    import tempfile as _tempfile
-
-    with _tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
-        from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-        from tests._helpers.profile import satisfy_sft_profile
-
-        spec = JobSpec(
-            run_id="hb-carry",
-            model="Qwen/Qwen3.5-9B",
-            algorithm="sft",
-            environment=EnvironmentSpec(id="team/example"),
-            train=TrainSpec(max_examples=8),
-        )
-        status = runner_submit.submit_job(satisfy_sft_profile(monkeypatch, spec), dry_run=True)
-        status.state = "running"
-        runner_state._save_status(status)
-
-        runner_status.record_heartbeat(
-            "hb-carry",
-            {"stage": "sft_step", "attempt": 1, "gpu": {"device_name": "B200", "gpu_util_pct": 91}},
-        )
-        # the long silent stretch: a checkpoint upload, which sends no gpu sample at all.
-        runner_status.record_heartbeat("hb-carry", {"stage": "checkpoint_uploading", "attempt": 1})
-
-        out = runner_status.get_status("hb-carry")
-        assert out.gpu_status is not None, "a checkpoint heartbeat blanked the gpu snapshot"
-        assert out.gpu_status["device_name"] == "B200"
-        assert out.gpu_status["gpu_util_pct"] == 91
-
-        # a retry is a different card; nothing from attempt 1 may describe it.
-        runner_status.record_heartbeat("hb-carry", {"stage": "boot", "attempt": 2})
-        assert runner_status.get_status("hb-carry").gpu_status is None, (
-            "attempt 2 inherited attempt 1's gpu snapshot"
-        )
-
-
-def test_status_sanitizer_preserves_metric_backlog_and_bounds_other_lists():
-
-    metrics = [{"step": step, "reward": step / 1025} for step in range(1025)]
-    sanitized = runner_status._sanitize_status_value(
-        {"metrics_last": metrics, "other": list(range(32))}
-    )
-
-    assert len(sanitized["metrics_last"]) == 1024
-    assert sanitized["metrics_last"][0]["step"] == 1
-    assert sanitized["metrics_last"][-1]["step"] == 1024
-    assert sanitized["other"] == list(range(16))
-
-
-def test_record_heartbeat_persists_finalize_liveness_ping_with_step(monkeypatch):
-    """The finalize-phase daemon pings (liveness=True, stage sft_finalizing, step stamped) must
-    land in status.last_heartbeat intact: cancel billing reads .step from the freshest persisted
-    heartbeat, and the CLI reads .stage/.ts/.liveness for the status panel."""
-    with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
-        from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-        from tests._helpers.profile import satisfy_sft_profile
-
-        spec = JobSpec(
-            run_id="hbf",
-            model="Qwen/Qwen3.5-9B",
-            algorithm="sft",
-            environment=EnvironmentSpec(id="team/example"),
-            train=TrainSpec(max_examples=8),
-        )
-        status = runner_submit.submit_job(satisfy_sft_profile(monkeypatch, spec), dry_run=True)
-        status.state = "running"
-        runner_state._save_status(status)
-
-        runner_status.record_heartbeat(
-            "hbf",
-            {"stage": "sft_finalizing", "step": 126, "ts": 123.0, "liveness": True},
-        )
-        out = runner_status.get_status("hbf")
-        assert out.last_heartbeat["stage"] == "sft_finalizing"
-        assert out.last_heartbeat["step"] == 126
-        assert out.last_heartbeat["liveness"] is True
-        assert runner_costs.actual_steps_run(out) == 126, (
-            "a cancel during finalize must bill the actual steps trained"
-        )
+    assert len(sanitized["metrics"]) == 64
+    assert sanitized["metrics"][0]["step"] == 0
+    assert sanitized["metrics"][-1]["step"] == 63
+    assert sanitized["other"] == list(range(64))
 
 
 def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypatch):
-    """finished_at freezes the training-teardown time on the FIRST terminal transition and is NOT
-    moved by later updated_at bumps (heartbeat/deploy/reconcile) — so reconciliation has an
-    immutable instance run_end even for a run deployed (or heartbeat-touched) after completion."""
+    """finished_at remains fixed after later resource observations and terminal rewrites."""
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
         from flash.core.spec import JobSpec, TrainSpec
@@ -564,6 +390,7 @@ def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypa
         s.state = "running"
         s.finished_at = None  # dry_run created via direct state set, never stamped finished_at
         runner_state._save_status(s)
+        runner_attempts._reserve_attempt_record("fa")
 
         # first terminal transition stamps finished_at to the teardown time
         assert runner_status._update("fa", "done", cost_usd=1.0) is True
@@ -572,13 +399,19 @@ def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypa
         teardown = done.finished_at
         assert teardown == done.updated_at
 
-        # a later updated_at bump (a late heartbeat after terminal) must NOT move finished_at
-        runner_status.record_heartbeat("fa", {"stage": "rl", "step": 1, "ts": 123.0})
+        # a later resource observation may move updated_at but not finished_at
+        attempt = runner_status._current_attempt(done)
+        assert runner_status.record_resource(
+            "fa",
+            {"state": "terminated", "observed_at": 123.0},
+            attempt_id=attempt.attempt_id,
+            fence=attempt.fence,
+        )
         bumped = runner_status.get_status("fa")
         assert bumped.updated_at >= done.updated_at
         assert bumped.finished_at == teardown
 
-        # a same-state terminal re-write (e.g. terminal cost fields) keeps the original too
+        # a same-state terminal rewrite keeps the original too
         runner_status._update("fa", "done", cost_usd=2.0)
         assert runner_status.get_status("fa").finished_at == teardown
 
@@ -2082,63 +1915,6 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     assert status.state == "running"
     assert status.remote == remote
     assert len(scheduled) == 1
-
-
-def test_completed_attempt_metrics_rereads_a_marker_that_is_not_visible_yet(monkeypatch):
-    """Recovery must RE-READ the marker, not sample it once.
-
-    The marker and metrics are two uploads of the same completion racing HF read-after-write lag, so
-    a marker that is invisible on the first read routinely surfaces moments later. Reading once would
-    report ABSENT and let the caller tear down an attempt that had already finished its paid work.
-    """
-    import io
-
-    import flash.providers._lifecycle.instances.poll_instance as instance_poll
-    import flash.providers._lifecycle.instances.terminal_artifacts as ta
-    import flash.providers.artifacts.hf as hf_artifacts
-    import flash.runner.supervise.lifecycle as lifecycle
-    from flash.core.spec import JobSpec, TrainSpec
-
-    spec = JobSpec(
-        run_id="lagging-marker",
-        model="Qwen/Qwen3.5-9B",
-        algorithm="sft",
-        train=TrainSpec(hf_repo="org/repo"),
-    )
-    # the reread window must stay NONZERO: the shared cutoff is `now + tries * wait_s`, so a zero
-    # wait would expire the budget before the second read and the test would pass for the wrong
-    # reason. sleep is faked instead, leaving the retry loop real.
-    monkeypatch.setattr(instance_poll, "_TERMINAL_REREAD_WAIT_S", 5.0)
-    monkeypatch.setattr(lifecycle.time, "time", lambda: 201.0)
-    monkeypatch.setattr(ta.time, "sleep", lambda _s: None)
-    marker_reads = {"n": 0}
-
-    def artifact_reader(_repo, path):
-        def read(force=False):
-            if path.endswith("/vast_attempt0.json"):
-                marker_reads["n"] += 1
-                # invisible on the first read, exactly as HF lag presents it
-                if marker_reads["n"] <= 1:
-                    return None
-                return (
-                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
-                    '"run_id":"lagging-marker","ts":199.0}'
-                )
-            return json.dumps({"train_tokens": 4096})
-
-        return read
-
-    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
-
-    assert lifecycle._completed_attempt_metrics(
-        spec,
-        provider="vast",
-        attempt=0,
-        launch_floor=100.0,
-        deadline_at=200.0,
-        log=io.StringIO(),
-    ) == {"train_tokens": 4096}
-    assert marker_reads["n"] >= 2  # a single sample would have reported ABSENT
 
 
 def test_completed_attempt_metrics_never_adopts_an_unverifiable_marker(monkeypatch):

@@ -1,14 +1,9 @@
-"""Regression test: the GPU worker must hard-exit on success so a hanging vLLM/torch
-teardown can't stall the run.
+"""regression coverage for hard-exiting after successful worker completion.
 
-Bug: after the RL train phase uploaded its adapter + train_meta, the worker process hung at
-interpreter shutdown (colocated-vLLM NCCL/CUDA teardown deadlock). Because the Flash handler
-runs the train phase via a *blocking* ``subprocess.run`` and only starts the eval phase once
-it returns, the eval phase never started — the run froze at the ``rl_train_done`` heartbeat
-until the wall-clock cap. ``check=False`` tolerated a segfault-at-exit but not a hang.
-
-Fix: ``worker.main`` calls ``os._exit(0)`` after the handler completes (all artifacts are
-already persisted to HF inside the handler), bypassing the hanging teardown.
+After the rl train phase persisted its adapter and metadata, interpreter shutdown could hang in
+colocated vllm nccl or cuda teardown. The blocking parent process then could not advance to the
+next phase before the fixed work deadline. ``worker.main`` bypasses that teardown by calling
+``os._exit(0)`` only after the handler completes and its artifacts are durable.
 """
 
 from __future__ import annotations
@@ -18,14 +13,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-import huggingface_hub
-import pytest
-
 import flash.engine.worker.entry.opd as opd_entry
 import flash.engine.worker.entry.sft as sft_entry
 import flash.engine.worker.entry.worker as worker
-import flash.engine.worker.io.heartbeat as heartbeat_io
-import flash.engine.worker.io.hf as hf_io
+import flash.engine.worker.io.progress as progress_io
 import flash.engine.worker.perf as worker_perf
 import flash.engine.worker.runtime.state as worker_state
 from flash.engine.support.worker_entrypoint import WORKER_FAILURE_LINE
@@ -41,9 +32,10 @@ class _HardExit(BaseException):
 
 def _patch_common(monkeypatch, fake_exit):
     monkeypatch.setattr(worker.os, "_exit", fake_exit)
-    monkeypatch.setattr(worker_state, "HF_REPO", "")  # skip the idempotency DONE check
+    monkeypatch.setattr(worker_state, "HF_REPO", "")  # keep artifact transport out of this test
     monkeypatch.setattr(worker_state, "RUN_MODE", "sft")
-    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(progress_io, "publish_progress", lambda *a, **k: None)
+    monkeypatch.setattr(worker.result_io, "publish_result", lambda **_kwargs: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
     # main() runs the real boot steps before the handler; this test exercises the hard-exit flow,
     # so stub out the Hopper fla fast-path setup.
@@ -199,83 +191,6 @@ def test_worker_dispatches_opd_run_mode(monkeypatch):
     assert ran["v"] is True, "RUN_MODE=opd must invoke run_opd"
     assert raised is not None
     assert raised.code == 0
-
-
-def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_path):
-    """DONE present but a transient HF read of the persisted metrics.json must surface as a RETRIABLE
-    RetriableInfraError (so the run reschedules and a fresh worker re-enters the idempotency path) —
-    NOT a SystemExit, which is a BaseException that bypasses the retriable-stamping handler and would
-    report a genuinely-succeeded run as a fatal failure."""
-    hb = []
-    exited = {"v": False}
-
-    def fake_exit(code=0):
-        exited["v"] = True
-        raise _HardExit(code)
-
-    monkeypatch.setattr(worker.os, "_exit", fake_exit)
-    monkeypatch.setattr(worker_state, "HF_REPO", "owner/run-dataset")
-    monkeypatch.setattr(hf_io, "hf_prefix", lambda: "seed0")
-    monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **k: {})
-    monkeypatch.setattr(hf_io, "error_artifact_name", lambda *a, **k: "error.txt")
-    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *a, **k: None)
-    monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *a, **k: hb.append((a, k)))
-
-    done_marker = tmp_path / "DONE"
-    done_marker.write_text("")
-
-    def fake_download(*, repo_id, repo_type, filename, token=None):
-        if filename.endswith("/DONE"):
-            return str(done_marker)
-        raise OSError("503 transient HF read")  # metrics.json read keeps failing
-
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
-
-    with pytest.raises(worker_perf.RetriableInfraError):
-        worker.main()
-    assert exited["v"] is False, "must not hard-exit when the replay read failed"
-    err_hbs = [k for _a, k in hb if k.get("retriable") is True]
-    assert err_hbs, "the error heartbeat must be stamped retriable=True so the run reschedules"
-
-
-def test_idempotency_metrics_reread_backoff_stops_at_run_deadline(monkeypatch, tmp_path):
-    clock = {"now": 100.0}
-    sleeps = []
-    downloads = []
-
-    monkeypatch.setenv("FLASH_RUN_DEADLINE_AT", "101.0")
-    monkeypatch.setattr(worker.os, "_exit", lambda code=0: (_ for _ in ()).throw(_HardExit(code)))
-    monkeypatch.setattr(worker_state, "HF_REPO", "owner/run-dataset")
-    monkeypatch.setattr(hf_io, "hf_prefix", lambda: "seed0")
-    monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
-    monkeypatch.setattr(hf_io, "error_artifact_name", lambda *_args, **_kwargs: "error.txt")
-    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(worker.time, "time", lambda: clock["now"])
-
-    def sleep(seconds):
-        sleeps.append(seconds)
-        clock["now"] += seconds
-
-    monkeypatch.setattr(worker.time, "sleep", sleep)
-    done_marker = tmp_path / "DONE"
-    done_marker.write_text("")
-
-    def fake_download(*, repo_id, repo_type, filename, token=None):
-        downloads.append(filename)
-        if filename.endswith("/DONE"):
-            return str(done_marker)
-        raise OSError("private provider response")
-
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
-
-    with pytest.raises(worker_perf.RetriableInfraError) as exc_info:
-        worker.main()
-
-    assert downloads == ["seed0/DONE", "seed0/metrics.json"]
-    assert sleeps == [1.0]
-    assert "private" not in str(exc_info.value)
 
 
 def test_worker_does_not_hard_exit_on_failure(monkeypatch):
