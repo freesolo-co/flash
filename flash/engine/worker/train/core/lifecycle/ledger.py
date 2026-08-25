@@ -11,7 +11,7 @@ INDEPENDENT rather than a linear enum, because both publication orders occur leg
 
 - sft and opd publish the deployable from ``before_upload``, so a required step reaches
   ``deployable_published`` BEFORE ``resume_uploaded``.
-- grpo stages a required adapter while its gradient gate is shut, uploads resume state meanwhile,
+- grpo stages a required adapter while its terminal publication latch is shut, uploads resume state meanwhile,
   and publishes the deployable on a later sweep -- the opposite order.
 
 A single ordered enum would have to call one of those orders a regression. Independent monotonic
@@ -19,7 +19,7 @@ facts describe both without ranking them.
 
 This module holds no filesystem, artifact-store, threading or policy logic on purpose: it replaces
 misleading state, it does not absorb publication behaviour. Which steps are eligible, when a
-gradient gate opens, whether a backlog may be coalesced and what a retry contract requires all stay
+terminal publication latch opens, whether a backlog may be coalesced and what a retry contract requires all stay
 with the algorithm that owns them.
 """
 
@@ -118,7 +118,7 @@ class CheckpointLedger:
         the merge and the multi-GB resume upload for state the artifact store already holds.
 
         A required step is deliberately NOT claimed as discovered: the previous attempt may have
-        uploaded resume state while a gradient gate withheld its deployable adapter, and this
+        uploaded resume state while a terminal publication latch withheld its deployable adapter, and this
         watcher must still stage and publish that adapter. The deployable is a separate artifact
         and is credited only by a caller that confirmed it, never inferred from the step counter.
         """

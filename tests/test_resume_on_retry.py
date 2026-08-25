@@ -373,6 +373,17 @@ def _staged_checkpoint(root, step, *, world_size=None, fsdp_version=2, shards=0,
     for kind in ("model", "optim", "extra_state"):
         for rank in range(shards):
             (inner / f"{kind}_world_size_{shards}_rank_{rank}.pt").write_bytes(b"shard")
+    (src / "_flash_resume_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "checkpoint_step": step,
+                "checkpoint_attempt": 0,
+                "required_adapters": [],
+                "first_positive_grad_step": 1,
+            }
+        )
+    )
     return src
 
 
@@ -627,13 +638,17 @@ def test_sft_flat_layout_is_guarded_too(monkeypatch, tmp_path, capsys):
 
 
 def test_sft_and_grpo_restore_use_the_canonical_worker_helper():
+    import inspect
+
     from flash.engine.worker.train.entry import sft_train
     from flash.engine.worker.verl import checkpoints as verl_checkpoints
 
     assert sft_train._restore_verl_resume.func is verl_checkpoints.restore_verl_resume
     assert sft_train._restore_verl_resume.keywords == {"job_label": "SFT"}
-    assert rl_checkpoints._restore_verl_resume.func is verl_checkpoints.restore_verl_resume
-    assert rl_checkpoints._restore_verl_resume.keywords == {"job_label": "GRPO"}
+    grpo_source = inspect.getsource(rl_checkpoints._restore_verl_resume)
+    assert "verl_checkpoints.inspect_resume_checkpoint" in grpo_source
+    assert "verl_checkpoints.stage_verl_resume" in grpo_source
+    assert 'job_label="GRPO"' in grpo_source
 
 
 def _fake_hf_resume_checkpoint_over(*candidates):
