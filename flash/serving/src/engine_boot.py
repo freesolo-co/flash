@@ -28,8 +28,6 @@ def load_tokenizer(
     base_model: str,
     settings: Any,
     cfg: Any,
-    *,
-    historical_cleanup: bool = False,
 ) -> tuple[Any, Any]:
     """Return ``(processor, tokenizer)`` for ``base_model``.
 
@@ -39,17 +37,11 @@ def load_tokenizer(
     from transformers import AutoProcessor, AutoTokenizer
 
     processor = None
-    tokenizer_model = tokenizer_model_for(
-        base_model,
-        historical_cleanup=historical_cleanup,
-    )
-    revisions = immutable_serving_revisions(
-        base_model,
-        historical_cleanup=historical_cleanup,
-    )
+    tokenizer_model = tokenizer_model_for(base_model)
+    revisions = immutable_serving_revisions(base_model)
     tokenizer_revision = revisions.get("tokenizer_revision")
     processor_revision = revisions.get("processor_revision")
-    if supports_image_input(base_model, historical_cleanup=historical_cleanup):
+    if supports_image_input(base_model):
         revision_kwargs = {"revision": processor_revision} if processor_revision else {}
         processor = AutoProcessor.from_pretrained(
             tokenizer_model,
@@ -76,10 +68,8 @@ def load_tokenizer(
 
 def _multimodal_args(
     base_model: str,
-    *,
-    historical_cleanup: bool = False,
 ) -> dict[str, Any]:
-    image_limit = image_limit_for(base_model, historical_cleanup=historical_cleanup)
+    image_limit = image_limit_for(base_model)
     if image_limit is None:
         return {}
     return {
@@ -145,8 +135,6 @@ def engine_args_for(
     base_model: str,
     overrides: dict[str, Any],
     cfg: Any,
-    *,
-    historical_cleanup: bool = False,
 ) -> dict[str, Any]:
     """The ``AsyncEngineArgs`` kwargs for ``base_model``, as a plain dict.
 
@@ -170,12 +158,7 @@ def engine_args_for(
     # whole card and the subsequent LoRA-module creation OOMs — so the 35B caps it low.
     if "max_num_seqs" in overrides:
         extra["max_num_seqs"] = int(overrides["max_num_seqs"])
-    extra.update(
-        _multimodal_args(
-            base_model,
-            historical_cleanup=historical_cleanup,
-        )
-    )
+    extra.update(_multimodal_args(base_model))
 
     parser = overrides.get("reasoning_parser")
     reasoning_parser = str(parser) if parser else None
@@ -224,26 +207,11 @@ def load_engine_config(
     base_model: str,
     settings: Any,
     cfg: Any,
-    *,
-    historical_cleanup: bool = False,
 ) -> tuple[Any, Any, dict[str, Any], dict[str, Any]]:
     """Resolve tokenizer, overrides, and engine kwargs for one engine startup."""
-    processor, tokenizer = load_tokenizer(
-        base_model,
-        settings,
-        cfg,
-        historical_cleanup=historical_cleanup,
-    )
-    overrides = engine_overrides_for(
-        base_model,
-        historical_cleanup=historical_cleanup,
-    )
-    kwargs = engine_args_for(
-        base_model,
-        overrides,
-        cfg,
-        historical_cleanup=historical_cleanup,
-    )
+    processor, tokenizer = load_tokenizer(base_model, settings, cfg)
+    overrides = engine_overrides_for(base_model)
+    kwargs = engine_args_for(base_model, overrides, cfg)
     return processor, tokenizer, overrides, kwargs
 
 

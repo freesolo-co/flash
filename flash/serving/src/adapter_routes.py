@@ -13,6 +13,7 @@ from typing import Any, TypeGuard
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
 from flash.serving.src.context import ServingContext
+from flash.serving.src.model_config import is_supported_base_model
 from flash.serving.src.registration import activate_revision, persist_revision
 from flash.serving.src.schemas import (
     AdapterActivationRequest,
@@ -237,18 +238,19 @@ async def remove_adapter(
     # the rows that durably converged.
     result = await disable_matched(matches, get_authoritative=get_authoritative)
 
-    # phase 2: remove every durably disabled row from routing immediately. gpu eviction is
-    # deferred until after either the success or conflict response, so a scaled-to-zero
-    # engine's cold start cannot make undeploy callers time out.
-    for cleanup_record, expected_generation in apply_teardown(
-        context.router, result.pending_teardown
-    ):
-        background_tasks.add_task(
-            context.unregister_safe,
-            cleanup_record.base_model,
-            cleanup_record.adapter_id,
-            expected_generation,
-        )
+    # phase 2: remove every durably disabled row from routing immediately. active hosted models
+    # schedule exact gpu eviction after the response. retired models have no engine to start, so their
+    # durable disable and router removal are the complete teardown.
+    cleanup_records = apply_teardown(context.router, result.pending_teardown)
+    active_gpu_cleanup = is_supported_base_model(matches[0].base_model)
+    if active_gpu_cleanup:
+        for cleanup_record, expected_generation in cleanup_records:
+            background_tasks.add_task(
+                context.unregister_safe,
+                cleanup_record.base_model,
+                cleanup_record.adapter_id,
+                expected_generation,
+            )
 
     if failure_response := result.failure_response(run_id, background_tasks):
         return failure_response
@@ -259,4 +261,5 @@ async def remove_adapter(
         matches[0].base_model,
         result.disabled_aliases,
         result.disabled_revisions,
+        gpu_cleanup=None if active_gpu_cleanup else "not_applicable_retired_model",
     )

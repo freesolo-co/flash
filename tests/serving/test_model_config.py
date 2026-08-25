@@ -5,10 +5,9 @@ from __future__ import annotations
 import pytest
 
 from flash.serving.src.model_config import (
+    _QWEN38_HOSTED_CANDIDATE,
     SERVING_MODELS,
     base_models,
-    candidate_engine_overrides_for,
-    candidate_immutable_serving_revisions,
     engine_overrides_for,
     gpu_for,
     image_limit_for,
@@ -124,7 +123,9 @@ def test_9b_has_l40s_rank128_serving_overrides() -> None:
 
 def test_qwen38_27b_is_a_pinned_pending_hosted_candidate() -> None:
     base_model = "Qwen/Qwen3.8-27B"
-    ov = candidate_engine_overrides_for(base_model)
+    candidate = _QWEN38_HOSTED_CANDIDATE
+    assert candidate["base_model"] == base_model
+    ov = candidate["engine"]
 
     assert base_model not in base_models()
     assert is_supported_base_model(base_model) is False
@@ -140,7 +141,9 @@ def test_qwen38_27b_is_a_pinned_pending_hosted_candidate() -> None:
     assert ov["enforce_eager"] is False
     assert ov["reasoning_parser"] == "qwen3"
     assert ov["model_revision"] == "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
-    assert candidate_immutable_serving_revisions(base_model) == {
+    assert {
+        key: ov[key] for key in ("model_revision", "tokenizer_revision", "processor_revision")
+    } == {
         "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
         "tokenizer_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
         "processor_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",

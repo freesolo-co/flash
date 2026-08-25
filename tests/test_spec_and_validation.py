@@ -720,13 +720,14 @@ def test_lora_rank_must_fit_default_serving_cap() -> None:
         spec_from_dict(_raw(**{"train.lora_rank": 129}))
 
 
-def test_pending_hosted_candidate_retains_serving_rank_metadata() -> None:
+def test_inactive_qwen38_serving_candidate_does_not_cap_training_rank() -> None:
     from flash.core.catalog import serving_lora_rank_cap
 
-    cap = serving_lora_rank_cap("Qwen/Qwen3.8-27B")
-    assert cap == 64
-    with pytest.raises(ConfigError, match="serving max_lora_rank=64"):
-        spec_from_dict(_raw(model="Qwen/Qwen3.8-27B", **{"train.lora_rank": cap + 1}))
+    assert serving_lora_rank_cap("Qwen/Qwen3.8-27B") is None
+    assert (
+        spec_from_dict(_raw(model="Qwen/Qwen3.8-27B", **{"train.lora_rank": 128})).train.lora_rank
+        == 128
+    )
 
 
 def test_bare_environment_id_is_rejected() -> None:

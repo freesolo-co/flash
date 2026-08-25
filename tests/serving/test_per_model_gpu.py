@@ -2,7 +2,7 @@
 
 Modal fixes a class's GPU and concurrency at decoration time, so the serving app registers one
 ``LoraEngine`` ``@app.cls`` per distinct (GPU tier, max_inputs) key and dispatches each base model to
-its class (9b -> l40s, 27b -> h100, 35b -> h200). modal_app imports the ``modal`` sdk
+its class (9b -> l40s, 35b -> h200). modal_app imports the ``modal`` sdk
 at module top, which isn't installed offline, so we stub it just enough to import the module and
 reach the built engine classes.
 """
@@ -499,9 +499,6 @@ def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
         assert cls.pinned_gpu == gpu
     assert by_key[("L40S", 16)].pinned_gpu == "L40S"
     assert by_key[("H200", 16)].pinned_gpu == "H200"
-    cleanup = modal_app_module._HISTORICAL_QWEN36_27B_CLEANUP_ENGINE
-    assert cleanup.pinned_gpu == "H100"
-    assert cleanup.historical_cleanup_only is True
 
 
 def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
@@ -708,38 +705,6 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
     ]
 
 
-def test_historical_qwen36_27b_unregister_uses_dedicated_cleanup_dispatch(
-    modal_app_module, monkeypatch
-):
-    calls = []
-
-    async def _unregister(adapter_id, expected_generation):
-        calls.append((adapter_id, expected_generation))
-
-    engine = types.SimpleNamespace(
-        unregister=types.SimpleNamespace(remote=types.SimpleNamespace(aio=_unregister))
-    )
-    bound_models = []
-
-    def historical_class(*, base_model):
-        bound_models.append(base_model)
-        return engine
-
-    monkeypatch.setitem(
-        modal_app_module._HISTORICAL_CLEANUP_ENGINES,
-        "Qwen/Qwen3.6-27B",
-        historical_class,
-    )
-    pool = modal_app_module._ModalEnginePool()
-
-    asyncio.run(pool.unregister("Qwen/Qwen3.6-27B", "retired@final.sha", "generation-1"))
-
-    assert bound_models == ["Qwen/Qwen3.6-27B"]
-    assert calls == [("retired@final.sha", "generation-1")]
-    with pytest.raises(ValueError, match="Unsupported base model"):
-        modal_app_module._engine_cls_for("Qwen/Qwen3.6-27B")
-
-
 # ---- Functional: actually run _load() and capture the AsyncEngineArgs (vLLM/tokenizer stubbed) ----
 # Stronger than the AST checks in test_fp8_config: this exercises the real per-model override
 # resolution (_ov.get) + the _arg_supported guard, proving the FP8 + moe_backend wiring end-to-end.
@@ -785,36 +750,6 @@ def _capture_engine_args(modal_app_module, monkeypatch, tmp_path, base_model: st
     return _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, base_model)[1]
 
 
-def test_historical_qwen36_cleanup_cold_starts_and_allows_only_unregister(
-    modal_app_module,
-    monkeypatch,
-    tmp_path,
-):
-    cleanup_type = modal_app_module._HISTORICAL_QWEN36_27B_CLEANUP_ENGINE
-    engine, args = _load_engine_and_args(
-        modal_app_module,
-        monkeypatch,
-        tmp_path,
-        "Qwen/Qwen3.6-27B",
-        engine_type=cleanup_type,
-    )
-
-    assert args.model == "Freesolo-Co/Qwen3.6-27B-FP8"
-    assert args.max_loras == 16
-    result = asyncio.run(engine.unregister("retired@final.sha", "generation-1"))
-    assert result == {
-        "ok": True,
-        "removed": "retired@final.sha",
-        "base_model": "Qwen/Qwen3.6-27B",
-    }
-    with pytest.raises(RuntimeError, match="cannot register"):
-        asyncio.run(engine.register({}, None))
-    with pytest.raises(RuntimeError, match="cannot generate"):
-        asyncio.run(engine.generate({}, None, None))
-    with pytest.raises(ValueError, match="Unsupported base model"):
-        modal_app_module._engine_cls_for("Qwen/Qwen3.6-27B")
-
-
 @pytest.mark.parametrize("base_model", base_models())
 def test_every_catalog_model_forwards_its_reasoning_parser(
     modal_app_module, monkeypatch, tmp_path, base_model: str
@@ -858,12 +793,12 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
 
 def test_qwen38_candidate_immutable_args_fail_closed_when_vllm_drops_revision_support():
     from flash.serving.src import engine_boot
-    from flash.serving.src.model_config import candidate_engine_overrides_for
+    from flash.serving.src.model_config import _QWEN38_HOSTED_CANDIDATE
 
     with pytest.raises(RuntimeError, match=r"cannot pin.*missing engine args"):
         engine_boot._required_immutable_args(
             "Qwen/Qwen3.8-27B",
-            candidate_engine_overrides_for("Qwen/Qwen3.8-27B"),
+            _QWEN38_HOSTED_CANDIDATE["engine"],
             {"model"},
         )
 

@@ -237,11 +237,11 @@ def test_unregister_safe_records_exact_gpu_cleanup_failure(capsys):
     context = object.__new__(ServingContext)
     context.pool = _FailingPool()
 
-    asyncio.run(context.unregister_safe("Qwen/Qwen3.6-27B", "retired@final.sha", "generation-1"))
+    asyncio.run(context.unregister_safe(QWEN, "active@final.sha", "generation-1"))
 
     assert (
-        "hosted adapter gpu cleanup failed for retired@final.sha on Qwen/Qwen3.6-27B: "
-        "RuntimeError('exact eviction failed for Qwen/Qwen3.6-27B retired@final.sha generation-1')"
+        f"hosted adapter gpu cleanup failed for active@final.sha on {QWEN}: "
+        f"RuntimeError('exact eviction failed for {QWEN} active@final.sha generation-1')"
         in capsys.readouterr().out
     )
 

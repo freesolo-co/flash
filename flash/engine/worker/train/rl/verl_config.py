@@ -28,7 +28,11 @@ from flash.engine.worker.backend_common import (
     trainer_dtype_overrides,
 )
 from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.sft_train import _hydra_val, _verl_image_message_content
+from flash.engine.worker.sft_train import _hydra_val
+from flash.engine.worker.train.core.prompt_rows import (
+    canonical_prompt_messages,
+    prompt_message_features,
+)
 from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
@@ -77,23 +81,9 @@ def build_verl_dataset_rows(
     for position, (messages, idx, gt) in enumerate(
         zip(message_prompts, example_indices, ground_truths, strict=True)
     ):
-        prompt: list[dict] | list
-        if image_uris is None:
-            prompt = messages
-        else:
-            prompt = [
-                {
-                    "role": str(message.get("role") or ""),
-                    "content": _verl_image_message_content(message.get("content")),
-                    **(
-                        {"reasoning_content": message["reasoning_content"]}
-                        if "reasoning_content" in message
-                        else {}
-                    ),
-                }
-                for message in messages
-            ]
-            placeholders = sum(str(message["content"]).count("<image>") for message in prompt)
+        prompt = canonical_prompt_messages(messages, multimodal=image_uris is not None)
+        if image_uris is not None:
+            placeholders = sum(message["content"].count("<image>") for message in prompt)
             if placeholders != len(image_uris[position]):
                 raise ValueError(
                     f"multimodal prompt for example {int(idx)} has {placeholders} <image> "
@@ -156,16 +146,10 @@ def _processor_expanded_prompt(
     return [int(token_id) for token_id in input_ids], rendered
 
 
-def _verl_grpo_parquet_features(*, multimodal: bool, include_reasoning: bool):
+def _verl_grpo_parquet_features(*, multimodal: bool, prompt: dict):
     """provide one explicit arrow schema for the full grpo row set."""
     from datasets import Features, Value
 
-    prompt = {
-        "role": Value("string"),
-        "content": Value("string"),
-    }
-    if include_reasoning:
-        prompt["reasoning_content"] = Value("string")
     features = {
         "data_source": Value("string"),
         "prompt": [prompt],
@@ -179,25 +163,13 @@ def _verl_grpo_parquet_features(*, multimodal: bool, include_reasoning: bool):
     return Features(features)
 
 
-def _grpo_reasoning_schema(rows: list[dict]) -> bool:
-    include_reasoning = False
-    for row in rows:
-        for message in row.get("prompt", []):
-            if "reasoning_content" not in message:
-                continue
-            include_reasoning = True
-            if not isinstance(message["reasoning_content"], str):
-                raise ValueError("prompt reasoning_content must be text")
-    return include_reasoning
-
-
 def write_verl_grpo_parquet(rows: list[dict], path: str) -> None:
     """write grpo rows with one explicit schema derived from the full row set."""
     from datasets import Dataset
 
     features = _verl_grpo_parquet_features(
         multimodal=any("images" in row for row in rows),
-        include_reasoning=_grpo_reasoning_schema(rows),
+        prompt=prompt_message_features(rows),
     )
     Dataset.from_list(rows, features=features).to_parquet(path)
 

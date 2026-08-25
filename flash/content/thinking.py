@@ -11,43 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-
-def _canonical_leading_thinking(content: str) -> tuple[str, str] | None:
-    """split one unambiguous leading ``<think>`` span from its answer."""
-    if not content.startswith("<think>"):
-        return None
-    if content.count("<think>") != 1 or content.count("</think>") != 1:
-        return None
-    close = content.find("</think>", len("<think>"))
-    if close < 0:
-        return None
-    reasoning = content[len("<think>") : close].strip("\n")
-    answer = content[close + len("</think>") :].lstrip("\n")
-    return reasoning, answer
-
-
-def messages_for_chat_template(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Expose one canonical inline reasoning span through Qwen3.8's template field.
-
-    Normalize only an assistant message that starts with exactly one balanced ``<think>`` pair.
-    Quoted, close-only, malformed, and repeated markers remain literal content. An explicit
-    ``reasoning_content`` field remains authoritative, including an empty string.
-    """
-    normalized: list[dict[str, Any]] = []
-    for message in messages:
-        copied = dict(message)
-        content = copied.get("content")
-        split = (
-            _canonical_leading_thinking(content)
-            if copied.get("role") == "assistant"
-            and "reasoning_content" not in copied
-            and isinstance(content, str)
-            else None
-        )
-        if split is not None:
-            copied["reasoning_content"], copied["content"] = split
-        normalized.append(copied)
-    return normalized
+from flash.content.reasoning_normalization import messages_for_chat_template
 
 
 def _messages_for_content_only_serialization(

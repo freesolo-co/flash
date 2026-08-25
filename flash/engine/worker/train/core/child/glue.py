@@ -24,6 +24,10 @@ import warnings
 from typing import Any
 from uuid import uuid4
 
+from flash_reasoning_normalization import (
+    messages_for_chat_template as _messages_for_chat_template,
+)
+
 _ALLOWED_MESSAGE_KEYS = frozenset({"role", "content", "reasoning_content"})
 _PROBE_PREFIX = "flash-env-glue-probe"
 # the media block types verl's own dataset parser substitutes for a placeholder, and the exact set
@@ -32,39 +36,6 @@ _PROBE_PREFIX = "flash-env-glue-probe"
 # here as literals rather than imported from flash.content.multimodal because this module is copied
 # into the verl child, where flash is not importable -- see the module docstring.
 _MEDIA_BLOCK_TYPES = frozenset({"image", "video", "audio"})
-
-
-def _canonical_leading_thinking(content: str) -> tuple[str, str] | None:
-    """split one unambiguous leading ``<think>`` span from its answer."""
-    if not content.startswith("<think>"):
-        return None
-    if content.count("<think>") != 1 or content.count("</think>") != 1:
-        return None
-    close = content.find("</think>", len("<think>"))
-    if close < 0:
-        return None
-    reasoning = content[len("<think>") : close].strip("\n")
-    answer = content[close + len("</think>") :].lstrip("\n")
-    return reasoning, answer
-
-
-def _messages_for_chat_template(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """child-local reasoning normalization; this copied module cannot import flash."""
-    normalized = []
-    for message in messages:
-        copied = dict(message)
-        content = copied.get("content")
-        split = (
-            _canonical_leading_thinking(content)
-            if copied.get("role") == "assistant"
-            and "reasoning_content" not in copied
-            and isinstance(content, str)
-            else None
-        )
-        if split is not None:
-            copied["reasoning_content"], copied["content"] = split
-        normalized.append(copied)
-    return normalized
 
 
 _IMAGE_DATA_URI_HEADERS = {

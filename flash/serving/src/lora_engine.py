@@ -117,7 +117,6 @@ class _LoraEngineImpl:
             self.base_model,
             self.settings,
             cfg,
-            historical_cleanup=bool(getattr(self, "historical_cleanup_only", False)),
         )
         self._pin_loras = pin_loras_default(overrides, cfg)
         self.reasoning_parser = kwargs.get("reasoning_parser")

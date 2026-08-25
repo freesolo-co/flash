@@ -48,7 +48,6 @@ from flash.engine.worker.opd_train import (
     build_opd_overrides,
     encode_shifted_group_metadata,
 )
-from flash.engine.worker.opd_train_runner import _prepare_prompt_messages, _render_prompt_rows
 from flash.engine.worker.teacher.client import TeacherScore
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
 from flash.engine.worker.train.core.child.glue import (
@@ -77,6 +76,12 @@ from flash.engine.worker.train.opd.child.structured import (
     StructuredOutputReplay,
     _count_legal_tokens,
     canonical_structured_spec,
+)
+from flash.engine.worker.train.opd.prompt_preparation import (
+    _prepare_prompt_messages,
+)
+from flash.engine.worker.train.opd.prompt_preparation import (
+    render_prompt_rows as _render_prompt_rows,
 )
 from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
 from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
@@ -653,6 +658,26 @@ def test_image_prompt_positions_remain_outside_alignment_groups():
     )
     assert teacher_ids[: len(prompt_ids) - 1] == [-1, -1, -1]
     assert teacher_ids[len(prompt_ids) - 1] == 0
+
+
+def test_opd_prompt_rows_flatten_text_blocks_and_preserve_reasoning():
+    from flash.engine.worker.train.core.prompt_rows import canonical_prompt_messages
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "hello "},
+                {"type": "text", "text": "world"},
+            ],
+        },
+        {"role": "assistant", "content": "answer", "reasoning_content": "later"},
+    ]
+
+    assert canonical_prompt_messages(messages, multimodal=False) == [
+        {"role": "user", "content": "hello world"},
+        {"role": "assistant", "content": "answer", "reasoning_content": "later"},
+    ]
 
 
 @pytest.mark.parametrize("image_first", [False, True])
@@ -8140,8 +8165,8 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
     monkeypatch, thinking, rendered_prompt, expected_opened
 ):
     from flash.engine.worker import opd_train as opd_mod
-    from flash.engine.worker import opd_train_runner
     from flash.engine.worker.model.decoding import prompt_opens_thinking
+    from flash.engine.worker.train.opd import prompt_preparation
     from flash.engine.worker.train.opd.state import _OpdRequest
 
     class _Tokenizer:
@@ -8206,7 +8231,7 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
         model_revision="revision",
     )
 
-    state = opd_train_runner._prepare_prompts(
+    state = prompt_preparation.prepare_prompts(
         request,
         [
             (
@@ -8242,8 +8267,8 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
     from the first RETAINED prompt (`_build_grpo_prompts`); opd must match.
     """
     from flash.engine.worker import opd_train as opd_mod
-    from flash.engine.worker import opd_train_runner
     from flash.engine.worker.model.decoding import prompt_opens_thinking
+    from flash.engine.worker.train.opd import prompt_preparation
     from flash.engine.worker.train.opd.state import _OpdRequest
 
     # row 0 renders WITHOUT an open think tag and is over budget; row 1 renders WITH one and fits.
@@ -8297,7 +8322,7 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
         model_revision="revision",
     )
 
-    state = opd_train_runner._prepare_prompts(
+    state = prompt_preparation.prepare_prompts(
         request,
         [
             ({}, [{"role": "user", "content": "too-long"}]),
@@ -8323,9 +8348,9 @@ def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice
     import ast
     import textwrap
 
-    from flash.engine.worker import opd_train_runner
+    from flash.engine.worker.train.opd import prompt_preparation
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(opd_train_runner._render_prompt_rows)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(prompt_preparation.render_prompt_rows)))
     renders = [
         node
         for node in ast.walk(tree)

@@ -57,7 +57,6 @@ from flash.engine.worker.sft_train import (  # noqa: F401
     _NvidiaSmiPeakSampler,
     _probe_gpu_in_subprocess,
     _seed_resume_lifecycle,
-    _verl_image_message_content,
     _warmstart_adapter_path,
 )
 from flash.engine.worker.train.core.child.glue import (  # noqa: F401
@@ -456,10 +455,8 @@ from flash.engine.worker.opd_train_runner import (  # noqa: E402
     _build_train_note_sections,
     _export_and_upload_adapter,
     _materialize_child_files,
-    _prepare_prompts,
     _prepare_request,
     _prepare_workload,
-    _render_prompt_rows,
     _report_training_complete,
     _resolve_opd_gpu_mem_util,
     _run_child,
@@ -516,6 +513,12 @@ from flash.engine.worker.train.opd.overrides import (  # noqa: E402,F401
     _opd_parquet_features,
     _write_opd_parquet,
     build_opd_overrides,
+)
+from flash.engine.worker.train.opd.prompt_preparation import (  # noqa: E402
+    prepare_prompts as _prepare_prompts,
+)
+from flash.engine.worker.train.opd.prompt_preparation import (  # noqa: E402
+    render_prompt_rows as _render_prompt_rows,
 )
 
 # prompt fingerprinting and token-mask helpers, implemented in `.train.opd.prompts`.

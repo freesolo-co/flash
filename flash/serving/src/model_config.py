@@ -61,29 +61,6 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "reasoning_parser": "qwen3",
         },
     },
-    {
-        "base_model": "Qwen/Qwen3.8-27B",
-        "image_input_limit": 4,
-        "gpu": "H100",
-        "engine": {
-            # pending hosted candidate only. immutable metadata stays here for the exact canary, but
-            # active hosted lookups exclude this model until that canary deliberately enables it.
-            "serve_model_id": "Qwen/Qwen3.8-27B-FP8",
-            "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
-            "tokenizer_model": "Qwen/Qwen3.8-27B",
-            "tokenizer_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
-            "processor_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
-            # 0.90 leaves room for cuda-graph capture. the inherited h100 shape remains a candidate
-            # until the exact official fp8 canary qualifies it.
-            "gpu_memory_utilization": 0.90,
-            "max_loras": 16,
-            "max_lora_rank": 64,
-            "max_model_len": 32768,
-            "max_num_seqs": 8,
-            "enforce_eager": False,
-            "reasoning_parser": "qwen3",
-        },
-    },
     # 35B-A3B MoE: bf16 on an H200 (141 GiB) is the one serving path that gives a flash adapter its
     # full all-expert LoRA and CUDA graphs at speed. it gets rank 64 at 6 hot slots (6 x 64).
     # why bf16/H200 and not the FP8 checkpoint used by every other tier:
@@ -131,46 +108,41 @@ SERVING_MODELS: list[dict[str, Any]] = [
     },
 ]
 
-_HOSTED_SERVING_ENABLED_MODELS = frozenset(
-    {
-        "Qwen/Qwen3.5-9B",
-        "Qwen/Qwen3.6-35B-A3B",
-    }
-)
 _BY_MODEL: dict[str, dict[str, Any]] = {m["base_model"]: m for m in SERVING_MODELS}
-_HISTORICAL_CLEANUP_MODELS: dict[str, dict[str, Any]] = {
-    "Qwen/Qwen3.6-27B": {
-        "base_model": "Qwen/Qwen3.6-27B",
-        "image_input_limit": 4,
-        "gpu": "H100",
-        "engine": {
-            "serve_model_id": "Freesolo-Co/Qwen3.6-27B-FP8",
-            "gpu_memory_utilization": 0.90,
-            "max_loras": 16,
-            "max_lora_rank": 64,
-            "max_model_len": 32768,
-            "max_num_seqs": 8,
-            "enforce_eager": False,
-            "reasoning_parser": "qwen3",
-        },
-    }
+
+# inert descriptor for the exact pending canary. activation means moving this descriptor into
+# SERVING_MODELS, not consulting a second runtime allowlist.
+_QWEN38_HOSTED_CANDIDATE: dict[str, Any] = {
+    "base_model": "Qwen/Qwen3.8-27B",
+    "image_input_limit": 4,
+    "gpu": "H100",
+    "engine": {
+        "serve_model_id": "Qwen/Qwen3.8-27B-FP8",
+        "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+        "tokenizer_model": "Qwen/Qwen3.8-27B",
+        "tokenizer_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        "processor_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        "gpu_memory_utilization": 0.90,
+        "max_loras": 16,
+        "max_lora_rank": 64,
+        "max_model_len": 32768,
+        "max_num_seqs": 8,
+        "enforce_eager": False,
+        "reasoning_parser": "qwen3",
+    },
 }
 
 
 def base_models() -> list[str]:
-    return [
-        m["base_model"] for m in SERVING_MODELS if m["base_model"] in _HOSTED_SERVING_ENABLED_MODELS
-    ]
+    return [model["base_model"] for model in SERVING_MODELS]
 
 
 def is_supported_base_model(base_model: str) -> bool:
-    return base_model in _HOSTED_SERVING_ENABLED_MODELS
+    return base_model in _BY_MODEL
 
 
-def _config_for(base_model: str, *, historical_cleanup: bool = False) -> dict[str, Any]:
-    cfg = _BY_MODEL.get(base_model) if is_supported_base_model(base_model) else None
-    if cfg is None and historical_cleanup:
-        cfg = _HISTORICAL_CLEANUP_MODELS.get(base_model)
+def _config_for(base_model: str) -> dict[str, Any]:
+    cfg = _BY_MODEL.get(base_model)
     if cfg is None:
         allowed = ", ".join(base_models())
         raise ValueError(
@@ -180,44 +152,34 @@ def _config_for(base_model: str, *, historical_cleanup: bool = False) -> dict[st
     return cfg
 
 
-def candidate_config_for(base_model: str) -> dict[str, Any]:
-    """Return immutable metadata for a pending hosted candidate without activating it."""
-    cfg = _BY_MODEL.get(base_model)
-    if cfg is None or is_supported_base_model(base_model):
-        raise ValueError(f"Unsupported pending hosted candidate {base_model!r}")
-    return cfg
+def supports_image_input(base_model: str) -> bool:
+    return image_limit_for(base_model) is not None
 
 
-def supports_image_input(base_model: str, *, historical_cleanup: bool = False) -> bool:
-    return image_limit_for(base_model, historical_cleanup=historical_cleanup) is not None
+def image_limit_for(base_model: str) -> int | None:
+    return _config_for(base_model)["image_input_limit"]
 
 
-def image_limit_for(base_model: str, *, historical_cleanup: bool = False) -> int | None:
-    return _config_for(base_model, historical_cleanup=historical_cleanup)["image_input_limit"]
-
-
-def gpu_for(base_model: str, *, historical_cleanup: bool = False) -> str:
-    """Return the Modal GPU class for an active or cleanup-only engine."""
-    return _config_for(base_model, historical_cleanup=historical_cleanup).get("gpu") or DEFAULT_GPU
+def gpu_for(base_model: str) -> str:
+    """return the Modal GPU class for an active hosted engine."""
+    return _config_for(base_model).get("gpu") or DEFAULT_GPU
 
 
 def serve_model_for(base_model: str) -> str:
-    """Return the pre-quantized checkpoint an active hosted engine loads."""
+    """return the pre-quantized checkpoint an active hosted engine loads."""
     _config_for(base_model)
     return _prequant_serve_model_for(base_model)
 
 
-def tokenizer_model_for(base_model: str, *, historical_cleanup: bool = False) -> str:
-    """Return the logical tokenizer and processor repository for a hosted engine."""
-    engine = _config_for(base_model, historical_cleanup=historical_cleanup).get("engine") or {}
+def tokenizer_model_for(base_model: str) -> str:
+    """return the logical tokenizer and processor repository for a hosted engine."""
+    engine = _config_for(base_model).get("engine") or {}
     return str(engine.get("tokenizer_model") or base_model)
 
 
-def immutable_serving_revisions(
-    base_model: str, *, historical_cleanup: bool = False
-) -> dict[str, str]:
-    """Return model/tokenizer/processor pins required by this hosted engine."""
-    engine = _config_for(base_model, historical_cleanup=historical_cleanup).get("engine") or {}
+def immutable_serving_revisions(base_model: str) -> dict[str, str]:
+    """return model/tokenizer/processor pins required by this hosted engine."""
+    engine = _config_for(base_model).get("engine") or {}
     return {
         key: str(engine[key])
         for key in ("model_revision", "tokenizer_revision", "processor_revision")
@@ -225,33 +187,16 @@ def immutable_serving_revisions(
     }
 
 
-def candidate_immutable_serving_revisions(base_model: str) -> dict[str, str]:
-    engine = candidate_config_for(base_model).get("engine") or {}
-    return {
-        key: str(engine[key])
-        for key in ("model_revision", "tokenizer_revision", "processor_revision")
-        if engine.get(key)
-    }
-
-
-def engine_overrides_for(base_model: str, *, historical_cleanup: bool = False) -> dict[str, Any]:
-    """Return vLLM overrides for an active or cleanup-only hosted engine."""
-    config = _config_for(base_model, historical_cleanup=historical_cleanup)
+def engine_overrides_for(base_model: str) -> dict[str, Any]:
+    """return vLLM overrides for an active hosted engine."""
+    config = _config_for(base_model)
     overrides = dict(config.get("engine") or {})
     if "serve_model_id" not in overrides:
         overrides["serve_model_id"] = serve_model_for(base_model)
     return overrides
 
 
-def candidate_engine_overrides_for(base_model: str) -> dict[str, Any]:
-    """Return pinned engine metadata for a pending candidate without enabling routing."""
-    overrides = dict(candidate_config_for(base_model).get("engine") or {})
-    if "serve_model_id" not in overrides:
-        overrides["serve_model_id"] = _prequant_serve_model_for(base_model)
-    return overrides
-
-
 def reasoning_parser_for(base_model: str) -> str | None:
-    """The model-scoped vLLM reasoning parser, or None when parsing is disabled."""
+    """the model-scoped vLLM reasoning parser, or None when parsing is disabled."""
     parser = (_config_for(base_model).get("engine") or {}).get("reasoning_parser")
     return str(parser) if parser else None

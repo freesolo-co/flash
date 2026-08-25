@@ -1170,6 +1170,26 @@ def test_text_job_does_not_police_reserved_placeholders():
     assert rows[0]["prompt"] == [{"role": "user", "content": "what does <image> mean?"}]
 
 
+def test_text_block_grpo_rows_flatten_content_without_python_repr():
+    rows = rl_train.build_verl_dataset_rows(
+        [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "hello "},
+                        {"type": "text", "text": "world"},
+                    ],
+                }
+            ]
+        ],
+        [0],
+        ["a"],
+    )
+
+    assert rows[0]["prompt"] == [{"role": "user", "content": "hello world"}]
+
+
 def test_mixed_job_parquet_round_trips_the_images_column(tmp_path):
     # Dataset.from_list infers ONE type per column across all rows. in a mixed job the text rows
     # have an empty images list, and inference on an all-empty-or-partly-empty column can land on a
@@ -1241,15 +1261,13 @@ def test_text_only_parquet_preserves_reasoning_first_authored_on_a_later_row(tmp
     assert "reasoning_content" in restored.features["prompt"].feature
 
 
-def test_grpo_parquet_rejects_non_string_authored_reasoning(tmp_path):
-    rows = rl_train.build_verl_dataset_rows(
-        [[{"role": "assistant", "content": "answer", "reasoning_content": ["old"]}]],
-        [0],
-        ["a"],
-    )
-
+def test_grpo_rows_reject_non_string_authored_reasoning():
     with pytest.raises(ValueError, match="reasoning_content must be text"):
-        rl_train.write_verl_grpo_parquet(rows, str(tmp_path / "invalid-reasoning.parquet"))
+        rl_train.build_verl_dataset_rows(
+            [[{"role": "assistant", "content": "answer", "reasoning_content": ["old"]}]],
+            [0],
+            ["a"],
+        )
 
 
 # ------------------------------- override generation -------------------------------

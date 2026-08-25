@@ -322,8 +322,6 @@ def _build_engine(
     class_name: str,
     max_inputs: int,
     target_inputs: int,
-    *,
-    historical_cleanup_only: bool = False,
 ) -> Any:
     """Register one Modal ``@app.cls`` LoraEngine pinned to ``gpu``.
 
@@ -351,8 +349,6 @@ def _build_engine(
             record_dict: dict[str, Any],
             deployment_generation: str | None = None,
         ) -> dict[str, Any]:
-            if self.historical_cleanup_only:
-                raise RuntimeError("historical cleanup engines cannot register adapters")
             return await self._register(record_dict, deployment_generation)
 
         @modal.method()
@@ -362,8 +358,6 @@ def _build_engine(
             record_dict: dict[str, Any] | None = None,
             expected_checkpoint: str | None = None,
         ) -> dict[str, Any]:
-            if self.historical_cleanup_only:
-                raise RuntimeError("historical cleanup engines cannot generate")
             return await self._generate(payload_dict, record_dict, expected_checkpoint)
 
         @modal.method(is_generator=True)
@@ -373,8 +367,6 @@ def _build_engine(
             record_dict: dict[str, Any] | None = None,
             expected_checkpoint: str | None = None,
         ):
-            if self.historical_cleanup_only:
-                raise RuntimeError("historical cleanup engines cannot generate")
             async for event in self._stream_generate(
                 payload_dict, record_dict, expected_checkpoint
             ):
@@ -397,7 +389,6 @@ def _build_engine(
     # model name, so a base model accidentally routed onto the wrong tier's class surfaces in health
     # instead of being masked by the expected-tier lookup.
     _Engine.pinned_gpu = gpu
-    _Engine.historical_cleanup_only = historical_cleanup_only
     # Give the REAL class its distinct, module-level identity BEFORE decorating. A clean (no-``<locals>``)
     # __qualname__ satisfies Modal's global-scope validation, and binding it as a module attribute under
     # that name makes ``getattr(module, class_name)`` resolve the class Modal re-imports in the container.
@@ -444,24 +435,6 @@ ENGINE_BY_KEY: dict[tuple[str, int], Any] = {
 def _engine_cls_for(base_model: str) -> Any:
     """The Modal LoraEngine class to run ``base_model`` on (its (GPU, concurrency) class)."""
     return ENGINE_BY_KEY[_engine_key(base_model)]
-
-
-_HISTORICAL_QWEN36_27B_CLEANUP_ENGINE = _build_engine(
-    "H100",
-    "LoraEngine_H100_c16_historical_cleanup",
-    16,
-    12,
-    historical_cleanup_only=True,
-)
-_HISTORICAL_CLEANUP_ENGINES = {
-    "Qwen/Qwen3.6-27B": _HISTORICAL_QWEN36_27B_CLEANUP_ENGINE,
-}
-
-
-def _cleanup_engine_cls_for(base_model: str) -> Any:
-    """Resolve active engines plus retired engines that support unregister only."""
-    cleanup_engine = _HISTORICAL_CLEANUP_ENGINES.get(base_model)
-    return cleanup_engine if cleanup_engine is not None else _engine_cls_for(base_model)
 
 
 class _ModalEnginePool:
@@ -525,7 +498,7 @@ class _ModalEnginePool:
         adapter_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        engine = _cleanup_engine_cls_for(base_model)(base_model=base_model)
+        engine = _engine_cls_for(base_model)(base_model=base_model)
         await engine.unregister.remote.aio(adapter_id, expected_generation)
 
 

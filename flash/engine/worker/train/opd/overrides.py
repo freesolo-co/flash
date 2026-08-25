@@ -462,15 +462,9 @@ def _build_opd_child_env(
     return child
 
 
-def _opd_parquet_features(*, multimodal: bool, include_reasoning: bool):
+def _opd_parquet_features(*, multimodal: bool, prompt: dict):
     from datasets import Features, Value
 
-    prompt = {
-        "role": Value("string"),
-        "content": Value("string"),
-    }
-    if include_reasoning:
-        prompt["reasoning_content"] = Value("string")
     features = {
         "prompt": [prompt],
         "data_source": Value("string"),
@@ -485,18 +479,6 @@ def _opd_parquet_features(*, multimodal: bool, include_reasoning: bool):
     return Features(features)
 
 
-def _opd_reasoning_schema(rows: list[dict]) -> bool:
-    include_reasoning = False
-    for row in rows:
-        for message in row.get("prompt", []):
-            if "reasoning_content" not in message:
-                continue
-            include_reasoning = True
-            if not isinstance(message["reasoning_content"], str):
-                raise ValueError("prompt reasoning_content must be text")
-    return include_reasoning
-
-
 # arrow duplicates shared prompt references, so one table scales host ram with the full horizon.
 # fixed batches keep the peak flat; this was empirically measured and will drift with prompt shape.
 _OPD_PARQUET_WRITE_BATCH_ROWS = 2000
@@ -508,13 +490,14 @@ def _write_opd_parquet(rows: list[dict], path: str) -> None:
 
     if not rows:
         raise ValueError("refusing to write an empty OPD parquet")
+    from flash.engine.worker.train.core.prompt_rows import prompt_message_features
+
     multimodal = any("images" in row for row in rows)
-    include_reasoning = _opd_reasoning_schema(rows)
     # derive one explicit schema from the full row set before opening the writer. this keeps optional
     # reasoning authored after the first batch and the multimodal images struct stable across batches.
     schema = _opd_parquet_features(
         multimodal=multimodal,
-        include_reasoning=include_reasoning,
+        prompt=prompt_message_features(rows),
     ).arrow_schema
     # write to a sibling temp file and rename only once every batch landed. closing a partially
     # written ParquetWriter still emits a valid footer, so failing in place would leave a READABLE

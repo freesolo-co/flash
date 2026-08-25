@@ -310,17 +310,6 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="A100 PCIe",
         min_disk_gb=160,
-        # candidate metadata remains available for training and customer-owned serving validation.
-        # hosted activation is controlled separately by flash.serving.src.model_config.
-        serving=ServingCapacity(
-            gpu="H100",
-            serve_model_id="Qwen/Qwen3.8-27B-FP8",
-            max_loras=16,
-            max_lora_rank=64,
-            max_model_len=32768,
-            max_num_seqs=8,
-            gpu_memory_utilization=0.90,
-        ),
         thinking="hybrid",
         notes="Dense 27.781427952B multimodal VL checkpoint with image-capable bf16 LoRA training. "
         "SFT fits the 80GB A100 (~55.6GB weights); colocated GRPO needs the B200 (trainer + vLLM "

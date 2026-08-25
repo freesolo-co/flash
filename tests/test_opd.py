@@ -858,109 +858,82 @@ def test_multimodal_teacher_payload_matches_preserve_false_reasoning_history(
     ]
 
 
-def test_thinking_prefill_text_is_template_delta(monkeypatch):
-    """Regression (opd.py): the thinking prefill is the DELTA a thinking-mode chat template
-    opens after the generation prompt (enable_thinking True vs False). Empty when thinking is off (the
-    plain teacher prompt already matches) or the template ignores enable_thinking."""
+class _ThinkingRenderTok:
+    def __init__(self, disabled, enabled):
+        self.disabled = disabled
+        self.enabled = enabled
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        enable_thinking,
+        preserve_thinking,
+    ):
+        assert preserve_thinking is False
+        return self.enabled if enable_thinking else self.disabled
+
+
+def test_thinking_prefill_accepts_terminal_opener_at_shared_boundary(monkeypatch):
     from flash.engine.worker.entry import opd as opd_mod
 
-    class _Tok:
-        def apply_chat_template(
-            self,
-            messages,
-            *,
-            tokenize,
-            add_generation_prompt,
-            enable_thinking,
-            preserve_thinking,
-        ):
-            assert preserve_thinking is False
-            return "<|im_start|>assistant\n" + ("<think>\n" if enable_thinking else "")
-
+    tok = _ThinkingRenderTok("A:\n", "A:\n<think>\n")
     monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=False))
-    assert opd_mod._thinking_prefill_text(_Tok()) == ""  # thinking off -> no prefill
+    assert opd_mod._thinking_prefill_text(tok) == ""
     monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
-    assert opd_mod._thinking_prefill_text(_Tok()) == "<think>\n"  # exact opened delta
-
-    class _NoThinkTok:  # template that ignores enable_thinking -> renders identically -> empty delta
-        def apply_chat_template(self, messages, **kw):
-            return "<|im_start|>assistant\n"
-
-    assert opd_mod._thinking_prefill_text(_NoThinkTok()) == ""
+    assert opd_mod._thinking_prefill_text(tok) == "<think>\n"
 
 
-def test_thinking_prefill_derives_opener_from_hybrid_template(monkeypatch):
-    """Regression (opd.py): _thinking_prefill_text must handle a HYBRID template where the
-    thinking render is NOT a prefix-extension of the non-thinking render — the opener is inserted BEFORE
-    shared trailing template text, so base is not a prefix of think. The old think.startswith(base) test
-    returned "", dropping the opener the student pre-fills so the teacher scored reasoning tokens against
-    the wrong prefix. The common prefix/suffix derivation must recover the opener from think's unique
-    middle."""
+@pytest.mark.parametrize("disabled", ["A:\n<think></think>", "A:\n<think>\n\n</think>\n\n"])
+def test_thinking_prefill_accepts_one_terminal_whitespace_only_closed_block(monkeypatch, disabled):
     from flash.engine.worker.entry import opd as opd_mod
 
-    class _HybridTok:
-        # non-thinking: no opener; thinking: inserts "<think>\n" BEFORE the shared "END" suffix, so
-        # "A:\nEND" is NOT a prefix of "A:\n<think>\nEND".
-        def apply_chat_template(self, messages, *, enable_thinking, **kw):
-            return "A:\n<think>\nEND" if enable_thinking else "A:\nEND"
-
     monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
-    assert opd_mod._thinking_prefill_text(_HybridTok()) == "<think>\n"
+    assert (
+        opd_mod._thinking_prefill_text(_ThinkingRenderTok(disabled, "A:\n<think>\n")) == "<think>\n"
+    )
 
 
-def test_thinking_prefill_recovers_opener_from_closed_block_hybrid(monkeypatch):
-    """Regression (opd.py): a HYBRID template that disables thinking by force-CLOSING
-    the block — enable_thinking=False -> '...<think></think>\\n', enable_thinking=True -> '...<think>\\n'
-    — shares '<think>' in BOTH renders, so the common-prefix delta eats it and the previous fix returned
-    only '\\n'. The student still pre-fills '<think>\\n', so the teacher must condition on the full
-    opener; recover it from base's closing tag."""
+def test_thinking_prefill_accepts_pinned_qwen38_render_with_system_difference(monkeypatch):
+    """the pinned qwen3.8 template adds a thinking-only system instruction before the shared turn."""
     from flash.engine.worker.entry import opd as opd_mod
 
-    class _ClosedBlockTok:
-        def apply_chat_template(self, messages, *, enable_thinking, **kw):
-            # both open <think>; non-thinking force-closes it with </think>.
-            return "A:\n<think>\n" if enable_thinking else "A:\n<think></think>\n"
-
+    disabled = "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    enabled = (
+        "<|im_start|>system\n"
+        "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
+        "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
+        "clarity in the final answer.<|im_end|>\n"
+        "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    )
     monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
-    assert opd_mod._thinking_prefill_text(_ClosedBlockTok()) == "<think>\n"
+    assert opd_mod._thinking_prefill_text(_ThinkingRenderTok(disabled, enabled)) == "<think>\n"
 
 
-def test_thinking_prefill_recovers_opener_from_whitespace_empty_block_hybrid(monkeypatch):
-    """Regression (opd.py): a hybrid whose disabled render is an EMPTY block WITH whitespace
-    (enable_thinking=False -> '...<think>\\n\\n</think>\\n', True -> '...<think>\\n') shares '<think>\\n'
-    in the common prefix, so base's unique middle is '\\n</think>\\n' -- the closer behind a newline. The
-    closed-block recovery must lstrip that intra-block whitespace before the '</' test, else it returns ''
-    and thinking-mode OPD scores the student's reasoning against a teacher prompt that never opened
-    <think>. The opener returned is still the thinking-side '<think>\\n'."""
+@pytest.mark.parametrize(
+    ("disabled", "enabled"),
+    [
+        ("A:\n", "A:\n"),
+        ("A:\n", "A:\n<think>\nEND"),
+        ("A:\nEND", "A:\n<think>\nEND"),
+        ("A:\n<think>not empty</think>\n", "A:\n<think>\n"),
+        ("unrelated base\n", "unrelated thinking\n<think>\n"),
+    ],
+    ids=[
+        "template-ignores-thinking",
+        "nonterminal-opener",
+        "shared-suffix-insertion",
+        "malformed-disabled-block",
+        "no-nonwhitespace-shared-suffix",
+    ],
+)
+def test_thinking_prefill_fails_closed_for_unsafe_template_shapes(monkeypatch, disabled, enabled):
     from flash.engine.worker.entry import opd as opd_mod
 
-    class _WhitespaceEmptyBlockTok:
-        def apply_chat_template(self, messages, *, enable_thinking, **kw):
-            # both open <think>\n; non-thinking force-closes with a whitespace-only empty block.
-            return "A:\n<think>\n" if enable_thinking else "A:\n<think>\n\n</think>\n"
-
     monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
-    assert opd_mod._thinking_prefill_text(_WhitespaceEmptyBlockTok()) == "<think>\n"
-
-
-def test_thinking_prefill_recovers_opener_when_closed_block_leaves_whitespace_remainder(
-    monkeypatch,
-):
-    """Regression (opd.py:134): a closed-block hybrid whose disabled render closes IMMEDIATELY
-    after the opener (enable_thinking=False -> '...<think></think>', True -> '...<think>\\n') shares only
-    '<think>' in the common prefix, so think_mid is the NON-EMPTY whitespace remainder '\\n'. The old
-    `if think_mid: return think_mid` early-return handed back '\\n' and skipped the closed-block recovery,
-    conditioning the teacher on a prompt that opened but never continued <think>. The recovery must run
-    FIRST and return the real thinking-side opener '<think>\\n'."""
-    from flash.engine.worker.entry import opd as opd_mod
-
-    class _ClosedImmediatelyTok:
-        def apply_chat_template(self, messages, *, enable_thinking, **kw):
-            # thinking opens "<think>\n"; non-thinking force-closes right after the opener.
-            return "A:\n<think>\n" if enable_thinking else "A:\n<think></think>"
-
-    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
-    assert opd_mod._thinking_prefill_text(_ClosedImmediatelyTok()) == "<think>\n"
+    assert opd_mod._thinking_prefill_text(_ThinkingRenderTok(disabled, enabled)) == ""
 
 
 def test_student_tokens_absorb_dropped_leading_space_sentencepiece():

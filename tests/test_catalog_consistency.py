@@ -75,15 +75,6 @@ def test_serving_capacity_matches_validated_matrix():
             "max_num_seqs": 8,
             "gpu_memory_utilization": 0.90,
         },
-        "Qwen/Qwen3.8-27B": {
-            "gpu": "H100",
-            "serve_model_id": "Qwen/Qwen3.8-27B-FP8",
-            "max_loras": 16,
-            "max_lora_rank": 64,
-            "max_model_len": 32768,
-            "max_num_seqs": 8,
-            "gpu_memory_utilization": 0.90,
-        },
         "Qwen/Qwen3.6-35B-A3B": {
             "gpu": "H200",
             "serve_model_id": "Qwen/Qwen3.6-35B-A3B",
@@ -129,7 +120,8 @@ def test_serving_repos_match_current_active_serving_matrix() -> None:
         "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
         "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B",
     }
-    assert MODELS["Qwen/Qwen3.8-27B"].serving is not None
+    assert MODELS["Qwen/Qwen3.8-27B"].serving is None
+    assert "serving" not in MODELS["Qwen/Qwen3.8-27B"].to_dict()
 
 
 def test_qwen38_27b_fixture_binds_checkpoint_metadata() -> None:

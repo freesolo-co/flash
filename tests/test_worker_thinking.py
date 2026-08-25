@@ -91,6 +91,40 @@ def test_messages_for_chat_template_preserves_ambiguous_or_noncanonical_markers(
     assert _messages_for_chat_template(messages) == messages
 
 
+def test_messages_for_chat_template_matches_scalar_and_leading_text_blocks_before_media():
+    from flash.content.thinking import messages_for_chat_template
+
+    scalar = [{"role": "assistant", "content": "<think>reason</think>answer"}]
+    blocks = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "input_text", "text": "<think>rea"},
+                {"type": "text", "text": "son</think>answer"},
+                {"type": "image"},
+                {"type": "text", "text": "later"},
+            ],
+        }
+    ]
+
+    scalar_result = messages_for_chat_template(scalar)[0]
+    block_result = messages_for_chat_template(blocks)[0]
+    assert scalar_result == {
+        "role": "assistant",
+        "reasoning_content": "reason",
+        "content": "answer",
+    }
+    assert block_result == {
+        "role": "assistant",
+        "reasoning_content": "reason",
+        "content": [
+            {"type": "input_text", "text": "answer"},
+            {"type": "image"},
+            {"type": "text", "text": "later"},
+        ],
+    }
+
+
 def test_messages_for_chat_template_preserves_explicit_reasoning_and_nonassistant_tags():
     from flash.content.thinking import messages_for_chat_template
     from flash.engine.worker.train.core.child.glue import _messages_for_chat_template

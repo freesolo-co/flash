@@ -260,6 +260,24 @@ def test_pending_qwen38_hosted_candidate_registration_fails_without_write(setup)
     assert pool.registered == []
 
 
+def test_retired_model_undeploy_disables_without_gpu_start(setup) -> None:
+    client, pool, router, persistence = setup
+    retired = ImmutableAdapterRegistration.model_validate(
+        _final_registration(base_model="Qwen/Qwen3.6-27B")
+    ).to_record()
+    retired = persistence._stamp(retired.model_copy(update={"status": "ready"}))
+    persistence.rows[retired.adapter_id] = retired
+    router.upsert(retired, revive=True)
+
+    response = client.delete(f"/adapters/{retired.adapter_id}")
+
+    assert response.status_code == 200
+    assert response.json()["gpu_cleanup"] == "not_applicable_retired_model"
+    assert persistence.rows[retired.adapter_id].status == "disabled"
+    assert retired.adapter_id not in {record.adapter_id for record in router.ready_records()}
+    assert pool.unregistered == []
+
+
 def test_legacy_and_direct_alias_registration_fail_without_write(setup) -> None:
     client, _, _, persistence = setup
     legacy = _registration()

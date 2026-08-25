@@ -222,31 +222,28 @@ def test_deploy_9b_dry_run_is_not_rejected():
     assert dep.to_dict()["state"] == "dry_run"
 
 
-def test_deploy_27b_dry_run_accepts_rank_at_serving_cap():
-    from flash.serve.deploy import deploy_adapter
+def test_deploy_27b_rejects_before_rank_resolution_or_dry_run_success(monkeypatch):
+    import flash.serve.deploy as deploy
 
-    dep = deploy_adapter(
-        run_id="q27",
-        model="Qwen/Qwen3.8-27B",
-        hf_repo="org/repo",
-        adapter_prefix="sft/q27/seed0",
-        dry_run=True,
-        lora_rank=64,
+    monkeypatch.setattr(
+        deploy,
+        "validate_serving_lora_rank",
+        lambda *_args, **_kwargs: pytest.fail("inactive model must reject before rank validation"),
     )
-    assert dep.to_dict()["state"] == "dry_run"
+    monkeypatch.setattr(
+        deploy,
+        "deployment_record",
+        lambda *_args, **_kwargs: pytest.fail("inactive model must reject before artifact shaping"),
+    )
 
-
-def test_deploy_27b_rejects_lora_rank_above_serving_cap():
-    from flash.serve.deploy import deploy_adapter
-
-    with pytest.raises(ValueError, match="max_lora_rank=64"):
-        deploy_adapter(
-            run_id="q27-r65",
+    with pytest.raises(ValueError, match="not active in hosted serving"):
+        deploy.deploy_adapter(
+            run_id="q27",
             model="Qwen/Qwen3.8-27B",
             hf_repo="org/repo",
-            adapter_prefix="sft/q27-r65/seed0",
+            adapter_prefix="sft/q27/seed0",
             dry_run=True,
-            lora_rank=65,
+            lora_rank=64,
         )
 
 
