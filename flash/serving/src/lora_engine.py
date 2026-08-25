@@ -74,7 +74,7 @@ class _LoraEngineImpl:
     Modal entrypoints (load/register/generate/stream_generate/unregister/health) live on the thin
     per-model subclass and forward to the ``_``-prefixed methods here."""
 
-    base_model: str  # immutable class identity set by the per-model Modal subclass
+    base_model: str  # immutable class identity set by the per-model modal subclass
 
     def _replica_identifier(self) -> str:
         replica_id = getattr(self, "_replica_id", None)

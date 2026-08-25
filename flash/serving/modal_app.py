@@ -15,6 +15,22 @@ from typing import Any
 
 import modal
 
+from flash.serving.src.capacity import (
+    CAPACITY_POLL_INTERVAL_SECONDS,
+    CAPACITY_REFRESH_TIMEOUT_SECONDS,
+    CAPACITY_SNAPSHOT_MAX_AGE_SECONDS,
+    CapacitySnapshot,
+    fixed_local_active_limit,
+)
+from flash.serving.src.lora_engine import _LoraEngineImpl
+from flash.serving.src.model_config import (
+    HostedTrafficPolicy,
+    base_models,
+    configured_router_async_capacity,
+    gpu_for,
+    hosted_traffic_policy_for,
+)
+
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - only relevant for global modal installs
@@ -270,29 +286,9 @@ app = modal.App(APP_NAME, image=image)
 hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
 
-# ``_LoraEngineImpl`` lives in ``flash.serving.src.lora_engine`` (kept free of any ``modal`` import
-# so it registers nothing, and inside the ``flash`` package so the image's
-# ``add_local_python_source("flash")`` ships it to the remote container under the same import path
-# it has here), re-exported so ``_build_engine`` can subclass it.
-# ---- One Modal LoraEngine class per GPU tier -----------------------------------------------------
-# model_config is a pure-stdlib module (no heavy deps), so importing it at module scope is safe for
-# `modal deploy` (which imports modal_app.py locally) — unlike the vllm/transformers imports, which
-# stay lazy inside the engine methods.
-from flash.serving.src.capacity import (  # noqa: E402
-    CAPACITY_POLL_INTERVAL_SECONDS,
-    CAPACITY_REFRESH_TIMEOUT_SECONDS,
-    CAPACITY_SNAPSHOT_MAX_AGE_SECONDS,
-    CapacitySnapshot,
-    fixed_local_active_limit,
-)
-from flash.serving.src.lora_engine import _LoraEngineImpl  # noqa: E402
-from flash.serving.src.model_config import (  # noqa: E402
-    HostedTrafficPolicy,
-    base_models,
-    configured_router_async_capacity,
-    gpu_for,
-    hosted_traffic_policy_for,
-)
+# ``_LoraEngineImpl`` is import-light and registers no modal resources. the serving modules imported
+# above keep vllm and transformers lazy, while the image ships the same ``flash`` package path used
+# locally. each generated modal subclass below bakes one exact model and traffic policy.
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
