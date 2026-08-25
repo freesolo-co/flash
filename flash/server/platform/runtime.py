@@ -313,28 +313,10 @@ def _start_resubmit(
 
 
 def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
-    from flash.runner.lifecycle.attempts import _latest_reserved_attempt
-    from flash.runner.supervise.lifecycle import _completed_attempt_metrics
+    del status, deadline_at
+    from flash.runner.supervise.lifecycle import _attempt_result_metrics
 
-    attempt = _latest_reserved_attempt(spec.run_id)
-    if attempt is None:
-        return None
-    providers = {
-        str(name)
-        for name in (getattr(status, "submitted_instance_providers", None) or [])
-        if name in {"vast", "lambda"}
-    }
-    for provider in sorted(providers):
-        metrics = _completed_attempt_metrics(
-            spec,
-            provider=provider,
-            attempt=attempt,
-            launch_floor=float(status.created_at),
-            deadline_at=deadline_at,
-        )
-        if metrics is not None:
-            return metrics
-    return None
+    return _attempt_result_metrics(spec.run_id)
 
 
 def _deferred_resubmit_loop(spec) -> None:

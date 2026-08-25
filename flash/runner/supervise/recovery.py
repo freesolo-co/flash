@@ -44,7 +44,7 @@ def _canonical_provider_handle(handle):
     raise ValueError("persisted provider identity is missing or unsupported")
 
 
-def _attempt_result_metrics(run_id: str, handle) -> dict | None:
+def _attempt_result_metrics(run_id: str, handle=None) -> dict | None:
     """return metrics only from the current verified fenced success result."""
     from flash.providers.artifacts.attempts import (
         persist_attempt_artifacts,
@@ -58,12 +58,12 @@ def _attempt_result_metrics(run_id: str, handle) -> dict | None:
         source_snapshot_from_status,
     )
 
-    canonical = _canonical_provider_handle(handle)
     status = get_status(run_id)
     attempt = AttemptRecord.from_dict(status.attempt)
-    data = canonical.to_dict()
-    if data.get("attempt") != attempt.attempt_id or data.get("fence") != attempt.fence:
-        raise RuntimeError("persisted provider handle does not match the current fenced attempt")
+    if handle is not None:
+        data = _canonical_provider_handle(handle).to_dict()
+        if data.get("attempt") != attempt.attempt_id or data.get("fence") != attempt.fence:
+            raise RuntimeError("persisted provider handle does not match the current fenced attempt")
     spec = effective_spec_from_status(status)
     artifacts = read_attempt_artifacts(
         spec.train.hf_repo,
