@@ -246,6 +246,9 @@ def _openai_sse_text(chunks: Iterator[str]) -> Iterator[str]:
     try:
         for event in iter_openai_sse_events(chunks):
             if isinstance(event, ErrorEvent):
+                if reasoning_open:
+                    reasoning_open = False
+                    yield "</think>"
                 raise ClientError(event.message)
             if not isinstance(event, DeltaEvent):
                 continue

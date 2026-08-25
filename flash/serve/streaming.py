@@ -174,7 +174,6 @@ def _complete_sse_frames(chunks: Iterator[bytes]) -> Iterator[bytes]:
     """yield only complete sse frames while preserving every upstream byte."""
 
     buffered = bytearray()
-    terminal = False
     for chunk in chunks:
         buffered.extend(chunk)
         while True:
@@ -186,14 +185,14 @@ def _complete_sse_frames(chunks: Iterator[bytes]) -> Iterator[bytes]:
             end = min(ends)
             delimiter_length = 4 if buffered[end : end + 4] == b"\r\n\r\n" else 2
             frame = bytes(buffered[: end + delimiter_length])
-            yield frame
             del buffered[: end + delimiter_length]
-            if sse_data_is_terminal(frame):
-                terminal = True
+            terminal = sse_data_is_terminal(frame)
+            yield frame
+            if terminal:
+                return
     if buffered:
         raise ClientError("chat stream ended with an incomplete server-sent event frame")
-    if not terminal:
-        raise ClientError("chat stream ended before the terminal [DONE] event")
+    raise ClientError("chat stream ended before the terminal [DONE] event")
 
 
 def _streamed_body(

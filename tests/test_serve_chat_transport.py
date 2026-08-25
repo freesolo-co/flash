@@ -284,6 +284,46 @@ def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch
     assert len(exits) == 1
 
 
+def test_chat_sse_stops_at_done_and_ignores_trailing_incomplete_bytes(monkeypatch):
+    import flash.serve.deploy as d
+
+    terminal = b"data: [DONE]\r\n\r\n"
+    exits = []
+    upstream = StreamResponse(byte_chunks=(terminal + b"trailing incomplete bytes",))
+    client = StreamClient(StreamContext(upstream, exits))
+    monkeypatch.setattr(d, "_stream_http_client", lambda: client)
+    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+
+    frames = list(d.chat_sse("run-1", [{"role": "user", "content": "hi"}]).iter_bytes())
+
+    assert frames == [terminal]
+    assert len(exits) == 1
+
+
+def test_chat_sse_stops_at_error_without_reading_trailing_bytes(monkeypatch):
+    import flash.serve.deploy as d
+
+    terminal = b'data: {"error":{"message":"engine failed"}}\n\n'
+    trailing_reads = []
+    exits = []
+
+    def chunks():
+        yield terminal
+        trailing_reads.append(True)
+        yield b"trailing garbage"
+
+    upstream = StreamResponse(byte_chunks=chunks())
+    client = StreamClient(StreamContext(upstream, exits))
+    monkeypatch.setattr(d, "_stream_http_client", lambda: client)
+    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+
+    frames = list(d.chat_sse("run-1", [{"role": "user", "content": "hi"}]).iter_bytes())
+
+    assert frames == [terminal]
+    assert trailing_reads == []
+    assert len(exits) == 1
+
+
 def test_chat_sse_close_before_first_byte_releases_upstream(monkeypatch):
     import flash.serve.deploy as d
 
