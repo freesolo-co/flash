@@ -2450,6 +2450,7 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, 
         preprocessor=_Tok(),
     )
     uploader.start()
+    uploader.allow_deployable_publication()
     uploader.stop()
 
     # step 10 was required and completed, so it published as a REQUIRED deployable. step 5 is a gcd
@@ -4337,104 +4338,106 @@ def test_resume_uploader_never_fails_the_run_on_an_upload_error(tmp_path):
     assert 2 in uploader.lifecycle.discovered_steps
 
 
-def test_grpo_gradient_check_rejects_a_run_whose_rewards_never_varied():
-    # the defect this guards: a run on a constant-reward environment reaches state=done with a
-    # written checkpoint and an exported adapter, and its reward history looks perfectly healthy,
-    # but every advantage was 0 so the published adapter equals its initialization.
-    with pytest.raises(RuntimeError, match="zero advantage spread"):
-        rl_train._check_grpo_had_a_gradient([1.0, 1.0, 1.0], [0.0, 0.0, 0.0])
+def test_grpo_gradient_check_rejects_all_zero_actor_gradients():
+    with pytest.raises(RuntimeError, match="zero actor gradient norm"):
+        rl_train._check_grpo_had_a_gradient(
+            [1.0, 1.0], [0.0, 0.0], {1: 0.0, 2: 0.0}, expected_steps=range(1, 3)
+        )
 
 
-def test_grpo_gradient_check_admits_a_run_with_spread_on_any_step():
-    # zero spread on some steps is legitimate (a converged run, or one unlucky all-equal group), so
-    # the guard must key on "no step ever had spread" rather than "some step had none".
-    rl_train._check_grpo_had_a_gradient([0.4, 0.6], [0.0, 1.5])
-    rl_train._check_grpo_had_a_gradient([0.4], [2.0])
+def test_grpo_gradient_check_accepts_positive_norm_despite_zero_advantage_spread():
+    rl_train._check_grpo_had_a_gradient(
+        [0.875, 1.0],
+        [0.0, 0.0],
+        {1: 0.0076509942300617695, 2: 0.0},
+        expected_steps=range(1, 3),
+    )
+
+
+def test_positive_advantage_spread_does_not_override_all_zero_gradients():
+    with pytest.raises(RuntimeError, match="zero actor gradient norm"):
+        rl_train._check_grpo_had_a_gradient(
+            [0.4, 0.6], [1.5, 0.0], {1: 0.0, 2: 0.0}, expected_steps=range(1, 3)
+        )
 
 
 def test_grpo_gradient_check_rejects_reward_metrics_without_advantage_metrics():
-    # both series are parsed off the same verl log line, so advantages missing while rewards are
-    # present means the parse regressed. without this the spread check silently cannot fire.
     with pytest.raises(RuntimeError, match="no advantage metrics"):
-        rl_train._check_grpo_had_a_gradient([1.0], [])
+        rl_train._check_grpo_had_a_gradient([1.0], [], {1: 1.0}, expected_steps=range(1, 2))
 
 
 def test_grpo_gradient_check_still_rejects_an_unconsulted_reward_bridge():
     with pytest.raises(RuntimeError, match="never consulted"):
-        rl_train._check_grpo_had_a_gradient([], [])
+        rl_train._check_grpo_had_a_gradient([], [], {}, expected_steps=range(1, 2))
 
 
-def test_advantage_spread_is_parsed_from_a_real_verl_step_line():
-    # the guard is only as good as this parse: verl namespaces both keys under critic/ even though
-    # grpo runs without a critic, and emits them outside its use_critic branch
-    # (verl/trainer/ppo/metric_utils.py), so they are present for every grpo step.
+def test_advantage_bounds_remain_diagnostic_when_gradient_evidence_is_positive():
     line = (
-        "step:1 - critic/rewards/mean:1.0 - critic/rewards/max:1.0 - critic/rewards/min:1.0 - "
-        "critic/advantages/mean:0.0 - critic/advantages/max:0.0 - critic/advantages/min:0.0 - "
-        "actor/pg_loss:0.0"
+        "step:1 - critic/rewards/mean:0.875 - critic/advantages/max:0.125 - "
+        "critic/advantages/min:0.125 - actor/grad_norm:0.0076509942300617695"
     )
     adv_max = backend_common.parse_verl_metric(line, "critic/advantages/max")
     adv_min = backend_common.parse_verl_metric(line, "critic/advantages/min")
-    assert adv_max == 0.0
-    assert adv_min == 0.0
-    # this is the exact shape of the run in ISSUES VERL-064: healthy reward, zero spread.
-    with pytest.raises(RuntimeError, match="zero advantage spread"):
-        rl_train._check_grpo_had_a_gradient([1.0], [adv_max - adv_min])
-
-    varied = line.replace("critic/advantages/max:0.0", "critic/advantages/max:0.67").replace(
-        "critic/advantages/min:0.0", "critic/advantages/min:-0.33"
-    )
-    spread = backend_common.parse_verl_metric(
-        varied, "critic/advantages/max"
-    ) - backend_common.parse_verl_metric(varied, "critic/advantages/min")
-    assert spread > 0.0
-    rl_train._check_grpo_had_a_gradient([0.5], [spread])
+    grad_norm = backend_common.parse_verl_metric(line, "actor/grad_norm")
+    assert adv_max - adv_min == 0.0
+    rl_train._check_grpo_had_a_gradient([0.875], [0.0], {1: grad_norm}, expected_steps=range(1, 2))
 
 
-def test_run_rl_train_wires_the_gradient_check_into_the_publish_path():
-    # a helper nothing calls is not a guard. assert the training path actually invokes it, and that
-    # it does so before the adapter export rather than after a publish has already happened.
+def test_run_rl_train_wires_direct_gradient_evidence_into_the_publish_path():
     entry_source = inspect.getsource(rl_train.run_rl_train)
     verdict_source = inspect.getsource(rl_train._validate_rl_child)
     metrics_source = inspect.getsource(rl_train._ingest_step_metrics)
     export_source = inspect.getsource(rl_train._export_final_adapter)
     assert "_validate_rl_child(" in entry_source
     assert "_check_grpo_had_a_gradient(" in verdict_source
-    assert "resumed=bool(resume_step)," in verdict_source
-    assert "already_complete=bool(resume_step) and resume_step >= expected_steps," in verdict_source
+    assert "state.grad_norms," in verdict_source
+    assert "expected_steps=range(" in verdict_source
     assert entry_source.index("_validate_rl_child(") < entry_source.index("_export_final_adapter(")
     assert "export_peft_adapter(" in export_source
-    # and that the spread series it passes is collected from the structured durable metrics row.
+    assert 'step_metrics.get("grad_norm")' in metrics_source
     assert 'step_metrics.get("advantage_max")' in metrics_source
     assert 'step_metrics.get("advantage_min")' in metrics_source
     assert "_finalize_advantage_evidence(state, resume_step, expected_steps)" in verdict_source
-    assert verdict_source.index("_check_grpo_had_a_gradient(") < verdict_source.index(
-        "_finalize_advantage_evidence(state, resume_step, expected_steps)"
+
+
+def test_grpo_gradient_check_abstains_only_from_the_productivity_verdict_on_resume():
+    rl_train._check_grpo_had_a_gradient(
+        [1.0], [0.0], {10: 0.0}, resumed=True, expected_steps=range(10, 11)
     )
+    with pytest.raises(RuntimeError, match=r"missing=\[10\]"):
+        rl_train._check_grpo_had_a_gradient(
+            [1.0], [0.0], {}, resumed=True, expected_steps=range(10, 11)
+        )
+    with pytest.raises(RuntimeError, match="not finite and nonnegative"):
+        rl_train._check_grpo_had_a_gradient(
+            [1.0], [0.0], {10: -1.0}, resumed=True, expected_steps=range(10, 11)
+        )
+    with pytest.raises(RuntimeError, match="zero actor gradient norm"):
+        rl_train._check_grpo_had_a_gradient(
+            [1.0], [0.0], {1: 0.0}, resumed=False, expected_steps=range(1, 2)
+        )
 
 
-def test_grpo_gradient_check_abstains_for_a_resumed_run():
-    # a run resuming at step 9 of 10 observes ONE step; if that group ties, the spread history is
-    # all-zero even though the restored weights carry nine steps of real updates. rejecting it would
-    # throw away a correctly trained policy, so the resumed case abstains from the spread verdict.
-    rl_train._check_grpo_had_a_gradient([1.0], [0.0], resumed=True)
-    # abstaining is scoped to the spread verdict only: the parse/wiring checks still apply, because
-    # a missing metric stream is a regression no matter where training started.
-    with pytest.raises(RuntimeError, match="no advantage metrics"):
-        rl_train._check_grpo_had_a_gradient([1.0], [], resumed=True)
-    with pytest.raises(RuntimeError, match="never consulted"):
-        rl_train._check_grpo_had_a_gradient([], [], resumed=True)
-    # and a FRESH run with the same all-zero history is still rejected -- the abstention must be
-    # about the resume boundary, not a weakening of the guard.
-    with pytest.raises(RuntimeError, match="zero advantage spread"):
-        rl_train._check_grpo_had_a_gradient([1.0], [0.0], resumed=False)
+def test_terminal_metric_evidence_rejects_missing_nonfinite_negative_and_bad_range():
+    with pytest.raises(RuntimeError, match=r"missing=\[2\], extra=\[\]"):
+        rl_train._check_grpo_had_a_gradient(
+            [0.5, 0.5], [1.0, 1.0], {1: 1.0}, expected_steps=range(1, 3)
+        )
+    for value in (float("nan"), float("inf"), -0.1):
+        with pytest.raises(RuntimeError, match="not finite and nonnegative"):
+            rl_train._check_grpo_had_a_gradient(
+                [0.5], [1.0], {1: value}, expected_steps=range(1, 2)
+            )
+    with pytest.raises(RuntimeError, match=r"missing=\[1\], extra=\[3\]"):
+        rl_train._check_grpo_had_a_gradient([0.5], [1.0], {3: 1.0}, expected_steps=range(1, 2))
 
 
-def test_terminal_advantage_evidence_rejects_missing_nonfinite_and_zero_spread():
+def test_terminal_advantage_evidence_still_rejects_missing_and_nonfinite_bounds():
     missing = rl_train._StepMetricState()
     missing.reward_history[:] = [0.5, 0.5]
     missing.adv_spread_history[:] = [1.0]
     missing.advantage_bounds[1] = (-0.5, 0.5)
+    missing.grad_norms = {1: 1.0, 2: 1.0}
     with pytest.raises(RuntimeError, match=r"missing=\[2\], extra=\[\]"):
         rl_train._validate_rl_child(0, missing, 0, 2, None)
 
@@ -4442,79 +4445,49 @@ def test_terminal_advantage_evidence_rejects_missing_nonfinite_and_zero_spread()
     nonfinite.reward_history.append(0.5)
     nonfinite.adv_spread_history.append(1.0)
     nonfinite.advantage_bounds[1] = (0.0, float("inf"))
+    nonfinite.grad_norms[1] = 1.0
     with pytest.raises(RuntimeError, match="not finite and ordered"):
         rl_train._validate_rl_child(0, nonfinite, 0, 1, None)
 
-    zero = rl_train._StepMetricState()
-    zero.reward_history.append(0.5)
-    zero.adv_spread_history.append(0.0)
-    zero.advantage_bounds[1] = (0.0, 0.0)
-    with pytest.raises(RuntimeError, match="zero advantage spread"):
-        rl_train._validate_rl_child(0, zero, 0, 1, None)
-
 
 def test_grpo_gradient_check_accepts_a_resume_that_is_already_complete():
-    # a checkpoint already at the target yields no metrics because verl runs zero steps.
-    # empty histories are therefore valid for a fully trained resume.
-    rl_train._check_grpo_had_a_gradient([], [], resumed=True, already_complete=True)
-
-    # the exemption is ONLY for the zero-step case. a resume that ran steps and produced no metrics
-    # is still a wiring regression, and a fresh run can never claim it.
-    with pytest.raises(RuntimeError, match="never consulted"):
-        rl_train._check_grpo_had_a_gradient([], [], resumed=True, already_complete=False)
-    with pytest.raises(RuntimeError, match="never consulted"):
-        rl_train._check_grpo_had_a_gradient([], [], resumed=False)
-
-
-def test_resume_uploader_withholds_deployables_until_spread_appears():
-    # the uploader publishes servable adapters WHILE training runs, so a degenerate-reward run would
-    # make untrained adapters durable minutes before the end-of-run guard fails the run.
-    spread: list[float] = []
-    uploader = rl_train._VerlResumeUploader(
-        "/nonexistent",
-        resume_step=0,
-        required_steps=(1,),
-        had_gradient=lambda: any(s > 0.0 for s in spread),
+    rl_train._check_grpo_had_a_gradient(
+        [], [], {}, resumed=True, already_complete=True, expected_steps=range(6, 6)
     )
+    with pytest.raises(RuntimeError, match="never consulted"):
+        rl_train._check_grpo_had_a_gradient(
+            [], [], {}, expected_steps=range(6, 7), resumed=True, already_complete=False
+        )
+    with pytest.raises(RuntimeError, match="never consulted"):
+        rl_train._check_grpo_had_a_gradient([], [], {}, expected_steps=range(1, 2))
+
+
+def test_resume_uploader_publication_latch_starts_closed_and_opens_explicitly():
+    uploader = rl_train._VerlResumeUploader("/nonexistent", resume_step=0, required_steps=(1,))
     assert uploader._deployable_allowed() is False
-    spread.append(0.0)  # a step ran, but its group tied: still no gradient evidence
-    assert uploader._deployable_allowed() is False
-    spread.append(1.25)
+    uploader.allow_deployable_publication()
     assert uploader._deployable_allowed() is True
 
 
-def test_resume_uploader_treats_an_unreadable_gradient_signal_as_closed():
-    # this gate decides whether an artifact becomes durable and servable, so a callback that raises
-    # must not be read as permission to publish.
-    def boom() -> bool:
-        raise RuntimeError("signal unavailable")
-
-    uploader = rl_train._VerlResumeUploader("/nonexistent", resume_step=0, had_gradient=boom)
-    assert uploader._deployable_allowed() is False
-    # and no callback at all means no gate, which is the resume-only configuration.
-    assert rl_train._VerlResumeUploader("/nonexistent", resume_step=0)._deployable_allowed() is True
-
-
-def test_run_rl_train_gates_midtraining_deployables_and_exempts_resumes():
-    entry_source = inspect.getsource(rl_train.run_rl_train)
-    uploader_source = inspect.getsource(rl_train._start_resume_uploader)
-    # the gate must be wired into the uploader, not merely available on it.
-    assert "had_gradient=(" in uploader_source
-    # a resumed run publishes as before: its restored weights already carry earlier updates that
-    # this worker's spread history cannot speak for.
-    assert "if resume_step" in uploader_source.split("had_gradient=(")[1].split(")")[0] + ")"
-    # the spread series must be declared before the uploader closes over it, or the closure raises
-    # NameError the first time the drain thread consults it.
-    assert entry_source.index("adv_spread_history = state.adv_spread_history") < entry_source.index(
-        "_start_resume_uploader("
+def test_terminal_validation_opens_the_uploader_latch_before_the_final_drain():
+    verdict_source = inspect.getsource(rl_train._validate_rl_child)
+    assert "resume_uploader.allow_deployable_publication()" in verdict_source
+    assert verdict_source.index("_check_grpo_had_a_gradient(") < verdict_source.index(
+        "resume_uploader.allow_deployable_publication()"
     )
+    assert verdict_source.index("_finalize_advantage_evidence(") < verdict_source.index(
+        "resume_uploader.allow_deployable_publication()"
+    )
+    assert verdict_source.index(
+        "resume_uploader.allow_deployable_publication()"
+    ) < verdict_source.index("resume_uploader.stop()")
 
 
 def _patch_stage_and_publish(monkeypatch, staged: list[int], published: list[int]) -> None:
     """record staging and publication separately, without running model_merger or touching hf.
 
     they are patched as two seams because the production code separates them: staging is bounded by
-    verl's checkpoint retention, publication by the gradient gate.
+    verl's checkpoint retention, publication by the terminal validation latch.
     """
     monkeypatch.setattr(
         rl_train._VerlResumeUploader,
@@ -4541,7 +4514,6 @@ def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path
     uploaded: list[int] = []
     staged: list[int] = []
     published: list[int] = []
-    spread: list[float] = []
     monkeypatch.setattr(
         rl_train._w,
         "upload_resume_checkpoint",
@@ -4550,12 +4522,7 @@ def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
     _write_step(local_dir, 3)
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir),
-        resume_step=0,
-        required_steps=(3,),
-        had_gradient=lambda: any(s > 0.0 for s in spread),
-    )
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(3,))
     uploader.start()
     try:
         deadline = time.monotonic() + 10
@@ -4569,7 +4536,7 @@ def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path
         time.sleep(1.5)  # several sweeps: neither the upload nor the export may repeat
         assert uploaded == [3]
         assert staged == [3]
-        spread.append(2.0)  # gradient evidence appears; the held-back deployable is released
+        uploader.allow_deployable_publication()
         while time.monotonic() < deadline and not published:
             time.sleep(0.05)
         assert published == [3]
@@ -4577,6 +4544,114 @@ def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path
         assert staged == [3]
     finally:
         uploader.stop()
+    uploader.raise_if_incomplete()
+
+
+def test_positive_early_gradient_never_publishes_before_terminal_validation(tmp_path, monkeypatch):
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    staged: list[int] = []
+    published: list[int] = []
+    monkeypatch.setattr(
+        rl_train._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
+    )
+    _patch_stage_and_publish(monkeypatch, staged, published)
+    _write_step(local_dir, 1)
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(1,))
+    uploader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not staged:
+            time.sleep(0.01)
+        assert staged == [1]
+        time.sleep(0.6)
+        assert published == []
+    finally:
+        uploader.stop()
+
+
+def test_invalid_later_step_never_releases_an_early_positive_required_save(tmp_path, monkeypatch):
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    staged: list[int] = []
+    published: list[int] = []
+    monkeypatch.setattr(
+        rl_train._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
+    )
+    _patch_stage_and_publish(monkeypatch, staged, published)
+    _write_step(local_dir, 1)
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(1,))
+    uploader.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not staged:
+        time.sleep(0.01)
+
+    state = rl_train._StepMetricState()
+    state.reward_history[:] = [0.5, 0.5]
+    state.adv_spread_history[:] = [1.0]
+    state.advantage_bounds[1] = (-0.5, 0.5)
+    state.grad_norms[1] = 0.25
+    with pytest.raises(RuntimeError, match=r"missing=\[2\]"):
+        rl_train._validate_rl_child(0, state, 0, 2, uploader)
+    uploader.stop()
+
+    assert staged == [1]
+    assert published == []
+
+
+def test_clean_terminal_validation_releases_staged_required_save(tmp_path, monkeypatch):
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    staged: list[int] = []
+    published: list[int] = []
+    monkeypatch.setattr(
+        rl_train._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
+    )
+    _patch_stage_and_publish(monkeypatch, staged, published)
+    _write_step(local_dir, 1)
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(1,))
+    uploader.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not staged:
+        time.sleep(0.01)
+    assert published == []
+
+    state = rl_train._StepMetricState()
+    state.reward_history.append(0.5)
+    state.adv_spread_history.append(1.0)
+    state.advantage_bounds[1] = (-0.5, 0.5)
+    state.grad_norms[1] = 0.25
+    rl_train._validate_rl_child(0, state, 0, 1, uploader)
+
+    assert published == [1]
+    uploader.raise_if_incomplete()
+
+
+def test_resumed_new_required_step_waits_for_terminal_validation(tmp_path, monkeypatch):
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    staged: list[int] = []
+    published: list[int] = []
+    monkeypatch.setattr(
+        rl_train._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
+    )
+    _patch_stage_and_publish(monkeypatch, staged, published)
+    _write_step(local_dir, 2)
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=1, required_steps=(2,))
+    uploader.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not staged:
+        time.sleep(0.01)
+    assert published == []
+
+    state = rl_train._StepMetricState()
+    state.reward_history.append(0.5)
+    state.adv_spread_history.append(0.0)
+    state.advantage_bounds[2] = (0.0, 0.0)
+    state.grad_norms[2] = 0.0
+    rl_train._validate_rl_child(0, state, 1, 2, uploader)
+
+    assert published == [2]
     uploader.raise_if_incomplete()
 
 
@@ -4603,9 +4678,8 @@ def test_a_gate_already_open_publishes_the_deployable_before_the_resume_upload(
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
     _write_step(local_dir, 3)
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(3,), had_gradient=lambda: True
-    )
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(3,))
+    uploader.allow_deployable_publication()
     uploader.start()
     try:
         deadline = time.monotonic() + 10
@@ -4669,9 +4743,7 @@ def test_a_permanently_withheld_step_fails_the_run_and_does_not_hang_stop(tmp_pa
     )
     _patch_stage_and_publish(monkeypatch, [], [])
     _write_step(local_dir, 3)
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(3,), had_gradient=lambda: False
-    )
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(3,))
     uploader.start()
     time.sleep(0.5)
     uploader.stop()  # must return, not hang
@@ -4683,8 +4755,8 @@ def test_gate_opening_just_before_stop_still_publishes_rather_than_failing_on_ti
     tmp_path, monkeypatch
 ):
     # the drain loop samples the gate once per sweep. if the main thread records the run's first
-    # positive spread and calls stop() after that sample, publishing nothing would fail a genuinely
-    # trained run for no reason but thread scheduling. the sweep that observes stop() must therefore
+    # terminal validation can open the latch immediately before stop. publishing nothing would fail a
+    # genuinely trained run for no reason but thread scheduling, so the stop sweep must observe it.
     # still act on the gate as it stands then.
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
@@ -4694,23 +4766,12 @@ def test_gate_opening_just_before_stop_still_publishes_rather_than_failing_on_ti
     )
     _patch_stage_and_publish(monkeypatch, [], published)
     _write_step(local_dir, 3)
-    gate = [False]
-    # flips the gate open on the sweep *after* the first sample, mimicking the main thread recording
-    # spread while the drain loop is already past its own read.
-    reads = [0]
-
-    def _had_gradient():
-        reads[0] += 1
-        return gate[0]
-
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(3,), had_gradient=_had_gradient
-    )
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(3,))
     uploader.start()
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and reads[0] < 1:
+    while time.monotonic() < deadline and not uploader.staged_adapters:
         time.sleep(0.01)
-    gate[0] = True  # spread appears, then the run ends immediately
+    uploader.allow_deployable_publication()
     uploader.stop()
     assert published == [3]
     uploader.raise_if_incomplete()
@@ -4718,7 +4779,7 @@ def test_gate_opening_just_before_stop_still_publishes_rather_than_failing_on_ti
 
 def test_resumed_required_step_can_still_publish_its_withheld_deployable(tmp_path, monkeypatch):
     # a previous worker resume-uploads a required checkpoint while withholding its adapter behind the
-    # gradient gate, so the step is durable as resume state but NOT published. seeding the lifecycle
+    # terminal latch, so the step is durable as resume state but not published. seeding the lifecycle
     # with resume_step would hide it from _pending forever, and completeness would then fail a run on
     # the one step this worker is both able and allowed to publish.
     local_dir = tmp_path / "ckpt"
@@ -4735,8 +4796,10 @@ def test_resumed_required_step_can_still_publish_its_withheld_deployable(tmp_pat
     uploader.credit_durable_required_steps(4)
     uploader.start()
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and not published:
+    while time.monotonic() < deadline and not uploader.staged_adapters:
         time.sleep(0.01)
+    assert published == []
+    uploader.allow_deployable_publication()
     uploader.stop()
     assert published == [4]
     uploader.raise_if_incomplete()
@@ -4746,7 +4809,7 @@ def test_checkpoint_appearing_at_stop_is_uploaded_before_the_exit(tmp_path, monk
     # verl advances latest_checkpointed_iteration.txt right up to the moment the child exits, so the
     # newest resume checkpoint can appear after the drain's last scan but before stop(). exiting
     # without sweeping that checkpoint would drop durable work a preemption then has to redo. resume
-    # upload is not gated, and with the gradient gate shut nothing may be PUBLISHED.
+    # upload is not gated, and with the terminal latch shut nothing may be published.
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     uploaded: list[int] = []
@@ -4788,9 +4851,7 @@ def test_checkpoint_appearing_at_stop_is_uploaded_before_the_exit(tmp_path, monk
     monkeypatch.setattr(
         rl_train._VerlResumeUploader, "_completed_step", _completed_then_race, raising=True
     )
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(5,), had_gradient=lambda: False
-    )
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(5,))
     uploader.start()
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and uploader._thread.is_alive():
@@ -4803,7 +4864,7 @@ def test_checkpoint_appearing_at_stop_is_uploaded_before_the_exit(tmp_path, monk
 
 def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monkeypatch):
     # verl keeps only max_actor_ckpt_to_keep=3 actor checkpoints, so with four or more required steps
-    # written before the first varying-reward group it deletes the earliest source while its
+    # written before terminal validation it deletes the earliest source while its
     # deployable is still withheld. deferring the EXPORT until the gate opens would then leave that
     # step unpublishable and fail an otherwise valid run, so the export is staged under export_root
     # (flash's own workdir, outside verl's retention) and only the upload waits for the gate.
@@ -4811,7 +4872,6 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monk
     local_dir.mkdir()
     staged: list[int] = []
     published: list[int] = []
-    gate = [False]
     monkeypatch.setattr(
         rl_train._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
     )
@@ -4840,7 +4900,7 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monk
         (local_dir / f"global_step_{step}").mkdir()
     _write_step(local_dir, 4)
     uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(1, 2, 3, 4), had_gradient=lambda: gate[0]
+        str(local_dir), resume_step=0, required_steps=(1, 2, 3, 4)
     )
     uploader.start()
     try:
@@ -4853,7 +4913,7 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monk
         # step whose export was deferred until the gate opened.
         for step in (1, 2):
             shutil.rmtree(local_dir / f"global_step_{step}")
-        gate[0] = True  # the first varying-reward group finally arrives
+        uploader.allow_deployable_publication()
         while time.monotonic() < deadline and len(published) < 4:
             time.sleep(0.01)
     finally:
@@ -4896,9 +4956,8 @@ def test_staging_failure_does_not_strand_an_earlier_publishable_step(tmp_path, m
     for step in (1, 2):
         (local_dir / f"global_step_{step}").mkdir()
     _write_step(local_dir, 2)
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(1, 2), had_gradient=lambda: True
-    )
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(1, 2))
+    uploader.allow_deployable_publication()
     uploader.start()
     try:
         deadline = time.monotonic() + 10
@@ -4914,7 +4973,7 @@ def test_staging_failure_does_not_strand_an_earlier_publishable_step(tmp_path, m
 
 
 def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, monkeypatch):
-    # a zero-spread run withholds every required deployable by design. checking completeness first
+    # a zero-gradient run withholds every required deployable by design. checking completeness first
     # would raise on artifacts the gate is deliberately holding, reporting a checkpoint-publication
     # failure -- the symptom -- instead of the constant reward signal that caused it.
     local_dir = tmp_path / "ckpt"
@@ -4924,15 +4983,15 @@ def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, mon
         rl_train._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
     )
     _patch_stage_and_publish(monkeypatch, [], [])
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(6,), had_gradient=lambda: False
-    )
+    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(6,))
     uploader.start()
     uploader.stop()
-    # both failures are live: the deployable was withheld, and the run produced no spread. the
-    # gradient verdict must be the one that speaks.
-    with pytest.raises(RuntimeError, match="zero advantage spread on all"):
-        rl_train._check_grpo_had_a_gradient([0.5, 0.5], [0.0, 0.0], resumed=False)
+    # both failures are live: the deployable was withheld, and the run produced only zero actor
+    # gradients. the gradient verdict must be the one that speaks.
+    with pytest.raises(RuntimeError, match="zero actor gradient norm"):
+        rl_train._check_grpo_had_a_gradient(
+            [0.5, 0.5], [0.0, 0.0], {1: 0.0, 2: 0.0}, expected_steps=range(1, 3)
+        )
     with pytest.raises(RuntimeError, match="required saves were not durably published"):
         uploader.raise_if_incomplete()
     # ordering is asserted at the call site: the verdict precedes stop()/raise_if_incomplete().
@@ -5022,6 +5081,7 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
     state.reward_history.append(0.5)
     state.adv_spread_history.append(1.0)
     state.advantage_bounds[1] = (-0.25, 0.75)
+    state.grad_norms[1] = 0.25
     runtime = SimpleNamespace(identity_ledger=ledger)
     rl_train._validate_rl_child(0, state, 0, 1, None, reward_runtime=runtime)
 
@@ -5029,12 +5089,14 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
     assert "rollout_identity_evidence=state.rollout_identity_evidence" in terminal_source
     assert "advantage_spread_history=state.adv_spread_history" in terminal_source
     assert "advantage_bounds=state.advantage_bounds_evidence" in terminal_source
+    assert "grad_norm_evidence=state.grad_norm_evidence" in terminal_source
     notes = rl_train._build_verl_train_notes(
         _notes_inp(),
         **_notes_common(),
         rollout_identity_evidence=state.rollout_identity_evidence,
         advantage_spread_history=state.adv_spread_history,
         advantage_bounds=state.advantage_bounds_evidence,
+        grad_norm_evidence=state.grad_norm_evidence,
     )
     assert notes["rollout_identity_evidence"] == {
         "steps": [
@@ -5048,6 +5110,7 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
     }
     assert notes["advantage_spread_history"] == [1.0]
     assert notes["advantage_bounds"] == [{"step": 1, "min": -0.25, "max": 0.75, "spread": 1.0}]
+    assert notes["grad_norm_evidence"] == [{"step": 1, "grad_norm": 0.25}]
 
 
 def test_already_complete_resume_finalizes_empty_rollout_identity_evidence():
@@ -5059,14 +5122,17 @@ def test_already_complete_resume_finalizes_empty_rollout_identity_evidence():
     assert state.rollout_identity_evidence == {"steps": [], "validation": []}
     assert state.adv_spread_history == []
     assert state.advantage_bounds_evidence == []
+    assert state.grad_norm_evidence == []
     notes = rl_train._build_verl_train_notes(
         _notes_inp(),
         **_notes_common(),
         advantage_spread_history=state.adv_spread_history,
         advantage_bounds=state.advantage_bounds_evidence,
+        grad_norm_evidence=state.grad_norm_evidence,
     )
     assert notes["advantage_spread_history"] == []
     assert notes["advantage_bounds"] == []
+    assert notes["grad_norm_evidence"] == []
 
 
 def test_train_notes_carry_the_trl_observability_fields():
@@ -9069,6 +9135,7 @@ def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
     state.reward_history.append(0.5)
     state.adv_spread_history.append(1.0)
     state.advantage_bounds[1] = (-0.5, 0.5)
+    state.grad_norms[1] = 1.0
     marker = tmp_path / "applied_shims.txt"
     marker.write_text("entropy-quantile\n")
     # the complete set passes and falls through to the gradient verdict.
@@ -9468,13 +9535,13 @@ def test_single_turn_run_records_multi_turn_accounting_as_an_explicit_none():
     assert notes["multi_turn_accounting"] is None
 
 
-def _verl_step_line(step: int, *, adv_min: float, adv_max: float) -> str:
+def _verl_step_line(step: int, *, adv_min: float, adv_max: float, grad_norm: float = 1.0) -> str:
     """one verl LocalLogger step line, in the exact shape the child prints."""
     return (
         f"step:{step} - critic/rewards/mean:1.0 - critic/rewards/max:1.0 - "
         f"critic/rewards/min:1.0 - critic/advantages/mean:0.0 - "
         f"critic/advantages/max:{adv_max} - critic/advantages/min:{adv_min} - "
-        "actor/pg_loss:0.0"
+        f"actor/pg_loss:0.0 - actor/grad_norm:{grad_norm}"
     )
 
 
@@ -9499,6 +9566,7 @@ def test_resumed_grpo_ignores_the_replayed_resume_step_bounds():
         observability,
     )
     assert 2 not in state.advantage_bounds
+    assert 2 not in state.grad_norms
 
     # the first genuinely new step is recorded.
     rl_train._ingest_step_metrics(
@@ -9508,6 +9576,7 @@ def test_resumed_grpo_ignores_the_replayed_resume_step_bounds():
         observability,
     )
     assert sorted(state.advantage_bounds) == [3]
+    assert state.grad_norms == {3: 1.0}
 
     # and the terminal verdict accepts the run instead of reporting step 2 as extra.
     rl_train_runner._finalize_advantage_evidence(state, 2, 3)

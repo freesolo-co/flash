@@ -241,6 +241,7 @@ def _write_terminal_metadata(
             rollout_identity_evidence=state.rollout_identity_evidence,
             advantage_spread_history=state.adv_spread_history,
             advantage_bounds=state.advantage_bounds_evidence,
+            grad_norm_evidence=state.grad_norm_evidence,
             multi_turn_accounting=(
                 reward_runtime.multi_turn_bridge.turn_accounting()
                 if reward_runtime.multi_turn_bridge is not None
@@ -399,10 +400,6 @@ def run_rl_train():
         expected_steps, loggers = configured["expected_steps"], configured["loggers"]
         _w.heartbeat("rl_step", step=0, initial=True)
         state = _StepMetricState()
-        # equal within-group rewards produce zero advantages and gradients. collect per-step spread;
-        # reward mean and pg_loss cannot prove a signal. declare this before the uploader because its
-        # publication gate closes over the histories.
-        adv_spread_history = state.adv_spread_history
         resume_uploader = _start_resume_uploader(
             local_dir=files["local_dir"],
             resume_step=files["resume_step"],
@@ -410,7 +407,6 @@ def run_rl_train():
             workdir=files["workdir"],
             python_bin=python_bin,
             preprocessor=preprocessor,
-            adv_spread_history=adv_spread_history,
         )
         env_for_verl = _build_rl_child_env(inp, files, loggers, reward_runtime.reward_url)
         metrics_last = state.metrics_last

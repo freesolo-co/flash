@@ -10,11 +10,11 @@ Split out of `flash.engine.worker.rl_train` to keep that module under the file-s
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import threading
 import time
-from collections.abc import Callable
 
 from flash.engine.verl_checkpoint import FsdpCheckpointInspection
 from flash.engine.verl_policy import FsdpGeneration
@@ -66,7 +66,6 @@ class _VerlResumeUploader:
         model_revision: str = "",
         exclude_modules: str | None = None,
         preprocessor=None,
-        had_gradient: Callable[[], bool] | None = None,
     ) -> None:
         self.local_dir = local_dir
         self.required_steps = frozenset(required_steps)
@@ -77,7 +76,7 @@ class _VerlResumeUploader:
         # recorded from the transport's own callback.
         self._resume_attempted: set[int] = {resume_step} if resume_step else set()
         # required step -> staged adapter directory, populated the sweep a checkpoint appears and
-        # drained by publication once the gradient gate opens. paths, not lifecycle state: this is
+        # drained by publication once the terminal latch opens. paths, not lifecycle state: this is
         # what decouples publication from verl's checkpoint retention.
         self.staged_adapters: dict[int, str] = {}
         self.export_root = export_root
@@ -89,10 +88,9 @@ class _VerlResumeUploader:
         # from an adapter dir that carries only tokenizer files, since the runtime needs the
         # preprocessor config to turn pixels back into tokens.
         self.preprocessor = preprocessor
-        # gate deployable publication on real gradient evidence so zero-gradient runs cannot leave
-        # servable per-step adapters before the final guard fails. resume uploads remain allowed because
-        # they are internal retry state, not servable artifacts.
-        self.had_gradient = had_gradient
+        # required deployables stay closed until terminal metric validation succeeds. staging and
+        # internal resume uploads remain concurrent because neither makes an adapter servable.
+        self._publication_latch = threading.Event()
         self._error: BaseException | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -132,17 +130,13 @@ class _VerlResumeUploader:
         if missing:
             raise RuntimeError(f"required saves were not durably published: {missing}")
 
-    def _deployable_allowed(self) -> bool:
-        """return whether gradient evidence permits deployable publication.
+    def allow_deployable_publication(self) -> None:
+        """open required-save publication after terminal metric validation succeeds."""
+        self._publication_latch.set()
 
-        no callback means no gate. callback errors fail closed because this controls durable serving.
-        """
-        if self.had_gradient is None:
-            return True
-        try:
-            return bool(self.had_gradient())
-        except Exception:
-            return False
+    def _deployable_allowed(self) -> bool:
+        """return whether terminal validation permits deployable publication."""
+        return self._publication_latch.is_set()
 
     def _completed_step(self) -> int:
         return completed_checkpoint_step(self.local_dir)
@@ -156,7 +150,7 @@ class _VerlResumeUploader:
     def _stage_deployable(self, step: int, checkpoint_dir: str) -> str:
         """stage a required checkpoint as a servable adapter under ``export_root``.
 
-        stage before the gradient gate because verl may prune ``checkpoint_dir`` while the gate is
+        stage before the terminal latch opens because verl may prune ``checkpoint_dir`` while it is
         closed. ``export_root`` outlives verl retention; only later publication makes it servable.
         """
         actor_dir = os.path.join(checkpoint_dir, "actor")
@@ -211,8 +205,8 @@ class _VerlResumeUploader:
                 stopping = self._stop.is_set()
                 for step, path in self._pending():
                     # stage while verl's checkpoint still exists; publication happens below, once
-                    # the gate opens. the two have different deadlines -- the source expires with
-                    # verl's retention, the permission arrives with the first varying-reward group --
+                    # the gate opens. the two have different deadlines: the source expires with
+                    # verl's retention, while permission arrives after terminal metric validation,
                     # so a step is staged on the sweep that finds it and published whenever it may be.
                     if (
                         step in self.required_steps
@@ -246,8 +240,8 @@ class _VerlResumeUploader:
                             )
                     self.lifecycle.mark_discovered(step)
                 # a step staged while the gate was shut is published by a later sweep, so this runs
-                # every pass and not only when something was staged: the gate opens on the first
-                # varying-reward group, which is usually a sweep that finds no new checkpoint.
+                # every pass and not only when something was staged. terminal validation opens the
+                # latch immediately before stop asks this thread for its final drain.
                 self._publish_ready()
                 # `stopping`, not a fresh read: the sweep above is the full pass over everything
                 # stop() had made visible, and only after running it may the loop exit. staged
@@ -303,18 +297,20 @@ def _restore_verl_resume(
 def _check_grpo_had_a_gradient(
     reward_history: list[float],
     adv_spread_history: list[float],
+    grad_norms: dict[int, float],
     *,
+    expected_steps: range | tuple[int, ...],
     resumed: bool = False,
     already_complete: bool = False,
 ) -> None:
-    """raise unless grpo rewards produced a nonzero policy gradient.
+    """raise unless the newly executed grpo steps include a positive gradient norm.
 
-    grpo mean-centres rewards within each group, so equal rewards yield zero advantages and a zero
-    gradient despite valid checkpoints and reward means. advantage spread is the decisive signal;
-    pg_loss can also be near zero on a valid first step.
+    verl's finite actor/grad_norm is the direct evidence that the actor backward pass reached an
+    optimizer update. advantage bounds remain diagnostic because masking can exclude rows from their
+    reduction and collapse the logged spread even when the actor received a nonzero gradient.
 
-    abstain for resumed or already-complete runs because this worker did not observe the earlier
-    productive steps. the guard still catches degenerate envs on their first, unresumed attempt.
+    a resumed worker may observe only a zero-gradient suffix of an already productive run, but every
+    step it newly executes must still carry complete valid gradient evidence.
     """
     if already_complete:
         # no step ran, so there is no metric stream to judge and nothing the parse could have
@@ -322,32 +318,36 @@ def _check_grpo_had_a_gradient(
         return
     if not reward_history:
         raise RuntimeError(
-            "verl reported no reward metrics for the whole run — the flash reward bridge was "
+            "verl reported no reward metrics for the whole run; the flash reward bridge was "
             "never consulted (wiring regression); refusing to publish a policy trained on "
             "default rewards"
         )
     if not adv_spread_history:
-        # advantages ride the same log line as critic/rewards/mean (both come from one
-        # compute_data_metrics dict), so reward metrics without advantage metrics means the parse
-        # broke, not that verl chose not to report. treat that as a regression rather than let the
-        # spread check below degrade into a guard that cannot fire.
+        # keep advantage format verification independent from the gradient verdict. both metrics are
+        # expected on each step line, but only grad_norm proves that an optimizer update had signal.
         raise RuntimeError(
-            "verl reported reward metrics but no advantage metrics for any step — "
-            "critic/advantages/max and /min could not be parsed (metric-format regression); "
-            "refusing to publish because the zero-gradient check cannot run"
+            "verl reported reward metrics but no advantage metrics for any step; "
+            "critic/advantages/max and /min could not be parsed (metric-format regression)"
         )
-    if resumed:
-        # see the docstring: this worker's history is a suffix of the run's training, so an all-zero
-        # suffix is not evidence the run never had a gradient. the parse checks above still apply --
-        # they catch a wiring/format regression regardless of where training started.
-        return
-    # deliberately "no step ever had spread" rather than "some step had none": a run that genuinely
-    # converges, or that draws one unlucky all-equal group, legitimately reports zero spread on
-    # individual steps, and rejecting those would fail correct runs.
-    if not any(spread > 0.0 for spread in adv_spread_history):
+    expected = tuple(expected_steps)
+    actual = tuple(sorted(grad_norms))
+    if actual != expected:
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
         raise RuntimeError(
-            f"grpo saw zero advantage spread on all {len(adv_spread_history)} steps — every group's "
-            "rewards were identical, so every advantage was 0 and the gradient was exactly 0; the "
-            "environment's reward does not discriminate between completions. refusing to publish an "
-            "adapter identical to its initialization"
+            "GRPO gradient norms do not cover the executed optimizer steps: "
+            f"missing={missing}, extra={extra}"
+        )
+    if not actual:
+        raise RuntimeError("verl reported no actor/grad_norm evidence for newly executed steps")
+    for step in actual:
+        value = grad_norms[step]
+        if not math.isfinite(value) or value < 0.0:
+            raise RuntimeError(f"GRPO gradient norm for step {step} is not finite and nonnegative")
+    if resumed:
+        return
+    if not any(value > 0.0 for value in grad_norms.values()):
+        raise RuntimeError(
+            f"grpo reported zero actor gradient norm on all {len(grad_norms)} newly executed steps; "
+            "refusing to publish an adapter identical to its initialization"
         )

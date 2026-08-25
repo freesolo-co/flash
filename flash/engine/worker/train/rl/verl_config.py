@@ -728,6 +728,7 @@ def _build_verl_train_notes(
     rollout_identity_evidence: dict | None = None,
     advantage_spread_history: list[float] | None = None,
     advantage_bounds: list[dict] | None = None,
+    grad_norm_evidence: list[dict] | None = None,
     multi_turn_accounting: dict | None = None,
 ) -> dict:
     return {
@@ -791,6 +792,7 @@ def _build_verl_train_notes(
         ),
         "advantage_spread_history": list(advantage_spread_history or []),
         "advantage_bounds": copy.deepcopy(advantage_bounds or []),
+        "grad_norm_evidence": copy.deepcopy(grad_norm_evidence or []),
         # episode and turn totals for a multi-turn run; None for single-turn, which has no
         # episode loop to account for. published in the durable notes rather than only on the
         # heartbeat because this is the evidence that separates "multi-turn was configured" from
