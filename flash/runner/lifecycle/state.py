@@ -34,12 +34,14 @@ _UNDEPLOYABLE_STATES = TERMINAL_STATES - {"done"}
 # serialize local writers before taking each run's interprocess lock.
 _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
+_NEXT_FENCE_KEY = "next_fence"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
 _OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
 _PRIVATE_STATUS_KEYS = frozenset(
     {
         _RUN_DEADLINE_AT_KEY,
         _NEXT_ATTEMPT_KEY,
+        _NEXT_FENCE_KEY,
         _CLEANUP_REMOTES_KEY,
         _OPD_RETRY_CONTRACT_KEY,
     }
@@ -153,8 +155,10 @@ class RunStatus:
     billing_error: str | None = None
     billing_charge: dict | None = None
     platform_context: dict | None = None
-    last_heartbeat: dict | None = None
-    gpu_status: dict | None = None
+    attempt: dict | None = None
+    progress: dict | None = None
+    resource: dict | None = None
+    result: dict | None = None
     workload_profile_input_digest: str | None = None
     workload_profile: dict | None = None
     # submit-time derived grpo/opd prompt budget from flash.engine.plan.prompt_budget. workers drop
@@ -175,9 +179,6 @@ class RunStatus:
         data.pop("report_sequence", None)
         # internal warm-start preparation (storage locators, digests) never leaves the server
         data.pop("effective_preparation", None)
-        heartbeat = data.get("last_heartbeat")
-        if isinstance(heartbeat, dict):
-            heartbeat.pop("source_provenance", None)
         source_snapshot = data.pop("source_snapshot", None)
         data.pop("source_verified_attempt", None)
         if source_snapshot is not None:
@@ -313,6 +314,7 @@ def _save_status(
     *,
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
+    _next_fence: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
@@ -335,10 +337,13 @@ def _save_status(
                 )
             if _next_attempt is _PRIVATE_VALUE_UNSET:
                 _next_attempt = 0
+            if _next_fence is _PRIVATE_VALUE_UNSET:
+                _next_fence = 1
         _save_status_unlocked(
             status,
             _run_deadline_at=_run_deadline_at,
             _next_attempt=_next_attempt,
+            _next_fence=_next_fence,
             _cleanup_remotes=_cleanup_remotes,
             _opd_retry_contract_version=_opd_retry_contract_version,
         )
@@ -349,6 +354,7 @@ def _save_status_unlocked(
     *,
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
+    _next_fence: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
@@ -370,6 +376,7 @@ def _save_status_unlocked(
     private_values = {
         _RUN_DEADLINE_AT_KEY: _run_deadline_at,
         _NEXT_ATTEMPT_KEY: _next_attempt,
+        _NEXT_FENCE_KEY: _next_fence,
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
         _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
     }

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from flash.adapters.artifacts import MAX_ATTEMPT_ID
 from flash.adapters.fused_experts import lora_target_parameters
 from flash.core.spec import JobSpec
@@ -19,33 +21,6 @@ def _infer_next_attempt(raw: dict) -> int:
     if _attempt_int(stored) is None:
         raise RuntimeError("stored next attempt identity is invalid")
     return stored
-
-
-def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
-    """True when a heartbeat carries the attempt identity this run most recently reserved.
-
-    This is the plane-side counterpart of ``_heartbeat_matches_attempt``, which runs provider-side
-    where the launch timestamp is in hand; here the equivalent identity
-    is the reserved attempt, which the worker stamps on every heartbeat and ``_save_status`` already
-    persists as ``next_attempt`` (the NEXT id to hand out, so the live attempt is one below it --
-    same arithmetic as ``_latest_reserved_attempt``, computed from the caller's already-loaded
-    record because this runs inside the status guard and must not re-read it).
-    """
-    if not isinstance(hb, dict):
-        return False
-    try:
-        next_attempt = _attempt_int(_infer_next_attempt(raw))
-    except RuntimeError:
-        return False
-    if next_attempt is None:
-        return False
-    # `_reserve_attempt` runs before the provider launch (lifecycle.py), so a live worker's
-    # heartbeat always sits one below the stored counter. zero means nothing has been reserved yet;
-    # accept attempt 0 there rather than rejecting, because the launch path writes the counter and
-    # the worker's first heartbeat can be read back in either order, and refusing to arm would hand
-    # the run a budget measured from a moment before it started working.
-    expected = next_attempt - 1 if next_attempt > 0 else 0
-    return _attempt_int(hb.get("attempt")) == expected
 
 
 def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]:
@@ -99,13 +74,16 @@ def _verified_opd_next_attempt(run_id: str) -> int:
     return _verified_opd_retry_state(run_id)[0]
 
 
-def _reserve_attempt(
+def _reserve_attempt_record(
     run_id: str,
     *,
     minimum_attempt: int = 0,
     expected_next_attempt: int | None = None,
-) -> int:
-    """Durably consume one run-global attempt identity before provider creation."""
+):
+    """Durably reserve an attempt and monotonic fence before provider creation."""
+    from flash.runner.lifecycle.deadlines import _derive_attempt_deadlines
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
     minimum = _attempt_int(minimum_attempt)
     if minimum is None:
         raise RuntimeError("minimum attempt identity is invalid")
@@ -132,13 +110,53 @@ def _reserve_attempt(
                 raise RuntimeError("opd attempt reservation requires verified retry evidence")
             if minimum > expected:
                 raise RuntimeError("minimum opd attempt exceeds the verified retry snapshot")
-            attempt = expected
+            attempt_id = expected
         else:
-            attempt = max(current, minimum)
-        if attempt >= MAX_ATTEMPT_ID:
+            attempt_id = max(current, minimum)
+        if attempt_id >= MAX_ATTEMPT_ID:
             raise RuntimeError("run attempt identity is exhausted")
-        state._save_status_unlocked(status, _next_attempt=attempt + 1)
-        return attempt
+        fence = raw.get(state._NEXT_FENCE_KEY)
+        if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
+            raise RuntimeError("stored next fence identity is missing or invalid")
+        reserved_at = time.time()
+        grant, work, result, run = _derive_attempt_deadlines(
+            raw,
+            reserved_at=reserved_at,
+        )
+        record = AttemptRecord(
+            attempt_id=attempt_id,
+            fence=fence,
+            state="reserved",
+            reserved_at=reserved_at,
+            grant_deadline_at=grant,
+            work_deadline_at=work,
+            result_deadline_at=result,
+            run_deadline_at=run,
+        )
+        status.attempt = record.to_dict()
+        status.progress = None
+        status.resource = None
+        status.result = None
+        state._save_status_unlocked(
+            status,
+            _next_attempt=attempt_id + 1,
+            _next_fence=fence + 1,
+        )
+        return record
+
+
+def _reserve_attempt(
+    run_id: str,
+    *,
+    minimum_attempt: int = 0,
+    expected_next_attempt: int | None = None,
+) -> int:
+    """Compatibility-free internal convenience returning the reserved numeric attempt."""
+    return _reserve_attempt_record(
+        run_id,
+        minimum_attempt=minimum_attempt,
+        expected_next_attempt=expected_next_attempt,
+    ).attempt_id
 
 
 def _latest_reserved_attempt(run_id: str) -> int | None:

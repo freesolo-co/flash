@@ -245,72 +245,63 @@ def get_logs(run_id: str) -> str:
         return f.read()
 
 
-_STATUS_LIST_LIMIT = 16
-_STATUS_METRICS_HISTORY_LIMIT = 1024
+def _current_attempt(status: RunStatus):
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    return AttemptRecord.from_dict(status.attempt)
 
 
-def _sanitize_status_value(value, *, depth: int = 0, field: str = ""):
-    """Bound a heartbeat payload before persisting it in run status JSON."""
-    if depth > 5:
-        return str(value)[:200]
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    if isinstance(value, str):
-        return value[:1000]
-    if isinstance(value, list):
-        if field == "metrics_last":
-            values = value[-_STATUS_METRICS_HISTORY_LIMIT:]
-        else:
-            values = value[:_STATUS_LIST_LIMIT]
-        return [_sanitize_status_value(v, depth=depth + 1) for v in values]
-    if isinstance(value, dict):
-        out = {}
-        for i, (k, v) in enumerate(value.items()):
-            if i >= 64:
-                out["truncated"] = True
-                break
-            sanitized_key = str(k)[:120]
-            out[sanitized_key] = _sanitize_status_value(v, depth=depth + 1, field=sanitized_key)
-        return out
-    return str(value)[:500]
+def _record_projection(
+    run_id: str,
+    field: str,
+    value: dict,
+    *,
+    attempt_id: int,
+    fence: int,
+    resource_identity: tuple | None = None,
+) -> bool:
+    """Persist a projection only for the exact current attempt, fence, and resource."""
+    from flash.runner.accounting.reconciliation import _remote_resource_identity
+    from flash.runner.lifecycle.protocol import bounded_json
 
-
-def record_heartbeat(run_id: str, heartbeat: dict) -> None:
-    """Persist the latest worker heartbeat/GPU snapshot without changing run state."""
-    if not run_id or not isinstance(heartbeat, dict):
-        return
-    if not os.path.exists(state.runs_file_path(run_id, ".json")):
-        return
-    hb = _sanitize_status_value(heartbeat)
-    gpu = hb.get("gpu") if isinstance(hb, dict) else None
     with state._status_guard(run_id):
-        try:
-            status = get_status(run_id)
-        except FileNotFoundError:
-            return
-        prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
-        # a boot/retry heartbeat for a NEW attempt must inherit nothing from the previous one: its
-        # metrics are a different run of the steps and its gpu snapshot is a different card.
-        same_attempt = prev is not None and prev.get("attempt") == hb.get("attempt")
-        # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
-        # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
-        # metrics-bearing heartbeat lands.
-        if isinstance(hb, dict) and not hb.get("metrics_last"):
-            prev_metrics = prev.get("metrics_last") if isinstance(prev, dict) else None
-            if same_attempt and isinstance(prev_metrics, list) and prev_metrics:
-                hb["metrics_last"] = prev_metrics
-        status.last_heartbeat = hb
-        # carried forward on the same rule as the metric backlog above, and for the same reason: most
-        # heartbeats carry no `gpu` at all -- only the periodic liveness tick and the terminal ones do
-        # -- so assigning unconditionally blanks the snapshot on every checkpoint-stage heartbeat and
-        # leaves `flash runs status` and the API reporting no GPU for a running job.
-        if isinstance(gpu, dict):
-            status.gpu_status = gpu
-        elif not same_attempt:
-            status.gpu_status = None
+        status = get_status(run_id)
+        attempt = _current_attempt(status)
+        if attempt.attempt_id != attempt_id or attempt.fence != fence:
+            return False
+        if resource_identity is not None and _remote_resource_identity(status.remote) != resource_identity:
+            return False
+        setattr(status, field, bounded_json(value))
         status.updated_at = time.time()
         state._save_status_unlocked(status)
     reporting._report_status(status)
+    return True
+
+
+def record_progress(run_id: str, value: dict, *, attempt_id: int, fence: int) -> bool:
+    return _record_projection(run_id, "progress", value, attempt_id=attempt_id, fence=fence)
+
+
+def record_resource(
+    run_id: str,
+    value: dict,
+    *,
+    attempt_id: int,
+    fence: int,
+    resource_identity: tuple | None = None,
+) -> bool:
+    return _record_projection(
+        run_id,
+        "resource",
+        value,
+        attempt_id=attempt_id,
+        fence=fence,
+        resource_identity=resource_identity,
+    )
+
+
+def record_result(run_id: str, value: dict, *, attempt_id: int, fence: int) -> bool:
+    return _record_projection(run_id, "result", value, attempt_id=attempt_id, fence=fence)
 
 
 def validate_terminal_source_metrics(
