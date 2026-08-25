@@ -75,21 +75,21 @@ def test_nvlink_classification_is_by_form_factor():
 
 
 def test_nvlink_classification_tracks_the_provisioned_board():
-    """Classification must follow the pin a MULTI-CARD run actually lands on.
+    """classification must follow the exact board a multi-card run requests.
 
-    Multi-card provisioning is runpod-only, and runpod pins H100 to the HBM3 sxm part while
-    negating the pcie/NVL boards in the same pool. Assert against those pins rather than restating
-    the classification, so re-pinning a class to a different board fails here instead of silently
-    pricing it on an interconnect it no longer has.
+    Multi-card provisioning is runpod-only, and the Pod request now carries one exact REST GPU type
+    id rather than an SDK pool with excluded members. Assert against that request identity so
+    re-pinning H100 to a PCIe board fails here instead of silently pricing it as NVLink.
     """
     from flash.cost.facts import has_nvlink
     from flash.providers.base import GPU_INFO
-    from flash.providers.runpod.gpus import _POOL_MEMBERS_MISSING_FROM_SDK
+    from flash.providers.runpod.gpus import gpu_type_id
 
-    assert GPU_INFO["H100"].runpod_gpu_type_id == "NVIDIA H100 80GB HBM3"  # sxm, not the pcie board
+    expected = "NVIDIA H100 80GB HBM3"
+    assert GPU_INFO["H100"].runpod_gpu_type_id == expected
+    assert gpu_type_id("H100") == expected
+    assert "PCIe" not in gpu_type_id("H100")
     assert has_nvlink("H100")
-    # the non-sxm members of the same runpod pool are negated, so a pin cannot land on them.
-    assert _POOL_MEMBERS_MISSING_FROM_SDK["ADA_80_PRO"] == ("NVIDIA H100 PCIe", "NVIDIA H100 NVL")
 
 
 def test_multi_card_speedup_is_interconnect_aware():
