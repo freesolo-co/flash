@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -618,6 +620,8 @@ class _QueuedClient:
             raise response
         if callable(response):
             response = await response()
+        if isinstance(response, httpx.Response):
+            return response
         return httpx.Response(
             response[0],
             json=response[1],
@@ -842,6 +846,96 @@ def test_transient_heartbeat_failure_recovers_without_poisoning_terminal_rpc(
     assert outbox._background_error is None
     assert not outbox._stopping.is_set()
     assert event.identity.request_id not in outbox._active_generations
+
+
+def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> None:
+    first = _usage_event()
+    second = replace(
+        first,
+        identity=RequestIdentity(
+            request_id="fsgen-00000000000000000000000000000002",
+            correlation_id="correlation-2",
+        ),
+    )
+    now = [datetime(2026, 8, 25, 12, 0, tzinfo=UTC)]
+    sleeps_started: asyncio.Queue[float] = asyncio.Queue()
+    release_sleep = asyncio.Event()
+
+    async def controlled_sleep(seconds: float) -> None:
+        await sleeps_started.put(seconds)
+        await release_sleep.wait()
+        release_sleep.clear()
+        now[0] += timedelta(seconds=seconds)
+
+    capture_result = (
+        200,
+        [
+            {
+                "state": "in_progress",
+                "lease_seconds": 120,
+                "heartbeat_seconds": 20,
+            }
+        ],
+    )
+    client = _QueuedClient(
+        [
+            *([capture_result] * 5),
+            (
+                200,
+                [
+                    {
+                        "request_id": first.identity.request_id,
+                        "generation_lease_expires_at": "2026-08-25T12:02:20Z",
+                    }
+                ],
+            ),
+        ]
+    )
+    outbox = DurableUsageOutbox(
+        _outbox_settings(),
+        client=client,
+        worker_id="worker-1",
+        sleep=controlled_sleep,
+        clock=lambda: now[0],
+    )
+
+    async def run() -> None:
+        await outbox.capture(first)
+        outbox._heartbeat_worker = asyncio.create_task(outbox._run_heartbeat_worker())
+        assert await sleeps_started.get() == 20
+        for remaining in (16, 12, 8, 4):
+            now[0] += timedelta(seconds=4)
+            await outbox.capture(second)
+            outbox.relinquish(second.identity.request_id)
+            assert await sleeps_started.get() == remaining
+        release_sleep.set()
+        assert await sleeps_started.get() == 20
+        await asyncio.sleep(0)
+        heartbeat_calls = [
+            payload
+            for url, payload in client.calls
+            if url.endswith("/rpc/heartbeat_serving_generation")
+        ]
+        assert heartbeat_calls == [
+            {
+                "p_generation_owner_id": outbox._generation_owner_id,
+                "p_generation_owner_epoch": str(outbox._generation_owner_epoch),
+                "p_request_ids": [first.identity.request_id],
+            }
+        ]
+        outbox._stopping.set()
+        outbox._heartbeat_wake.set()
+        await outbox._heartbeat_worker
+        outbox._heartbeat_worker = None
+
+    asyncio.run(run())
+
+    assert now[0] == datetime(2026, 8, 25, 12, 0, 20, tzinfo=UTC)
+    assert first.identity.request_id in outbox._active_generations
+    assert outbox._generation_lease_deadlines[first.identity.request_id] == datetime(
+        2026, 8, 25, 12, 2, 20, tzinfo=UTC
+    )
+    assert outbox._background_error is None
 
 
 def test_heartbeat_batches_exact_active_generation_authority() -> None:
@@ -1089,6 +1183,31 @@ def test_permanent_or_exhausted_delivery_is_quarantined(
     quarantine_url, quarantine = client.calls[1]
     assert quarantine_url.endswith("/rpc/quarantine_serving_usage")
     assert quarantine["p_reason"] == reason
+
+
+@pytest.mark.parametrize("settlement", [[], "invalid", None])
+def test_non_object_settlement_response_is_quarantined_and_releases_lease(
+    settlement: Any,
+) -> None:
+    row = _claimed_row()
+    response_body = b"null" if settlement is None else json.dumps(settlement).encode()
+    response = httpx.Response(
+        200,
+        content=response_body,
+        request=httpx.Request("POST", "https://api.example.com/settlement"),
+    )
+    client = _QueuedClient([response, (200, None)])
+    outbox = DurableUsageOutbox(
+        _outbox_settings(), client=client, worker_id="worker-1", sleep=_no_sleep
+    )
+    outbox._active_leases.add(row["id"])
+
+    asyncio.run(outbox._deliver(row))
+
+    quarantine_url, quarantine = client.calls[1]
+    assert quarantine_url.endswith("/rpc/quarantine_serving_usage")
+    assert quarantine["p_reason"] == "invalid_settlement_response"
+    assert outbox._active_leases == set()
 
 
 def test_startup_claim_recovers_expired_lease_and_delivers() -> None:

@@ -651,19 +651,31 @@ class DurableUsageOutbox:
                 await asyncio.wait_for(self._wake.wait(), timeout=self._poll_seconds)
 
     async def _run_heartbeat_worker(self) -> None:
+        next_heartbeat_at: datetime | None = None
         while not self._stopping.is_set():
             self._heartbeat_wake.clear()
             heartbeat_seconds = self._heartbeat_seconds
             if not self._active_generations or heartbeat_seconds is None:
+                next_heartbeat_at = None
                 await self._heartbeat_wake.wait()
                 continue
-            try:
-                await asyncio.wait_for(self._heartbeat_wake.wait(), timeout=heartbeat_seconds)
-                continue
-            except TimeoutError:
-                pass
+            if next_heartbeat_at is None:
+                next_heartbeat_at = self._clock() + timedelta(seconds=heartbeat_seconds)
+            remaining = (next_heartbeat_at - self._clock()).total_seconds()
+            if remaining > 0:
+                async with asyncio.TaskGroup() as group:
+                    wake = group.create_task(self._heartbeat_wake.wait())
+                    delay = group.create_task(self._sleep(remaining))
+                    done, pending = await asyncio.wait(
+                        {wake, delay}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in pending:
+                        task.cancel()
+                if wake in done and delay not in done:
+                    continue
             try:
                 await self._heartbeat_active_generations_with_retry()
+                next_heartbeat_at = self._clock() + timedelta(seconds=heartbeat_seconds)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -779,6 +791,8 @@ class DurableUsageOutbox:
             return
         try:
             result = response.json()
+            if not isinstance(result, Mapping):
+                raise TypeError
             ack = {
                 "usage_id": result.get("usageId"),
                 "ledger_id": result.get("ledgerId"),
