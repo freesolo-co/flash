@@ -443,6 +443,19 @@ class _ModalEnginePool:
             ):
                 return current
             snapshot = await self._fetch_capacity_snapshot(model, observed_local_active)
+            current = self._capacity.get(model)
+            now = self._clock()
+            if (
+                snapshot.error == "stats_unavailable"
+                and current is not None
+                and current.is_dispatchable(
+                    now,
+                    model=model,
+                    deployment_identity=_capacity_deployment_identity(model),
+                    max_age_seconds=CAPACITY_SNAPSHOT_MAX_AGE_SECONDS,
+                )
+            ):
+                return current
             self._capacity[model] = snapshot
             if self._capacity_changed is not None:
                 self._capacity_changed(model)
@@ -451,7 +464,6 @@ class _ModalEnginePool:
     async def _fetch_capacity_snapshot(
         self, model: str, observed_local_active: int
     ) -> CapacitySnapshot:
-        observed_at = self._clock()
         deployment_identity = _capacity_deployment_identity(model)
         policy = hosted_traffic_policy_for(model)
         hard_limit = policy.max_inputs * policy.max_containers
@@ -461,6 +473,7 @@ class _ModalEnginePool:
                 engine.generate.get_current_stats.aio(),
                 timeout=CAPACITY_REFRESH_TIMEOUT_SECONDS,
             )
+            observed_at = self._clock()
             counts = {
                 "total_runners": stats.num_total_runners,
                 "running_inputs": stats.num_running_inputs,
@@ -498,7 +511,7 @@ class _ModalEnginePool:
             return CapacitySnapshot.unavailable_snapshot(
                 model,
                 deployment_identity,
-                observed_at,
+                self._clock(),
                 "stats_unavailable",
                 observed_local_active=observed_local_active,
             )
@@ -840,6 +853,69 @@ def router():
         chat_authorizer=_build_chat_authorizer(settings),
         capacity_provider=pool,
     )
+
+
+@app.local_entrypoint()
+def publish_readiness(base_url: str) -> None:
+    """Smoke every deployed engine and publish exact-model readiness evidence."""
+    import httpx
+
+    from flash.serving.src.readiness import (
+        build_runtime_readiness_evidence,
+        publish_readiness_pass,
+    )
+    from flash.serving.src.schemas import AdapterRecord, GenerateRequest
+    from flash.serving.src.settings import Settings
+
+    settings = Settings()
+    with httpx.Client(timeout=30.0) as client:
+        response = client.get(f"{base_url.rstrip('/')}/healthz")
+        response.raise_for_status()
+        deployment_health = response.json()
+
+    model_evidence: list[tuple[str, dict[str, Any]]] = []
+    for model in base_models():
+        engine = modal.Cls.from_name(APP_NAME, _engine_class_name(model))()
+        engine_health = engine.health.remote()
+        record = AdapterRecord(
+            adapter_id=model,
+            repo_id=model,
+            base_model=model,
+            checkpoint=model,
+            serve_base_model=True,
+            thinking=True,
+        )
+        request = GenerateRequest(
+            adapter_id=model,
+            messages=[{"role": "user", "content": "Reply with ok."}],
+            max_tokens=8,
+            temperature=0.0,
+        )
+        payload = request.model_dump(mode="json", by_alias=True)
+        record_payload = record.model_dump(mode="json", by_alias=True)
+        non_streaming = engine.generate.remote(payload, record_payload, model)
+        streaming_events = list(engine.stream_generate.remote_gen(payload, record_payload, model))
+        ready = next((event for event in streaming_events if event.get("type") == "ready"), None)
+        final = next((event for event in streaming_events if event.get("type") == "final"), None)
+        if ready is None or final is None:
+            raise RuntimeError(f"streaming readiness smoke did not complete for {model}")
+        streaming = {**ready, **final}
+        evidence = build_runtime_readiness_evidence(
+            settings,
+            model,
+            engine_health=engine_health,
+            non_streaming=non_streaming,
+            streaming=streaming,
+            deployment_health=deployment_health,
+        )
+        model_evidence.append((model, evidence))
+
+    for model, evidence in model_evidence:
+        published = publish_readiness_pass(settings, model, evidence)
+        print(
+            f"published readiness for {published.model_id} at {published.passed_at.isoformat()}",
+            flush=True,
+        )
 
 
 @app.local_entrypoint()

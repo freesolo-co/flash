@@ -831,6 +831,15 @@ def _retryable_smoke_unavailable(
         return None
     error = payload["error"]
     code = error.get("code")
+    if error.get("type") == "server_error" and code == "serving_capacity_unavailable":
+        raw_delay = response.headers.get("Retry-After")
+        try:
+            retry_after_seconds = float(raw_delay)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(retry_after_seconds) or retry_after_seconds <= 0:
+            return None
+        return RetryableServingUnavailable(str(code), retry_after_seconds)
     if (
         error.get("type") != "adapter_unavailable"
         or error.get("retryable") is not True

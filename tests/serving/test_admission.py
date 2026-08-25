@@ -207,6 +207,33 @@ def test_zero_capacity_fails_closed_immediately_without_queueing() -> None:
     asyncio.run(run())
 
 
+def test_zero_capacity_transition_fails_waiters_preserves_active_and_recovers() -> None:
+    async def run() -> None:
+        limits = _Limits(**{_MODEL_A: 1})
+        controller = AdmissionController(_policy, limits)
+        active = await controller.acquire(_MODEL_A)
+        waiters = [asyncio.create_task(controller.acquire(_MODEL_A)) for _ in range(2)]
+        await asyncio.sleep(0)
+        assert controller.snapshot(_MODEL_A).queued == 2
+
+        limits.values[_MODEL_A] = 0
+        controller.capacity_changed(_MODEL_A)
+        results = await asyncio.gather(*waiters, return_exceptions=True)
+
+        assert all(isinstance(result, ServingCapacityUnavailable) for result in results)
+        assert controller.snapshot(_MODEL_A).active == 1
+        assert controller.snapshot(_MODEL_A).queued == 0
+
+        limits.values[_MODEL_A] = 1
+        controller.capacity_changed(_MODEL_A)
+        active.release()
+        recovered = await controller.acquire(_MODEL_A)
+        recovered.release()
+        assert controller.snapshot(_MODEL_A).active == 0
+
+    asyncio.run(run())
+
+
 def test_dispatch_limit_is_capped_by_policy_hard_limit() -> None:
     async def run() -> None:
         controller = AdmissionController(_policy, _Limits(**{_MODEL_A: 1000}))

@@ -29,7 +29,7 @@ from flash.serving.src.supabase_rest import (
 
 READINESS_TABLE = "hosted_model_readiness_passes"
 READINESS_EVIDENCE_VERSION = 1
-_READINESS_SELECT = (
+READINESS_SELECT = (
     "deployment_mode,deployment_sha,deployment_id,model_id,engine_contract_sha256,"
     "evidence_version,evidence,evidence_sha256,passed_at"
 )
@@ -134,6 +134,14 @@ class ReadinessPassEvidence(BaseModel):
             raise ValueError("identity values must be unpadded")
         return value
 
+    @model_validator(mode="after")
+    def validate_generation_checkpoints(self) -> ReadinessPassEvidence:
+        if self.non_streaming.checkpoint != self.model_id:
+            raise ValueError("non-streaming readiness checkpoint must match model_id")
+        if self.streaming.checkpoint != self.model_id:
+            raise ValueError("streaming readiness checkpoint must match model_id")
+        return self
+
 
 class HostedModelReadinessPass(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -236,6 +244,69 @@ class ReadinessPublication(BaseModel):
         return self
 
 
+def build_runtime_readiness_evidence(
+    settings: Settings,
+    model_id: str,
+    *,
+    engine_health: dict[str, Any],
+    non_streaming: dict[str, Any],
+    streaming: dict[str, Any],
+    deployment_health: dict[str, Any],
+) -> dict[str, Any]:
+    if (
+        engine_health.get("ok") is not True
+        or engine_health.get("engine_dead") is not False
+        or engine_health.get("base_model") != model_id
+    ):
+        raise ValueError("engine health does not attest the exact readiness model")
+    if (
+        deployment_health.get("ok") is not True
+        or deployment_health.get("deployment_sha") != settings.deployment_sha
+        or deployment_health.get("deployment_id") != settings.deployment_id
+    ):
+        raise ValueError("router health does not attest the exact deployment identity")
+
+    def generation_evidence(result: dict[str, Any]) -> dict[str, Any]:
+        checkpoint = result.get("checkpoint")
+        if checkpoint != model_id:
+            raise ValueError("generation checkpoint does not attest the exact readiness model")
+        return {
+            "passed": True,
+            "evidence_sha256": evidence_sha256(result),
+            "request_id": result.get("request_id"),
+            "engine_replica_id": result.get("engine_replica_id"),
+            "prompt_tokens": result.get("prompt_tokens"),
+            "completion_tokens": result.get("completion_tokens"),
+            "finish_reason": result.get("finish_reason"),
+            "checkpoint": checkpoint,
+        }
+
+    evidence = ReadinessPassEvidence(
+        schema_version=1,
+        outcome="passed",
+        deployment_mode=settings.deployment_mode,
+        deployment_sha=settings.deployment_sha,
+        deployment_id=settings.deployment_id,
+        model_id=model_id,
+        engine_contract_sha256=engine_contract_sha256(model_id),
+        health={"passed": True, "evidence_sha256": evidence_sha256(engine_health)},
+        non_streaming=generation_evidence(non_streaming),
+        streaming=generation_evidence(streaming),
+        provenance={"passed": True, "evidence_sha256": evidence_sha256(deployment_health)},
+        runtime_attestation={
+            "passed": True,
+            "evidence_sha256": evidence_sha256(
+                {
+                    "engine": engine_health,
+                    "deployment": deployment_health,
+                    "model_id": model_id,
+                }
+            ),
+        },
+    )
+    return evidence.model_dump(mode="json")
+
+
 def build_readiness_publication(
     settings: Settings,
     model_id: str,
@@ -264,7 +335,7 @@ def _has_readiness_identity(settings: Settings) -> bool:
 
 def _readiness_params(settings: Settings) -> dict[str, str]:
     return {
-        "select": _READINESS_SELECT,
+        "select": READINESS_SELECT,
         "deployment_mode": f"eq.{settings.deployment_mode}",
         "deployment_sha": f"eq.{settings.deployment_sha}",
         "deployment_id": f"eq.{settings.deployment_id}",
@@ -272,7 +343,11 @@ def _readiness_params(settings: Settings) -> dict[str, str]:
     }
 
 
-def _parse_readiness_rows(response: httpx.Response) -> list[HostedModelReadinessPass]:
+def _parse_readiness_rows(
+    response: httpx.Response,
+    *,
+    expected_identity: tuple[str, str, str] | None = None,
+) -> list[HostedModelReadinessPass]:
     rows = response.json()
     if not isinstance(rows, list):
         raise RuntimeError("Supabase readiness response must be a list")
@@ -280,10 +355,20 @@ def _parse_readiness_rows(response: httpx.Response) -> list[HostedModelReadiness
     for row in rows:
         try:
             readiness = HostedModelReadinessPass.model_validate(row)
-        except ValueError as exc:
-            raise RuntimeError("Supabase returned an invalid hosted model readiness row") from exc
+        except ValueError:
+            continue
         if not is_supported_base_model(readiness.model_id):
-            raise RuntimeError(f"Supabase readiness names unknown model {readiness.model_id!r}")
+            continue
+        if (
+            expected_identity is not None
+            and (
+                readiness.deployment_mode,
+                readiness.deployment_sha,
+                readiness.deployment_id,
+            )
+            != expected_identity
+        ):
+            continue
         expected_digest = engine_contract_sha256(readiness.model_id)
         if readiness.engine_contract_sha256 != expected_digest:
             continue
@@ -301,15 +386,14 @@ def load_readiness_passes(settings: Settings) -> list[HostedModelReadinessPass]:
             headers=supabase_headers(settings, "flash"),
         )
     raise_for_supabase(response, "load hosted model readiness passes")
-    passes = _parse_readiness_rows(response)
-    for readiness in passes:
-        if (
-            readiness.deployment_mode != settings.deployment_mode
-            or readiness.deployment_sha != settings.deployment_sha
-            or readiness.deployment_id != settings.deployment_id
-        ):
-            raise RuntimeError("Supabase returned readiness for a different deployment identity")
-    return passes
+    return _parse_readiness_rows(
+        response,
+        expected_identity=(
+            settings.deployment_mode,
+            settings.deployment_sha,
+            settings.deployment_id,
+        ),
+    )
 
 
 def qualified_base_records(settings: Settings) -> list[AdapterRecord]:
@@ -359,7 +443,7 @@ def _read_published(
     response = client.get(
         supabase_table_url(settings, READINESS_TABLE),
         params={
-            "select": _READINESS_SELECT,
+            "select": READINESS_SELECT,
             "deployment_mode": f"eq.{publication.deployment_mode}",
             "deployment_sha": f"eq.{publication.deployment_sha}",
             "deployment_id": f"eq.{publication.deployment_id}",
@@ -391,7 +475,7 @@ def publish_readiness_pass(
             try:
                 response = client.post(
                     supabase_table_url(settings, READINESS_TABLE),
-                    params={"select": _READINESS_SELECT},
+                    params={"select": READINESS_SELECT},
                     headers={
                         **supabase_headers(settings, "flash"),
                         "Prefer": "return=representation",

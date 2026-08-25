@@ -100,6 +100,29 @@ def test_hosted_deploy_docs_and_workflows_point_at_paths_that_exist() -> None:
         assert "working-directory: ." in body
 
 
+def test_deploy_workflows_verify_publish_and_gate_readiness_evidence() -> None:
+    expected_commands = {
+        "deploy-modal.yml": (
+            "modal run flash/serving/modal_app.py::publish_readiness --base-url https://serve.freesolo.co"
+        ),
+        "deploy-modal-dev.yml": (
+            "modal run --env dev flash/serving/modal_app.py::publish_readiness --base-url"
+        ),
+    }
+    for workflow, command in expected_commands.items():
+        body = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        assert "hosted_model_readiness_passes?select=${columns}&limit=1" in body
+        assert "from flash.serving.src.readiness import READINESS_SELECT" in body
+        assert "fresh " in body
+        assert "readiness is unpublished" in body
+        assert command in body
+        assert "exposes exactly the readiness-qualified model catalog" in body
+        assert "sorted(base_models())" in body
+        assert '"httpx==0.28.1"' in body
+        assert '"pydantic==2.13.4"' in body
+        assert '"pydantic-settings==2.14.2"' in body
+
+
 def test_image_extras_cover_every_directly_imported_third_party_package() -> None:
     """The image resolves from these extras, not uv.lock, so a dropped bound is a production break.
 

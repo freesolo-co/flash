@@ -39,10 +39,13 @@ isolation namespaces both. `SERVING_DEPLOYMENT_MODE` identifies the deployment a
 Modal environment `dev` and that production mode does not. The mode does not change autoscaling or
 engine behavior.
 
-Both environments keep `MIN_CONTAINERS = 0`, so every GPU engine scales to zero and starts on demand.
-The CPU router remains warm. The shared hardcoded settings remain `MAX_CONTAINERS = None`,
-`SCALEDOWN_WINDOW_SECONDS = 1800`, and `MAX_INPUTS = 64` with
-`TARGET_INPUTS = 48`.
+Both environments keep one warm engine container per advertised model and allow two containers per
+model. The CPU router remains a singleton with a fixed `max_inputs=332`, covering every engine's hard
+application slots plus the two bounded waiters per model. Modal 1.5.4 has no SDK setting that rejects an
+ASGI request before Modal admits it to the router container. The application 429 is therefore prompt only
+after Modal admission; traffic above the router's fixed 332 inputs can wait at Modal ingress before the
+application can classify it. Keep the router bound fixed at 332 until Modal exposes an ingress rejection
+setting.
 
 ### Production
 

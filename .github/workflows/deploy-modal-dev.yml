@@ -113,7 +113,8 @@ jobs:
           # pinned to the exact client pyproject declares; see deploy-modal.yml for why an
           # unbounded range is unsafe for the deploy path.
           # exact pins keep the deploy client bootstrap reproducible across runner image changes.
-          uv pip install --system "modal==1.5.4" "python-dotenv==1.2.3"
+          uv pip install --system "modal==1.5.4" "python-dotenv==1.2.3" "httpx==0.28.1" \
+            "pydantic==2.13.4" "pydantic-settings==2.14.2"
 
       - name: Verify development deployment inputs
         if: steps.gate.outputs.deploy == 'true'
@@ -224,6 +225,26 @@ jobs:
             exit 1
           fi
           echo "Development Supabase flash.hosted_lora_adapters is queryable."
+
+      - name: Verify development readiness schema
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          if ! columns="$(python -c 'from flash.serving.src.readiness import READINESS_SELECT; print(READINESS_SELECT)')" || [ -z "$columns" ]; then
+            echo "::error::Could not read READINESS_SELECT; refusing to deploy against an unverified readiness schema."
+            exit 1
+          fi
+          endpoint="${SUPABASE_URL%/}/rest/v1/hosted_model_readiness_passes?select=${columns}&limit=1"
+          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --connect-timeout 5 --max-time 15 \
+            --header "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            --header "Accept-Profile: flash" \
+            "$endpoint")"
+          if [ "$status" != "200" ]; then
+            echo "::error::Development Supabase flash.hosted_model_readiness_passes schema is not queryable (HTTP ${status})."
+            exit 1
+          fi
 
       - name: Deploy development serving
         if: steps.gate.outputs.deploy == 'true'
@@ -339,6 +360,53 @@ jobs:
               sleep_seconds=$remaining
             fi
             sleep "$sleep_seconds"
+          done
+
+      - name: Verify fresh development readiness is unpublished
+        if: steps.gate.outputs.deploy == 'true'
+        run: |
+          python - <<'PY'
+          from flash.serving.src.readiness import load_readiness_passes
+          from flash.serving.src.settings import Settings
+
+
+          if load_readiness_passes(Settings()):
+              raise SystemExit("fresh development deployment already has readiness publications")
+          PY
+
+      - name: Publish development model readiness evidence
+        if: steps.gate.outputs.deploy == 'true'
+        run: modal run --env dev flash/serving/modal_app.py::publish_readiness --base-url "$EXPECTED_SERVING_URL"
+
+      - name: Gate development model exposure on complete publications
+        if: steps.gate.outputs.deploy == 'true'
+        run: |
+          expected="$(python -c 'import json; from flash.serving.src.model_config import base_models; print(json.dumps(sorted(base_models())))')"
+          deadline=$((SECONDS + 300))
+          while true; do
+            response="$(curl --silent --show-error --connect-timeout 5 --max-time 10 "${EXPECTED_SERVING_URL}/healthz" || true)"
+            if RESPONSE="$response" EXPECTED="$expected" python - <<'PY'
+          import json
+          import os
+
+
+          try:
+              payload = json.loads(os.environ["RESPONSE"])
+              expected = json.loads(os.environ["EXPECTED"])
+          except ValueError:
+              raise SystemExit(1)
+          actual = payload.get("base_models") if isinstance(payload, dict) else None
+          raise SystemExit(0 if actual == expected else 1)
+          PY
+            then
+              echo "Development serving exposes exactly the readiness-qualified model catalog."
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "::error::Development serving did not expose the complete readiness-qualified model catalog within 300 seconds."
+              exit 1
+            fi
+            sleep 10
           done
 
       - name: Nothing to deploy

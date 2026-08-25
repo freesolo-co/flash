@@ -493,6 +493,135 @@ def test_modal_capacity_snapshot_parses_exact_stats_and_identity(modal_app_modul
     assert pool.current_dispatch_capacity(model) == 64
 
 
+def test_capacity_timestamp_is_taken_after_stats_rpc(modal_app_module, monkeypatch) -> None:
+    model = "Qwen/Qwen3.5-0.8B"
+    clock = {"now": 10.0}
+    stats = types.SimpleNamespace(
+        num_total_runners=1,
+        num_running_inputs=0,
+        input_headroom=8,
+        backlog=0,
+    )
+
+    class GetCurrentStats:
+        @staticmethod
+        async def aio():
+            clock["now"] = 10.75
+            return stats
+
+    class Engine:
+        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
+
+    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
+    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
+
+    snapshot = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
+
+    assert snapshot.observed_at == 10.75
+    assert pool.current_dispatch_capacity(model) == 8
+
+
+def test_transient_stats_failure_preserves_valid_snapshot_until_expiry(
+    modal_app_module, monkeypatch
+) -> None:
+    model = "Qwen/Qwen3.5-0.8B"
+    clock = {"now": 10.0}
+    fail = {"value": False}
+
+    class GetCurrentStats:
+        @staticmethod
+        async def aio():
+            if fail["value"]:
+                raise RuntimeError("stats unavailable")
+            return types.SimpleNamespace(
+                num_total_runners=1,
+                num_running_inputs=0,
+                input_headroom=8,
+                backlog=0,
+            )
+
+    class Engine:
+        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
+
+    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
+    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
+    first = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
+
+    fail["value"] = True
+    clock["now"] = 10.6
+    preserved = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
+    assert preserved is first
+    assert pool.current_dispatch_capacity(model) == 8
+
+    clock["now"] = 12.01
+    unavailable = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
+    assert unavailable.error == "stats_unavailable"
+    assert pool.current_dispatch_capacity(model) == 0
+
+
+def test_no_warm_runners_replaces_valid_snapshot_immediately(modal_app_module, monkeypatch) -> None:
+    model = "Qwen/Qwen3.5-0.8B"
+    clock = {"now": 10.0}
+    runners = {"value": 1}
+
+    class GetCurrentStats:
+        @staticmethod
+        async def aio():
+            return types.SimpleNamespace(
+                num_total_runners=runners["value"],
+                num_running_inputs=0,
+                input_headroom=8,
+                backlog=0,
+            )
+
+    class Engine:
+        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
+
+    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
+    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
+    asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
+
+    runners["value"] = 0
+    clock["now"] = 10.6
+    snapshot = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
+
+    assert snapshot.error == "no_warm_runners"
+    assert pool.current_dispatch_capacity(model) == 0
+
+
+def test_slow_success_does_not_trigger_immediate_serial_refresh(
+    modal_app_module, monkeypatch
+) -> None:
+    model = "Qwen/Qwen3.5-0.8B"
+    clock = {"now": 10.0}
+    calls = 0
+
+    class GetCurrentStats:
+        @staticmethod
+        async def aio():
+            nonlocal calls
+            calls += 1
+            clock["now"] += 0.9
+            return types.SimpleNamespace(
+                num_total_runners=1,
+                num_running_inputs=0,
+                input_headroom=8,
+                backlog=0,
+            )
+
+    class Engine:
+        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
+
+    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
+    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
+
+    first = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
+    second = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
+
+    assert second is first
+    assert calls == 1
+
+
 def test_fixed_stats_snapshot_never_self_inflates_admission_limit(
     modal_app_module, monkeypatch
 ) -> None:

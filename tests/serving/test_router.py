@@ -416,6 +416,56 @@ def test_zero_live_capacity_returns_retryable_503_body() -> None:
     }
 
 
+def test_blocked_stats_do_not_accumulate_before_admission_under_burst() -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    class BlockedCapacity:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def capacity_snapshot(
+            self, model: str, observed_local_active: int
+        ) -> CapacitySnapshot:
+            del model, observed_local_active
+            self.calls += 1
+            await asyncio.Event().wait()
+            raise AssertionError("blocked stats unexpectedly completed")
+
+        def current_dispatch_capacity(self, _model: str) -> int:
+            return 0
+
+    capacity = BlockedCapacity()
+    pool = FakePool()
+    app = build_serving_app(
+        pool,
+        _router_for("qa", QWEN),
+        capacity_provider=capacity,
+        chat_authorizer=_allow,
+    )
+
+    async def scenario():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            return await asyncio.gather(
+                *(
+                    client.post(
+                        "/generate",
+                        json={"adapter_id": "qa", "prompt": "hi"},
+                        headers={"Authorization": "Bearer t"},
+                    )
+                    for _ in range(20)
+                )
+            )
+
+    responses = asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
+
+    assert all(response.status_code == 503 for response in responses)
+    assert capacity.calls == 0
+    assert pool.generated == []
+    snapshot = app.state.serving_context.admission.snapshot(QWEN)
+    assert snapshot.active == 0
+    assert snapshot.queued == 0
+
+
 def test_full_admission_queue_returns_retryable_429_body() -> None:
     from httpx import ASGITransport, AsyncClient
 

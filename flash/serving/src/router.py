@@ -160,6 +160,7 @@ def _lifespan_for(
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: "FastAPI"):
+        await context.refresh_capacity_once()
         refresh_tasks = (
             asyncio.create_task(context.lookup.refresh_periodically()),
             asyncio.create_task(context.refresh_capacity_periodically()),

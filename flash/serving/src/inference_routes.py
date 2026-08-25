@@ -46,7 +46,7 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     caller_org = await context.authorize_inference(request, payload.adapter_id)
     requested, target = await context.lookup.resolve(payload.adapter_id)
     await _prepare_generate_request(payload, target)
-    lease = await context.acquire_admission(target.base_model)
+    lease = await _acquire_until_disconnect(context, request, target.base_model)
     admission_headers = context.admission_headers(target.base_model, lease)
     try:
         result = await _await_until_disconnect(
@@ -74,7 +74,7 @@ async def generate_for_adapter(
     req = _parse_generate({**payload, "adapter_id": adapter_id})
     requested, target = await context.lookup.resolve(req.adapter_id)
     await _prepare_generate_request(req, target)
-    lease = await context.acquire_admission(target.base_model)
+    lease = await _acquire_until_disconnect(context, request, target.base_model)
     admission_headers = context.admission_headers(target.base_model, lease)
     try:
         result = await _await_until_disconnect(
@@ -141,7 +141,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     req = _parse_generate(fields)
     await _prepare_generate_request(req, target)
-    lease = await context.acquire_admission(target.base_model)
+    lease = await _acquire_until_disconnect(context, request, target.base_model)
     admission_headers = context.admission_headers(target.base_model, lease)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -191,6 +191,34 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     if target.is_revision:
         response_headers["X-Freesolo-LoRA-Request-Adapter"] = lora_request_adapter
     return JSONResponse(response, headers=response_headers)
+
+
+async def _acquire_until_disconnect(
+    context: ServingContext, request: Request, model: str
+) -> AdmissionLease:
+    acquisition = asyncio.create_task(context.acquire_admission(model))
+    disconnect = asyncio.create_task(_wait_for_disconnect(request))
+    transferred = False
+    lease: AdmissionLease | None = None
+    try:
+        done, _ = await asyncio.wait({acquisition, disconnect}, return_when=asyncio.FIRST_COMPLETED)
+        if disconnect in done:
+            disconnect.result()
+            raise asyncio.CancelledError
+        lease = acquisition.result()
+        transferred = True
+        return lease
+    finally:
+        disconnect.cancel()
+        if not acquisition.done():
+            acquisition.cancel()
+        acquisition_result, _ = await asyncio.gather(
+            acquisition, disconnect, return_exceptions=True
+        )
+        if lease is None and isinstance(acquisition_result, AdmissionLease):
+            lease = acquisition_result
+        if lease is not None and not transferred:
+            lease.release()
 
 
 async def _await_until_disconnect(request: Request, awaitable: Awaitable[Any]) -> Any:

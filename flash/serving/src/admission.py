@@ -151,8 +151,12 @@ class AdmissionController:
 
     def capacity_changed(self, model: str) -> None:
         state = self._states.get(model)
-        if state is not None:
-            self._promote(model, state)
+        if state is None:
+            return
+        if self._dispatch_limit(model, state.policy) <= 0:
+            self._fail_waiters_for_unavailable_capacity(model, state)
+            return
+        self._promote(model, state)
 
     def active_count(self, model: str) -> int:
         state = self._states.get(model)
@@ -205,6 +209,16 @@ class AdmissionController:
             raise RuntimeError(f"admission active count underflow for model {model!r}")
         state.active -= 1
         self._promote(model, state)
+
+    @staticmethod
+    def _fail_waiters_for_unavailable_capacity(model: str, state: _ModelState) -> None:
+        while state.waiters:
+            waiter = state.waiters.popleft()
+            if waiter.future.cancelled():
+                continue
+            waiter.future.set_exception(
+                ServingCapacityUnavailable(model, state.policy.retry_after_seconds)
+            )
 
     @staticmethod
     def _remove_waiter(state: _ModelState, waiter: _Waiter) -> None:

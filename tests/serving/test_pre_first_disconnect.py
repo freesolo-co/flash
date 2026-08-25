@@ -9,12 +9,13 @@ from fastapi import Request
 from starlette.requests import ClientDisconnect
 
 from flash.serving.src import inference_routes
-from flash.serving.src.admission import AdmissionLease
+from flash.serving.src.admission import AdmissionController, AdmissionLease
 from flash.serving.src.inference_routes import (
     _discard_prepared_stream,
     _LeasedAsyncIterator,
     _stream_chat_completion,
 )
+from flash.serving.src.model_config import hosted_traffic_policy_for
 from flash.serving.src.routing import AdapterRouter
 from flash.serving.src.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.serving_io import _sse
@@ -151,6 +152,96 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
     completed, generation_cancelled = asyncio.run(scenario())
     assert completed, "the handler kept generating after the peer disconnected"
     assert generation_cancelled, "the handler returned without cancelling generation"
+
+
+@pytest.mark.parametrize("route", ["generate", "generate_for_adapter", "chat_completions"])
+def test_queued_disconnect_never_dispatches_or_leaks_admission(monkeypatch, route: str) -> None:
+    async def scenario() -> tuple[int, int, int, int]:
+        messages: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        record = _record()
+        controller = AdmissionController(
+            hosted_traffic_policy_for,
+            lambda model: 1 if model == QWEN else 0,
+        )
+        active = await controller.acquire(QWEN)
+
+        class Lookup:
+            async def resolve(self, _adapter_id: str):
+                return record, record
+
+        class Context:
+            lookup = Lookup()
+
+            def __init__(self) -> None:
+                self.pool_calls = 0
+                self.usage_reports = 0
+
+            async def authorize_inference(self, *_args):
+                return "org-1"
+
+            async def acquire_admission(self, model: str) -> AdmissionLease:
+                return await controller.acquire(model)
+
+            def admission_headers(self, model: str, lease: AdmissionLease) -> dict[str, str]:
+                snapshot = controller.snapshot(model)
+                return {
+                    "X-Freesolo-Queue-Duration-Seconds": f"{lease.queue_duration_seconds:.6f}",
+                    "X-Freesolo-Application-Active": str(snapshot.active),
+                    "X-Freesolo-Application-Pending": str(snapshot.queued),
+                }
+
+            async def generate(self, *_args, **_kwargs):
+                self.pool_calls += 1
+                raise AssertionError("a disconnected queued request reached the pool")
+
+            def schedule_usage(self, *_args, **_kwargs) -> None:
+                self.usage_reports += 1
+
+        async def receive():
+            return await messages.get()
+
+        context = Context()
+        monkeypatch.setattr(
+            inference_routes.ServingContext,
+            "of",
+            staticmethod(lambda _request: context),
+        )
+        request = _request(receive)
+        if route == "generate":
+            awaitable = inference_routes.generate(
+                GenerateRequest(adapter_id=record.adapter_id, prompt="hi"), request
+            )
+        elif route == "generate_for_adapter":
+            awaitable = inference_routes.generate_for_adapter(
+                record.adapter_id, {"prompt": "hi"}, request
+            )
+        else:
+            awaitable = inference_routes.chat_completions(
+                {
+                    "model": record.adapter_id,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                request,
+            )
+        task = asyncio.create_task(awaitable)
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while controller.snapshot(QWEN).queued != 1:
+            assert not task.done()
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0)
+        await messages.put({"type": "http.disconnect"})
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        queued_after_disconnect = controller.snapshot(QWEN).queued
+        active.release()
+        return (
+            context.pool_calls,
+            context.usage_reports,
+            queued_after_disconnect,
+            controller.snapshot(QWEN).active,
+        )
+
+    assert asyncio.run(scenario()) == (0, 0, 0, 0)
 
 
 class _Context:

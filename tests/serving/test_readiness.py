@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from flash.serving.src.lookup import AdapterLookup
 from flash.serving.src.readiness import (
     build_readiness_publication,
+    build_runtime_readiness_evidence,
     engine_contract_sha256,
     evidence_sha256,
     load_readiness_passes,
@@ -232,15 +233,14 @@ def test_exact_identity_and_contract_qualify_while_stale_digest_does_not(monkeyp
     )
 
 
-def test_stale_or_mismatched_identity_is_rejected_without_partial_results(monkeypatch) -> None:
+def test_mismatched_identity_isolated_from_valid_sibling(monkeypatch) -> None:
     settings = _settings()
     other_settings = _settings(FREESOLO_DEPLOYMENT_ID="other-deployment")
     stale = _row(QWEN_2B, settings=other_settings)
     rows = [_row(QWEN, settings=settings), stale]
     _patch_client(monkeypatch, _Client(get=lambda *_a, **_k: _response(200, rows)))
 
-    with pytest.raises(RuntimeError, match="different deployment identity"):
-        load_readiness_passes(settings)
+    assert [readiness.model_id for readiness in load_readiness_passes(settings)] == [QWEN]
 
 
 @pytest.mark.parametrize(
@@ -258,8 +258,7 @@ def test_arbitrary_or_failed_evidence_never_qualifies(monkeypatch, evidence) -> 
     row = _row(settings=settings, evidence=evidence)
     _patch_client(monkeypatch, _Client(get=lambda *_a, **_k: _response(200, [row])))
 
-    with pytest.raises(RuntimeError, match="invalid hosted model readiness row"):
-        load_readiness_passes(settings)
+    assert load_readiness_passes(settings) == []
 
 
 def test_evidence_identity_must_match_storage_row(monkeypatch) -> None:
@@ -269,8 +268,7 @@ def test_evidence_identity_must_match_storage_row(monkeypatch) -> None:
     row = _row(settings=settings, evidence=evidence)
     _patch_client(monkeypatch, _Client(get=lambda *_a, **_k: _response(200, [row])))
 
-    with pytest.raises(RuntimeError, match="invalid hosted model readiness row"):
-        load_readiness_passes(settings)
+    assert load_readiness_passes(settings) == []
 
 
 def test_unknown_evidence_model_fails_closed(monkeypatch) -> None:
@@ -281,8 +279,76 @@ def test_unknown_evidence_model_fails_closed(monkeypatch) -> None:
     row["evidence_sha256"] = evidence_sha256(row["evidence"])
     _patch_client(monkeypatch, _Client(get=lambda *_a, **_k: _response(200, [row])))
 
-    with pytest.raises(RuntimeError, match="unknown model"):
-        load_readiness_passes(settings)
+    assert load_readiness_passes(settings) == []
+
+
+def test_cold_start_retains_valid_sibling_when_other_rows_are_invalid(monkeypatch) -> None:
+    settings = _settings()
+    malformed = _row(QWEN_2B, settings=settings)
+    malformed["evidence"] = {"outcome": "failed"}
+    malformed["evidence_sha256"] = evidence_sha256(malformed["evidence"])
+    unknown = _row(QWEN_2B, settings=settings)
+    unknown["model_id"] = "unknown/model"
+    unknown["evidence"]["model_id"] = "unknown/model"
+    unknown["evidence_sha256"] = evidence_sha256(unknown["evidence"])
+    _patch_client(
+        monkeypatch,
+        _Client(get=lambda *_a, **_k: _response(200, [malformed, _row(QWEN), unknown])),
+    )
+
+    records = qualified_base_records(settings)
+
+    assert [record.adapter_id for record in records] == [QWEN]
+
+
+def test_generation_evidence_is_bound_to_exact_logical_model() -> None:
+    settings = _settings()
+    engine_health = {"ok": True, "engine_dead": False, "base_model": QWEN}
+    deployment_health = {
+        "ok": True,
+        "deployment_sha": settings.deployment_sha,
+        "deployment_id": settings.deployment_id,
+    }
+    non_streaming = {
+        "request_id": "request-non-streaming",
+        "engine_replica_id": "replica-1",
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "finish_reason": "stop",
+        "checkpoint": QWEN,
+    }
+    streaming = {**non_streaming, "request_id": "request-streaming"}
+
+    evidence = build_runtime_readiness_evidence(
+        settings,
+        QWEN,
+        engine_health=engine_health,
+        non_streaming=non_streaming,
+        streaming=streaming,
+        deployment_health=deployment_health,
+    )
+    assert evidence["non_streaming"]["checkpoint"] == QWEN
+    assert evidence["streaming"]["checkpoint"] == QWEN
+
+    with pytest.raises(ValueError, match="exact readiness model"):
+        build_runtime_readiness_evidence(
+            settings,
+            QWEN_2B,
+            engine_health={**engine_health, "base_model": QWEN_2B},
+            non_streaming=non_streaming,
+            streaming=streaming,
+            deployment_health=deployment_health,
+        )
+
+
+def test_copied_cross_model_publication_is_rejected() -> None:
+    settings = _settings()
+    copied = _evidence(QWEN, settings=settings)
+    copied["model_id"] = QWEN_2B
+    copied["engine_contract_sha256"] = engine_contract_sha256(QWEN_2B)
+
+    with pytest.raises(ValueError, match="checkpoint must match model_id"):
+        build_readiness_publication(settings, QWEN_2B, copied)
 
 
 def test_partial_qualification_gates_each_adapter_base() -> None:

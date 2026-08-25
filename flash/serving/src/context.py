@@ -98,20 +98,21 @@ class ServingContext:
         if self.reload_records is not None:
             await self.lookup.reload()
 
+    async def refresh_capacity_once(self) -> None:
+        await asyncio.gather(
+            *(
+                self.capacity.capacity_snapshot(model, self.admission.active_count(model))
+                for model in self.router.base_models()
+            ),
+            return_exceptions=True,
+        )
+
     async def refresh_capacity_periodically(self) -> None:
         while True:
-            await asyncio.gather(
-                *(
-                    self.capacity.capacity_snapshot(model, self.admission.active_count(model))
-                    for model in self.router.base_models()
-                ),
-                return_exceptions=True,
-            )
+            await self.refresh_capacity_once()
             await asyncio.sleep(CAPACITY_POLL_INTERVAL_SECONDS)
 
     async def acquire_admission(self, model: str) -> AdmissionLease:
-        await self.capacity.capacity_snapshot(model, self.admission.active_count(model))
-        self.admission.capacity_changed(model)
         return await self.admission.acquire(model)
 
     def admission_headers(self, model: str, lease: AdmissionLease) -> dict[str, str]:

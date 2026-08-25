@@ -1517,6 +1517,91 @@ def test_chat_classifies_retryable_alias_smoke_503_for_the_expected_revision(mon
     assert exc_info.value.retry_after_seconds == 1.5
 
 
+def test_chat_classifies_exact_capacity_503_with_valid_retry_after(monkeypatch):
+    import flash.serve.deploy as d
+
+    class Response:
+        status_code = 503
+
+        def __init__(self):
+            self.headers = {"Retry-After": "1"}
+
+        def json(self):
+            return {
+                "error": {
+                    "type": "server_error",
+                    "code": "serving_capacity_unavailable",
+                    "message": "no fresh warm capacity",
+                }
+            }
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(d, "_new_serving_client", Client)
+
+    with pytest.raises(d.RetryableServingUnavailable) as exc_info:
+        d.chat(
+            "run-1",
+            [{"role": "user", "content": "hello"}],
+            timeout_s=5.0,
+            retry_unavailable=True,
+        )
+
+    assert exc_info.value.code == "serving_capacity_unavailable"
+    assert exc_info.value.retry_after_seconds == 1.0
+
+
+@pytest.mark.parametrize("retry_after", [None, "", "nan", "0", "-1"])
+def test_chat_treats_capacity_503_with_invalid_retry_after_as_terminal(monkeypatch, retry_after):
+    import flash.serve.deploy as d
+
+    class Response:
+        status_code = 503
+        request = d.httpx.Request("POST", "https://serve.example/v1/chat/completions")
+
+        def __init__(self):
+            self.headers = {} if retry_after is None else {"Retry-After": retry_after}
+
+        def json(self):
+            return {
+                "error": {
+                    "type": "server_error",
+                    "code": "serving_capacity_unavailable",
+                }
+            }
+
+        def raise_for_status(self):
+            raise d.httpx.HTTPStatusError("unavailable", request=self.request, response=self)
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(d, "_new_serving_client", Client)
+
+    with pytest.raises(d.httpx.HTTPStatusError):
+        d.chat(
+            "run-1",
+            [{"role": "user", "content": "hello"}],
+            timeout_s=5.0,
+            retry_unavailable=True,
+        )
+
+
 @pytest.mark.parametrize(
     "error",
     [
