@@ -366,6 +366,16 @@ def _staged_checkpoint(root, step, *, world_size=None, fsdp_version=2, shards=0,
     for kind in ("model", "optim", "extra_state"):
         for rank in range(shards):
             (inner / f"{kind}_world_size_{shards}_rank_{rank}.pt").write_bytes(b"shard")
+    (src / "_flash_resume_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "checkpoint_step": step,
+                "required_adapter_steps": [],
+                "first_positive_grad_step": 1,
+            }
+        )
+    )
     return src
 
 

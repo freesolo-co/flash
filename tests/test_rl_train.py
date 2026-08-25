@@ -2425,10 +2425,15 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, 
     monkeypatch.setattr(
         rl_train._w, "upload_resume_checkpoint", lambda *a, **kw: True, raising=False
     )
+    monkeypatch.setattr(rl_train._w, "hf_upload_folder", lambda *a, **kw: True, raising=False)
     monkeypatch.setattr(
         rl_train._w, "write_base_model_provenance", lambda *a, **kw: None, raising=False
     )
-    monkeypatch.setattr(rl_train, "export_peft_adapter", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        rl_train,
+        "export_peft_adapter",
+        lambda actor, destination, **kwargs: _write_internal_adapter(Path(destination)),
+    )
     monkeypatch.setattr(rl_train, "stamp_adapter_dir_provenance", lambda *a, **kw: None)
 
     local_dir = tmp_path / "ckpt"
@@ -2449,6 +2454,7 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, 
         model_id="Qwen/Qwen3.5-9B",
         model_revision="rev",
         preprocessor=_Tok(),
+        metric_evidence=_always_ready_metric_evidence(),
     )
     uploader.start()
     uploader.allow_deployable_publication()
@@ -2476,6 +2482,7 @@ def test_resume_credits_required_steps_already_durable_on_hf(tmp_path, monkeypat
         resume_step=20,
         required_steps=(10, 15, 25),
         preprocessor=_Tok(),
+        metric_evidence=_always_ready_metric_evidence(),
     )
     uploader.credit_durable_required_steps(20)
 
@@ -2492,7 +2499,12 @@ def test_resume_step_is_not_credited_without_a_durable_adapter(tmp_path, monkeyp
     # so the restored step counter alone must never credit a required save.
     monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
 
-    uploader = rl_train._VerlResumeUploader(str(tmp_path), resume_step=10, required_steps=(10,))
+    uploader = rl_train._VerlResumeUploader(
+        str(tmp_path),
+        resume_step=10,
+        required_steps=(10,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.credit_durable_required_steps(10)
 
     assert uploader.lifecycle.deployable_published_steps == set()
@@ -4243,6 +4255,7 @@ def test_restore_verl_resume_stages_the_checkpoint_where_verl_looks(tmp_path, mo
     )
     for kind in ("model", "optim", "extra_state"):
         (src / "actor" / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
+    _write_resume_manifest(src, 7, positive=3)
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(src))
@@ -4265,6 +4278,20 @@ def test_restore_verl_resume_rejects_an_unparseable_checkpoint_path(tmp_path, mo
         )
 
 
+class _AlwaysReadyMetricEvidence:
+    prior_positive_grad_step = 1
+
+    def set_prior_positive_step(self, step, *, checkpoint_step):
+        self.prior_positive_grad_step = step
+
+    def checkpoint_manifest_evidence(self, checkpoint_step):
+        return True, 1 if checkpoint_step >= 1 else None
+
+
+def _always_ready_metric_evidence():
+    return _AlwaysReadyMetricEvidence()
+
+
 def _write_step(local_dir, step):
     d = local_dir / f"global_step_{step}"
     (d / "actor").mkdir(parents=True)
@@ -4276,7 +4303,9 @@ def test_resume_uploader_uploads_each_completed_step(tmp_path):
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     seen = []
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0)
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir), resume_step=0, metric_evidence=_always_ready_metric_evidence()
+    )
 
     import flash.engine.worker.rl_train as mod
 
@@ -4308,7 +4337,9 @@ def test_resume_uploader_skips_the_step_it_resumed_from(tmp_path):
     mod._w.upload_resume_checkpoint = lambda step, path, **k: seen.append(int(step))
     try:
         _write_step(local_dir, 5)
-        uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=5)
+        uploader = rl_train._VerlResumeUploader(
+            str(local_dir), resume_step=5, metric_evidence=_always_ready_metric_evidence()
+        )
         uploader.start()
         time.sleep(0.5)
         uploader.stop()
@@ -4330,7 +4361,9 @@ def test_resume_uploader_never_fails_the_run_on_an_upload_error(tmp_path):
     mod._w.upload_resume_checkpoint = boom
     try:
         _write_step(local_dir, 2)
-        uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0)
+        uploader = rl_train._VerlResumeUploader(
+            str(local_dir), resume_step=0, metric_evidence=_always_ready_metric_evidence()
+        )
         uploader.start()
         time.sleep(0.5)
         uploader.stop()  # must not raise
@@ -4401,21 +4434,39 @@ def test_run_rl_train_wires_direct_gradient_evidence_into_the_publish_path():
     assert "_finalize_advantage_evidence(state, resume_step, expected_steps)" in verdict_source
 
 
-def test_grpo_gradient_check_abstains_only_from_the_productivity_verdict_on_resume():
+def test_grpo_gradient_check_combines_prior_and_current_positive_evidence():
     rl_train._check_grpo_had_a_gradient(
-        [1.0], [0.0], {10: 0.0}, resumed=True, expected_steps=range(10, 11)
+        [1.0],
+        [0.0],
+        {10: 0.0},
+        resume_step=9,
+        prior_positive_step=4,
+        expected_steps=range(10, 11),
+    )
+    with pytest.raises(RuntimeError, match="no prior positive-gradient evidence"):
+        rl_train._check_grpo_had_a_gradient(
+            [1.0], [0.0], {10: 0.0}, resume_step=9, expected_steps=range(10, 11)
+        )
+    rl_train._check_grpo_had_a_gradient(
+        [1.0], [0.0], {10: 0.25}, resume_step=9, expected_steps=range(10, 11)
     )
     with pytest.raises(RuntimeError, match=r"missing=\[10\]"):
         rl_train._check_grpo_had_a_gradient(
-            [1.0], [0.0], {}, resumed=True, expected_steps=range(10, 11)
+            [1.0],
+            [0.0],
+            {},
+            resume_step=9,
+            prior_positive_step=4,
+            expected_steps=range(10, 11),
         )
     with pytest.raises(RuntimeError, match="not finite and nonnegative"):
         rl_train._check_grpo_had_a_gradient(
-            [1.0], [0.0], {10: -1.0}, resumed=True, expected_steps=range(10, 11)
-        )
-    with pytest.raises(RuntimeError, match="zero actor gradient norm"):
-        rl_train._check_grpo_had_a_gradient(
-            [1.0], [0.0], {1: 0.0}, resumed=False, expected_steps=range(1, 2)
+            [1.0],
+            [0.0],
+            {10: -1.0},
+            resume_step=9,
+            prior_positive_step=4,
+            expected_steps=range(10, 11),
         )
 
 
@@ -4451,20 +4502,41 @@ def test_terminal_advantage_evidence_still_rejects_missing_and_nonfinite_bounds(
         rl_train._validate_rl_child(0, nonfinite, 0, 1, None)
 
 
-def test_grpo_gradient_check_accepts_a_resume_that_is_already_complete():
+def test_grpo_gradient_check_requires_prior_evidence_for_an_already_complete_resume():
     rl_train._check_grpo_had_a_gradient(
-        [], [], {}, resumed=True, already_complete=True, expected_steps=range(6, 6)
+        [],
+        [],
+        {},
+        resume_step=5,
+        prior_positive_step=3,
+        already_complete=True,
+        expected_steps=range(6, 6),
     )
-    with pytest.raises(RuntimeError, match="never consulted"):
+    with pytest.raises(RuntimeError, match="no durable positive actor gradient evidence"):
         rl_train._check_grpo_had_a_gradient(
-            [], [], {}, expected_steps=range(6, 7), resumed=True, already_complete=False
+            [], [], {}, resume_step=5, already_complete=True, expected_steps=range(6, 6)
+        )
+    with pytest.raises(RuntimeError, match="invalid prior"):
+        rl_train._check_grpo_had_a_gradient(
+            [],
+            [],
+            {},
+            resume_step=5,
+            prior_positive_step=6,
+            already_complete=True,
+            expected_steps=range(6, 6),
         )
     with pytest.raises(RuntimeError, match="never consulted"):
-        rl_train._check_grpo_had_a_gradient([], [], {}, expected_steps=range(1, 2))
+        rl_train._check_grpo_had_a_gradient([], [], {}, expected_steps=range(6, 7), resume_step=5)
 
 
 def test_resume_uploader_publication_latch_starts_closed_and_opens_explicitly():
-    uploader = rl_train._VerlResumeUploader("/nonexistent", resume_step=0, required_steps=(1,))
+    uploader = rl_train._VerlResumeUploader(
+        "/nonexistent",
+        resume_step=0,
+        required_steps=(1,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     assert uploader._deployable_allowed() is False
     uploader.allow_deployable_publication()
     assert uploader._deployable_allowed() is True
@@ -4510,124 +4582,8 @@ def _patch_stage_and_publish(monkeypatch, staged: list[int], published: list[int
     )
 
 
-def test_latest_resume_carries_all_withheld_required_adapters_across_retry(tmp_path, monkeypatch):
-    remote = tmp_path / "remote"
-    remote.mkdir()
-    published: list[int] = []
-
-    def write_native_step(local_dir, step):
-        actor = local_dir / f"global_step_{step}" / "actor"
-        actor.mkdir(parents=True)
-        (actor / "fsdp_config.json").write_text('{"FSDP_version": 2, "world_size": 1}')
-        for kind in ("model", "optim", "extra_state"):
-            (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
-        (local_dir / "latest_checkpointed_iteration.txt").write_text(str(step))
-
-    def stage_adapter(self, step, _checkpoint_dir):
-        adapter = tmp_path / f"attempt-{id(self)}" / f"step-{step}"
-        adapter.mkdir(parents=True)
-        (adapter / "adapter_model.safetensors").write_bytes(f"step-{step}".encode())
-        (adapter / "adapter_config.json").write_text(f'{{"step": {step}}}')
-        (adapter / "preprocessor_config.json").write_text("{}")
-        return str(adapter)
-
-    def upload(step, path, **kwargs):
-        destination = remote / f"checkpoint-{step}"
-        shutil.rmtree(destination, ignore_errors=True)
-        shutil.copytree(path, destination)
-        for candidate in remote.glob("checkpoint-*"):
-            if candidate != destination:
-                shutil.rmtree(candidate)
-        callback = kwargs.get("after_upload")
-        if callback is not None:
-            callback()
-        return True
-
-    monkeypatch.setattr(rl_train._VerlResumeUploader, "_stage_deployable", stage_adapter)
-    monkeypatch.setattr(rl_train._w, "upload_resume_checkpoint", upload, raising=False)
-    monkeypatch.setattr(
-        rl_train._VerlResumeUploader,
-        "_publish_staged",
-        lambda self, step, adapter_dir: (
-            published.append(int(step)),
-            self.lifecycle.mark_deployable_published(step),
-        )[0],
-    )
-
-    first = None
-    second = None
-    first_started = False
-    second_started = False
-    try:
-        local_one = tmp_path / "local-one"
-        local_one.mkdir()
-        write_native_step(local_one, 2)
-        first = rl_train._VerlResumeUploader(
-            str(local_one),
-            resume_step=0,
-            required_steps=(2, 4),
-            export_root=str(tmp_path / "exports-one"),
-        )
-        first.start()
-        first_started = True
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and not (remote / "checkpoint-2").exists():
-            time.sleep(0.01)
-        write_native_step(local_one, 4)
-        while time.monotonic() < deadline and not (remote / "checkpoint-4").exists():
-            time.sleep(0.01)
-        first.stop()
-
-        bundle = remote / "checkpoint-4" / "_flash_required_adapters"
-        assert sorted(path.name for path in bundle.iterdir()) == ["step-2", "step-4"]
-        assert not (remote / "checkpoint-2").exists()
-        assert published == []
-
-        shutil.rmtree(local_one)
-        shutil.rmtree(tmp_path / "exports-one", ignore_errors=True)
-        monkeypatch.setattr(
-            rl_train._w,
-            "hf_resume_checkpoint",
-            lambda *args, **kwargs: str(remote / "checkpoint-4"),
-        )
-        monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
-        local_two = tmp_path / "local-two"
-        local_two.mkdir()
-        resume_step = rl_train._restore_verl_resume(
-            str(local_two), world_size=1, expected_fsdp_generation=2
-        )
-        assert resume_step == 4
-
-        second = rl_train._VerlResumeUploader(
-            str(local_two),
-            resume_step=resume_step,
-            required_steps=(2, 4),
-            export_root=str(tmp_path / "exports-two"),
-        )
-        second.credit_durable_required_steps(resume_step)
-        second.restore_staged_adapters(resume_step)
-        assert sorted(second.staged_adapters) == [2, 4]
-        second.start()
-        second_started = True
-        assert published == []
-
-        state = rl_train._StepMetricState()
-        rl_train._validate_rl_child(0, state, 4, 4, second)
-        assert published == [2, 4]
-        second.raise_if_incomplete()
-    finally:
-        if second_started:
-            try:
-                second.stop()
-            finally:
-                if first_started:
-                    first.stop()
-        elif first_started:
-            first.stop()
-
-
 def _write_internal_adapter(adapter_dir: Path, *, weights: str = "single") -> None:
-    adapter_dir.mkdir(parents=True)
+    adapter_dir.mkdir(parents=True, exist_ok=True)
     (adapter_dir / "adapter_config.json").write_text("{}")
     if weights == "single":
         (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
@@ -4643,17 +4599,383 @@ def _write_internal_adapter(adapter_dir: Path, *, weights: str = "single") -> No
         raise AssertionError(f"unknown adapter weight shape {weights}")
 
 
+def _write_resume_manifest(checkpoint: Path, step: int, required=(), positive=1) -> None:
+    (checkpoint / "_flash_resume_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "checkpoint_step": step,
+                "required_adapter_steps": list(required),
+                "first_positive_grad_step": positive,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def _metric_state(*norms: tuple[int, float], resume_step: int = 0, prior=None):
+    state = rl_train._StepMetricState(resume_step=resume_step)
+    state.set_prior_positive_step(prior, checkpoint_step=resume_step)
+    for step, value in norms:
+        state.record_grad_norm(step, value)
+    return state
+
+
+def test_internal_required_adapters_upload_once_and_restore_from_latest_manifest(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    local.mkdir()
+    remote = tmp_path / "remote" / "checkpoint"
+    remote.mkdir(parents=True)
+    internal_uploads = []
+    native_uploads = []
+    published = []
+
+    def stage(self, step, _path):
+        adapter = tmp_path / "exports-one" / f"step-{step}"
+        _write_internal_adapter(adapter)
+        return str(adapter)
+
+    def upload_internal(source, subpath, required=False):
+        assert required is True
+        internal_uploads.append(subpath)
+        destination = tmp_path / "remote" / subpath
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination)
+        return True
+
+    def upload_native(step, source, **kwargs):
+        destination = remote / f"checkpoint-{step}"
+        shutil.rmtree(destination, ignore_errors=True)
+        shutil.copytree(source, destination)
+        for old in remote.glob("checkpoint-*"):
+            if old != destination:
+                shutil.rmtree(old)
+        native_uploads.append(step)
+        callback = kwargs.get("after_upload")
+        if callback:
+            callback()
+        return True
+
+    monkeypatch.setattr(rl_train._VerlResumeUploader, "_stage_deployable", stage)
+    monkeypatch.setattr(rl_train._w, "hf_upload_folder", upload_internal, raising=False)
+    monkeypatch.setattr(rl_train._w, "upload_resume_checkpoint", upload_native, raising=False)
+    monkeypatch.setattr(
+        rl_train._VerlResumeUploader,
+        "_publish_staged",
+        lambda self, step, path: (
+            published.append(step),
+            self.lifecycle.mark_deployable_published(step),
+        )[0],
+    )
+
+    uploader = rl_train._VerlResumeUploader(
+        str(local),
+        resume_step=0,
+        required_steps=(2, 4),
+        metric_evidence=_metric_state((1, 0.0), (2, 0.5), (3, 0.0), (4, 0.0)),
+        export_root=str(tmp_path / "exports-one"),
+    )
+    try:
+        for step in (2, 4):
+            native = _write_step(local, step)
+            (native / "actor" / "fsdp_config.json").write_text(
+                '{"FSDP_version": 2, "world_size": 1}'
+            )
+            for kind in ("model", "optim", "extra_state"):
+                (native / "actor" / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
+            uploader.start() if step == 2 else None
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and step not in native_uploads:
+                time.sleep(0.01)
+        uploader.stop()
+    finally:
+        if uploader._thread.is_alive():
+            uploader.stop()
+
+    assert internal_uploads == [
+        "checkpoint/required-adapters/step-2/adapter",
+        "checkpoint/required-adapters/step-4/adapter",
+    ]
+    latest = remote / "checkpoint-4"
+    manifest = json.loads((latest / "_flash_resume_manifest.json").read_text())
+    assert manifest["required_adapter_steps"] == [2, 4]
+    assert manifest["first_positive_grad_step"] == 2
+    assert not list(latest.rglob("adapter_model.safetensors"))
+
+    monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda **kwargs: str(latest))
+    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
+    restored = tmp_path / "restored"
+    restored.mkdir()
+    resume_step = rl_train._restore_verl_resume(
+        str(restored),
+        world_size=1,
+        expected_fsdp_generation=2,
+        required_steps=(2, 4),
+    )
+    assert resume_step == 4
+    second_state = _metric_state(resume_step=4)
+    second = rl_train._VerlResumeUploader(
+        str(restored),
+        resume_step=4,
+        required_steps=(2, 4),
+        metric_evidence=second_state,
+        export_root=str(tmp_path / "exports-two"),
+    )
+    second.credit_durable_required_steps(4)
+    second.restore_staged_adapters(4)
+    assert second_state.prior_positive_grad_step == 2
+    assert sorted(second.staged_adapters) == [2, 4]
+    second.allow_deployable_publication()
+    second._publish_ready()
+    assert published == [2, 4]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda manifest: manifest.update(extra=True),
+        lambda manifest: manifest.update(version=2),
+        lambda manifest: manifest.update(version=1.0),
+        lambda manifest: manifest.update(checkpoint_step=True),
+        lambda manifest: manifest.update(required_adapter_steps=[2, 2]),
+        lambda manifest: manifest.update(required_adapter_steps=[2, 1]),
+        lambda manifest: manifest.update(required_adapter_steps=[0]),
+        lambda manifest: manifest.update(required_adapter_steps=[5]),
+        lambda manifest: manifest.update(first_positive_grad_step=0),
+        lambda manifest: manifest.update(first_positive_grad_step=5),
+        lambda manifest: manifest.update(first_positive_grad_step=True),
+    ],
+)
+def test_resume_manifest_rejects_unknown_noncanonical_and_out_of_range_facts(tmp_path, mutate):
+    checkpoint = tmp_path / "checkpoint-4"
+    checkpoint.mkdir()
+    manifest = {
+        "version": 1,
+        "checkpoint_step": 4,
+        "required_adapter_steps": [1, 2],
+        "first_positive_grad_step": 1,
+    }
+    mutate(manifest)
+    (checkpoint / "_flash_resume_manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(RuntimeError, match="GRPO resume manifest"):
+        rl_checkpoints._read_resume_manifest(
+            str(checkpoint), checkpoint_step=4, required_steps=(1, 2)
+        )
+
+
+def test_required_adapter_namespace_rejects_canonical_collision_and_step_symlink(tmp_path):
+    checkpoint = tmp_path / "checkpoint" / "checkpoint-4"
+    checkpoint.mkdir(parents=True)
+    root = checkpoint.parent / "required-adapters"
+    _write_internal_adapter(root / "step-2" / "adapter")
+    _write_internal_adapter(root / "step-02" / "adapter")
+    with pytest.raises(RuntimeError, match="namespace collision"):
+        rl_checkpoints._internal_adapter_sources(str(checkpoint), (2,))
+
+    shutil.rmtree(root / "step-02")
+    outside = tmp_path / "outside-step"
+    _write_internal_adapter(outside / "adapter")
+    shutil.rmtree(root / "step-2")
+    (root / "step-2").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="namespace step"):
+        rl_checkpoints._internal_adapter_sources(str(checkpoint), (2,))
+
+
+def test_checkpoint_waits_for_its_own_metric_and_preemption_keeps_previous_remote(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    local.mkdir()
+    state = _metric_state()
+    uploaded = []
+    monkeypatch.setattr(
+        rl_train._w,
+        "upload_resume_checkpoint",
+        lambda step, path, **kwargs: uploaded.append(step),
+        raising=False,
+    )
+    checkpoint = _write_step(local, 1)
+    uploader = rl_train._VerlResumeUploader(str(local), resume_step=0, metric_evidence=state)
+    uploader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and uploader._blocked_evidence_step != 1:
+            time.sleep(0.01)
+        assert uploaded == []
+        assert not (checkpoint / "_flash_resume_manifest.json").exists()
+    finally:
+        uploader.stop()
+    assert uploaded == []
+
+
+def test_checkpoint_manifest_is_written_only_after_metric_ingestion(tmp_path, monkeypatch):
+    local = tmp_path / "local"
+    local.mkdir()
+    state = _metric_state()
+    uploaded = []
+
+    def upload(step, path, **kwargs):
+        uploaded.append(
+            (step, json.loads((Path(path) / "_flash_resume_manifest.json").read_text()))
+        )
+
+    monkeypatch.setattr(rl_train._w, "upload_resume_checkpoint", upload, raising=False)
+    _write_step(local, 1)
+    uploader = rl_train._VerlResumeUploader(str(local), resume_step=0, metric_evidence=state)
+    uploader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and uploader._blocked_evidence_step != 1:
+            time.sleep(0.01)
+        assert uploaded == []
+        state.record_grad_norm(1, 0.25)
+        while time.monotonic() < deadline and not uploaded:
+            time.sleep(0.01)
+    finally:
+        uploader.stop()
+    assert uploaded[0][1]["first_positive_grad_step"] == 1
+
+
+def test_required_adapter_upload_failure_blocks_later_native_replacement(tmp_path, monkeypatch):
+    local = tmp_path / "local"
+    local.mkdir()
+    native = []
+    monkeypatch.setattr(
+        rl_train._VerlResumeUploader,
+        "_stage_deployable",
+        lambda self, step, path: str(tmp_path / f"step-{step}"),
+    )
+    _write_internal_adapter(tmp_path / "step-2")
+    monkeypatch.setattr(
+        rl_train._w,
+        "hf_upload_folder",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("hf down")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        rl_train._w,
+        "upload_resume_checkpoint",
+        lambda step, path, **kwargs: native.append(step),
+        raising=False,
+    )
+    _write_step(local, 2)
+    uploader = rl_train._VerlResumeUploader(
+        str(local),
+        resume_step=0,
+        required_steps=(2,),
+        metric_evidence=_metric_state((2, 0.5)),
+    )
+    uploader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and 2 not in uploader.staged_adapters:
+            time.sleep(0.01)
+        _write_step(local, 3)
+    finally:
+        uploader.stop()
+    assert native == []
+    with pytest.raises(RuntimeError, match=r"not durably published: \[2\]"):
+        uploader.raise_if_incomplete()
+
+
+def test_required_save_debt_prevents_a_later_checkpoint_from_replacing_recoverable_state(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "local"
+    local.mkdir()
+    uploaded = []
+    upload_started = threading.Event()
+    release_upload = threading.Event()
+
+    def blocked_upload(step, path, **kwargs):
+        uploaded.append(step)
+        if step == 1:
+            upload_started.set()
+            assert release_upload.wait(timeout=10)
+        callback = kwargs.get("after_upload")
+        if callback is not None:
+            callback()
+
+    monkeypatch.setattr(
+        rl_train._w,
+        "upload_resume_checkpoint",
+        blocked_upload,
+        raising=False,
+    )
+    uploader = rl_train._VerlResumeUploader(
+        str(local),
+        resume_step=0,
+        required_steps=(2,),
+        metric_evidence=_metric_state((1, 0.5), (2, 0.0), (3, 0.0), (4, 0.0), (5, 0.0)),
+    )
+    _write_step(local, 1)
+    uploader.start()
+    try:
+        assert upload_started.wait(timeout=10)
+        _write_step(local, 2)
+        shutil.rmtree(local / "global_step_2")
+        for step in (3, 4, 5):
+            _write_step(local, step)
+        release_upload.set()
+    finally:
+        release_upload.set()
+        uploader.stop()
+    assert uploaded == [1]
+    with pytest.raises(RuntimeError, match=r"not durably published: \[2\]"):
+        uploader.raise_if_incomplete()
+
+
+def test_resume_manifest_and_internal_tree_fail_closed(tmp_path, monkeypatch):
+    remote_root = tmp_path / "remote" / "checkpoint"
+    checkpoint = remote_root / "checkpoint-4"
+    actor = checkpoint / "actor"
+    actor.mkdir(parents=True)
+    (actor / "fsdp_config.json").write_text('{"FSDP_version": 2, "world_size": 1}')
+    for kind in ("model", "optim", "extra_state"):
+        (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
+    _write_resume_manifest(checkpoint, 4, required=(2,), positive=2)
+    internal = remote_root / "required-adapters" / "step-2" / "adapter"
+    _write_internal_adapter(internal, weights="sharded")
+    monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda **kwargs: str(checkpoint))
+
+    local = tmp_path / "local"
+    local.mkdir()
+    assert (
+        rl_train._restore_verl_resume(
+            str(local),
+            world_size=1,
+            expected_fsdp_generation=2,
+            required_steps=(2,),
+        )
+        == 4
+    )
+    assert (local / "_flash_required_adapter_store" / "step-2" / "adapter").is_dir()
+
+    (internal / "adapter_model-00002-of-00002.safetensors").unlink()
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    with pytest.raises(RuntimeError, match="required adapter"):
+        rl_train._restore_verl_resume(
+            str(broken),
+            world_size=1,
+            expected_fsdp_generation=2,
+            required_steps=(2,),
+        )
+
+
 def test_internal_adapter_validation_accepts_complete_sharded_weights(tmp_path):
     adapter = tmp_path / "adapter"
     _write_internal_adapter(adapter, weights="sharded")
-
     rl_checkpoints._validate_internal_adapter_dir(str(adapter), label="step-2")
 
 
 def test_internal_adapter_validation_rejects_incomplete_sharded_weights(tmp_path):
     adapter = tmp_path / "adapter"
     _write_internal_adapter(adapter, weights="incomplete-sharded")
-
     with pytest.raises(RuntimeError, match="missing adapter config or weights"):
         rl_checkpoints._validate_internal_adapter_dir(str(adapter), label="step-2")
 
@@ -4666,183 +4988,106 @@ def test_internal_adapter_validation_rejects_missing_required_file(tmp_path, mis
         (adapter / "adapter_config.json").write_text("{}")
     if missing != "weights":
         (adapter / "adapter_model.safetensors").write_bytes(b"weights")
-
     with pytest.raises(RuntimeError, match="missing adapter config or weights"):
         rl_checkpoints._validate_internal_adapter_dir(str(adapter), label="step-2")
 
 
-def test_internal_adapter_validation_rejects_nested_symlink(tmp_path):
-    adapter = tmp_path / "adapter"
-    _write_internal_adapter(adapter)
-    nested = adapter / "nested"
-    nested.mkdir()
-    outside = tmp_path / "outside.json"
-    outside.write_text("{}")
-    (nested / "escape.json").symlink_to(outside)
+def test_internal_adapter_validation_rejects_root_and_nested_symlinks(tmp_path):
+    outside = tmp_path / "outside"
+    _write_internal_adapter(outside)
+    root_link = tmp_path / "root-link"
+    root_link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="not a real directory"):
+        rl_checkpoints._validate_internal_adapter_dir(str(root_link), label="step-2")
 
+    nested = outside / "nested"
+    nested.mkdir()
+    target = tmp_path / "outside.json"
+    target.write_text("{}")
+    (nested / "escape.json").symlink_to(target)
     with pytest.raises(RuntimeError, match=r"symlink 'escape.json'"):
-        rl_checkpoints._validate_internal_adapter_dir(str(adapter), label="step-2")
+        rl_checkpoints._validate_internal_adapter_dir(str(outside), label="step-2")
 
 
 def test_published_required_adapter_is_not_restored_or_republished(tmp_path, monkeypatch):
-    local_dir = tmp_path / "ckpt"
-    bundle = local_dir / "global_step_4" / "_flash_required_adapters" / "step-2"
-    bundle.mkdir(parents=True)
-    (bundle / "adapter_config.json").write_text("{}")
-    (bundle / "adapter_model.safetensors").write_bytes(b"weights")
-    published: list[int] = []
+    local = tmp_path / "local"
+    checkpoint = local / "global_step_4"
+    checkpoint.mkdir(parents=True)
+    _write_resume_manifest(checkpoint, 4, required=(2,), positive=2)
+    _write_internal_adapter(local / "_flash_required_adapter_store" / "step-2" / "adapter")
     monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: step == 2)
-    monkeypatch.setattr(
-        rl_train._VerlResumeUploader,
-        "_publish_staged",
-        lambda self, step, adapter_dir: published.append(int(step)),
-    )
+    published = []
     uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
+        str(local),
+        resume_step=4,
+        required_steps=(2,),
+        metric_evidence=_metric_state(resume_step=4),
+        export_root=str(tmp_path / "exports"),
     )
     uploader.credit_durable_required_steps(4)
     uploader.restore_staged_adapters(4)
-    uploader._bundle_staged_adapters(str(local_dir / "global_step_4"))
+    monkeypatch.setattr(uploader, "_publish_staged", lambda step, path: published.append(step))
     uploader.allow_deployable_publication()
     uploader._publish_ready()
-
-    assert not (local_dir / "global_step_4" / "_flash_required_adapters").exists()
     assert uploader.staged_adapters == {}
-    assert published == []
-    assert uploader.lifecycle.deployable_published_steps == {2}
-
-
-def test_missing_required_adapter_bundle_fails_closed(tmp_path, monkeypatch):
-    local_dir = tmp_path / "ckpt"
-    (local_dir / "global_step_4").mkdir(parents=True)
-    published: list[int] = []
-    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
-    monkeypatch.setattr(
-        rl_train._VerlResumeUploader,
-        "_publish_staged",
-        lambda self, step, adapter_dir: published.append(int(step)),
-    )
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
-    )
-    uploader.credit_durable_required_steps(4)
-    with pytest.raises(RuntimeError, match="missing required-adapter bundle"):
-        uploader.restore_staged_adapters(4)
-    uploader.allow_deployable_publication()
-    uploader._publish_ready()
     assert published == []
 
 
-def test_malformed_required_adapter_bundle_entry_fails_closed(tmp_path, monkeypatch):
-    local_dir = tmp_path / "ckpt"
-    malformed = local_dir / "global_step_4" / "_flash_required_adapters" / "step-two"
-    malformed.mkdir(parents=True)
-    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
-    )
-    uploader.credit_durable_required_steps(4)
-    with pytest.raises(RuntimeError, match="invalid GRPO required-adapter bundle entry"):
-        uploader.restore_staged_adapters(4)
-    assert uploader.staged_adapters == {}
-
-
-def test_canonical_required_adapter_step_collision_fails_closed(tmp_path, monkeypatch):
-    local_dir = tmp_path / "ckpt"
-    bundle_root = local_dir / "global_step_4" / "_flash_required_adapters"
-    _write_internal_adapter(bundle_root / "step-2")
-    _write_internal_adapter(bundle_root / "step-02")
-    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
-    )
-    uploader.credit_durable_required_steps(4)
-
-    with pytest.raises(RuntimeError, match="required-adapter bundle collision 'step-02'"):
-        uploader.restore_staged_adapters(4)
-
-    assert uploader.staged_adapters == {}
-
-
-def test_required_adapter_bundle_root_symlink_fails_closed(tmp_path, monkeypatch):
-    local_dir = tmp_path / "ckpt"
-    checkpoint = local_dir / "global_step_4"
+def test_start_resume_uploader_hydrates_manifest_before_thread_start(tmp_path, monkeypatch):
+    local = tmp_path / "local"
+    checkpoint = local / "global_step_4"
     checkpoint.mkdir(parents=True)
-    outside = tmp_path / "outside-bundle"
-    _write_internal_adapter(outside / "step-2")
-    (checkpoint / "_flash_required_adapters").symlink_to(outside, target_is_directory=True)
-    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
-    )
-    uploader.credit_durable_required_steps(4)
-
-    with pytest.raises(RuntimeError, match="missing required-adapter bundle"):
-        uploader.restore_staged_adapters(4)
-
-    assert uploader.staged_adapters == {}
-
-
-def test_traversal_required_adapter_bundle_fails_closed(tmp_path, monkeypatch):
-    local_dir = tmp_path / "ckpt"
-    bundle_root = local_dir / "global_step_4" / "_flash_required_adapters"
-    bundle_root.mkdir(parents=True)
-    (bundle_root / "../outside").mkdir()
-    (bundle_root / "step-2").symlink_to(bundle_root / "../outside", target_is_directory=True)
-    published: list[int] = []
-    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
-    monkeypatch.setattr(
-        rl_train._VerlResumeUploader,
-        "_publish_staged",
-        lambda self, step, adapter_dir: published.append(int(step)),
-    )
-    uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
-    )
-    uploader.credit_durable_required_steps(4)
-    with pytest.raises(RuntimeError, match="not a real directory"):
-        uploader.restore_staged_adapters(4)
-    uploader.allow_deployable_publication()
-    uploader._publish_ready()
-    assert published == []
-
-
-def test_start_resume_uploader_hydrates_bundle_before_thread_start(tmp_path, monkeypatch):
-    local_dir = tmp_path / "ckpt"
-    bundled = local_dir / "global_step_4" / "_flash_required_adapters" / "step-2"
-    bundled.mkdir(parents=True)
-    (bundled / "adapter_config.json").write_text("{}")
-    (bundled / "adapter_model.safetensors").write_bytes(b"weights")
-    started: list[bool] = []
+    _write_resume_manifest(checkpoint, 4, required=(2,), positive=2)
+    _write_internal_adapter(local / "_flash_required_adapter_store" / "step-2" / "adapter")
+    started = []
     monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
     monkeypatch.setattr(
         rl_train._VerlResumeUploader,
         "start",
-        lambda self: started.append(bool(self.staged_adapters)),
+        lambda self: started.append(
+            (sorted(self.staged_adapters), self.metric_evidence.prior_positive_grad_step)
+        ),
     )
-    inp = {
-        "save_at_steps": (2,),
-        "model_id": "Qwen/Qwen3.5-9B",
-        "model_revision": "rev",
-        "multimodal": False,
-    }
+    state = _metric_state(resume_step=4)
     uploader = rl_train._start_resume_uploader(
-        local_dir=str(local_dir),
+        local_dir=str(local),
         resume_step=4,
-        inp=inp,
+        inp={
+            "save_at_steps": (2,),
+            "model_id": "Qwen/Qwen3.5-9B",
+            "model_revision": "rev",
+            "multimodal": False,
+        },
         workdir=str(tmp_path),
         python_bin="python",
         preprocessor=object(),
+        metric_evidence=state,
     )
-    assert started == [True]
+    assert started == [([2], 2)]
     assert sorted(uploader.staged_adapters) == [2]
 
 
-def test_no_required_saves_add_no_internal_adapter_bundle(tmp_path):
-    checkpoint = tmp_path / "global_step_1"
-    checkpoint.mkdir()
-    uploader = rl_train._VerlResumeUploader(str(tmp_path), resume_step=0, required_steps=())
-    uploader._bundle_staged_adapters(str(checkpoint))
+def test_no_required_saves_write_only_the_small_resume_manifest(tmp_path):
+    checkpoint = _write_step(tmp_path, 1)
+    state = _metric_state((1, 0.5))
+    uploaded = []
+    uploader = rl_train._VerlResumeUploader(
+        str(tmp_path), resume_step=0, required_steps=(), metric_evidence=state
+    )
+    original = rl_train._w.upload_resume_checkpoint
+    rl_train._w.upload_resume_checkpoint = lambda step, path, **kwargs: uploaded.append(step)
+    try:
+        uploader.start()
+        uploader.stop()
+    finally:
+        rl_train._w.upload_resume_checkpoint = original
+    assert uploaded == [1]
+    assert (
+        json.loads((checkpoint / "_flash_resume_manifest.json").read_text())[
+            "required_adapter_steps"
+        ]
+        == []
+    )
     assert not (checkpoint / "_flash_required_adapters").exists()
 
 
@@ -4864,7 +5109,12 @@ def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
     _write_step(local_dir, 3)
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(3,))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(3,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.start()
     try:
         deadline = time.monotonic() + 10
@@ -4899,7 +5149,12 @@ def test_positive_early_gradient_never_publishes_before_terminal_validation(tmp_
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
     _write_step(local_dir, 1)
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(1,))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(1,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.start()
     try:
         deadline = time.monotonic() + 10
@@ -4922,7 +5177,12 @@ def test_invalid_later_step_never_releases_an_early_positive_required_save(tmp_p
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
     _write_step(local_dir, 1)
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(1,))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(1,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.start()
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and not staged:
@@ -4951,7 +5211,12 @@ def test_clean_terminal_validation_releases_staged_required_save(tmp_path, monke
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
     _write_step(local_dir, 1)
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(1,))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(1,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.start()
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and not staged:
@@ -4979,14 +5244,20 @@ def test_resumed_new_required_step_waits_for_terminal_validation(tmp_path, monke
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
     _write_step(local_dir, 2)
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=1, required_steps=(2,))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=1,
+        required_steps=(2,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.start()
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and not staged:
         time.sleep(0.01)
     assert published == []
 
-    state = rl_train._StepMetricState()
+    state = rl_train._StepMetricState(resume_step=1)
+    state.set_prior_positive_step(1, checkpoint_step=1)
     state.reward_history.append(0.5)
     state.adv_spread_history.append(0.0)
     state.advantage_bounds[2] = (0.0, 0.0)
@@ -5020,7 +5291,12 @@ def test_a_gate_already_open_publishes_the_deployable_before_the_resume_upload(
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
     _write_step(local_dir, 3)
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(3,))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(3,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.allow_deployable_publication()
     uploader.start()
     try:
@@ -5059,7 +5335,12 @@ def test_a_failed_resume_upload_is_not_recorded_as_durable_and_stays_non_fatal(
     monkeypatch.setattr(rl_train._w, "upload_resume_checkpoint", exploding_upload, raising=False)
     _patch_stage_and_publish(monkeypatch, [], [])
     _write_step(local_dir, 2)
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=())
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.start()
     try:
         deadline = time.monotonic() + 10
@@ -5085,7 +5366,12 @@ def test_a_permanently_withheld_step_fails_the_run_and_does_not_hang_stop(tmp_pa
     )
     _patch_stage_and_publish(monkeypatch, [], [])
     _write_step(local_dir, 3)
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(3,))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(3,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.start()
     time.sleep(0.5)
     uploader.stop()  # must return, not hang
@@ -5108,7 +5394,12 @@ def test_gate_opening_just_before_stop_still_publishes_rather_than_failing_on_ti
     )
     _patch_stage_and_publish(monkeypatch, [], published)
     _write_step(local_dir, 3)
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(3,))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(3,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.start()
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and not uploader.staged_adapters:
@@ -5134,7 +5425,12 @@ def test_resumed_required_step_can_still_publish_its_withheld_deployable(tmp_pat
     _write_step(local_dir, 4)
     # resumed at exactly the required step, and no adapter on hf for it, so it stays uncredited.
     monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=4, required_steps=(4,))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=4,
+        required_steps=(4,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.credit_durable_required_steps(4)
     uploader.start()
     deadline = time.monotonic() + 10
@@ -5198,7 +5494,12 @@ def test_checkpoint_appearing_at_stop_is_uploaded_before_the_exit(tmp_path, monk
     monkeypatch.setattr(
         rl_train._VerlResumeUploader, "_completed_step", _completed_then_race, raising=True
     )
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(5,))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(5,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.start()
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and uploader._thread.is_alive():
@@ -5222,6 +5523,7 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monk
     monkeypatch.setattr(
         rl_train._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
     )
+    monkeypatch.setattr(rl_train._w, "hf_upload_folder", lambda *a, **kw: True, raising=False)
 
     def _stage_requiring_its_source(self, step, path):
         # the real _stage_deployable runs model_merger over <path>/actor, so it cannot succeed once
@@ -5230,7 +5532,9 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monk
         if not os.path.isdir(path):
             raise AssertionError(f"staged step {step} after verl pruned {path}")
         staged.append(int(step))
-        return f"{path}-adapter"
+        adapter = Path(f"{path}-adapter")
+        _write_internal_adapter(adapter)
+        return str(adapter)
 
     monkeypatch.setattr(
         rl_train._VerlResumeUploader, "_stage_deployable", _stage_requiring_its_source
@@ -5247,7 +5551,10 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monk
         (local_dir / f"global_step_{step}").mkdir()
     _write_step(local_dir, 4)
     uploader = rl_train._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(1, 2, 3, 4)
+        str(local_dir),
+        resume_step=0,
+        required_steps=(1, 2, 3, 4),
+        metric_evidence=_always_ready_metric_evidence(),
     )
     uploader.start()
     try:
@@ -5285,11 +5592,14 @@ def test_staging_failure_does_not_strand_an_earlier_publishable_step(tmp_path, m
     monkeypatch.setattr(
         rl_train._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
     )
+    monkeypatch.setattr(rl_train._w, "hf_upload_folder", lambda *a, **kw: True, raising=False)
 
     def _stage_failing_on_step_2(self, step, path):
         if int(step) == 2:
             raise RuntimeError("model_merger ran out of memory")
-        return f"{path}-adapter"
+        adapter = Path(f"{path}-adapter")
+        _write_internal_adapter(adapter)
+        return str(adapter)
 
     monkeypatch.setattr(rl_train._VerlResumeUploader, "_stage_deployable", _stage_failing_on_step_2)
     monkeypatch.setattr(
@@ -5303,7 +5613,12 @@ def test_staging_failure_does_not_strand_an_earlier_publishable_step(tmp_path, m
     for step in (1, 2):
         (local_dir / f"global_step_{step}").mkdir()
     _write_step(local_dir, 2)
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(1, 2))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(1, 2),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.allow_deployable_publication()
     uploader.start()
     try:
@@ -5330,7 +5645,12 @@ def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, mon
         rl_train._w, "upload_resume_checkpoint", lambda step, path, **k: True, raising=False
     )
     _patch_stage_and_publish(monkeypatch, [], [])
-    uploader = rl_train._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=(6,))
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir),
+        resume_step=0,
+        required_steps=(6,),
+        metric_evidence=_always_ready_metric_evidence(),
+    )
     uploader.start()
     uploader.stop()
     # both failures are live: the deployable was withheld, and the run produced only zero actor
@@ -5463,7 +5783,8 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
 def test_already_complete_resume_finalizes_empty_rollout_identity_evidence():
     from flash.engine.worker.train.rl.identity import RolloutIdentityLedger
 
-    state = rl_train._StepMetricState()
+    state = rl_train._StepMetricState(resume_step=5)
+    state.set_prior_positive_step(3, checkpoint_step=5)
     runtime = SimpleNamespace(identity_ledger=RolloutIdentityLedger(1, 2))
     rl_train._validate_rl_child(0, state, 5, 5, None, reward_runtime=runtime)
     assert state.rollout_identity_evidence == {"steps": [], "validation": []}

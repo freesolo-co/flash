@@ -1,15 +1,9 @@
-"""Checkpoint upload and gradient verification for the GRPO trainer.
-
-verl writes sharded checkpoints as training proceeds; `_VerlResumeUploader` watches for completed
-ones and streams them to the Hub on a background thread so a retry can resume and required saves
-are durable. `_check_grpo_had_a_gradient` is the publish-time guard that refuses an adapter
-identical to its initialization.
-
-Split out of `flash.engine.worker.rl_train` to keep that module under the file-size limit.
-"""
+"""Checkpoint durability and gradient verification for the GRPO trainer."""
 
 from __future__ import annotations
 
+import contextlib
+import json
 import math
 import os
 import shutil
@@ -33,52 +27,184 @@ from flash.engine.worker.verl.checkpoints import (
     inspect_resume_checkpoint,
 )
 
-_REQUIRED_ADAPTER_BUNDLE_DIR = "_flash_required_adapters"
+_RESUME_MANIFEST = "_flash_resume_manifest.json"
+_RESUME_MANIFEST_VERSION = 1
+_LOCAL_REQUIRED_ADAPTER_STORE = "_flash_required_adapter_store"
+_HF_REQUIRED_ADAPTER_ROOT = "required-adapters"
 
 
 def _validate_internal_adapter_dir(path: str, *, label: str) -> None:
-    """reject malformed internal adapter trees before copying or publishing them."""
+    """reject malformed internal adapter trees before restoring or publishing them."""
     if not os.path.isdir(path) or os.path.islink(path):
-        raise RuntimeError(f"invalid GRPO required-adapter bundle {label}: not a real directory")
+        raise RuntimeError(f"invalid GRPO required adapter {label}: not a real directory")
     root = os.path.realpath(path)
     names = set(os.listdir(path))
     if "adapter_config.json" not in names or not has_loadable_adapter_weights(names):
         raise RuntimeError(
-            f"invalid GRPO required-adapter bundle {label}: missing adapter config or weights"
+            f"invalid GRPO required adapter {label}: missing adapter config or weights"
         )
     for current, dirs, files in os.walk(path):
         if os.path.commonpath((root, os.path.realpath(current))) != root:
-            raise RuntimeError(f"invalid GRPO required-adapter bundle {label}: path traversal")
+            raise RuntimeError(f"invalid GRPO required adapter {label}: path traversal")
         for name in (*dirs, *files):
             candidate = os.path.join(current, name)
             if os.path.islink(candidate):
-                raise RuntimeError(
-                    f"invalid GRPO required-adapter bundle {label}: symlink {name!r}"
-                )
+                raise RuntimeError(f"invalid GRPO required adapter {label}: symlink {name!r}")
             if os.path.commonpath((root, os.path.realpath(candidate))) != root:
-                raise RuntimeError(f"invalid GRPO required-adapter bundle {label}: path traversal")
+                raise RuntimeError(f"invalid GRPO required adapter {label}: path traversal")
+
+
+def _strict_positive_step(value, *, field: str, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value > maximum:
+        raise RuntimeError(
+            f"invalid GRPO resume manifest {field}: expected an integer in 1..{maximum}"
+        )
+    return value
+
+
+def _read_resume_manifest(
+    checkpoint_dir: str,
+    *,
+    checkpoint_step: int,
+    required_steps: frozenset[int] | set[int] | tuple[int, ...],
+) -> tuple[tuple[int, ...], int | None]:
+    """read one exact current-contract resume manifest and reject every ambiguous shape."""
+    path = os.path.join(checkpoint_dir, _RESUME_MANIFEST)
+    if not os.path.isfile(path) or os.path.islink(path):
+        raise RuntimeError(
+            f"GRPO resume checkpoint {checkpoint_step} is missing a regular {_RESUME_MANIFEST}"
+        )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"GRPO resume checkpoint {checkpoint_step} has an unreadable {_RESUME_MANIFEST}"
+        ) from error
+    expected_keys = {
+        "version",
+        "checkpoint_step",
+        "required_adapter_steps",
+        "first_positive_grad_step",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != expected_keys:
+        raise RuntimeError("invalid GRPO resume manifest keys")
+    if type(manifest["version"]) is not int or manifest["version"] != _RESUME_MANIFEST_VERSION:
+        raise RuntimeError("invalid GRPO resume manifest version")
+    declared_step = _strict_positive_step(
+        manifest["checkpoint_step"], field="checkpoint_step", maximum=checkpoint_step
+    )
+    if declared_step != checkpoint_step:
+        raise RuntimeError(
+            f"invalid GRPO resume manifest checkpoint_step {declared_step}; expected {checkpoint_step}"
+        )
+    raw_required = manifest["required_adapter_steps"]
+    if not isinstance(raw_required, list):
+        raise RuntimeError("invalid GRPO resume manifest required_adapter_steps")
+    parsed_required = tuple(
+        _strict_positive_step(value, field="required_adapter_steps", maximum=checkpoint_step)
+        for value in raw_required
+    )
+    if parsed_required != tuple(sorted(set(parsed_required))):
+        raise RuntimeError("invalid GRPO resume manifest noncanonical required_adapter_steps")
+    unknown = sorted(set(parsed_required) - set(required_steps))
+    if unknown:
+        raise RuntimeError(f"invalid GRPO resume manifest unknown required adapter steps {unknown}")
+    positive = manifest["first_positive_grad_step"]
+    if positive is not None:
+        positive = _strict_positive_step(
+            positive, field="first_positive_grad_step", maximum=checkpoint_step
+        )
+    return parsed_required, positive
+
+
+def _write_resume_manifest(
+    checkpoint_dir: str,
+    *,
+    checkpoint_step: int,
+    required_adapter_steps: tuple[int, ...],
+    first_positive_grad_step: int | None,
+) -> None:
+    """atomically write the small durability manifest included in a native checkpoint commit."""
+    manifest = {
+        "version": _RESUME_MANIFEST_VERSION,
+        "checkpoint_step": checkpoint_step,
+        "required_adapter_steps": list(required_adapter_steps),
+        "first_positive_grad_step": first_positive_grad_step,
+    }
+    path = os.path.join(checkpoint_dir, _RESUME_MANIFEST)
+    temporary = f"{path}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(temporary)
+        raise
+
+
+def _internal_adapter_sources(
+    checkpoint_dir: str, referenced_steps: tuple[int, ...]
+) -> dict[int, str]:
+    """resolve referenced singular-namespace adapters beside a downloaded checkpoint."""
+    if not referenced_steps:
+        return {}
+    root = os.path.join(os.path.dirname(checkpoint_dir), _HF_REQUIRED_ADAPTER_ROOT)
+    if not os.path.isdir(root) or os.path.islink(root):
+        raise RuntimeError("GRPO resume is missing the required-adapter internal namespace")
+    sources: dict[int, str] = {}
+    referenced = set(referenced_steps)
+    for entry in os.scandir(root):
+        name = entry.name
+        if not name.startswith("step-") or not name[5:].isdigit():
+            continue
+        step = int(name[5:])
+        if step not in referenced:
+            continue
+        if name != f"step-{step}" or step in sources:
+            raise RuntimeError(f"invalid GRPO required-adapter namespace collision {name!r}")
+        if not entry.is_dir(follow_symlinks=False) or entry.is_symlink():
+            raise RuntimeError(f"invalid GRPO required-adapter namespace step {name!r}")
+        adapter = os.path.join(entry.path, "adapter")
+        _validate_internal_adapter_dir(adapter, label=name)
+        sources[step] = adapter
+    missing = sorted(set(referenced_steps) - sources.keys())
+    if missing:
+        raise RuntimeError(f"GRPO resume required-adapter namespace is missing steps {missing}")
+    return sources
+
+
+def _stage_internal_adapters(
+    checkpoint_dir: str,
+    local_dir: str,
+    referenced_steps: tuple[int, ...],
+) -> None:
+    """copy manifest-referenced internal adapters to a deterministic local restore store."""
+    sources = _internal_adapter_sources(checkpoint_dir, referenced_steps)
+    store = os.path.join(local_dir, _LOCAL_REQUIRED_ADAPTER_STORE)
+    shutil.rmtree(store, ignore_errors=True)
+    if not sources:
+        return
+    for step, source in sorted(sources.items()):
+        destination = os.path.join(store, f"step-{step}", "adapter")
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        shutil.copytree(source, destination)
+        _validate_internal_adapter_dir(destination, label=f"step-{step}")
 
 
 def _rl_train():
-    """The orchestrator module, imported lazily because it imports this one.
-
-    `export_peft_adapter`, `stamp_adapter_dir_provenance`, and `_deployable_adapter_on_hf` are
-    defined elsewhere but patched on `rl_train` by the upload tests. Binding them here would
-    capture the originals, so the patches would rebind an object this module never reads and the
-    uploader would perform real exports and Hub reads under test.
-    """
+    """return the orchestrator module so its runtime monkeypatch seams stay live."""
     from flash.engine.worker import rl_train
 
     return rl_train
 
 
 class _VerlResumeUploader:
-    """stream completed verl checkpoints to hf for resume and required saves.
-
-    all checkpoints upload resume state. exact ``save_at_steps`` also exports deployable adapters.
-    verl advances ``latest_checkpointed_iteration.txt`` only after writing ``global_step_N``, so the
-    marker prevents half-written uploads.
-    """
+    """stream completed verl checkpoints without outrunning their durability evidence."""
 
     def __init__(
         self,
@@ -86,6 +212,7 @@ class _VerlResumeUploader:
         *,
         resume_step: int,
         required_steps: tuple[int, ...] = (),
+        metric_evidence,
         export_root: str = "",
         python_bin: str = "",
         model_id: str = "",
@@ -94,136 +221,87 @@ class _VerlResumeUploader:
         preprocessor=None,
     ) -> None:
         self.local_dir = local_dir
+        self.resume_step = int(resume_step)
+        self.metric_evidence = metric_evidence
         self.required_steps = frozenset(required_steps)
         self.lifecycle = CheckpointLedger()
         self.lifecycle.seed_resumed_step(resume_step, self.required_steps)
-        # attempted, NOT uploaded: a step joins this before the upload call so a permanently failing
-        # upload cannot respin every 0.5s. durability is the ledger's resume_uploaded fact, which is
-        # recorded from the transport's own callback.
         self._resume_attempted: set[int] = {resume_step} if resume_step else set()
-        # required step -> staged adapter directory, populated the sweep a checkpoint appears and
-        # drained by publication once the terminal latch opens. paths, not lifecycle state: this is
-        # what decouples publication from verl's checkpoint retention.
         self.staged_adapters: dict[int, str] = {}
+        self._internally_durable_steps: set[int] = set()
+        self._reported_required_debt = False
+        self._blocked_evidence_step: int | None = None
         self.export_root = export_root
         self.python_bin = python_bin
         self.model_id = model_id
         self.model_revision = model_revision
         self.exclude_modules = exclude_modules
-        # the processor on a multimodal job, else the tokenizer: an image model cannot be served
-        # from an adapter dir that carries only tokenizer files, since the runtime needs the
-        # preprocessor config to turn pixels back into tokens.
         self.preprocessor = preprocessor
-        # required deployables stay closed until terminal metric validation succeeds. staging and
-        # internal resume uploads remain concurrent because neither makes an adapter servable.
         self._publication_latch = threading.Event()
         self._error: BaseException | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def credit_durable_required_steps(self, resume_step: int) -> None:
-        """credit required saves already published before resume.
-
-        verify the adapter on hf rather than trusting the step counter; a preempted worker can pass a
-        required step without publishing its deployable artifact.
-        """
+        """credit required deployables that are verifiably servable before this attempt."""
         for step in sorted(self.required_steps):
             if step <= int(resume_step) and _rl_train()._deployable_adapter_on_hf(step):
                 self.lifecycle.mark_deployable_published(step)
 
     def restore_staged_adapters(self, resume_step: int) -> None:
-        """hydrate unpublished required adapters bundled into the restored native checkpoint."""
-        owed = {
-            step
-            for step in self.required_steps
-            if step <= int(resume_step) and step not in self.lifecycle.deployable_published_steps
-        }
+        """validate the restored manifest, trust its metric fact, and hydrate owed adapters."""
+        resume_step = int(resume_step)
+        if not resume_step:
+            self.metric_evidence.set_prior_positive_step(None, checkpoint_step=0)
+            return
+        checkpoint_dir = os.path.join(self.local_dir, f"global_step_{resume_step}")
+        referenced, positive = _read_resume_manifest(
+            checkpoint_dir,
+            checkpoint_step=resume_step,
+            required_steps=self.required_steps,
+        )
+        self.metric_evidence.set_prior_positive_step(positive, checkpoint_step=resume_step)
+        self._internally_durable_steps.update(referenced)
+        published = self.lifecycle.deployable_published_steps
+        owed = set(referenced) - published
         if not owed:
             return
-        bundle_root = os.path.join(
-            self.local_dir, f"global_step_{int(resume_step)}", _REQUIRED_ADAPTER_BUNDLE_DIR
-        )
-        if not os.path.isdir(bundle_root) or os.path.islink(bundle_root):
-            raise RuntimeError(
-                f"GRPO resume checkpoint {resume_step} is missing required-adapter bundle for "
-                f"steps {sorted(owed)}"
-            )
-        sources: dict[int, str] = {}
-        for entry in os.scandir(bundle_root):
-            name = entry.name
-            if not name.startswith("step-") or not name[5:].isdigit():
-                raise RuntimeError(f"invalid GRPO required-adapter bundle entry {name!r}")
-            step = int(name[5:])
-            if name != f"step-{step}" or step in sources:
-                raise RuntimeError(f"invalid GRPO required-adapter bundle collision {name!r}")
-            if step not in self.required_steps or step > int(resume_step):
-                raise RuntimeError(f"invalid GRPO required-adapter bundle step {step}")
-            _validate_internal_adapter_dir(entry.path, label=name)
-            if step not in self.lifecycle.deployable_published_steps:
-                sources[step] = entry.path
-        missing = sorted(owed - sources.keys())
-        if missing:
-            raise RuntimeError(
-                f"GRPO resume checkpoint {resume_step} required-adapter bundle is missing steps "
-                f"{missing}"
-            )
+        store = os.path.join(self.local_dir, _LOCAL_REQUIRED_ADAPTER_STORE)
         os.makedirs(self.export_root, exist_ok=True)
         restored: dict[int, str] = {}
         try:
-            for step in sorted(sources):
+            for step in sorted(owed):
+                source = os.path.join(store, f"step-{step}", "adapter")
+                _validate_internal_adapter_dir(source, label=f"step-{step}")
                 name = f"step-{step}"
                 destination = os.path.join(self.export_root, name)
                 temporary = os.path.join(self.export_root, f".{name}.restoring")
                 shutil.rmtree(temporary, ignore_errors=True)
-                shutil.copytree(sources[step], temporary)
+                shutil.copytree(source, temporary)
                 shutil.rmtree(destination, ignore_errors=True)
                 os.replace(temporary, destination)
                 restored[step] = destination
         except BaseException:
             for path in restored.values():
                 shutil.rmtree(path, ignore_errors=True)
-            for step in sources:
-                temporary = os.path.join(self.export_root, f".step-{step}.restoring")
-                shutil.rmtree(temporary, ignore_errors=True)
+            for step in owed:
+                shutil.rmtree(
+                    os.path.join(self.export_root, f".step-{step}.restoring"), ignore_errors=True
+                )
             raise
         for step, path in restored.items():
             self.staged_adapters[step] = path
             self.lifecycle.mark_staged(step)
 
-    def _bundle_staged_adapters(self, checkpoint_dir: str) -> None:
-        """copy every unpublished staged required adapter into this native resume checkpoint."""
-        bundle_root = os.path.join(checkpoint_dir, _REQUIRED_ADAPTER_BUNDLE_DIR)
-        shutil.rmtree(bundle_root, ignore_errors=True)
-        unpublished = {
-            step: path
-            for step, path in self.staged_adapters.items()
-            if step in self.required_steps and step not in self.lifecycle.deployable_published_steps
-        }
-        if not unpublished:
-            return
-        os.makedirs(bundle_root, exist_ok=True)
-        for step in sorted(unpublished):
-            source = unpublished[step]
-            _validate_internal_adapter_dir(source, label=f"step-{step}")
-            shutil.copytree(source, os.path.join(bundle_root, f"step-{step}"))
-
     def start(self) -> None:
         self._thread.start()
 
     def stop(self) -> None:
-        # idempotent: the clean path stops the drain early to surface a missing required save, and
-        # the finally block stops it again on every path.
         self._stop.set()
-        # bounded by lack of progress, not wall clock: the uploads run on this thread, so a big
-        # model's full-state drain can legitimately outlast any constant deadline (VERL-131).
         join_while_draining(self._thread, "verl resume uploader")
 
     def raise_if_incomplete(self) -> None:
-        """fail the run when a required save never became durable.
-
-        called only after training finished cleanly: on a crash or cancel the missing steps are a
-        symptom of the real failure, and raising here would mask it.
-        """
+        """fail clean completion when required durability or uploader work failed."""
         if isinstance(self._error, (MergeDiskHeadroomError, MergeDiskExhaustedError)):
             raise self._error
         if self._error is not None:
@@ -233,28 +311,21 @@ class _VerlResumeUploader:
             raise RuntimeError(f"required saves were not durably published: {missing}")
 
     def allow_deployable_publication(self) -> None:
-        """open required-save publication after terminal metric validation succeeds."""
         self._publication_latch.set()
 
     def _deployable_allowed(self) -> bool:
-        """return whether terminal validation permits deployable publication."""
         return self._publication_latch.is_set()
 
     def _completed_step(self) -> int:
         return completed_checkpoint_step(self.local_dir)
 
     def _pending(self) -> list[tuple[int, str]]:
-        """the completed checkpoint dirs this uploader has not handled yet, oldest first."""
         return undiscovered_checkpoint_dirs(
             self.local_dir, self._completed_step(), self.lifecycle.discovered_steps
         )
 
     def _stage_deployable(self, step: int, checkpoint_dir: str) -> str:
-        """stage a required checkpoint as a servable adapter under ``export_root``.
-
-        stage before the terminal latch opens because verl may prune ``checkpoint_dir`` while it is
-        closed. ``export_root`` outlives verl retention; only later publication makes it servable.
-        """
+        """export a required step outside verl retention while publication remains closed."""
         actor_dir = os.path.join(checkpoint_dir, "actor")
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
         shutil.rmtree(adapter_dir, ignore_errors=True)
@@ -262,8 +333,6 @@ class _VerlResumeUploader:
         _rl_train().export_peft_adapter(
             actor_dir, adapter_dir, base_model_id=self.model_id, python_bin=self.python_bin
         )
-        # the served adapter needs its preprocessor alongside it, exactly as the final publish does:
-        # the processor on a multimodal job (tokenizer + image preprocessor), else the tokenizer.
         self.preprocessor.save_pretrained(adapter_dir)
         _rl_train().stamp_adapter_dir_provenance(
             adapter_dir,
@@ -274,61 +343,110 @@ class _VerlResumeUploader:
         _w.write_base_model_provenance(adapter_dir, self.model_id, self.model_revision)
         return adapter_dir
 
+    def _make_required_adapter_durable(self, step: int, adapter_dir: str) -> None:
+        """upload one withheld adapter once under the non-serving singular namespace."""
+        if step in self._internally_durable_steps:
+            return
+        _validate_internal_adapter_dir(adapter_dir, label=f"step-{step}")
+        uploaded = _w.hf_upload_folder(
+            adapter_dir,
+            f"checkpoint/{_HF_REQUIRED_ADAPTER_ROOT}/step-{step}/adapter",
+            required=True,
+        )
+        if not uploaded:
+            raise RuntimeError(f"required internal adapter upload returned false at step {step}")
+        self._internally_durable_steps.add(step)
+
     def _publish_staged(self, step: int, adapter_dir: str) -> None:
-        """make an already-staged adapter durable and servable."""
         _w.publish_deployable_checkpoint(adapter_dir, step, required=True, _provenance_ready=True)
         self.lifecycle.mark_deployable_published(step)
 
     def _publish_ready(self) -> None:
-        """publish permitted staged steps oldest first.
-
-        staged exports remain publishable after verl prunes their checkpoints. read the gate once so
-        evidence appearing during export applies on the same pass.
-        """
         if not self._deployable_allowed():
             return
         published = self.lifecycle.deployable_published_steps
         for step in sorted(self.staged_adapters):
-            if step not in published:
+            if step in self._internally_durable_steps and step not in published:
                 self._publish_staged(step, self.staged_adapters[step])
 
+    def _required_debt(self, checkpoint_step: int) -> list[int]:
+        published = self.lifecycle.deployable_published_steps
+        return sorted(
+            step
+            for step in self.required_steps
+            if step <= checkpoint_step
+            and step not in published
+            and step not in self._internally_durable_steps
+        )
+
+    def _manifest_required_steps(self, checkpoint_step: int) -> tuple[int, ...]:
+        published = self.lifecycle.deployable_published_steps
+        return tuple(
+            step
+            for step in sorted(self._internally_durable_steps)
+            if step <= checkpoint_step and step not in published
+        )
+
     def _run(self) -> None:
-        # a failed resume upload must not fail the run: the policy is still trained and published at
-        # the end, and the only loss is having to restart from an earlier step after a preemption.
-        # a failed REQUIRED save is different -- the customer asked for a deployable at that step, so
-        # it propagates and raise_if_incomplete() turns it into a run failure.
         try:
             while True:
-                # sampled before the sweep so a stop() arriving mid-sweep still gets one full pass
-                # over the checkpoints it made visible. verl advances
-                # latest_checkpointed_iteration.txt right up to the moment the child exits, so the
-                # newest resume checkpoint routinely appears in that window; exiting without
-                # sweeping it would drop durable work a preemption then has to redo.
                 stopping = self._stop.is_set()
+                deferred_for_evidence = False
+                if self._blocked_evidence_step is not None:
+                    evidence_ready, _positive = self.metric_evidence.checkpoint_manifest_evidence(
+                        self._blocked_evidence_step
+                    )
+                    if not evidence_ready:
+                        if stopping:
+                            return
+                        time.sleep(0.5)
+                        continue
+                    self._blocked_evidence_step = None
                 for step, path in self._pending():
-                    # stage while verl's checkpoint still exists; publication happens below, once
-                    # the gate opens. the two have different deadlines: the source expires with
-                    # verl's retention, while permission arrives after terminal metric validation,
-                    # so a step is staged on the sweep that finds it and published whenever it may be.
                     if (
                         step in self.required_steps
                         and step not in self.lifecycle.deployable_published_steps
                         and step not in self.staged_adapters
                     ):
-                        self.staged_adapters[step] = self._stage_deployable(step, path)
+                        adapter_dir = self._stage_deployable(step, path)
+                        self.staged_adapters[step] = adapter_dir
                         self.lifecycle.mark_staged(step)
-                        # published here, not once the sweep ends: staging a later step can raise,
-                        # and the resume upload below can be interrupted by a preemption. either
-                        # would leave an already-exported adapter local-only, so each step is made
-                        # durable as soon as it is both staged and permitted.
-                        self._publish_ready()
-                    # resume uploads are ungated internal retry state and may be the only checkpoints before
-                    # gradient evidence appears. mark attempts before upload so a permanent failure cannot
-                    # spin every 0.5s, preserving the existing non-fatal upload semantics.
-                    if step not in self._resume_attempted:
-                        self._resume_attempted.add(step)
                         try:
-                            self._bundle_staged_adapters(path)
+                            self._make_required_adapter_durable(step, adapter_dir)
+                        except Exception as error:
+                            print(
+                                f"[rl-verl] required adapter durability failed at step {step}: {error}",
+                                flush=True,
+                            )
+                        self._publish_ready()
+                    if step not in self._resume_attempted:
+                        evidence_ready, positive_step = (
+                            self.metric_evidence.checkpoint_manifest_evidence(step)
+                        )
+                        if not evidence_ready:
+                            self._blocked_evidence_step = step
+                            deferred_for_evidence = True
+                            break
+                        self._blocked_evidence_step = None
+                        debt = self._required_debt(step)
+                        if debt:
+                            if not self._reported_required_debt:
+                                print(
+                                    "[rl-verl] retaining the previous resume checkpoint because "
+                                    f"checkpoint {step} has undurable required saves {debt}",
+                                    flush=True,
+                                )
+                                self._reported_required_debt = True
+                            self.lifecycle.mark_discovered(step)
+                            continue
+                        self._resume_attempted.add(step)
+                        _write_resume_manifest(
+                            path,
+                            checkpoint_step=step,
+                            required_adapter_steps=self._manifest_required_steps(step),
+                            first_positive_grad_step=positive_step,
+                        )
+                        try:
                             _w.upload_resume_checkpoint(
                                 step,
                                 path,
@@ -342,14 +460,9 @@ class _VerlResumeUploader:
                                 flush=True,
                             )
                     self.lifecycle.mark_discovered(step)
-                # a step staged while the gate was shut is published by a later sweep, so this runs
-                # every pass and not only when something was staged. terminal validation opens the
-                # latch immediately before stop asks this thread for its final drain.
                 self._publish_ready()
-                # `stopping`, not a fresh read: the sweep above is the full pass over everything
-                # stop() had made visible, and only after running it may the loop exit. staged
-                # steps still awaiting the gate cannot hold the loop open -- with the gate shut they
-                # never clear, and waiting would hang stop(); raise_if_incomplete() reports them.
+                if stopping and deferred_for_evidence:
+                    return
                 if stopping and not self._pending():
                     return
                 time.sleep(0.5)
@@ -362,15 +475,9 @@ def _restore_verl_resume(
     *,
     world_size: int,
     expected_fsdp_generation: FsdpGeneration,
+    required_steps: tuple[int, ...] = (),
 ) -> int:
-    """stage this run's streamed resume checkpoint into local_dir; return the step it resumes at.
-
-    returns 0 when there is nothing to resume, which is the ordinary fresh-run path, and also when
-    ``world_size`` does not match the shards' writer (``stage_verl_resume`` explains why). ``prefer``
-    steers the fetch itself toward a lower checkpoint this attempt can load when a higher, later,
-    incompatible one also streamed -- without it, a repeated discard would starve the compatible one
-    every retry (the remote max-step pick never advances past the checkpoint this attempt rejects).
-    """
+    """stage this run's current-contract native checkpoint and its internal adapter store."""
     inspections: dict[str, FsdpCheckpointInspection] = {}
 
     def prefer(path: str) -> bool:
@@ -382,18 +489,58 @@ def _restore_verl_resume(
                 expected_fsdp_generation=expected_fsdp_generation,
             )
             inspections[path] = inspection
-        return inspection.loadable
+        if not inspection.loadable:
+            return False
+        step_text = os.path.basename(path).removeprefix("checkpoint-")
+        if not step_text.isdigit() or int(step_text) <= 0:
+            return False
+        try:
+            referenced, _positive = _read_resume_manifest(
+                path,
+                checkpoint_step=int(step_text),
+                required_steps=required_steps,
+            )
+            _internal_adapter_sources(path, referenced)
+        except RuntimeError:
+            return False
+        return True
 
     resume = _w.hf_resume_checkpoint(prefer=prefer)
     if not resume:
         return 0
+    inspection = inspections.get(resume)
+    if inspection is None:
+        inspection = inspect_resume_checkpoint(
+            resume,
+            world_size=world_size,
+            expected_fsdp_generation=expected_fsdp_generation,
+        )
+    if not inspection.loadable:
+        return stage_verl_resume(
+            resume,
+            local_dir,
+            job_label="GRPO",
+            world_size=world_size,
+            expected_fsdp_generation=expected_fsdp_generation,
+            inspection=inspection,
+        )
+    name = os.path.basename(resume)
+    if not name.startswith("checkpoint-") or not name[len("checkpoint-") :].isdigit():
+        raise RuntimeError(f"invalid GRPO resume checkpoint path {resume!r}")
+    step = int(name[len("checkpoint-") :])
+    referenced, _positive = _read_resume_manifest(
+        resume,
+        checkpoint_step=step,
+        required_steps=required_steps,
+    )
+    _stage_internal_adapters(resume, local_dir, referenced)
     return stage_verl_resume(
         resume,
         local_dir,
         job_label="GRPO",
         world_size=world_size,
         expected_fsdp_generation=expected_fsdp_generation,
-        inspection=inspections.get(resume),
+        inspection=inspection,
     )
 
 
@@ -403,31 +550,26 @@ def _check_grpo_had_a_gradient(
     grad_norms: dict[int, float],
     *,
     expected_steps: range | tuple[int, ...],
-    resumed: bool = False,
+    resume_step: int = 0,
+    prior_positive_step: int | None = None,
     already_complete: bool = False,
 ) -> None:
-    """raise unless the newly executed grpo steps include a positive gradient norm.
-
-    verl's finite actor/grad_norm is the direct evidence that the actor backward pass reached an
-    optimizer update. advantage bounds remain diagnostic because masking can exclude rows from their
-    reduction and collapse the logged spread even when the actor received a nonzero gradient.
-
-    a resumed worker may observe only a zero-gradient suffix of an already productive run, but every
-    step it newly executes must still carry complete valid gradient evidence.
-    """
-    if already_complete:
-        # no step ran, so there is no metric stream to judge and nothing the parse could have
-        # dropped. the restored policy's evidence lives in the worker that produced it.
-        return
-    if not reward_history:
+    """require complete current metrics and positive-gradient evidence across all attempts."""
+    resume_step = int(resume_step)
+    if prior_positive_step is not None and (
+        isinstance(prior_positive_step, bool)
+        or not isinstance(prior_positive_step, int)
+        or prior_positive_step <= 0
+        or prior_positive_step > resume_step
+    ):
+        raise RuntimeError("invalid prior GRPO positive-gradient evidence")
+    if not already_complete and not reward_history:
         raise RuntimeError(
             "verl reported no reward metrics for the whole run; the flash reward bridge was "
             "never consulted (wiring regression); refusing to publish a policy trained on "
             "default rewards"
         )
-    if not adv_spread_history:
-        # keep advantage format verification independent from the gradient verdict. both metrics are
-        # expected on each step line, but only grad_norm proves that an optimizer update had signal.
+    if not already_complete and not adv_spread_history:
         raise RuntimeError(
             "verl reported reward metrics but no advantage metrics for any step; "
             "critic/advantages/max and /min could not be parsed (metric-format regression)"
@@ -441,16 +583,20 @@ def _check_grpo_had_a_gradient(
             "GRPO gradient norms do not cover the executed optimizer steps: "
             f"missing={missing}, extra={extra}"
         )
-    if not actual:
-        raise RuntimeError("verl reported no actor/grad_norm evidence for newly executed steps")
     for step in actual:
         value = grad_norms[step]
         if not math.isfinite(value) or value < 0.0:
             raise RuntimeError(f"GRPO gradient norm for step {step} is not finite and nonnegative")
-    if resumed:
+    if already_complete:
+        if prior_positive_step is None:
+            raise RuntimeError(
+                "GRPO resume has no durable positive actor gradient evidence; refusing publication"
+            )
         return
-    if not any(value > 0.0 for value in grad_norms.values()):
+    if not actual:
+        raise RuntimeError("verl reported no actor/grad_norm evidence for newly executed steps")
+    if prior_positive_step is None and not any(value > 0.0 for value in grad_norms.values()):
         raise RuntimeError(
-            f"grpo reported zero actor gradient norm on all {len(grad_norms)} newly executed steps; "
-            "refusing to publish an adapter identical to its initialization"
+            f"grpo reported zero actor gradient norm on all {len(grad_norms)} newly executed steps "
+            "and no prior positive-gradient evidence; refusing to publish an unchanged adapter"
         )

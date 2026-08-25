@@ -399,7 +399,7 @@ def run_rl_train():
         )
         expected_steps, loggers = configured["expected_steps"], configured["loggers"]
         _w.heartbeat("rl_step", step=0, initial=True)
-        state = _StepMetricState()
+        state = _StepMetricState(resume_step=int(files["resume_step"]))
         resume_uploader = _start_resume_uploader(
             local_dir=files["local_dir"],
             resume_step=files["resume_step"],
@@ -407,6 +407,7 @@ def run_rl_train():
             workdir=files["workdir"],
             python_bin=python_bin,
             preprocessor=preprocessor,
+            metric_evidence=state,
         )
         env_for_verl = _build_rl_child_env(inp, files, loggers, reward_runtime.reward_url)
         metrics_last = state.metrics_last
