@@ -179,7 +179,7 @@ def test_create_run_rejects_missing_or_invalid_project_before_request(stub, proj
 def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None:
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "opd",
             "environment": {"id": "owner/project/env"},
@@ -1387,7 +1387,7 @@ def test_spec_payload_sends_an_omitted_gpu_count_as_omitted() -> None:
     auto-sized at all. Each authored form must still arrive as a hard pin.
     """
     base = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "environment": {"id": "owner/project/env"},

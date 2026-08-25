@@ -356,13 +356,30 @@ def test_tag_only_image_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cmd_serve_deploy(_args(image="ghcr.io/freesolo-co/freesolo-flash-serve:dev")) == 1
 
 
-def test_unknown_model_is_refused_before_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "retired_model",
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
+)
+def test_removed_model_is_refused_before_resolution(
+    monkeypatch: pytest.MonkeyPatch, retired_model: str
+) -> None:
     def _explode(**_kwargs):
         raise AssertionError("resolution ran for an unsupported model")
 
     monkeypatch.setattr("flash.serve.resolve.resolve_adapter", _explode)
 
-    assert cmd_serve_deploy(_args(model="Qwen/Qwen3.5-0.8B")) == 1
+    assert cmd_serve_deploy(_args(model=retired_model)) == 1
+
+
+def test_qwen38_customer_owned_deploy_is_refused_before_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _explode(**_kwargs):
+        raise AssertionError("resolution ran for a model without a customer-owned profile")
+
+    monkeypatch.setattr("flash.serve.resolve.resolve_adapter", _explode)
+
+    assert cmd_serve_deploy(_args(model="Qwen/Qwen3.8-27B")) == 1
 
 
 def test_runpod_provisioning_warns_that_the_pod_may_be_live_and_billing(
@@ -725,6 +742,48 @@ def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("flash.serve.resolve.resolve_adapter", _fake_resolve)
     monkeypatch.setattr("flash.serve.resolve.resolve_base_revision", _fake_base_revision)
+
+
+def _historical_identity(
+    monkeypatch: pytest.MonkeyPatch, args: argparse.Namespace, retired_model: str
+) -> str:
+    from dataclasses import replace
+
+    from flash.cli.commands.serve_identity import encode_deployment_identity
+    from flash.serve.app import AdapterExecutionInput, ExecutionInputs, build_serving_manifest
+    from flash.serve.control import DeploymentSpec
+    from flash.serve.provisioning import DeploymentBundle
+
+    _stub_resolution(monkeypatch)
+    current = serve_deploy._deployment_bundle(args)
+    engine = replace(current.spec.engine, served_model=retired_model, tokenizer_model=retired_model)
+    adapters = tuple(
+        replace(adapter, base_model=retired_model) for adapter in current.spec.adapters
+    )
+    spec = DeploymentSpec(
+        deployment_id=current.spec.deployment_id,
+        generation=current.spec.generation,
+        provider=current.spec.provider,
+        placement=current.spec.placement,
+        engine=engine,
+        adapters=adapters,
+    )
+    inputs = ExecutionInputs(
+        expected_oci_digest=current.manifest.expected_oci_digest,
+        engine_args=current.manifest.engine_args,
+        tokenizer_kwargs=current.manifest.tokenizer_kwargs,
+        processor_kwargs=current.manifest.processor_kwargs,
+        adapters=tuple(
+            AdapterExecutionInput(adapter_revision=entry.adapter_revision, files=entry.files)
+            for entry in current.manifest.adapters
+        ),
+    )
+    historical = DeploymentBundle(
+        spec=spec,
+        manifest=build_serving_manifest(spec, inputs),
+        image=current.image,
+    )
+    return encode_deployment_identity(historical)
 
 
 def test_self_hosting_docs_document_a_command_that_exists() -> None:

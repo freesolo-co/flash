@@ -17,6 +17,7 @@ from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.testclient import TestClient
 
 from flash.serving.src.adapter_routes import remove_adapter
+from flash.serving.src.context import ServingContext
 from flash.serving.src.router import AdapterRouter
 from flash.serving.src.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.schemas import AdapterRecord
@@ -36,8 +37,8 @@ def _serve(*args, **kwargs):
     return TestClient(build_serving_app(*args, **kwargs), headers={"Authorization": "Bearer t"})
 
 
-QWEN = "Qwen/Qwen3.5-0.8B"
-QWEN_2B = "Qwen/Qwen3.5-2B"
+QWEN = "Qwen/Qwen3.5-9B"
+QWEN_35B = "Qwen/Qwen3.6-35B-A3B"
 
 
 def _revision_id(run_id: str) -> str:
@@ -167,6 +168,7 @@ class FakePool:
                 "adapter_id": payload.adapter_id,
                 "text": f"[{base_model}] reply",
                 "finish_reason": "stop",
+                "prompt_token_ids": [4, 5],
                 "token_ids": [1, 2, 3],
                 "inference_time_seconds": 0.01,
                 "checkpoint": checkpoint,
@@ -215,12 +217,31 @@ class FakePool:
 
 @pytest.fixture
 def app_setup():
-    # 2 adapters on the 0.8B base (share one GPU), 1 on the 2B base (its own GPU).
-    revisions = [_rec("qa", QWEN), _rec("qb", QWEN), _rec("mc", QWEN_2B)]
+    # two adapters share the 9b engine, while one adapter uses the separate 35b engine.
+    revisions = [_rec("qa", QWEN), _rec("qb", QWEN), _rec("mc", QWEN_35B)]
     router = AdapterRouter([*revisions, *(_alias(revision) for revision in revisions)])
     pool = FakePool()
     client = _serve(pool, router, internal_key="sekret")
     return client, pool, router
+
+
+def test_unregister_safe_records_exact_gpu_cleanup_failure(capsys):
+    class _FailingPool:
+        async def unregister(self, base_model, adapter_id, expected_generation):
+            raise RuntimeError(
+                f"exact eviction failed for {base_model} {adapter_id} {expected_generation}"
+            )
+
+    context = object.__new__(ServingContext)
+    context.pool = _FailingPool()
+
+    asyncio.run(context.unregister_safe(QWEN, "active@final.sha", "generation-1"))
+
+    assert (
+        f"hosted adapter gpu cleanup failed for active@final.sha on {QWEN}: "
+        f"RuntimeError('exact eviction failed for {QWEN} active@final.sha generation-1')"
+        in capsys.readouterr().out
+    )
 
 
 def test_healthz_reports_one_gpu_per_base_model(app_setup):
@@ -233,12 +254,10 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
         "revision_provenance",
         "thinking_structured_outputs_deferred_v1",
     ]
-    assert body["base_models"] == [QWEN, QWEN_2B]  # sorted by model id
+    assert body["base_models"] == [QWEN, QWEN_35B]  # sorted by model id
     assert body["gpus"] == 2  # two configured supported base-model engines
-    # Per-model GPU tier (replaces the misleading single configuredGpu): both test models are small
-    # so they map to the cheap FP8-capable L4; gpu_tiers is the distinct set actually in use.
-    assert body["gpu_by_model"] == {QWEN: "L4", QWEN_2B: "L4"}
-    assert body["gpu_tiers"] == ["L4"]
+    assert body["gpu_by_model"] == {QWEN: "L40S", QWEN_35B: "H200"}
+    assert body["gpu_tiers"] == ["H200", "L40S"]
     assert "configuredGpu" not in body  # the single-GPU field is gone (per-model now)
     assert body["adapters"] == 6
 
@@ -330,8 +349,8 @@ def test_generate_routes_to_the_adapters_base_model(app_setup):
     client, pool, _ = app_setup
     assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 200
     assert client.post("/generate", json={"adapter_id": "mc", "prompt": "hi"}).status_code == 200
-    # qa -> 0.8B engine, mc -> 2B engine.
-    assert pool.generated == [(QWEN, _revision_id("qa")), (QWEN_2B, _revision_id("mc"))]
+    # each adapter dispatches to its own active base-model engine.
+    assert pool.generated == [(QWEN, _revision_id("qa")), (QWEN_35B, _revision_id("mc"))]
 
 
 def test_chat_template_kwargs_forwarded_on_generate(app_setup):
@@ -601,17 +620,22 @@ def test_many_adapters_share_one_base_model_engine(app_setup):
     }
 
 
-def test_generate_endpoint_returns_snake_case_body(app_setup):
-    """The client-facing /generate response is snake_case end-to-end: the engine RPC dict is now
-    snake_case (see modal_app.py::_generate) and the router returns it verbatim, so no camelCase
-    key can reach the caller."""
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/generate", {"adapter_id": "qa", "prompt": "hi"}),
+        ("/adapters/qa/generate", {"prompt": "hi"}),
+    ],
+)
+def test_raw_generate_responses_exclude_internal_fields(app_setup, path, payload):
     client, _, _ = app_setup
-    body = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).json()
+    body = client.post(path, json=payload).json()
     assert body["adapter_id"] == "qa"
     assert body["finish_reason"] == "stop"
     assert body["token_ids"] == [1, 2, 3]
     assert body["text"] == f"[{QWEN}] reply"
-    # None of the old camelCase spellings survive anywhere in the response.
+    assert "prompt_token_ids" not in body
+    # none of the old camelcase spellings survive anywhere in the response.
     for camel in ("adapterId", "finishReason", "tokenIds", "inferenceTimeSeconds", "requestId"):
         assert camel not in body
 
@@ -626,8 +650,8 @@ def test_openai_chat_completions_routes_and_shapes(app_setup):
     body = resp.json()
     assert body["object"] == "chat.completion"
     assert body["model"] == "mc"
-    assert body["choices"][0]["message"]["content"] == f"[{QWEN_2B}] reply"
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert body["choices"][0]["message"]["content"] == f"[{QWEN_35B}] reply"
+    assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
 
 
 def test_external_openai_chat_forwards_system_prompts(app_setup):
@@ -642,7 +666,7 @@ def test_external_openai_chat_forwards_system_prompts(app_setup):
     )
 
     assert resp.status_code == 200, resp.text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
     assert pool.messages[-1] == messages
 
 
@@ -661,7 +685,7 @@ def test_internal_openai_chat_can_send_system_prompts(app_setup):
     )
 
     assert resp.status_code == 200, resp.text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
 
 
 def test_external_generate_forwards_system_prompts(app_setup):
@@ -697,11 +721,11 @@ def test_openai_chat_completions_streams_sse_chunks(app_setup):
 
     assert '"delta":{"role":"assistant"}' in text
     assert '"delta":{"content":"[' in text
-    assert f"{QWEN_2B}] " in text
+    assert f"{QWEN_35B}] " in text
     assert '"delta":{"content":"reply"}' in text
     assert '"finish_reason":"stop"' in text
     assert "data: [DONE]" in text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
 
 
 def test_openai_chat_completions_stream_can_include_usage(app_setup):
@@ -720,7 +744,7 @@ def test_openai_chat_completions_stream_can_include_usage(app_setup):
         text = resp.read().decode("utf-8")
 
     assert '"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}' in text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
 
 
 def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):

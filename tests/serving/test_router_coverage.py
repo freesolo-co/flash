@@ -30,7 +30,7 @@ from flash.serving.src.router import (
 from flash.serving.src.schemas import AdapterRecord
 from flash.serving.src.structured_outputs import StructuredOutputsError
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 
 
 async def _allow(_token: str, _adapter_id: str) -> str:

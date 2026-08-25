@@ -13,7 +13,7 @@ import pytest
 
 from flash.content import multimodal as mm
 
-MODEL_ID = "Qwen/Qwen3.5-4B"
+MODEL_ID = "Qwen/Qwen3.5-9B"
 MODEL_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 _IMAGE_CASES = [
     ((56, 56), "red", 64),

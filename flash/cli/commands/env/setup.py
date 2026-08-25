@@ -692,7 +692,7 @@ def _write_rl_config(
     """write the rl config-file phase."""
     if not rl.exists():
         rl.write_text(
-            'model = "Qwen/Qwen3.5-4B"\n'
+            'model = "Qwen/Qwen3.5-9B"\n'
             f"{project_line}"
             'algorithm = "grpo"\n'
             f"{thinking_line}"
@@ -724,7 +724,7 @@ def _write_sft_config(
     """write the sft config-file phase."""
     if not sft.exists():
         sft.write_text(
-            'model = "Qwen/Qwen3.5-4B"\n'
+            'model = "Qwen/Qwen3.5-9B"\n'
             f"{project_line}"
             'algorithm = "sft"\n'
             f"{thinking_line}"
@@ -780,7 +780,7 @@ def _write_opd_config(
         )
         opd.write_text(
             f"{opd_multiturn_note}"
-            'model = "Qwen/Qwen3.5-4B"\n'
+            'model = "Qwen/Qwen3.5-9B"\n'
             f"{project_line}"
             'algorithm = "opd"   # on-policy distillation from a managed parasail teacher (default glm 5.2)\n'
             f"{thinking_line}"

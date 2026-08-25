@@ -15,7 +15,7 @@ from flash.engine.profiling.workload_profile import (
 
 def _spec() -> JobSpec:
     return JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         model_revision="a" * 40,
         model_revision_auto=True,
         algorithm="sft",

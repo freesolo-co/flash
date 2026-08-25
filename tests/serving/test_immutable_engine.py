@@ -15,7 +15,7 @@ from flash.serving.src.lora_engine import _LoraEngineImpl, _LoraEntry
 from flash.serving.src.registry import AdapterRegistry
 from flash.serving.src.schemas import AdapterRecord
 
-BASE_MODEL = "Qwen/Qwen3.5-0.8B"
+BASE_MODEL = "Qwen/Qwen3.5-9B"
 RUN_ID = "flash-1234567890-abcdef12"
 
 

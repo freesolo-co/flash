@@ -227,11 +227,11 @@ def test_vast_competes_purely_on_price(monkeypatch):
     # Vast is the cheapest fitting offer -> Vast is selected.
     _stub_candidates(
         monkeypatch,
-        runpod=[("runpod", "RTX 4090", 0.69, 24)],
-        lambda_=[("lambda", "A10", 0.60, 24)],
-        vast=[("vast", "RTX 4090", 0.47, 24)],
+        runpod=[("runpod", "RTX 4090", 0.69, 48)],
+        lambda_=[("lambda", "A10", 0.60, 48)],
+        vast=[("vast", "RTX 4090", 0.47, 48)],
     )
-    a = allocate("Qwen/Qwen3.5-0.8B", "sft")
+    a = allocate("Qwen/Qwen3.5-9B", "sft")
     assert a.provider == "vast"
     assert a.hourly_usd == pytest.approx(0.47)
 
@@ -241,11 +241,11 @@ def test_vast_competes_purely_on_price(monkeypatch):
     # long enough on it to more than erase the $0.09/hr saving.
     _stub_candidates(
         monkeypatch,
-        runpod=[("runpod", "RTX 4090", 0.69, 24)],
-        lambda_=[("lambda", "A10", 0.60, 24)],
-        vast=[("vast", "RTX 4090", 0.80, 24)],
+        runpod=[("runpod", "RTX 4090", 0.69, 48)],
+        lambda_=[("lambda", "A10", 0.60, 48)],
+        vast=[("vast", "RTX 4090", 0.80, 48)],
     )
-    b = allocate("Qwen/Qwen3.5-0.8B", "sft")
+    b = allocate("Qwen/Qwen3.5-9B", "sft")
     assert b.provider == "runpod"
     assert b.hourly_usd == pytest.approx(0.69)
 
@@ -257,19 +257,19 @@ def test_gpu_name_breaks_price_vram_tie_before_provider_order(monkeypatch):
     # identical price and VRAM; Vast's class name sorts before RunPod's, so Vast wins the tie.
     _stub_candidates(
         monkeypatch,
-        runpod=[("runpod", "RTX 4090", 0.50, 24)],
-        vast=[("vast", "A100", 0.50, 24)],
+        runpod=[("runpod", "RTX 4090", 0.50, 48)],
+        vast=[("vast", "A100", 0.50, 48)],
     )
-    assert allocate("Qwen/Qwen3.5-0.8B", "sft").provider == "vast"  # "A100" < "RTX 4090"
+    assert allocate("Qwen/Qwen3.5-9B", "sft").provider == "vast"  # "A100" < "RTX 4090"
 
     # flip which provider owns the name that sorts first, and the other provider wins. when all key
     # fields match, Python's stable sort preserves registry and provider-local order instead.
     _stub_candidates(
         monkeypatch,
-        runpod=[("runpod", "A100", 0.50, 24)],
-        vast=[("vast", "RTX 4090", 0.50, 24)],
+        runpod=[("runpod", "A100", 0.50, 48)],
+        vast=[("vast", "RTX 4090", 0.50, 48)],
     )
-    assert allocate("Qwen/Qwen3.5-0.8B", "sft").provider == "runpod"  # "A100" < "RTX 4090"
+    assert allocate("Qwen/Qwen3.5-9B", "sft").provider == "runpod"  # "A100" < "RTX 4090"
 
 
 def test_allocation_summary_formats_runpod_choice():

@@ -87,6 +87,8 @@ def test_hosted_deploy_docs_and_workflows_point_at_paths_that_exist() -> None:
     # both documented deploys must name the app by its repo-root-relative path.
     assert readme.count("modal deploy flash/serving/modal_app.py") == 1
     assert readme.count("modal deploy --env dev flash/serving/modal_app.py") == 1
+    assert readme.count('export FREESOLO_DEPLOYMENT_ID="manual-production-') == 1
+    assert readme.count('export FREESOLO_DEPLOYMENT_ID="manual-development-') == 1
 
     for workflow in DEPLOY_WORKFLOWS:
         path = ROOT / ".github" / "workflows" / workflow

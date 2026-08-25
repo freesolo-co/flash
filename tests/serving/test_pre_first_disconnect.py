@@ -22,7 +22,7 @@ from flash.serving.src.usage import (
 from flash.serving.src.usage_outbox import RequestIdentity
 from tests.serving.conftest import RecordingUsageStore
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 
 
 def _record() -> AdapterRecord:

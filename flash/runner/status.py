@@ -18,6 +18,7 @@ import os
 import time
 
 import flash.runner as runner
+from flash.core.catalog import validate_model_for_algorithm
 from flash.core.spec import JobSpec
 from flash.core.spec_persistence import validate_persisted_spec_envelope
 from flash.runner import RunStatus
@@ -83,6 +84,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             + ", ".join(leaked_revision_keys)
         )
     public_spec = JobSpec.from_dict(status.spec)
+    validate_model_for_algorithm(public_spec.model, public_spec.algorithm)
     snapshot = status.effective_preparation
     if not isinstance(snapshot, dict):
         if public_spec.train.init_from_adapter:
@@ -95,6 +97,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     if not isinstance(raw_worker, dict):
         raise ValueError("persisted effective preparation is malformed")
     worker_spec = JobSpec.from_dict(raw_worker)
+    validate_model_for_algorithm(worker_spec.model, worker_spec.algorithm)
     runner._validate_effective_spec(public_spec, worker_spec)
     expected = snapshot.get("adapter_identity")
     stored_digest = snapshot.get("preparation_digest")

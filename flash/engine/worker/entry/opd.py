@@ -99,47 +99,49 @@ def _resolve_opd_knobs() -> OpdKnobs:
 
 
 def _thinking_prefill_text(tok) -> str:
-    """The trailing text a thinking-mode chat template opens after the generation prompt (Qwen's
-    ``<think>\\n``), i.e. the delta between the enable_thinking=True and =False renders. Returns "" when
-    thinking is off or the template ignores enable_thinking (the two renders match), so callers can
-    unconditionally append it to the teacher prompt for student/teacher conditioning parity."""
+    """return the exact terminal Qwen reasoning opener, or fail closed."""
     if not _w.THINKING:
         return ""
+    expected = "<think>\n"
     probe = [{"role": "user", "content": ""}]
     with contextlib.suppress(Exception):
+        from flash.content.thinking import messages_for_chat_template
+
+        probe = messages_for_chat_template(probe)
         base = tok.apply_chat_template(
-            probe, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            probe,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+            preserve_thinking=False,
         )
         think = tok.apply_chat_template(
-            probe, tokenize=False, add_generation_prompt=True, enable_thinking=True
+            probe,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True,
+            preserve_thinking=False,
         )
-        if think == base:
-            return ""  # template ignores enable_thinking -> plain "Assistant: " already matches
-        # The thinking render opens a reasoning block the non-thinking render doesn't, but it is NOT
-        # always a pure suffix (the old think.startswith(base) test). Compute the longest common PREFIX
-        # and SUFFIX of the two renders; the thinking render's UNIQUE MIDDLE is the opener.
-        p = 0
-        m = min(len(base), len(think))
-        while p < m and base[p] == think[p]:
-            p += 1
-        s = 0
-        while s < len(base) - p and s < len(think) - p and base[-1 - s] == think[-1 - s]:
-            s += 1
-        think_mid = think[p : len(think) - s]
-        base_mid = base[p : len(base) - s]
-        # recover the open thinking block before the `think_mid` return. non-thinking rendering may
-        # close the shared `<think>` prefix, leaving whitespace in `think_mid`; strip whitespace for
-        # detection but return the exact thinking-side opener.
-        base_mid_tag = base_mid.lstrip()
-        if base_mid_tag.startswith("</") and ">" in base_mid_tag:
-            open_tag = (
-                "<" + base_mid_tag[2 : base_mid_tag.index(">") + 1]
-            )  # "</think>..." -> "<think>"
-            cut = think.rfind(open_tag, 0, p)
-            if cut != -1:
-                return think[cut:]  # e.g. "<think>\n"
-        if think_mid:
-            return think_mid  # opener appended, or inserted before shared trailing template text
+        if think == base or not think.endswith(expected):
+            return ""
+
+        think_prefix = think[: -len(expected)]
+        base_prefix = base
+        trimmed_base = base.rstrip()
+        if trimmed_base.endswith("</think>"):
+            close_start = len(trimmed_base) - len("</think>")
+            open_start = trimmed_base.rfind("<think>", 0, close_start)
+            if open_start < 0 or trimmed_base[open_start + len("<think>") : close_start].strip():
+                return ""
+            base_prefix = trimmed_base[:open_start]
+
+        suffix_len = 0
+        for left, right in zip(reversed(base_prefix), reversed(think_prefix), strict=False):
+            if left != right:
+                break
+            suffix_len += 1
+        if suffix_len and base_prefix[-suffix_len:].strip():
+            return expected
     return ""
 
 

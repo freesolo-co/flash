@@ -36,6 +36,9 @@ def _install_vllm_stub() -> None:
     @dataclasses.dataclass
     class AsyncEngineArgs:
         model: str | None = None
+        revision: str | None = None
+        tokenizer: str | None = None
+        tokenizer_revision: str | None = None
         trust_remote_code: bool = False
         dtype: str = "auto"
         quantization: str | None = None

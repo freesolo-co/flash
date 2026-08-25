@@ -117,6 +117,7 @@ def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> J
         "cached_tokens_reported",
         "engine_replica_id",
         "lora_request_adapter",
+        "prompt_token_ids",
     }
     public_result = {key: value for key, value in result.items() if key not in internal_fields}
     body = {**public_result, "freesolo": provenance} if provenance is not None else public_result

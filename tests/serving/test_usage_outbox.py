@@ -39,7 +39,7 @@ from flash.serving.src.usage_outbox import (
 )
 from tests.serving.conftest import attest
 
-BASE_MODEL = "Qwen/Qwen3.5-0.8B"
+BASE_MODEL = "Qwen/Qwen3.5-9B"
 
 
 def _revision() -> AdapterRecord:
@@ -633,6 +633,69 @@ def test_capture_uses_deployment_owner_process_epoch_and_server_timing() -> None
     assert payload["p_generation_owner_epoch"]
     assert outbox._heartbeat_seconds == 20
     assert event.identity.request_id in outbox._active_generations
+
+
+def test_slow_capture_starts_full_heartbeat_lease_after_rpc_success() -> None:
+    event = _usage_event()
+    now = [datetime(2026, 8, 24, 12, 0, tzinfo=UTC)]
+    sleeps: list[float] = []
+
+    async def delayed_capture() -> tuple[int, Any]:
+        now[0] += timedelta(seconds=119)
+        return (
+            200,
+            [
+                {
+                    "state": "in_progress",
+                    "lease_seconds": 120,
+                    "heartbeat_seconds": 20,
+                }
+            ],
+        )
+
+    async def advance_clock(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    client = _QueuedClient(
+        [
+            delayed_capture,
+            httpx.ConnectError("transient heartbeat failure"),
+            httpx.ConnectError("transient heartbeat failure"),
+            (503, {"error": "temporarily unavailable"}),
+            (
+                200,
+                [
+                    {
+                        "request_id": event.identity.request_id,
+                        "generation_lease_expires_at": "2026-08-24T12:04:00Z",
+                    }
+                ],
+            ),
+            (200, [{"state": "pending", "replay": False}]),
+        ]
+    )
+    outbox = DurableUsageOutbox(
+        _outbox_settings(),
+        client=client,
+        worker_id="worker-1",
+        sleep=advance_clock,
+        clock=lambda: now[0],
+    )
+
+    async def run() -> None:
+        await outbox.capture(event)
+        assert outbox._generation_lease_deadlines[event.identity.request_id] == datetime(
+            2026, 8, 24, 12, 3, 59, tzinfo=UTC
+        )
+        await outbox._heartbeat_active_generations_with_retry()
+        await outbox.finalize(event)
+
+    asyncio.run(run())
+
+    assert sleeps == [0.05, 20.0, 20.0]
+    assert client.calls[-1][0].endswith("/rpc/finalize_serving_usage")
+    assert outbox._background_error is None
 
 
 def test_finalize_uses_exact_owner_epoch_and_stops_heartbeating() -> None:
@@ -1454,6 +1517,68 @@ def test_pre_response_disconnect_persists_ready_snapshot_and_closes_iterator() -
     assert session.failed[-1][0]["type"] == "ready"
     assert session.failed[-1][1] == "client_disconnected"
     assert session.finalized == []
+
+
+def test_full_stream_queue_disconnect_does_not_block_cleanup_sentinel() -> None:
+    session = _StreamSession()
+    generation_id = new_generation_id()
+    record = _revision()
+    fourth_delta_requested = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def events():
+        try:
+            yield {
+                "type": "ready",
+                "prompt_tokens": 2,
+                "completion_tokens": 0,
+                "prompt_token_ids": [1, 2],
+                "completion_token_ids": [],
+                "reasoning_tokens": 0,
+                "thinking": False,
+                "request_id": generation_id,
+            }
+            for index in range(4):
+                if index == 3:
+                    fourth_delta_requested.set()
+                yield {
+                    "type": "delta",
+                    "text": str(index),
+                    "prompt_tokens": 2,
+                    "completion_tokens": index + 1,
+                    "prompt_token_ids": [1, 2],
+                    "completion_token_ids": list(range(index + 1)),
+                    "reasoning_tokens": 0,
+                    "thinking": False,
+                    "request_id": generation_id,
+                }
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    async def run() -> bytes:
+        stream = openai_chat_stream(
+            AdapterRouter([record]),
+            record=record,
+            events=events(),
+            adapter_id=record.adapter_id,
+            completion_id="chatcmpl-stream",
+            created=123,
+            include_usage=True,
+            usage_session=session,  # type: ignore[arg-type]
+        )
+        role = await anext(stream)
+        await asyncio.wait_for(fourth_delta_requested.wait(), timeout=1)
+        await asyncio.wait_for(stream.aclose(), timeout=1)
+        return role
+
+    role = asyncio.run(run())
+
+    assert b'"role":"assistant"' in role
+    assert closed.is_set()
+    assert session.finalized == []
+    assert len(session.failed) == 1
+    assert session.failed[0][1] == "client_disconnected"
 
 
 def test_stream_disconnect_persists_latest_cumulative_snapshot() -> None:

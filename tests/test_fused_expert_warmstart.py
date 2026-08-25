@@ -892,8 +892,7 @@ def test_multimodal_export_accepts_a_suffix_shared_across_both_stacks(tmp_path):
     read that as corruption and failed a HEALTHY image export at publish time, after the paid run
     had already finished -- worse than the load-time failure the check exists to prevent.
 
-    widths are the real ones from tests/fixtures/qwen35_08b_target_metadata.json: text hidden 1024
-    / intermediate 3584, vision hidden 768 / intermediate 3072.
+    the synthetic widths deliberately differ between the text and vision stacks.
     """
     from flash.engine.worker.verl.checkpoints import stamp_adapter_dir_provenance
 

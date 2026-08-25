@@ -220,6 +220,7 @@ def test_lora_engine_builds_tokenized_chat_prompt(modal_app_module):
                 "add_generation_prompt": True,
                 "return_dict": False,
                 "enable_thinking": True,
+                "preserve_thinking": False,
             }
             return [1, 2, 3]
 
@@ -313,6 +314,7 @@ def test_lora_engine_filters_reserved_chat_template_kwargs(modal_app_module):
         "add_generation_prompt": True,
         "return_dict": False,
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
 
 
@@ -414,6 +416,7 @@ def test_lora_engine_drops_return_shape_chat_template_kwargs(modal_app_module):
         "add_generation_prompt": True,
         "return_dict": False,
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
 
     # A non-dict chat_template_kwargs is ignored entirely (no crash). enable_thinking still comes
@@ -426,6 +429,7 @@ def test_lora_engine_drops_return_shape_chat_template_kwargs(modal_app_module):
         "add_generation_prompt": True,
         "return_dict": False,
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
 
 
@@ -465,7 +469,7 @@ def test_lora_engine_cache_key_ignores_reserved_chat_template_kwargs(modal_app_m
 
 def test_lora_engine_health_reports_served_model_and_baked_config(modal_app_module, monkeypatch):
     engine = object.__new__(modal_app_module._LoraEngineImpl)
-    engine.base_model = "Qwen/Qwen3.5-2B"
+    engine.base_model = "Qwen/Qwen3.5-9B"
     engine._prompt_cache_size = 2048
 
     class _Registry:
@@ -488,19 +492,20 @@ def test_lora_engine_health_reports_served_model_and_baked_config(modal_app_modu
     engine._prompt_token_cache = OrderedDict([(("prompt", "cached"), (1, 2, 3))])
     monkeypatch.setitem(sys.modules, "torch", _Torch())
 
-    # Health reports the served PRE-QUANTIZED checkpoint (owned FP8 for 2B) + baked-in config.
+    # health reports the served pre-quantized checkpoint and baked-in 9b config.
     assert engine._health() == {
         "ok": True,
         # No engine built on this bare instance -> not dead -> ok stays True.
         "engine_dead": False,
-        "base_model": "Qwen/Qwen3.5-2B",
-        "served_model": "Freesolo-Co/Qwen3.5-2B-FP8",
+        "base_model": "Qwen/Qwen3.5-9B",
+        "served_model": "Freesolo-Co/Qwen3.5-9B-FP8",
+        "immutable_identity": None,
         # A pre-quant FP8 checkpoint carries fp8 weights (auto-detected) + the global fp8 KV cache.
         "quantization": "fp8",
         "kv_cache_dtype": "fp8",
         "adapters": 2,
-        # configured_gpu now reflects the per-model GPU tier (2B -> L4), not a single global.
-        "configured_gpu": modal_app_module.gpu_for("Qwen/Qwen3.5-2B"),
+        # configured_gpu reflects the active model's per-model gpu tier.
+        "configured_gpu": modal_app_module.gpu_for("Qwen/Qwen3.5-9B"),
         "cuda_available": True,
         "device_name": "NVIDIA H100",
         "enable_prefix_caching": True,
@@ -602,10 +607,10 @@ def test_load_adapters_for_base_filters_records(modal_app_module, monkeypatch):
             self.status = "ready"
             self.is_revision = True
 
-    records = [_Record("Qwen/Qwen3.5-4B"), _Record("Qwen/Qwen3.5-0.8B")]
+    records = [_Record("Qwen/Qwen3.8-27B"), _Record("Qwen/Qwen3.5-9B")]
     monkeypatch.setattr("flash.serving.src.persistence.load_adapters", lambda settings: records)
 
-    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-0.8B") == [records[1]]
+    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-9B") == [records[1]]
 
 
 def test_load_adapters_for_base_skips_hydration_failures(modal_app_module, monkeypatch, capsys):
@@ -614,7 +619,7 @@ def test_load_adapters_for_base_skips_hydration_failures(modal_app_module, monke
 
     monkeypatch.setattr("flash.serving.src.persistence.load_adapters", _boom)
 
-    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-0.8B") == []
+    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-9B") == []
     assert "adapter hydration skipped" in capsys.readouterr().out
 
 
@@ -625,7 +630,7 @@ def test_adapter_source_cache_dir_ignores_adapter_id(modal_app_module):
         {
             "adapter_id": "a",
             "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "subfolder": "sft/run/seed0/adapter",
             "repo_type": "dataset",
             "thinking": True,
@@ -686,7 +691,7 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
         {
             "adapter_id": "a",
             "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "subfolder": "sft/run/seed0/adapter",
             "repo_type": "dataset",
             "thinking": True,
@@ -736,7 +741,7 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
         {
             "adapter_id": "a",
             "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "subfolder": "sft/run/seed0/adapter",
             "repo_type": "dataset",
             "thinking": True,
@@ -785,7 +790,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
         {
             "adapter_id": "a",
             "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "subfolder": "sft/run/seed0/adapter",
             "repo_type": "dataset",
             "thinking": True,
@@ -836,7 +841,7 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
         {
             "adapter_id": "cached",
             "repo_id": "org/cached",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "subfolder": "sft/cached/seed0/adapter",
             "repo_type": "dataset",
             "thinking": True,
@@ -896,7 +901,7 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
             {
                 "adapter_id": adapter_id,
                 "repo_id": repo,
-                "base_model": "Qwen/Qwen3.5-0.8B",
+                "base_model": "Qwen/Qwen3.5-9B",
                 "thinking": True,
             }
         )

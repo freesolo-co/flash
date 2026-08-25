@@ -141,6 +141,16 @@ class _StreamOutput:
         await self.emit(chunk, ignore_disconnect=ignore_disconnect)
         await self.emit(_sse("[DONE]"), ignore_disconnect=ignore_disconnect)
 
+    async def finish(self) -> None:
+        if self._disconnected.is_set():
+            if not self._terminal_sent:
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    while True:
+                        self._output.get_nowait()
+            self._output.put_nowait((None, None))
+            return
+        await self._output.put((None, None))
+
 
 async def _close_stream_sources(
     disconnect_wait: asyncio.Task[bool],
@@ -156,7 +166,7 @@ async def _close_stream_sources(
             await _close_async_iterator(source)
         except BaseException as exc:
             close_error = close_error or exc
-    await stream_output.emit(ignore_disconnect=True)
+    await stream_output.finish()
     if close_error is not None:
         raise close_error
 

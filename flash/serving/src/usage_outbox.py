@@ -431,8 +431,8 @@ class DurableUsageOutbox:
 
     async def capture(self, event: UsageEvent) -> None:
         self._raise_background_error()
-        lease_started_at = self._clock()
         result = await self._generation_rpc("capture_serving_usage", event)
+        lease_started_at = self._clock()
         timing = _generation_capture_result(result)
         self._set_generation_timing(timing["heartbeat_seconds"], timing["lease_seconds"])
         if timing["state"] == "in_progress":

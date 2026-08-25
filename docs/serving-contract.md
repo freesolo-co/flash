@@ -5,7 +5,8 @@ client, shared runtime, and customer-owned provider deployment. Freesolo's hoste
 (`flash/serving/`) is another implementation of this contract.
 A deployment serves one base model and its LoRA adapters. Use `flash serve deploy` to provision one
 in your own Modal or RunPod account, or implement these endpoints and run the conformance suite
-below.
+below. The maintained customer-owned profile supports only `Qwen/Qwen3.5-9B`; Qwen3.6 27B is
+retired and Qwen3.8 27B is available only through the separately managed hosted-serving catalog.
 
 ## Identity model
 
@@ -47,7 +48,7 @@ A custom dynamic-registration backend may intentionally be keyless; advertise th
 ```json
 {
   "ok": true,
-  "base_models": ["Qwen/Qwen3.5-4B"],
+  "base_models": ["Qwen/Qwen3.5-9B"],
   "requires_key": true,
   "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"]
 }
@@ -72,7 +73,7 @@ A custom dynamic-registration backend may intentionally be keyless; advertise th
   "repo_id": "acme/artifacts",
   "repo_type": "dataset",
   "subfolder": "sft/run-abc/adapter",
-  "base_model": "Qwen/Qwen3.5-4B",
+  "base_model": "Qwen/Qwen3.5-9B",
   "checkpoint": "run-abc/step-10",
   "org_id": "org-id",
   "thinking": false,
@@ -182,7 +183,7 @@ uv run pytest tests/serving_conformance \
   --serving-url "$FREESOLO_SERVING_URL" \
   --conformance-repo acme/artifacts \
   --conformance-subfolder sft/run-abc/adapter \
-  --conformance-base-model Qwen/Qwen3.5-4B \
+  --conformance-base-model Qwen/Qwen3.5-9B \
   --conformance-hf-revision 8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f
 ```
 

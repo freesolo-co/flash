@@ -23,7 +23,7 @@ from flash.serving.src.router import build_offline_serving_app as build_serving_
 from flash.serving.src.schemas import AdapterRecord
 from tests.serving.conftest import attest
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 
 
 async def _allow(_token: str, _adapter_id: str) -> str:
