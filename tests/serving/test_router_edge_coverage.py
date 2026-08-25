@@ -11,15 +11,16 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import AdapterRouter, build_serving_app
+from flash.serving.src.router import AdapterRouter
+from flash.serving.src.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.schemas import AdapterRecord
 
 QWEN = "Qwen/Qwen3.5-9B"
 SHA = "a" * 40
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
-    return None
+async def _allow(_token: str, _adapter_id: str) -> str:
+    return "org-1"
 
 
 def _revision(
@@ -170,12 +171,7 @@ class _ReplayPool(_Pool):
 def test_stream_replay_derives_checkpoint_and_skips_empty_delta(
     record: AdapterRecord, expected_checkpoint: str | None
 ) -> None:
-    reports: list[dict[str, Any]] = []
-
-    async def reporter(usage: dict[str, Any]) -> None:
-        reports.append(usage)
-
-    client = _client(_ReplayPool(), AdapterRouter([record]), usage_reporter=reporter)
+    client = _client(_ReplayPool(), AdapterRouter([record]))
     with client.stream(
         "POST",
         "/v1/chat/completions",
@@ -194,7 +190,6 @@ def test_stream_replay_derives_checkpoint_and_skips_empty_delta(
 
     assert '"delta":{"content":"hello"}' in body
     assert '"delta":{"content":""}' not in body
-    assert reports == []
 
 
 class _ValueErrorPool(_Pool):

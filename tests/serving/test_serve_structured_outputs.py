@@ -501,15 +501,18 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     # dict would compare the value to itself and pin nothing at all.
     request_id = ready.pop("request_id")
     replica_id = ready.pop("engine_replica_id")
-    assert uuid.UUID(request_id).version == 4
+    assert uuid.UUID(hex=request_id.removeprefix("fsgen-")).version == 4
     assert uuid.UUID(hex=replica_id).version == 4
     assert ready == {
         "type": "ready",
         "thinking": False,
+        "prompt_token_ids": [1],
+        "completion_token_ids": [1, 2],
         "prompt_tokens": 1,
         "completion_tokens": 2,
         "cached_tokens": 0,
         "cached_tokens_reported": True,
+        "reasoning_tokens": 0,
         "checkpoint": "",
     }
     delta = events[1].copy()
@@ -517,10 +520,14 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     assert delta == {
         "type": "delta",
         "text": "ok",
+        "thinking": False,
+        "prompt_token_ids": [1],
+        "completion_token_ids": [1, 2],
         "prompt_tokens": 1,
         "completion_tokens": 2,
         "cached_tokens": 0,
         "cached_tokens_reported": True,
+        "reasoning_tokens": 0,
         "request_id": request_id,
         "engine_replica_id": replica_id,
         "checkpoint": "",
@@ -579,11 +586,20 @@ def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
         for event in events:
             yield event
 
+    class UsageSession:
+        async def finalize(self, _result):
+            return None
+
+        async def capture(self, _result):
+            return None
+
+        async def fail(self, _result, _code):
+            return None
+
     async def drain():
         return [
             chunk
             async for chunk in openai_chat_stream(
-                MagicMock(),
                 MagicMock(),
                 record=record,
                 events=event_stream(),
@@ -591,7 +607,7 @@ def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
                 completion_id="completion-1",
                 created=1,
                 include_usage=True,
-                caller_org=None,
+                usage_session=UsageSession(),
             )
         ]
 
@@ -624,10 +640,13 @@ def test_stream_close_after_ready_closes_inner_generator(modal_app_module):
         assert ready == {
             "type": "ready",
             "thinking": False,
+            "prompt_token_ids": [1],
+            "completion_token_ids": [1],
             "prompt_tokens": 1,
             "completion_tokens": 1,
             "cached_tokens": 0,
             "cached_tokens_reported": True,
+            "reasoning_tokens": 0,
             "request_id": ready["request_id"],
             "engine_replica_id": ready["engine_replica_id"],
             "checkpoint": "",

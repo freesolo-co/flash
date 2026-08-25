@@ -17,7 +17,7 @@ from test_router import QWEN, _allow, _router_for
 
 from flash.client.http import ClientError
 from flash.serve.streaming import _openai_stream_content
-from flash.serving.src.router import build_serving_app
+from flash.serving.src.router import build_offline_serving_app as build_serving_app
 
 
 class VLLMValidationError(ValueError):
