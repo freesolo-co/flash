@@ -103,7 +103,7 @@ def serving_base_url() -> str:
     Standalone planes must target a backend they operate because every request carries the plane's
     ``FREESOLO_INTERNAL_KEY``. Reject hosted URLs whether supplied explicitly or by fallback.
 
-    Lives here rather than in ``flash.serve.deploy`` so that reading it costs nothing: deploy
+    Lives here rather than in ``flash.serve.deployment.deploy`` so that reading it costs nothing: deploy
     imports httpx at module scope, and ``[project].dependencies`` is empty so the client CLI runs on
     a bare install. A command that only needs to resolve the configured URL must not be the reason
     a user has to install an extra -- and this guard is security-relevant, so the alternative of

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from functools import partial
 
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
@@ -23,7 +24,7 @@ import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.adapters.lora_rank import alpha_from_adapter_config, rank_from_adapter_config
 from flash.engine.worker.runtime.kernel_warmup import KERNEL_CACHE_ENV_SUBDIRS
-from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
+from flash.engine.worker.verl.checkpoints import restore_verl_resume
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
@@ -131,20 +132,7 @@ def _verl_image_message_content(content) -> str:
     return "".join(parts)
 
 
-def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
-    """stage this run's streamed resume checkpoint; 0 when there is nothing usable to resume from.
-
-    ``world_size`` is the rank count this attempt launches verl at; a checkpoint written at a
-    different one is discarded rather than staged (see ``resume_topology_matches``). the fetch itself
-    prefers a lower loadable checkpoint over a higher incompatible one, so a repeated discard cannot
-    starve a compatible checkpoint uploaded after the one this attempt already rejected.
-    """
-    resume = _worker_hf.hf_resume_checkpoint(
-        prefer=lambda path: resume_checkpoint_is_loadable(path, world_size=world_size)
-    )
-    if not resume:
-        return 0
-    return stage_verl_resume(resume, local_dir, job_label="SFT", world_size=world_size)
+_restore_verl_resume = partial(restore_verl_resume, job_label="SFT")
 
 
 def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
@@ -417,7 +405,6 @@ from flash.engine.worker.train.entry.backend_common import (  # noqa: E402,F401
     resolve_verl_python,
     run_verl_training,
     shim_marker_file,
-    stage_verl_resume,
     strict_gdn_probe_module,
     verify_applied_shim_markers,
     verl_step_number,

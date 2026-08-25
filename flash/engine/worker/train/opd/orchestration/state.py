@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from flash.engine.support.verl_policy import FsdpGeneration
+
 
 @dataclass(frozen=True)
 class _BridgePrompt:
@@ -62,6 +64,8 @@ class _WorkloadState:
     lora_rank: int
     lora_alpha: int
     target_modules: Any
+    target_parameters: tuple[str, ...] | None
+    fsdp_generation: FsdpGeneration
     exclude_modules: str | None
     warmstart_adapter: str | None
 

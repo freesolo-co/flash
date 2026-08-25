@@ -24,8 +24,9 @@ from flash.serve.deployment.deploy import (
     undeploy_adapter,
 )
 from flash.serve.deployment.deploy import chat as serve_chat
+from flash.serve.deployment.deploy import chat_sse as serve_chat_sse
+from flash.serve.deployment.deploy import chat_stream as serve_chat_stream
 from flash.serve.deployment.export import export_adapter
-from flash.serve.request.streaming import chat_stream as serve_chat_stream
 from flash.server.platform import db
 from flash.server.platform.locks import _DEPLOY_LOCKS, _deploy_lock
 from flash.server.platform.runtime import (
@@ -53,7 +54,7 @@ class DeploymentJobStartError(RuntimeError):
 
 
 # Symbols re-exported through this module. The route handlers look these up on
-# ``flash.server.app`` at call time (``_app.<name>``) so a test that patches ``app.<name>``
+# ``flash.server.asgi.app`` at call time (``_app.<name>``) so a test that patches ``app.<name>``
 # is honored; listing them here also keeps them from reading as unused imports.
 __all__ = [
     "_DEPLOY_LOCKS",
@@ -76,6 +77,7 @@ __all__ = [
     "recover_runs",
     "run_server",
     "serve_chat",
+    "serve_chat_sse",
     "serve_chat_stream",
     "start_deployment_job",
     "submit_job",

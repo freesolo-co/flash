@@ -257,7 +257,11 @@ def _prepare_rl_files(inp, prompts):
     # width this attempt actually launches verl at. NOT the rented card count: the clamp that bounds
     # the launch by the step's sequences can make those differ, and a mismatch here silently discards
     # a loadable checkpoint and restarts the run from step 0.
-    resume_step = rl_checkpoints._restore_verl_resume(local_dir, world_size=int(inp["dp_cards"]))
+    resume_step = rl_checkpoints._restore_verl_resume(
+        local_dir,
+        world_size=int(inp["dp_cards"]),
+        expected_fsdp_generation=inp["fsdp_generation"],
+    )
     train_pq = os.path.join(workdir, "train.parquet")
     val_pq = os.path.join(workdir, "val.parquet")
     reward_py = os.path.join(workdir, "reward.py")

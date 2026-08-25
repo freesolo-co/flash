@@ -2170,7 +2170,7 @@ def test_alias_thinking_verification_rejects_a_silent_reasoning_channel(monkeypa
 def test_alias_thinking_verification_accepts_an_empty_reasoning_block(monkeypatch):
     """A model that thought briefly still proves the parser ran, so it must not be failed.
 
-    `flash.serve.thinking` folds an empty `reasoning_content` to `<think></think>`, which is what
+    `flash.serve.request.thinking` folds an empty `reasoning_content` to `<think></think>`, which
     separates "thought little" from "the reasoning field never arrived".
     """
     monkeypatch.setattr(

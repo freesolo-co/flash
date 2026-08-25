@@ -3,13 +3,15 @@
 Thinking models emit their reasoning inside `<think>`/`</think>`, and the delimiter can be
 split across streamed chunks, duplicated, or left unbalanced by a truncated generation.
 Parsing that back into a clean payload is pure string work with no serving dependencies, so
-it lives here rather than in `flash.serve.deploy`.
+it lives here rather than in `flash.serve.deployment.deploy`.
 
 Split out to keep that module under the file-size limit. The tag constants are defined here
 and consumed directly by the request paths.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 _TAG_CLOSE = "</think>"
 _TAG_OPEN = "<think>"
@@ -171,13 +173,19 @@ def _delimiter_may_complete(text: str, reasoning: str) -> bool:
     return _TAG_CLOSE.startswith(stripped[len(body) :].strip())
 
 
-def _strip_retained_close(text: str, reasoning: str, start: int = 0) -> tuple[str | None, int]:
+def _strip_retained_close(
+    text: str,
+    reasoning: str,
+    start: int = 0,
+    *,
+    find_delimiter: Callable[[str, int], int] = _find_delimiter,
+) -> tuple[str | None, int]:
     """Drop a retained sampled ``</think>`` from the head of the post-reasoning content.
 
     Return ``None`` while a split delimiter may still be arriving. Resume from ``start`` to avoid
     rescanning the growing buffer; end-of-stream distinguishes a delayed answer from the tag itself.
     """
-    close = _find_delimiter(text, start)
+    close = find_delimiter(text, start)
     if close >= 0:
         end = _retained_delimiter_end(text, close, reasoning)
         if end is not None:

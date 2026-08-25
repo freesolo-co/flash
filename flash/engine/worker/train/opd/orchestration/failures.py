@@ -21,6 +21,7 @@ from pathlib import Path
 import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.runtime.state as _worker_state
+from flash.engine.support.verl_policy import FsdpGeneration
 from flash.engine.worker.train.entry.sft_train import (
     SHIM_FRAGMENT_FAILED_EXIT_CODE,
     _export_checkpoint_adapter,
@@ -33,8 +34,7 @@ from flash.engine.worker.train.opd.orchestration.protocol import (
     TRANSIENT_TEACHER_EXIT,
 )
 from flash.engine.worker.verl.checkpoints import (
-    checkpoint_world_size,
-    resume_checkpoint_is_loadable,
+    inspect_resume_checkpoint,
     resume_topology_matches,
     resume_upload_unavailable,
 )
@@ -378,6 +378,7 @@ def _restore_verl_resume(
     prompt_pool_fingerprint: str,
     update_horizon: int,
     world_size: int,
+    expected_fsdp_generation: FsdpGeneration,
 ) -> tuple[int, dict | None]:
     revision = _worker_state.OPD_RESUME_REVISION or None
     # no `prefer`: opd pins an exact commit via OPD_RESUME_REVISION with fail_closed, and
@@ -396,19 +397,27 @@ def _restore_verl_resume(
         # a pinned revision means a prior attempt crossed optimizer.step(): the control-plane
         # gate (verify_opd_replacement_safe) authorized this replacement only to continue from
         # exactly this checkpoint. discarding it and restarting from step 0 would repeat
-        # already-billed teacher work and optimizer steps outside what the gate approved, so a
-        # topology mismatch fails closed here instead of falling through to a fresh run.
-        if not resume_checkpoint_is_loadable(resume, world_size=world_size):
-            written = checkpoint_world_size(resume)
+        # already-billed teacher work and optimizer steps outside what the gate approved, so an
+        # incompatible native checkpoint fails closed here instead of starting fresh.
+        inspection = inspect_resume_checkpoint(
+            resume,
+            world_size=world_size,
+            expected_fsdp_generation=expected_fsdp_generation,
+        )
+        if not inspection.loadable:
             raise RuntimeError(
                 f"permanent OPD resume failure: pinned resume revision {revision!r} names "
-                f"checkpoint {os.path.basename(resume)}, whose fsdp shards were written at "
-                f"world size {written if written is not None else 'unknown'} while this "
-                f"attempt runs at world size {world_size}. restarting from step 0 would "
-                "violate the pinned-resume contract, so this attempt refuses to train; "
-                "relaunch the retry at the checkpoint's gpu count."
+                f"checkpoint {os.path.basename(resume)}, rejected because "
+                f"{inspection.diagnostic()}. restarting from step 0 would violate the pinned-resume "
+                "contract, so this attempt refuses to train; relaunch from a compatible complete "
+                f"fsdp{expected_fsdp_generation} checkpoint."
             )
-    elif not resume_topology_matches(resume, world_size=world_size, job_label="OPD"):
+    elif not resume_topology_matches(
+        resume,
+        world_size=world_size,
+        expected_fsdp_generation=expected_fsdp_generation,
+        job_label="OPD",
+    ):
         return 0, None
     with open(os.path.join(resume, "opd_state.json"), encoding="utf-8") as file:
         state = validate_opd_resume_state_metadata(

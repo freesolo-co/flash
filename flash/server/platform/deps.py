@@ -1,6 +1,6 @@
 """Shared FastAPI request dependencies and spec/secret parsing for the route modules.
 
-Only import lazily from ``create_app()`` — never at ``flash.server.app`` import time.
+Only import lazily from ``create_app()`` — never at ``flash.server.asgi.app`` import time.
 ``owned_run`` resolves ``get_status`` via the module so test patches on ``app.get_status`` are honored.
 """
 

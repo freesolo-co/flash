@@ -7,6 +7,7 @@ state, so they are testable without constructing an engine.
 
 import hashlib
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +113,35 @@ def _adapter_cache_ready(path: Path) -> bool:
         )
     except OSError:
         return False
+
+
+def _stream_usage_fields(
+    request_output: Any,
+    completion_token_ids: list[int],
+    *,
+    start: float,
+    request_id: str,
+    engine_replica_id: str,
+    checkpoint: str,
+    thinking: bool,
+) -> dict[str, Any]:
+    prompt_token_ids = list(getattr(request_output, "prompt_token_ids", []) or [])
+    fields = {
+        "prompt_token_ids": prompt_token_ids,
+        "completion_token_ids": list(completion_token_ids),
+        "prompt_tokens": _num_prompt_tokens(request_output),
+        "completion_tokens": len(completion_token_ids),
+        "cached_tokens": _num_cached_tokens(request_output),
+        "cached_tokens_reported": _cached_tokens_reported(request_output),
+        "inference_time_seconds": time.time() - start,
+        "request_id": request_id,
+        "engine_replica_id": engine_replica_id,
+        "checkpoint": checkpoint,
+        "thinking": thinking,
+    }
+    if not thinking:
+        fields["reasoning_tokens"] = 0
+    return fields
 
 
 def _stream_text_delta(text: str, previous_text: str) -> tuple[str, str]:

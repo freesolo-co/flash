@@ -16,7 +16,7 @@ import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 # Adapter-cache paths and token accounting live in engine_support.py, alongside
 # _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
@@ -44,37 +44,17 @@ from flash.serving.src.engine.support import (
     _num_prompt_tokens,
     _safe_chat_template_kwargs,
     _stream_text_delta,
+    _stream_usage_fields,
     enforce_expected_checkpoint,
 )
 
 
-def _stream_usage_fields(
-    request_output: Any,
-    completion_token_ids: list[int],
-    *,
-    start: float,
-    request_id: str,
-    engine_replica_id: str,
-    checkpoint: str,
-    thinking: bool,
-) -> dict[str, Any]:
-    prompt_token_ids = list(getattr(request_output, "prompt_token_ids", []) or [])
-    fields = {
-        "prompt_token_ids": prompt_token_ids,
-        "completion_token_ids": list(completion_token_ids),
-        "prompt_tokens": _num_prompt_tokens(request_output),
-        "completion_tokens": len(completion_token_ids),
-        "cached_tokens": _num_cached_tokens(request_output),
-        "cached_tokens_reported": _cached_tokens_reported(request_output),
-        "inference_time_seconds": time.time() - start,
-        "request_id": request_id,
-        "engine_replica_id": engine_replica_id,
-        "checkpoint": checkpoint,
-        "thinking": thinking,
-    }
-    if not thinking:
-        fields["reasoning_tokens"] = 0
-    return fields
+class _StreamUsageContext(TypedDict):
+    start: float
+    request_id: str
+    engine_replica_id: str
+    checkpoint: str
+    thinking: bool
 
 
 class _LoraEngineImpl:
@@ -762,9 +742,8 @@ class _LoraEngineImpl:
 
         payload = GenerateRequest.model_validate(payload_dict)
         lora_request, record = await self._lora_request(payload.adapter_id, record_dict)
-        # streaming sends its headers before the first token, so there is no response field left to
-        # carry an attestation. the check still runs for its raise: a mismatched immutable adapter
-        # fails here, before any token is emitted, rather than streaming the wrong weights.
+        # the ready event carries the resolved adapter identity to the router before response headers
+        # are sent, so a mismatched immutable adapter fails before any token is emitted.
         lora_request_attestation = self._lora_request_attestation(record, lora_request)
         active_checkpoint = self._enforce_expected_checkpoint(record, expected_checkpoint)
         # resolve structured outputs and advance vllm before the ready event so validation failures
@@ -804,7 +783,7 @@ class _LoraEngineImpl:
 
             first_token_ids = list(getattr(first_output.outputs[0], "token_ids", []) or [])
             completion_token_ids: list[int] = []
-            usage_context = {
+            usage_context: _StreamUsageContext = {
                 "start": start,
                 "request_id": request_id,
                 "engine_replica_id": self._replica_identifier(),

@@ -6,8 +6,9 @@ import contextlib
 import math
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -35,7 +36,8 @@ from flash.serve.contract.responses import (
 from flash.serve.contract.responses import (
     validate_activation_response as _validate_activation_response,
 )
-from flash.serve.deployment import adapter_check
+from flash.serve.deployment import adapter_check, readiness
+from flash.serve.request import streaming as streaming_support
 from flash.serve.request import thinking as thinking_support
 from flash.serve.request import transport
 
@@ -43,13 +45,9 @@ logger = get_logger(__name__)
 
 READBACK_DELAY_SECONDS = 0.5
 READBACK_MAX_DELAY_SECONDS = 2.0
-REVISION_READY_MIN_BUDGET_SECONDS = 10 * 60.0
-REVISION_READY_MAX_BUDGET_SECONDS = 15 * 60.0
-REVISION_READY_SECONDS_PER_PARAM_B = 20.0
 ACTIVATION_READBACK_ATTEMPTS = 3
 ACTIVATION_READBACK_DELAY_SECONDS = 2.0
 SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
-_RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 
 
 @dataclass
@@ -258,7 +256,7 @@ def deploy_adapter(
         subfolder,
         expected_identity=body,
         require_provenance=require_provenance,
-        budget_s=revision_ready_budget_seconds(model),
+        budget_s=readiness.revision_ready_budget_seconds(model),
     )
     if before_activate is not None:
         _call_before_activate(
@@ -373,25 +371,6 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
     return advertised
 
 
-def revision_ready_budget_seconds(model: str) -> float:
-    """Readiness budget for a cold serving engine holding ``model``, scaled by base-model size.
-
-    An unknown model keeps the floor: a fork can add a catalog entry, and a revision-pinned id need
-    not be a catalog key, so a lookup miss must not fail a deploy that would otherwise succeed.
-    """
-    from flash.core.catalog import MODELS
-
-    info = MODELS.get(str(model or "").strip())
-    if info is None:
-        return REVISION_READY_MIN_BUDGET_SECONDS
-    # total params, not active: an MoE loads every expert into VRAM even though a token routes
-    # through few, so the cold-start cost tracks the full checkpoint.
-    scaled = REVISION_READY_MIN_BUDGET_SECONDS + REVISION_READY_SECONDS_PER_PARAM_B * max(
-        0.0, float(info.params_b)
-    )
-    return min(scaled, REVISION_READY_MAX_BUDGET_SECONDS)
-
-
 def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
     if retry_after is not None:
         try:
@@ -410,7 +389,7 @@ def _wait_revision_ready(
     *,
     expected_identity: dict | None = None,
     require_provenance: bool = True,
-    budget_s: float = REVISION_READY_MIN_BUDGET_SECONDS,
+    budget_s: float = readiness.REVISION_READY_MIN_BUDGET_SECONDS,
 ) -> dict:
     budget = max(0.0, float(budget_s))
     deadline = time.monotonic() + budget
@@ -659,32 +638,82 @@ def _retryable_smoke_unavailable(
     requested_model: str,
     expected_adapter_revision: str,
 ) -> serving_errors.RetryableServingUnavailable | None:
-    if response.status_code != 503:
-        return None
-    try:
-        payload = response.json()
-    except ValueError:
-        return None
-    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
-        return None
-    error = payload["error"]
-    code = error.get("code")
-    if (
-        error.get("type") != "adapter_unavailable"
-        or error.get("retryable") is not True
-        or code not in _RETRYABLE_SMOKE_503_CODES
-        or error.get("requested_model") != requested_model
-        or error.get("adapter_revision") != expected_adapter_revision
-    ):
-        return None
-    raw_delay = response.headers.get("Retry-After") or error.get("retry_after_seconds")
-    try:
-        retry_after_seconds = float(raw_delay)
-    except (TypeError, ValueError):
-        retry_after_seconds = SMOKE_RETRY_FALLBACK_DELAY_SECONDS
-    if not math.isfinite(retry_after_seconds) or retry_after_seconds <= 0:
-        retry_after_seconds = SMOKE_RETRY_FALLBACK_DELAY_SECONDS
-    return serving_errors.RetryableServingUnavailable(str(code), retry_after_seconds)
+    return transport.retryable_smoke_unavailable(
+        response,
+        requested_model=requested_model,
+        expected_adapter_revision=expected_adapter_revision,
+        fallback_delay_seconds=SMOKE_RETRY_FALLBACK_DELAY_SECONDS,
+    )
+
+
+def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[str]:
+    return streaming_support._openai_stream_content(
+        lines, thinking=thinking, find_delimiter=thinking_support._find_delimiter
+    )
+
+
+def chat_sse(
+    run_id: str,
+    messages: list[dict],
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+    thinking: bool = False,
+    top_p: float = 0.95,
+    stop: list[str] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    structured_outputs: dict[str, Any] | None = None,
+    stream_options: dict[str, bool] | None = None,
+) -> transport.OpenAIStreamResponse:
+    """open a raw openai stream while preserving status, headers, and sse bytes."""
+
+    return transport.request_chat_sse(
+        transport._chat_http_client(),
+        url=f"{transport.serving_openai_base_url()}/chat/completions",
+        headers=transport._internal_key_header(),
+        run_id=run_id,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        top_p=top_p,
+        stop=stop,
+        chat_template_kwargs=chat_template_kwargs,
+        structured_outputs=structured_outputs,
+        stream_options=stream_options,
+        frame_bytes=streaming_support._complete_sse_frames,
+    )
+
+
+def chat_stream(
+    run_id: str,
+    messages: list[dict],
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+    thinking: bool = False,
+    stop: list[str] | None = None,
+) -> Iterator[str]:
+    """yield decoded text while preserving eager open and cleanup semantics."""
+
+    def decode_body(upstream: transport.OpenAIStreamResponse, enabled: bool) -> Iterator[str]:
+        return streaming_support._streamed_body(
+            upstream,
+            thinking=enabled,
+            find_delimiter=thinking_support._find_delimiter,
+        )
+
+    return transport.request_chat_stream(
+        transport._chat_http_client(),
+        url=f"{transport.serving_openai_base_url()}/chat/completions",
+        headers=transport._internal_key_header(),
+        run_id=run_id,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        stop=stop,
+        frame_bytes=streaming_support._complete_sse_frames,
+        decode_body=decode_body,
+    )
 
 
 def chat(
@@ -699,6 +728,8 @@ def chat(
     retry_unavailable: bool = False,
     stop: list[str] | None = None,
     structured_outputs: dict | None = None,
+    top_p: float = 0.95,
+    chat_template_kwargs: dict | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
@@ -707,18 +738,6 @@ def chat(
     ``stop`` carries the run's own stop sequences so a model trained to terminate on a delimiter
     rather than EOS finishes on ``stop`` instead of running to ``max_tokens``.
     """
-    base = transport.serving_openai_base_url()
-    body = {
-        "model": run_id,
-        "messages": messages,
-        "max_tokens": int(max_tokens),
-        "temperature": float(temperature),
-        "chat_template_kwargs": {"enable_thinking": bool(thinking)},
-    }
-    if stop:
-        body["stop"] = [str(value) for value in stop]
-    if structured_outputs is not None:
-        body["structured_outputs"] = structured_outputs
     # follow_redirects: modal 303-redirects slow cold-start requests across many poll cycles
     # before the result is ready, bounded by the transport redirect limit on the serving origin.
     headers = transport._internal_key_header()
@@ -730,26 +749,35 @@ def chat(
         if retry_unavailable
         else contextlib.nullcontext(transport._chat_http_client())
     )
-    with client_context as client:
-        resp = client.post(f"{base}/chat/completions", json=body, headers=headers, timeout=timeout)
-        if retry_unavailable:
-            retryable_error = _retryable_smoke_unavailable(
-                resp,
-                requested_model=run_id,
-                expected_adapter_revision=expected_adapter_revision or run_id,
-            )
-            if retryable_error is not None:
-                raise retryable_error
-        resp.raise_for_status()
-        payload = resp.json()
-        thinking_support._balance_thinking_payload(payload, thinking=thinking)
-        if expected_checkpoint and isinstance(payload, dict):
-            payload["_freesolo_headers"] = {
-                "adapter_revision": resp.headers.get("X-Freesolo-Adapter-Revision"),
-                "checkpoint": resp.headers.get("X-Freesolo-Checkpoint"),
-                "hf_revision": resp.headers.get("X-Freesolo-HF-Revision"),
-            }
-            payload["_freesolo_lora_request_adapter"] = resp.headers.get(
-                "X-Freesolo-LoRA-Request-Adapter"
-            )
-        return payload
+
+    def classify_unavailable(response: httpx.Response) -> None:
+        if not retry_unavailable:
+            return
+        retryable_error = _retryable_smoke_unavailable(
+            response,
+            requested_model=run_id,
+            expected_adapter_revision=expected_adapter_revision or run_id,
+        )
+        if retryable_error is not None:
+            raise retryable_error
+
+    return transport.request_chat_json(
+        client_context,
+        url=f"{transport.serving_openai_base_url()}/chat/completions",
+        headers=headers,
+        run_id=run_id,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        top_p=top_p,
+        stop=stop,
+        chat_template_kwargs=chat_template_kwargs,
+        structured_outputs=structured_outputs,
+        timeout=timeout,
+        before_raise=classify_unavailable,
+        balance_payload=lambda payload, enabled: thinking_support._balance_thinking_payload(
+            payload, thinking=enabled
+        ),
+        expected_checkpoint=expected_checkpoint,
+    )

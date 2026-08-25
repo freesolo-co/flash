@@ -10,7 +10,7 @@ import pytest
 
 import flash.serve.contract.errors as serving_errors
 import flash.serve.deployment.adapter_check as adapter_check
-import flash.serve.request.streaming as serving_streaming
+import flash.serve.deployment.deploy as serving_deploy
 import flash.serve.request.transport as serving_transport
 
 
@@ -61,7 +61,6 @@ def test_control_http_client_is_reused_and_all_clients_close(monkeypatch):
     assert created[0].closed is True
     assert serving_transport._HTTP_CLIENT is None
     assert serving_transport._CHAT_HTTP_CLIENT is None
-    assert serving_transport._STREAM_HTTP_CLIENT is None
 
 
 def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
@@ -102,7 +101,9 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
 
         def iter_lines(self):
             yield 'data: {"choices":[{"delta":{"content":"held"}}]}'
+            yield ""
             yield "data: [DONE]"
+            yield ""
 
     class _PoolLimitedClient:
         def __init__(self, **kwargs):
@@ -129,7 +130,7 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
     serving_transport._close_http_client()
     monkeypatch.setattr(httpx, "Client", _PoolLimitedClient)
 
-    stream = serving_streaming.chat_stream("run-1", [{"role": "user", "content": "hello"}])
+    stream = serving_deploy.chat_stream("run-1", [{"role": "user", "content": "hello"}])
     assert next(stream) == "held"
     try:
         result = deploy.undeploy_adapter("run-1")
@@ -138,7 +139,7 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
 
     assert result["serving_deregistered"] is True
     assert len(created) == 2
-    assert created[0] is serving_transport._STREAM_HTTP_CLIENT
+    assert created[0] is serving_transport._CHAT_HTTP_CLIENT
     assert created[1] is serving_transport._HTTP_CLIENT
     assert created[0].kwargs["limits"].max_connections is None
     assert created[0].kwargs["limits"].max_keepalive_connections == 100

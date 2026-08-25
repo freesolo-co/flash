@@ -355,12 +355,12 @@ def test_hf_resume_checkpoint_pinned_without_numeric_dir_raises(monkeypatch, res
 # ============================================================================================
 # worker resume: fsdp world-size guard when a retry lands on a different card count
 # ============================================================================================
-def _staged_checkpoint(root, step, *, world_size=None, shards=0, nested=True):
-    """Build a downloaded ``checkpoint-N`` shaped like the one verl uploaded.
+def _staged_checkpoint(root, step, *, world_size=None, fsdp_version=2, shards=0, nested=True):
+    """build a downloaded ``checkpoint-N`` shaped like the one verl uploaded.
 
-    ``nested`` mirrors verl's two trainers: RL/OPD put the shards under ``actor/``, SFT writes them
-    straight into the step dir. ``world_size`` writes verl's own ``fsdp_config.json`` stamp;
-    ``shards`` writes per-rank shard files, which encode the same width in their names.
+    ``nested`` mirrors verl's two trainers: rl/opd put the shards under ``actor/``, while sft writes
+    them straight into the step dir. a complete native checkpoint has one model, optimizer, and
+    extra-state shard for every rank.
     """
     src = root / f"checkpoint-{step}"
     inner = src / "actor" if nested else src
@@ -368,10 +368,11 @@ def _staged_checkpoint(root, step, *, world_size=None, shards=0, nested=True):
     (inner / "model.safetensors").write_text("weights")
     if world_size is not None:
         (inner / "fsdp_config.json").write_text(
-            json.dumps({"FSDP_version": 2, "world_size": world_size})
+            json.dumps({"FSDP_version": fsdp_version, "world_size": world_size})
         )
-    for rank in range(shards):
-        (inner / f"model_world_size_{shards}_rank_{rank}.pt").write_bytes(b"shard")
+    for kind in ("model", "optim", "extra_state"):
+        for rank in range(shards):
+            (inner / f"{kind}_world_size_{shards}_rank_{rank}.pt").write_bytes(b"shard")
     return src
 
 
@@ -380,7 +381,14 @@ def _rl_resume(monkeypatch, tmp_path, src, *, world_size):
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", lambda *a, **k: str(src))
-    return rl_checkpoints._restore_verl_resume(str(local_dir), world_size=world_size), local_dir
+    return (
+        rl_checkpoints._restore_verl_resume(
+            str(local_dir),
+            world_size=world_size,
+            expected_fsdp_generation=2,
+        ),
+        local_dir,
+    )
 
 
 def test_matching_world_size_resumes(monkeypatch, tmp_path):
@@ -405,29 +413,158 @@ def test_mismatched_world_size_discards_instead_of_crashing(monkeypatch, tmp_pat
     assert not (local_dir / "global_step_7").exists()
     line = capsys.readouterr().out
     assert "discarding resume checkpoint checkpoint-7" in line
-    assert "world size 4" in line
-    assert "runs at 2" in line
+    assert "stamped 4" in line
+    assert "expected 2" in line
 
 
-def test_world_size_falls_back_to_the_shard_filenames(monkeypatch, tmp_path):
-    # verl has always stamped fsdp_config.json, but the shard names carry the same width, so a
-    # checkpoint that lost the stamp is still classified rather than guessed at.
-    src = _staged_checkpoint(tmp_path, 3, shards=4)
+def test_fsdp1_same_width_is_discarded(monkeypatch, tmp_path, capsys):
+    src = _staged_checkpoint(tmp_path, 3, world_size=4, fsdp_version=1, shards=4)
 
-    assert _rl_resume(monkeypatch, tmp_path, src, world_size=4)[0] == 3
+    step, local_dir = _rl_resume(monkeypatch, tmp_path, src, world_size=4)
+
+    assert step == 0
+    assert not (local_dir / "global_step_3").exists()
+    assert "restarting from step 0" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("stamped_config", ["null", "[1, 2, 3]"])
-def test_world_size_falls_back_when_fsdp_config_is_not_a_mapping(tmp_path, stamped_config):
-    """valid json whose top-level value is null or a list is not verl's world_size stamp (a mapping
-    with a "world_size" key). checkpoint_world_size must not raise on it -- it must fall back to the
-    shard filenames exactly as it does for a genuinely unreadable file."""
-    from flash.engine.worker.verl.checkpoints import checkpoint_world_size
+@pytest.mark.parametrize(
+    ("expected_fsdp_generation", "checkpoint_fsdp_generation", "expected_loadable"),
+    [(1, 1, True), (1, 2, False), (2, 1, False), (2, 2, True)],
+)
+def test_native_resume_requires_the_exact_fsdp_generation(
+    tmp_path,
+    expected_fsdp_generation,
+    checkpoint_fsdp_generation,
+    expected_loadable,
+):
+    from flash.engine.worker.verl.checkpoints import inspect_resume_checkpoint
 
-    src = _staged_checkpoint(tmp_path, 11, shards=3)
-    (src / "actor" / "fsdp_config.json").write_text(stamped_config)
+    src = _staged_checkpoint(
+        tmp_path,
+        5,
+        world_size=2,
+        fsdp_version=checkpoint_fsdp_generation,
+        shards=2,
+    )
 
-    assert checkpoint_world_size(str(src)) == 3
+    assert (
+        inspect_resume_checkpoint(
+            str(src),
+            world_size=2,
+            expected_fsdp_generation=expected_fsdp_generation,
+        ).loadable
+        is expected_loadable
+    )
+
+
+@pytest.mark.parametrize(
+    "stamped_config",
+    [
+        None,
+        "not-json",
+        "null",
+        "[1, 2, 3]",
+        json.dumps({"world_size": 2}),
+        json.dumps({"FSDP_version": [1, 2], "world_size": 2}),
+        json.dumps({"FSDP_version": 2, "world_size": "2"}),
+        '{"FSDP_version": 2, "FSDP_version": 2, "world_size": 2}',
+        '{"FSDP_version": 2, "world_size": 2, "world_size": 2}',
+    ],
+)
+def test_missing_mixed_or_unreadable_fsdp_stamp_is_discarded(monkeypatch, tmp_path, stamped_config):
+    src = _staged_checkpoint(tmp_path, 11, world_size=2, shards=2)
+    stamp = src / "actor" / "fsdp_config.json"
+    if stamped_config is None:
+        stamp.unlink()
+    else:
+        stamp.write_text(stamped_config)
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=2)[0] == 0
+
+
+@pytest.mark.parametrize("missing_kind", ["model", "optim", "extra_state"])
+def test_incomplete_shard_classes_are_discarded(monkeypatch, tmp_path, missing_kind):
+    src = _staged_checkpoint(tmp_path, 13, world_size=2, shards=2)
+    for path in (src / "actor").glob(f"{missing_kind}_world_size_*.pt"):
+        path.unlink()
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=2)[0] == 0
+
+
+def test_missing_rank_shard_is_discarded(monkeypatch, tmp_path):
+    src = _staged_checkpoint(tmp_path, 15, world_size=2, shards=2)
+    (src / "actor" / "optim_world_size_2_rank_1.pt").unlink()
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=2)[0] == 0
+
+
+@pytest.mark.parametrize("shard_kind", ["model", "optim", "extra_state"])
+def test_zero_byte_shards_are_discarded(monkeypatch, tmp_path, shard_kind):
+    src = _staged_checkpoint(tmp_path, 16, world_size=1, shards=1)
+    (src / "actor" / f"{shard_kind}_world_size_1_rank_0.pt").write_bytes(b"")
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=1)[0] == 0
+
+
+def test_mixed_shard_widths_are_discarded(monkeypatch, tmp_path):
+    src = _staged_checkpoint(tmp_path, 17, world_size=2, shards=2)
+    actor = src / "actor"
+    (actor / "extra_state_world_size_2_rank_1.pt").rename(
+        actor / "extra_state_world_size_4_rank_1.pt"
+    )
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=2)[0] == 0
+
+
+def test_lone_noncanonical_rank_is_discarded(monkeypatch, tmp_path):
+    src = _staged_checkpoint(tmp_path, 19, world_size=2, shards=2)
+    actor = src / "actor"
+    (actor / "model_world_size_2_rank_0.pt").rename(actor / "model_world_size_2_rank_00.pt")
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=2)[0] == 0
+
+
+def test_lone_noncanonical_world_size_is_discarded(monkeypatch, tmp_path):
+    src = _staged_checkpoint(tmp_path, 21, world_size=1, shards=1)
+    actor = src / "actor"
+    (actor / "model_world_size_1_rank_0.pt").rename(actor / "model_world_size_01_rank_0.pt")
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=1)[0] == 0
+
+
+def test_duplicate_rank_representation_is_discarded(monkeypatch, tmp_path):
+    src = _staged_checkpoint(tmp_path, 22, world_size=1, shards=1)
+    actor = src / "actor"
+    (actor / "model_world_size_1_rank_00.pt").write_bytes(b"duplicate")
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=1)[0] == 0
+
+
+def test_inconsistent_numeric_forms_across_shard_classes_are_discarded(monkeypatch, tmp_path):
+    src = _staged_checkpoint(tmp_path, 23, world_size=1, shards=1)
+    actor = src / "actor"
+    (actor / "model_world_size_1_rank_0.pt").rename(actor / "model_world_size_01_rank_0.pt")
+    (actor / "optim_world_size_1_rank_0.pt").rename(actor / "optim_world_size_1_rank_00.pt")
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=1)[0] == 0
+
+
+def test_shard_named_directory_is_discarded(monkeypatch, tmp_path):
+    src = _staged_checkpoint(tmp_path, 25, world_size=1, shards=1)
+    shard = src / "actor" / "optim_world_size_1_rank_0.pt"
+    shard.unlink()
+    shard.mkdir()
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=1)[0] == 0
+
+
+def test_broken_shard_symlink_is_discarded(monkeypatch, tmp_path):
+    src = _staged_checkpoint(tmp_path, 27, world_size=1, shards=1)
+    shard = src / "actor" / "extra_state_world_size_1_rank_0.pt"
+    shard.unlink()
+    shard.symlink_to(src / "missing-shard")
+
+    assert _rl_resume(monkeypatch, tmp_path, src, world_size=1)[0] == 0
 
 
 @pytest.mark.parametrize("world_size", [1, 2])
@@ -446,11 +583,11 @@ def test_unknown_topology_is_always_discarded(monkeypatch, tmp_path, world_size,
 
     assert step == 0, "unreadable topology must never be staged, at any world size"
     assert not (local_dir / "global_step_5").exists()
-    assert "world size unknown" in capsys.readouterr().out
+    assert "invalid or missing fsdp stamp" in capsys.readouterr().out
 
 
 def test_sft_flat_layout_is_guarded_too(monkeypatch, tmp_path, capsys):
-    # SFT writes its shards into global_step_N itself rather than a nested actor/ dir.
+    # sft writes its shards into global_step_n itself rather than a nested actor/ dir.
     from flash.engine.worker.train.entry import sft_train
 
     src = _staged_checkpoint(tmp_path, 9, world_size=2, shards=2, nested=False)
@@ -458,12 +595,45 @@ def test_sft_flat_layout_is_guarded_too(monkeypatch, tmp_path, capsys):
     local_dir.mkdir()
     monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", lambda *a, **k: str(src))
 
-    assert sft_train._restore_verl_resume(str(local_dir), world_size=2) == 9
+    assert (
+        sft_train._restore_verl_resume(str(local_dir), world_size=2, expected_fsdp_generation=2)
+        == 9
+    )
     shutil.rmtree(local_dir)
     local_dir.mkdir()
-    assert sft_train._restore_verl_resume(str(local_dir), world_size=4) == 0
+    assert (
+        sft_train._restore_verl_resume(str(local_dir), world_size=4, expected_fsdp_generation=2)
+        == 0
+    )
     assert not (local_dir / "global_step_9").exists()
     assert "[SFT] discarding resume checkpoint checkpoint-9" in capsys.readouterr().out
+
+    shutil.rmtree(local_dir)
+    local_dir.mkdir()
+    fsdp1 = _staged_checkpoint(
+        tmp_path,
+        10,
+        world_size=2,
+        fsdp_version=1,
+        shards=2,
+        nested=False,
+    )
+    monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", lambda *a, **k: str(fsdp1))
+    assert (
+        sft_train._restore_verl_resume(str(local_dir), world_size=2, expected_fsdp_generation=2)
+        == 0
+    )
+    assert not (local_dir / "global_step_10").exists()
+
+
+def test_sft_and_grpo_restore_use_the_canonical_worker_helper():
+    from flash.engine.worker.train.entry import sft_train
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    assert sft_train._restore_verl_resume.func is verl_checkpoints.restore_verl_resume
+    assert sft_train._restore_verl_resume.keywords == {"job_label": "SFT"}
+    assert rl_checkpoints._restore_verl_resume.func is verl_checkpoints.restore_verl_resume
+    assert rl_checkpoints._restore_verl_resume.keywords == {"job_label": "GRPO"}
 
 
 def _fake_hf_resume_checkpoint_over(*candidates):
@@ -485,6 +655,20 @@ def _fake_hf_resume_checkpoint_over(*candidates):
     return _resume
 
 
+def _count_resume_inspections(monkeypatch):
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    original = verl_checkpoints.inspect_resume_checkpoint
+    counts = {}
+
+    def inspect(path, **kwargs):
+        counts[path] = counts.get(path, 0) + 1
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(verl_checkpoints, "inspect_resume_checkpoint", inspect)
+    return counts
+
+
 def test_grpo_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     monkeypatch, tmp_path
 ):
@@ -496,6 +680,7 @@ def test_grpo_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     stayed the remote max -- exactly the repeat-discard loop this fix closes.
     """
 
+    counts = _count_resume_inspections(monkeypatch)
     incompatible = _staged_checkpoint(tmp_path, 7, world_size=4, shards=4)
     compatible = _staged_checkpoint(tmp_path, 3, world_size=2, shards=2)
     local_dir = tmp_path / "ckpt"
@@ -506,9 +691,12 @@ def test_grpo_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
         _fake_hf_resume_checkpoint_over(incompatible, compatible),
     )
 
-    step = rl_checkpoints._restore_verl_resume(str(local_dir), world_size=2)
+    step = rl_checkpoints._restore_verl_resume(
+        str(local_dir), world_size=2, expected_fsdp_generation=2
+    )
 
     assert step == 3
+    assert counts == {str(incompatible): 1, str(compatible): 1}
     assert (local_dir / "global_step_3" / "actor" / "model.safetensors").exists()
     assert not (local_dir / "global_step_7").exists()
 
@@ -519,6 +707,7 @@ def test_sft_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     """Same repeat-discard-loop fix as the GRPO case, for SFT's flat (non-nested) checkpoint layout."""
     from flash.engine.worker.train.entry import sft_train
 
+    counts = _count_resume_inspections(monkeypatch)
     incompatible = _staged_checkpoint(tmp_path, 9, world_size=4, shards=4, nested=False)
     compatible = _staged_checkpoint(tmp_path, 5, world_size=2, shards=2, nested=False)
     local_dir = tmp_path / "ckpt"
@@ -529,7 +718,11 @@ def test_sft_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
         _fake_hf_resume_checkpoint_over(incompatible, compatible),
     )
 
-    assert sft_train._restore_verl_resume(str(local_dir), world_size=2) == 5
+    assert (
+        sft_train._restore_verl_resume(str(local_dir), world_size=2, expected_fsdp_generation=2)
+        == 5
+    )
+    assert counts == {str(incompatible): 1, str(compatible): 1}
     assert (local_dir / "global_step_5" / "model.safetensors").exists()
     assert not (local_dir / "global_step_9").exists()
 
@@ -549,7 +742,11 @@ def test_opd_discards_a_mismatched_checkpoint_with_its_accounting(monkeypatch, t
     monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", lambda **_k: str(src))
 
     step, state = opd_failures._restore_verl_resume(
-        str(local_dir), prompt_pool_fingerprint="a" * 64, update_horizon=8, world_size=1
+        str(local_dir),
+        prompt_pool_fingerprint="a" * 64,
+        update_horizon=8,
+        world_size=1,
+        expected_fsdp_generation=2,
     )
 
     assert (step, state) == (0, None)
@@ -569,7 +766,11 @@ def test_opd_pinned_revision_topology_mismatch_fails_closed(monkeypatch, tmp_pat
 
     with pytest.raises(RuntimeError, match=r"permanent OPD resume failure.*'pinned-sha'"):
         opd_failures._restore_verl_resume(
-            str(local_dir), prompt_pool_fingerprint="a" * 64, update_horizon=8, world_size=1
+            str(local_dir),
+            prompt_pool_fingerprint="a" * 64,
+            update_horizon=8,
+            world_size=1,
+            expected_fsdp_generation=2,
         )
     assert not (local_dir / "global_step_2").exists()
 

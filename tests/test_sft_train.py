@@ -61,6 +61,7 @@ def _cfg(**over):
         "lora_alpha": 32,
         "target_modules": "all-linear",
         "exclude_modules": None,
+        "fsdp_generation": 2,
         "ulysses_sp_size": 2,
         "lr": 1e-4,
         "warmup_ratio": 0.03,
@@ -85,7 +86,8 @@ def _as_map(overrides):
 
 
 def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
-    overrides = _as_map(build_sft_overrides(_cfg()))
+    built = build_sft_overrides(_cfg())
+    overrides = _as_map(built)
     assert overrides == {
         "data.train_files": "/w/train.parquet",
         # hardcoded null, not a cfg value: see test_sft_ships_no_val_file_so_the_child_cannot_validate
@@ -137,9 +139,16 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
         "trainer.max_ckpt_to_keep": "1",
         "trainer.total_training_steps": "120",
     }
+    assert [value for value in built if "engine.strategy=" in value] == ["engine.strategy=fsdp2"]
     assert "optim.eps" not in overrides
     assert "optim.lr_scheduler_type" not in overrides
     assert "data.messages_key" not in overrides
+
+
+def test_sft_strategy_cannot_be_downgraded_by_internal_config_injection():
+    built = build_sft_overrides(_cfg(strategy="fsdp"))
+
+    assert [value for value in built if "engine.strategy=" in value] == ["engine.strategy=fsdp2"]
 
 
 def test_overrides_point_verl_at_a_warm_start_adapter():
@@ -2548,9 +2557,17 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
     local_dir.mkdir()
     resume_dir = tmp_path / "downloaded" / "checkpoint-1"
     (resume_dir / "huggingface").mkdir(parents=True)
-    # verl stamps every checkpoint with its writer's world size; staging demands a match.
+    # native staging requires a complete fsdp2 checkpoint from every writer rank.
     (resume_dir / "fsdp_config.json").write_text(json.dumps({"FSDP_version": 2, "world_size": 1}))
-    resume_step = stage_verl_resume(str(resume_dir), str(local_dir), job_label="SFT", world_size=1)
+    for kind in ("model", "optim", "extra_state"):
+        (resume_dir / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
+    resume_step = stage_verl_resume(
+        str(resume_dir),
+        str(local_dir),
+        job_label="SFT",
+        world_size=1,
+        expected_fsdp_generation=2,
+    )
     # a checkpoint this attempt actually trained, which must still be exported and uploaded.
     (local_dir / "global_step_2" / "huggingface").mkdir(parents=True)
     (local_dir / "latest_checkpointed_iteration.txt").write_text("2")
@@ -3280,7 +3297,11 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     spec, captured = _stub_sft_run(monkeypatch)
     # max_steps is 2, so resuming at 2 means the watcher never runs and finalization is the only
     # path left that can publish the step.
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, *, world_size: 2)
+    monkeypatch.setattr(
+        sft_train,
+        "_restore_verl_resume",
+        lambda local_dir, *, world_size, expected_fsdp_generation: 2,
+    )
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         raise AssertionError("a run resumed at its horizon must not start the child")
@@ -3830,6 +3851,7 @@ def test_sft_never_enables_liger_because_it_zeroes_the_lora_gradient():
         "lora_rank": 32,
         "lora_alpha": 64,
         "target_modules": "all-linear",
+        "fsdp_generation": 2,
         "lora_adapter_path": None,
         "ulysses_sp_size": 1,
         "lr": 1e-4,
@@ -4291,7 +4313,8 @@ def test_sft_resume_guard_checks_the_launched_width_not_the_allocation():
     from flash.engine.worker.train.entry import sft_train_runner
 
     src = inspect.getsource(sft_train_runner._prepare_sft_child)
-    assert "_restore_verl_resume(options.paths.local_dir, world_size=world_size)" in src
+    assert "world_size=world_size" in src
+    assert "expected_fsdp_generation=fsdp_generation" in src
     assert "world_size=options.gpu_count" not in src
 
     # and the resolved width must be established before the resume call that consumes it.

@@ -36,6 +36,7 @@ from flash.engine.plan.steps import (
     rl_data_parallel_cards,
     validate_save_steps,
 )
+from flash.engine.support.verl_policy import _resolve_fsdp_generation
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
 from flash.engine.worker.runtime.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.train.core.child.glue import validate_glue_template
@@ -397,6 +398,7 @@ def _assemble_grpo_inputs(
     schedule,
     prompt_opened_thinking,
     warmstart_adapter,
+    fsdp_generation,
     pinned,
 ):
     return {
@@ -454,6 +456,7 @@ def _assemble_grpo_inputs(
         "lora_rank": options["lora_rank"],
         "lora_alpha": options["lora_alpha"],
         "warmstart_adapter": warmstart_adapter,
+        "fsdp_generation": fsdp_generation,
         "epochs": schedule["epochs"],
         "verl_total_epochs": schedule["verl_total_epochs"],
         "steps": schedule["steps"],
@@ -597,5 +600,6 @@ def _resolve_grpo_inputs():
         schedule=schedule,
         prompt_opened_thinking=prompt_opened_thinking,
         warmstart_adapter=warmstart_adapter,
+        fsdp_generation=_resolve_fsdp_generation("grpo", targeting.target_parameters),
         pinned=pinned,
     )

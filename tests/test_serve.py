@@ -16,7 +16,7 @@ import pytest
 
 import flash.serve.contract.errors as serving_errors
 import flash.serve.deployment.deploy as d
-import flash.serve.request.streaming as serving_streaming
+import flash.serve.deployment.readiness as serving_readiness
 import flash.serve.request.transport as serving_transport
 from flash.serve.contract.errors import ServingError
 
@@ -56,7 +56,6 @@ def _stub_shared_http_client(monkeypatch):
     client = _Client()
     monkeypatch.setattr(transport, "_http_client", lambda: client)
     monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
-    monkeypatch.setattr(transport, "_stream_http_client", lambda: client)
 
 
 def _stub_adapter_config(
@@ -844,21 +843,24 @@ def test_revision_ready_budget_scales_with_base_model_size():
     as `remained 'registered'`; re-running the identical deploy against the now-warm engine
     succeeded. Bigger base, bigger budget.
     """
-    import flash.serve.deployment.deploy as d
     from flash.core.catalog import MODELS
 
-    smallest = d.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
-    largest = d.revision_ready_budget_seconds("Qwen/Qwen3.6-35B-A3B")
-    assert smallest >= d.REVISION_READY_MIN_BUDGET_SECONDS
+    smallest = serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
+    largest = serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.6-35B-A3B")
+    assert smallest >= serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
     assert largest > smallest
 
     # monotonic in params_b across the whole catalog: a bigger checkpoint never gets less time.
     budgets = [
-        (info.params_b, d.revision_ready_budget_seconds(model_id))
+        (info.params_b, serving_readiness.revision_ready_budget_seconds(model_id))
         for model_id, info in MODELS.items()
     ]
     for _params_b, budget in budgets:
-        assert d.REVISION_READY_MIN_BUDGET_SECONDS <= budget <= d.REVISION_READY_MAX_BUDGET_SECONDS
+        assert (
+            serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
+            <= budget
+            <= serving_readiness.REVISION_READY_MAX_BUDGET_SECONDS
+        )
     ordered = [budget for _params, budget in sorted(budgets)]
     assert ordered == sorted(ordered)
     # the surviving catalog has only one sub-cap row, so add a synthetic smaller row to prove the
@@ -868,10 +870,10 @@ def test_revision_ready_budget_scales_with_base_model_size():
     synthetic_id = "test/readiness-budget-smaller"
     MODELS[synthetic_id] = replace(MODELS["Qwen/Qwen3.5-9B"], id=synthetic_id, params_b=1.0)
     try:
-        synthetic = d.revision_ready_budget_seconds(synthetic_id)
+        synthetic = serving_readiness.revision_ready_budget_seconds(synthetic_id)
     finally:
         del MODELS[synthetic_id]
-    assert d.REVISION_READY_MIN_BUDGET_SECONDS < synthetic < smallest
+    assert serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS < synthetic < smallest
 
     # an MoE is sized by its TOTAL params: every expert is resident even though a token routes
     # through few, so active_params_b must not shrink the budget. asserted against the formula
@@ -880,13 +882,14 @@ def test_revision_ready_budget_scales_with_base_model_size():
     assert moe.is_moe
     assert moe.active_params_b < moe.params_b
     by_total = min(
-        d.REVISION_READY_MIN_BUDGET_SECONDS + d.REVISION_READY_SECONDS_PER_PARAM_B * moe.params_b,
-        d.REVISION_READY_MAX_BUDGET_SECONDS,
+        serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
+        + serving_readiness.REVISION_READY_SECONDS_PER_PARAM_B * moe.params_b,
+        serving_readiness.REVISION_READY_MAX_BUDGET_SECONDS,
     )
     by_active = min(
-        d.REVISION_READY_MIN_BUDGET_SECONDS
-        + d.REVISION_READY_SECONDS_PER_PARAM_B * moe.active_params_b,
-        d.REVISION_READY_MAX_BUDGET_SECONDS,
+        serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
+        + serving_readiness.REVISION_READY_SECONDS_PER_PARAM_B * moe.active_params_b,
+        serving_readiness.REVISION_READY_MAX_BUDGET_SECONDS,
     )
     assert largest == by_total
     assert largest > by_active
@@ -894,10 +897,12 @@ def test_revision_ready_budget_scales_with_base_model_size():
 
 def test_revision_ready_budget_unknown_model_keeps_the_floor():
     """A fork's own catalog entry or a revision-pinned id must not fail the lookup into an error."""
-    import flash.serve.deployment.deploy as d
 
     for unknown in ("some-org/not-in-catalog", "", "   "):
-        assert d.revision_ready_budget_seconds(unknown) == d.REVISION_READY_MIN_BUDGET_SECONDS
+        assert (
+            serving_readiness.revision_ready_budget_seconds(unknown)
+            == serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
+        )
 
 
 def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
@@ -909,7 +914,6 @@ def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
     before the CLI's default `--wait` gives up, so the cap must reserve time rather than merely clear
     smoke.
     """
-    import flash.serve.deployment.deploy as d
 
     # take the CLI default from the parser rather than restating it, so the two cannot drift apart
     # silently: shrinking bare `--wait` must fail here, not in a deploy.
@@ -921,7 +925,7 @@ def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
         _build_parser().parse_args(["models", "deploy", "run-1", "--wait"]).wait
     )
 
-    bounded = d.REVISION_READY_MAX_BUDGET_SECONDS + 2 * _SMOKE_BUDGET_SECONDS
+    bounded = serving_readiness.REVISION_READY_MAX_BUDGET_SECONDS + 2 * _SMOKE_BUDGET_SECONDS
     assert bounded < _DEPLOYMENT_STALE_SECONDS
     # and the CLI must not call a still-progressing deploy failed before the plane reaps it.
     assert bounded < cli_default_wait
@@ -959,8 +963,8 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
         adapter_prefix="sft/run-1/seed0",
     )
 
-    assert budgets == [d.revision_ready_budget_seconds("Qwen/Qwen3.6-35B-A3B")]
-    assert budgets[0] > d.REVISION_READY_MIN_BUDGET_SECONDS
+    assert budgets == [serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.6-35B-A3B")]
+    assert budgets[0] > serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
 
 
 def test_revision_ready_timeout_message_is_self_diagnosing(monkeypatch):
@@ -1194,7 +1198,7 @@ def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp
     def registered(adapter_id, *, timeout_s=None):
         assert adapter_id == registration_body["adapter_id"]
         # the deploy funds this read from the model's own scaled budget, not the bare floor.
-        assert timeout_s == d.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
+        assert timeout_s == serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
         clock[0] += timeout_s
         return (
             {
@@ -1471,416 +1475,6 @@ def test_undeploy_propagates_serving_error(monkeypatch):
     # A 404 short-circuits before raise_for_status(), so it stays a no-op success (not a ServingError).
     monkeypatch.setattr(httpx, "delete", lambda *a, **k: _Resp(404))
     assert d.undeploy_adapter("flash-7-abcd")["serving_deregistered"] is False
-
-
-def test_chat_classifies_retryable_alias_smoke_503_for_the_expected_revision(monkeypatch):
-    import flash.serve.deployment.deploy as d
-
-    run_id = "run-1"
-    revision = f"{run_id}@final." + "a" * 40
-
-    class Response:
-        status_code = 503
-
-        def __init__(self):
-            self.headers = {"Retry-After": "1.5"}
-
-        def json(self):
-            return {
-                "error": {
-                    "type": "adapter_unavailable",
-                    "code": "adapter_loading",
-                    "message": "adapter revision is loading",
-                    "retryable": True,
-                    "requested_model": run_id,
-                    "adapter_revision": revision,
-                    "retry_after_seconds": 2,
-                }
-            }
-
-    class Client:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def post(self, *args, **kwargs):
-            return Response()
-
-    monkeypatch.setattr(httpx, "Client", Client)
-
-    with pytest.raises(serving_errors.RetryableServingUnavailable) as exc_info:
-        d.chat(
-            run_id,
-            [{"role": "user", "content": "hello"}],
-            expected_adapter_revision=revision,
-            timeout_s=5.0,
-            retry_unavailable=True,
-        )
-
-    assert exc_info.value.code == "adapter_loading"
-    assert exc_info.value.retry_after_seconds == 1.5
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        {
-            "type": "adapter_unavailable",
-            "code": "adapter_load_failed",
-            "retryable": True,
-        },
-        {
-            "type": "adapter_unavailable",
-            "code": "adapter_loading",
-            "retryable": False,
-        },
-    ],
-)
-def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
-    import flash.serve.deployment.deploy as d
-
-    revision = "run-1@final." + "a" * 40
-
-    class Response:
-        status_code = 503
-
-        def __init__(self):
-            self.headers = {"Retry-After": "1"}
-            self.request = httpx.Request("POST", "https://serve.example/v1/chat/completions")
-
-        def json(self):
-            return {
-                "error": {
-                    **error,
-                    "requested_model": revision,
-                    "adapter_revision": revision,
-                }
-            }
-
-        def raise_for_status(self):
-            raise httpx.HTTPStatusError("unavailable", request=self.request, response=self)
-
-    class Client:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def post(self, *args, **kwargs):
-            return Response()
-
-    monkeypatch.setattr(httpx, "Client", Client)
-
-    with pytest.raises(httpx.HTTPStatusError):
-        d.chat(
-            revision,
-            [{"role": "user", "content": "hello"}],
-            timeout_s=5.0,
-            retry_unavailable=True,
-        )
-
-
-def test_chat_posts_to_freesolo_serving(monkeypatch):
-    """A terminal /v1 override produces one OpenAI path for direct chat."""
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
-
-    seen = {}
-    completion = {
-        "object": "chat.completion",
-        "model": "flash-7-abcd",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi there"}}],
-    }
-
-    class _Resp:
-        status_code = 200
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return completion
-
-    class _FakeClient:
-        # chat() uses an explicit httpx.Client (context manager) so it can follow Modal's 303
-        # async-result redirects; the fake records the call and the client kwargs.
-        def __init__(self, *args, **kwargs):
-            seen["client_kwargs"] = kwargs
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def post(self, url, json=None, headers=None):
-            seen["url"] = url
-            seen["json"] = json
-            seen["headers"] = headers or {}
-            return _Resp()
-
-    monkeypatch.setattr(httpx, "Client", _FakeClient)
-    out = d.chat(
-        run_id="flash-7-abcd",
-        messages=[{"role": "user", "content": "2+2?"}],
-        temperature=0.0,
-        max_tokens=8,
-        thinking=True,
-    )
-    assert seen["url"] == "https://serve.example/v1/chat/completions"
-    # Modal 303-redirects slow ASGI requests to an async-result poll URL, so the chat client
-    # MUST follow redirects (else httpx raises on the 303 mid cold-start).
-    assert seen["client_kwargs"]["follow_redirects"] is True
-    assert seen["json"]["model"] == "flash-7-abcd"
-    assert seen["json"]["max_tokens"] == 8
-    assert seen["json"]["messages"] == [{"role": "user", "content": "2+2?"}]
-    # Per-run thinking parity: the thinking flag is forwarded to the chat template so a
-    # thinking-trained adapter serves with thinking (not silently dropped).
-    assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
-    # The OpenAI shape is preserved so resp["choices"][0]["message"]["content"] works.
-    assert out["choices"][0]["message"]["content"] == "hi there"
-    # The control plane is a trusted serving caller, so it presents the internal key — this is
-    # what lets `flash chat` keep working when the serving app enforces external chat auth.
-    assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
-
-
-def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkeypatch):
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
-    requests = []
-
-    class Response:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"choices": [{"message": {"content": "ok"}}]}
-
-    class Client:
-        def post(self, url, **kwargs):
-            requests.append((url, kwargs))
-            return Response()
-
-    monkeypatch.setattr(serving_transport, "_chat_http_client", Client)
-
-    messages = [{"role": "user", "content": "hello"}]
-    d.chat("run-1", messages, structured_outputs={})
-    d.chat("run-1", messages)
-
-    first_url, first = requests[0]
-    second_url, second = requests[1]
-    assert first_url == second_url == "https://serve.example/v1/chat/completions"
-    assert first["json"]["structured_outputs"] == {}
-    assert "structured_outputs" not in second["json"]
-    assert first["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
-    assert second["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
-
-
-def test_chat_stream_yields_openai_sse_content(monkeypatch):
-    """A terminal /v1 override produces one OpenAI path for streaming chat."""
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
-    seen = {}
-
-    class _StreamResp:
-        def __init__(self):
-            self.headers = {"content-type": "text/event-stream"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def raise_for_status(self):
-            return None
-
-        def iter_lines(self):
-            return iter(
-                [
-                    'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}',
-                    'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}',
-                    'data: {"choices":[{"delta":{"content":" there"},"finish_reason":null}]}',
-                    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
-                    "data: [DONE]",
-                ]
-            )
-
-    class _FakeClient:
-        def __init__(self, *args, **kwargs):
-            seen["client_kwargs"] = kwargs
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def stream(self, method, url, json=None, headers=None):
-            seen["method"] = method
-            seen["url"] = url
-            seen["json"] = json
-            seen["headers"] = headers or {}
-            return _StreamResp()
-
-    monkeypatch.setattr(httpx, "Client", _FakeClient)
-
-    chunks = list(
-        serving_streaming.chat_stream(
-            run_id="flash-7-abcd",
-            messages=[{"role": "user", "content": "2+2?"}],
-            temperature=0.0,
-            max_tokens=8,
-            thinking=True,
-        )
-    )
-
-    assert chunks == ["hi", " there"]
-    assert seen["client_kwargs"]["follow_redirects"] is True
-    assert seen["method"] == "POST"
-    # Trusted-caller bypass: chat_stream presents the internal key, like the non-streaming chat.
-    assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
-    assert seen["url"] == "https://serve.example/v1/chat/completions"
-    assert seen["json"]["stream"] is True
-    assert seen["json"]["model"] == "flash-7-abcd"
-    assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
-
-
-def test_chat_stream_accepts_json_fallback(monkeypatch):
-    """A new Flash server can still talk to an older serving app that ignores stream=true.
-
-    Drives a REAL httpx streaming response (MockTransport) so the read-before-.json() contract is
-    actually exercised — a stub with a bare .json() would mask the ResponseNotRead bug.
-    """
-    import httpx
-
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-
-    def handler(request):
-        return httpx.Response(
-            200, json={"choices": [{"message": {"content": "full reply"}}]}
-        )  # httpx sets content-type: application/json
-
-    transport = httpx.MockTransport(handler)
-    real_client = httpx.Client
-
-    def _client(*args, **kwargs):
-        kwargs["transport"] = transport
-        return real_client(*args, **kwargs)
-
-    monkeypatch.setattr(httpx, "Client", _client)
-
-    assert list(
-        serving_streaming.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
-    ) == ["full reply"]
-
-
-def _erroring_stream_seams(monkeypatch, resp):
-    """Point the chat_stream seams at a fake client whose stream() yields ``resp``."""
-
-    class _FakeClient:
-        def stream(self, method, url, **kwargs):
-            return resp
-
-    monkeypatch.setattr(serving_transport, "_stream_http_client", lambda: _FakeClient())
-    monkeypatch.setattr(
-        serving_transport, "serving_openai_base_url", lambda: "https://serve.example/v1"
-    )
-
-
-def test_chat_stream_upstream_error_raises_before_first_chunk(monkeypatch):
-    """An upstream 4xx/5xx raises at chat_stream() call time, not during iteration.
-
-    The serving route wraps only the serve_chat_stream CALL in its try/except; by the time
-    the body iterates, the 200 and headers are already flushed. The request and
-    raise_for_status therefore must run inside chat_stream itself, and the upstream response
-    must be closed on the way out.
-    """
-    import httpx
-
-    exits = []
-
-    class _ErrorResp:
-        def __init__(self):
-            self.headers = {"content-type": "application/json"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            exits.append(exc)
-            return False
-
-        def raise_for_status(self):
-            request = httpx.Request("POST", "https://serve.example/v1/chat/completions")
-            response = httpx.Response(502, request=request)
-            raise httpx.HTTPStatusError("bad gateway", request=request, response=response)
-
-    _erroring_stream_seams(monkeypatch, _ErrorResp())
-
-    with pytest.raises(httpx.HTTPStatusError):
-        serving_streaming.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
-    assert len(exits) == 1
-
-
-class _MidstreamFailureResp:
-    def __init__(self):
-        self.exits = []
-        self.headers = {"content-type": "text/event-stream"}
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.exits.append(exc)
-        return False
-
-    def raise_for_status(self):
-        return None
-
-    def iter_lines(self):
-        yield 'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}'
-        raise RuntimeError("upstream connection lost")
-
-
-def test_chat_stream_midstream_failure_raises_and_closes_upstream(monkeypatch):
-    """A failure after the first chunk propagates out of the iterator and closes upstream.
-
-    The propagating exception is what makes the serving route abort the chunked body, so the
-    client sees a truncated transfer rather than a clean eof."""
-
-    resp = _MidstreamFailureResp()
-    _erroring_stream_seams(monkeypatch, resp)
-
-    stream = serving_streaming.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
-    assert next(stream) == "hi"
-    with pytest.raises(RuntimeError, match="upstream connection lost"):
-        next(stream)
-    assert len(resp.exits) == 1
-
-
-def test_chat_stream_close_without_iterating_closes_upstream(monkeypatch):
-    """Closing the returned iterator before reading any chunk still releases the response.
-
-    chat_stream opens the upstream connection eagerly, so the returned generator must already
-    be running: close() on a never-started generator skips the finally that exits the httpx
-    stream context."""
-
-    resp = _MidstreamFailureResp()
-    _erroring_stream_seams(monkeypatch, resp)
-
-    stream = serving_streaming.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
-    stream.close()
-    assert len(resp.exits) == 1
 
 
 def test_internal_key_is_stripped_on_cross_origin_redirect(monkeypatch):

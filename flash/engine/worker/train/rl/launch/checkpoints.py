@@ -15,6 +15,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable
+from functools import partial
 
 import flash.engine.worker.io.hf as _worker_hf
 from flash.engine.worker.io.heartbeat import join_while_draining
@@ -22,14 +23,13 @@ from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 from flash.engine.worker.train.entry.backend_common import (
     completed_checkpoint_step,
     export_peft_adapter,
-    stage_verl_resume,
     stamp_adapter_dir_provenance,
     undiscovered_checkpoint_dirs,
 )
 from flash.engine.worker.verl.checkpoints import (
     MergeDiskExhaustedError,
     MergeDiskHeadroomError,
-    resume_checkpoint_is_loadable,
+    restore_verl_resume,
 )
 
 
@@ -249,21 +249,7 @@ class _VerlResumeUploader:
             self._error = error
 
 
-def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
-    """stage this run's streamed resume checkpoint into local_dir; return the step it resumes at.
-
-    returns 0 when there is nothing to resume, which is the ordinary fresh-run path, and also when
-    ``world_size`` does not match the shards' writer (``stage_verl_resume`` explains why). ``prefer``
-    steers the fetch itself toward a lower checkpoint this attempt can load when a higher, later,
-    incompatible one also streamed -- without it, a repeated discard would starve the compatible one
-    every retry (the remote max-step pick never advances past the checkpoint this attempt rejects).
-    """
-    resume = _worker_hf.hf_resume_checkpoint(
-        prefer=lambda path: resume_checkpoint_is_loadable(path, world_size=world_size)
-    )
-    if not resume:
-        return 0
-    return stage_verl_resume(resume, local_dir, job_label="GRPO", world_size=world_size)
+_restore_verl_resume = partial(restore_verl_resume, job_label="GRPO")
 
 
 def _check_grpo_had_a_gradient(

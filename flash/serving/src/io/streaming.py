@@ -8,7 +8,7 @@ the app.
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 import orjson
 
@@ -36,13 +36,14 @@ def _sse(data: dict[str, Any] | str) -> bytes:
 async def _next_event_or_disconnect(
     events: AsyncIterator[dict[str, Any]], disconnect_wait: asyncio.Task[bool]
 ) -> dict[str, Any] | None:
-    next_event = asyncio.create_task(anext(events))
+    next_event: asyncio.Future[dict[str, Any] | bool] = asyncio.ensure_future(anext(events))
+    waiters: set[asyncio.Future[Any]] = {next_event, disconnect_wait}
     await asyncio.sleep(0)
     if next_event.done():
-        return next_event.result()
-    done, _ = await asyncio.wait({next_event, disconnect_wait}, return_when=asyncio.FIRST_COMPLETED)
+        return cast("dict[str, Any]", next_event.result())
+    done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
     if next_event in done:
-        return next_event.result()
+        return cast("dict[str, Any]", next_event.result())
     next_event.cancel()
     await asyncio.gather(next_event, return_exceptions=True)
     return None
@@ -402,6 +403,7 @@ async def prepare_stream(
             expected_checkpoint=expected_checkpoint,
         )
         first = await anext(events)
+        require_attested_revision(first, target)
     except BaseException as exc:
         # cancellation while waiting for the first engine event must still enter the pool iterator's
         # finally block, which aborts the remote generation. ordinary dispatch failures need the same
@@ -415,23 +417,27 @@ async def prepare_stream(
     try:
         if require_generation_id and first.get("request_id") != generation_id:
             raise RuntimeError("serving engine returned a mismatched generation id")
-        if require_generation_id:
-            require_attested_revision(first, target)
         if first.get("type") == "ready":
             active_checkpoint = first.get("checkpoint")
             provenance = _revision_provenance(target, active_checkpoint)
+            headers = _provenance_headers(provenance, active_checkpoint)
+            if target.is_revision:
+                headers["X-Freesolo-LoRA-Request-Adapter"] = first["lora_request_adapter"]
             return (
                 _replay_first_event(first, events),
-                _provenance_headers(provenance, active_checkpoint),
+                headers,
                 bool(first.get("thinking")),
                 first,
             )
 
         active_checkpoint = _active_checkpoint_ref(target)
         provenance = _revision_provenance(target, active_checkpoint)
+        headers = _provenance_headers(provenance, active_checkpoint)
+        if target.is_revision:
+            headers["X-Freesolo-LoRA-Request-Adapter"] = first["lora_request_adapter"]
         return (
             _replay_first_event(first, events),
-            _provenance_headers(provenance, active_checkpoint),
+            headers,
             False,
             first,
         )

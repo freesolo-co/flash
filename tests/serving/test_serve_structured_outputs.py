@@ -426,6 +426,45 @@ def test_thinking_constraint_requires_configured_parser(modal_app_module):
     assert eng.engine.sampling_params == []
 
 
+def test_stream_generate_attests_the_resolved_revision_before_deltas(modal_app_module):
+    eng = _engine(modal_app_module)
+    revision_id = "run-1@final." + "a" * 40
+    revision = AdapterRecord.model_validate(
+        {
+            "adapter_id": revision_id,
+            "repo_id": "org/run-1",
+            "org_id": "org-1",
+            "base_model": QWEN,
+            "checkpoint": "run-1",
+            "status": "ready",
+            "thinking": False,
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "run-1",
+                "checkpoint_step": None,
+                "hf_revision": "a" * 40,
+            },
+        }
+    )
+
+    async def resolved_lora(_adapter_id, _record_dict=None):
+        return types.SimpleNamespace(lora_name=revision_id), revision
+
+    eng._lora_request = resolved_lora
+
+    async def first_event():
+        stream = eng._stream_generate({"adapter_id": revision_id, "prompt": "hi"})
+        try:
+            return await anext(stream)
+        finally:
+            await stream.aclose()
+
+    ready = asyncio.run(first_event())
+
+    assert ready["type"] == "ready"
+    assert ready["lora_request_adapter"] == revision_id
+
+
 def test_stream_generate_carries_structured_outputs(modal_app_module):
     eng = _engine(modal_app_module)
 
