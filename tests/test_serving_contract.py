@@ -10,6 +10,7 @@ import pytest
 import flash.serve.contract.errors as serving_errors
 import flash.serve.contract.urls as serving_urls
 import flash.serve.deployment.adapter_check as adapter_check
+import flash.serve.deployment.readiness as serving_readiness
 import flash.serve.request.transport as serving_transport
 from flash.serve.contract.protocol import (
     ADAPTER_REVISION_PATTERN,
@@ -414,7 +415,7 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
         assert adapter_revision == revision
         assert expected_identity["metadata"]["hf_revision"] == sha
         # the readiness wait is funded from the base model's own budget, never the bare default
-        assert budget_s == deploy.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
+        assert budget_s == serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
         events.append("ready")
         return {}
 
