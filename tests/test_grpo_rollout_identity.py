@@ -13,11 +13,11 @@ import cloudpickle
 import pytest
 
 from flash.engine.worker.train.rl.child import patches
-from flash.engine.worker.train.rl.identity import (
+from flash.engine.worker.train.rl.rollout.identity import (
     RolloutIdentityLedger,
     parse_rollout_identity,
 )
-from flash.engine.worker.train.rl.reward_module import render_reward_module
+from flash.engine.worker.train.rl.rollout.reward_module import render_reward_module
 
 
 def _identity(step: int, index: int, ordinal: int, *, validate: bool = False) -> dict:
@@ -707,7 +707,7 @@ def test_exact_identity_patch_fails_closed_on_manager_boundary_drift(monkeypatch
 
 def test_single_turn_reward_server_registration_and_scoring_use_same_identity(monkeypatch):
     from flash.engine.worker.train.rl.child.multiturn import post_json
-    from flash.engine.worker.train.rl.multi_turn import start_reward_server
+    from flash.engine.worker.train.rl.rollout.multi_turn import start_reward_server
 
     ledger = RolloutIdentityLedger(1, 2)
     server, url = start_reward_server(
@@ -747,8 +747,8 @@ def test_single_turn_reward_server_registration_and_scoring_use_same_identity(mo
 
 
 def test_multi_turn_bridge_carries_and_records_the_registered_identity():
-    from flash.engine.worker.train.rl.multi_turn import MultiTurnBridge
-    from flash.envs.base import RolloutReward
+    from flash.engine.worker.train.rl.rollout.multi_turn import MultiTurnBridge
+    from flash.envs.loading.base import RolloutReward
 
     class Env:
         def new_rollout_state(self, example, prompt):

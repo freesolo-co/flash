@@ -11,9 +11,9 @@ import pytest
 from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import AdapterRouter
-from flash.serving.src.router import build_offline_serving_app as build_serving_app
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.conftest import attest
 
 QWEN = "Qwen/Qwen3.5-9B"

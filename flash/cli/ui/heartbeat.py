@@ -5,18 +5,14 @@ attempt, and -- when it is old -- which of the several very different things tha
 panel cannot observe the worker directly, so every hint here is written to state what the age does
 and does not prove, rather than to reassure.
 
-The rendering primitives stay in `flash.cli.ui.render`; this module holds the interpretation. Split
-out to keep `render.py` under the file-size limit, and imported back into `render` so
-`render._heartbeat_pairs(...)` and friends keep resolving -- which is how the status panel and the
-CLI tests reach them.
+The rendering primitives stay in `flash.cli.ui.render`; this module owns heartbeat interpretation.
 """
 
 from __future__ import annotations
 
 import math
 import time
-
-from flash.cli.ui.render import _dim
+from collections.abc import Callable
 
 
 def _heartbeat_age_seconds(value: object) -> float | None:
@@ -56,7 +52,7 @@ def live_attempt(obj: dict) -> int | None:
     about which attempt is current -- three surfaces that a user reads within one screen of each
     other, where a disagreement reads as a run that is on two attempts at once.
     """
-    from flash.providers._lifecycle.poll import _attempt_int
+    from flash.providers._lifecycle.instances.poll import _attempt_int
 
     remote = obj.get("remote")
     if isinstance(remote, dict):
@@ -83,7 +79,7 @@ def heartbeat_is_current_attempt(obj: dict, heartbeat: dict) -> bool:
     """
     # reuse the poller's attempt-identity contract (a bounded nonnegative int, never a bool, string,
     # or float) so the status display and stall detection agree on what a valid attempt is.
-    from flash.providers._lifecycle.poll import _attempt_int
+    from flash.providers._lifecycle.instances.poll import _attempt_int
 
     remote = obj.get("remote")
     current_attempt = _attempt_int(remote.get("attempt")) if isinstance(remote, dict) else None
@@ -291,7 +287,7 @@ def _stale_step_hint(
     # step 0 is the cold, still-running first step: no optimizer update has landed, so there is no
     # later hidden step for the reassurance to point at. reuse the shared step-gated predicate
     # rather than a bare presence check.
-    from flash.providers._lifecycle.poll import is_training_heartbeat
+    from flash.providers._lifecycle.instances.poll import is_training_heartbeat
 
     if not is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step")):
         return None
@@ -413,7 +409,9 @@ def _step_timing_pairs(
     return pairs
 
 
-def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
+def _heartbeat_pairs(
+    obj: dict, *, format_hint: Callable[[str], str] = str
+) -> list[tuple[str, str]]:
     """Worker heartbeat rows for the status panel: stage, step, age, and a quiet-is-normal hint."""
     hb = obj.get("last_heartbeat")
     if not isinstance(hb, dict) or not hb.get("stage"):
@@ -492,7 +490,7 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         # the progress row already explains this silence, and does it more precisely. show one or
         # the other, never both, or the panel gives two readings of the same quiet.
         if running and not explained and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
-            age += _dim(f"  ({_QUIET_HEARTBEAT_HINT})")
+            age += format_hint(f"  ({_QUIET_HEARTBEAT_HINT})")
         pairs.append(("heartbeat", age))
     if explained:
         pairs.append(("progress", explained))

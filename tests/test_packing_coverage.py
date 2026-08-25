@@ -148,7 +148,7 @@ def test_the_strict_module_resolver_refuses_to_guess_the_arch(monkeypatch) -> No
     """
     import transformers
 
-    from flash.engine.worker.backend_common import strict_gdn_probe_module
+    from flash.engine.worker.train.entry.backend_common import strict_gdn_probe_module
 
     monkeypatch.setattr(
         transformers.AutoConfig,

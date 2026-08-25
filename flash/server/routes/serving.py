@@ -1,6 +1,6 @@
 """Serving endpoints: deploy / undeploy an adapter, list deployments, and chat.
 
-Service functions are resolved through ``flash.server.app`` at call time so test-suite patches on
+Service functions are resolved through ``flash.server.asgi.app`` at call time so test-suite patches on
 ``app.<name>`` are honored here.
 """
 
@@ -22,41 +22,33 @@ from fastapi.responses import StreamingResponse
 from jsonschema.validators import validator_for  # noqa: F401
 
 from flash.core.spec import JobSpec, require_project_id
-from flash.runner import (
-    effective_spec_from_status,
-    # kept although this module no longer calls it: a deploy test patches
-    # `serving.mark_deployed`, and `monkeypatch.setattr` needs the attribute to already exist.
-    # `serving_completion` reads it back through this module, so the patch reaches the call sites.
-    mark_deployed,  # noqa: F401
+from flash.runner.lifecycle.status import effective_spec_from_status
+from flash.runner.results.verified_revisions import verified_adapter_revision_generation
+from flash.runner.supervise.transitions import (
     mark_deployment_failed,
     mark_deployment_pending,
     mark_deployment_revocation_failed,
     mark_undeployed,
-    verified_adapter_revision_generation,
 )
-from flash.serve._chat_transport import RawChatStream
 
 # `RetryableServingUnavailable` is raised by the serving-coverage tests as
 # `serving.RetryableServingUnavailable`, so it stays reachable here even though the smoke path
 # that catches it now lives in `.serving_smoke`.
-from flash.serve.deploy import (  # noqa: F401
+from flash.serve.contract.errors import (  # noqa: F401
     ActivationOutcomeUnknown,
     AdapterConfigMissing,
     RetryableServingUnavailable,
     ServingError,
 )
-from flash.serve.openai_request import (
-    OpenAIRequestError,
-    merge_stop_sequences,
-    parse_chat_request,
-)
-from flash.serve.provenance import (
+from flash.serve.contract.provenance import (
     ImmutableProvenance,
     validate_body_provenance,
     validate_header_provenance,
 )
-from flash.serve.urls import public_deployment
-from flash.server import app as _app
+from flash.serve.contract.urls import public_deployment
+from flash.serve.request.openai import OpenAIRequestError, merge_stop_sequences, parse_chat_request
+from flash.serve.request.transport import RawChatStream, is_event_stream_content_type
+from flash.server.asgi import app as _app
 from flash.server.platform import auth, db
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
 from flash.server.platform.internal_client import run_org_id
@@ -87,7 +79,7 @@ def _public_deployment(deployment: dict) -> dict:
 
 
 def _enqueue_deployment_report(status) -> None:
-    from flash.runner import _report_status, _report_status_async
+    from flash.runner.lifecycle.reporting import _report_status, _report_status_async
 
     if os.environ.get("FLASH_DEPLOY_SYNC") == "1":
         _report_status(status)
@@ -209,7 +201,7 @@ def _queued_deployment_record(
     # Validate the cheap configured-rank part synchronously so obvious spec errors return 400
     # instead of becoming background deployment failures.
     try:
-        from flash.serve.deploy import validate_serving_lora_rank
+        from flash.serve.deployment.adapter_check import validate_serving_lora_rank
 
         validate_serving_lora_rank(
             effective_spec.model,
@@ -573,7 +565,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     # best-effort product-analytics report: exports never otherwise touch the
     # platform backend (the copy is hf-to-hf inside flash).
     with contextlib.suppress(Exception):
-        from flash.server.domain.run_registry import record_model_exported
+        from flash.server.domain.registry.runs import record_model_exported
 
         record_model_exported(
             status=status,
@@ -625,7 +617,7 @@ def _deployment_listing_scope(
 
 def _in_deployment_listing_scope(status, org: str, project: str) -> bool:
     """Whether a run belongs to the requested org AND project (manageable_run's predicate)."""
-    from flash.runner import _status_org_id
+    from flash.runner.lifecycle.preparation import _status_org_id
 
     if _status_org_id(status) != org:
         return False
@@ -802,8 +794,8 @@ def chat(
             try:
                 content_type = upstream.headers.get("content-type", "")
                 headers = _upstream_response_headers(upstream.headers)
-                if upstream.status_code < 400:
-                    if "text/event-stream" not in content_type.lower():
+                if 200 <= upstream.status_code < 300:
+                    if not is_event_stream_content_type(content_type):
                         raise ValueError("serving backend returned a non-sse streaming response")
                     normalized_headers = {
                         key.lower(): value for key, value in upstream.headers.items()

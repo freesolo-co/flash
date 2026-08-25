@@ -7,6 +7,8 @@ import tempfile
 from dataclasses import dataclass, field
 from math import ceil
 
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.submit as runner_submit
 from tests._helpers.profile import satisfy_sft_profile
 
 
@@ -21,7 +23,7 @@ class _FakeConfig:
 
 
 def test_apply_disk_gb_raises_disk():
-    from flash.providers.runpod.jobs import apply_disk_gb
+    from flash.providers.runpod.execution.job_execution import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, 160)
@@ -30,7 +32,7 @@ def test_apply_disk_gb_raises_disk():
 
 def test_apply_disk_gb_never_shrinks():
     """Configs carry a historical disk_gb=60 default; it must not shrink the 64 default."""
-    from flash.providers.runpod.jobs import apply_disk_gb
+    from flash.providers.runpod.execution.job_execution import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, 60)
@@ -38,7 +40,7 @@ def test_apply_disk_gb_never_shrinks():
 
 
 def test_apply_disk_gb_noops():
-    from flash.providers.runpod.jobs import apply_disk_gb
+    from flash.providers.runpod.execution.job_execution import apply_disk_gb
 
     cfg = _FakeConfig()
     apply_disk_gb(cfg, None)
@@ -163,7 +165,6 @@ def test_revision_geometry_is_applied_before_the_disk_floor(monkeypatch):
 
 def test_submit_applies_derived_model_disk_floor(monkeypatch):
     """submit_job sends the resolved full-bf16 merge floor to the worker."""
-    from flash import runner
     from flash.core.catalog import MODELS, ModelInfo
     from flash.core.spec import JobSpec
 
@@ -179,7 +180,7 @@ def test_submit_applies_derived_model_disk_floor(monkeypatch):
     monkeypatch.setitem(MODELS, model.id, model)
     expected_floor = ceil(model.params_b * 2) * 3 + 64
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = JobSpec.from_dict(
             {
                 "model": "test/big-disk",
@@ -191,8 +192,8 @@ def test_submit_applies_derived_model_disk_floor(monkeypatch):
         )
         # sft submission is profile-gated, and this synthetic catalog model has no hub revision to
         # resolve. disk sizing is what is under test, so seed the profile instead.
-        satisfy_sft_profile(runner, monkeypatch, spec)
-        status = runner.submit_job(spec, dry_run=True)
+        satisfy_sft_profile(monkeypatch, spec)
+        status = runner_submit.submit_job(spec, dry_run=True)
         # disk_gb is platform-managed: stripped from the public status.spec, read the sizing the
         # worker executes from the effective-preparation worker spec.
         assert status.effective_preparation["worker_spec"]["gpu"]["disk_gb"] == expected_floor
@@ -206,5 +207,5 @@ def test_submit_applies_derived_model_disk_floor(monkeypatch):
                 "gpu": {"type": "RTX 5090", "disk_gb": 200},
             }
         )
-        status = runner.submit_job(spec_big, dry_run=True)
+        status = runner_submit.submit_job(spec_big, dry_run=True)
         assert status.effective_preparation["worker_spec"]["gpu"]["disk_gb"] == 200

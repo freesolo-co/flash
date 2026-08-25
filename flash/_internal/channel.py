@@ -16,7 +16,7 @@ _DEFAULT_CLI_NAME = "flash-dev" if CHANNEL == "dev" else "flash"
 # banner.
 BRAND_NAME = _DEFAULT_CLI_NAME
 
-# Every console script in [project.scripts] that enters flash.cli:main, per channel. `flash` is
+# every console script in [project.scripts] that enters the cli parser, per channel. `flash` is
 # only correct to PRINT when the operator actually reached us through it: the `server` and `dev`
 # extras install runpod-flash, which claims the same script name, so on such a host `flash` may be
 # RunPod's CLI. Printing `flash runs cancel <id>` there tells the operator to run a command that

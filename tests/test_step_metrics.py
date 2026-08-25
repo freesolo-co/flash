@@ -1,3 +1,5 @@
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
+
 """verl GRPO per-step metrics reconstructed from the trainer's stdout.
 
 an in-process trainer would feed `flash runs log -f` from a TrainerCallback. verl's trainer runs
@@ -12,14 +14,13 @@ import ast
 import inspect
 import textwrap
 
-from flash.engine.worker import rl_train_runner
-from flash.engine.worker.backend_common import (
+from flash.engine.worker.train.entry.backend_common import (
     append_step_metrics,
     parse_verl_metric,
     parse_verl_step_metrics,
     verl_step_number,
 )
-from flash.engine.worker.rl_train_runner import _ingest_step_metrics, _StepMetricState
+from flash.engine.worker.train.entry.rl_train_runner import _ingest_step_metrics, _StepMetricState
 
 # a realistic verl step line: ray tags worker stdout with a pid prefix, and reduce_metrics returns
 # numpy scalars that pprint renders as np.float64(...) under numpy>=2.
@@ -203,7 +204,7 @@ def test_exact_advantage_bounds_are_retained_in_the_forced_step_heartbeat(monkey
         calls.append((stage, fields))
         return next(outcomes)
 
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", heartbeat)
+    monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     for step, minimum, maximum in ((1, -0.25, 0.75), (2, -0.5, 1.5)):
@@ -253,7 +254,9 @@ def test_masked_truncation_sequence_uses_grad_norm_as_publication_evidence(monke
     assert sum(rewards) / len(rewards) == 0.875
     assert 1.0 - sum(response_mask) / len(response_mask) == 0.125
 
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+    )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     lines = (
@@ -284,7 +287,9 @@ def test_masked_truncation_sequence_uses_grad_norm_as_publication_evidence(monke
 
 
 def test_replayed_step_replaces_gradient_evidence(monkeypatch):
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+    )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     common = (
@@ -298,7 +303,9 @@ def test_replayed_step_replaces_gradient_evidence(monkeypatch):
 
 
 def test_replayed_step_without_grad_norm_removes_stale_evidence(monkeypatch):
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+    )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     common = (
@@ -312,7 +319,9 @@ def test_replayed_step_without_grad_norm_removes_stale_evidence(monkeypatch):
 
 
 def test_replayed_step_without_bounds_clears_stale_bounds_atomically(monkeypatch):
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+    )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     full = (
@@ -333,7 +342,9 @@ def test_replayed_step_without_bounds_clears_stale_bounds_atomically(monkeypatch
 
 
 def test_pg_loss_only_training_replay_clears_all_stale_terminal_evidence(monkeypatch):
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+    )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     full = (
@@ -350,7 +361,9 @@ def test_pg_loss_only_training_replay_clears_all_stale_terminal_evidence(monkeyp
 
 
 def test_validation_only_replay_does_not_clear_training_evidence(monkeypatch):
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+    )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     full = (
@@ -366,13 +379,13 @@ def test_validation_only_replay_does_not_clear_training_evidence(monkeypatch):
 
 
 def _verl_rl_tree() -> ast.Module:
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
     source = "\n".join(
         inspect.getsource(fn)
         for fn in (
             rl_train.run_rl_train,
-            rl_train._ingest_step_metrics,
+            rl_train_runner._ingest_step_metrics,
             rl_train._write_terminal_metadata,
         )
     )
@@ -492,8 +505,8 @@ def test_first_backlog_is_forced_past_the_rl_step_throttle():
 def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():
     # the payload schema belongs to the cli, not verl: a key the renderer does not know is dead
     # weight, so keep the mapping's flash-side names inside the rendered set.
-    from flash.cli.commands import _FOLLOW_METRIC_FIELDS
-    from flash.engine.worker.backend_common import _VERL_METRIC_FIELDS
+    from flash.cli.commands.ops.log_follow import _FOLLOW_METRIC_FIELDS
+    from flash.engine.worker.train.entry.backend_common import _VERL_METRIC_FIELDS
 
     rendered = {name for name, *_ in _FOLLOW_METRIC_FIELDS}
     emitted = {flash_key for _, flash_key in _VERL_METRIC_FIELDS}

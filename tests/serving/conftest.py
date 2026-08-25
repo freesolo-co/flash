@@ -8,11 +8,43 @@ logic (engine-arg construction, LoRA request building, sampling params).
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import sys
 import types
+from collections.abc import Callable, Iterator
 from typing import Any
 
-from flash.serving.src.usage_outbox import OfflineUsageStore, UsageEvent, UsageOutboxError
+import pytest
+
+from flash.serving.src.accounting.usage_outbox import (
+    OfflineUsageStore,
+    UsageEvent,
+    UsageOutboxError,
+)
+
+
+@pytest.fixture(scope="module")
+def load_modal_app_under_stub() -> Iterator[Callable[[Any], Any]]:
+    module_name = "flash.serving.app.modal_app"
+    missing = object()
+    previous_modal = sys.modules.get("modal", missing)
+    previous_app = sys.modules.get(module_name, missing)
+
+    def load(modal_stub: Any) -> Any:
+        sys.modules["modal"] = modal_stub
+        sys.modules.pop(module_name, None)
+        return importlib.import_module(module_name)
+
+    try:
+        yield load
+    finally:
+        sys.modules.pop(module_name, None)
+        if previous_app is not missing:
+            sys.modules[module_name] = previous_app
+        if previous_modal is missing:
+            sys.modules.pop("modal", None)
+        else:
+            sys.modules["modal"] = previous_modal
 
 
 def _install_vllm_stub() -> None:

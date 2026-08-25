@@ -164,7 +164,7 @@ def test_gdn_state_page_and_attention_kv_use_real_geometry():
 
 def test_9b_grpo_stays_within_its_validated_placement_tier(monkeypatch):
     from flash.cost import RunConfig, estimate_cost
-    from flash.providers import allocator
+    from flash.providers.core import allocator
 
     train = {
         "max_context_tokens": 4096,

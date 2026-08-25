@@ -16,12 +16,13 @@ from fastapi import HTTPException
 
 from flash.content.multimodal import messages_with_image_data_uris, normalize_prompt_images
 from flash.core.spec import JobSpec
-from flash.runner import adapter_prefix, read_verified_adapter_revisions
+from flash.runner.lifecycle.state import adapter_prefix
 from flash.runner.results.checkpoints import checkpoint_adapter_prefix
+from flash.runner.results.verified_revisions import read_verified_adapter_revisions
 from flash.schema import parse_adapter_revision
-from flash.serve.deploy import ServingError
-from flash.serve.openai_request import OpenAIRequestError, parse_chat_request
-from flash.server import app as _app
+from flash.serve.contract.errors import ServingError
+from flash.serve.request.openai import OpenAIRequestError, parse_chat_request
+from flash.server.asgi import app as _app
 
 # defined here rather than in the route module because that one imports this one: the routes read
 # them back through their own namespace, so there is still exactly one definition.

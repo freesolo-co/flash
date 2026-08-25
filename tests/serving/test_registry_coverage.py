@@ -8,8 +8,8 @@ from __future__ import annotations
 from datetime import UTC
 from pathlib import Path
 
-from flash.serving.src.registry import AdapterRegistry, _parse_iso
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.store.registry import AdapterRegistry, _parse_iso
 
 
 def _alias() -> AdapterRecord:

@@ -15,6 +15,9 @@ import re
 
 import pytest
 
+import flash.engine.worker.model.decoding as worker_decoding
+import flash.engine.worker.runtime.state as worker_state
+import flash.engine.worker.train.rl.launch.config as worker_grpo_config
 from flash.core.grpo import SUPPORTED_GRPO_GROUP_SIZES
 from flash.core.spec import JobSpec
 from flash.schema import ConfigError, spec_from_dict
@@ -28,96 +31,132 @@ class _Tok:
 
 
 def test_think_token_count_counts_the_think_span() -> None:
-    import flash.engine.worker as w
 
     tok = _Tok()
-    assert w.think_token_count("<think>a b c</think>the answer", tok) == 3
-    assert w.think_token_count("no reasoning here", tok) == 0
+    assert worker_decoding.think_token_count("<think>a b c</think>the answer", tok) == 3
+    assert worker_decoding.think_token_count("no reasoning here", tok) == 0
     # an unclosed block (budget exhausted) counts everything after <think>
-    assert w.think_token_count("pre <think>a b c d", tok) == 4
-    assert w.think_token_count(None, tok) == 0
-    assert w.think_token_count("<think></think>x", tok) == 0
+    assert worker_decoding.think_token_count("pre <think>a b c d", tok) == 4
+    assert worker_decoding.think_token_count(None, tok) == 0
+    assert worker_decoding.think_token_count("<think></think>x", tok) == 0
     # prompt-opened hybrid thinking: the chat template appended <think> to the PROMPT, so the
     # completion starts mid-reasoning with only the closing </think>. The reasoning is everything
     # before that close (without this the penalty no-ops on the common enable_thinking=true path).
-    assert w.think_token_count('a b c d</think>{"x": 1}', tok) == 4
-    assert w.think_token_count("</think>just the answer", tok) == 0
+    assert worker_decoding.think_token_count('a b c d</think>{"x": 1}', tok) == 4
+    assert worker_decoding.think_token_count("</think>just the answer", tok) == 0
     # case 3: prompt-opened thinking that NEVER closes (ran out of max_completion_tokens) — no tags at all. With
     # prompt_opened_thinking the WHOLE completion is unterminated reasoning and is counted, so the
     # longest rambles can't dodge the penalty; without the flag a tag-less completion is plain text (0).
-    assert w.think_token_count("rambling on and on forever", tok, prompt_opened_thinking=True) == 5
-    assert w.think_token_count("rambling on and on forever", tok) == 0
+    assert (
+        worker_decoding.think_token_count(
+            "rambling on and on forever", tok, prompt_opened_thinking=True
+        )
+        == 5
+    )
+    assert worker_decoding.think_token_count("rambling on and on forever", tok) == 0
     # the flag does NOT change a completion that already carries a tag (cases 1/2 still win).
-    assert w.think_token_count("a b c</think>ans", tok, prompt_opened_thinking=True) == 3
-    assert w.think_token_count("<think>a b</think>ans", tok, prompt_opened_thinking=True) == 2
-    assert w.think_token_count("", tok, prompt_opened_thinking=True) == 0
+    assert (
+        worker_decoding.think_token_count("a b c</think>ans", tok, prompt_opened_thinking=True) == 3
+    )
+    assert (
+        worker_decoding.think_token_count("<think>a b</think>ans", tok, prompt_opened_thinking=True)
+        == 2
+    )
+    assert worker_decoding.think_token_count("", tok, prompt_opened_thinking=True) == 0
     # Case 1 vs 2 is decided by tag ORDER, not presence: a prompt-opened completion that CLOSES its
     # reasoning and then echoes a literal <think> in the answer must count the span up to the FIRST
     # </think> (the reasoning), NOT anchor on the echoed opener (which would count "echo here" = 2).
-    assert w.think_token_count("a b c d</think>answer with <think> echo here", tok) == 4
+    assert (
+        worker_decoding.think_token_count("a b c d</think>answer with <think> echo here", tok) == 4
+    )
     # a self-tagged block followed by an echoed opener still counts only the first real span.
-    assert w.think_token_count("<think>a b c</think>tail <think> echo", tok) == 3
+    assert worker_decoding.think_token_count("<think>a b c</think>tail <think> echo", tok) == 3
     # prompt-opened + NEVER closed + an echoed <think>: count the WHOLE completion (it's all
     # unterminated reasoning), not just the text after the echoed opener.
-    assert w.think_token_count("reason 42 <think> more", tok, prompt_opened_thinking=True) == 4
+    assert (
+        worker_decoding.think_token_count(
+            "reason 42 <think> more", tok, prompt_opened_thinking=True
+        )
+        == 4
+    )
     # the same echoed completion WITHOUT the prompt-open signal: the model opened <think> itself
     # (unclosed) -> count after that opener (case: model-opened unclosed).
-    assert w.think_token_count("reason 42 <think> more", tok) == 1
+    assert worker_decoding.think_token_count("reason 42 <think> more", tok) == 1
     # prompt-opened + an echoed <think> BEFORE the first </think>: the prompt pre-opened reasoning, so
     # the span is the WHOLE pre-opened reasoning from the start through the first close
     # ("reason 42 <think> more" = 4) -- NOT just the sliver after the echoed opener (" more" = 1).
     assert (
-        w.think_token_count("reason 42 <think> more </think> ans", tok, prompt_opened_thinking=True)
+        worker_decoding.think_token_count(
+            "reason 42 <think> more </think> ans", tok, prompt_opened_thinking=True
+        )
         == 4
     )
     # the same string WITHOUT the prompt-open signal: the model opened AND closed its own <think>, so
     # only the span between the model's tags counts (" more" = 1) -- case 1.
-    assert w.think_token_count("reason 42 <think> more </think> ans", tok) == 1
+    assert worker_decoding.think_token_count("reason 42 <think> more </think> ans", tok) == 1
 
 
 def test_prompt_opens_thinking_detects_preopened_tag() -> None:
-    import flash.engine.worker as w
 
     # A hybrid template pre-opens <think> at the end of the generation prompt (no closing tag).
-    assert w.prompt_opens_thinking("<|im_start|>assistant\n<think>\n") is True
+    assert worker_decoding.prompt_opens_thinking("<|im_start|>assistant\n<think>\n") is True
     # An uncurated/non-thinking template appends no <think> -> a tagless completion is a real answer.
-    assert w.prompt_opens_thinking("<|im_start|>assistant\n") is False
-    assert w.prompt_opens_thinking("") is False
-    assert w.prompt_opens_thinking(None) is False
+    assert worker_decoding.prompt_opens_thinking("<|im_start|>assistant\n") is False
+    assert worker_decoding.prompt_opens_thinking("") is False
+    assert worker_decoding.prompt_opens_thinking(None) is False
     # A prompt that opened AND closed a <think> (e.g. a few-shot exemplar) is NOT pre-opened.
-    assert w.prompt_opens_thinking("...<think>example</think>...<|im_start|>assistant\n") is False
+    assert (
+        worker_decoding.prompt_opens_thinking("...<think>example</think>...<|im_start|>assistant\n")
+        is False
+    )
     # If the LAST think is left open (after an earlier closed one), it IS pre-opened.
-    assert w.prompt_opens_thinking("<think>ex</think>q<|im_start|>assistant\n<think>\n") is True
+    assert (
+        worker_decoding.prompt_opens_thinking("<think>ex</think>q<|im_start|>assistant\n<think>\n")
+        is True
+    )
     # FALSE-POSITIVE guard: a user/system message that merely CONTAINS an unclosed literal <think>
     # must NOT count as pre-opened when the generation suffix didn't actually prefill thinking (the
     # detection anchors on the trailing <think> suffix, not a scan of the whole prompt).
-    assert w.prompt_opens_thinking("user asked <think> about x<|im_start|>assistant\n") is False
+    assert (
+        worker_decoding.prompt_opens_thinking("user asked <think> about x<|im_start|>assistant\n")
+        is False
+    )
 
 
 def test_graded_text_hides_tagless_prompt_opened_reasoning(monkeypatch) -> None:
-    import flash.engine.worker as w
 
-    monkeypatch.setattr(w, "THINKING", True)
+    monkeypatch.setattr(worker_state, "THINKING", True)
     # Tagless completion under a prompt-opened <think>: the generation never closed reasoning, so the
     # env must grade NOTHING (scores 0) — not the raw ramble (which a raw-text fallback could reward).
-    assert w.graded_text("rambling forever no answer", prompt_opened_thinking=True) == ""
+    assert (
+        worker_decoding.graded_text("rambling forever no answer", prompt_opened_thinking=True) == ""
+    )
     # Without the prompt-opened signal (e.g. an uncurated template that didn't pre-open), the same
     # tagless text is a normal answer and is graded as-is.
-    assert w.graded_text("the answer is 42", prompt_opened_thinking=False) == "the answer is 42"
+    assert (
+        worker_decoding.graded_text("the answer is 42", prompt_opened_thinking=False)
+        == "the answer is 42"
+    )
     # A normally-tagged thinking completion is unaffected: strip to the post-</think> answer.
     assert (
-        w.graded_text("reasoning...</think>\\boxed{5}", prompt_opened_thinking=True) == "\\boxed{5}"
+        worker_decoding.graded_text("reasoning...</think>\\boxed{5}", prompt_opened_thinking=True)
+        == "\\boxed{5}"
     )
     # Echoed <think> while still unterminated (no </think>): the WHOLE thing is reasoning -> hidden,
     # NOT just the text before the echoed opener (which a raw-text fallback could otherwise reward).
-    assert w.graded_text("reason 42 <think> still going", prompt_opened_thinking=True) == ""
+    assert (
+        worker_decoding.graded_text("reason 42 <think> still going", prompt_opened_thinking=True)
+        == ""
+    )
     # THINKING off: no stripping at all, even with the flag set.
-    monkeypatch.setattr(w, "THINKING", False)
-    assert w.graded_text("rambling forever", prompt_opened_thinking=True) == "rambling forever"
+    monkeypatch.setattr(worker_state, "THINKING", False)
+    assert (
+        worker_decoding.graded_text("rambling forever", prompt_opened_thinking=True)
+        == "rambling forever"
+    )
 
 
 def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
-    import flash.engine.worker as w
 
     train_knobs = {
         "group_size": 4,
@@ -141,8 +180,8 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             "train": {**train_knobs},
         }
     )
-    monkeypatch.setattr(w, "JOB_SPEC", spec)
-    assert w.grpo_overrides() == grpo_knobs
+    monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
+    assert worker_grpo_config.grpo_overrides() == grpo_knobs
     # A leftover grpo_config in environment.params must NOT be read by the worker.
     poisoned = JobSpec.from_dict(
         {
@@ -155,11 +194,11 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             "train": {},
         }
     )
-    monkeypatch.setattr(w, "JOB_SPEC", poisoned)
-    assert w.grpo_overrides() == {}
+    monkeypatch.setattr(worker_state, "JOB_SPEC", poisoned)
+    assert worker_grpo_config.grpo_overrides() == {}
     # only the knobs actually set are returned (a partial set omits the rest)
     monkeypatch.setattr(
-        w,
+        worker_state,
         "JOB_SPEC",
         JobSpec.from_dict(
             {
@@ -170,16 +209,16 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             }
         ),
     )
-    assert w.grpo_overrides() == {"group_size": 2}
+    assert worker_grpo_config.grpo_overrides() == {"group_size": 2}
     # no [train] knobs -> empty (recipe defaults apply downstream)
     monkeypatch.setattr(
-        w,
+        worker_state,
         "JOB_SPEC",
         JobSpec.from_dict({"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"}),
     )
-    assert w.grpo_overrides() == {}
-    monkeypatch.setattr(w, "JOB_SPEC", None)
-    assert w.grpo_overrides() == {}
+    assert worker_grpo_config.grpo_overrides() == {}
+    monkeypatch.setattr(worker_state, "JOB_SPEC", None)
+    assert worker_grpo_config.grpo_overrides() == {}
 
 
 def test_train_grpo_knobs_parse_and_roundtrip() -> None:
@@ -218,7 +257,6 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
 
 
 def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypatch) -> None:
-    import flash.engine.worker as w
     from flash.schema import spec_and_train_keys_from_file
 
     config = tmp_path / "grpo.toml"
@@ -243,8 +281,8 @@ def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypa
     roundtripped = JobSpec.from_dict(spec.to_dict())
     assert roundtripped.train.entropy_quantile == 0.2
 
-    monkeypatch.setattr(w, "JOB_SPEC", roundtripped)
-    assert w.grpo_overrides() == {"entropy_quantile": 0.2}
+    monkeypatch.setattr(worker_state, "JOB_SPEC", roundtripped)
+    assert worker_grpo_config.grpo_overrides() == {"entropy_quantile": 0.2}
 
 
 def test_opt_int_float_reject_bools() -> None:
@@ -369,7 +407,7 @@ def test_init_from_adapter_rejects_non_string_value(bad_ref: object) -> None:
 
 def test_hf_repo_is_managed_not_user_set() -> None:
     # [train] hf_repo is the platform-managed per-run HF artifact repo: the control plane assigns
-    # it server-side at submit (see runner.submit_job). It is not a user config key -- the schema
+    # it server-side at submit (see runner_submit.submit_job). It is not a user config key -- the schema
     # rejects a user-supplied value outright rather than silently ignoring it.
     raw = {
         "model": "Qwen/Qwen3.5-9B",
@@ -582,14 +620,13 @@ def test_build_grpo_prompt_dataset_keeps_columns_arrow_safe() -> None:
     # rows and a str for others. Embedding the rich record in the dataset makes PyArrow infer one
     # column type across all rows and crash; build_grpo_prompt_dataset stores a stable int index
     # instead, and reward_fn maps it back to the original record.
-    import flash.engine.worker as w
 
     prompts = [
         {"prompt": "p0", "example": {"id": "a", "metadata": {"param": 8}}},  # int param
         {"prompt": "p1", "example": {"id": "b", "metadata": {"param": "gentle"}}},  # str param
         {"prompt": "p2", "example": {"id": "c", "metadata": {"param": 12}}},
     ]
-    rows, examples = w.build_grpo_prompt_dataset(prompts)
+    rows, examples = worker_grpo_config.build_grpo_prompt_dataset(prompts)
 
     # Columns are trivially typed: the prompt + an int index. The rich record is gone.
     assert rows == [
@@ -614,7 +651,6 @@ def test_grpo_masks_truncated_completions_by_default() -> None:
     including it biases the policy gradient and — on long-completion / multi-turn envs that
     frequently hit the budget — can degrade the model below its SFT start.
     """
-    import flash.engine.worker as w
 
     # No stop_sequences (the common case) -> masking ON.
     spec = JobSpec.from_dict(
@@ -625,16 +661,15 @@ def test_grpo_masks_truncated_completions_by_default() -> None:
             "train": {},
         }
     )
-    assert w.grpo_mask_truncated_completions(spec.train) is True
+    assert worker_grpo_config.grpo_mask_truncated_completions(spec.train) is True
     # Defensive: a None train spec (no JOB_SPEC) still resolves to the safe default (ON).
-    assert w.grpo_mask_truncated_completions(None) is True
+    assert worker_grpo_config.grpo_mask_truncated_completions(None) is True
 
 
 def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
     """With stop_sequences, vLLM strips the stop string so a normally-terminated completion does
     NOT end in EOS -- the "last token != EOS" truncation check would then flag (and mask) every
     completion, so the run would learn nothing. Gate the flag OFF in that case."""
-    import flash.engine.worker as w
 
     spec = JobSpec.from_dict(
         {
@@ -645,7 +680,7 @@ def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
         }
     )
     assert spec.train.stop_sequences == ("</answer>",)
-    assert w.grpo_mask_truncated_completions(spec.train) is False
+    assert worker_grpo_config.grpo_mask_truncated_completions(spec.train) is False
 
 
 def test_build_grpo_prompt_dataset_survives_dataset_from_list() -> None:
@@ -653,8 +688,6 @@ def test_build_grpo_prompt_dataset_survives_dataset_from_list() -> None:
     # mixed-type column, while the index-based rows construct cleanly.
     Dataset = pytest.importorskip("datasets").Dataset
     ArrowInvalid = pytest.importorskip("pyarrow.lib").ArrowInvalid
-
-    import flash.engine.worker as w
 
     prompts = [
         {"prompt": "p0", "example": {"metadata": {"param": 8}}},
@@ -665,7 +698,7 @@ def test_build_grpo_prompt_dataset_survives_dataset_from_list() -> None:
         Dataset.from_list(prompts)
 
     # The fix's rows build a valid dataset and round-trip the index column.
-    rows, examples = w.build_grpo_prompt_dataset(prompts)
+    rows, examples = worker_grpo_config.build_grpo_prompt_dataset(prompts)
     ds = Dataset.from_list(rows)
     assert ds.column_names == ["prompt", "example_idx"]
     assert list(ds["example_idx"]) == [0, 1]
@@ -721,7 +754,7 @@ def test_grpo_prompt_budget_guard_matches_the_worker_resolver() -> None:
     from flash import schema
     from flash.engine.plan.recipe import RECIPE
     from flash.engine.plan.vram import grpo_completion_len
-    from flash.engine.worker.train.rl import inputs
+    from flash.engine.worker.train.rl.launch import inputs
 
     assert grpo_completion_len(None, False) == RECIPE.rl.max_completion_len
     assert grpo_completion_len(None, True) == RECIPE.rl.max_completion_len_thinking

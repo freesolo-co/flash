@@ -21,7 +21,7 @@ _LOCK_SUFFIX = ".verified-revisions.lock"
 
 
 def _paths(run_id: str) -> tuple[str, str, str]:
-    from flash.runner import RUNS_DIR, runs_file_path
+    from flash.runner.lifecycle.state import RUNS_DIR, runs_file_path
 
     os.makedirs(RUNS_DIR, exist_ok=True)
     return (

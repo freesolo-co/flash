@@ -4,8 +4,9 @@ RunPod (always on) and the instance-based complements — Lambda (opt-in via LAM
 Vast (opt-in via VAST_API_KEY) — all implement the SAME ``base.Provider`` interface, so the
 orchestrator/allocator treat them interchangeably.
 
-Every provider carries the universal per-substrate surface below (``PROVIDER_MODULES``). Modules
-that only SOME providers need are divergence-driven, not part of the contract: ``gpus`` exists only
+Every provider carries the universal per-substrate client surface in ``CLIENT_MODULES`` plus the
+provider-specific jobs module returned by ``_jobs_module``. Modules that only SOME providers need
+are divergence-driven, not part of the contract: ``gpus`` exists only
 where a provider translates friendly names to substrate ids (RunPod validated classes, Lambda's
 ``instance_type_for``) — instance providers otherwise draw ``gpu_classes`` from the shared
 ``base.gpu_classes_for``; ``train`` exists only for RunPod's serverless endpoint-deploy machinery
@@ -21,7 +22,9 @@ _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 
 # The universal per-provider surface: concerns every substrate must implement itself (no shared
 # default fits). ``gpus``/``train`` are intentionally NOT here — they're per-provider by necessity.
-PROVIDER_MODULES = ("api", "auth", "pricing", "jobs", "preflight")
+# the per-substrate client surface now lives under each provider's `client` subpackage;
+# `jobs` stays at the provider root (runpod groups its heavier job modules in `execution`).
+CLIENT_MODULES = ("api", "auth", "pricing", "preflight")
 PROVIDER_METHODS = (
     "is_configured",
     "preflight",
@@ -40,7 +43,7 @@ _PKG = {"runpod": "runpod", "lambda": "lambda_", "vast": "vast"}
 
 
 def test_registry_lists_all_providers():
-    from flash.providers import PROVIDER_NAMES, get_provider
+    from flash.providers.core.registry import PROVIDER_NAMES, get_provider
 
     assert PROVIDER_NAMES == ("runpod", "lambda", "vast")
     assert get_provider("RunPod ").name == "runpod"
@@ -52,8 +55,8 @@ def test_registry_lists_all_providers():
 
 @pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
 def test_provider_implements_the_interface(provider):
-    from flash.providers import get_provider
-    from flash.providers.base import Provider
+    from flash.providers.core.base import Provider
+    from flash.providers.core.registry import get_provider
 
     prov = get_provider(provider)
     assert isinstance(prov, Provider)
@@ -61,13 +64,25 @@ def test_provider_implements_the_interface(provider):
         assert callable(getattr(prov, meth)), f"{provider} missing {meth}"
 
 
+def _jobs_module(pkg: str) -> str:
+    """runpod groups job execution under `execution`; the others keep `jobs` at the root."""
+    return (
+        f"flash.providers.{pkg}.execution.jobs"
+        if pkg == "runpod"
+        else f"flash.providers.{pkg}.jobs"
+    )
+
+
 @pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
 def test_module_layout(provider):
     """Every provider subpackage exposes the SAME public module set (the symmetry contract)."""
-    for mod in PROVIDER_MODULES:
-        importlib.import_module(f"flash.providers.{_PKG[provider]}.{mod}")
-    pkg = importlib.import_module(f"flash.providers.{_PKG[provider]}")
-    assert hasattr(pkg, "PROVIDER")
+    for mod in CLIENT_MODULES:
+        importlib.import_module(f"flash.providers.{_PKG[provider]}.client.{mod}")
+    importlib.import_module(_jobs_module(_PKG[provider]))
+    provider_module = importlib.import_module(
+        f"flash.providers.{_PKG[provider]}.execution.provider"
+    )
+    assert hasattr(provider_module, "PROVIDER")
 
 
 @pytest.mark.parametrize("provider", ["lambda", "vast"])
@@ -75,7 +90,7 @@ def test_method_signatures_match_runpod(provider):
     """The interface methods take the same parameters on every provider (swappable)."""
     import inspect
 
-    from flash.providers import get_provider
+    from flash.providers.core.registry import get_provider
 
     rp = get_provider("runpod")
     other = get_provider(provider)
@@ -87,7 +102,7 @@ def test_method_signatures_match_runpod(provider):
 
 def test_setup_vs_training_gate_contract():
     """define the canonical setup-vs-training classifier contract used by provider polling."""
-    from flash.providers._lifecycle.poll import (
+    from flash.providers._lifecycle.instances.poll import (
         SETUP_HEARTBEAT_STAGES,
         STEP_GATED_STAGES,
         is_training_heartbeat,
@@ -110,7 +125,7 @@ def test_setup_vs_training_gate_contract():
 
 
 def test_format_heartbeat_includes_rl_step_metrics():
-    from flash.providers._lifecycle.poll import _format_heartbeat
+    from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
     rendered = _format_heartbeat(
         {
@@ -144,8 +159,8 @@ def test_format_heartbeat_includes_rl_step_metrics():
 
 
 def test_runpod_provider_implements_the_interface():
-    from flash.providers import get_provider
-    from flash.providers.base import Provider
+    from flash.providers.core.base import Provider
+    from flash.providers.core.registry import get_provider
 
     prov = get_provider("runpod")
     assert isinstance(prov, Provider)
@@ -154,23 +169,24 @@ def test_runpod_provider_implements_the_interface():
 
 
 def test_runpod_module_layout():
-    for mod in PROVIDER_MODULES:
-        importlib.import_module(f"flash.providers.runpod.{mod}")
-    pkg = importlib.import_module("flash.providers.runpod")
-    assert hasattr(pkg, "PROVIDER")
+    for mod in CLIENT_MODULES:
+        importlib.import_module(f"flash.providers.runpod.client.{mod}")
+    importlib.import_module(_jobs_module("runpod"))
+    provider_module = importlib.import_module("flash.providers.runpod.execution.provider")
+    assert hasattr(provider_module, "PROVIDER")
 
 
 def test_gpu_classes_match_runpod_rows():
-    from flash.providers import get_provider
-    from flash.providers.base import GPU_INFO
+    from flash.providers.core.base import GPU_INFO
+    from flash.providers.core.registry import get_provider
 
     rp = {g.name for g in get_provider("runpod").gpu_classes()}
     assert rp == {g.name for g in GPU_INFO.values() if g.enum_member}
 
 
 def test_sweep_orphans_is_part_of_the_protocol():
-    from flash.providers import get_provider
-    from flash.providers.base import Provider
+    from flash.providers.core.base import Provider
+    from flash.providers.core.registry import get_provider
 
     assert hasattr(get_provider("runpod"), "sweep_orphans")
     assert get_provider("runpod").sweep_orphans(active_labels={"flash-x"}) == []
@@ -182,8 +198,8 @@ def test_run_instances_remaining_is_optional_not_required_by_protocol():
     # run label; RunPod serverless self-reaps). It must NOT be on the @runtime_checkable Provider
     # Protocol, or isinstance(runpod_provider, Provider) would go False and break the symmetry checks
     # above. Vast implements it; RunPod does not; both still satisfy Provider. Detected via getattr.
-    from flash.providers import get_provider
-    from flash.providers.base import Provider
+    from flash.providers.core.base import Provider
+    from flash.providers.core.registry import get_provider
 
     assert "run_instances_remaining" not in dir(Provider)  # not a required Protocol member
     assert hasattr(get_provider("vast"), "run_instances_remaining")  # Vast provides the capability
@@ -192,14 +208,15 @@ def test_run_instances_remaining_is_optional_not_required_by_protocol():
 
 
 def test_static_pricing():
-    pricing = importlib.import_module("flash.providers.runpod.pricing")
+    pricing = importlib.import_module("flash.providers.runpod.client.pricing")
     assert pricing.hourly_rate("RTX 5090") == pytest.approx(0.99)
 
 
 def _stub_candidates(monkeypatch, *, runpod=(), lambda_=(), vast=()):
     """Pin allocate()'s three provider candidate lists so ranking can be tested in isolation."""
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import Candidate
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate
+    from flash.providers.core.registry import get_provider
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
     # allocate() sources candidates via provider.live_candidates(need, constraints); pin each provider's.
@@ -222,7 +239,7 @@ def _stub_candidates(monkeypatch, *, runpod=(), lambda_=(), vast=()):
 
 def test_vast_competes_purely_on_price(monkeypatch):
     """Vast is ranked by cost alongside runpod/lambda: the cheapest offer wins, whoever owns it."""
-    from flash.providers.allocator import allocate
+    from flash.providers.core.allocator import allocate
 
     # Vast is the cheapest fitting offer -> Vast is selected.
     _stub_candidates(
@@ -252,7 +269,7 @@ def test_vast_competes_purely_on_price(monkeypatch):
 
 def test_gpu_name_breaks_price_vram_tie_before_provider_order(monkeypatch):
     """gpu name breaks a price-and-VRAM tie before stable provider order; full-key ties retain order."""
-    from flash.providers.allocator import allocate
+    from flash.providers.core.allocator import allocate
 
     # identical price and VRAM; Vast's class name sorts before RunPod's, so Vast wins the tie.
     _stub_candidates(
@@ -273,8 +290,8 @@ def test_gpu_name_breaks_price_vram_tie_before_provider_order(monkeypatch):
 
 
 def test_allocation_summary_formats_runpod_choice():
-    from flash.providers.allocator import allocation_summary
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.allocator import allocation_summary
+    from flash.providers.core.base import Allocation, Candidate
 
     cand = Candidate("runpod", "RTX 4090", 0.69, 24)
     alloc = Allocation(
@@ -289,7 +306,7 @@ def test_allocation_summary_formats_runpod_choice():
 
 
 def test_jobhandle_roundtrip_tags_provider():
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
 
     h = JobHandle(provider="runpod", data={"endpoint_id": "ep", "job_id": "j"})
     d = h.to_dict()
@@ -302,9 +319,9 @@ def test_jobhandle_roundtrip_tags_provider():
 
 
 def test_provider_cancel_destroy_dispatch(monkeypatch):
-    from flash.providers import get_provider
-    from flash.providers.base import JobHandle
-    from flash.providers.runpod import api as rp_api
+    from flash.providers.core.base import JobHandle
+    from flash.providers.core.registry import get_provider
+    from flash.providers.runpod.client import api as rp_api
 
     cancelled, deleted = [], []
     monkeypatch.setattr(
@@ -335,9 +352,9 @@ def test_provider_cancel_destroy_dispatch(monkeypatch):
 
 
 def test_runpod_destroy_accepts_exact_owner_404_confirmation(monkeypatch):
-    from flash.providers import get_provider
-    from flash.providers.base import JobHandle
-    from flash.providers.runpod import api as rp_api
+    from flash.providers.core.base import JobHandle
+    from flash.providers.core.registry import get_provider
+    from flash.providers.runpod.client import api as rp_api
 
     lookups = []
     monkeypatch.setattr(
@@ -368,9 +385,9 @@ def test_runpod_destroy_accepts_exact_owner_404_confirmation(monkeypatch):
 
 
 def test_runpod_destroy_rejects_non_authoritative_absence_result(monkeypatch):
-    from flash.providers import get_provider
-    from flash.providers.base import JobHandle
-    from flash.providers.runpod import api as rp_api
+    from flash.providers.core.base import JobHandle
+    from flash.providers.core.registry import get_provider
+    from flash.providers.runpod.client import api as rp_api
 
     monkeypatch.setattr(
         rp_api,
@@ -416,8 +433,8 @@ def test_the_key_sent_on_the_wire_is_the_key_preflight_accepted(monkeypatch, pro
     """
     import urllib.request
 
-    from flash.providers._lifecycle.auth import load_provider_key
-    from flash.providers._lifecycle.http import RestClient
+    from flash.providers._lifecycle.net.auth import load_provider_key
+    from flash.providers._lifecycle.net.http import RestClient
 
     padded = "\n  key-with-padding  \n"
     monkeypatch.setenv(env_var, padded)

@@ -27,7 +27,7 @@ from flash.adapters.lora_rank import (
     strict_declared_lora_ranks,
 )
 from flash.engine.worker.model.lora import _read_safetensors_tensor_metadata
-from flash.serve.contract import reject_non_finite_json_constant
+from flash.serve.contract.protocol import reject_non_finite_json_constant
 
 from .manifest import ArtifactFile, ManifestAdapter, ServingManifest
 from .progress import emit_boot_progress

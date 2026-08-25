@@ -6,7 +6,7 @@ import argparse
 
 import pytest
 
-import flash.cli.commands.env.list as commands
+import flash.cli.commands.env.ops.list as commands
 from flash.client import ApiClient, ClientError
 
 
@@ -39,7 +39,7 @@ def test_published_environment_is_not_reported_as_empty(monkeypatch, capsys):
 
 
 def test_published_environment_flows_from_endpoint_to_cli(monkeypatch, capsys):
-    import flash.server.domain.envs as domain
+    import flash.server.domain.registry.envs as domain
     from flash.server.routes import envs as routes
 
     monkeypatch.setattr(domain, "list_namespace_slugs", lambda **_kwargs: ["acme/project/my-env"])

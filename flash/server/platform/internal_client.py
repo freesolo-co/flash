@@ -42,7 +42,7 @@ def org_id_of(context: dict[str, Any] | None) -> str:
 def run_org_id(status: Any) -> str:
     """The org that owns a run: its ``billing_context`` then ``platform_context`` (the submit-path
     order), each isinstance-guarded against a non-dict legacy value; ``""`` if none. NOTE: this is the
-    OPPOSITE order to ``run_registry`` (which prefers ``platform_context`` — see its comment); the two
+    OPPOSITE order to ``runs`` (which prefers ``platform_context`` — see its comment); the two
     are intentionally different, do not conflate them."""
     for ctx in (
         getattr(status, "billing_context", None),

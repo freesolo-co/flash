@@ -448,9 +448,9 @@ def test_runtime_installer_rejects_stale_or_non_dataclass_configs_and_incomplete
 
 
 def test_sft_grpo_and_opd_plugins_install_text_targeting_only_for_text_jobs(tmp_path):
-    importlib.import_module("flash.engine.worker.sft_train")
-    from flash.engine.worker import sft_train_runner
-    from flash.engine.worker.train.opd.overrides import _build_opd_plugin_config
+    importlib.import_module("flash.engine.worker.train.entry.sft_train")
+    from flash.engine.worker.train.entry import sft_train_runner
+    from flash.engine.worker.train.opd.orchestration.overrides import _build_opd_plugin_config
     from flash.engine.worker.train.rl.child.plugin import required_patch_names
 
     shim_dir = tmp_path / "sft-text-shim"
@@ -523,7 +523,7 @@ def test_exact_verl_hf_model_reproduces_old_peft_failure_and_attaches_new_target
     from transformers import AutoModelForImageTextToText
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 
-    from flash.engine.worker.train.sft.config import _hydra_val
+    from flash.engine.worker.train.sft.setup.config import _hydra_val
 
     config = Qwen3_5Config.from_dict(_metadata()["config"])
     intended_regex = resolve_lora_targeting(
