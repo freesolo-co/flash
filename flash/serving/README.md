@@ -55,12 +55,13 @@ and the custom domain `https://serve.freesolo.co`. The production workflow remai
 # imports `flash.serving.src...`, so deploying from anywhere else fails at import.
 uv sync --extra serving
 set -a && source .env && set +a
+export FREESOLO_DEPLOYMENT_ID="manual-production-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
 uv run modal deploy flash/serving/modal_app.py
 ```
 
 Required production wiring is `HF_TOKEN`, `FREESOLO_INTERNAL_KEY`,
-`PLATFORM_BACKEND_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and
-`SERVING_CUSTOM_DOMAIN=serve.freesolo.co`.
+`PLATFORM_BACKEND_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, a nonblank
+`FREESOLO_DEPLOYMENT_ID`, and `SERVING_CUSTOM_DOMAIN=serve.freesolo.co`.
 
 ### Development
 
@@ -101,6 +102,7 @@ export SUPABASE_URL=https://${SUPABASE_PROJECT_REF_DEV}.supabase.co
 export SUPABASE_SERVICE_ROLE_KEY="replace-with-development-server-key"
 export FREESOLO_INTERNAL_KEY="replace-with-shared-internal-key"
 export HF_TOKEN="replace-with-hugging-face-token"
+export FREESOLO_DEPLOYMENT_ID="manual-development-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
 uv run modal deploy --env dev flash/serving/modal_app.py
 ```
 

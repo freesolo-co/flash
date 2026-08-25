@@ -50,23 +50,31 @@ from flash.serving.src.model_config import (
 
 def _stream_usage_fields(
     request_output: Any,
-    completion_tokens: int,
+    completion_token_ids: list[int],
     *,
     start: float,
     request_id: str,
     engine_replica_id: str,
     checkpoint: str,
+    thinking: bool,
 ) -> dict[str, Any]:
-    return {
+    prompt_token_ids = list(getattr(request_output, "prompt_token_ids", []) or [])
+    fields = {
+        "prompt_token_ids": prompt_token_ids,
+        "completion_token_ids": list(completion_token_ids),
         "prompt_tokens": _num_prompt_tokens(request_output),
-        "completion_tokens": completion_tokens,
+        "completion_tokens": len(completion_token_ids),
         "cached_tokens": _num_cached_tokens(request_output),
         "cached_tokens_reported": _cached_tokens_reported(request_output),
         "inference_time_seconds": time.time() - start,
         "request_id": request_id,
         "engine_replica_id": engine_replica_id,
         "checkpoint": checkpoint,
+        "thinking": thinking,
     }
+    if not thinking:
+        fields["reasoning_tokens"] = 0
+    return fields
 
 
 class _LoraEngineImpl:
@@ -652,6 +660,7 @@ class _LoraEngineImpl:
         payload_dict: dict[str, Any],
         record_dict: dict[str, Any] | None = None,
         expected_checkpoint: str | None = None,
+        generation_id: str | None = None,
     ) -> dict[str, Any]:
         from vllm import SamplingParams
         from vllm.sampling_params import RequestOutputKind
@@ -680,7 +689,7 @@ class _LoraEngineImpl:
             structured_outputs=structured_outputs,
             stop=payload.stop,
         )
-        request_id = str(uuid.uuid4())
+        request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
         start = time.time()
         final_output = None
         prompt_input = await self._prepare_prompt_input(payload, thinking_default)
@@ -709,6 +718,7 @@ class _LoraEngineImpl:
         if finish_reason is None:
             raise RuntimeError("vLLM generation ended without a finish reason")
         completion_token_ids = list(getattr(output, "token_ids", []) or [])
+        prompt_token_ids = list(getattr(final_output, "prompt_token_ids", []) or [])
         prompt_tokens = _num_prompt_tokens(final_output)
         return {
             "ok": True,
@@ -721,7 +731,9 @@ class _LoraEngineImpl:
             "text": output.text,
             "finish_reason": finish_reason,
             "token_ids": completion_token_ids,
-            # token counts for per-token billing; the router forwards these to the backend.
+            "prompt_token_ids": prompt_token_ids,
+            "completion_token_ids": completion_token_ids,
+            **({"reasoning_tokens": 0} if not thinking_default else {}),
             "prompt_tokens": prompt_tokens,
             "completion_tokens": len(completion_token_ids),
             # Prefix-cached prompt tokens (served from the KV cache, prefill skipped). With
@@ -730,16 +742,9 @@ class _LoraEngineImpl:
             "cached_tokens": _num_cached_tokens(final_output),
             "cached_tokens_reported": _cached_tokens_reported(final_output),
             "inference_time_seconds": time.time() - start,
-            # stable per-generation id: the router uses it as the usage-report idempotency key so
-            # a future report retry can't double-bill the same generation.
             "request_id": request_id,
             "engine_replica_id": self._replica_identifier(),
             "checkpoint": active_checkpoint,
-            # the thinking mode this generation was RENDERED with. the chat template opens the
-            # reasoning block in the prompt, so a thinking completion carries only the closing
-            # </think> and cannot be classified from its own text. the openai layer needs that
-            # distinction to split reasoning from content; the raw /generate contract keeps
-            # ``text`` verbatim.
             "thinking": thinking_default,
         }
 
@@ -748,6 +753,7 @@ class _LoraEngineImpl:
         payload_dict: dict[str, Any],
         record_dict: dict[str, Any] | None = None,
         expected_checkpoint: str | None = None,
+        generation_id: str | None = None,
     ):
         from vllm import SamplingParams
         from vllm.sampling_params import RequestOutputKind
@@ -759,7 +765,7 @@ class _LoraEngineImpl:
         # streaming sends its headers before the first token, so there is no response field left to
         # carry an attestation. the check still runs for its raise: a mismatched immutable adapter
         # fails here, before any token is emitted, rather than streaming the wrong weights.
-        self._lora_request_attestation(record, lora_request)
+        lora_request_attestation = self._lora_request_attestation(record, lora_request)
         active_checkpoint = self._enforce_expected_checkpoint(record, expected_checkpoint)
         # resolve structured outputs and advance vllm before the ready event so validation failures
         # remain clean responses instead of surfacing after streaming has started.
@@ -775,7 +781,7 @@ class _LoraEngineImpl:
             structured_outputs=structured_outputs,
             stop=payload.stop,
         )
-        request_id = str(uuid.uuid4())
+        request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
         start = time.time()
         prompt_input = await self._prepare_prompt_input(payload, thinking_default)
         output_stream = None
@@ -796,21 +802,18 @@ class _LoraEngineImpl:
                 self._self_heal_if_dead("stream_generate")
                 raise
 
+            first_token_ids = list(getattr(first_output.outputs[0], "token_ids", []) or [])
             completion_token_ids: list[int] = []
-            first_completion_tokens = len(
-                list(getattr(first_output.outputs[0], "token_ids", []) or [])
-            )
             usage_context = {
                 "start": start,
                 "request_id": request_id,
                 "engine_replica_id": self._replica_identifier(),
                 "checkpoint": active_checkpoint,
+                "thinking": thinking_default,
             }
 
             def usage_fields(request_output: Any) -> dict[str, Any]:
-                return _stream_usage_fields(
-                    request_output, len(completion_token_ids), **usage_context
-                )
+                return _stream_usage_fields(request_output, completion_token_ids, **usage_context)
 
             # ``thinking`` rides the ready event because it must be known before the first delta.
             # usage rides it too because vllm has already produced its first output, and a client may
@@ -818,7 +821,12 @@ class _LoraEngineImpl:
             yield {
                 "type": "ready",
                 "thinking": thinking_default,
-                **_stream_usage_fields(first_output, first_completion_tokens, **usage_context),
+                **(
+                    {"lora_request_adapter": lora_request_attestation}
+                    if lora_request_attestation is not None
+                    else {}
+                ),
+                **_stream_usage_fields(first_output, first_token_ids, **usage_context),
             }
             final_output = None
             previous_text = ""
