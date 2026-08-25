@@ -44,7 +44,7 @@ jobs:
       EXPECTED_SERVING_URL: https://serve-dev.freesolo.co
 
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -92,12 +92,12 @@ jobs:
           echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
           echo "Deploy development serving: $deploy"
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         if: steps.gate.outputs.deploy == 'true'
         with:
           python-version: "3.12"
 
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         if: steps.gate.outputs.deploy == 'true'
         with:
           # pin the installed binary as well as the action implementation.
@@ -113,8 +113,7 @@ jobs:
           # pinned to the exact client pyproject declares; see deploy-modal.yml for why an
           # unbounded range is unsafe for the deploy path.
           # exact pins keep the deploy client bootstrap reproducible across runner image changes.
-          uv pip install --system "modal==1.5.4" "python-dotenv==1.2.3" "httpx==0.28.1" \
-            "pydantic==2.13.4" "pydantic-settings==2.14.2"
+          uv pip install --system "modal==1.5.4" "python-dotenv==1.2.3"
 
       - name: Verify development deployment inputs
         if: steps.gate.outputs.deploy == 'true'
@@ -204,7 +203,7 @@ jobs:
           # import the constants module, not persistence.py: this job installs only modal and
           # python-dotenv, while persistence.py imports httpx at module scope, so importing it
           # would raise ModuleNotFoundError and the guard below would block every dev deploy.
-          if ! columns="$(python -c 'from flash.serving.src.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
+          if ! columns="$(python -c 'from flash.serving.src.store.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
             # failing closed matters here: an empty list would degrade the query back to a bare
             # existence check and this gate would pass while proving nothing.
             echo "::error::Could not read PERSISTED_COLUMNS; refusing to deploy against an unverified schema."
@@ -226,24 +225,9 @@ jobs:
           fi
           echo "Development Supabase flash.hosted_lora_adapters is queryable."
 
-      - name: Verify development readiness schema
-        if: steps.gate.outputs.deploy == 'true'
-        working-directory: .
-        run: |
-          set -euo pipefail
-          if ! columns="$(python -c 'from flash.serving.src.readiness import READINESS_SELECT; print(READINESS_SELECT)')" || [ -z "$columns" ]; then
-            echo "::error::Could not read READINESS_SELECT; refusing to deploy against an unverified readiness schema."
-            exit 1
-          fi
-          python scripts/wait_for_supabase_schema.py \
-            --table hosted_model_readiness_passes \
-            --columns "$columns" \
-            --label "Development Supabase flash.hosted_model_readiness_passes" \
-            --timeout-seconds 300
-
       - name: Deploy development serving
         if: steps.gate.outputs.deploy == 'true'
-        run: modal deploy --env dev flash/serving/modal_app.py
+        run: modal deploy --env dev flash/serving/app/modal_app.py
 
       - name: Verify development serving URL
         if: steps.gate.outputs.deploy == 'true'
@@ -355,53 +339,6 @@ jobs:
               sleep_seconds=$remaining
             fi
             sleep "$sleep_seconds"
-          done
-
-      - name: Verify fresh development readiness is unpublished
-        if: steps.gate.outputs.deploy == 'true'
-        run: |
-          python - <<'PY'
-          from flash.serving.src.readiness import load_readiness_passes
-          from flash.serving.src.settings import Settings
-
-
-          if load_readiness_passes(Settings()):
-              raise SystemExit("fresh development deployment already has readiness publications")
-          PY
-
-      - name: Publish development model readiness evidence
-        if: steps.gate.outputs.deploy == 'true'
-        run: modal run --env dev flash/serving/modal_app.py::publish_readiness --base-url "$EXPECTED_SERVING_URL"
-
-      - name: Gate development model exposure on complete publications
-        if: steps.gate.outputs.deploy == 'true'
-        run: |
-          expected="$(python -c 'import json; from flash.serving.src.model_config import base_models; print(json.dumps(sorted(base_models())))')"
-          deadline=$((SECONDS + 300))
-          while true; do
-            response="$(curl --silent --show-error --connect-timeout 5 --max-time 10 "${EXPECTED_SERVING_URL}/healthz" || true)"
-            if RESPONSE="$response" EXPECTED="$expected" python - <<'PY'
-          import json
-          import os
-
-
-          try:
-              payload = json.loads(os.environ["RESPONSE"])
-              expected = json.loads(os.environ["EXPECTED"])
-          except ValueError:
-              raise SystemExit(1)
-          actual = payload.get("base_models") if isinstance(payload, dict) else None
-          raise SystemExit(0 if actual == expected else 1)
-          PY
-            then
-              echo "Development serving exposes exactly the readiness-qualified model catalog."
-              break
-            fi
-            if (( SECONDS >= deadline )); then
-              echo "::error::Development serving did not expose the complete readiness-qualified model catalog within 300 seconds."
-              exit 1
-            fi
-            sleep 10
           done
 
       - name: Nothing to deploy

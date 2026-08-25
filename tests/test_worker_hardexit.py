@@ -21,8 +21,14 @@ from pathlib import Path
 import huggingface_hub
 import pytest
 
-import flash.engine.worker as worker
-from flash.engine.worker_entrypoint import WORKER_FAILURE_LINE
+import flash.engine.worker.entry.opd as opd_entry
+import flash.engine.worker.entry.sft as sft_entry
+import flash.engine.worker.entry.worker as worker
+import flash.engine.worker.io.heartbeat as heartbeat_io
+import flash.engine.worker.io.hf as hf_io
+import flash.engine.worker.perf as worker_perf
+import flash.engine.worker.runtime.state as worker_state
+from flash.engine.support.worker_entrypoint import WORKER_FAILURE_LINE
 
 
 class _HardExit(BaseException):
@@ -35,13 +41,13 @@ class _HardExit(BaseException):
 
 def _patch_common(monkeypatch, fake_exit):
     monkeypatch.setattr(worker.os, "_exit", fake_exit)
-    monkeypatch.setattr(worker, "HF_REPO", "")  # skip the idempotency DONE check
-    monkeypatch.setattr(worker, "RUN_MODE", "sft")
-    monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(worker_state, "HF_REPO", "")  # skip the idempotency DONE check
+    monkeypatch.setattr(worker_state, "RUN_MODE", "sft")
+    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *a, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
     # main() runs the real boot steps before the handler; this test exercises the hard-exit flow,
     # so stub out the Hopper fla fast-path setup.
-    monkeypatch.setattr(worker, "_ensure_fla_fastpath_on_hopper", lambda: None)
+    monkeypatch.setattr(worker_perf, "_ensure_fla_fastpath_on_hopper", lambda: None)
 
 
 def _run_safe_entrypoint(tmp_path, sitecustomize):
@@ -50,7 +56,7 @@ def _run_safe_entrypoint(tmp_path, sitecustomize):
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), str(repo_root), env.get("PYTHONPATH", "")])
     return subprocess.run(
-        [sys.executable, "-m", "flash.engine.worker_entrypoint"],
+        [sys.executable, "-m", "flash.engine.support.worker_entrypoint"],
         cwd=repo_root,
         env=env,
         capture_output=True,
@@ -71,7 +77,7 @@ def test_managed_entrypoint_emits_one_safe_failure_line(tmp_path):
     secret = "managed-private-provider-response"
     result = _run_safe_entrypoint(
         tmp_path,
-        "import flash.engine.worker as worker\n"
+        "import flash.engine.worker.entry.worker as worker\n"
         "def fail():\n"
         f"    raise RuntimeError({secret!r})\n"
         "worker.main = fail\n",
@@ -98,7 +104,7 @@ def test_managed_entrypoint_sanitizes_worker_import_failure(tmp_path):
 def test_direct_worker_module_emits_one_normal_traceback(tmp_path):
     secret = "direct-worker-diagnostic"
     (tmp_path / "sitecustomize.py").write_text(
-        "import flash.engine.worker as worker\n"
+        "import flash.engine.worker.entry.worker as worker\n"
         "def fail():\n"
         f"    raise RuntimeError({secret!r})\n"
         "worker.main = fail\n"
@@ -127,7 +133,7 @@ def test_worker_hard_exits_zero_on_success(monkeypatch):
         raise _HardExit(code)
 
     _patch_common(monkeypatch, fake_exit)
-    monkeypatch.setattr(worker, "run_sft", lambda: ran.__setitem__("v", True))
+    monkeypatch.setattr(sft_entry, "run_sft", lambda: ran.__setitem__("v", True))
 
     raised = None
     try:
@@ -155,14 +161,14 @@ def test_worker_dispatches_sft_adapter_continuation_to_the_handler(monkeypatch):
 
     _patch_common(monkeypatch, fake_exit)
     monkeypatch.setattr(
-        worker,
+        worker_state,
         "JOB_SPEC",
         JobSpec(
             algorithm="sft",
             train=TrainSpec(init_from_adapter="owner/runs:sft/source-run"),
         ),
     )
-    monkeypatch.setattr(worker, "run_sft", lambda: ran.__setitem__("v", True))
+    monkeypatch.setattr(sft_entry, "run_sft", lambda: ran.__setitem__("v", True))
 
     raised = None
     try:
@@ -182,8 +188,8 @@ def test_worker_dispatches_opd_run_mode(monkeypatch):
         raise _HardExit(code)
 
     _patch_common(monkeypatch, fake_exit)
-    monkeypatch.setattr(worker, "RUN_MODE", "opd")
-    monkeypatch.setattr(worker, "run_opd", lambda: ran.__setitem__("v", True))
+    monkeypatch.setattr(worker_state, "RUN_MODE", "opd")
+    monkeypatch.setattr(opd_entry, "run_opd", lambda: ran.__setitem__("v", True))
 
     raised = None
     try:
@@ -208,13 +214,13 @@ def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_p
         raise _HardExit(code)
 
     monkeypatch.setattr(worker.os, "_exit", fake_exit)
-    monkeypatch.setattr(worker, "HF_REPO", "owner/run-dataset")
-    monkeypatch.setattr(worker, "hf_prefix", lambda: "seed0")
-    monkeypatch.setattr(worker, "gpu_diagnostics", lambda **k: {})
-    monkeypatch.setattr(worker, "error_artifact_name", lambda *a, **k: "error.txt")
-    monkeypatch.setattr(worker, "hf_upload_file", lambda *a, **k: None)
+    monkeypatch.setattr(worker_state, "HF_REPO", "owner/run-dataset")
+    monkeypatch.setattr(hf_io, "hf_prefix", lambda: "seed0")
+    monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **k: {})
+    monkeypatch.setattr(hf_io, "error_artifact_name", lambda *a, **k: "error.txt")
+    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *a, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: hb.append((a, k)))
+    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *a, **k: hb.append((a, k)))
 
     done_marker = tmp_path / "DONE"
     done_marker.write_text("")
@@ -226,7 +232,7 @@ def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_p
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
 
-    with pytest.raises(worker.RetriableInfraError):
+    with pytest.raises(worker_perf.RetriableInfraError):
         worker.main()
     assert exited["v"] is False, "must not hard-exit when the replay read failed"
     err_hbs = [k for _a, k in hb if k.get("retriable") is True]
@@ -240,12 +246,12 @@ def test_idempotency_metrics_reread_backoff_stops_at_run_deadline(monkeypatch, t
 
     monkeypatch.setenv("FLASH_RUN_DEADLINE_AT", "101.0")
     monkeypatch.setattr(worker.os, "_exit", lambda code=0: (_ for _ in ()).throw(_HardExit(code)))
-    monkeypatch.setattr(worker, "HF_REPO", "owner/run-dataset")
-    monkeypatch.setattr(worker, "hf_prefix", lambda: "seed0")
-    monkeypatch.setattr(worker, "gpu_diagnostics", lambda **_kwargs: {})
-    monkeypatch.setattr(worker, "error_artifact_name", lambda *_args, **_kwargs: "error.txt")
-    monkeypatch.setattr(worker, "hf_upload_file", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(worker, "heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_state, "HF_REPO", "owner/run-dataset")
+    monkeypatch.setattr(hf_io, "hf_prefix", lambda: "seed0")
+    monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
+    monkeypatch.setattr(hf_io, "error_artifact_name", lambda *_args, **_kwargs: "error.txt")
+    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.time, "time", lambda: clock["now"])
 
     def sleep(seconds):
@@ -264,7 +270,7 @@ def test_idempotency_metrics_reread_backoff_stops_at_run_deadline(monkeypatch, t
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
 
-    with pytest.raises(worker.RetriableInfraError) as exc_info:
+    with pytest.raises(worker_perf.RetriableInfraError) as exc_info:
         worker.main()
 
     assert downloads == ["seed0/DONE", "seed0/metrics.json"]
@@ -284,7 +290,7 @@ def test_worker_does_not_hard_exit_on_failure(monkeypatch):
     def boom():
         raise ValueError("train blew up")
 
-    monkeypatch.setattr(worker, "run_sft", boom)
+    monkeypatch.setattr(sft_entry, "run_sft", boom)
 
     raised_value_error = False
     try:

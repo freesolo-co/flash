@@ -7,13 +7,13 @@ import pytest
 from flash.serve.app.manifest import build_serving_manifest
 from flash.serve.control import ModalPlacement, ModalProviderHandle
 from flash.serve.provisioning import DeploymentBundle, ServingImage
-from flash.serve.provisioning._modal_plan import build_modal_create_plan
-from flash.serve.provisioning._modal_resources import (
+from flash.serve.provisioning.modal.execution.sdk import ModalAppObservation, ModalObservation
+from flash.serve.provisioning.modal.planning.plan import build_modal_create_plan
+from flash.serve.provisioning.modal.planning.resources import (
     ModalResourceConflict,
     deployed_app_matches,
     exact_teardown_resources,
 )
-from flash.serve.provisioning._modal_sdk import ModalAppObservation, ModalObservation
 from tests.test_serve_app_manifest import _spec_and_inputs
 
 APP_ID = "ap-" + "A" * 22

@@ -10,19 +10,20 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from flash.serving.src import adapter_routes
-from flash.serving.src.adapter_routes import remove_adapter
-from flash.serving.src.persistence import (
-    PersistenceConflict,
-    PersistenceRecordError,
-    PersistenceReferenceError,
-)
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import (
+from flash.serving.src.http import adapter_routes
+from flash.serving.src.http.adapter_routes import remove_adapter
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.io.schemas import (
     AdapterRecord,
     ImmutableAdapterRegistration,
     PersistedAdapterRecord,
     internal_adapter_payload,
+)
+from flash.serving.src.store.persistence import (
+    PersistenceConflict,
+    PersistenceRecordError,
+    PersistenceReferenceError,
 )
 from tests.serving.conftest import attest
 
@@ -224,8 +225,8 @@ class FakePool:
         *,
         expected_checkpoint: str | None = None,
     ):
-        del base_model, payload, record, expected_checkpoint
-        yield {"type": "ready", "checkpoint": ""}
+        del base_model, payload, expected_checkpoint
+        yield attest(record, {"type": "ready", "checkpoint": ""})
         yield {"type": "final", "prompt_tokens": 1, "completion_tokens": 1}
 
 
@@ -234,10 +235,14 @@ def setup(monkeypatch):
     persistence = MemoryPersistence()
     pool = FakePool()
     router = AdapterRouter()
-    monkeypatch.setattr("flash.serving.src.persistence.get_adapter", persistence.get)
-    monkeypatch.setattr("flash.serving.src.persistence.list_run_adapters", persistence.list_run)
-    monkeypatch.setattr("flash.serving.src.persistence.insert_adapter", persistence.insert)
-    monkeypatch.setattr("flash.serving.src.persistence.replace_adapter_cas", persistence.replace)
+    monkeypatch.setattr("flash.serving.src.store.persistence.get_adapter", persistence.get)
+    monkeypatch.setattr(
+        "flash.serving.src.store.persistence.list_run_adapters", persistence.list_run
+    )
+    monkeypatch.setattr("flash.serving.src.store.persistence.insert_adapter", persistence.insert)
+    monkeypatch.setattr(
+        "flash.serving.src.store.persistence.replace_adapter_cas", persistence.replace
+    )
     client = TestClient(
         build_serving_app(pool, router, internal_key="secret"),
         headers=INTERNAL_HEADERS,
@@ -702,7 +707,7 @@ def test_unresolvable_org_is_permanent_not_a_retryable_outage(setup, monkeypatch
 
     # the fixture already bound src.persistence.insert_adapter, so rebind that same symbol --
     # replacing persistence.insert here would leave the router calling the fixture's original.
-    monkeypatch.setattr("flash.serving.src.persistence.insert_adapter", _reject_unknown_org)
+    monkeypatch.setattr("flash.serving.src.store.persistence.insert_adapter", _reject_unknown_org)
 
     response = _register(client, _registration(org_id="dev-org"))
 
@@ -731,9 +736,11 @@ def test_unclassified_storage_conflict_does_not_trigger_duplicate_readback(
             pytest.fail("unclassified 409 must not enter conflict readback")
 
     monkeypatch.setattr(
-        "flash.serving.src.persistence.insert_adapter", _reject_unclassified_conflict
+        "flash.serving.src.store.persistence.insert_adapter", _reject_unclassified_conflict
     )
-    monkeypatch.setattr("flash.serving.src.persistence.get_adapter", _read_required_namespaces)
+    monkeypatch.setattr(
+        "flash.serving.src.store.persistence.get_adapter", _read_required_namespaces
+    )
 
     result = _register(client, _registration())
 
@@ -1396,7 +1403,7 @@ def test_chat_completion_stream_emits_provenance_headers(setup) -> None:
 
     async def _stream(base_model, payload, record, *, expected_checkpoint=None):
         del base_model, payload, expected_checkpoint
-        yield {"type": "ready", "checkpoint": record.checkpoint}
+        yield attest(record, {"type": "ready", "checkpoint": record.checkpoint})
         yield {"type": "final", "prompt_tokens": 1, "completion_tokens": 1}
 
     pool.stream_generate = _stream
@@ -1473,8 +1480,11 @@ def test_chat_completion_stream_replay_path_reports_revision_checkpoint(setup) -
     checkpoint = f"{RUN_ID}/step-20"
 
     async def _stream_without_ready(base_model, payload, record, *, expected_checkpoint=None):
-        del base_model, payload, record, expected_checkpoint
-        yield {"type": "final", "prompt_tokens": 1, "completion_tokens": 1}
+        del base_model, payload, expected_checkpoint
+        yield attest(
+            record,
+            {"type": "final", "prompt_tokens": 1, "completion_tokens": 1},
+        )
 
     pool.stream_generate = _stream_without_ready
     with client.stream(

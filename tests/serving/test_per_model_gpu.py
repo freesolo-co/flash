@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from flash.serving.src.admission import AdmissionController, ServingOverloaded
-from flash.serving.src.model_config import (
+from flash.serving.src.engine.model_config import (
     base_models,
     configured_hard_gpu_ceiling,
     configured_router_async_capacity,
@@ -40,7 +40,7 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
 
 
 @pytest.fixture(scope="module")
-def modal_app_module():
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -53,24 +53,7 @@ def modal_app_module():
     app_mock.local_entrypoint.side_effect = _passthrough_decorator
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    _MISSING = object()
-    prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.modal_app", _MISSING)
-    sys.modules["modal"] = modal_stub
-    # Force a fresh import UNDER the stub: if another test imported modal_app earlier (without this
-    # stub), Python would reuse the cached module and the stub wouldn't apply, making this fixture
-    # order-dependent. Drop the cached module first; the finally block restores the prior entry.
-    sys.modules.pop("flash.serving.modal_app", None)
-    import flash.serving.modal_app as modal_app  # imported after the stub is installed
-
-    try:
-        yield modal_app
-    finally:
-        for name, prev in (("modal", prev_modal), ("modal_app", prev_modal_app)):
-            if prev is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
+    return load_modal_app_under_stub(modal_stub)
 
 
 _DEVELOPMENT_CUSTOM_DOMAIN = "serve-dev.freesolo.co"
@@ -137,15 +120,13 @@ def load_dotenv(*_args, **_kwargs):
 dotenv_stub.load_dotenv = load_dotenv
 sys.modules["dotenv"] = dotenv_stub
 
-import flash.serving.modal_app as modal_app
+import flash.serving.app.modal_app as modal_app
 
 print(json.dumps({
     "mode": modal_app.SERVING_DEPLOYMENT_MODE,
     "custom_domain": modal_app.SERVING_CUSTOM_DOMAIN,
     "asgi_custom_domains": modal_stub.asgi_app.call_args.kwargs["custom_domains"],
-    "engine_min_containers": sorted({
-        call.kwargs["min_containers"] for call in modal_app.app.cls.call_args_list
-    }),
+    "min_containers": modal_app.MIN_CONTAINERS,
 }))
 """
 
@@ -180,7 +161,7 @@ def test_deployment_mode_unset_defaults_to_production_with_warm_floor() -> None:
         "mode": "production",
         "custom_domain": "",
         "asgi_custom_domains": None,
-        "engine_min_containers": [1],
+        "min_containers": 1,
     }
 
 
@@ -195,7 +176,7 @@ def test_explicit_production_mode_accepts_production_custom_domain() -> None:
         "mode": "production",
         "custom_domain": "serve.freesolo.co",
         "asgi_custom_domains": ["serve.freesolo.co"],
-        "engine_min_containers": [1],
+        "min_containers": 1,
     }
 
 
@@ -211,7 +192,7 @@ def test_development_mode_accepts_exact_custom_domain_with_warm_floor() -> None:
         "mode": "development",
         "custom_domain": _DEVELOPMENT_CUSTOM_DOMAIN,
         "asgi_custom_domains": [_DEVELOPMENT_CUSTOM_DOMAIN],
-        "engine_min_containers": [1],
+        "min_containers": 1,
     }
 
 
@@ -350,7 +331,7 @@ def test_router_secret_keeps_supabase_credentials(modal_app_module, monkeypatch)
 
 
 def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_path) -> None:
-    from flash.serving.src.registry import AdapterRegistry
+    from flash.serving.src.store.registry import AdapterRegistry
 
     revision = "a" * 40
     adapter_id = f"run-1@step-1.{revision}"
@@ -413,10 +394,10 @@ def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
 
 
 builtins.__import__ = blocked_import
-import flash.serving.src.lora_engine
+import flash.serving.src.engine.lora_engine
 
 assert "PIL" not in sys.modules
-assert "flash.serving.src.multimodal" not in sys.modules
+assert "flash.serving.src.io.multimodal" not in sys.modules
 """
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -848,7 +829,7 @@ def test_installed_modal_registers_unparameterized_exact_warm_classes() -> None:
 import inspect
 import json
 
-import flash.serving.modal_app as modal_app
+import flash.serving.app.modal_app as modal_app
 
 app_inner = next(
     value for name, value in vars(modal_app.app).items() if name.startswith("_sync_original")
@@ -897,11 +878,11 @@ print(json.dumps(observed, sort_keys=True))
 def test_changed_hosted_sources_describe_warm_policy() -> None:
     root = Path(__file__).resolve().parents[2]
     sources = (
-        root / "flash/serving/modal_app.py",
-        root / "flash/serving/src/context.py",
-        root / "flash/serving/src/lora_engine.py",
-        root / "flash/serving/src/routing.py",
-        root / "flash/serving/README.md",
+        root / "flash/serving/app/modal_app.py",
+        root / "flash/serving/src/http/context.py",
+        root / "flash/serving/src/engine/lora_engine.py",
+        root / "flash/serving/src/http/routing.py",
+        root / "flash/serving/app/README.md",
     )
     forbidden = (
         "scale" + "-to-zero",
@@ -921,15 +902,12 @@ def test_changed_hosted_sources_describe_warm_policy() -> None:
     }
     assert hits == {}
 
-    readme = (root / "flash/serving/README.md").read_text(encoding="utf-8")
+    readme = (root / "flash/serving/app/README.md").read_text(encoding="utf-8")
     assert len(base_models()) == 2
     assert "current two-model catalog" in readme
     assert f"warm floor of {configured_warm_container_floor()} GPU containers" in readme
     assert f"hard ceiling of {configured_hard_gpu_ceiling()}" in readme
     assert f"`max_inputs={configured_router_async_capacity()}`" in readme
-    assert f"derived warm floor is {configured_warm_container_floor()} GPU containers" in readme
-    assert f"hard ceiling\nis {configured_hard_gpu_ceiling()}" in readme
-    assert f"router bound of {configured_router_async_capacity()} inputs" in readme
 
 
 def test_health_reports_pinned_gpu_over_derived_tier(modal_app_module):
@@ -958,7 +936,7 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
     """_health must advertise the EFFECTIVE context limit. The 35B MoE overrides max_model_len via its
     per-model engine override, so health must report that — not the global default — or monitoring
     misreports the context window vLLM actually serves."""
-    from flash.serving.src import settings as cfg
+    from flash.serving.src.store import settings as cfg
 
     impl = modal_app_module._LoraEngineImpl
 
@@ -977,7 +955,7 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
 
 
 def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
-    from flash.serving.src import model_config
+    from flash.serving.src.engine import model_config
 
     mod = modal_app_module
     monkeypatch.setattr(model_config, "base_models", lambda: ["ok", "boom"])
@@ -995,14 +973,14 @@ def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
             return "ok"
 
     def _from_name(_app_name: str, cls_name: str):
-        model = cls_name.removeprefix("LoraEngine_")
+        base_model = cls_name.removeprefix("LoraEngine_")
 
         def _factory():
             class _Health:
                 @staticmethod
                 def spawn():
-                    spawned.append(model)
-                    return _Handle(model)
+                    spawned.append(base_model)
+                    return _Handle(base_model)
 
             return type("Instance", (), {"health": _Health()})()
 
@@ -1017,11 +995,11 @@ def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
 
 
 def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monkeypatch):
-    """The one-warm/two-max pool dispatches through the exact per-model class."""
+    """The pool dispatches every call through the model's immutable warm class."""
     mod = modal_app_module
     bound_models: list[str] = []
-    generate_calls: list[tuple[dict, dict, str | None]] = []
-    stream_calls: list[tuple[dict, dict, str | None]] = []
+    generate_calls: list[tuple[dict, dict, str | None, str]] = []
+    stream_calls: list[tuple[dict, dict, str | None, str]] = []
     register_calls: list[tuple[dict, str | None]] = []
 
     class _Dump:
@@ -1030,20 +1008,26 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
             value: dict,
             *,
             deployment_generation: str | None = None,
+            generation_id: str | None = None,
         ) -> None:
             self.value = value
             self.deployment_generation = deployment_generation
+            self.generation_id = generation_id
 
         def model_dump(self, *, by_alias: bool) -> dict:
             assert by_alias is True
             return self.value
 
-    async def _generate(payload: dict, record: dict, checkpoint: str | None) -> dict:
-        generate_calls.append((payload, record, checkpoint))
+    async def _generate(
+        payload: dict, record: dict, checkpoint: str | None, generation_id: str
+    ) -> dict:
+        generate_calls.append((payload, record, checkpoint, generation_id))
         return {"ok": True}
 
-    async def _stream_generate(payload: dict, record: dict, checkpoint: str | None):
-        stream_calls.append((payload, record, checkpoint))
+    async def _stream_generate(
+        payload: dict, record: dict, checkpoint: str | None, generation_id: str
+    ):
+        stream_calls.append((payload, record, checkpoint, generation_id))
         yield {"delta": "hello"}
         yield {"delta": " world"}
 
@@ -1057,22 +1041,19 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
         )
         register = types.SimpleNamespace(remote=types.SimpleNamespace(aio=_register))
 
-        @property
-        def update_autoscaler(self):
-            raise AssertionError("fixed one-warm/two-max engines must not update autoscaling")
-
     engine = _FakeEngine()
 
-    def _engine_for(base_model: str):
-        def _bind():
-            bound_models.append(base_model)
-            return engine
+    def _bind():
+        bound_models.append("Qwen/Qwen3.5-9B")
+        return engine
 
-        return _bind
-
-    monkeypatch.setattr(mod, "_engine_cls_for", _engine_for)
+    monkeypatch.setattr(mod, "_engine_cls_for", lambda _base_model: _bind)
     pool = mod._ModalEnginePool()
-    payload = _Dump({"messages": [{"role": "user", "content": "hello"}]})
+    generation_id = "fsgen-00000000000000000000000000000001"
+    payload = _Dump(
+        {"messages": [{"role": "user", "content": "hello"}]},
+        generation_id=generation_id,
+    )
     record = _Dump(
         {"adapter_id": "run@step-1.sha"},
         deployment_generation="generation-1",
@@ -1115,6 +1096,7 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
             "deployment_generation": "generation-1",
         },
         "step-1",
+        generation_id,
     )
     assert generate_calls == [expected_inference_call]
     assert stream_calls == [expected_inference_call]
@@ -1152,7 +1134,7 @@ def _load_engine_and_args(
     monkeypatch.setattr(
         transformers.AutoProcessor, "from_pretrained", lambda *a, **k: fake_processor
     )
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     import vllm  # conftest stub when real vLLM is absent
 
@@ -1216,11 +1198,11 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
 
 
 def test_qwen38_candidate_immutable_args_fail_closed_when_vllm_drops_revision_support():
-    from flash.serving.src import engine_boot
-    from flash.serving.src.model_config import _QWEN38_HOSTED_CANDIDATE
+    from flash.serving.src.engine import boot
+    from flash.serving.src.engine.model_config import _QWEN38_HOSTED_CANDIDATE
 
     with pytest.raises(RuntimeError, match=r"cannot pin.*missing engine args"):
-        engine_boot._required_immutable_args(
+        boot._required_immutable_args(
             "Qwen/Qwen3.8-27B",
             _QWEN38_HOSTED_CANDIDATE["engine"],
             {"model"},

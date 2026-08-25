@@ -6,6 +6,8 @@ import importlib
 
 import pytest
 
+import flash.runner.lifecycle.state as runner_state
+
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
@@ -36,24 +38,22 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
 
-    import flash.providers.runpod.auth as runpod_keys
-    import flash.runner as runner
+    import flash.providers.runpod.client.auth as runpod_keys
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
 
     runpod_keys.reset()
-    importlib.reload(runner)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
 
-    import flash.providers as providers_mod
-    import flash.server.app as app_mod
-    import flash.server.domain.run_registry as run_registry
+    import flash.server.asgi.app as app_mod
+    import flash.server.domain.registry.runs as runs
+    from flash.providers.core import registry as providers_mod
 
     importlib.reload(app_mod)
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
-    monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
+    monkeypatch.setattr(runs, "_post", lambda *a, **k: False, raising=False)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token == _USER_TOKEN)
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
@@ -62,7 +62,7 @@ def api(tmp_path, monkeypatch):
 
 
 def test_download_env_package_endpoint_returns_package(api, monkeypatch):
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.envs as envs_mod
 
     seen: dict = {}
 
@@ -84,7 +84,7 @@ def test_download_env_package_endpoint_returns_package(api, monkeypatch):
 
 
 def test_download_env_package_endpoint_rejects_non_canonical_id(api, monkeypatch):
-    import flash.server.domain.envs as envs_mod
+    import flash.server.domain.registry.envs as envs_mod
 
     monkeypatch.setattr(
         envs_mod, "download_package", lambda **_k: pytest.fail("storage must not be touched")

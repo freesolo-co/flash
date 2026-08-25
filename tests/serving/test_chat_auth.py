@@ -11,8 +11,9 @@ import pytest
 from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.conftest import attest
 
 QWEN = "Qwen/Qwen3.5-9B"
@@ -107,10 +108,11 @@ class FakeAuthorizer:
         self.calls: list[tuple[str, str]] = []
         self._raises = raises
 
-    async def __call__(self, token: str, adapter_id: str) -> None:
+    async def __call__(self, token: str, adapter_id: str) -> str:
         self.calls.append((token, adapter_id))
         if self._raises is not None:
             raise self._raises
+        return "org-A"
 
 
 def _client(*, authorizer=None) -> TestClient:

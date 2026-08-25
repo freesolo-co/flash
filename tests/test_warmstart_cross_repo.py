@@ -7,16 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
-# The LIVE package proxy, not `import flash.engine.worker as W`. The code under test reads its
-# run-scoped globals through this same proxy (see flash/engine/worker/model/adapter.py), which
-# resolves `sys.modules['flash.engine.worker']` on every access. A module-level `import ... as W`
-# binds one package OBJECT at collection time; any earlier test that drops the package from
-# sys.modules and re-imports it (tests/test_worker_stack.py does, to re-run the import scope that
-# captures RUN_MODE/JOB_SPEC) replaces that object, and this alias keeps pointing at the dead one.
-# Patching the stale alias then sets an attribute nothing reads -- `revision` comes back None and
-# the failure is attributed to this file rather than the re-import that caused it. Patching through
-# the proxy targets whatever package the code will actually read.
-from flash.engine.worker.runtime.pkg_proxy import W
+import flash.core.catalog as catalog
+import flash.engine.worker.model.adapter as worker_adapter
+import flash.engine.worker.runtime.state as worker_state
+import flash.runner.lifecycle.preparation as runner_preparation
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as runner_submit
+import flash.runner.supervise.recovery as runner_recovery
 from tests._helpers.runner import provisioned_status
 
 _REVISION = "a" * 40
@@ -42,7 +40,7 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
         with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "wb") as fh:
             fh.write(b"fixture")
 
-    monkeypatch.setattr(W, "HF_REPO", hf_repo, raising=False)
+    monkeypatch.setattr(worker_state, "HF_REPO", hf_repo)
     monkeypatch.setattr(
         "flash.engine.worker.model.adapter._warmstart_adapter_is_loadable",
         lambda adapter_dir: (
@@ -54,7 +52,7 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
     try:
-        return calls, W._download_adapter(prefix)
+        return calls, worker_adapter._download_adapter(prefix)
     finally:
         shutil.rmtree("/tmp/evdl", ignore_errors=True)
 
@@ -78,7 +76,7 @@ def test_checkpoint_step_adapter_ref_downloads_that_step(monkeypatch):
 
 def test_worker_download_uses_pinned_source_revision(monkeypatch):
     monkeypatch.setattr(
-        W,
+        worker_state,
         "JOB_SPEC",
         SimpleNamespace(train=SimpleNamespace(init_from_adapter_revision=_REVISION)),
     )
@@ -110,7 +108,7 @@ def test_worker_download_failure_redacts_internal_storage_ref(monkeypatch, capsy
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fail_download)
     with pytest.raises(RuntimeError) as exc_info:
-        W._download_adapter(internal_ref)
+        worker_adapter._download_adapter(internal_ref)
 
     captured = capsys.readouterr()
     exposed = f"{exc_info.value}\n{captured.out}\n{captured.err}"
@@ -135,8 +133,6 @@ def _mark(monkeypatch, ref, child_run_id):
 
     import huggingface_hub
 
-    import flash.runner as R
-
     captured = {}
 
     class _FakeApi:
@@ -147,7 +143,7 @@ def _mark(monkeypatch, ref, child_run_id):
 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
     worker_spec = types.SimpleNamespace(train=types.SimpleNamespace(init_from_adapter=ref))
-    R._mark_warmstart_source(worker_spec, child_run_id)
+    runner_preparation._mark_warmstart_source(worker_spec, child_run_id)
     return captured
 
 
@@ -170,7 +166,6 @@ def test_mark_warmstart_source_noops_without_a_real_dependency(monkeypatch):
 
 def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeypatch):
     import flash.adapters.lora_rank as rank_mod
-    import flash.runner as R
     import flash.runner.results.checkpoints as checkpoints
     from flash.core.spec import JobSpec
 
@@ -182,7 +177,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
             "train": {"hf_repo": "owner/source-runs"},
         }
     )
-    source_status = provisioned_status(R, source, state="done")
+    source_status = provisioned_status(source, state="done")
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -197,7 +192,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     )
     calls = []
 
-    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
     monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
     monkeypatch.setattr(
         checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
@@ -226,8 +221,8 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
             "digest", "config", "adapter_model.safetensors", "weight:1"
         ),
     )
-    public_spec, worker_spec, identity, source_context = R._prepare_init_from_adapter(
-        child, token="token"
+    public_spec, worker_spec, identity, source_context = (
+        runner_preparation._prepare_init_from_adapter(child, token="token")
     )
 
     assert calls == [("owner/source-runs:sft/source-run", "token", _REVISION)]
@@ -246,7 +241,6 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
 
 
 def test_qwen36_adapter_is_never_reinterpreted_as_qwen38(monkeypatch):
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
     source = JobSpec.from_dict(
@@ -259,7 +253,7 @@ def test_qwen36_adapter_is_never_reinterpreted_as_qwen38(monkeypatch):
             "train": {"hf_repo": "owner/source-runs"},
         }
     )
-    source_status = provisioned_status(R, source, state="done")
+    source_status = provisioned_status(source, state="done")
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -270,14 +264,13 @@ def test_qwen36_adapter_is_never_reinterpreted_as_qwen38(monkeypatch):
             "train": {"init_from_adapter": "source-run"},
         }
     )
-    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
 
     with pytest.raises(ValueError, match=r"unsupported model 'Qwen/Qwen3\.6-27B'"):
-        R._prepare_init_from_adapter(child, token="token")
+        runner_preparation._prepare_init_from_adapter(child, token="token")
 
 
 def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
     source = JobSpec.from_dict(
@@ -290,7 +283,7 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
             "train": {"hf_repo": "owner/source-runs"},
         }
     )
-    source_status = provisioned_status(R, source, state="done")
+    source_status = provisioned_status(source, state="done")
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -301,10 +294,10 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
             "train": {"init_from_adapter": "source-run"},
         }
     )
-    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
 
     with pytest.raises(ValueError, match=r"source model_revision.*does not match target"):
-        R._prepare_init_from_adapter(child, token="token")
+        runner_preparation._prepare_init_from_adapter(child, token="token")
 
 
 class _ReachedArtifactResolution(Exception):
@@ -328,7 +321,6 @@ def test_unmanaged_source_revision_is_rejected_during_decode():
 
 def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
     """A GRPO child warm-starting from SFT inherits the source's runner-managed pin."""
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
     source = JobSpec.from_dict(
@@ -341,7 +333,7 @@ def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
             "train": {"hf_repo": "owner/source-runs"},
         }
     )
-    source_status = provisioned_status(R, source, state="done")
+    source_status = provisioned_status(source, state="done")
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -350,8 +342,10 @@ def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
             "train": {"init_from_adapter": "source-run"},
         }
     )
-    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
-    monkeypatch.setattr(R, "_internal_spec_from_status", lambda status: source, raising=False)
+    monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(
+        runner_state, "_internal_spec_from_status", lambda status: source, raising=False
+    )
 
     # stop right after the revision reconciliation with a sentinel: the artifact and rank
     # preflights below it need real HF state, and this test is only about which revision the child
@@ -372,7 +366,7 @@ def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
     # this test unable to tell them apart. A bare `raises(Exception)` has the same problem -- it
     # would pass on the very mismatch this test exists to rule out.
     with pytest.raises(_ReachedArtifactResolution):
-        R._prepare_init_from_adapter_inner(child, token="token")
+        runner_preparation._prepare_init_from_adapter_inner(child, token="token")
 
 
 def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeypatch):
@@ -389,7 +383,6 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
     """
     import flash.adapters.lora_rank as rank_mod
     import flash.cost.spec as cost_spec
-    import flash.runner as R
     import flash.runner.results.checkpoints as checkpoints
     from flash.core.spec import JobSpec
 
@@ -403,7 +396,7 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
             "train": {"hf_repo": "owner/source-runs"},
         }
     )
-    source_status = provisioned_status(R, source, state="done")
+    source_status = provisioned_status(source, state="done")
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -414,17 +407,19 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
     )
     seen_revisions = []
 
-    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
     # the resolver would hit the HF API for the sha; the pin is already immutable, so echo it back
-    monkeypatch.setattr(R, "_resolve_model_revision", lambda spec, *, required=False: spec)
+    monkeypatch.setattr(
+        runner_preparation, "_resolve_model_revision", lambda spec, *, required=False: spec
+    )
 
-    real_resolve = R.resolve_model
+    real_resolve = catalog.resolve_model
 
     def spy(model_id, algorithm, model_revision=""):
         seen_revisions.append(model_revision)
         return real_resolve(model_id, algorithm)  # unpinned: no HF geometry fetch in a unit test
 
-    monkeypatch.setattr(R, "resolve_model", spy)
+    monkeypatch.setattr(catalog, "resolve_model", spy)
     monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
     monkeypatch.setattr(
         checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
@@ -452,7 +447,7 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
     )
     monkeypatch.setattr(cost_spec, "estimate_for_spec", lambda spec: SimpleNamespace(total_usd=1.0))
 
-    prepared = R.prepare_job(child)
+    prepared = runner_submit.prepare_job(child)
 
     assert seen_revisions == [_REVISION], seen_revisions
     assert prepared.worker_spec.model_revision == _REVISION
@@ -460,7 +455,7 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
     assert prepared.worker_spec.model_revision_auto is True
 
 
-def _auto_pinned_source(R, *, org_id="org-a"):
+def _auto_pinned_source(*, org_id="org-a"):
     """A completed, auto-pinned SFT source run owned by ``org_id``."""
     from flash.core.spec import JobSpec
 
@@ -475,7 +470,7 @@ def _auto_pinned_source(R, *, org_id="org-a"):
         }
     )
     status = provisioned_status(
-        R, source, state="done", billing_context={"org_id": org_id} if org_id else None
+        source, state="done", billing_context={"org_id": org_id} if org_id else None
     )
     return source, status
 
@@ -506,16 +501,18 @@ def test_revision_inheritance_refuses_a_source_the_submitter_cannot_access(monke
     Not inheriting is the whole assertion: the submission still fails, but through
     `_prepare_init_from_adapter`'s same-org error, which is the redacted path.
     """
-    import flash.runner as R
 
-    _, status = _auto_pinned_source(R, org_id="org-a")
-    monkeypatch.setattr(R, "get_status", lambda run_id: status)
+    _, status = _auto_pinned_source(org_id="org-a")
+    monkeypatch.setattr(runner_status, "get_status", lambda run_id: status)
 
     child = _unpinned_child()
     # same org -> inherited
-    assert R._inherit_warmstart_revision(child, owner_org_id="org-a").model_revision == _REVISION
+    assert (
+        runner_preparation._inherit_warmstart_revision(child, owner_org_id="org-a").model_revision
+        == _REVISION
+    )
     # different org -> untouched, and the pin never reaches sizing
-    foreign = R._inherit_warmstart_revision(child, owner_org_id="org-b")
+    foreign = runner_preparation._inherit_warmstart_revision(child, owner_org_id="org-b")
     assert foreign.model_revision == ""
     assert foreign.model_revision_auto is False
 
@@ -530,14 +527,15 @@ def test_revision_inheritance_refuses_a_tampered_source_snapshot(monkeypatch):
     values and pass. The child would then train the source adapter against base weights it was
     never created for.
     """
-    import flash.runner as R
 
-    _, status = _auto_pinned_source(R, org_id="org-a")
+    _, status = _auto_pinned_source(org_id="org-a")
     # tamper: the worker half claims a different base commit than the public half
     status.effective_preparation["worker_spec"]["model_revision"] = "b" * 40
-    monkeypatch.setattr(R, "get_status", lambda run_id: status)
+    monkeypatch.setattr(runner_status, "get_status", lambda run_id: status)
 
-    inherited = R._inherit_warmstart_revision(_unpinned_child(), owner_org_id="org-a")
+    inherited = runner_preparation._inherit_warmstart_revision(
+        _unpinned_child(), owner_org_id="org-a"
+    )
 
     assert inherited.model_revision == ""  # nothing adopted from an unverified snapshot
     assert inherited.model_revision_auto is False
@@ -556,11 +554,10 @@ def test_warm_start_preparation_refuses_a_tampered_source_snapshot(monkeypatch):
     The sibling `test_revision_inheritance_refuses_a_tampered_source_snapshot` covers the hoisted
     function and never enters this one, which is exactly why this path needs its own test.
     """
-    import flash.runner as R
 
-    _, status = _auto_pinned_source(R, org_id="org-a")
+    _, status = _auto_pinned_source(org_id="org-a")
     status.effective_preparation["worker_spec"]["model_revision"] = "b" * 40
-    monkeypatch.setattr(R, "get_status", lambda run_id: status)
+    monkeypatch.setattr(runner_status, "get_status", lambda run_id: status)
     # would be reached only if the tampered pin were adopted; getting here at all is the failure
     monkeypatch.setattr(
         "flash.adapters.lora_rank.resolve_hf_dataset_revision", lambda *_a, **_kw: "rev"
@@ -577,7 +574,9 @@ def test_warm_start_preparation_refuses_a_tampered_source_snapshot(monkeypatch):
     # refusal and rules out the sentinel -- reaching artifact resolution means the tampered pin was
     # adopted, which is the actual regression.
     with pytest.raises(ValueError, match=r"preparation failed integrity|match the public run"):
-        R._prepare_init_from_adapter_inner(_unpinned_child(), owner_org_id="org-a", token="token")
+        runner_preparation._prepare_init_from_adapter_inner(
+            _unpinned_child(), owner_org_id="org-a", token="token"
+        )
 
 
 def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
@@ -585,7 +584,6 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
 
     import flash.adapters.lora_rank as rank_mod
     import flash.cost.spec as cost_spec
-    import flash.runner as R
     import flash.runner.results.checkpoints as checkpoints
     from flash.core.spec import JobSpec
 
@@ -597,7 +595,7 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
             "train": {"hf_repo": "owner/source-runs", "max_context_tokens": 8192},
         }
     )
-    source_status = provisioned_status(R, source, state="done")
+    source_status = provisioned_status(source, state="done")
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -617,7 +615,7 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
         source_reads.append(run_id)
         return source_status
 
-    monkeypatch.setattr(R, "get_status", get_source)
+    monkeypatch.setattr(runner_status, "get_status", get_source)
     monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
     monkeypatch.setattr(
         checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
@@ -650,7 +648,7 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
 
     monkeypatch.setattr(cost_spec, "estimate_for_spec", estimate)
 
-    prepared = R.prepare_job(child)
+    prepared = runner_submit.prepare_job(child)
 
     assert prepared.public_spec.train.init_from_adapter == "source-run/step-20"
     assert (prepared.public_spec.train.lora_rank, prepared.public_spec.train.lora_alpha) == (8, 128)
@@ -668,10 +666,9 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
 
 
 def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path):
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     public = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -693,7 +690,7 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
         }
     )
     identity = {"digest": "immutable-v1"}
-    status = R.RunStatus(
+    status = runner_state.RunStatus(
         run_id="child-run",
         state="queued",
         spec=public_dict,
@@ -701,13 +698,13 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
             "worker_spec": worker.to_internal_dict(),
             "adapter_identity": identity,
             "version": 1,
-            "preparation_digest": R._preparation_digest(public, worker, identity),
+            "preparation_digest": runner_preparation._preparation_digest(public, worker, identity),
         },
     )
-    R._save_status(status)
+    runner_state._save_status(status)
 
     assert "effective_preparation" not in status.to_dict()
-    legacy_status = R.RunStatus(
+    legacy_status = runner_state.RunStatus(
         run_id="legacy-child",
         state="queued",
         spec=public.to_internal_dict(),
@@ -715,10 +712,10 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
     public_status_spec = legacy_status.to_dict()["spec"]
     assert "init_from_adapter_revision" not in public_status_spec["train"]
     assert "lora_rank" not in public_status_spec["train"]
-    with open(R.runs_file_path("child-run", ".json")) as f:
+    with open(runner_state.runs_file_path("child-run", ".json")) as f:
         stored = json.load(f)
     assert stored["effective_preparation"]["worker_spec"]["train"]["lora_rank"] == 64
-    loaded = R.get_status("child-run")
+    loaded = runner_status.get_status("child-run")
     assert "lora_rank" not in loaded.spec["train"]
     assert loaded.effective_preparation == stored["effective_preparation"]
 
@@ -733,9 +730,8 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
     ],
 )
 def test_public_status_tolerates_malformed_legacy_spec_shapes(raw_spec):
-    import flash.runner as R
 
-    status = R.RunStatus(
+    status = runner_state.RunStatus(
         run_id="legacy-run",
         state="running",
         spec=raw_spec,
@@ -750,7 +746,6 @@ def test_public_status_tolerates_malformed_legacy_spec_shapes(raw_spec):
 
 @pytest.mark.parametrize("init_ref", ["source-run", 123, 0, {}])
 def test_public_status_redacts_identifiable_warmstart_fields_from_malformed_spec(init_ref):
-    import flash.runner as R
 
     raw_spec = {
         "train": {
@@ -760,7 +755,7 @@ def test_public_status_redacts_identifiable_warmstart_fields_from_malformed_spec
         },
         "gpu": "legacy-gpu",
     }
-    status = R.RunStatus(run_id="legacy-run", state="running", spec=raw_spec)
+    status = runner_state.RunStatus(run_id="legacy-run", state="running", spec=raw_spec)
 
     public_spec = status.to_dict()["spec"]
 
@@ -780,7 +775,6 @@ def test_public_status_redacts_internal_storage_ref_on_valid_spec(stored_ref, ex
     # A worker/effective or legacy record can persist the internal storage locator (which embeds the
     # private HF repo) as a VALID spec that parses cleanly; the public status must rewrite it back to
     # the user-facing checkpoint ref instead of leaking the repo.
-    import flash.runner as R
 
     raw_spec = {
         "run_id": "child-run",
@@ -789,7 +783,7 @@ def test_public_status_redacts_internal_storage_ref_on_valid_spec(stored_ref, ex
         "gpu": {"type": "RTX 4090"},
         "train": {"init_from_adapter": stored_ref, "init_from_adapter_revision": _REVISION},
     }
-    status = R.RunStatus(run_id="child-run", state="running", spec=raw_spec)
+    status = runner_state.RunStatus(run_id="child-run", state="running", spec=raw_spec)
 
     public_spec = status.to_dict()["spec"]
 
@@ -800,10 +794,9 @@ def test_public_status_redacts_internal_storage_ref_on_valid_spec(stored_ref, ex
 
 @pytest.mark.parametrize("snapshot", [None, []])
 def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_path, snapshot):
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     public = JobSpec.from_dict(
         {
             "run_id": "legacy-child",
@@ -812,8 +805,8 @@ def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_pa
             "train": {"init_from_adapter": "source-run"},
         }
     )
-    R._save_status(
-        R.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=public.run_id,
             state="provisioning",
             spec=public.to_dict(),
@@ -822,15 +815,14 @@ def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_pa
     )
 
     with pytest.raises(ValueError, match="effective preparation"):
-        R._persist_effective_worker_spec(public)
+        runner_submit._persist_effective_worker_spec(public)
 
 
 def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path):
-    import flash.providers as providers
-    import flash.runner as R
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
-    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     public = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -850,8 +842,8 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
     )
     worker = JobSpec.from_dict(worker_dict)
     identity = {"digest": "immutable-v1"}
-    R._save_status(
-        R.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=public.run_id,
             state="provisioning",
             spec=public.to_dict(),
@@ -859,7 +851,9 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
                 "worker_spec": worker.to_internal_dict(),
                 "adapter_identity": identity,
                 "version": 1,
-                "preparation_digest": R._preparation_digest(public, worker, identity),
+                "preparation_digest": runner_preparation._preparation_digest(
+                    public, worker, identity
+                ),
             },
         )
     )
@@ -867,10 +861,10 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
     selected_dict["gpu"]["type"] = "RTX 5090"
     selected = JobSpec.from_dict(selected_dict)
 
-    assert R._persist_effective_worker_spec(selected)
-    stored = R.get_status(public.run_id)
+    assert runner_submit._persist_effective_worker_spec(selected)
+    stored = runner_status.get_status(public.run_id)
     assert stored.effective_preparation["worker_spec"]["gpu"]["type"] == "RTX 5090"
-    assert R.effective_spec_from_status(stored).gpu.type == "RTX 5090"
+    assert runner_status.effective_spec_from_status(stored).gpu.type == "RTX 5090"
 
     cleaned = []
 
@@ -882,14 +876,13 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
     # runpod configured: its gc is the one reaping the rN-suffixed endpoints this test is about.
     # (only runpod is available, so the assertion counts one gc, not three.)
     monkeypatch.setattr(providers, "available_providers", lambda: ("runpod",))
-    R._gc_run_endpoints(public)
+    runner_recovery._gc_run_endpoints(public)
 
     assert [spec.gpu.type for spec in cleaned] == ["RTX 5090"]
 
 
 def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeypatch):
     import flash.adapters.lora_rank as rank_mod
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
     public = JobSpec.from_dict(
@@ -913,7 +906,7 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
     identity = rank_mod.AdapterArtifactIdentity(
         "artifact-v1", "config-v1", "adapter_model.safetensors", "weights-v1:1"
     )
-    status = R.RunStatus(
+    status = runner_state.RunStatus(
         run_id=public.run_id,
         state="running",
         spec=public.to_dict(),
@@ -921,7 +914,9 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
             "worker_spec": worker.to_internal_dict(),
             "adapter_identity": identity.to_dict(),
             "version": 1,
-            "preparation_digest": R._preparation_digest(public, worker, identity.to_dict()),
+            "preparation_digest": runner_preparation._preparation_digest(
+                public, worker, identity.to_dict()
+            ),
         },
     )
     seen = []
@@ -942,7 +937,7 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
     monkeypatch.setattr(rank_mod, "load_hf_adapter_config", load_config)
     monkeypatch.setattr(rank_mod, "adapter_artifact_identity", lambda *a, **k: identity)
 
-    recovered = R.effective_spec_from_status(status, verify_source=True)
+    recovered = runner_status.effective_spec_from_status(status, verify_source=True)
 
     assert recovered == worker
     assert seen == [_REVISION]
@@ -963,7 +958,6 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
 def test_effective_snapshot_rejects_tampering(field, value):
     import copy
 
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
     public = JobSpec.from_dict(
@@ -990,7 +984,7 @@ def test_effective_snapshot_rejects_tampering(field, value):
         "worker_spec": copy.deepcopy(worker.to_internal_dict()),
         "adapter_identity": identity,
         "version": 1,
-        "preparation_digest": R._preparation_digest(public, worker, identity),
+        "preparation_digest": runner_preparation._preparation_digest(public, worker, identity),
     }
     target = snapshot["worker_spec"]
     if field == "rank":
@@ -1007,14 +1001,14 @@ def test_effective_snapshot_rejects_tampering(field, value):
         target["train"]["hf_repo"] = value
     else:
         target["train"]["init_from_adapter"] = value
-    status = R.RunStatus(
+    status = runner_state.RunStatus(
         run_id=public.run_id,
         state="running",
         spec=public.to_dict(),
         effective_preparation=snapshot,
     )
     with pytest.raises(ValueError, match="effective preparation"):
-        R.effective_spec_from_status(status)
+        runner_status.effective_spec_from_status(status)
 
 
 @pytest.mark.parametrize(
@@ -1022,7 +1016,6 @@ def test_effective_snapshot_rejects_tampering(field, value):
     ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"],
 )
 def test_effective_spec_rejects_persisted_removed_model_before_activation(retired_model):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
     current = JobSpec.from_dict(
@@ -1030,10 +1023,10 @@ def test_effective_spec_rejects_persisted_removed_model_before_activation(retire
     )
     stored = current.to_dict()
     stored["model"] = retired_model
-    status = runner.RunStatus(run_id="retired", state="running", spec=stored)
+    status = runner_state.RunStatus(run_id="retired", state="running", spec=stored)
 
     with pytest.raises(ValueError, match="unsupported model"):
-        runner.effective_spec_from_status(status)
+        runner_status.effective_spec_from_status(status)
 
 
 def test_worker_metrics_sanitizer_redacts_nested_and_direct_private_refs():
@@ -1063,11 +1056,10 @@ def test_worker_metrics_sanitizer_redacts_nested_and_direct_private_refs():
 
 
 def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_path):
-    import flash.runner as R
-    import flash.server.domain.run_registry as registry
+    import flash.server.domain.registry.runs as registry
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(R, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     private_ref = "private-owner/private-repo:rl/source-run"
     spec = JobSpec.from_dict(
         {
@@ -1082,7 +1074,7 @@ def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_
         "record_training_checkpoint",
         lambda **kwargs: reported.append(kwargs["metrics"]),
     )
-    R._persist_metrics(
+    runner_status._persist_metrics(
         spec,
         {
             "wall_seconds": 1,
@@ -1094,7 +1086,7 @@ def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_
             },
         },
     )
-    with open(os.path.join(R.artifacts_dir(spec), "metrics.json")) as f:
+    with open(os.path.join(runner_state.artifacts_dir(spec), "metrics.json")) as f:
         persisted = json.load(f)
     assert reported == [persisted]
     assert "private-owner" not in json.dumps(persisted)
@@ -1103,7 +1095,6 @@ def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_
 
 
 def test_legacy_warmstart_status_fails_closed_without_private_snapshot():
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
     public = JobSpec.from_dict(
@@ -1114,9 +1105,9 @@ def test_legacy_warmstart_status_fails_closed_without_private_snapshot():
             "train": {"init_from_adapter": "source-run"},
         }
     )
-    status = R.RunStatus(run_id="legacy-child", state="running", spec=public.to_dict())
+    status = runner_state.RunStatus(run_id="legacy-child", state="running", spec=public.to_dict())
     with pytest.raises(ValueError, match="original preparation snapshot is unavailable"):
-        R.effective_spec_from_status(status, verify_source=True)
+        runner_status.effective_spec_from_status(status, verify_source=True)
 
 
 @pytest.mark.parametrize("source_algorithm", ["sft", "grpo", "opd"])
@@ -1135,7 +1126,6 @@ def test_every_algorithm_pair_prepares_a_warm_start(
     resolution instead of stopping at a policy check. The sentinel IS the pass condition, exactly as
     in the sibling inheritance tests above.
     """
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
     source = JobSpec.from_dict(
@@ -1149,7 +1139,7 @@ def test_every_algorithm_pair_prepares_a_warm_start(
             "train": {"hf_repo": "owner/source-runs"},
         }
     )
-    source_status = provisioned_status(R, source, state="done")
+    source_status = provisioned_status(source, state="done")
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -1158,9 +1148,9 @@ def test_every_algorithm_pair_prepares_a_warm_start(
             "train": {"init_from_adapter": source.run_id},
         }
     )
-    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
 
-    inherited = R._inherit_warmstart_revision(child)
+    inherited = runner_preparation._inherit_warmstart_revision(child)
     assert inherited.model_revision == _REVISION
     # carried, not re-derived: a self-resolved pin reads as author-supplied and deploy refuses it.
     assert inherited.model_revision_auto is True
@@ -1179,7 +1169,7 @@ def test_every_algorithm_pair_prepares_a_warm_start(
     # WarmStartPreparationError, which would make a real rejection indistinguishable from the
     # sentinel and let this test pass on the very block it exists to rule out.
     with pytest.raises(_ReachedArtifactResolution):
-        R._prepare_init_from_adapter_inner(inherited, token="token")
+        runner_preparation._prepare_init_from_adapter_inner(inherited, token="token")
 
 
 def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
@@ -1197,11 +1187,10 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
     """
     import flash.adapters.lora_rank as rank_mod
     import flash.cost.spec as cost_spec
-    import flash.runner as R
     import flash.runner.results.checkpoints as checkpoints
     from flash.core.spec import JobSpec
 
-    source, source_status = _auto_pinned_source(R, org_id="")
+    source, source_status = _auto_pinned_source(org_id="")
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
@@ -1213,27 +1202,29 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
     )
     resolver_calls = []
 
-    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
 
     def fake_resolve(spec, *, required=False):
         resolver_calls.append((spec.model_revision, required))
         return spec
 
-    monkeypatch.setattr(R, "_resolve_model_revision", fake_resolve)
+    monkeypatch.setattr(runner_preparation, "_resolve_model_revision", fake_resolve)
     # a pinned spec makes `resolve_model` re-derive geometry from the commit, which is a live HF
     # read; size unpinned so this stays a unit test of the ordering.
-    real_resolve = R.resolve_model
+    real_resolve = catalog.resolve_model
     monkeypatch.setattr(
-        R,
+        catalog,
         "resolve_model",
         lambda model_id, algorithm, model_revision="": real_resolve(model_id, algorithm),
     )
     # sft-only preparation: the packaged dataset and its pinned env are a separate contract from
     # warm start, and profiling one here would test the profiler rather than the inheritance.
     profiled = []
-    monkeypatch.setattr(R, "_require_pinned_profile_environment", lambda spec: spec)
     monkeypatch.setattr(
-        R,
+        runner_preparation, "_require_pinned_profile_environment", lambda spec: spec
+    )
+    monkeypatch.setattr(
+        runner_preparation,
         "_require_sft_workload_profile",
         lambda spec: profiled.append(spec.model_revision) or spec,
     )
@@ -1264,7 +1255,7 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
     )
     monkeypatch.setattr(cost_spec, "estimate_for_spec", lambda spec: SimpleNamespace(total_usd=1.0))
 
-    prepared = R.prepare_job(child)
+    prepared = runner_submit.prepare_job(child)
 
     # the force-pin ran, and it was already holding the source's revision when it did.
     assert resolver_calls == [(_REVISION, True)], resolver_calls
@@ -1285,7 +1276,6 @@ def test_inherited_sft_pin_survives_the_force_pin_when_the_hub_tip_moved(monkeyp
     moves, and `_adopted_warmstart_revision` cannot repair it because the pin is already set. Stubbing
     the resolver would hide exactly that, so this test drives the real one over a moved hub.
     """
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
     moved_tip = "b" * 40
@@ -1315,7 +1305,7 @@ def test_inherited_sft_pin_survives_the_force_pin_when_the_hub_tip_moved(monkeyp
         }
     )
 
-    resolved = R._resolve_model_revision(inherited, required=True)
+    resolved = runner_preparation._resolve_model_revision(inherited, required=True)
 
     assert resolved.model_revision == _REVISION, (
         f"force-pin overwrote the inherited source pin with {resolved.model_revision!r}"
@@ -1325,7 +1315,6 @@ def test_inherited_sft_pin_survives_the_force_pin_when_the_hub_tip_moved(monkeyp
 
 def test_force_pin_still_pins_a_fresh_sft_run_to_the_hub_tip(monkeypatch):
     """The short-circuit above must not disarm the force-pin it sits in front of."""
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
     tip = "b" * 40
@@ -1349,7 +1338,7 @@ def test_force_pin_still_pins_a_fresh_sft_run_to_the_hub_tip(monkeypatch):
         }
     )
 
-    resolved = R._resolve_model_revision(fresh, required=True)
+    resolved = runner_preparation._resolve_model_revision(fresh, required=True)
 
     assert resolved.model_revision == tip
     assert resolved.model_revision_auto is True
@@ -1366,11 +1355,10 @@ def test_recovery_reproduces_a_digest_taken_before_lora_alpha_was_public(monkeyp
     """
     import hashlib
 
-    import flash.runner as R
     from flash.core.spec import JobSpec
     from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 
-    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     public = JobSpec.from_dict(
         {
             "run_id": "pre-alpha-run",
@@ -1421,8 +1409,8 @@ def test_recovery_reproduces_a_digest_taken_before_lora_alpha_was_public(monkeyp
         ).encode("utf-8")
     ).hexdigest()
 
-    R._save_status(
-        R.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=public.run_id,
             state="provisioning",
             spec=stored_public,
@@ -1436,7 +1424,7 @@ def test_recovery_reproduces_a_digest_taken_before_lora_alpha_was_public(monkeyp
         )
     )
 
-    recovered = R.effective_spec_from_status(R.get_status(public.run_id))
+    recovered = runner_status.effective_spec_from_status(runner_status.get_status(public.run_id))
     assert recovered.train.lora_rank == 32
 
 
@@ -1453,10 +1441,9 @@ def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(mon
     """
     from dataclasses import replace
 
-    import flash.runner as R
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     public = replace(
         JobSpec.from_dict(
             {
@@ -1474,8 +1461,8 @@ def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(mon
     stored_public["train"].pop("lora_alpha", None)
     assert "lora_alpha" not in stored_public["train"]
 
-    R._save_status(
-        R.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=public.run_id,
             state="provisioning",
             spec=stored_public,
@@ -1484,7 +1471,7 @@ def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(mon
                 "adapter_identity": None,
                 "version": 1,
                 "workload_profile": None,
-                "preparation_digest": R._preparation_digest(
+                "preparation_digest": runner_preparation._preparation_digest(
                     public, public, None, stored_public=stored_public
                 ),
             },
@@ -1492,13 +1479,18 @@ def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(mon
     )
     # the record recovers BEFORE the rewrite -- so a failure after it is caused by the rewrite
     # itself, not by a fixture that was never valid.
-    assert R.reallocation_spec_from_status(R.get_status(public.run_id)).train.lora_rank == 32
+    assert (
+        runner_status.reallocation_spec_from_status(
+            runner_status.get_status(public.run_id)
+        ).train.lora_rank
+        == 32
+    )
 
-    assert R._persist_effective_worker_spec(public)
+    assert runner_submit._persist_effective_worker_spec(public)
 
     # the run survives its own attach: the rewritten digest is still reproducible from the stored
     # public spec, which the rewrite left untouched.
-    recovered = R.reallocation_spec_from_status(R.get_status(public.run_id))
+    recovered = runner_status.reallocation_spec_from_status(runner_status.get_status(public.run_id))
     assert recovered.train.lora_rank == 32
 
 
@@ -1518,11 +1510,10 @@ def test_digest_matches_the_shape_the_deployed_release_writes(monkeypatch, tmp_p
     import hashlib
     from dataclasses import replace
 
-    import flash.runner as R
     from flash.core.spec import JobSpec
     from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 
-    monkeypatch.setattr(R, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = replace(
         JobSpec.from_dict(
             {
@@ -1570,11 +1561,14 @@ def test_digest_matches_the_shape_the_deployed_release_writes(monkeypatch, tmp_p
         ).encode("utf-8")
     ).hexdigest()
 
-    assert R._preparation_digest(spec, spec, None, stored_public=spec.to_dict()) == canonical_digest
+    assert (
+        runner_preparation._preparation_digest(spec, spec, None, stored_public=spec.to_dict())
+        == canonical_digest
+    )
 
     # and a record carrying that digest -- the shape production writes -- recovers on the retry path.
-    R._save_status(
-        R.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=spec.run_id,
             state="running",
             spec=spec.to_dict(),
@@ -1587,7 +1581,12 @@ def test_digest_matches_the_shape_the_deployed_release_writes(monkeypatch, tmp_p
             },
         )
     )
-    assert R.reallocation_spec_from_status(R.get_status(spec.run_id)).train.lora_rank == 32
+    assert (
+        runner_status.reallocation_spec_from_status(
+            runner_status.get_status(spec.run_id)
+        ).train.lora_rank
+        == 32
+    )
 
 
 def test_a_snapshot_written_before_the_version_key_still_recovers(monkeypatch, tmp_path):

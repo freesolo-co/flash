@@ -10,7 +10,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Protocol, Self
 
-from flash.serving.src.model_config import HostedTrafficPolicy
+from flash.serving.src.engine.model_config import HostedTrafficPolicy
 
 
 class DispatchLimit(Protocol):

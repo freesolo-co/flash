@@ -12,19 +12,21 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image, ImageOps
 
-from flash.serving.src import multimodal
-from flash.serving.src import serving_io as serving_io_module
-from flash.serving.src.engine_support import _num_prompt_tokens
-from flash.serving.src.lora_engine import _LoraEngineImpl
-from flash.serving.src.multimodal import (
+from flash.serving.src.engine.lora_engine import _LoraEngineImpl
+from flash.serving.src.engine.support import _num_prompt_tokens
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.http.router import build_serving_app as build_durable_serving_app
+from flash.serving.src.io import multimodal
+from flash.serving.src.io.multimodal import (
     MultimodalRequestError,
     has_image_blocks,
     normalize_chat_messages,
     prepare_multimodal_request,
 )
-from flash.serving.src.registry import AdapterRegistry
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.store.registry import AdapterRegistry
+from tests.serving.conftest import RecordingUsageStore
 
 QWEN = "Qwen/Qwen3.5-9B"
 QWEN_35B = "Qwen/Qwen3.6-35B-A3B"
@@ -748,8 +750,8 @@ class _Pool:
         return None
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
-    return None
+async def _allow(_token: str, _adapter_id: str) -> str:
+    return "org-1"
 
 
 def _client(base_model: str) -> tuple[TestClient, _Pool]:
@@ -821,9 +823,9 @@ def test_all_message_entry_points_validate_against_resolved_model(
     validated: list[dict[str, Any]] = []
     supports_args: list[str] = []
     limit_args: list[str] = []
-    real_validate = serving_io_module.normalize_chat_messages
-    real_supports = serving_io_module.supports_image_input
-    real_limit = serving_io_module.image_limit_for
+    real_validate = multimodal.normalize_chat_messages
+    real_supports = multimodal.supports_image_input
+    real_limit = multimodal.image_limit_for
 
     def spy_validate(messages: Any, **kwargs: Any) -> None:
         validated.append(kwargs)
@@ -837,9 +839,9 @@ def test_all_message_entry_points_validate_against_resolved_model(
         limit_args.append(base_model)
         return real_limit(base_model)
 
-    monkeypatch.setattr(serving_io_module, "normalize_chat_messages", spy_validate)
-    monkeypatch.setattr(serving_io_module, "supports_image_input", spy_supports)
-    monkeypatch.setattr(serving_io_module, "image_limit_for", spy_limit)
+    monkeypatch.setattr(multimodal, "normalize_chat_messages", spy_validate)
+    monkeypatch.setattr(multimodal, "supports_image_input", spy_supports)
+    monkeypatch.setattr(multimodal, "image_limit_for", spy_limit)
     client, pool = _client(QWEN_35B)
     response = client.post(path, json=body)
 
@@ -988,24 +990,22 @@ def test_a_refused_attestation_is_never_metered(monkeypatch) -> None:
     # already been billed for a generation we then rejected with a 502. the check has to run
     # before metering, not after it.
     _unattesting_pool(monkeypatch)
-    reported: list[dict[str, Any]] = []
-
-    async def record_usage(payload: dict[str, Any]) -> None:
-        reported.append(payload)
-
-    revision = _revision(QWEN)
-    app = build_serving_app(
+    store = RecordingUsageStore()
+    revision = _revision(QWEN).model_copy(update={"thinking": False})
+    app = build_durable_serving_app(
         _Pool(),
         AdapterRouter([revision, _alias(revision)]),
         chat_authorizer=_allow,
-        usage_reporter=record_usage,
+        usage_store=store,
     )
     client = TestClient(app, headers={"Authorization": "Bearer test"})
 
     response = client.post("/generate", json={"adapter_id": REVISION_ID, "prompt": "hi"})
 
     assert response.status_code == 502
-    assert reported == []
+    assert store.captured == []
+    assert store.finalized == []
+    assert store.failed == []
 
 
 def test_mismatched_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> None:

@@ -16,9 +16,9 @@ from types import SimpleNamespace
 
 import pytest
 
-import flash.cli.commands as commands
-import flash.cli.commands.deploy as deploy_module
-from flash.cli.commands.deploy import _alias_move_warning, cmd_deploy
+import flash.cli.commands.ops.deploy as deploy_module
+import flash.cli.ui.render as cli_render
+from flash.cli.commands.ops.deploy import _alias_move_warning, cmd_deploy
 from flash.client import ApiError, ClientError
 
 
@@ -490,8 +490,8 @@ def test_a_numeric_string_step_is_still_compared_as_a_number() -> None:
 def test_a_malformed_step_does_not_stop_the_deploy_itself(monkeypatch, capsys) -> None:
     """End to end: the deploy still goes through, with no traceback and no warning."""
     client = _Client({"run_id": "flash-1", "state": "ready", "checkpoint_step": "abc"})
-    monkeypatch.setattr(commands, "client_from_config", lambda: client)
-    monkeypatch.setattr(commands.render, "styled", lambda: False)
+    monkeypatch.setattr(deploy_module, "client_from_config", lambda: client)
+    monkeypatch.setattr(cli_render, "styled", lambda: False)
 
     assert cmd_deploy(_args("flash-1/step-50")) == 0
 
@@ -509,8 +509,8 @@ def test_deployed_state_counts_as_servable() -> None:
 def test_deploy_warns_before_it_moves_the_alias(monkeypatch, capsys) -> None:
     """After the POST the alias has already moved; the warning has to precede it."""
     client = _Client(_ready(100))
-    monkeypatch.setattr(commands, "client_from_config", lambda: client)
-    monkeypatch.setattr(commands.render, "styled", lambda: False)
+    monkeypatch.setattr(deploy_module, "client_from_config", lambda: client)
+    monkeypatch.setattr(cli_render, "styled", lambda: False)
 
     assert cmd_deploy(_args("flash-1/step-50")) == 0
 
@@ -524,8 +524,8 @@ def test_deploy_warns_before_it_moves_the_alias(monkeypatch, capsys) -> None:
 
 def test_deploy_points_at_the_explicit_checkpoint_selector(monkeypatch, capsys) -> None:
     """Naming the fix matters: `RUN/step-N` compares checkpoints without fighting over the alias."""
-    monkeypatch.setattr(commands, "client_from_config", lambda: _Client(_ready(100)))
-    monkeypatch.setattr(commands.render, "styled", lambda: False)
+    monkeypatch.setattr(deploy_module, "client_from_config", lambda: _Client(_ready(100)))
+    monkeypatch.setattr(cli_render, "styled", lambda: False)
 
     cmd_deploy(_args("flash-1/step-50"))
 
@@ -535,8 +535,8 @@ def test_deploy_points_at_the_explicit_checkpoint_selector(monkeypatch, capsys) 
 def test_a_dry_run_registers_nothing_so_it_warns_about_nothing(monkeypatch, capsys) -> None:
     """`--dry-run` never touches the alias, so a replacement warning there is false."""
     client = _Client(_ready(100))
-    monkeypatch.setattr(commands, "client_from_config", lambda: client)
-    monkeypatch.setattr(commands.render, "styled", lambda: False)
+    monkeypatch.setattr(deploy_module, "client_from_config", lambda: client)
+    monkeypatch.setattr(cli_render, "styled", lambda: False)
 
     cmd_deploy(_args("flash-1/step-50", dry_run=True))
 
@@ -546,8 +546,8 @@ def test_a_dry_run_registers_nothing_so_it_warns_about_nothing(monkeypatch, caps
 
 def test_first_deploy_of_a_run_says_nothing_about_aliases(monkeypatch, capsys) -> None:
     """A run with nothing deployed must not gain a warning about a checkpoint that does not exist."""
-    monkeypatch.setattr(commands, "client_from_config", lambda: _Client(None))
-    monkeypatch.setattr(commands.render, "styled", lambda: False)
+    monkeypatch.setattr(deploy_module, "client_from_config", lambda: _Client(None))
+    monkeypatch.setattr(cli_render, "styled", lambda: False)
 
     assert cmd_deploy(_args("flash-1/step-50")) == 0
 

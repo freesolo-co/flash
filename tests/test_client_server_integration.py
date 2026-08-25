@@ -31,6 +31,10 @@ import urllib.request
 
 import pytest
 
+import flash.providers._lifecycle.net.worker as provider_worker
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.supervise.lifecycle as runner_lifecycle
+
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
@@ -102,25 +106,22 @@ def make_client(tmp_path, monkeypatch):
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
     # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.auth as runpod_keys
+    import flash.providers.runpod.client.auth as runpod_keys
 
     runpod_keys.reset()
-
-    import flash.runner as runner
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
 
-    importlib.reload(runner)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo: _SOURCE_SNAPSHOT)
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(provider_worker, "publish_source_snapshot", lambda _repo: _SOURCE_SNAPSHOT)
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
     # Keep ``create_run`` offline: the spec is really validated and a run row is
     # really recorded, but the GPU job body is a no-op (no provisioning thread
     # work). The client request/response contract is unaffected.
-    monkeypatch.setattr(runner, "_run_job", lambda *a, **k: None)
+    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda *a, **k: None)
 
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     importlib.reload(app_mod)
     monkeypatch.setattr(
@@ -132,10 +133,10 @@ def make_client(tmp_path, monkeypatch):
     # configured_providers() treat it as live, so create_app()'s lifespan recover_runs() would
     # dispatch real sweep_orphans() list calls — and the urllib->TestClient shim below isn't installed
     # until AFTER create_app() runs. Stub the provider set to empty so startup stays hermetic.
-    import flash.providers as providers_mod
-    import flash.server.domain.environment_registry as environment_registry
-    import flash.server.domain.projects as projects_mod
-    import flash.server.domain.run_registry as run_registry
+    import flash.server.domain.registry.environment_registry as environment_registry
+    import flash.server.domain.registry.projects as projects_mod
+    import flash.server.domain.registry.runs as runs
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(environment_registry, "require_environment_project", lambda **_kwargs: None)
@@ -144,10 +145,10 @@ def make_client(tmp_path, monkeypatch):
         "require_project_access",
         lambda *, project_id, **_kwargs: project_id,
     )
-    # And the same key makes each run-status update best-effort report via run_registry._post(); with
+    # And the same key makes each run-status update best-effort report via runs._post(); with
     # the urllib shim that POST would otherwise route into THIS app (no such route) and log a 404 warn
     # on every status change. Stub it (as the other server fixtures do) to keep output clean.
-    monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
+    monkeypatch.setattr(runs, "_post", lambda *a, **k: False, raising=False)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
@@ -248,12 +249,10 @@ def test_dry_run_create_previews_on_the_server(make_client) -> None:
 
 
 def test_logs_offset_paging_roundtrip(make_client) -> None:
-    import flash.runner as runner
-
     client = make_client()
     run_id = client.create_run(SPEC)["run_id"]
 
-    log_path = os.path.join(runner.RUNS_DIR, f"{run_id}.log")
+    log_path = os.path.join(runner_state.RUNS_DIR, f"{run_id}.log")
     with open(log_path, "w") as fh:
         fh.write("first line\n")
 

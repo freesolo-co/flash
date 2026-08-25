@@ -210,9 +210,10 @@ def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
 
 
 def test_selected_candidate_replaces_the_provisional_quote(monkeypatch):
-    from flash.providers import allocator, get_provider
-    from flash.providers.base import Candidate
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate
+    from flash.providers.core.registry import get_provider
+    from flash.providers.lambda_.client import api as lambda_api
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
     monkeypatch.setattr(
@@ -330,7 +331,7 @@ def test_runconfig_from_spec_preserves_conservative_opd_turn_budget(environment,
 
 def test_quote_preparation_never_calls_live_allocate(monkeypatch):
     """A market/API failure belongs to the retrying lifecycle, never quote preparation."""
-    import flash.providers.allocator as allocator_mod
+    import flash.providers.core.allocator as allocator_mod
 
     def explode(*_args, **_kwargs):
         raise AssertionError("quote preparation called live allocate")
@@ -343,7 +344,7 @@ def test_quote_preparation_never_calls_live_allocate(monkeypatch):
 
 
 def test_explicit_vast_quote_stays_offline(monkeypatch):
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.base import get_gpu_info
     from flash.providers.vast import jobs as vast
 
     def explode(*args, **kwargs):
@@ -383,7 +384,7 @@ def test_a100_sxm_40gb_has_real_tflops_not_default():
 
 
 def test_selected_live_candidate_overrides_provisional_provider_rate_and_count():
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
 
     candidate = Candidate("vast", "H100", 2.17, 80, gpu_count=2)
     est = estimate_cost(
@@ -402,7 +403,7 @@ def test_b200_not_cheaper_or_faster_than_h200_for_grpo():
     # regression: the estimator must not advertise b200 as faster/cheaper than h200 on peak flops.
     # b200/sm100 training is h200-class (portable kernels), so at its higher $/hr b200 must never
     # come out cheaper, and never faster, than h200 for the same run.
-    from flash.providers.base import GPU_INFO
+    from flash.providers.core.base import GPU_INFO
 
     h200 = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 100, gpu_type="H200"))
     b200 = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 100, gpu_type="B200"))
@@ -485,7 +486,7 @@ def test_auto_sizing_only_considers_cards_the_pinned_provider_can_rent():
     requirement it claimed could not be met, while 2x80 GB vast cards would have fit.
     """
     from flash.cost.analytical import _offline_gpu_shape
-    from flash.providers.base import providers_for
+    from flash.providers.core.base import providers_for
 
     gpu, _need, count, _provider, _hourly = _offline_gpu_shape(
         RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 10, provider="vast")
@@ -631,7 +632,7 @@ def test_the_offline_probe_sizes_a_pinned_catalog_model_by_its_revision(monkeypa
 
 
 def test_allocator_selected_gpu_count_renders_and_applies_speedup():
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
 
     # 50 steps, not 150: a long 4B grpo run exceeds the 24h wall cap, and a clamped run reports
     # the cap's runtime on every shape, so the speedup assertion below would fail on equality even
@@ -870,8 +871,8 @@ def test_multi_card_quote_states_pooled_vram_not_per_card():
     "180 GB; run needs >= 199 GB" on a shape that had just PASSED the gate -- a quote that reads
     as a rejection of the hardware it recommends.
     """
-    from flash.providers.base import Candidate
-    from flash.providers.sharding import combined_vram_gb
+    from flash.providers.core.base import Candidate
+    from flash.providers.core.sharding import combined_vram_gb
 
     config = RunConfig("Qwen/Qwen3.5-9B", "grpo", 50, gpu_count=2)
     two = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
@@ -888,7 +889,7 @@ def test_multi_card_quote_states_pooled_vram_not_per_card():
 
 def test_single_card_quote_keeps_the_plain_vram_spelling():
     """One card offers exactly itself, so the pooled wording must not appear."""
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
 
     one = estimate_cost(
         RunConfig("Qwen/Qwen3.5-9B", "grpo", 50),
@@ -905,7 +906,7 @@ def test_themed_panel_and_breakdown_agree_on_the_vram_clause():
     import os
 
     from flash.cli.ui import render
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
 
     two = estimate_cost(
         RunConfig("Qwen/Qwen3.5-9B", "grpo", 50, gpu_count=2),
@@ -935,7 +936,7 @@ def test_panel_and_breakdown_agree_when_executed_width_is_below_the_billed_count
     import os
 
     from flash.cli.ui import render
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
 
     narrow = RunConfig(
         "Qwen/Qwen3.5-9B", "sft", 10, gpu_count=3, batch_size=2, sft_retained_examples=2
@@ -970,7 +971,7 @@ def test_remedy_pool_is_narrowed_by_a_hard_provider_pin_not_a_soft_preference():
     borrow RunPod's freedom to rent arbitrary card counts and get sent to a wider SKU its pin may
     not carry.
     """
-    from flash.providers.fit_errors import widenable_gpu_names
+    from flash.providers.core.fit_errors import widenable_gpu_names
 
     assert widenable_gpu_names(("B200",), None) == ("B200",)
     assert widenable_gpu_names(("B200",), ("runpod",)) == ("B200",)
@@ -986,8 +987,8 @@ def test_offered_vram_credits_only_the_ranks_that_join_the_run():
     launches a single rank on two rented cards was told it had 130 GB when the gate valued 80.
     """
     from flash.cost.analytical import executed_gpu_count
-    from flash.providers.base import Candidate
-    from flash.providers.sharding import combined_vram_gb
+    from flash.providers.core.base import Candidate
+    from flash.providers.core.sharding import combined_vram_gb
 
     narrow = RunConfig("Qwen/Qwen3.5-9B", "sft", 10, batch_size=1, sft_retained_examples=1)
     est = estimate_cost(narrow, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
@@ -1010,7 +1011,7 @@ def test_offered_vram_credits_only_the_ranks_that_join_the_run():
 
 def test_unstamped_executed_count_falls_back_to_the_billed_count():
     """A hand-built estimate that never stamped the width must not read as a single rank."""
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
 
     est = estimate_cost(
         RunConfig("Qwen/Qwen3.5-9B", "grpo", 50, gpu_count=2),

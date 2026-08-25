@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
-from flash.serving.src.model_config import hosted_traffic_policy_for
+from flash.serving.src.engine.model_config import hosted_traffic_policy_for
 
 CAPACITY_SNAPSHOT_MAX_AGE_SECONDS = 2.0
 CAPACITY_POLL_INTERVAL_SECONDS = 0.5

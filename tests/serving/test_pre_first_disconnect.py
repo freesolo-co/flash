@@ -2,24 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from fastapi import Request
-from starlette.requests import ClientDisconnect
 
-from flash.serving.src import inference_routes
-from flash.serving.src.admission import AdmissionController, AdmissionLease
-from flash.serving.src.inference_routes import (
+from flash.serving.src.accounting.usage import (
+    AuthorizedTraffic,
+    build_usage_session,
+    principal_for_external_org,
+)
+from flash.serving.src.accounting.usage_outbox import RequestIdentity
+from flash.serving.src.admission import AdmissionLease
+from flash.serving.src.http import inference_routes
+from flash.serving.src.http.context import ServingContext
+from flash.serving.src.http.inference_routes import (
     _discard_prepared_stream,
-    _LeasedAsyncIterator,
     _stream_chat_completion,
 )
-from flash.serving.src.model_config import hosted_traffic_policy_for
-from flash.serving.src.routing import AdapterRouter
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
-from flash.serving.src.serving_io import _sse
-from flash.serving.src.streaming import openai_chat_stream, prepare_stream
+from flash.serving.src.http.routing import AdapterRouter
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.streaming import openai_chat_stream, prepare_stream
+from tests.serving.conftest import RecordingUsageStore
 
 QWEN = "Qwen/Qwen3.5-9B"
 
@@ -46,27 +51,10 @@ def _record() -> AdapterRecord:
     )
 
 
-def _scope(spec_version: str = "2.3") -> dict[str, Any]:
-    return {
-        "type": "http",
-        "asgi": {"spec_version": spec_version},
-        "method": "POST",
-        "path": "/v1/chat/completions",
-        "headers": [],
-    }
-
-
-def _request(receive) -> Request:
-    return Request(_scope(), receive)
-
-
 def _lease() -> AdmissionLease:
     class Controller:
-        def __init__(self) -> None:
-            self.releases = 0
-
         def _release(self, _model: str) -> None:
-            self.releases += 1
+            return None
 
     return AdmissionLease(Controller(), QWEN, queue_duration_seconds=0.0)
 
@@ -76,6 +64,48 @@ def _admission_headers() -> dict[str, str]:
         "X-Freesolo-Queue-Duration-Seconds": "0.000000",
         "X-Freesolo-Application-Active": "1",
         "X-Freesolo-Application-Pending": "0",
+    }
+
+
+def _request(receive) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "asgi": {"spec_version": "2.3"},
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+        },
+        receive,
+    )
+
+
+async def _wait_event_or_task(event: asyncio.Event, task: asyncio.Task[Any]) -> None:
+    event_wait = asyncio.create_task(event.wait())
+    done, _ = await asyncio.wait({event_wait, task}, return_when=asyncio.FIRST_COMPLETED)
+    if task in done:
+        event_wait.cancel()
+        await asyncio.gather(event_wait, return_exceptions=True)
+        task.result()
+        raise AssertionError("route completed before the expected event")
+    await event_wait
+
+
+def _ready(record: AdapterRecord, generation_id: str) -> dict[str, Any]:
+    return {
+        "type": "ready",
+        "checkpoint": record.checkpoint,
+        "thinking": False,
+        "prompt_token_ids": [1, 2],
+        "completion_token_ids": [],
+        "prompt_tokens": 2,
+        "completion_tokens": 0,
+        "cached_tokens": 0,
+        "cached_tokens_reported": True,
+        "reasoning_tokens": 0,
+        "request_id": generation_id,
+        "engine_replica_id": "replica-1",
+        "lora_request_adapter": record.adapter_id,
     }
 
 
@@ -95,7 +125,10 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
             lookup = Lookup()
 
             async def authorize_inference(self, *_args):
-                return "org-1"
+                return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
+
+            def reject_unsettleable_thinking(self, *_args) -> None:
+                return None
 
             async def acquire_admission(self, _model: str) -> AdmissionLease:
                 return _lease()
@@ -116,11 +149,10 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
         async def receive():
             return await messages.get()
 
-        context = Context()
         monkeypatch.setattr(
             inference_routes.ServingContext,
             "of",
-            staticmethod(lambda _request: context),
+            staticmethod(lambda _request: Context()),
         )
         request = _request(receive)
         if route == "generate":
@@ -140,67 +172,62 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
                 request,
             )
         task = asyncio.create_task(awaitable)
-        await entered.wait()
+        await _wait_event_or_task(entered, task)
         await messages.put({"type": "http.disconnect"})
-        done, _ = await asyncio.wait({task}, timeout=0.2)
-        cancelled_before_cleanup = cancelled.is_set()
-        if not done:
-            task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        return bool(done), cancelled_before_cleanup
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1)
+        return task.done(), cancelled.is_set()
 
     completed, generation_cancelled = asyncio.run(scenario())
-    assert completed, "the handler kept generating after the peer disconnected"
-    assert generation_cancelled, "the handler returned without cancelling generation"
+    assert completed
+    assert generation_cancelled
 
 
 @pytest.mark.parametrize("route", ["generate", "generate_for_adapter", "chat_completions"])
-def test_queued_disconnect_never_dispatches_or_leaks_admission(monkeypatch, route: str) -> None:
-    async def scenario() -> tuple[int, int, int, int]:
+def test_non_streaming_disconnect_after_engine_completion_finishes_finalization_once(
+    monkeypatch, route: str
+) -> None:
+    async def scenario() -> tuple[Any, RecordingUsageStore]:
+        finalization_entered = asyncio.Event()
+        release_finalization = asyncio.Event()
         messages: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         record = _record()
-        controller = AdmissionController(
-            hosted_traffic_policy_for,
-            lambda model: 1 if model == QWEN else 0,
-        )
-        active = await controller.acquire(QWEN)
+        store = RecordingUsageStore()
+
+        async def blocking_finalize(event) -> None:
+            finalization_entered.set()
+            await release_finalization.wait()
+            store.finalized.append(event)
+
+        store.finalize = blocking_finalize  # type: ignore[method-assign]
 
         class Lookup:
             async def resolve(self, _adapter_id: str):
                 return record, record
 
-        class Context:
-            lookup = Lookup()
-
-            def __init__(self) -> None:
-                self.pool_calls = 0
-                self.usage_reports = 0
-
+        class Context(ServingContext):
             async def authorize_inference(self, *_args):
-                return "org-1"
+                return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
 
-            async def acquire_admission(self, model: str) -> AdmissionLease:
-                return await controller.acquire(model)
+        context = Context(
+            object(),  # type: ignore[arg-type]
+            AdapterRouter([record]),
+            Lookup(),  # type: ignore[arg-type]
+            store,
+            internal_key=None,
+            deployment_id="deployment-1",
+            serving_release="release-1",
+            reload_records=None,
+            lookup_record=None,
+            chat_authorizer=None,
+        )
 
-            def admission_headers(self, model: str, lease: AdmissionLease) -> dict[str, str]:
-                snapshot = controller.snapshot(model)
-                return {
-                    "X-Freesolo-Queue-Duration-Seconds": f"{lease.queue_duration_seconds:.6f}",
-                    "X-Freesolo-Application-Active": str(snapshot.active),
-                    "X-Freesolo-Application-Pending": str(snapshot.queued),
-                }
-
-            async def generate(self, *_args, **_kwargs):
-                self.pool_calls += 1
-                raise AssertionError("a disconnected queued request reached the pool")
-
-            def schedule_usage(self, *_args, **_kwargs) -> None:
-                self.usage_reports += 1
+        async def completed_generation(*_args, generation_id: str, **_kwargs):
+            return _ready(record, generation_id)
 
         async def receive():
             return await messages.get()
 
-        context = Context()
+        monkeypatch.setattr("flash.serving.src.http.context.generate_once", completed_generation)
         monkeypatch.setattr(
             inference_routes.ServingContext,
             "of",
@@ -224,31 +251,26 @@ def test_queued_disconnect_never_dispatches_or_leaks_admission(monkeypatch, rout
                 request,
             )
         task = asyncio.create_task(awaitable)
-        deadline = asyncio.get_running_loop().time() + 1.0
-        while controller.snapshot(QWEN).queued != 1:
-            assert not task.done()
-            assert asyncio.get_running_loop().time() < deadline
-            await asyncio.sleep(0)
+        await _wait_event_or_task(finalization_entered, task)
         await messages.put({"type": "http.disconnect"})
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        queued_after_disconnect = controller.snapshot(QWEN).queued
-        active.release()
-        return (
-            context.pool_calls,
-            context.usage_reports,
-            queued_after_disconnect,
-            controller.snapshot(QWEN).active,
-        )
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_finalization.set()
+        result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1)
+        return result[0], store
 
-    assert asyncio.run(scenario()) == (0, 0, 0, 0)
+    result, store = asyncio.run(scenario())
+
+    assert isinstance(result, asyncio.CancelledError)
+    assert len(store.finalized) == 1
+    assert store.failed == []
 
 
 class _Context:
-    def __init__(self, pool: Any, record: AdapterRecord) -> None:
+    def __init__(self, pool: Any, record: AdapterRecord, store: RecordingUsageStore) -> None:
         self.pool = pool
         self.router = AdapterRouter([record])
-        self.reports: list[dict[str, Any]] = []
+        self.store = store
         self.chat_stream_calls = 0
 
     async def prepare_stream(
@@ -257,6 +279,7 @@ class _Context:
         requested: AdapterRecord,
         target: AdapterRecord,
         *,
+        generation_id: str,
         expected_checkpoint: str | None,
     ):
         return await prepare_stream(
@@ -265,25 +288,47 @@ class _Context:
             payload,
             requested,
             target,
+            generation_id=generation_id,
+            require_generation_id=True,
             expected_checkpoint=expected_checkpoint,
         )
 
-    def schedule_usage(
-        self, _record: AdapterRecord, usage: dict[str, Any], _caller_org: str | None
-    ) -> None:
-        self.reports.append(usage.copy())
+    def usage_session(self, identity, traffic, requested, target, first, admitted_at):
+        return build_usage_session(
+            self.store,
+            identity,
+            traffic.principal,
+            requested,
+            target,
+            first,
+            deployment_id="deployment-1",
+            serving_release="release-1",
+            captured_at=admitted_at,
+        )
 
     def chat_stream(self, **kwargs):
         self.chat_stream_calls += 1
-        return openai_chat_stream(self.router, self.schedule_usage, **kwargs)
+        return openai_chat_stream(self.router, **kwargs)
+
+
+def _identity() -> RequestIdentity:
+    return RequestIdentity(
+        request_id="fsgen-00000000000000000000000000000001",
+        correlation_id="correlation-1",
+    )
+
+
+def _traffic() -> AuthorizedTraffic:
+    return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
 
 
 def test_disconnect_before_first_event_closes_engine_without_starting_response_body() -> None:
-    async def scenario() -> tuple[bool, bool, int, list[dict[str, Any]]]:
+    async def scenario() -> tuple[bool, bool, int]:
         entered = asyncio.Event()
         closed = asyncio.Event()
         messages: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         record = _record()
+        store = RecordingUsageStore()
 
         class Events:
             def __aiter__(self):
@@ -304,7 +349,7 @@ def test_disconnect_before_first_event_closes_engine_without_starting_response_b
         async def receive():
             return await messages.get()
 
-        context = _Context(Pool(), record)
+        context = _Context(Pool(), record, store)
         task = asyncio.create_task(
             _stream_chat_completion(
                 context,
@@ -316,460 +361,143 @@ def test_disconnect_before_first_event_closes_engine_without_starting_response_b
                 completion_id="chatcmpl-disconnect",
                 created=123,
                 include_usage=True,
-                caller_org="org-1",
+                identity=_identity(),
+                traffic=_traffic(),
+                admitted_at=datetime.now(UTC),
                 lease=_lease(),
                 admission_headers=_admission_headers(),
             )
         )
-        await entered.wait()
+        await _wait_event_or_task(entered, task)
         await messages.put({"type": "http.disconnect"})
-        done, _ = await asyncio.wait({task}, timeout=0.2)
-        if not done:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            return False, closed.is_set(), context.chat_stream_calls, context.reports
-        try:
-            await task
-        except asyncio.CancelledError:
-            disconnected = True
-        except Exception:
-            disconnected = False
-        else:
-            disconnected = False
-        return disconnected, closed.is_set(), context.chat_stream_calls, context.reports
+        result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1)
+        return (
+            isinstance(result[0], asyncio.CancelledError),
+            closed.is_set(),
+            context.chat_stream_calls,
+        )
 
-    disconnected, closed, chat_stream_calls, reports = asyncio.run(scenario())
-    assert disconnected, "the handler did not cancel when the peer disconnected"
-    assert closed, "the cancelled preparation left the engine iterator suspended"
-    assert chat_stream_calls == 0, "a response body was built after the peer disconnected"
-    assert reports == [], "a request cancelled before any usage event must not be billed"
+    disconnected, closed, chat_stream_calls = asyncio.run(scenario())
+    assert disconnected
+    assert closed
+    assert chat_stream_calls == 0
 
 
-def test_disconnect_after_first_event_closes_engine_and_preserves_partial_usage() -> None:
-    async def scenario() -> tuple[bool, list[dict[str, Any]]]:
+def test_discard_prepared_stream_persists_ready_failure_and_closes_iterator() -> None:
+    async def scenario() -> tuple[RecordingUsageStore, bool]:
         closed = asyncio.Event()
         record = _record()
+        store = RecordingUsageStore()
+        identity = _identity()
+        first = _ready(record, identity.request_id)
+        session = build_usage_session(
+            store,
+            identity,
+            _traffic().principal,
+            record,
+            record,
+            first,
+            deployment_id="deployment-1",
+            serving_release="release-1",
+            captured_at=datetime.now(UTC),
+        )
 
         async def events():
             try:
-                yield {
-                    "type": "ready",
-                    "prompt_tokens": 4,
-                    "completion_tokens": 1,
-                    "request_id": "req-raced-disconnect",
-                }
+                yield first
                 await asyncio.Event().wait()
             finally:
                 closed.set()
 
-        context = _Context(object(), record)
-        prepared = events()
-        await _discard_prepared_stream(context, record, "org-1", prepared)
-        return closed.is_set(), context.reports
+        await _discard_prepared_stream(session, events())
+        return store, closed.is_set()
 
-    closed, reports = asyncio.run(scenario())
-    assert closed, "a prepared stream abandoned by a raced disconnect was not closed"
-    assert reports == [
-        {
-            "type": "ready",
-            "prompt_tokens": 4,
-            "completion_tokens": 1,
-            "request_id": "req-raced-disconnect",
-        }
-    ]
+    store, closed = asyncio.run(scenario())
+    assert closed
+    assert len(store.failed) == 1
+    assert store.failed[0][1] == "client_disconnected"
 
 
-def test_first_event_failure_closes_engine_iterator() -> None:
+@pytest.mark.parametrize("failure", ["generation_id", "attestation"])
+def test_post_first_validation_failure_closes_engine_iterator(failure: str) -> None:
     async def scenario() -> bool:
         closed = asyncio.Event()
-        receive_block = asyncio.Event()
         record = _record()
+        generation_id = _identity().request_id
+        first = _ready(record, generation_id)
+        if failure == "generation_id":
+            first["request_id"] = "fsgen-00000000000000000000000000000002"
+        else:
+            first["lora_request_adapter"] = "wrong-adapter"
 
-        class Events:
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                raise RuntimeError("first event failed")
-
-            async def aclose(self) -> None:
+        async def events():
+            try:
+                yield first
+            finally:
                 closed.set()
 
         class Pool:
             def stream_generate(self, *_args, **_kwargs):
-                return Events()
+                return events()
 
-        async def receive():
-            await receive_block.wait()
-            return {"type": "http.disconnect"}
-
-        context = _Context(Pool(), record)
-        with pytest.raises(RuntimeError, match="first event failed"):
-            await _stream_chat_completion(
-                context,
-                _request(receive),
+        with pytest.raises((RuntimeError, Exception)):
+            await prepare_stream(
+                Pool(),
+                AdapterRouter([record]),
                 GenerateRequest(adapter_id=record.adapter_id, prompt="hi"),
                 record,
                 record,
-                adapter_id=record.adapter_id,
-                completion_id="chatcmpl-failed",
-                created=123,
-                include_usage=True,
-                caller_org="org-1",
-                lease=_lease(),
-                admission_headers=_admission_headers(),
+                generation_id=generation_id,
+                require_generation_id=True,
+                expected_checkpoint=None,
             )
         return closed.is_set()
 
-    assert asyncio.run(scenario()), "a failed first advance leaked the engine iterator"
+    assert asyncio.run(scenario())
 
 
-def test_leased_iterator_explicit_close_before_first_advance_closes_and_releases_once() -> None:
-    async def scenario() -> tuple[int, bool]:
-        closed = False
-
-        class Events:
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                raise AssertionError("unstarted close must not advance the iterator")
-
-            async def aclose(self) -> None:
-                nonlocal closed
-                closed = True
-
-        lease = _lease()
-        owned = _LeasedAsyncIterator(Events(), lease)
-        await owned.aclose()
-        await owned.aclose()
-        return lease._controller.releases, closed
-
-    releases, closed = asyncio.run(scenario())
-    assert closed
-    assert releases == 1
-
-
-def test_leased_iterator_explicit_close_after_first_event_closes_and_releases_once() -> None:
-    async def scenario() -> tuple[bytes, int, bool]:
-        closed = False
-
-        class Events:
-            def __init__(self) -> None:
-                self.sent = False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if self.sent:
-                    await asyncio.Event().wait()
-                self.sent = True
-                return b"event"
-
-            async def aclose(self) -> None:
-                nonlocal closed
-                closed = True
-
-        lease = _lease()
-        owned = _LeasedAsyncIterator(Events(), lease)
-        first = await anext(owned)
-        await owned.aclose()
-        await owned.aclose()
-        return first, lease._controller.releases, closed
-
-    first, releases, closed = asyncio.run(scenario())
-    assert first == b"event"
-    assert closed
-    assert releases == 1
-
-
-def test_leased_iterator_normal_completion_releases_once() -> None:
-    async def scenario() -> tuple[list[bytes], int]:
-        async def events():
-            yield b"one"
-            yield b"two"
-
-        lease = _lease()
-        owned = _LeasedAsyncIterator(events(), lease)
-        chunks = [chunk async for chunk in owned]
-        await owned.aclose()
-        return chunks, lease._controller.releases
-
-    chunks, releases = asyncio.run(scenario())
-    assert chunks == [b"one", b"two"]
-    assert releases == 1
-
-
-def test_leased_iterator_midstream_error_closes_and_releases_once() -> None:
-    async def scenario() -> tuple[int, bool]:
-        closed = False
-
-        class Events:
-            def __init__(self) -> None:
-                self.sent = False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if not self.sent:
-                    self.sent = True
-                    return b"partial"
-                raise RuntimeError("engine stream failed")
-
-            async def aclose(self) -> None:
-                nonlocal closed
-                closed = True
-
-        lease = _lease()
-        owned = _LeasedAsyncIterator(Events(), lease)
-        assert await anext(owned) == b"partial"
-        with pytest.raises(RuntimeError, match="engine stream failed"):
-            await anext(owned)
-        return lease._controller.releases, closed
-
-    releases, closed = asyncio.run(scenario())
-    assert closed
-    assert releases == 1
-
-
-def test_leased_iterator_cancellation_closes_and_releases_once() -> None:
-    async def scenario() -> tuple[int, bool]:
-        entered = asyncio.Event()
-        closed = False
-
-        class Events:
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                entered.set()
-                await asyncio.Event().wait()
-                raise StopAsyncIteration
-
-            async def aclose(self) -> None:
-                nonlocal closed
-                closed = True
-
-        lease = _lease()
-        owned = _LeasedAsyncIterator(Events(), lease)
-        task = asyncio.create_task(anext(owned))
-        await entered.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        return lease._controller.releases, closed
-
-    releases, closed = asyncio.run(scenario())
-    assert closed
-    assert releases == 1
-
-
-def test_asgi_24_send_failure_closes_stream_and_releases_lease_once() -> None:
-    async def scenario() -> tuple[int, int]:
-        closes = 0
-
-        class Events:
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                return b"event"
-
-            async def aclose(self) -> None:
-                nonlocal closes
-                closes += 1
-
-        lease = _lease()
-        body = inference_routes._LeasedAsyncIterator(Events(), lease)
-        response = inference_routes._ClosingStreamingResponse(body)
-
-        async def receive():
-            await asyncio.Event().wait()
-
-        async def send(message: dict[str, Any]) -> None:
-            if message["type"] == "http.response.body" and message.get("body"):
-                raise OSError("client disconnected")
-
-        with pytest.raises(ClientDisconnect):
-            await response(_scope("2.4"), receive, send)
-        await body.aclose()
-        await body.aclose()
-        return closes, lease._controller.releases
-
-    closes, releases = asyncio.run(scenario())
-    assert closes == 1
-    assert releases == 1
-
-
-def test_asgi_23_disconnect_closes_stream_and_releases_lease_once() -> None:
-    async def scenario() -> tuple[int, int]:
-        sent = asyncio.Event()
-        closes = 0
-
-        class Events:
-            def __init__(self) -> None:
-                self.first = True
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if self.first:
-                    self.first = False
-                    return b"event"
-                await asyncio.Event().wait()
-                raise StopAsyncIteration
-
-            async def aclose(self) -> None:
-                nonlocal closes
-                closes += 1
-
-        lease = _lease()
-        body = inference_routes._LeasedAsyncIterator(Events(), lease)
-        response = inference_routes._ClosingStreamingResponse(body)
-
-        async def receive():
-            await sent.wait()
-            return {"type": "http.disconnect"}
-
-        async def send(message: dict[str, Any]) -> None:
-            if message["type"] == "http.response.body" and message.get("body"):
-                sent.set()
-
-        await response(_scope("2.3"), receive, send)
-        await body.aclose()
-        return closes, lease._controller.releases
-
-    closes, releases = asyncio.run(scenario())
-    assert closes == 1
-    assert releases == 1
-
-
-def test_connected_preparation_preserves_headers_events_and_usage() -> None:
-    async def scenario():
-        closed = asyncio.Event()
-        receive_block = asyncio.Event()
+def test_completed_preparation_wins_same_tick_disconnect() -> None:
+    async def scenario() -> bool:
         record = _record()
+        identity = _identity()
+        store = RecordingUsageStore()
+        context = _Context(object(), record, store)
 
-        class Pool:
-            async def stream_generate(self, *_args, **_kwargs):
-                try:
-                    yield {
-                        "type": "ready",
-                        "checkpoint": "run-a",
-                        "thinking": False,
-                        "prompt_tokens": 2,
-                        "completion_tokens": 1,
-                        "request_id": "req-connected",
-                    }
-                    yield {
-                        "type": "delta",
-                        "text": "answer",
-                        "prompt_tokens": 2,
-                        "completion_tokens": 1,
-                        "request_id": "req-connected",
-                    }
-                    yield {
-                        "type": "final",
-                        "finish_reason": "stop",
-                        "prompt_tokens": 2,
-                        "completion_tokens": 1,
-                        "request_id": "req-connected",
-                    }
-                finally:
-                    closed.set()
+        async def prepared_events():
+            if False:
+                yield {}
 
-        async def receive():
-            await receive_block.wait()
-            return {"type": "http.disconnect"}
+        async def prepared(*_args, **_kwargs):
+            return prepared_events(), {}, False, _ready(record, identity.request_id)
 
-        context = _Context(Pool(), record)
+        context.prepare_stream = prepared  # type: ignore[method-assign]
+        request = _request(lambda: asyncio.sleep(0, {"type": "http.disconnect"}))
         response = await _stream_chat_completion(
             context,
-            _request(receive),
+            request,
             GenerateRequest(adapter_id=record.adapter_id, prompt="hi"),
             record,
             record,
             adapter_id=record.adapter_id,
-            completion_id="chatcmpl-connected",
+            completion_id="chatcmpl-race",
             created=123,
             include_usage=True,
-            caller_org="org-1",
+            identity=identity,
+            traffic=_traffic(),
+            admitted_at=datetime.now(UTC),
             lease=_lease(),
             admission_headers=_admission_headers(),
         )
-        chunks = [chunk async for chunk in response.body_iterator]
-        return response, chunks, context, closed.is_set()
+        return response.status_code == 200
 
-    response, chunks, context, closed = asyncio.run(scenario())
-    revision = _record().metadata["hf_revision"]
-    assert response.headers["x-freesolo-adapter-revision"] == _record().adapter_id
-    assert response.headers["x-freesolo-checkpoint"] == "run-a"
-    assert response.headers["x-freesolo-hf-revision"] == revision
-    assert response.headers["x-freesolo-queue-duration-seconds"] == "0.000000"
-    assert response.headers["x-freesolo-application-active"] == "1"
-    assert response.headers["x-freesolo-application-pending"] == "0"
-    assert chunks == [
-        _sse(
-            {
-                "id": "chatcmpl-connected",
-                "object": "chat.completion.chunk",
-                "created": 123,
-                "model": _record().adapter_id,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
-        ),
-        _sse(
-            {
-                "id": "chatcmpl-connected",
-                "object": "chat.completion.chunk",
-                "created": 123,
-                "model": _record().adapter_id,
-                "choices": [{"index": 0, "delta": {"content": "answer"}, "finish_reason": None}],
-            }
-        ),
-        _sse(
-            {
-                "id": "chatcmpl-connected",
-                "object": "chat.completion.chunk",
-                "created": 123,
-                "model": _record().adapter_id,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
-            }
-        ),
-        _sse("[DONE]"),
-    ]
-    assert context.reports == [
-        {
-            "type": "final",
-            "finish_reason": "stop",
-            "prompt_tokens": 2,
-            "completion_tokens": 1,
-            "request_id": "req-connected",
-        }
-    ]
-    assert context.chat_stream_calls == 1
-    assert closed
+    assert asyncio.run(scenario())
 
 
 def test_completed_generation_wins_a_same_tick_disconnect_race() -> None:
-    """a generation that finished must not be discarded because the peer left in the same tick.
-
-    `asyncio.wait(FIRST_COMPLETED)` returns a SET: when generation and disconnect both resolve
-    before the loop wakes, BOTH are in `done`. deciding on the disconnect first throws away a
-    result whose `schedule_usage` has already run, so the caller is billed for a response nobody
-    returns. the packaged helper in flash/serve/app/http.py resolves the tie toward the operation,
-    and this pins the hosted copy to the same rule.
-    """
-
     async def scenario() -> Any:
         async def already_done() -> str:
             return "generated"
 
-        # both futures are resolved before the await, which forces the two-member `done` set.
         request = _request(lambda: asyncio.sleep(0, {"type": "http.disconnect"}))
         return await inference_routes._await_until_disconnect(request, already_done())
 

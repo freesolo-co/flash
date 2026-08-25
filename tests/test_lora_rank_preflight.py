@@ -576,7 +576,7 @@ def _patch_fused_submit_preflight(
 ):
     import flash.adapters.fused_experts as fused_experts
     import flash.adapters.lora_rank as lora_rank
-    import flash.runner.preparation as preparation
+    import flash.runner.lifecycle.preparation as preparation
     import flash.runner.results.checkpoints as checkpoints
 
     target_spec = _spec(rank=child_rank, model=_FUSED_MODEL)
@@ -593,11 +593,6 @@ def _patch_fused_submit_preflight(
         ),
     )
     status = SimpleNamespace(state="done")
-    runner = SimpleNamespace(
-        get_status=lambda _run_id: status,
-        _warmstart_source_is_authorized=lambda *_args, **_kwargs: True,
-        effective_spec_from_status=lambda _status: source_spec,
-    )
     events = []
 
     def load_config(_ref, _token, _revision):
@@ -618,7 +613,17 @@ def _patch_fused_submit_preflight(
         events.append(("preflight", seen))
         return SimpleNamespace(rank=resolved_rank, alpha=2 * resolved_rank)
 
-    monkeypatch.setattr(preparation, "_runner", lambda: runner)
+    monkeypatch.setattr(preparation.status_ops, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(
+        preparation,
+        "_warmstart_source_is_authorized",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        preparation.status_ops,
+        "effective_spec_from_status",
+        lambda _status: source_spec,
+    )
     monkeypatch.setattr(preparation, "_adopted_warmstart_revision", lambda spec, _source: spec)
     monkeypatch.setattr(checkpoints, "adapter_artifact_exists", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(lora_rank, "resolve_hf_dataset_revision", lambda *_args: "revision")
@@ -683,7 +688,7 @@ def test_submit_passes_the_loaded_config_to_validation_then_rank_preflight(monke
 
 
 def test_preparation_returns_resolved_source_rank_on_worker_spec(monkeypatch):
-    from flash.providers.allocator import required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb
 
     config = _config(target_parameters=list(_FUSED_TARGETS))
     preparation, target_spec, _events = _patch_fused_submit_preflight(

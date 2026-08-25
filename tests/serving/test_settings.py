@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from flash.serving.src import settings as cfg
-from flash.serving.src.settings import Settings
+from flash.serving.src.store import settings as cfg
+from flash.serving.src.store.settings import Settings
 
 
 def test_settings_holds_only_runtime_wiring() -> None:
@@ -12,7 +12,6 @@ def test_settings_holds_only_runtime_wiring() -> None:
         "internal_key",
         "deployment_sha",
         "deployment_id",
-        "deployment_mode",
         "backend_url",
         "supabase_url",
         "supabase_service_role_key",

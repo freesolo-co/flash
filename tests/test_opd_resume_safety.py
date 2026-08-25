@@ -8,6 +8,14 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.io.hf as worker_hf
+import flash.engine.worker.runtime.state as worker_state
+import flash.runner.lifecycle.attempts as runner_attempts
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.supervise.attach as runner_attach
+import flash.runner.supervise.lifecycle as runner_lifecycle
+import flash.runner.supervise.recovery as runner_recovery
 import flash.teacher.retry_contract as retry_contract
 from flash.teacher.retry_contract import (
     OPD_RESUME_REVISION_ENV,
@@ -26,9 +34,27 @@ _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
+def _patch_worker_marker_context(
+    monkeypatch,
+    *,
+    repo: str,
+    run_id: str,
+    attempt: int,
+    seed: int,
+    api=None,
+    remaining: float | None = None,
+) -> None:
+    monkeypatch.setattr(worker_state, "HF_REPO", repo)
+    monkeypatch.setattr(worker_state, "RUN_ID", run_id)
+    monkeypatch.setattr(worker_state, "ATTEMPT", attempt)
+    monkeypatch.setattr(worker_state, "SEED", seed)
+    monkeypatch.setattr(worker_state, "_remaining_worker_wall_seconds", lambda: remaining)
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: api)
+
+
 @pytest.fixture(autouse=True)
 def _stub_teacher_broker_transport(monkeypatch):
-    import flash.server.domain.teacher_broker as teacher_broker
+    import flash.server.domain.teacher.broker as teacher_broker
 
     monkeypatch.setattr(
         teacher_broker,
@@ -109,7 +135,6 @@ def _opd_spec(run_id: str, *, max_retries: int = 1, seed: int = 42):
 
 
 def _save_status(
-    runner,
     spec,
     *,
     state="running",
@@ -121,45 +146,44 @@ def _save_status(
     kwargs = {"_next_attempt": next_attempt}
     if contracted:
         kwargs["_opd_retry_contract_version"] = OPD_RETRY_CONTRACT_VERSION
-    status = provisioned_status(runner, spec, state=state, remote=remote)
+    status = provisioned_status(spec, state=state, remote=remote)
     status.source_snapshot = source_snapshot
-    runner._save_status(status, **kwargs)
+    runner_state._save_status(status, **kwargs)
 
 
 def test_status_initialization_stamps_opd_contract_only_when_explicit(monkeypatch, tmp_path):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     contracted = _opd_spec("contract-opd")
     uncontracted = _opd_spec("uncontracted-opd")
-    _save_status(runner, contracted)
-    _save_status(runner, uncontracted, contracted=False)
+    _save_status(contracted)
+    _save_status(uncontracted, contracted=False)
     for spec in (
         JobSpec(run_id="contract-sft", algorithm="sft"),
         JobSpec(run_id="contract-grpo", algorithm="grpo"),
     ):
-        runner._save_status(
-            runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
+        runner_state._save_status(
+            runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
         )
 
-    opd_raw = runner._load_status_json("contract-opd")
+    opd_raw = runner_status._load_status_json("contract-opd")
     assert opd_raw[OPD_RETRY_CONTRACT_STATUS_KEY] == OPD_RETRY_CONTRACT_VERSION
-    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner.get_status("contract-opd").__dict__
-    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner._load_status_json("uncontracted-opd")
-    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner._load_status_json("contract-sft")
-    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner._load_status_json("contract-grpo")
+    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner_status.get_status("contract-opd").__dict__
+    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner_status._load_status_json("uncontracted-opd")
+    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner_status._load_status_json("contract-sft")
+    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner_status._load_status_json("contract-grpo")
     with pytest.raises(ValueError, match="cannot be stored for a non-opd run"):
-        runner._save_status(
-            runner.RunStatus(
+        runner_state._save_status(
+            runner_state.RunStatus(
                 run_id="invalid-contract-sft",
                 state="running",
                 spec=JobSpec(run_id="invalid-contract-sft", algorithm="sft").to_dict(),
             ),
             _opd_retry_contract_version=OPD_RETRY_CONTRACT_VERSION,
         )
-    assert runner._reserve_attempt("contract-sft") == 0
-    assert runner._reserve_attempt("contract-grpo") == 0
+    assert runner_attempts._reserve_attempt("contract-sft") == 0
+    assert runner_attempts._reserve_attempt("contract-grpo") == 0
 
 
 def test_marker_path_and_canonical_exact_schema():
@@ -222,17 +246,13 @@ def test_marker_upload_failure_is_retriable_and_attempted_exactly_once(monkeypat
         raise failure
 
     api = SimpleNamespace(upload_file=upload_file)
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(
-            HF_REPO="private/runs",
-            RUN_ID="run-1",
-            ATTEMPT=0,
-            SEED=42,
-            hf_api=lambda: api,
-            _remaining_worker_wall_seconds=lambda: None,
-        ),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="private/runs",
+        run_id="run-1",
+        attempt=0,
+        seed=42,
+        api=api,
     )
 
     with pytest.raises(RetriableInfraError) as caught:
@@ -268,17 +288,13 @@ def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(monkeypatch):
 
     api = CommitThenLoseFirstResponse()
     monkeypatch.setenv("HF_TOKEN", "marker-secret")
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(
-            HF_REPO="private/runs",
-            RUN_ID="run-ambiguous",
-            ATTEMPT=2,
-            SEED=42,
-            hf_api=lambda: api,
-            _remaining_worker_wall_seconds=lambda: None,
-        ),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="private/runs",
+        run_id="run-ambiguous",
+        attempt=2,
+        seed=42,
+        api=api,
     )
     with pytest.raises(RetriableInfraError) as caught:
         hf.publish_opd_optimizer_start_marker()
@@ -298,10 +314,12 @@ def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(monkeypatch):
 def test_worker_marker_rejects_empty_repo(monkeypatch):
     from flash.engine.worker.io import hf
 
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(HF_REPO="", RUN_ID="run-1", ATTEMPT=0, SEED=42),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="",
+        run_id="run-1",
+        attempt=0,
+        seed=42,
     )
     with pytest.raises(RuntimeError, match="requires a private HF repository"):
         hf.publish_opd_optimizer_start_marker()
@@ -312,17 +330,14 @@ def test_worker_marker_starts_no_hf_call_at_deadline(monkeypatch):
     from flash.engine.worker.perf import RetriableInfraError
 
     calls = []
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(
-            HF_REPO="private/runs",
-            RUN_ID="run-1",
-            ATTEMPT=0,
-            SEED=42,
-            hf_api=lambda: calls.append("hf_api"),
-            _remaining_worker_wall_seconds=lambda: 0.0,
-        ),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="private/runs",
+        run_id="run-1",
+        attempt=0,
+        seed=42,
+        api=SimpleNamespace(upload_file=lambda **_kwargs: calls.append("hf_api")),
+        remaining=0.0,
     )
 
     with pytest.raises(RetriableInfraError, match="run wall deadline exceeded"):
@@ -348,17 +363,13 @@ def test_worker_marker_writes_fsync_and_required_upload(monkeypatch):
         )
 
     monkeypatch.setattr(hf.os, "fsync", lambda fd: fsync_calls.append(fd))
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(
-            HF_REPO="private/runs",
-            RUN_ID="run-1",
-            ATTEMPT=4,
-            SEED=42,
-            hf_api=lambda: SimpleNamespace(upload_file=upload_file),
-            _remaining_worker_wall_seconds=lambda: None,
-        ),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="private/runs",
+        run_id="run-1",
+        attempt=4,
+        seed=42,
+        api=SimpleNamespace(upload_file=upload_file),
     )
     hf.publish_opd_optimizer_start_marker()
 
@@ -393,7 +404,11 @@ class _FakePrivateHf:
 
     def get_paths_info(self, **kwargs):
         self.calls.append(("get_paths_info", kwargs))
-        return [SimpleNamespace(path=path) for path in kwargs["paths"] if path in self.files]
+        return [
+            SimpleNamespace(path=path, size=len(self.files[path]))
+            for path in kwargs["paths"]
+            if path in self.files
+        ]
 
     def upload_file(self, **kwargs):
         path = kwargs["path_in_repo"]
@@ -449,6 +464,7 @@ def test_strict_reader_pins_one_sha_and_any_present_marker_blocks(monkeypatch, t
             next_attempt=2,
             contract_version=1,
             phase="opd",
+            expected_fsdp_generation=1,
         )
 
     assert [name for name, _kwargs in calls] == ["repo_info", "get_paths_info", "download"]
@@ -483,6 +499,7 @@ def test_strict_reader_all_absent_is_safe(monkeypatch):
         next_attempt=2,
         contract_version=1,
         phase="opd",
+        expected_fsdp_generation=1,
     )
 
 
@@ -517,6 +534,7 @@ def test_strict_reader_malformed_or_outage_blocks(monkeypatch, tmp_path, mode):
             next_attempt=1,
             contract_version=1,
             phase="opd",
+            expected_fsdp_generation=1,
         )
 
 
@@ -535,35 +553,33 @@ def test_strict_reader_missing_repo_or_unsupported_contract_blocks(repo, version
             next_attempt=1,
             contract_version=version,
             phase="opd",
+            expected_fsdp_generation=1,
         )
 
 
 def test_initial_contracted_opd_reservation_skips_empty_attempt_query(monkeypatch, tmp_path):
     import huggingface_hub
 
-    import flash.runner as runner
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("initial-opd")
-    _save_status(runner, spec, next_attempt=0)
+    _save_status(spec, next_attempt=0)
     monkeypatch.setattr(
         huggingface_hub,
         "HfApi",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not query HF")),
     )
 
-    snapshot = runner._verified_opd_next_attempt(spec.run_id)
+    snapshot = runner_attempts._verified_opd_next_attempt(spec.run_id)
     assert snapshot == 0
-    assert runner._reserve_attempt(spec.run_id, expected_next_attempt=snapshot) == 0
+    assert runner_attempts._reserve_attempt(spec.run_id, expected_next_attempt=snapshot) == 0
 
 
 def test_retry_gate_uses_authoritative_jobspec_seed(monkeypatch, tmp_path):
-    import flash.runner as runner
     from flash.providers.artifacts import hf as _hf_artifacts
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("custom-seed-opd", seed=987)
-    _save_status(runner, spec, next_attempt=1)
+    _save_status(spec, next_attempt=1)
     seen = {}
 
     def verify(**kwargs):
@@ -571,50 +587,47 @@ def test_retry_gate_uses_authoritative_jobspec_seed(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_hf_artifacts, "verify_opd_replacement_safe", verify)
 
-    assert runner._verified_opd_retry_state(spec.run_id) == (1, None, None)
+    assert runner_attempts._verified_opd_retry_state(spec.run_id) == (1, None, None)
     assert seen["seed"] == 987
 
 
 def test_precontract_opd_fails_closed(monkeypatch, tmp_path):
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("precontract-opd")
-    _save_status(runner, spec, contracted=False)
+    _save_status(spec, contracted=False)
 
     with pytest.raises(RuntimeError, match="contract is missing or invalid"):
-        runner._verified_opd_next_attempt(spec.run_id)
+        runner_attempts._verified_opd_next_attempt(spec.run_id)
     with pytest.raises(RuntimeError, match="contract is missing or invalid"):
-        runner._reserve_attempt(spec.run_id, expected_next_attempt=0)
+        runner_attempts._reserve_attempt(spec.run_id, expected_next_attempt=0)
 
 
 def test_next_attempt_cas_race_blocks_opd_reservation(monkeypatch, tmp_path):
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("opd-cas")
-    _save_status(runner, spec, next_attempt=0)
-    snapshot = runner._verified_opd_next_attempt(spec.run_id)
-    status = runner.get_status(spec.run_id)
-    runner._save_status(status, _next_attempt=1)
+    _save_status(spec, next_attempt=0)
+    snapshot = runner_attempts._verified_opd_next_attempt(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
+    runner_state._save_status(status, _next_attempt=1)
 
     with pytest.raises(RuntimeError, match="changed after retry verification"):
-        runner._reserve_attempt(spec.run_id, expected_next_attempt=snapshot)
-    assert runner._load_status_json(spec.run_id)[runner._NEXT_ATTEMPT_KEY] == 1
+        runner_attempts._reserve_attempt(spec.run_id, expected_next_attempt=snapshot)
+    assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 1
 
 
 def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypatch, tmp_path):
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
-    from flash.providers.base import Allocation, Candidate, PollResult
+    import flash.providers.core.allocator as allocator
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     private_hf = _FakePrivateHf(tmp_path)
     private_hf.install(monkeypatch)
     spec = _opd_spec("automatic-retry-absent")
-    _save_status(runner, spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
+    _save_status(spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
     monkeypatch.setattr(
         allocator,
@@ -678,17 +691,16 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
 
 
 def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch, tmp_path):
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
-    from flash.providers.base import Allocation, Candidate, PollResult
+    import flash.providers.core.allocator as allocator
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     private_hf = _FakePrivateHf(tmp_path)
     private_hf.install(monkeypatch)
     spec = _opd_spec("automatic-retry-pinned")
-    _save_status(runner, spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
+    _save_status(spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
     monkeypatch.setattr(
         allocator,
@@ -711,7 +723,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
             self.worker_envs = []
 
         def submit_run(self, _spec, _seed, *, attempt, on_handle, **kwargs):
-            from flash.providers._lifecycle.worker import build_worker_env
+            from flash.providers._lifecycle.net.worker import build_worker_env
 
             secrets = kwargs.get("runtime_secrets")
             self.runtime_secrets.append(secrets)
@@ -722,12 +734,21 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
                 private_hf.files[marker_path] = canonical_opd_optimizer_start_json(
                     run_id=spec.run_id, attempt=0, seed=42
                 )
-                for path in _ckpt_files("opd", spec.run_id, 20, _COMPLETE_CKPT):
-                    private_hf.files[path] = (
-                        json.dumps(_valid_resume_state(20)).encode()
-                        if path.endswith("/opd_state.json")
-                        else b"checkpoint"
-                    )
+                checkpoint_names = (
+                    *_COMPLETE_CKPT[:6],
+                    "actor/fsdp_config.json",
+                    "actor/model_world_size_1_rank_0.pt",
+                    "actor/optim_world_size_1_rank_0.pt",
+                    "actor/extra_state_world_size_1_rank_0.pt",
+                )
+                for path in _ckpt_files("opd", spec.run_id, 20, checkpoint_names):
+                    if path.endswith("/opd_state.json"):
+                        payload = json.dumps(_valid_resume_state(20)).encode()
+                    elif path.endswith("/actor/fsdp_config.json"):
+                        payload = json.dumps({"FSDP_version": 1, "world_size": 1}).encode()
+                    else:
+                        payload = b"checkpoint"
+                    private_hf.files[path] = payload
                 return PollResult(False, failure="poll_error", detail="transient")
             return PollResult(True, metrics={"train_tokens": 1})
 
@@ -776,12 +797,11 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
 
 
 def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkeypatch, tmp_path):
-    import flash.providers as providers
-    import flash.runner as runner
-    from flash.providers.base import PollResult
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import PollResult
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     spec = _opd_spec("attach-opd-block")
     marker_path = opd_optimizer_start_marker_path(spec.run_id, 0)
     private_hf = _FakePrivateHf(tmp_path)
@@ -790,7 +810,6 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
     )
     private_hf.install(monkeypatch)
     _save_status(
-        runner,
         spec,
         next_attempt=1,
         remote=_remote(attempt=0),
@@ -809,11 +828,13 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
             events.append("destroy")
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     resumed = []
-    monkeypatch.setattr(runner, "_run_training", lambda *_args, **_kwargs: resumed.append(True))
+    monkeypatch.setattr(
+        runner_lifecycle, "_run_training", lambda *_args, **_kwargs: resumed.append(True)
+    )
 
-    status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
 
     assert events == ["cancel", "destroy"]
     assert resumed == []
@@ -830,11 +851,10 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
 
 
 def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_path):
-    import flash.providers as providers
-    import flash.runner as runner
+    from flash.providers.core import registry as providers
     from flash.server.platform import runtime as _runtime
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("handleless-opd-block")
     marker_path = opd_optimizer_start_marker_path(spec.run_id, 0)
     private_hf = _FakePrivateHf(tmp_path)
@@ -843,22 +863,23 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
     )
     private_hf.install(monkeypatch)
     _save_status(
-        runner,
         spec,
         state="provisioning",
         next_attempt=1,
         source_snapshot=_SOURCE_SNAPSHOT,
     )
     started = []
-    monkeypatch.setattr(runner, "_run_job_background", lambda *_args: started.append(True))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        runner_lifecycle, "_run_job_background", lambda *_args: started.append(True)
+    )
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(_runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
     monkeypatch.setattr(providers, "configured_providers", list)
 
     _runtime.recover_runs()
 
     assert started == []
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert status.state == "failed"
     assert "replacement is blocked" in status.error
     assert [name for name, _kwargs in private_hf.calls] == [
@@ -875,25 +896,20 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
     A lost response cannot prove the commit failed, so the published marker must fail closed before
     another worker allocates a GPU.
     """
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
+    import flash.providers.core.allocator as allocator
     from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
     from flash.runner.supervise import lifecycle
 
     private_hf = _FakePrivateHf(tmp_path, raise_after_upload=True)
     monkeypatch.setattr(hf, "_sleep_with_hf_deadline", lambda _delay: True)
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(
-            HF_REPO="private/runs",
-            RUN_ID="ambiguous-upload",
-            ATTEMPT=0,
-            SEED=42,
-            hf_api=lambda: private_hf,
-            _remaining_worker_wall_seconds=lambda: None,
-        ),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="private/runs",
+        run_id="ambiguous-upload",
+        attempt=0,
+        seed=42,
+        api=private_hf,
     )
     with pytest.raises(RetriableInfraError, match="required upload"):
         hf.publish_opd_optimizer_start_marker()
@@ -905,9 +921,9 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
 
     private_hf.raise_after_upload = False
     private_hf.install(monkeypatch)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("ambiguous-upload")
-    _save_status(runner, spec, next_attempt=1, source_snapshot=_SOURCE_SNAPSHOT)
+    _save_status(spec, next_attempt=1, source_snapshot=_SOURCE_SNAPSHOT)
     monkeypatch.setattr(
         allocator,
         "allocate",
@@ -926,6 +942,7 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
 # full-state resume checkpoint at the same pinned revision. these drive verify_opd_replacement_safe
 # directly with a validated attempt-1 marker present, varying only the checkpoint listing.
 
+_MISSING_SIZE = object()
 _COMPLETE_CKPT = (
     "adapter_config.json",
     "adapter_model.safetensors",
@@ -933,6 +950,13 @@ _COMPLETE_CKPT = (
     "rng_state.pth",
     "opd_state.json",
     "tokenizer.json",
+    "actor/fsdp_config.json",
+    "actor/model_world_size_2_rank_0.pt",
+    "actor/model_world_size_2_rank_1.pt",
+    "actor/optim_world_size_2_rank_0.pt",
+    "actor/optim_world_size_2_rank_1.pt",
+    "actor/extra_state_world_size_2_rank_0.pt",
+    "actor/extra_state_world_size_2_rank_1.pt",
 )
 # adapter written but optimizer.pt missing: a torn/partial upload, not resumable.
 _INCOMPLETE_CKPT = (
@@ -954,17 +978,37 @@ def _install_marker_gate(
     checkpoint_files,
     checkpoint_state=None,
     state_download_error=None,
+    fsdp_generation=1,
+    fsdp_world_size=2,
+    shard_size_overrides=None,
 ):
     """Install one validated marker plus pinned checkpoint listing and metadata reads."""
     present_path = opd_optimizer_start_marker_path("run-1", 1)
-    seen = {"list_revision": None, "downloads": []}
+    seen = {"list_revision": None, "downloads": [], "path_info_requests": []}
 
     class Api:
         def repo_info(self, **_kwargs):
             return SimpleNamespace(sha="pinned-sha")
 
-        def get_paths_info(self, **_kwargs):
-            return [SimpleNamespace(path=present_path)]
+        def get_paths_info(self, **kwargs):
+            requested = kwargs.get("paths", [])
+            seen["path_info_requests"].append(requested)
+            if present_path in requested:
+                return [SimpleNamespace(path=present_path, size=1)]
+            available = (
+                set(checkpoint_files) if not isinstance(checkpoint_files, Exception) else set()
+            )
+            infos = []
+            for path in requested:
+                if path not in available:
+                    continue
+                size = (shard_size_overrides or {}).get(path, 1)
+                infos.append(
+                    SimpleNamespace(path=path)
+                    if size is _MISSING_SIZE
+                    else SimpleNamespace(path=path, size=size)
+                )
+            return infos
 
         def list_repo_files(self, **kwargs):
             seen["list_revision"] = kwargs.get("revision")
@@ -977,6 +1021,12 @@ def _install_marker_gate(
         if kwargs["filename"] == present_path:
             path = tmp_path / "marker.json"
             path.write_bytes(canonical_opd_optimizer_start_json(run_id="run-1", attempt=1, seed=42))
+            return str(path)
+        if kwargs["filename"].endswith("/actor/fsdp_config.json"):
+            path = tmp_path / "fsdp_config.json"
+            path.write_text(
+                json.dumps({"FSDP_version": fsdp_generation, "world_size": fsdp_world_size})
+            )
             return str(path)
         if state_download_error is not None:
             raise state_download_error
@@ -999,6 +1049,7 @@ def _run_gate():
         next_attempt=2,
         contract_version=1,
         phase="opd",
+        expected_fsdp_generation=1,
     )
 
 
@@ -1006,9 +1057,7 @@ def test_gate_allows_replacement_when_marker_paired_with_valid_metadata(monkeypa
     seen = _install_marker_gate(
         monkeypatch, tmp_path, checkpoint_files=_ckpt_files("opd", "run-1", 40, _COMPLETE_CKPT)
     )
-    # no fsdp shards in this listing, so the width is unreadable and reported as None rather than
-    # guessed -- the caller then leaves the retry's shape unconstrained.
-    assert _run_gate() == ("pinned-sha", None)
+    assert _run_gate() == ("pinned-sha", 2)
     assert seen["list_revision"] == "pinned-sha"
     metadata_download = seen["downloads"][-1]
     assert metadata_download["revision"] == "pinned-sha"
@@ -1061,40 +1110,114 @@ def test_gate_blocks_pinned_checkpoint_metadata_download_failure(monkeypatch, tm
 
 
 def _sharded_ckpt(step: int, world_size: int) -> list[str]:
-    """A complete checkpoint listing plus the fsdp shards one world size writes."""
-    return _ckpt_files("opd", "run-1", step, _COMPLETE_CKPT) + _ckpt_files(
-        "opd",
-        "run-1",
-        step,
-        tuple(f"actor/model_world_size_{world_size}_rank_{rank}.pt" for rank in range(world_size)),
+    """A complete checkpoint listing with the canonical native shard set."""
+    names = (
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "optimizer.pt",
+        "rng_state.pth",
+        "opd_state.json",
+        "tokenizer.json",
+        "actor/fsdp_config.json",
+        *(
+            f"actor/{kind}_world_size_{world_size}_rank_{rank}.pt"
+            for kind in ("model", "optim", "extra_state")
+            for rank in range(world_size)
+        ),
     )
+    return _ckpt_files("opd", "run-1", step, names)
 
 
 def test_gate_reports_the_width_the_checkpoint_was_written_at(monkeypatch, tmp_path):
-    """The retry has to be allocated at this width, so the gate has to report it.
+    """the retry has to be allocated at the validated native checkpoint width.
 
-    Read from the shard filenames in the listing the gate already fetches: verl loads exactly
-    `model_world_size_W_rank_R.pt`, so the width is recoverable remotely with no extra request and
-    no new field in opd_state.json -- which matters because the control plane picks the retry's
-    card count before any worker exists to open the checkpoint.
+    the gate reads the width from pinned fsdp_config.json, expands the canonical expected shard names,
+    and validates their pinned path metadata before reporting that width. this matters because the
+    control plane picks the retry's card count before any worker exists to open the checkpoint.
     """
     _install_marker_gate(monkeypatch, tmp_path, checkpoint_files=_sharded_ckpt(40, 2))
     assert _run_gate() == ("pinned-sha", 2)
 
 
-def test_gate_reports_no_width_for_torn_shards(monkeypatch, tmp_path):
-    """Two widths in one directory is a torn or merged save, not a topology to pin a retry to.
-
-    Reporting either number would pin the retry to a shape half the shards cannot be loaded on.
-    None means "do not constrain", which leaves the retry ranking exactly as it is today.
-    """
+def test_gate_blocks_torn_shards_instead_of_guessing_a_width(monkeypatch, tmp_path):
     _install_marker_gate(
         monkeypatch,
         tmp_path,
         checkpoint_files=_sharded_ckpt(40, 2)
         + _ckpt_files("opd", "run-1", 40, ("actor/model_world_size_4_rank_0.pt",)),
     )
-    assert _run_gate() == ("pinned-sha", None)
+    with pytest.raises(RuntimeError, match="malformed shard name"):
+        _run_gate()
+
+
+@pytest.mark.parametrize("missing_kind", ["optim", "extra_state"])
+def test_gate_blocks_missing_native_state_class(monkeypatch, tmp_path, missing_kind):
+    files = [
+        path for path in _sharded_ckpt(40, 2) if f"/actor/{missing_kind}_world_size_" not in path
+    ]
+    _install_marker_gate(monkeypatch, tmp_path, checkpoint_files=files)
+
+    with pytest.raises(RuntimeError, match=rf"missing shard.*{missing_kind}_world_size_2_rank_0"):
+        _run_gate()
+
+
+def test_gate_blocks_wrong_private_fsdp_generation(monkeypatch, tmp_path):
+    _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_sharded_ckpt(40, 2),
+        fsdp_generation=2,
+    )
+
+    with pytest.raises(RuntimeError, match="fsdp generation mismatch"):
+        _run_gate()
+
+
+def test_gate_rejects_oversized_fsdp_width_before_expanding_shard_paths(monkeypatch, tmp_path):
+    seen = _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_sharded_ckpt(40, 2),
+        fsdp_world_size=9,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid or missing fsdp stamp"):
+        _run_gate()
+
+    assert len(seen["path_info_requests"]) == 1
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "actor/model_world_size_2_rank_00.pt",
+        "actor/model_world_size_02_rank_0.pt",
+    ],
+)
+def test_gate_blocks_noncanonical_native_rank_alias(monkeypatch, tmp_path, bad_name):
+    files = _sharded_ckpt(40, 2) + _ckpt_files("opd", "run-1", 40, (bad_name,))
+    _install_marker_gate(monkeypatch, tmp_path, checkpoint_files=files)
+
+    with pytest.raises(RuntimeError, match="malformed shard name"):
+        _run_gate()
+
+
+@pytest.mark.parametrize(
+    "invalid_size",
+    [_MISSING_SIZE, True, "1", 1.5, 0, -1],
+    ids=["missing", "boolean", "string", "float", "zero", "negative"],
+)
+def test_gate_blocks_invalid_expected_native_file_size(monkeypatch, tmp_path, invalid_size):
+    invalid_path = "opd/run-1/checkpoint/checkpoint-40/actor/optim_world_size_2_rank_1.pt"
+    _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_sharded_ckpt(40, 2),
+        shard_size_overrides={invalid_path: invalid_size},
+    )
+
+    with pytest.raises(RuntimeError, match=r"empty or unreadable shard.*optim_world_size_2_rank_1"):
+        _run_gate()
 
 
 def test_nested_shards_do_not_count_toward_checkpoint_completeness(monkeypatch, tmp_path):
@@ -1125,7 +1248,7 @@ def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
     resume_world_size, survivor_indexes, headline
 ):
     """a pinned resume admits only candidates that execute at the checkpoint width."""
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise.seed_submission import _pinned_to_resume_width
 
     candidates = (
@@ -1163,7 +1286,7 @@ def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
 
 def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
     """a filtered rental reports the incompatible execution width, not its card count."""
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise.seed_submission import (
         _build_candidate_plan,
         _pinned_to_resume_width,
@@ -1209,7 +1332,7 @@ def test_retry_allocation_falls_back_for_unusable_executed_width(
     executed_present, executed_gpu_count, wrong_width
 ):
     """absent and malformed executed widths fall back to the rented card count."""
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise.seed_submission import _pinned_to_resume_width
 
     if executed_present:

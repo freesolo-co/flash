@@ -71,11 +71,9 @@ jobs:
       # (empty => default *.modal.run url), so non-prod/fork/local workspaces stay deployable. This
       # domain is verified in the production Modal workspace, so prod keeps serving on serve.freesolo.co.
       SERVING_CUSTOM_DOMAIN: serve.freesolo.co
-      FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
-      FREESOLO_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # the deploy gate diffs against the revision reported by the currently deployed app.
           fetch-depth: 0
@@ -127,15 +125,10 @@ jobs:
           echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
           echo "Deploy serving: $deploy"
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         if: steps.gate.outputs.deploy == 'true'
         with:
           python-version: "3.12"
-
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-        if: steps.gate.outputs.deploy == 'true'
-        with:
-          version: "0.12.5"
 
       - name: Install Modal client
         if: steps.gate.outputs.deploy == 'true'
@@ -151,11 +144,11 @@ jobs:
           # time. Installing flash here would instead risk importing a DIFFERENT copy than the one
           # `add_local_python_source("flash")` ships to the container.
           # exact pins keep the deploy client bootstrap reproducible across runner image changes.
+          python -m pip install --upgrade "pip==26.2.1"
           # pinned to the exact client pyproject declares and the provisioning path was validated
           # against: deploy behaviour (app lifecycle, tags, lookup) is client-version sensitive, so
           # an unbounded range lets a future release change deploys with no diff here.
-          uv pip install --system "modal==1.5.4" "python-dotenv==1.2.3" "httpx==0.28.1" \
-            "pydantic==2.13.4" "pydantic-settings==2.14.2"
+          python -m pip install "modal==1.5.4" "python-dotenv==1.2.3"
 
       - name: Verify Modal auth is configured
         if: steps.gate.outputs.deploy == 'true'
@@ -215,7 +208,7 @@ jobs:
           # import the constants module, not persistence.py: this job installs only modal and
           # python-dotenv, while persistence.py imports httpx at module scope, so importing it
           # would raise ModuleNotFoundError and the guard below would block every prod deploy.
-          if ! columns="$(python -c 'from flash.serving.src.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
+          if ! columns="$(python -c 'from flash.serving.src.store.persisted_columns import PERSISTED_COLUMNS; print(PERSISTED_COLUMNS)')" || [ -z "$columns" ]; then
             # failing closed matters here: an empty list would degrade the query back to a bare
             # existence check and this gate would pass while proving nothing.
             echo "::error::Could not read PERSISTED_COLUMNS; refusing to deploy against an unverified schema."
@@ -287,23 +280,12 @@ jobs:
             sleep "$sleep_seconds"
           done
 
-      - name: Verify production readiness schema
-        if: steps.gate.outputs.deploy == 'true'
-        working-directory: .
-        run: |
-          if ! columns="$(python -c 'from flash.serving.src.readiness import READINESS_SELECT; print(READINESS_SELECT)')" || [ -z "$columns" ]; then
-            echo "::error::Could not read READINESS_SELECT; refusing to deploy against an unverified readiness schema."
-            exit 1
-          fi
-          python scripts/wait_for_supabase_schema.py \
-            --table hosted_model_readiness_passes \
-            --columns "$columns" \
-            --label "Production Supabase flash.hosted_model_readiness_passes" \
-            --timeout-seconds 300
-
       - name: Deploy serving
         if: steps.gate.outputs.deploy == 'true'
-        run: modal deploy flash/serving/modal_app.py
+        env:
+          FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
+          FREESOLO_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: modal deploy flash/serving/app/modal_app.py
 
       - name: Wait for production serving readiness
         if: steps.gate.outputs.deploy == 'true'
@@ -386,53 +368,6 @@ jobs:
               sleep_seconds=$remaining
             fi
             sleep "$sleep_seconds"
-          done
-
-      - name: Verify fresh production readiness is unpublished
-        if: steps.gate.outputs.deploy == 'true'
-        run: |
-          python - <<'PY'
-          from flash.serving.src.readiness import load_readiness_passes
-          from flash.serving.src.settings import Settings
-
-
-          if load_readiness_passes(Settings()):
-              raise SystemExit("fresh production deployment already has readiness publications")
-          PY
-
-      - name: Publish production model readiness evidence
-        if: steps.gate.outputs.deploy == 'true'
-        run: modal run flash/serving/modal_app.py::publish_readiness --base-url https://serve.freesolo.co
-
-      - name: Gate production model exposure on complete publications
-        if: steps.gate.outputs.deploy == 'true'
-        run: |
-          expected="$(python -c 'import json; from flash.serving.src.model_config import base_models; print(json.dumps(sorted(base_models())))')"
-          deadline=$((SECONDS + 300))
-          while true; do
-            response="$(curl --silent --show-error --connect-timeout 5 --max-time 10 https://serve.freesolo.co/healthz || true)"
-            if RESPONSE="$response" EXPECTED="$expected" python - <<'PY'
-          import json
-          import os
-
-
-          try:
-              payload = json.loads(os.environ["RESPONSE"])
-              expected = json.loads(os.environ["EXPECTED"])
-          except ValueError:
-              raise SystemExit(1)
-          actual = payload.get("base_models") if isinstance(payload, dict) else None
-          raise SystemExit(0 if actual == expected else 1)
-          PY
-            then
-              echo "Production serving exposes exactly the readiness-qualified model catalog."
-              break
-            fi
-            if (( SECONDS >= deadline )); then
-              echo "::error::Production serving did not expose the complete readiness-qualified model catalog within 300 seconds."
-              exit 1
-            fi
-            sleep 10
           done
 
       - name: Nothing to deploy

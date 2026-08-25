@@ -15,6 +15,12 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from flash._internal.channel import CLI_NAME
+from flash._internal.openai_sse import (
+    DeltaEvent,
+    ErrorEvent,
+    OpenAISSEError,
+    iter_openai_sse_events,
+)
 from flash.client.config import load_credentials_with_source
 from flash.client.shapes import RequireSpec, matches_require
 from flash.client.streaming import (
@@ -25,7 +31,7 @@ from flash.client.streaming import (
     _read_response_body,
 )
 from flash.core.spec import require_project_id
-from flash.serve.urls import is_freesolo_hosted_url
+from flash.serve.contract.urls import is_freesolo_hosted_url
 
 
 class ClientError(RuntimeError):
@@ -230,6 +236,42 @@ def _prepare_chat_request(
     elif step is not None:
         body["step"] = step
     return base_run_id, body
+
+
+def _openai_sse_text(chunks: Iterator[str]) -> Iterator[str]:
+    """render normalized openai events for cli and environment evaluation."""
+
+    reasoning_open = False
+    reasoning_done = False
+    try:
+        for event in iter_openai_sse_events(chunks):
+            if isinstance(event, ErrorEvent):
+                if reasoning_open:
+                    reasoning_open = False
+                    yield "</think>"
+                raise ClientError(event.message)
+            if not isinstance(event, DeltaEvent):
+                continue
+            reasoning = event.reasoning_content
+            if reasoning is not None:
+                if not reasoning_open and not (reasoning_done and not reasoning):
+                    reasoning_open = True
+                    yield "<think>"
+                if reasoning:
+                    yield reasoning
+            content = event.content
+            if content:
+                if reasoning_open:
+                    reasoning_open = False
+                    reasoning_done = True
+                    yield "</think>"
+                yield content
+    except OpenAISSEError as exc:
+        if reasoning_open:
+            yield "</think>"
+        raise ClientError(str(exc)) from exc
+    if reasoning_open:
+        yield "</think>"
 
 
 def _parse_adapter_target(target: str) -> tuple[str, int | None]:
@@ -483,7 +525,7 @@ class ApiClient:
         # nonblank but unusable one (`my-env`, `acme/env`, unsafe path characters) would be
         # advertised as usable and then fail at submit. Validated with the managed parser itself
         # rather than a second predicate here, so the two cannot drift apart.
-        from flash.envs.loader import _parse_managed_environment_slug
+        from flash.envs.loading.loader import _parse_managed_environment_slug
 
         ids: list[str] = []
         for row in rows:
@@ -528,7 +570,7 @@ class ApiClient:
 
     def download_env_package(self, env_id: str) -> bytes:
         """Download a managed environment package through the Flash control plane."""
-        from flash.envs import loader
+        from flash.envs.loading import loader
 
         quoted = urllib.parse.quote(env_id, safe="/")
         return self._request_bytes(
@@ -815,7 +857,8 @@ class ApiClient:
             urllib.request.urlopen(req, timeout=30 * 60) as resp,
         ):
             content_type = resp.headers.get("Content-Type", "")
-            if "application/json" in content_type:
+            media_type = content_type.partition(";")[0].strip().lower()
+            if media_type == "application/json":
                 payload = self._decode_response(
                     f"/v1/runs/{base_run_id}/chat",
                     resp.read(),
@@ -829,7 +872,8 @@ class ApiClient:
             read1 = getattr(resp, "read1", None)
             read = read1 if read1 is not None else resp.read
             read_size = 4096 if read1 is not None else 1
-            try:
+
+            def decoded_chunks() -> Iterator[str]:
                 while raw := read(read_size):
                     state = decoder.getstate()
                     try:
@@ -844,6 +888,13 @@ class ApiClient:
                         raise exc
                     yield from decoded
                 yield from decoder.decode(b"", final=True)
+
+            try:
+                chunks = decoded_chunks()
+                if media_type == "text/event-stream":
+                    yield from _openai_sse_text(chunks)
+                else:
+                    yield from chunks
             except (http.client.IncompleteRead, ConnectionError) as exc:
                 # the server aborts the chunked response when the serving backend fails
                 # mid-generation; urllib reports the missing terminating chunk (or reset) here.

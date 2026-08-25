@@ -20,13 +20,13 @@ from flash.serve.provisioning import (
     SanitizedProviderFailure,
     ServingImage,
     ServingRuntimeSecrets,
-    _common,
     base64url_identity,
     decode_manifest_environment,
     encode_manifest_environment,
     failed_deployment_result,
     serving_resource_names,
 )
+from flash.serve.provisioning.common import records as _common
 from tests.test_serve_app_manifest import _spec_and_inputs
 
 SECRET = "runtime-secret-sentinel"
