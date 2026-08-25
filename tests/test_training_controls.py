@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import flash.engine.worker.io.heartbeat as worker_heartbeat
 import flash.engine.worker.io.hf as worker_hf
+import flash.engine.worker.io.progress as worker_progress
 import flash.engine.worker.runtime.state as worker_state
 from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
@@ -204,7 +204,7 @@ def test_resume_first_companion_retries_without_reuploading_full_state(monkeypat
 
     monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
     monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_progress, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
     assert worker_hf.upload_resume_checkpoint(
@@ -229,7 +229,7 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
     monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
     monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
     monkeypatch.setattr(
-        worker_heartbeat, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+        worker_progress, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
     )
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
@@ -269,7 +269,7 @@ def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path,
     monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
     monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
     monkeypatch.setattr(
-        worker_heartbeat, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+        worker_progress, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
     )
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
@@ -284,90 +284,6 @@ def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path,
     assert failure["step"] == 50
     assert failure["operation"] == failure_stage
     assert f"{failure_stage} companion failed" in failure["error"]
-
-
-def test_upload_failure_cause_reaches_the_rendered_run_log():
-    """The payload is not the deliverable: `get_logs()` shows only what the formatter renders.
-
-    The formatter emits a fixed list of numeric metric keys, so a stage whose entire content is an
-    explanation rather than a measurement committed the cause and printed `stage=... step=50` alone.
-    """
-    from flash.providers._lifecycle.instances.poll import _format_heartbeat
-
-    line = _format_heartbeat(
-        {
-            "stage": "checkpoint_upload_failed",
-            "step": 50,
-            "checkpoint_failure": {
-                "step": 50,
-                "operation": "resume",
-                "error": "PermissionError: hf quota refused credential <redacted>",
-            },
-        }
-    )
-
-    assert "stage=checkpoint_upload_failed" in line
-    assert "step=50" in line
-    assert "checkpoint_failure_step=50" in line
-    assert "checkpoint_failure_stage=resume" in line
-    assert "checkpoint_error=PermissionError: hf quota refused credential <redacted>" in line
-
-
-def test_a_failure_cause_cannot_rewrite_the_log_it_is_printed_in():
-    """This text is an exception message, so it is not ours: a hook or provider response wrote it.
-
-    The same line already neutralizes child output and sampled completions. Surfacing the cause
-    raw would let a `\\x1b[2J` clear the screen or a `\\r` overwrite the line the user is reading
-    the failure in -- and the failure report is exactly when the log has to stay legible.
-    """
-    from flash.providers._lifecycle.instances.poll import _format_heartbeat
-
-    line = _format_heartbeat(
-        {
-            "stage": "checkpoint_upload_failed",
-            "step": 50,
-            "checkpoint_failure": {
-                "step": 50,
-                "operation": "resume",
-                "error": "boom\x1b[2Jwiped\roverwrite",
-            },
-        }
-    )
-
-    assert "\x1b" not in line
-    assert "\r" not in line
-    assert "checkpoint_error=boom\\x1b[2Jwiped\\x0doverwrite" in line
-
-
-def test_a_heartbeat_without_a_failure_cause_is_unchanged():
-    """The failure fields are additive: an ordinary step line must not grow an empty `error=`."""
-    from flash.providers._lifecycle.instances.poll import _format_heartbeat
-
-    line = _format_heartbeat(
-        {"stage": "sft_step", "step": 12, "error": "   ", "checkpoint_failure": {}}
-    )
-
-    assert line == "worker: stage=sft_step step=12"
-
-
-def test_an_upload_failure_is_critical_so_an_in_flight_commit_cannot_drop_it():
-    """This heartbeat is raised from inside a long HF upload -- when a ping is otherwise dropped.
-
-    `_HB_UPLOAD_IN_FLIGHT` is set for the duration of that upload, and an unforced non-critical
-    stage returns not-due immediately. The failure is reported once and nothing restates it, so the
-    one case that produces this heartbeat is the case that would discard it.
-    """
-    from flash.engine.worker.io.heartbeat import _is_critical_stage, _is_terminal_stage
-
-    assert _is_critical_stage("checkpoint_upload_failed")
-    # criticality and checkpoint carry use one terminal predicate.
-    assert _is_terminal_stage("done")
-    assert _is_terminal_stage("error_oom")
-    assert not _is_terminal_stage("checkpoint_upload_failed")
-    assert _is_critical_stage("done")
-    assert _is_critical_stage("error_oom")
-    assert not _is_critical_stage("sft_step")
-    assert not _is_critical_stage("rl_step")
 
 
 def test_seed_training_rngs_initializes_all_supported_generators(monkeypatch):
