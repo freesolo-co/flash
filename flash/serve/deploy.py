@@ -825,7 +825,7 @@ def _retryable_smoke_unavailable(
     requested_model: str,
     expected_adapter_revision: str,
 ) -> RetryableServingUnavailable | None:
-    if response.status_code != 503:
+    if response.status_code not in {429, 503}:
         return None
     try:
         payload = response.json()
@@ -835,7 +835,10 @@ def _retryable_smoke_unavailable(
         return None
     error = payload["error"]
     code = error.get("code")
-    if error.get("type") == "server_error" and code == "serving_capacity_unavailable":
+    exact_transient_server_error = (
+        response.status_code == 503 and code == "serving_capacity_unavailable"
+    ) or (response.status_code == 429 and code == "serving_overloaded")
+    if error.get("type") == "server_error" and exact_transient_server_error:
         raw_delay = response.headers.get("Retry-After")
         try:
             retry_after_seconds = float(raw_delay)
@@ -844,6 +847,8 @@ def _retryable_smoke_unavailable(
         if not math.isfinite(retry_after_seconds) or retry_after_seconds <= 0:
             return None
         return RetryableServingUnavailable(str(code), retry_after_seconds)
+    if response.status_code != 503:
+        return None
     if (
         error.get("type") != "adapter_unavailable"
         or error.get("retryable") is not True

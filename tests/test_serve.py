@@ -1563,24 +1563,112 @@ def test_chat_classifies_exact_capacity_503_with_valid_retry_after(monkeypatch):
     assert exc_info.value.retry_after_seconds == 1.0
 
 
-@pytest.mark.parametrize("retry_after", [None, "", "nan", "0", "-1"])
-def test_chat_treats_capacity_503_with_invalid_retry_after_as_terminal(monkeypatch, retry_after):
+def test_chat_classifies_exact_overload_429_with_valid_retry_after(monkeypatch):
     import flash.serve.deploy as d
 
     class Response:
-        status_code = 503
-        request = d.httpx.Request("POST", "https://serve.example/v1/chat/completions")
+        status_code = 429
 
         def __init__(self):
-            self.headers = {} if retry_after is None else {"Retry-After": retry_after}
+            self.headers = {"Retry-After": "1"}
 
         def json(self):
             return {
                 "error": {
                     "type": "server_error",
-                    "code": "serving_capacity_unavailable",
+                    "code": "serving_overloaded",
+                    "message": "serving model is at capacity",
                 }
             }
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(d, "_new_serving_client", Client)
+
+    with pytest.raises(d.RetryableServingUnavailable) as exc_info:
+        d.chat(
+            "run-1",
+            [{"role": "user", "content": "hello"}],
+            timeout_s=5.0,
+            retry_unavailable=True,
+        )
+
+    assert exc_info.value.code == "serving_overloaded"
+    assert exc_info.value.retry_after_seconds == 1.0
+
+
+@pytest.mark.parametrize("retry_after", [None, "", "nan", "0", "-1"])
+@pytest.mark.parametrize(
+    ("status_code", "code"),
+    [(503, "serving_capacity_unavailable"), (429, "serving_overloaded")],
+)
+def test_chat_treats_transient_server_error_with_invalid_retry_after_as_terminal(
+    monkeypatch, retry_after, status_code, code
+):
+    import flash.serve.deploy as d
+
+    class Response:
+        request = d.httpx.Request("POST", "https://serve.example/v1/chat/completions")
+
+        def __init__(self):
+            self.status_code = status_code
+            self.headers = {} if retry_after is None else {"Retry-After": retry_after}
+
+        def json(self):
+            return {"error": {"type": "server_error", "code": code}}
+
+        def raise_for_status(self):
+            raise d.httpx.HTTPStatusError("unavailable", request=self.request, response=self)
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(d, "_new_serving_client", Client)
+
+    with pytest.raises(d.httpx.HTTPStatusError):
+        d.chat(
+            "run-1",
+            [{"role": "user", "content": "hello"}],
+            timeout_s=5.0,
+            retry_unavailable=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error"),
+    [
+        (429, {"type": "server_error", "code": "serving_capacity_unavailable"}),
+        (429, {"type": "adapter_unavailable", "code": "serving_overloaded"}),
+        (429, {"type": "server_error", "code": "rate_limited"}),
+    ],
+)
+def test_chat_fails_closed_for_unrelated_429(monkeypatch, status_code, error):
+    import flash.serve.deploy as d
+
+    class Response:
+        request = d.httpx.Request("POST", "https://serve.example/v1/chat/completions")
+
+        def __init__(self):
+            self.status_code = status_code
+            self.headers = {"Retry-After": "1"}
+
+        def json(self):
+            return {"error": error}
 
         def raise_for_status(self):
             raise d.httpx.HTTPStatusError("unavailable", request=self.request, response=self)

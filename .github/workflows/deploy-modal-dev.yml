@@ -235,16 +235,11 @@ jobs:
             echo "::error::Could not read READINESS_SELECT; refusing to deploy against an unverified readiness schema."
             exit 1
           fi
-          endpoint="${SUPABASE_URL%/}/rest/v1/hosted_model_readiness_passes?select=${columns}&limit=1"
-          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-            --connect-timeout 5 --max-time 15 \
-            --header "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
-            --header "Accept-Profile: flash" \
-            "$endpoint")"
-          if [ "$status" != "200" ]; then
-            echo "::error::Development Supabase flash.hosted_model_readiness_passes schema is not queryable (HTTP ${status})."
-            exit 1
-          fi
+          python scripts/wait_for_supabase_schema.py \
+            --table hosted_model_readiness_passes \
+            --columns "$columns" \
+            --label "Development Supabase flash.hosted_model_readiness_passes" \
+            --timeout-seconds 300
 
       - name: Deploy development serving
         if: steps.gate.outputs.deploy == 'true'

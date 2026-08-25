@@ -111,7 +111,9 @@ def test_deploy_workflows_verify_publish_and_gate_readiness_evidence() -> None:
     }
     for workflow, command in expected_commands.items():
         body = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
-        assert "hosted_model_readiness_passes?select=${columns}&limit=1" in body
+        assert "scripts/wait_for_supabase_schema.py" in body
+        assert "--table hosted_model_readiness_passes" in body
+        assert "--timeout-seconds 300" in body
         assert "from flash.serving.src.readiness import READINESS_SELECT" in body
         assert "fresh " in body
         assert "readiness is unpublished" in body
