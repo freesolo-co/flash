@@ -4,7 +4,12 @@ import copy
 
 import pytest
 
-from flash.source_snapshot import (
+import flash.runner.accounting.costs as runner_costs
+import flash.runner.accounting.reconciliation as runner_reconciliation
+import flash.runner.lifecycle.reporting as runner_reporting
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+from flash.snapshot.archive import (
     PUBLIC_PROVENANCE_KEY,
     TERMINAL_ATTESTATION_KEY,
     source_attestation,
@@ -12,37 +17,10 @@ from flash.source_snapshot import (
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 SOURCE_SNAPSHOT = valid_source_snapshot()
-_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
-
-
-def _runpod_remote(*, attempt: int) -> dict:
-    return {
-        "provider": "runpod",
-        "instance_id": f"pod-{attempt}",
-        "phase": "exact",
-        "label": f"flash-run-s0-a{attempt}-0123456789abcdef-deadbeef",
-        "key_fingerprint": _RUNPOD_FINGERPRINT,
-        "account_id": "account-1",
-        "payload_secret_id": f"secret-{attempt}",
-        "payload_secret_name": "FLASH_PAYLOAD_0123456789abcdef",
-        "data_center_id": "US-KS-2",
-        "network_volume_id": None,
-        "container_disk_gb": 120,
-        "container_registry_auth_id": None,
-        "gpu_count": 1,
-        "image_name": None,
-        "gpu_type_id_override": None,
-        "allowed_cuda_versions": None,
-        "docker_start_cmd": [],
-        "gpu": "RTX 4090",
-        "hourly_usd": 0.69,
-        "attempt": attempt,
-        "started_ts": 100.0,
-    }
 
 
 def _status(*, attempt: int = 2, source_snapshot: dict | None = SOURCE_SNAPSHOT):
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
     return RunStatus(
         run_id="run-1",
@@ -65,7 +43,7 @@ def _metrics(*, attempt: int = 2, descriptor: dict = SOURCE_SNAPSHOT) -> dict:
 
 
 def test_terminal_source_metrics_require_exact_attempt_bound_evidence() -> None:
-    from flash.runner import validate_terminal_source_metrics
+    from flash.runner.lifecycle.status import validate_terminal_source_metrics
 
     sanitized, verified_attempt = validate_terminal_source_metrics(_status(), _metrics())
     assert verified_attempt == 2
@@ -80,7 +58,7 @@ def test_terminal_source_metrics_require_exact_attempt_bound_evidence() -> None:
 
 @pytest.mark.parametrize("case", ["missing", "digest", "revision", "stale"])
 def test_terminal_source_metrics_reject_missing_mismatched_and_stale_evidence(case: str) -> None:
-    from flash.runner import validate_terminal_source_metrics
+    from flash.runner.lifecycle.status import validate_terminal_source_metrics
 
     metrics = _metrics()
     if case == "missing":
@@ -98,7 +76,7 @@ def test_terminal_source_metrics_reject_missing_mismatched_and_stale_evidence(ca
 
 
 def test_descriptorless_attempt_stays_unverified_even_with_forged_evidence() -> None:
-    from flash.runner import validate_terminal_source_metrics
+    from flash.runner.lifecycle.status import validate_terminal_source_metrics
 
     sanitized, verified_attempt = validate_terminal_source_metrics(
         _status(source_snapshot=None),
@@ -132,11 +110,10 @@ def test_public_status_exposes_only_safe_source_projection() -> None:
 
 
 def test_recovery_completion_requires_attestation_before_done(monkeypatch, tmp_path) -> None:
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec.from_dict(
         {
             "run_id": "run-1",
@@ -146,36 +123,39 @@ def test_recovery_completion_requires_attestation_before_done(monkeypatch, tmp_p
             "gpu": {"max_wall_seconds": 3600},
         }
     )
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         run_id="run-1",
         state="running",
         spec=spec.to_dict(),
         source_snapshot=SOURCE_SNAPSHOT,
     )
-    runner._save_status(status, _next_attempt=3)
-    monkeypatch.setattr(runner, "_persist_metrics", lambda _spec, _metrics: 1.0)
-    monkeypatch.setattr(runner, "_status_estimated_charge", lambda *_args, **_kwargs: 1.0)
-    monkeypatch.setattr(runner, "artifacts_dir", lambda _spec: "/artifacts")
-    monkeypatch.setattr(runner, "_report_status", lambda _status: None)
+    runner_state._save_status(status, _next_attempt=3)
+    monkeypatch.setattr(runner_status, "_persist_metrics", lambda _spec, _metrics: 1.0)
+    monkeypatch.setattr(runner_costs, "_status_estimated_charge", lambda *_args, **_kwargs: 1.0)
+    monkeypatch.setattr(runner_state, "artifacts_dir", lambda _spec: "/artifacts")
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
 
     with pytest.raises(RuntimeError):
-        runner._compare_and_complete_remote("run-1", None, spec, {"wall_seconds": 1.0})
-    assert runner.get_status("run-1").state == "running"
+        runner_reconciliation._compare_and_complete_remote(
+            "run-1", None, spec, {"wall_seconds": 1.0}
+        )
+    assert runner_status.get_status("run-1").state == "running"
 
-    assert runner._compare_and_complete_remote("run-1", None, spec, _metrics()) is True
-    completed = runner.get_status("run-1")
+    assert (
+        runner_reconciliation._compare_and_complete_remote("run-1", None, spec, _metrics()) is True
+    )
+    completed = runner_status.get_status("run-1")
     assert completed.state == "done"
     assert completed.source_verified_attempt == 2
 
 
-def test_attach_freezes_top_level_descriptor_and_discards_noncanonical_code_prefix(
+def test_attach_freezes_top_level_descriptor_and_discards_legacy_prefix(
     monkeypatch, tmp_path
 ) -> None:
-    import flash.runner as runner
     from flash.core.spec import JobSpec
     from flash.runner.supervise.attach import _build_attach_context
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec.from_dict(
         {
             "run_id": "run-1",
@@ -184,9 +164,18 @@ def test_attach_freezes_top_level_descriptor_and_discards_noncanonical_code_pref
             "train": {"epochs": 1, "hf_repo": "org/repo"},
         }
     )
-    remote = {**_runpod_remote(attempt=2), "code_prefix": "code/legacy/flash"}
-    runner._save_status(
-        runner.RunStatus(
+    remote = {
+        "provider": "runpod",
+        "endpoint_id": "endpoint",
+        "endpoint_name": "name",
+        "key_fingerprint": "c" * 64,
+        "job_id": "job",
+        "attempt": 2,
+        "started_ts": 100.0,
+        "code_prefix": "code/legacy/flash",
+    }
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id="run-1",
             state="running",
             spec=spec.to_dict(),
@@ -201,7 +190,7 @@ def test_attach_freezes_top_level_descriptor_and_discards_noncanonical_code_pref
 
 
 def test_descriptorless_replacement_is_blocked() -> None:
-    from flash.runner import source_snapshot_from_status
+    from flash.runner.lifecycle.status import source_snapshot_from_status
 
     with pytest.raises(RuntimeError, match="descriptor-less attempts cannot be replaced"):
         source_snapshot_from_status(_status(source_snapshot=None), required=True)

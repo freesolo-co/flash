@@ -113,6 +113,7 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
         "runtime_capsule_build_sha256",
         "runtime_capsule_manifest_sha256",
         "runtime_capsule_profiles_sha256",
+        "archive_sha256",
     ):
         assert base_partial[key], f"base input {key} not populated"
 
@@ -151,13 +152,14 @@ def _copy_fingerprint_inputs(destination: Path) -> None:
         "flash/__init__.py",
         "flash/_internal/__init__.py",
         "flash/_internal/channel.py",
+        "flash/_internal/version.py",
         "flash/engine/worker/runtime/kernel_warmup.py",
         *INSTANCE_PROFILE_SOURCES,
         "flash/runtime_capsule/__init__.py",
         "flash/runtime_capsule/build.py",
         "flash/runtime_capsule/manifest.py",
         "flash/runtime_capsule/profiles.py",
-        "flash/source_snapshot.py",
+        "flash/snapshot/archive.py",
     ):
         source = ROOT / path
         target = destination / path
@@ -324,7 +326,7 @@ def test_freesolo_floor_is_in_lockstep():
     The image governs the deployed version, while FREESOLO_WORKER_SPEC remains a range for published
     package compatibility. A worker pin outside that range would make the two paths disagree.
     """
-    from flash.envs.base import FREESOLO_WORKER_SPEC
+    from flash.envs.loading.base import FREESOLO_WORKER_SPEC
 
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
     docker_fs = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "freesolo"]
@@ -366,7 +368,7 @@ def test_parse_baked_per_sm_arches_contract():
 
 
 def test_print_baked_arches_cli_exits_before_fingerprint_work(tmp_path):
-    worker_dir = tmp_path / "flash" / "providers" / "_lifecycle"
+    worker_dir = tmp_path / "flash" / "providers" / "_lifecycle" / "net"
     worker_dir.mkdir(parents=True)
     (worker_dir / "worker.py").write_text('BAKED_PER_SM_ARCHES = frozenset({"sm90", "sm80"})\n')
     result = subprocess.run(
@@ -386,9 +388,9 @@ def test_print_baked_arches_cli_exits_before_fingerprint_work(tmp_path):
 
 
 def test_baked_arch_workflows_match_canonical_source():
-    from flash.providers._lifecycle.worker import BAKED_PER_SM_ARCHES
+    from flash.providers._lifecycle.net.worker import BAKED_PER_SM_ARCHES
 
-    worker_source = (ROOT / "flash" / "providers" / "_lifecycle" / "worker.py").read_text()
+    worker_source = (ROOT / "flash" / "providers" / "_lifecycle" / "net" / "worker.py").read_text()
     source_arches = kf.parse_baked_per_sm_arches(worker_source)
     canonical_arches = set(BAKED_PER_SM_ARCHES)
 

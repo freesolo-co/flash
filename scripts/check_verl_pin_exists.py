@@ -22,7 +22,7 @@ import tempfile
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from flash.engine.worker.backend_common import VERL_REQUIREMENT  # noqa: E402
+from flash.engine.worker.train.entry.backend_common import VERL_REQUIREMENT  # noqa: E402
 
 DOCKERFILE = os.path.join(REPO_ROOT, "Dockerfile.worker")
 

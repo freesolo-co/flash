@@ -9,9 +9,9 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass
 
+import flash.engine.worker.runtime.state as _worker_state
 from flash.engine.plan.recipe import RECIPE, resolve_teacher
 from flash.engine.plan.vram import opd_completion_len
-from flash.engine.worker.runtime.pkg_proxy import W as _w
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ class OpdKnobs:
 def _resolve_opd_knobs() -> OpdKnobs:
     """Resolve every opd knob from the JobSpec's [train] table, falling back to RECIPE.opd."""
     d = RECIPE.opd
-    t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
+    t = _worker_state.JOB_SPEC.train if _worker_state.JOB_SPEC else None
 
     def opt(name, default):
         v = getattr(t, name, None) if t else None
@@ -82,7 +82,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
             else d.sampling_temperature
         ),
         top_p=d.sampling_top_p,
-        max_completion=opd_completion_len(opt("max_completion_tokens", 0), _w.THINKING),
+        max_completion=opd_completion_len(opt("max_completion_tokens", 0), _worker_state.THINKING),
         # reads prompts_per_step, NOT batch_size: opd rejects batch_size at parse time, so an opd
         # spec carries the optimizer batch only under this key. reading the old name found None on
         # every run and trained the recipe default no matter what the user authored.
@@ -100,7 +100,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
 
 def _thinking_prefill_text(tok) -> str:
     """return the exact terminal Qwen reasoning opener, or fail closed."""
-    if not _w.THINKING:
+    if not _worker_state.THINKING:
         return ""
     expected = "<think>\n"
     probe = [{"role": "user", "content": ""}]
@@ -161,6 +161,6 @@ def _drop_fully_forced_groups(groups, forced):
 
 def run_opd():
     """Run OPD. verl is the only backend; this module keeps the knob and prompt helpers it shares."""
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import run_opd_train
 
     run_opd_train()

@@ -20,7 +20,7 @@ def _spec(*, algorithm: str = "grpo", secrets: tuple[str, ...] = ()):
 
 
 def test_worker_env_owns_allocator_policy_and_filters_removed_knobs(monkeypatch):
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:999")
     monkeypatch.setenv("VLLM_USE_V1", "0")
@@ -34,7 +34,7 @@ def test_worker_env_owns_allocator_policy_and_filters_removed_knobs(monkeypatch)
 
 
 def test_opd_worker_env_uses_sleep_safe_allocator_and_bounded_teacher_transport():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     env = build_worker_env(
         _spec(algorithm="opd"),
@@ -54,7 +54,7 @@ def test_opd_worker_env_uses_sleep_safe_allocator_and_bounded_teacher_transport(
 
 def test_worker_env_forwards_only_declared_runtime_secrets_and_lists_redaction_names():
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     env = build_worker_env(
         _spec(secrets=("SERPAPI_API_KEY", "AWS_SECRET_ACCESS_KEY")),
@@ -76,7 +76,7 @@ def test_worker_env_forwards_only_declared_runtime_secrets_and_lists_redaction_n
 
 
 def test_removed_worker_keys_cannot_reenter_through_declared_secrets():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     env = build_worker_env(
         _spec(secrets=("FLASH_CHALK_SPEC", "FLASH_TRITON_LORA", "MY_TOKEN")),
@@ -94,7 +94,7 @@ def test_removed_worker_keys_cannot_reenter_through_declared_secrets():
 
 
 def test_worker_and_control_plane_share_attempt_scoped_artifact_names():
-    from flash.engine.worker import error_artifact_name as worker_name
+    from flash.engine.worker.io.hf import error_artifact_name as worker_name
     from flash.providers.artifacts.hf import error_artifact_name as plane_name
 
     for phase in ("sft", "rl", "opd"):
@@ -107,10 +107,10 @@ def test_worker_and_control_plane_share_attempt_scoped_artifact_names():
 
 def test_sft_training_keeps_active_optimization_wiring():
     from flash.engine.profiling import sft_image_rows, sft_workload
-    from flash.engine.worker import sft_train
     from flash.engine.worker.entry import sft
-    from flash.engine.worker.train.sft import config as sft_config
+    from flash.engine.worker.train.entry import sft_train
     from flash.engine.worker.train.sft.child import plugin as sft_plugin
+    from flash.engine.worker.train.sft.setup import config as sft_config
 
     assert "run_sft_train()" in inspect.getsource(sft.run_sft)
     assert "_pretokenize_completion_only(" in inspect.getsource(sft_workload)

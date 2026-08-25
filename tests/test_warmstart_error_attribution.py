@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-import flash.runner as runner
+import flash.runner.lifecycle.preparation as runner_preparation
 
 # resolve the class off the live module on every use. other suites reload ``flash.runner``, which
 # rebinds this class to a new object, and a module-level import captured here would no longer be the
@@ -21,31 +21,31 @@ import flash.runner as runner
 def test_warm_start_preparation_error_is_a_value_error():
     # the submit route catches ValueError broadly for spec problems; staying a subclass keeps
     # that path working if the tagged error escapes an unpatched caller.
-    assert issubclass(runner.WarmStartPreparationError, ValueError)
+    assert issubclass(runner_preparation.WarmStartPreparationError, ValueError)
 
 
 def test_adapter_resolution_failure_is_tagged(monkeypatch):
     def _boom(spec, **kwargs):
         raise RuntimeError("source adapter revision not found")
 
-    monkeypatch.setattr(runner, "_prepare_init_from_adapter_inner", _boom)
+    monkeypatch.setattr(runner_preparation, "_prepare_init_from_adapter_inner", _boom)
 
-    with pytest.raises(runner.WarmStartPreparationError) as excinfo:
-        runner._prepare_init_from_adapter(object(), owner_org_id="org-1")
+    with pytest.raises(runner_preparation.WarmStartPreparationError) as excinfo:
+        runner_preparation._prepare_init_from_adapter(object(), owner_org_id="org-1")
 
     assert "source adapter revision not found" in str(excinfo.value)
 
 
 def test_already_tagged_error_is_not_double_wrapped(monkeypatch):
-    original = runner.WarmStartPreparationError("adapter rank mismatch")
+    original = runner_preparation.WarmStartPreparationError("adapter rank mismatch")
 
     def _boom(spec, **kwargs):
         raise original
 
-    monkeypatch.setattr(runner, "_prepare_init_from_adapter_inner", _boom)
+    monkeypatch.setattr(runner_preparation, "_prepare_init_from_adapter_inner", _boom)
 
-    with pytest.raises(runner.WarmStartPreparationError) as excinfo:
-        runner._prepare_init_from_adapter(object(), owner_org_id="org-1")
+    with pytest.raises(runner_preparation.WarmStartPreparationError) as excinfo:
+        runner_preparation._prepare_init_from_adapter(object(), owner_org_id="org-1")
 
     assert excinfo.value is original
 
@@ -54,7 +54,10 @@ def test_only_tagged_failures_are_blamed_on_the_adapter():
     # the submit route selects on this type, so an unrelated prepare_job failure (gpu sizing,
     # budget, environment resolution) cannot be rewritten into a bad-adapter message. see
     # test_server_billing.py for the route-level assertions on the responses themselves.
-    assert not isinstance(ValueError("no gpu class satisfies"), runner.WarmStartPreparationError)
+    assert not isinstance(
+        ValueError("no gpu class satisfies"), runner_preparation.WarmStartPreparationError
+    )
     assert isinstance(
-        runner.WarmStartPreparationError("bad adapter"), runner.WarmStartPreparationError
+        runner_preparation.WarmStartPreparationError("bad adapter"),
+        runner_preparation.WarmStartPreparationError,
     )

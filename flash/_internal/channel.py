@@ -16,7 +16,7 @@ _DEFAULT_CLI_NAME = "flash-dev" if CHANNEL == "dev" else "flash"
 # banner.
 BRAND_NAME = _DEFAULT_CLI_NAME
 
-# every console script in [project.scripts] that enters flash.cli:main, per channel. preserve the
+# every console script in [project.scripts] that enters the cli parser, per channel. preserve the
 # exact name the operator used when rendering follow-up commands.
 _CLI_SCRIPT_NAMES = (
     frozenset({"flash-dev", "flash-dev-cli"})

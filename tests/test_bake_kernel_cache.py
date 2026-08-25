@@ -26,7 +26,7 @@ bake = _load_bake()
 
 
 def test_default_gpu_walk_covers_every_baked_arch():
-    from flash.providers._lifecycle.worker import BAKED_PER_SM_ARCHES
+    from flash.providers._lifecycle.net.worker import BAKED_PER_SM_ARCHES
 
     assert set(bake.GPU_WALK_BY_SM) == BAKED_PER_SM_ARCHES
     all_types = [gpu for choices in bake.GPU_WALK_BY_SM.values() for gpu in choices]
@@ -35,9 +35,10 @@ def test_default_gpu_walk_covers_every_baked_arch():
 
 
 def test_capacity_only_walk_uses_shared_phase_aware_launcher(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import auth as runpod_auth
-    from flash.providers.runpod import pods
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.client import auth as runpod_auth
+    from flash.providers.runpod.client import pods as runpod_pods
+    from flash.providers.runpod.execution import pods
 
     attempts = []
     monkeypatch.setattr(runpod_auth, "ordered_keys", lambda: ["key-a", "key-b"])
@@ -58,7 +59,7 @@ def test_capacity_only_walk_uses_shared_phase_aware_launcher(monkeypatch):
             )
         )
         if len(attempts) < 3:
-            raise runpod_api.RunpodCapacityError("full")
+            raise runpod_pods.RunpodCapacityError("full")
         return SimpleNamespace(pod_id="pod-1", key_fingerprint=kwargs["fingerprint"])
 
     monkeypatch.setattr(pods, "launch_payload_pod", launch)
@@ -83,8 +84,8 @@ def test_capacity_only_walk_uses_shared_phase_aware_launcher(monkeypatch):
 
 
 def test_non_capacity_failure_never_walks_to_another_gpu(monkeypatch):
-    from flash.providers.runpod import auth as runpod_auth
-    from flash.providers.runpod import pods
+    from flash.providers.runpod.client import auth as runpod_auth
+    from flash.providers.runpod.execution import pods
 
     calls = []
     monkeypatch.setattr(runpod_auth, "ordered_keys", lambda: ["key-a"])
@@ -120,9 +121,9 @@ def test_non_capacity_failure_never_walks_to_another_gpu(monkeypatch):
     ],
 )
 def test_bake_launch_boundary_cuda_floor(monkeypatch, sm, allowed, expected):
-    from flash.providers.runpod import auth as runpod_auth
-    from flash.providers.runpod import pods
-    from flash.providers.runpod.pod_identity import RunpodPodHandle, payload_for_handle
+    from flash.providers.runpod.client import auth as runpod_auth
+    from flash.providers.runpod.execution import pods
+    from flash.providers.runpod.execution.identity import RunpodPodHandle, payload_for_handle
 
     monkeypatch.setattr(runpod_auth, "ordered_keys", lambda: ["key"])
     observed = []
@@ -190,7 +191,7 @@ def test_bake_payload_is_opaque_secret_content_not_process_environment(monkeypat
 
 
 def test_bake_recovery_retains_intent_when_cleanup_is_unconfirmed(monkeypatch):
-    from flash.providers.runpod import pods
+    from flash.providers.runpod.execution import pods
 
     pending = pods.RunpodPodHandle(
         instance_id="label-0123456789abcdef-12345678",
@@ -249,7 +250,9 @@ def test_bake_scripts_use_static_launcher_and_no_runpod_sdk():
     controller = BAKE_SCRIPT.read_text()
     launcher = (ROOT / "docker" / "runpod_pod_launcher.py").read_text()
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
-    intent_helper = (ROOT / "flash" / "providers" / "runpod" / "hf_intent.py").read_text()
+    intent_helper = (
+        ROOT / "flash" / "providers" / "runpod" / "execution" / "hf_intent.py"
+    ).read_text()
     assert "launch_payload_pod(" in controller
     assert "import runpod" not in controller
     assert "runpod.create_pod" not in controller

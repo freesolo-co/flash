@@ -8,41 +8,45 @@ from pathlib import Path
 
 import pytest
 
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.results.verified_revisions as runner_verified_revisions
+import flash.runner.supervise.transitions as runner_transitions
+
 
 def _complete_checkpoint(run_id: str, revision: str, barrier) -> None:
-    import flash.runner as runner
 
     barrier.wait(timeout=10)
-    runner.mark_checkpoint_deployed(
+    runner_transitions.mark_checkpoint_deployed(
         run_id,
         {
             "state": "ready",
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
 
 
 def _write_stale_status(run_id: str, loaded, release) -> None:
-    import flash.runner as runner
 
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     loaded.set()
     if not release.wait(timeout=10):
         raise TimeoutError("stale status writer was not released")
     status.last_heartbeat = {"step": 1}
-    runner._save_status(status)
+    runner_state._save_status(status)
 
 
 def _read_revisions(run_id: str, output) -> None:
-    import flash.runner as runner
 
-    output.put(tuple(sorted(runner.read_verified_adapter_revisions(run_id))))
+    output.put(tuple(sorted(runner_verified_revisions.read_verified_adapter_revisions(run_id))))
 
 
-def _new_status(runner, run_id: str):
-    return runner.RunStatus(
+def _new_status(run_id: str):
+    return runner_state.RunStatus(
         run_id=run_id,
         state="done",
         spec={"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
@@ -61,24 +65,25 @@ def _new_status(runner, run_id: str):
 def test_ready_commit_helpers_reject_noncanonical_revision(
     monkeypatch, tmp_path, helper_name, revision
 ):
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     run_id = "ready-commit"
-    runner._save_status(_new_status(runner, run_id))
+    runner_state._save_status(_new_status(run_id))
     deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
     if revision is not None:
         deployment["adapter_revision"] = revision
 
     with pytest.raises(ValueError, match="full same-run adapter revision"):
-        getattr(runner, helper_name)(
+        getattr(runner_transitions, helper_name)(
             run_id,
             deployment,
-            verification_generation=runner.verified_adapter_revision_generation(run_id),
+            verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+                run_id
+            ),
         )
 
-    assert runner.get_status(run_id).deployment is None
-    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_status.get_status(run_id).deployment is None
+    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
 
 
 @pytest.mark.parametrize(
@@ -89,32 +94,30 @@ def test_ready_commit_helpers_reject_noncanonical_revision(
     ],
 )
 def test_verified_revision_ledger_rejects_legacy_shapes(monkeypatch, tmp_path, raw):
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     run_id = "strict-revision-ledger"
-    path = Path(runner.runs_file_path(run_id, ".verified-revisions"))
+    path = Path(runner_state.runs_file_path(run_id, ".verified-revisions"))
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(raw))
 
     with pytest.raises(ValueError, match="invalid verified"):
-        runner.read_verified_adapter_revisions(run_id)
+        runner_verified_revisions.read_verified_adapter_revisions(run_id)
 
 
 def test_stale_generation_cannot_commit_ready_revision(monkeypatch, tmp_path):
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     run_id = "stale-generation"
-    runner._save_status(_new_status(runner, run_id))
+    runner_state._save_status(_new_status(run_id))
     revision = f"{run_id}@final." + "e" * 40
-    stale_generation = runner.verified_adapter_revision_generation(run_id)
+    stale_generation = runner_verified_revisions.verified_adapter_revision_generation(run_id)
 
     assert (
-        runner.invalidate_verified_adapter_revisions(run_id, commit=lambda: None)
+        runner_verified_revisions.invalidate_verified_adapter_revisions(run_id, commit=lambda: None)
         == stale_generation + 1
     )
-    status = runner.mark_checkpoint_deployed(
+    status = runner_transitions.mark_checkpoint_deployed(
         run_id,
         {
             "state": "ready",
@@ -125,15 +128,14 @@ def test_stale_generation_cannot_commit_ready_revision(monkeypatch, tmp_path):
     )
 
     assert status.deployment is None
-    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
 
 
 def test_concurrent_checkpoint_completions_preserve_both_revisions(monkeypatch, tmp_path):
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     run_id = "concurrent-revisions"
-    runner._save_status(_new_status(runner, run_id))
+    runner_state._save_status(_new_status(run_id))
     revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-40." + "b" * 40]
     context = multiprocessing.get_context("fork")
     barrier = context.Barrier(3)
@@ -149,15 +151,14 @@ def test_concurrent_checkpoint_completions_preserve_both_revisions(monkeypatch, 
         process.join(timeout=10)
         assert process.exitcode == 0
 
-    assert runner.read_verified_adapter_revisions(run_id) == frozenset(revisions)
+    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(revisions)
 
 
 def test_stale_status_process_cannot_erase_verified_revision(monkeypatch, tmp_path):
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     run_id = "stale-status-revision"
-    runner._save_status(_new_status(runner, run_id))
+    runner_state._save_status(_new_status(run_id))
     revision = f"{run_id}@step-20." + "c" * 40
     context = multiprocessing.get_context("fork")
     loaded = context.Event()
@@ -166,34 +167,37 @@ def test_stale_status_process_cannot_erase_verified_revision(monkeypatch, tmp_pa
     process.start()
     assert loaded.wait(timeout=10)
 
-    runner.mark_checkpoint_deployed(
+    runner_transitions.mark_checkpoint_deployed(
         run_id,
         {
             "state": "ready",
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
     release.set()
     process.join(timeout=10)
 
     assert process.exitcode == 0
-    assert runner.get_status(run_id).last_heartbeat == {"step": 1}
-    assert runner.read_verified_adapter_revisions(run_id) == frozenset({revision})
-    assert "verified_adapter_revisions" not in runner.get_status(run_id).to_dict()
+    assert runner_status.get_status(run_id).last_heartbeat == {"step": 1}
+    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
+        {revision}
+    )
+    assert "verified_adapter_revisions" not in runner_status.get_status(run_id).to_dict()
 
 
 def test_verified_revision_ledger_survives_new_process(monkeypatch, tmp_path):
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     run_id = "restart-revision"
     revision = f"{run_id}@final." + "d" * 40
-    runner.add_verified_adapter_revision(
+    runner_verified_revisions.add_verified_adapter_revision(
         run_id,
         revision,
-        expected_generation=runner.verified_adapter_revision_generation(run_id),
+        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
     )
     context = multiprocessing.get_context("fork")
     output = context.Queue()

@@ -2,17 +2,17 @@
 FROM python:3.12-slim AS capsule-builder
 WORKDIR /src
 COPY flash/__init__.py flash/__init__.py
-COPY flash/_internal/__init__.py flash/_internal/channel.py flash/_internal/
+COPY flash/_internal/__init__.py flash/_internal/channel.py flash/_internal/version.py flash/_internal/
 COPY flash/runtime_capsule/ flash/runtime_capsule/
 COPY flash/providers/_lifecycle/ flash/providers/_lifecycle/
-COPY flash/source_snapshot.py flash/source_snapshot.py
+COPY flash/snapshot/ flash/snapshot/
 COPY docker/build_instance_capsule.py docker/build_instance_capsule.py
 RUN PYTHONPATH=/src python docker/build_instance_capsule.py /src /instance-bootstrap.pyz
 
 # Flash prebuilt WORKER image — the full training stack baked in for RunPod workers.
 # the worker fetches one pinned source archive at runtime; the trusted verifier is baked here.
 #
-# this image name is defined in flash/providers/_lifecycle/worker.py. it must be
+# this image name is defined in flash/providers/_lifecycle/net/worker.py. it must be
 # published to GHCR and the package set PUBLIC (no registry login is configured) so RunPod can
 # pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
@@ -90,7 +90,7 @@ RUN pip install --no-cache-dir \
 # pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
 # seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
 # (no fla.modules). The git URL is PINNED to a commit (not the moving default branch) for
-# reproducible image builds; keep this sha in lockstep with the worker dependencies in flash/providers/_lifecycle/worker.py.
+# reproducible image builds; keep this sha in lockstep with the worker dependencies in flash/providers/_lifecycle/net/worker.py.
 # tilelang is 0.1.9, not the newest release: flash-qla (added for the sm90 GDN backend) hard-requires
 # tilelang==0.1.9 AND apache-tvm-ffi==0.1.9, so 0.1.11 made this layer unsatisfiable and every image
 # build failed from 2026-08-12 until the downgrade. 0.1.11 was only ever "latest stable at the time"
@@ -191,7 +191,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
     && echo "causal_conv1d: installed (GDN packing enabled)"
 
 # weight cache (runtime, not baked): when the shared weight-cache network volume is attached,
-# flash/providers/_lifecycle/worker.py:weight_cache_env redirects only base-model prefetching through
+# flash/providers/_lifecycle/net/worker.py:weight_cache_env redirects only base-model prefetching through
 # FLASH_WEIGHT_CACHE_DIR to the persistent volume for reuse across runs. HF_HOME remains ephemeral,
 # so environment and reward downloads are not shared. executable kernel-jit caches are deliberately
 # not shared because the volume is multi-tenant; a poisoned compiled artifact could affect another
@@ -370,7 +370,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
 # This is /opt/verl-venv/bin/python -- FLASH_VERL_PYTHON, the interpreter that actually trains -- and
 # a separate network fetch from the verified main-interpreter download above (that wheel is gone by
 # now, --no-cache-dir). uv honours a `#sha256=` url fragment and refuses to install a mismatching
-# artifact, the same mechanism flash/engine/worker/backend_common.py's FLASH_ATTN_INSTALL_SPEC
+# artifact, the same mechanism flash/engine/worker/train/entry/backend_common.py's FLASH_ATTN_INSTALL_SPEC
 # already relies on, so appending it here closes the gap: a replaced release asset is rejected before
 # it lands in the venv that trains, not just in the main interpreter. Unlike that block this install
 # has no `|| echo` fallback, so a mismatch already fails the build outright.

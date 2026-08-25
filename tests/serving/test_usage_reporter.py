@@ -11,9 +11,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from flash.serving.src import engine_support
-from flash.serving.src.settings import Settings
-from flash.serving.src.usage_outbox import DurableUsageOutbox, UsageOutboxError
+from flash.serving.src.accounting.usage_outbox import DurableUsageOutbox, UsageOutboxError
+from flash.serving.src.engine import support as engine_support
+from flash.serving.src.store.settings import Settings
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -26,7 +26,7 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
 
 
 @pytest.fixture(scope="module")
-def modal_app_module():
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -39,25 +39,7 @@ def modal_app_module():
     app_mock.local_entrypoint.side_effect = _passthrough_decorator
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    # Save + restore the prior sys.modules entries so this stub doesn't leak into other tests
-    # (which would hide a real `modal`/`modal_app` import error or make the suite order-dependent).
-    # _MISSING marks "was not present" so teardown removes our stub instead of reinserting a stale
-    # one. We also drop the imported `modal_app` so it is re-imported fresh against the real module.
-    _MISSING = object()
-    prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.modal_app", _MISSING)
-    sys.modules["modal"] = modal_stub
-
-    import flash.serving.modal_app as modal_app  # imported after the stub is installed
-
-    try:
-        yield modal_app
-    finally:
-        for name, prev in (("modal", prev_modal), ("modal_app", prev_modal_app)):
-            if prev is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
+    return load_modal_app_under_stub(modal_stub)
 
 
 def test_hosted_usage_outbox_fails_closed_on_partial_configuration(modal_app_module):
@@ -144,7 +126,7 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
 def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app_module):
     # The whole point of the table: an idle container bills at the full gpu rate, so a cheap
     # fast-booting tier must not hold a card as long as the 35B's ~1010s-boot H200 does.
-    from flash.serving.src.model_config import base_models, gpu_for
+    from flash.serving.src.engine.model_config import base_models, gpu_for
 
     window_for = modal_app_module.scaledown_window_for
     default = modal_app_module.DEFAULT_SCALEDOWN_WINDOW_SECONDS
@@ -608,7 +590,9 @@ def test_load_adapters_for_base_filters_records(modal_app_module, monkeypatch):
             self.is_revision = True
 
     records = [_Record("Qwen/Qwen3.8-27B"), _Record("Qwen/Qwen3.5-9B")]
-    monkeypatch.setattr("flash.serving.src.persistence.load_adapters", lambda settings: records)
+    monkeypatch.setattr(
+        "flash.serving.src.store.persistence.load_adapters", lambda settings: records
+    )
 
     assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-9B") == [records[1]]
 
@@ -617,14 +601,14 @@ def test_load_adapters_for_base_skips_hydration_failures(modal_app_module, monke
     def _boom(_settings):
         raise TimeoutError("supabase timeout")
 
-    monkeypatch.setattr("flash.serving.src.persistence.load_adapters", _boom)
+    monkeypatch.setattr("flash.serving.src.store.persistence.load_adapters", _boom)
 
     assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-9B") == []
     assert "adapter hydration skipped" in capsys.readouterr().out
 
 
 def test_adapter_source_cache_dir_ignores_adapter_id(modal_app_module):
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.io.schemas import AdapterRecord
 
     first = AdapterRecord.model_validate(
         {
@@ -651,7 +635,7 @@ def test_adapter_source_cache_dir_ignores_adapter_id(modal_app_module):
 def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monkeypatch, tmp_path):
     import asyncio
 
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.io.schemas import AdapterRecord
 
     calls: list[dict[str, Any]] = []
 
@@ -678,7 +662,7 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
             self.paths[record.adapter_id] = path
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.registry = _Registry()
@@ -716,7 +700,7 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
 def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monkeypatch, tmp_path):
     import asyncio
 
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.io.schemas import AdapterRecord
 
     class _Registry:
         def __init__(self) -> None:
@@ -735,7 +719,7 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
         raise AssertionError("cached adapter should not call Hugging Face")
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     record = AdapterRecord.model_validate(
         {
@@ -771,7 +755,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
 ):
     import asyncio
 
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.io.schemas import AdapterRecord
 
     class _Registry:
         def __init__(self) -> None:
@@ -812,7 +796,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
         return str(local_dir)
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.registry = _Registry()
@@ -834,8 +818,8 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
 ):
     import asyncio
 
-    from flash.serving.src.registry import AdapterRegistry, lora_int_id
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.io.schemas import AdapterRecord
+    from flash.serving.src.store.registry import AdapterRegistry, lora_int_id
 
     cached = AdapterRecord.model_validate(
         {
@@ -853,7 +837,7 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
     cache_path.mkdir(parents=True)
     (cache_path / "adapter_config.json").write_text("{}", encoding="utf-8")
     (cache_path / "adapter_model.safetensors").write_bytes(b"weights")
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     class _Engine:
         def __init__(self) -> None:
@@ -890,9 +874,9 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
 def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkeypatch, tmp_path):
     # two distinct adapters whose sha1 masks collide to the same vllm int id must not share it.
     # unconfirmed entries still occupy their id because vllm may retain the corresponding weights.
-    from flash.serving.src import registry as registry_mod
-    from flash.serving.src.lora_engine import _LoraEntry
-    from flash.serving.src.schemas import AdapterRecord
+    from flash.serving.src.engine.lora_engine import _LoraEntry
+    from flash.serving.src.io.schemas import AdapterRecord
+    from flash.serving.src.store import registry as registry_mod
 
     monkeypatch.setattr(registry_mod, "lora_int_id", lambda adapter_id: 42)
 
@@ -925,8 +909,8 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
 
 
 def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_module, monkeypatch):
-    from flash.serving.src import registry as registry_mod
-    from flash.serving.src.lora_engine import _LoraEntry
+    from flash.serving.src.engine.lora_engine import _LoraEntry
+    from flash.serving.src.store import registry as registry_mod
 
     monkeypatch.setattr(registry_mod, "lora_int_id", lambda _adapter_id: 42)
 

@@ -5,11 +5,16 @@ import sys
 import threading
 import types
 
+import httpx
 import pytest
+
+import flash.serve.contract.errors as serving_errors
+import flash.serve.deployment.adapter_check as adapter_check
+import flash.serve.deployment.deploy as serving_deploy
+import flash.serve.request.transport as serving_transport
 
 
 def test_control_http_client_is_reused_and_all_clients_close(monkeypatch):
-    import flash.serve.deploy as deploy
 
     created = []
 
@@ -33,34 +38,33 @@ def test_control_http_client_is_reused_and_all_clients_close(monkeypatch):
         def close(self):
             self.closed = True
 
-    deploy._close_http_client()
-    monkeypatch.setattr(deploy.httpx, "Client", _Client)
+    serving_transport._close_http_client()
+    monkeypatch.setattr(httpx, "Client", _Client)
 
-    deploy._serving_request("GET", "https://serve.example/healthz")
-    deploy._serving_request("POST", "https://serve.example/adapters", json={"id": "r1"})
+    serving_transport.serving_request("GET", "https://serve.example/healthz")
+    serving_transport.serving_request("POST", "https://serve.example/adapters", json={"id": "r1"})
 
     assert len(created) == 1
-    assert created[0] is deploy._http_client()
+    assert created[0] is serving_transport._http_client()
     assert [request[:2] for request in created[0].requests] == [
         ("GET", "https://serve.example/healthz"),
         ("POST", "https://serve.example/adapters"),
     ]
     assert created[0].kwargs == {
         "follow_redirects": True,
-        "max_redirects": deploy._MAX_REDIRECTS,
-        "event_hooks": {"request": [deploy._strip_internal_key_off_origin]},
+        "max_redirects": serving_transport._MAX_REDIRECTS,
+        "event_hooks": {"request": [serving_transport._strip_internal_key_off_origin]},
     }
 
-    deploy._close_http_client()
+    serving_transport._close_http_client()
 
     assert created[0].closed is True
-    assert deploy._HTTP_CLIENT is None
-    assert deploy._CHAT_HTTP_CLIENT is None
-    assert deploy._STREAM_HTTP_CLIENT is None
+    assert serving_transport._HTTP_CLIENT is None
+    assert serving_transport._CHAT_HTTP_CLIENT is None
 
 
 def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     created = []
 
@@ -85,7 +89,7 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
 
         def __enter__(self):
             if not self.client.pool.acquire(blocking=False):
-                raise deploy.httpx.PoolTimeout("pool exhausted", request=self.request)
+                raise httpx.PoolTimeout("pool exhausted", request=self.request)
             return self
 
         def __exit__(self, *_args):
@@ -97,7 +101,9 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
 
         def iter_lines(self):
             yield 'data: {"choices":[{"delta":{"content":"held"}}]}'
+            yield ""
             yield "data: [DONE]"
+            yield ""
 
     class _PoolLimitedClient:
         def __init__(self, **kwargs):
@@ -107,12 +113,12 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
             created.append(self)
 
         def stream(self, method, url, **_kwargs):
-            return _StreamResponse(self, deploy.httpx.Request(method, url))
+            return _StreamResponse(self, httpx.Request(method, url))
 
         def request(self, method, url, **_kwargs):
-            request = deploy.httpx.Request(method, url)
+            request = httpx.Request(method, url)
             if not self.pool.acquire(blocking=False):
-                raise deploy.httpx.PoolTimeout("pool exhausted", request=request)
+                raise httpx.PoolTimeout("pool exhausted", request=request)
             try:
                 return _UndeployResponse()
             finally:
@@ -121,10 +127,10 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
         def close(self):
             self.closed = True
 
-    deploy._close_http_client()
-    monkeypatch.setattr(deploy.httpx, "Client", _PoolLimitedClient)
+    serving_transport._close_http_client()
+    monkeypatch.setattr(httpx, "Client", _PoolLimitedClient)
 
-    stream = deploy.chat_stream("run-1", [{"role": "user", "content": "hello"}])
+    stream = serving_deploy.chat_stream("run-1", [{"role": "user", "content": "hello"}])
     assert next(stream) == "held"
     try:
         result = deploy.undeploy_adapter("run-1")
@@ -133,17 +139,17 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
 
     assert result["serving_deregistered"] is True
     assert len(created) == 2
-    assert created[0] is deploy._STREAM_HTTP_CLIENT
-    assert created[1] is deploy._HTTP_CLIENT
+    assert created[0] is serving_transport._CHAT_HTTP_CLIENT
+    assert created[1] is serving_transport._HTTP_CLIENT
     assert created[0].kwargs["limits"].max_connections is None
     assert created[0].kwargs["limits"].max_keepalive_connections == 100
 
-    deploy._close_http_client()
+    serving_transport._close_http_client()
     assert all(client.closed for client in created)
 
 
 def test_normal_chat_pool_cannot_starve_control_requests(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     created = []
     chat_started = threading.Event()
@@ -194,8 +200,8 @@ def test_normal_chat_pool_cannot_starve_control_requests(monkeypatch):
         def close(self):
             self.closed = True
 
-    deploy._close_http_client()
-    monkeypatch.setattr(deploy.httpx, "Client", _PoolLimitedClient)
+    serving_transport._close_http_client()
+    monkeypatch.setattr(httpx, "Client", _PoolLimitedClient)
 
     thread = threading.Thread(
         target=lambda: chat_result.append(
@@ -212,17 +218,17 @@ def test_normal_chat_pool_cannot_starve_control_requests(monkeypatch):
 
     assert result["serving_deregistered"] is True
     assert chat_result == [{"choices": []}]
-    assert created[0] is deploy._CHAT_HTTP_CLIENT
-    assert created[1] is deploy._HTTP_CLIENT
+    assert created[0] is serving_transport._CHAT_HTTP_CLIENT
+    assert created[1] is serving_transport._HTTP_CLIENT
     assert created[0].kwargs["limits"].max_connections is None
     assert created[0].kwargs["limits"].max_keepalive_connections == 100
 
-    deploy._close_http_client()
+    serving_transport._close_http_client()
     assert all(client.closed for client in created)
 
 
 def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     revision = "run-1@final." + "a" * 40
     subfolder = "sft/run-1/seed0/adapter"
@@ -237,7 +243,7 @@ def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
         "metadata": {"lifecycle_state": "ready"},
     }
     outcomes = [
-        deploy.ServingError("temporary 503", status_code=503, retry_after="1.25"),
+        serving_errors.ServingError("temporary 503", status_code=503, retry_after="1.25"),
         (loading, types.SimpleNamespace(headers={"Retry-After": "9"})),
         (ready, types.SimpleNamespace(headers={})),
     ]
@@ -264,7 +270,6 @@ def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
 
 
 def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, tmp_path):
-    import flash.serve.deploy as deploy
 
     config_path = tmp_path / "adapter_config.json"
     config_path.write_text(json.dumps({"r": 32}), encoding="utf-8")
@@ -292,7 +297,7 @@ def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, 
     )
 
     assert (
-        deploy.adapter_artifact_metadata(
+        adapter_check.adapter_artifact_metadata(
             "org/repo",
             "sft/run-1/seed0/adapter",
             hf_revision="a" * 40,
@@ -303,7 +308,6 @@ def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, 
 
 
 def test_adapter_preflight_config_failure_does_not_start_tensor_listing(monkeypatch):
-    import flash.serve.deploy as deploy
 
     tensor_started = False
 
@@ -322,8 +326,8 @@ def test_adapter_preflight_config_failure_does_not_start_tensor_listing(monkeypa
         types.SimpleNamespace(hf_hub_download=hf_hub_download, HfApi=_HfApi),
     )
 
-    with pytest.raises(deploy.ServingError, match="failed to read org/repo"):
-        deploy.adapter_artifact_metadata(
+    with pytest.raises(serving_errors.ServingError, match="failed to read org/repo"):
+        adapter_check.adapter_artifact_metadata(
             "org/repo",
             "sft/run-1/seed0/adapter",
             hf_revision="a" * 40,
@@ -333,14 +337,14 @@ def test_adapter_preflight_config_failure_does_not_start_tensor_listing(monkeypa
 
 
 def test_zero_retry_after_uses_positive_readiness_backoff(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0.5)
     assert deploy._readback_delay(0, "0") == 0.5
 
 
 def test_activation_reconciliation_keeps_reliability_delay(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     revision = "run-1@final." + "a" * 40
     previous = "run-1@final." + "b" * 40
@@ -352,9 +356,9 @@ def test_activation_reconciliation_keeps_reliability_delay(monkeypatch):
     sleeps = []
 
     def fail_activation(*_args, **_kwargs):
-        raise deploy.ServingError("activation response lost")
+        raise serving_errors.ServingError("activation response lost")
 
-    monkeypatch.setattr(deploy, "_serving_request", fail_activation)
+    monkeypatch.setattr(serving_transport, "serving_request", fail_activation)
     monkeypatch.setattr(deploy, "_registered_adapter", lambda _run_id: aliases.pop(0))
     monkeypatch.setattr(deploy.time, "sleep", sleeps.append)
 
@@ -373,7 +377,7 @@ def test_activation_reconciliation_keeps_reliability_delay(monkeypatch):
 
 
 def test_bounded_smoke_chat_uses_isolated_client(monkeypatch):
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     created = []
 
@@ -405,9 +409,9 @@ def test_bounded_smoke_chat_uses_isolated_client(monkeypatch):
         def post(self, *_args, **_kwargs):
             return _Response()
 
-    monkeypatch.setattr(deploy.httpx, "Client", _Client)
+    monkeypatch.setattr(httpx, "Client", _Client)
     monkeypatch.setattr(
-        deploy,
+        serving_transport,
         "_http_client",
         lambda: (_ for _ in ()).throw(AssertionError("smoke must not use shared client")),
     )

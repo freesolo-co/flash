@@ -24,13 +24,13 @@ from referencing.exceptions import Unresolvable
 from flash.adapters.lora_rank import serving_completion_token_capacity
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.core.spec import JobSpec
-from flash.serve.contract import LORA_REQUEST_ATTESTATION_CAPABILITY
-from flash.serve.deploy import (
+from flash.serve.contract.errors import (
     AliasThinkingSilent,
     RetryableServingUnavailable,
     ServingError,
 )
-from flash.serve.preflight import (
+from flash.serve.contract.protocol import LORA_REQUEST_ATTESTATION_CAPABILITY
+from flash.serve.deployment.preflight import (
     SERVING_PROMPT_TOKEN_ALLOWANCE,
     ExternalSchemaReference,
     reject_external_schema_reference,
@@ -38,7 +38,7 @@ from flash.serve.preflight import (
     validate_local_json_schema,
     validate_structured_output_patterns,
 )
-from flash.server import app as _app
+from flash.server.asgi import app as _app
 
 
 def _serving():

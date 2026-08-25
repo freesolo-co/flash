@@ -103,8 +103,8 @@ def _bake_repo(sm: str, workflow_id: str) -> str:
 
 
 def _cleanup_claimed_bake_intent(store, record: dict, deadline_s: int) -> None:
-    from flash.providers.runpod.pod_identity import RunpodCreateAbsent, RunpodPodHandle
-    from flash.providers.runpod.pods import resolve_pending_handle, terminate_handle
+    from flash.providers.runpod.execution.identity import RunpodCreateAbsent, RunpodPodHandle
+    from flash.providers.runpod.execution.pods import resolve_pending_handle, terminate_handle
 
     handle = RunpodPodHandle.from_dict(record["handle"])
     spec = _bake_spec(record["run_id"], handle.container_disk_gb, deadline_s)
@@ -152,9 +152,10 @@ def _launch_with_gpu_walk(
     rounds: int = CREATE_ROUNDS,
     backoff_s: tuple[int, ...] = CREATE_BACKOFF_S,
 ):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import auth as runpod_auth
-    from flash.providers.runpod.pods import launch_payload_pod
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.client import auth as runpod_auth
+    from flash.providers.runpod.client import pods as runpod_pods
+    from flash.providers.runpod.execution.pods import launch_payload_pod
 
     last = None
     for round_index in range(rounds):
@@ -178,7 +179,7 @@ def _launch_with_gpu_walk(
                         cleanup_guard=cleanup_guard,
                     )
                     return handle, gpu_type_id
-                except runpod_api.RunpodCapacityError as exc:
+                except runpod_pods.RunpodCapacityError as exc:
                     last = exc
                     if after_failed_attempt is not None:
                         after_failed_attempt()
@@ -188,7 +189,7 @@ def _launch_with_gpu_walk(
         delay += random.uniform(0, 0.25 * delay)
         log(f"all gpu types full; retrying walk in {delay:.0f}s")
         time.sleep(delay)
-    raise runpod_api.RunpodCapacityError(
+    raise runpod_pods.RunpodCapacityError(
         f"no capacity across gpu walk {gpu_type_ids!r} after {rounds} rounds"
     ) from last
 
@@ -206,8 +207,8 @@ def _status_present(api, repo: str, retries: int = 1) -> bool:
 
 
 def _poll_bake(api, repo: str, handle, deadline_at: float, *, renew_lease=None) -> str:
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod.hf_intent import INTENT_LEASE_S
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution.hf_intent import INTENT_LEASE_S
 
     dead = 0
     next_renewal = time.time() + INTENT_LEASE_S / 3.0
@@ -264,8 +265,8 @@ def main() -> int:
     token = os.environ["HF_TOKEN"]
     from huggingface_hub import HfApi
 
-    from flash.providers._lifecycle.poll import preload_instance_run_id
-    from flash.providers.runpod.hf_intent import (
+    from flash.providers._lifecycle.instances.poll import preload_instance_run_id
+    from flash.providers.runpod.execution.hf_intent import (
         HfRunpodIntentStore,
         intent_lock,
         intent_path,

@@ -28,10 +28,11 @@ import numpy as np
 import pytest
 from safetensors.numpy import save
 
-from flash.engine.worker import backend_common as vc
-from flash.engine.worker import rl_train
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
 from flash.engine.worker.perf.lifecycle import RetriableInfraError
 from flash.engine.worker.train.core.child import runtime as child_runtime
+from flash.engine.worker.train.entry import backend_common as vc
+from flash.engine.worker.train.entry import rl_train
 
 # the stamp reads the run's modality off `exclude_modules`: the language-prefix regex for a
 # text-only run, None for a multimodal one. these artifacts are text-only.
@@ -201,11 +202,11 @@ def _trainer_source(module: str) -> str:
     vacuously. These are read by PATH rather than imported because the assertions are on source
     text, so the set of files has to be maintained here when a trainer is split further.
     """
-    parts = [f"flash/engine/worker/{module}.py"]
+    parts = [f"flash/engine/worker/train/entry/{module}.py"]
     if module == "opd_train":
-        parts.append("flash/engine/worker/train/opd/overrides.py")
+        parts.append("flash/engine/worker/train/opd/orchestration/overrides.py")
     if module == "rl_train":
-        parts.append("flash/engine/worker/train/rl/verl_config.py")
+        parts.append("flash/engine/worker/train/rl/launch/verl_config.py")
     return "\n".join(pathlib.Path(_REPO_ROOT, p).read_text() for p in parts)
 
 
@@ -469,7 +470,7 @@ def test_an_exhausted_wheel_install_hands_the_arm_back_instead_of_burning_it(mon
 
     Assert the heartbeat flag, not only the exception type, because the poller routes on that flag.
     """
-    from flash.engine.worker import _worker_failure_flags
+    from flash.engine.worker.entry.worker import _worker_failure_flags
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
 
     calls, sleeps = [], []
@@ -1819,7 +1820,7 @@ def test_run_verl_training_classifies_a_child_cuda_oom_rather_than_returning_it(
 def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     monkeypatch, oom_first
 ):
-    from flash.engine.worker import _worker_failure_flags
+    from flash.engine.worker.entry.worker import _worker_failure_flags
     from flash.engine.worker.perf import lifecycle
 
     monkeypatch.setattr(lifecycle, "cuda_oom_count", lambda: 0)
@@ -2786,7 +2787,7 @@ def test_the_conftest_fixture_restores_the_flag_the_entry_point_set():
         "    libc.prctl(37, ctypes.byref(cur), 0, 0, 0)\n"
         "    return cur.value\n"
         "import os\n"
-        "from flash.engine.worker import backend_common as vc\n"
+        "from flash.engine.worker.train.entry import backend_common as vc\n"
         "def test_claims_adoption():\n"
         "    vc.run_verl_training(['bash', '-c', \"echo 'step: 1'\"], env=dict(os.environ))\n"
         "    assert flag() == 1\n"
@@ -2991,7 +2992,7 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
 _SHORT_LIVED_WORKER = r"""
 import os, sys, time
 sys.path.insert(0, {repo!r})
-from flash.engine.worker import backend_common as vc
+from flash.engine.worker.train.entry import backend_common as vc
 
 # a straggler as teardown leaves one: exited, owed to this process, recorded because it was still
 # running when the drain deadline passed.
@@ -3067,7 +3068,7 @@ def test_grpo_teardown_uses_the_shared_escalating_kill():
     # the grpo path used to hand-roll killpg(pid, 15) and swallow the wait timeout, so a vllm
     # EngineCore that ignored the term kept its cuda context and stranded the gpu for later jobs.
     # pin the call site: a bare killpg here would reintroduce exactly that.
-    source = inspect.getsource(rl_train)
+    source = inspect.getsource(rl_train_runner)
     assert "kill_process_group(self._proc, process_group_id=self._process_group_id)" in source
     assert "os.killpg" not in source, "grpo teardown must not hand-roll a non-escalating killpg"
 
@@ -3112,7 +3113,7 @@ def test_every_test_touching_a_linux_only_api_carries_the_platform_guard():
 _TOPOLOGY_PROBE = r"""
 import ctypes, os, signal, sys, time
 sys.path.insert(0, {repo!r})
-from flash.engine.worker.backend_common import _reap, adopt_orphaned_descendants
+from flash.engine.worker.train.entry.backend_common import _reap, adopt_orphaned_descendants
 
 CLAIM = {claim!r}
 
@@ -3243,7 +3244,7 @@ def test_the_claim_is_made_before_each_verl_process_is_spawned():
     Claiming after the child exists leaves any grandchild it has already orphaned parented
     elsewhere, so the fix would work only for the second job onward on a reused worker.
     """
-    for fn in (vc._run_streaming_verl_subprocess, rl_train._execute_rl_child):
+    for fn in (vc._run_streaming_verl_subprocess, rl_train_runner._execute_rl_child):
         src = " ".join(inspect.getsource(fn).split())
         assert "adopt_orphaned_descendants()" in src, f"{fn.__name__} never claims its orphans"
         assert src.index("adopt_orphaned_descendants()") < src.index("subprocess.Popen("), (
@@ -3864,16 +3865,17 @@ def test_both_verl_bridges_use_the_bounded_server():
     each bridge is defined in its own module, so a fix applied to one leaves the other able to
     exhaust the thread table on exactly the same rollout shape.
     """
-    from flash.engine.worker import opd_train
+    import flash.engine.worker.train.opd.bridging.batching as opd_batching
+    import flash.engine.worker.train.rl.rollout.multi_turn as rl_multi_turn
 
     # the teacher bridge is a module-level class, so check the type itself.
-    assert issubclass(opd_train._TeacherBridgeHTTPServer, vc.BoundedThreadingHTTPServer), (
+    assert issubclass(opd_batching._TeacherBridgeHTTPServer, vc.BoundedThreadingHTTPServer), (
         "the opd teacher bridge does not use BoundedThreadingHTTPServer"
     )
     # the reward bridge is defined inside the function that starts it, so it is only reachable
     # through the source. parse rather than substring-match: a comment mentioning the old name
     # must not pass, and a real subclass must not be missed.
-    for mod in (rl_train, opd_train):
+    for mod in (rl_multi_turn, opd_batching):
         tree = ast.parse(pathlib.Path(inspect.getfile(mod)).read_text())
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):
@@ -3894,7 +3896,7 @@ def _exit_delay_with_pool(pool_expr: str) -> float:
     program = textwrap.dedent(f"""
         import sys, time
         sys.path.insert(0, {str(pathlib.Path(vc.__file__).parents[3])!r})
-        from flash.engine.worker.backend_common import _DaemonBridgeThreadPool  # noqa: F401
+        from flash.engine.worker.train.entry.backend_common import _DaemonBridgeThreadPool  # noqa: F401
         from concurrent.futures import ThreadPoolExecutor  # noqa: F401
 
         pool = {pool_expr}
@@ -4397,7 +4399,7 @@ def test_rendering_the_probe_ignores_a_monkeypatched_parent(monkeypatch):
     ever resolved through ``perf.<attr>`` a test double's body would be rendered into the child and
     the shipped shim would be whatever the last test stubbed. Pin the immunity.
     """
-    from flash.engine.worker import perf
+    import flash.engine.worker.perf as perf
 
     before = vc.render_tilelang_cudart_shim()
     monkeypatch.setattr(perf, "_find_real_libcudart", lambda: "/fake/libcudart.so")
@@ -4532,9 +4534,9 @@ def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
     Each trainer resolves the backend once from `caps` and threads the ANSWER through its config
     dict, so the override builders read `cfg[...]` and only the call sites name the helper.
     """
-    import flash.engine.worker.opd_train as opd_train
-    import flash.engine.worker.rl_train as rl_train
-    import flash.engine.worker.sft_train as sft_train
+    import flash.engine.worker.train.entry.opd_train as opd_train
+    import flash.engine.worker.train.entry.rl_train as rl_train
+    import flash.engine.worker.train.entry.sft_train as sft_train
 
     for module in (sft_train, rl_train, opd_train):
         source = pathlib.Path(module.__file__).read_text()
@@ -4559,9 +4561,9 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
     triton measured 2.25x faster. That failure is invisible today -- every catalog model is a gdn
     hybrid -- which is exactly why it needs a test rather than a reader noticing it later.
     """
-    import flash.engine.worker.opd_train as opd_train
-    import flash.engine.worker.rl_train as rl_train
-    import flash.engine.worker.sft_train as sft_train
+    import flash.engine.worker.train.entry.opd_train as opd_train
+    import flash.engine.worker.train.entry.rl_train as rl_train
+    import flash.engine.worker.train.entry.sft_train as sft_train
 
     for module in (sft_train, rl_train, opd_train):
         lines = pathlib.Path(module.__file__).read_text().splitlines()
@@ -4856,31 +4858,33 @@ def test_rollout_layered_summon_uses_a_bare_override_not_an_append():
     assert override.startswith("actor_rollout_ref.rollout.layered_summon=")
 
 
-def test_fused_expert_targets_select_fsdp2():
-    # the regression this exists for: PEFT applies `target_parameters` by registering a torch
-    # parametrization onto a NAMED TENSOR at forward time (peft/tuners/lora/layer.py:2463), and
-    # register_parametrization does `delattr` then asserts the name is gone (parametrize.py:387).
-    # fsdp1 fails that on both settings of use_orig_params -- False flattens the tensor away
-    # (raise at parametrize.py:639), True leaves FSDP.__getattr__ resolving it from the wrapped
-    # module so `hasattr` stays True and the bare assert fires (parametrize.py:634). only fsdp2's
-    # fully_shard keeps the parameter under its own name with no wrapper indirection.
+@pytest.mark.parametrize(
+    ("fsdp_generation", "expected"),
+    [(1, "fsdp"), (2, "fsdp2")],
+)
+def test_actor_fsdp_strategy_renders_the_resolved_generation(fsdp_generation, expected):
     from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
 
-    assert actor_fsdp_strategy_overrides(["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]) == [
-        "actor_rollout_ref.actor.strategy=fsdp2"
+    assert actor_fsdp_strategy_overrides(fsdp_generation) == [
+        f"actor_rollout_ref.actor.strategy={expected}"
     ]
 
 
-@pytest.mark.parametrize("empty", [None, []])
-def test_dense_models_stay_on_fsdp1(empty):
-    # a dense model's lora lives on wrapper MODULES swapped in at injection, so no parametrization
-    # is ever registered and fsdp1 is fine. the key is still written rather than omitted, so the
-    # dense default is stated once here instead of being inherited from verl's yaml.
-    # only None and [] are exercised: resolve_lora_targeting hands back a list or None, so a bare
-    # string or tuple is not a shape this boundary can produce.
-    from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
+@pytest.mark.parametrize(
+    ("algorithm", "target_parameters", "expected"),
+    [
+        ("sft", None, 2),
+        ("sft", ["mlp.experts.gate_up_proj"], 2),
+        ("grpo", None, 2),
+        ("grpo", ["mlp.experts.gate_up_proj"], 2),
+        ("opd", None, 1),
+        ("opd", ["mlp.experts.gate_up_proj"], 2),
+    ],
+)
+def test_private_fsdp_policy_matrix(algorithm, target_parameters, expected):
+    from flash.engine.support.verl_policy import _resolve_fsdp_generation
 
-    assert actor_fsdp_strategy_overrides(empty) == ["actor_rollout_ref.actor.strategy=fsdp"]
+    assert _resolve_fsdp_generation(algorithm, target_parameters) == expected
 
 
 def test_actor_fsdp_strategy_uses_a_bare_override_not_an_append():
@@ -4888,7 +4892,7 @@ def test_actor_fsdp_strategy_uses_a_bare_override_not_an_append():
     # prefix would be an append to an existing key and fail the config merge.
     from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
 
-    (override,) = actor_fsdp_strategy_overrides(["mlp.experts.gate_up_proj"])
+    (override,) = actor_fsdp_strategy_overrides(2)
     assert not override.startswith("+")
     assert override.startswith("actor_rollout_ref.actor.strategy=")
 

@@ -1,6 +1,6 @@
 """Focused hermetic coverage for the shared instance bootstrap (Vast/Lambda worker container).
 
-These target under-covered helpers in ``flash.providers._lifecycle.bootstrap``: payload loading,
+These target under-covered helpers in ``flash.providers._lifecycle.bootstrapping.bootstrap``: payload loading,
 code-prefix validation, the Hugging Face transient-retry machinery (status/Retry-After parsing +
 backoff), the HF upload/exists/fetch wrappers, ``run_mode``'s subprocess tee (success + wall-clock
 timeout), the attempt-marker writer, the preload wall-cap watchdog ``_fire`` path, and ``main()``'s
@@ -23,8 +23,8 @@ import types
 
 import pytest
 
-from flash.providers._lifecycle import bootstrap as b
-from flash.providers._lifecycle.deadline import deadline_kwargs
+from flash.providers._lifecycle.bootstrapping import bootstrap as b
+from flash.providers._lifecycle.net.deadline import deadline_kwargs
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 SOURCE_SNAPSHOT = valid_source_snapshot()
@@ -778,7 +778,7 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
     deadline = b.time.time() + 100
     rc = b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=deadline)
     assert rc == 0
-    assert popen_calls[0][0][0] == [sys.executable, "-m", "flash.engine.worker_entrypoint"]
+    assert popen_calls[0][0][0] == [sys.executable, "-m", "flash.engine.support.worker_entrypoint"]
     upload_deadline, _reaping_deadline = b._upload_cleanup_deadlines(deadline)
     expected_worker_deadline = b._worker_execution_deadline(upload_deadline)
     assert float(popen_calls[0][1]["env"]["FLASH_RUN_DEADLINE_AT"]) == pytest.approx(
@@ -2444,7 +2444,7 @@ def test_read_console_tail_drops_a_single_unterminated_line(tmp_path, monkeypatc
     configured secret then removes a prefix sized for THAT secret and leaves a long fragment of the
     runtime one, which full-value redaction can never match. The empty tail never leaked.
     """
-    from flash.providers._lifecycle import bootstrap_secrets
+    from flash.providers._lifecycle.bootstrapping import secrets as bootstrap_secrets
 
     for name in [key for key in b.os.environ if bootstrap_secrets._secret_env_name(key)]:
         monkeypatch.delenv(name, raising=False)

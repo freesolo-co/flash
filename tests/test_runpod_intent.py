@@ -9,9 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from flash.core.spec import GpuSpec, JobSpec
-from flash.providers.runpod import api as runpod_api
-from flash.providers.runpod.hf_intent import HfRunpodIntentStore, IntentLeaseHeld
-from flash.providers.runpod.pod_identity import PRE_POD_CREATE, RunpodPodHandle
+from flash.providers.runpod.client import api as runpod_api
+from flash.providers.runpod.client import pods as runpod_pods
+from flash.providers.runpod.execution.hf_intent import HfRunpodIntentStore, IntentLeaseHeld
+from flash.providers.runpod.execution.identity import PRE_POD_CREATE, RunpodPodHandle
 
 
 class _CasConflict(RuntimeError):
@@ -128,23 +129,30 @@ def test_expired_remote_owner_is_atomically_claimed(remote_download):
     assert remote_download.record["owner"] == "owner-b"
 
 
-def test_launch_owner_loss_skips_local_rollback_and_retains_exact_intent(monkeypatch):
-    from flash.providers.runpod import pods
+def test_launch_cancellation_guard_failure_still_terminates_and_preserves_original(monkeypatch):
+    from flash.providers.runpod.execution import pods
+    from flash.runner.supervise.errors import _TerminalHandleRace
 
     spec = _spec()
     persisted = []
     cleaned = []
+    creates = []
     monkeypatch.setattr(
-        runpod_api,
+        runpod_pods,
         "list_secrets_for_fingerprint",
         lambda *args, **kwargs: ("account", []),
     )
     monkeypatch.setattr(
-        runpod_api,
+        runpod_pods,
         "create_secret_for_fingerprint",
-        lambda selected, name, value, **kwargs: runpod_api.RunpodSecret("secret", name),
+        lambda selected, name, value, **kwargs: runpod_pods.RunpodSecret("secret", name),
     )
-    monkeypatch.setattr(pods, "terminate_handle", lambda *args, **kwargs: cleaned.append(True))
+    monkeypatch.setattr(pods, "terminate_handle", lambda handle, **kwargs: cleaned.append(handle))
+    monkeypatch.setattr(
+        pods,
+        "create_or_adopt_pod",
+        lambda *args, **kwargs: creates.append(True),
+    )
 
     pre_pod_callbacks = []
 
@@ -152,13 +160,13 @@ def test_launch_owner_loss_skips_local_rollback_and_retains_exact_intent(monkeyp
         if handle["phase"] == PRE_POD_CREATE:
             pre_pod_callbacks.append(1)
             if len(pre_pod_callbacks) == 2:
-                raise IntentLeaseHeld("foreign owner won CAS")
+                raise _TerminalHandleRace("cancelled")
         persisted.append(handle)
 
     def guard():
-        raise IntentLeaseHeld("foreign owner has live lease")
+        raise RuntimeError("intent renewal unavailable")
 
-    with pytest.raises(IntentLeaseHeld, match="live lease"):
+    with pytest.raises(_TerminalHandleRace, match="cancelled") as exc_info:
         pods.launch_payload_pod(
             spec,
             0,
@@ -173,24 +181,96 @@ def test_launch_owner_loss_skips_local_rollback_and_retains_exact_intent(monkeyp
     assert persisted[-1]["phase"] == PRE_POD_CREATE
     assert persisted[-1]["payload_secret_id"] == "secret"
     assert pre_pod_callbacks == [1, 1]
-    assert cleaned == []
+    assert creates == []
+    assert len(cleaned) == 1
+    assert cleaned[0].payload_secret_id == "secret"
+    assert any(
+        "rollback guard also failed: RuntimeError: intent renewal unavailable" in note
+        for note in exc_info.value.__notes__
+    )
+
+
+def test_launch_cancellation_preserved_when_guard_and_teardown_both_fail(monkeypatch):
+    from flash.providers.runpod.execution import pods
+    from flash.runner.supervise.errors import _TerminalHandleRace
+
+    spec = _spec()
+    creates = []
+    teardown_calls = []
+    monkeypatch.setattr(
+        runpod_pods,
+        "list_secrets_for_fingerprint",
+        lambda *args, **kwargs: ("account", []),
+    )
+    monkeypatch.setattr(
+        runpod_pods,
+        "create_secret_for_fingerprint",
+        lambda selected, name, value, **kwargs: runpod_pods.RunpodSecret("secret", name),
+    )
+    monkeypatch.setattr(
+        pods,
+        "create_or_adopt_pod",
+        lambda *args, **kwargs: creates.append(True),
+    )
+
+    def terminate(handle, **kwargs):
+        teardown_calls.append(handle)
+        raise runpod_api.RunpodApiError("teardown unavailable")
+
+    monkeypatch.setattr(pods, "terminate_handle", terminate)
+    pre_pod_callbacks = []
+
+    def persist(handle):
+        if handle["phase"] == PRE_POD_CREATE:
+            pre_pod_callbacks.append(1)
+            if len(pre_pod_callbacks) == 2:
+                raise _TerminalHandleRace("cancelled")
+
+    def guard():
+        raise RuntimeError("intent renewal unavailable")
+
+    with pytest.raises(_TerminalHandleRace, match="cancelled") as exc_info:
+        pods.launch_payload_pod(
+            spec,
+            0,
+            serialized_payload="opaque",
+            fingerprint=runpod_api.key_fingerprint("key"),
+            data_center_id="US-CA-2",
+            network_volume_id="volume",
+            on_handle=persist,
+            cleanup_guard=guard,
+            deadline_at=time.time() + 60,
+        )
+
+    assert pre_pod_callbacks == [1, 1]
+    assert creates == []
+    assert len(teardown_calls) == 1
+    notes = exc_info.value.__notes__
+    assert any(
+        "rollback guard also failed: RuntimeError: intent renewal unavailable" in note
+        for note in notes
+    )
+    assert any(
+        "rollback teardown also failed: RunpodApiError: teardown unavailable" in note
+        for note in notes
+    )
 
 
 def test_launch_owned_local_error_still_rolls_back(monkeypatch):
-    from flash.providers.runpod import pods
+    from flash.providers.runpod.execution import pods
 
     spec = _spec()
     cleaned = []
     guarded = []
     monkeypatch.setattr(
-        runpod_api,
+        runpod_pods,
         "list_secrets_for_fingerprint",
         lambda *args, **kwargs: ("account", []),
     )
     monkeypatch.setattr(
-        runpod_api,
+        runpod_pods,
         "create_secret_for_fingerprint",
-        lambda selected, name, value, **kwargs: runpod_api.RunpodSecret("secret", name),
+        lambda selected, name, value, **kwargs: runpod_pods.RunpodSecret("secret", name),
     )
     monkeypatch.setattr(pods, "terminate_handle", lambda handle, **kwargs: cleaned.append(handle))
 

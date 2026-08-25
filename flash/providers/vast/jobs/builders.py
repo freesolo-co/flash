@@ -2,7 +2,7 @@
 
 The normalized dataclasses (``VastOffer``, ``VastJobHandle``), the image accessor, and the container
 ``onstart`` script. Cross-provider pieces (the sweep label, the bootstrap payload) come from the
-shared ``flash.providers._lifecycle.instance`` so Vast stays byte-identical to Lambda on substrate-neutral
+shared ``flash.providers._lifecycle.instances.instance`` so Vast stays byte-identical to Lambda on substrate-neutral
 parts. Vast rents a CONTAINER directly (image + args), not a VM you cloud-init, so there is no
 ``build_user_data``/``docker run`` — ``build_onstart`` runs the shared bootstrap as the container command.
 
@@ -16,7 +16,7 @@ import json
 from dataclasses import dataclass
 from typing import ClassVar
 
-from flash.providers._lifecycle.instance import (
+from flash.providers._lifecycle.instances.instance import (
     InstanceJobHandle,
     _instance_capsule,
     _spill_large_spec_to_hf,
@@ -26,7 +26,7 @@ from flash.providers._lifecycle.instance import (
 )
 
 # Shared instance-provider helpers (single source of truth; Vast binds arm="vast" + its own onstart).
-from flash.providers._lifecycle.instance import (
+from flash.providers._lifecycle.instances.instance import (
     build_payload as _shared_build_payload,
 )
 
@@ -116,7 +116,7 @@ def vast_image(gpu: str | None = None) -> str:
     Vast runs the worker via its own onstart, so the image's CMD is irrelevant — only the baked
     deps/cache matter. The Blackwell driver floor lives in the ``cuda_max_good`` offer filter, not
     the image."""
-    from flash.providers._lifecycle.worker import worker_image_for_gpu
+    from flash.providers._lifecycle.net.worker import worker_image_for_gpu
 
     return worker_image_for_gpu(gpu)
 

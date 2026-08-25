@@ -16,11 +16,13 @@ from fastapi import HTTPException
 
 from flash.content.multimodal import messages_with_image_data_uris, normalize_prompt_images
 from flash.core.spec import JobSpec
-from flash.runner import adapter_prefix, read_verified_adapter_revisions
+from flash.runner.lifecycle.state import adapter_prefix
 from flash.runner.results.checkpoints import checkpoint_adapter_prefix
+from flash.runner.results.verified_revisions import read_verified_adapter_revisions
 from flash.schema import parse_adapter_revision
-from flash.serve.deploy import ServingError
-from flash.server import app as _app
+from flash.serve.contract.errors import ServingError
+from flash.serve.request.openai import OpenAIRequestError, parse_chat_request
+from flash.server.asgi import app as _app
 
 # defined here rather than in the route module because that one imports this one: the routes read
 # them back through their own namespace, so there is still exactly one definition.
@@ -203,6 +205,37 @@ def _resolve_explicit_chat_revision(
     return None
 
 
+def _authorized_chat_revision(
+    run_id: str,
+    deployment: dict,
+    adapter_revision,
+    step,
+    verified_revisions: set[str],
+) -> str | None:
+    """return the one verified immutable revision this chat request may serve."""
+
+    ready_deployment = _previous_ready_deployment(deployment)
+    ready_revision = (
+        ready_deployment.get("adapter_revision") if ready_deployment is not None else None
+    )
+    preferred = ready_revision if isinstance(ready_revision, str) else None
+    explicit = _resolve_explicit_chat_revision(
+        run_id,
+        adapter_revision,
+        step,
+        verified_revisions,
+        preferred_revision=preferred,
+    )
+    if explicit is not None:
+        return explicit
+    if not isinstance(ready_revision, str) or ready_revision not in verified_revisions:
+        return None
+    parsed = parse_adapter_revision(ready_revision)
+    if parsed is None or parsed[0] != run_id:
+        return None
+    return ready_revision
+
+
 def _spec_is_unservable(status) -> bool:
     """Whether the serving routes' own `JobSpec.from_dict` would reject this run's persisted spec.
 
@@ -217,19 +250,8 @@ def _spec_is_unservable(status) -> bool:
 
 
 def _chat_messages_from_payload(payload: dict) -> list[dict]:
-    """Normalize a chat payload's messages against the training image contract.
+    """compatibility seam for tests and callers that validate only message payloads."""
 
-    serving admits the same images training does, so the request goes through the canonical
-    normalizer and the count, user-only role, mime, byte, pixel, and decoded-memory limits cannot
-    drift from the ones training enforces.
-
-    what gets forwarded is the shape that was validated. a text-only request is returned
-    untouched, because normalization rewrites scalar ``content`` into block form and sending that
-    rewritten shape upstream would change the wire format of every existing text-only request. an
-    image request is forwarded in canonical openai ``image_url`` form: the normalizer accepts the
-    sdk spellings (``input_text``, ``input_image``, ``image``) that the upstream engine does not,
-    so returning the caller's own blocks would admit a request the engine then rejects.
-    """
     raw = payload.get("messages")
     if raw is None:
         return []
@@ -242,9 +264,25 @@ def _chat_messages_from_payload(payload: dict) -> list[dict]:
                 detail=f"messages[{index}] must be a chat message object",
             )
     try:
-        normalized = normalize_prompt_images({}, raw, None)
+        parse_chat_request(
+            payload,
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+    except OpenAIRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raw = payload["messages"]
+    assert isinstance(raw, list)
+    return _managed_chat_messages(raw)
+
+
+def _managed_chat_messages(messages: list[dict]) -> list[dict]:
+    """apply the training image contract after the shared message grammar."""
+
+    try:
+        normalized = normalize_prompt_images({}, messages, None)
         if not normalized.descriptors:
-            return raw
+            return messages
         return messages_with_image_data_uris(normalized.messages, normalized.descriptors, None)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"invalid image request: {exc}") from exc

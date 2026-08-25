@@ -6,8 +6,8 @@ import os
 
 import pytest
 
-import flash.providers.preflight as pf
-import flash.providers.runpod.auth as runpod_keys
+import flash.providers.core.preflight as pf
+import flash.providers.runpod.client.auth as runpod_keys
 from flash._internal.channel import CLI_NAME
 
 # Credentials every control plane needs regardless of which GPU substrate it runs on.
@@ -45,7 +45,7 @@ def clean_env(monkeypatch):
 
 def _clear_provider_cache() -> None:
     """Drop the per-name Provider singletons so is_configured() re-reads the env."""
-    import flash.providers as providers
+    from flash.providers.core import registry as providers
 
     providers._get_provider.cache_clear()
 
@@ -84,7 +84,7 @@ def test_preflight_accepts_any_single_provider(clean_env, monkeypatch, provider_
     _clear_provider_cache()
     pf.check_run_preflight()  # no raise
 
-    from flash.providers import available_providers
+    from flash.providers.core.registry import available_providers
 
     expected = {
         "RUNPOD_API_KEY": "runpod",
@@ -110,7 +110,7 @@ def test_runpod_unconfigured_is_not_available(clean_env):
     It previously reported itself configured unconditionally, so a Lambda-only plane ranked
     RunPod classes it could never provision and died at submit instead of allocating on Lambda.
     """
-    from flash.providers import available_providers
+    from flash.providers.core.registry import available_providers
 
     assert "runpod" not in available_providers()
 
@@ -132,7 +132,7 @@ def test_empty_runpod_pool_does_not_enable_runpod(clean_env, monkeypatch):
     """RUNPOD_API_KEY parsing to NO usable keys is 'unconfigured', not an empty enabled pool."""
     monkeypatch.setenv("HF_TOKEN", "hf")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fsk")
-    from flash.providers import available_providers
+    from flash.providers.core.registry import available_providers
 
     for empty in (",", "   ", " , , "):
         _set_runpod(monkeypatch, empty)
@@ -220,7 +220,7 @@ def test_require_operator_config_still_refuses_a_missing_credential(clean_env, m
 
 
 def test_runpod_key_is_env_only(clean_env):
-    from flash.providers.runpod.auth import load_api_key
+    from flash.providers.runpod.client.auth import load_api_key
 
     assert load_api_key() is None
 

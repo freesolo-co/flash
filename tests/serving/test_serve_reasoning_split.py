@@ -17,10 +17,10 @@ import orjson
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.responses import _ReasoningStreamSplitter, _split_reasoning
-from flash.serving.src.router import AdapterRouter
-from flash.serving.src.router import build_offline_serving_app as build_serving_app
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.io.responses import _ReasoningStreamSplitter, _split_reasoning
+from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.conftest import attest
 
 QWEN = "Qwen/Qwen3.5-9B"
@@ -86,7 +86,10 @@ class _Pool:
         )
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        yield {"type": "ready", "checkpoint": "", "thinking": self._thinking}
+        yield attest(
+            record,
+            {"type": "ready", "checkpoint": "", "thinking": self._thinking},
+        )
         for delta in self._deltas:
             yield {"type": "delta", "text": delta}
         yield {"type": "final", "finish_reason": "stop"}
@@ -102,7 +105,9 @@ class _NoReadyPool(_Pool):
     """Streams without a leading ``ready`` event, so the router takes the replay path."""
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        for delta in self._deltas:
+        first, *remaining = self._deltas
+        yield attest(record, {"type": "delta", "text": first})
+        for delta in remaining:
             yield {"type": "delta", "text": delta}
         yield {"type": "final", "finish_reason": "stop"}
 

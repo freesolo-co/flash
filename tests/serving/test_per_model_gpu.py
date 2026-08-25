@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from flash.serving.src.model_config import base_models, gpu_for
+from flash.serving.src.engine.model_config import base_models, gpu_for
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -32,7 +32,7 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
 
 
 @pytest.fixture(scope="module")
-def modal_app_module():
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -45,24 +45,7 @@ def modal_app_module():
     app_mock.local_entrypoint.side_effect = _passthrough_decorator
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    _MISSING = object()
-    prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.modal_app", _MISSING)
-    sys.modules["modal"] = modal_stub
-    # Force a fresh import UNDER the stub: if another test imported modal_app earlier (without this
-    # stub), Python would reuse the cached module and the stub wouldn't apply, making this fixture
-    # order-dependent. Drop the cached module first; the finally block restores the prior entry.
-    sys.modules.pop("flash.serving.modal_app", None)
-    import flash.serving.modal_app as modal_app  # imported after the stub is installed
-
-    try:
-        yield modal_app
-    finally:
-        for name, prev in (("modal", prev_modal), ("modal_app", prev_modal_app)):
-            if prev is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
+    return load_modal_app_under_stub(modal_stub)
 
 
 _DEVELOPMENT_CUSTOM_DOMAIN = "serve-dev.freesolo.co"
@@ -129,7 +112,7 @@ def load_dotenv(*_args, **_kwargs):
 dotenv_stub.load_dotenv = load_dotenv
 sys.modules["dotenv"] = dotenv_stub
 
-import flash.serving.modal_app as modal_app
+import flash.serving.app.modal_app as modal_app
 
 print(json.dumps({
     "mode": modal_app.SERVING_DEPLOYMENT_MODE,
@@ -340,7 +323,7 @@ def test_router_secret_keeps_supabase_credentials(modal_app_module, monkeypatch)
 
 
 def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_path) -> None:
-    from flash.serving.src.registry import AdapterRegistry
+    from flash.serving.src.store.registry import AdapterRegistry
 
     revision = "a" * 40
     adapter_id = f"run-1@step-1.{revision}"
@@ -403,10 +386,10 @@ def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
 
 
 builtins.__import__ = blocked_import
-import flash.serving.src.lora_engine
+import flash.serving.src.engine.lora_engine
 
 assert "PIL" not in sys.modules
-assert "flash.serving.src.multimodal" not in sys.modules
+assert "flash.serving.src.io.multimodal" not in sys.modules
 """
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -539,7 +522,7 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
     """_health must advertise the EFFECTIVE context limit. The 35B MoE overrides max_model_len via its
     per-model engine override, so health must report that — not the global default — or monitoring
     misreports the context window vLLM actually serves."""
-    from flash.serving.src import settings as cfg
+    from flash.serving.src.store import settings as cfg
 
     impl = modal_app_module._LoraEngineImpl
 
@@ -558,7 +541,7 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
 
 
 def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
-    from flash.serving.src import model_config
+    from flash.serving.src.engine import model_config
 
     mod = modal_app_module
     monkeypatch.setattr(model_config, "base_models", lambda: ["ok", "boom"])
@@ -739,7 +722,7 @@ def _load_engine_and_args(
     monkeypatch.setattr(
         transformers.AutoProcessor, "from_pretrained", lambda *a, **k: fake_processor
     )
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     import vllm  # conftest stub when real vLLM is absent
 
@@ -803,11 +786,11 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
 
 
 def test_qwen38_candidate_immutable_args_fail_closed_when_vllm_drops_revision_support():
-    from flash.serving.src import engine_boot
-    from flash.serving.src.model_config import _QWEN38_HOSTED_CANDIDATE
+    from flash.serving.src.engine import boot
+    from flash.serving.src.engine.model_config import _QWEN38_HOSTED_CANDIDATE
 
     with pytest.raises(RuntimeError, match=r"cannot pin.*missing engine args"):
-        engine_boot._required_immutable_args(
+        boot._required_immutable_args(
             "Qwen/Qwen3.8-27B",
             _QWEN38_HOSTED_CANDIDATE["engine"],
             {"model"},

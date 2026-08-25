@@ -15,6 +15,10 @@ import types
 import pytest
 
 from flash.core.spec import GpuSpec, JobSpec
+from flash.runner.accounting import weight_cache as runner_weight_cache
+from flash.runner.lifecycle import state as runner_state
+from flash.runner.lifecycle import status as runner_status
+from flash.runner.lifecycle import submit as runner_submit
 from tests._helpers.profile import satisfy_sft_profile
 from tests._helpers.source_snapshot import valid_source_snapshot
 
@@ -28,7 +32,6 @@ def _oversized_model_info():
     Sized off WEIGHT_CACHE_VOLUME_GB so it stays oversized if the volume grows again — the real
     catalog now fits entirely, so the size gate needs a stand-in to stay covered.
     """
-    from flash import runner
     from flash.core.catalog import ModelInfo
 
     return ModelInfo(
@@ -37,7 +40,9 @@ def _oversized_model_info():
         params="huge",
         algos=("sft",),
         min_vram_gb=80,
-        params_b=float(runner.WEIGHT_CACHE_VOLUME_GB),  # peak = 4x params_b GB >> the volume
+        params_b=float(
+            runner_weight_cache.WEIGHT_CACHE_VOLUME_GB
+        ),  # peak = 4x params_b GB >> the volume
     )
 
 
@@ -133,7 +138,7 @@ def test_network_volume_gb_tolerant_of_bad_values():
 # worker weight_cache_env / build_worker_env redirect
 # ---------------------------------------------------------------------------
 def test_weight_cache_env_is_base_model_scoped():
-    from flash.providers._lifecycle.worker import weight_cache_env
+    from flash.providers._lifecycle.net.worker import weight_cache_env
 
     env = weight_cache_env("/runpod-volume")
     # BASE-MODEL-SCOPED: FLASH_WEIGHT_CACHE_DIR points the base-model prefetch at the mount's HF hub
@@ -151,13 +156,13 @@ def test_weight_cache_env_is_base_model_scoped():
 
 
 def test_weight_cache_env_custom_mount():
-    from flash.providers._lifecycle.worker import weight_cache_env
+    from flash.providers._lifecycle.net.worker import weight_cache_env
 
     assert weight_cache_env("/workspace")["FLASH_WEIGHT_CACHE_DIR"] == "/workspace/hf-cache/hub"
 
 
 def test_build_worker_env_sets_base_model_cache_with_volume():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     env = build_worker_env(_vol_spec(), 0)
     assert env["FLASH_WEIGHT_CACHE_DIR"] == "/runpod-volume/hf-cache/hub"
@@ -166,7 +171,7 @@ def test_build_worker_env_sets_base_model_cache_with_volume():
 
 
 def test_build_worker_env_no_cache_without_volume():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     env = build_worker_env(JobSpec(model="m", seed=0), 0)
     # Without a volume the base-model cache var must NOT be set (pointing at a missing mount).
@@ -185,7 +190,9 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
     import huggingface_hub
     import huggingface_hub.constants
 
+    import flash.engine.worker.io.heartbeat as worker_heartbeat
     import flash.engine.worker.io.hf as hf
+    import flash.engine.worker.perf as worker_perf
 
     calls = []
 
@@ -212,8 +219,8 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot)
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(ephemeral_hub))
-    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(hf._w, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *a, **k: None)
     return hf, calls
 
 
@@ -281,7 +288,7 @@ def test_prefetch_model_falls_back_to_ephemeral_when_mount_absent(tmp_path, monk
 def test_prefetch_model_starts_no_download_at_deadline(tmp_path, monkeypatch):
     monkeypatch.delenv("FLASH_WEIGHT_CACHE_DIR", raising=False)
     hf, calls = _patch_prefetch_io(monkeypatch, tmp_path / "ephemeral" / "hub")
-    monkeypatch.setattr(hf._w, "_remaining_worker_wall_seconds", lambda: 0.0)
+    monkeypatch.setattr(hf._worker_state, "_remaining_worker_wall_seconds", lambda: 0.0)
 
     hf.prefetch_model("Qwen/Qwen3.5-9B")
 
@@ -310,7 +317,7 @@ def test_shared_weight_cache_dir_resolves_mount_for_both_substrates(tmp_path, mo
 # instance-provider integration (Lambda reuses RunPod's build_worker_env)
 # ---------------------------------------------------------------------------
 def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
-    from flash.providers._lifecycle.worker import strip_runpod_volume_env
+    from flash.providers._lifecycle.net.worker import strip_runpod_volume_env
 
     env = {
         "FLASH_WEIGHT_CACHE_DIR": "/runpod-volume/hf-cache/hub",
@@ -327,8 +334,8 @@ def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
 def test_instance_payload_strips_runpod_volume_redirect():
     # The RunPod weight-cache base-model redirect must NOT leak into a Lambda payload —
     # those instances never mount /runpod-volume. (build_worker_env DOES set it; the instance strips.)
-    from flash.providers._lifecycle import instance as _instance
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.instances import instance as _instance
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     # network_volume is managed -> carried by the internal dict (the leak source that build_worker_env
     # turns into the /runpod-volume redirect).
@@ -351,21 +358,19 @@ def test_instance_payload_strips_runpod_volume_redirect():
 
 
 # ---------------------------------------------------------------------------
-# runner._assign_weight_cache_volume — fully managed, no knobs. Only curated models are trainable
+# runner_weight_cache._assign_weight_cache_volume — fully managed, no knobs. Only curated models are trainable
 # and their weights are public, so the shared cross-tenant cache holds nothing private; size
 # (_fits_weight_cache) is what gates attachment.
 # ---------------------------------------------------------------------------
 def test_assign_weight_cache_attaches_to_a_run():
-    from flash import runner
 
-    out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
-    assert out.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME == "flash-weights"
-    assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB
+    out = runner_weight_cache._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
+    assert out.gpu.network_volume == runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME == "flash-weights"
+    assert out.gpu.network_volume_gb == runner_weight_cache.WEIGHT_CACHE_VOLUME_GB
 
 
 def test_assign_weight_cache_keeps_a_custom_volume():
     # A NON-shared (per-org / custom) volume is the intended escape hatch — left intact.
-    from flash import runner
 
     spec = JobSpec.from_dict(
         {
@@ -378,26 +383,24 @@ def test_assign_weight_cache_keeps_a_custom_volume():
             },
         }
     )
-    out = runner._assign_weight_cache_volume(spec)
+    out = runner_weight_cache._assign_weight_cache_volume(spec)
     assert out.gpu.network_volume == "org-123-private-cache"  # not the shared cache -> kept
 
 
 def test_assign_weight_cache_ignores_removed_kill_switch(monkeypatch):
     # Regression: the FLASH_WEIGHT_CACHE=0 kill switch is GONE — fully managed, always on.
-    from flash import runner
 
     monkeypatch.setenv("FLASH_WEIGHT_CACHE", "0")
-    out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
+    out = runner_weight_cache._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
     assert out.gpu.network_volume == "flash-weights"  # env ignored
 
 
 def test_assign_weight_cache_does_not_override_existing():
-    from flash import runner
 
     spec = _vol_spec(name="explicit-vol")
     # network_volume is managed -> carried by the internal dict; an already-pinned volume is honored.
     spec = JobSpec.from_dict({**spec.to_internal_dict(), "run_id": "r"})
-    out = runner._assign_weight_cache_volume(spec)
+    out = runner_weight_cache._assign_weight_cache_volume(spec)
     assert out.gpu.network_volume == "explicit-vol"  # an explicit/test value is never clobbered
 
 
@@ -407,10 +410,9 @@ def test_assign_weight_cache_skips_oversized_catalog_model():
     # mid-download. It is left cache-less and downloads to the container disk instead. Every model
     # in the current catalog fits (see test_every_catalog_model_fits_the_weight_cache), so the gate
     # is exercised with a synthetic oversized entry rather than a real one.
-    from flash import runner
 
     info = _oversized_model_info()
-    out = runner._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
+    out = runner_weight_cache._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
     assert out.gpu.network_volume is None  # too big for the shared cache -> cache-less
 
 
@@ -419,7 +421,6 @@ def test_assign_weight_cache_strips_preset_shared_cache_on_oversized_catalog_mod
     # already pinned ``flash-weights`` for an oversized model must NOT bypass the gate via the
     # "honor an existing volume" no-op and redirect the download onto the undersized mount. It is
     # stripped cache-less.
-    from flash import runner
 
     info = _oversized_model_info()
     spec = JobSpec.from_dict(
@@ -428,19 +429,18 @@ def test_assign_weight_cache_strips_preset_shared_cache_on_oversized_catalog_mod
             "run_id": "r",
             "gpu": {
                 "type": "B200",
-                "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
+                "network_volume": runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME,
                 "network_volume_gb": 100,
             },
         }
     )
-    out = runner._assign_weight_cache_volume(spec, info)
+    out = runner_weight_cache._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume is None  # oversized -> the pre-set shared cache was stripped
 
 
 def test_assign_weight_cache_keeps_preset_shared_cache_on_fitting_catalog_model():
     # The re-gate only strips when OVERSIZED: a fitting model that already carries the shared cache
     # keeps it (the pin is correct), exercising the honor-existing path for a shared-name spec.
-    from flash import runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
@@ -450,19 +450,18 @@ def test_assign_weight_cache_keeps_preset_shared_cache_on_fitting_catalog_model(
             "run_id": "r",
             "gpu": {
                 "type": "H100",
-                "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
+                "network_volume": runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME,
                 "network_volume_gb": 100,
             },
         }
     )
-    out = runner._assign_weight_cache_volume(spec, info)
+    out = runner_weight_cache._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume == "flash-weights"  # fits -> kept
 
 
 def test_assign_weight_cache_keeps_preset_custom_volume_on_oversized_catalog_model():
     # The re-gate is scoped to the SHARED name only: a custom/per-org volume on an oversized model is
     # left intact (the caller owns its sizing — it may be a 200 GB org cache that DOES fit).
-    from flash import runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.6-35B-A3B"]
@@ -477,38 +476,35 @@ def test_assign_weight_cache_keeps_preset_custom_volume_on_oversized_catalog_mod
             },
         }
     )
-    out = runner._assign_weight_cache_volume(spec, info)
+    out = runner_weight_cache._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume == "org-123-big-cache"  # custom volume honored despite size
 
 
 def test_assign_weight_cache_attaches_fitting_catalog_model():
     # A model whose download fits the cache (with temp headroom) is still attached when info is passed.
-    from flash import runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]  # ~19.4 GB download, peak ~39 GB < 100 GB
-    out = runner._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
+    out = runner_weight_cache._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
     assert out.gpu.network_volume == "flash-weights"
 
 
 def test_fits_weight_cache_is_size_based():
-    from flash import runner
 
     # Oversized models are still excluded: the gate is a size check, not "always true".
-    assert not runner._fits_weight_cache(_oversized_model_info())
+    assert not runner_weight_cache._fits_weight_cache(_oversized_model_info())
 
 
 def test_every_catalog_model_fits_the_weight_cache():
     # The largest models have the slowest cold downloads, so they are exactly the ones the cache
     # must cover. WEIGHT_CACHE_VOLUME_GB must stay >= the peak footprint of the biggest catalog
     # entry; if a larger model is added, grow the volume rather than silently skipping its cache.
-    from flash import runner
     from flash.core.catalog import MODELS
 
     for mid, info in MODELS.items():
-        assert runner._fits_weight_cache(info), (
+        assert runner_weight_cache._fits_weight_cache(info), (
             f"{mid} ({info.params_b}B) no longer fits the "
-            f"{runner.WEIGHT_CACHE_VOLUME_GB} GB weight cache"
+            f"{runner_weight_cache.WEIGHT_CACHE_VOLUME_GB} GB weight cache"
         )
 
 
@@ -516,10 +512,9 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
     # Integration: the assignment is wired into submit_job and visible on the effective worker spec.
     # network_volume is platform-managed -> stripped from the public status.spec, so observe the
     # managed assignment on the effective-preparation worker spec the worker actually runs.
-    from flash import runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = JobSpec.from_dict(
             {
                 "model": "Qwen/Qwen3.5-9B",
@@ -531,11 +526,11 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
         )
         # sft submission is profile-gated; the cache attachment under test is not, so seed the
         # profile rather than exercising the hub round-trips a real submit performs.
-        satisfy_sft_profile(runner, monkeypatch, spec)
-        status = runner.submit_job(spec, dry_run=True)
+        satisfy_sft_profile(monkeypatch, spec)
+        status = runner_submit.submit_job(spec, dry_run=True)
     gpu = status.effective_preparation["worker_spec"]["gpu"]
     assert gpu["network_volume"] == "flash-weights"
-    assert gpu["network_volume_gb"] == runner.WEIGHT_CACHE_VOLUME_GB
+    assert gpu["network_volume_gb"] == runner_weight_cache.WEIGHT_CACHE_VOLUME_GB
     # and it must NOT leak into the public spec
     assert "network_volume" not in status.spec["gpu"]
 
@@ -560,7 +555,7 @@ def test_drop_weight_cache_preserves_non_shared_escape_hatch_volume():
     # Review (Copilot): the no-capacity cache-drop must NOT strip a non-shared per-org/custom volume —
     # that is the deliberate escape-hatch isolation the run opted into. Only the SHARED
     # platform cache (WEIGHT_CACHE_VOLUME_NAME) is dropped.
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.supervise.lifecycle import _drop_weight_cache
 
     custom = _vol_spec(name="org-1234-private")
@@ -579,16 +574,16 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         public = JobSpec.from_dict(
             {**_vol_spec().to_internal_dict(), "run_id": "managed-cache-fallback"}
         )
-        assert public.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME
+        assert public.gpu.network_volume == runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME
         selected_dict = public.to_internal_dict()
         selected_dict["gpu"]["network_volume"] = None
         selected = JobSpec.from_dict(selected_dict)
-        runner._save_status(
-            runner.RunStatus(
+        runner_state._save_status(
+            runner_state.RunStatus(
                 run_id=public.run_id,
                 state="provisioning",
                 spec=public.to_dict(),
@@ -601,12 +596,12 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
             )
         )
 
-        assert runner._persist_effective_worker_spec(selected)
+        assert runner_submit._persist_effective_worker_spec(selected)
 
-        stored = runner.get_status(public.run_id)
+        stored = runner_status.get_status(public.run_id)
         assert stored.effective_preparation["worker_spec"]["gpu"]["network_volume"] is None
         assert stored.effective_preparation["adapter_identity"] is None
-        assert runner.effective_spec_from_status(stored).gpu.network_volume is None
+        assert runner_status.effective_spec_from_status(stored).gpu.network_volume is None
 
 
 def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
@@ -618,16 +613,16 @@ def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         committed = JobSpec.from_dict(
             {
                 **_vol_spec(name="org-1234-private").to_internal_dict(),
                 "run_id": "custom-cache-fallback",
             }
         )
-        assert committed.gpu.network_volume != runner.WEIGHT_CACHE_VOLUME_NAME
-        runner._save_status(
-            runner.RunStatus(
+        assert committed.gpu.network_volume != runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME
+        runner_state._save_status(
+            runner_state.RunStatus(
                 run_id=committed.run_id,
                 state="provisioning",
                 spec=committed.to_dict(),
@@ -644,7 +639,7 @@ def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
         selected = JobSpec.from_dict(selected_dict)
 
         with pytest.raises(ValueError, match="effective preparation"):
-            runner._persist_effective_worker_spec(selected)
+            runner_submit._persist_effective_worker_spec(selected)
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +648,7 @@ def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
 def test_catalog_model_ids_are_the_cache_fitting_catalog():
     from flash.core.catalog import MODELS
     from flash.providers.artifacts import weight_cache as preload
-    from flash.runner import _fits_weight_cache
+    from flash.runner.accounting.weight_cache import _fits_weight_cache
 
     ids = set(preload.catalog_model_ids())
     # The default preload set is the catalog RESTRICTED to models that fit the weight cache (warming a
@@ -668,7 +663,7 @@ def test_catalog_model_ids_are_the_cache_fitting_catalog():
 
 def test_teardown_lambda_filesystems_deletes_only_fleet(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     fses = [
         {"id": "f1", "name": "flash-weights", "region": {"name": "us-east-1"}},
@@ -686,7 +681,7 @@ def test_teardown_lambda_filesystems_deletes_only_fleet(monkeypatch):
 
 def test_teardown_lambda_filesystems_no_key_is_noop(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     monkeypatch.setattr(
         lambda_api,
@@ -796,7 +791,7 @@ def test_teardown_empty_datacenters_scope_is_refused(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     ensured = []
     monkeypatch.setattr(
@@ -821,7 +816,7 @@ def test_provision_lambda_filesystems_covers_every_region(monkeypatch):
 
 def test_provision_lambda_skips_failed_region(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     def flaky(name, region, deadline_at=None):
         if region == "bad-1":
@@ -836,7 +831,7 @@ def test_provision_lambda_skips_failed_region(monkeypatch):
 
 def test_provision_lambda_no_key_is_noop(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     monkeypatch.setattr(
         lambda_api,
@@ -870,7 +865,7 @@ def test_provision_cli_dry_run_provisions_nothing(monkeypatch):
 
 def test_warm_weight_cache_fans_out_over_datacenters(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     seen_dcs = []
     fingerprint = runpod_api.key_fingerprint("key")
@@ -902,7 +897,7 @@ def test_warm_weight_cache_fans_out_over_datacenters(monkeypatch):
 
 def test_warm_weight_cache_defaults_to_full_fleet_and_catalog(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     captured = {}
     fingerprint = runpod_api.key_fingerprint("key")
@@ -941,7 +936,7 @@ def _preload_spec():
 
 
 def test_instance_build_payload_preload_mode():
-    from flash.providers._lifecycle import instance as _instance
+    from flash.providers._lifecycle.instances import instance as _instance
 
     spec = _preload_spec()
     p = _instance.build_payload(
@@ -965,7 +960,7 @@ def test_instance_build_payload_preload_mode():
 
 
 def test_instance_build_payload_no_mode_by_default():
-    from flash.providers._lifecycle import instance as _instance
+    from flash.providers._lifecycle.instances import instance as _instance
 
     spec = _preload_spec()
     p = _instance.build_payload(
@@ -982,7 +977,7 @@ def test_instance_build_payload_no_mode_by_default():
 
 
 def test_instance_preload_requires_mounted_cache():
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     # FLASH_WEIGHT_CACHE_DIR rooted at an UNMOUNTED cache -> refuse (would warm ephemeral disk), no download
     r = b.run_preload(
@@ -997,7 +992,7 @@ def test_instance_preload_downloads_into_cache(tmp_path, monkeypatch):
     import sys
     import types
 
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     calls = []
 
@@ -1037,7 +1032,7 @@ def test_instance_preload_skips_download_when_already_cached(tmp_path, monkeypat
     snapshot already_cached and does NOT re-download it."""
     import sys
 
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     real_downloads = []
 
@@ -1064,7 +1059,7 @@ def test_instance_preload_skips_download_when_already_cached(tmp_path, monkeypat
 def test_nfs_mount_check_verifies_mountpoint_and_writes_sentinel():
     """The NFS (Lambda) preamble drops the sentinel ONLY when the host path is a real mountpoint, so an
     auto-created empty Docker-bind dir (failed/unready NFS) is detectable in-container."""
-    from flash.providers._lifecycle import instance as _instance
+    from flash.providers._lifecycle.instances import instance as _instance
 
     pre = _instance._cache_nfs_mount_check({"cache_host_mount": "/lambda/nfs/flash-weights"})
     assert "mountpoint -q '/lambda/nfs/flash-weights'" in pre  # gates on a REAL mount
@@ -1078,7 +1073,7 @@ def test_instance_preload_nfs_requires_mount_sentinel(tmp_path, monkeypatch):
     auto-creates a missing host dir, so isdir(mount) alone can't prove the NFS actually mounted."""
     import sys
 
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     def _boom(**k):
         raise AssertionError("must not download when the NFS cache isn't really mounted")
@@ -1105,7 +1100,7 @@ def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch)
     """With the NFS preamble's real-mount sentinel present, a Lambda preload proceeds to download."""
     import sys
 
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     calls = []
 
@@ -1136,7 +1131,7 @@ def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch)
 def test_build_payload_carries_mount_marker_for_nfs_cache():
     """a cache-attached Lambda preload payload carries cache_mount_marker so the in-container check
     can require the NFS mount sentinel."""
-    from flash.providers._lifecycle import instance as _instance
+    from flash.providers._lifecycle.instances import instance as _instance
 
     spec = _preload_spec()
     p = _instance.build_payload(
@@ -1156,7 +1151,7 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
 def test_preload_wall_cap_timer_armed_and_cancellable(monkeypatch):
     """run_preload has no worker subprocess, so the preload branch arms an absolute-deadline watchdog
     that hard-exits the box if a download hangs past deadline_at. The timer is cancellable on finish."""
-    from flash.providers._lifecycle import bootstrap as b
+    from flash.providers._lifecycle.bootstrapping import bootstrap as b
 
     now = 1_000.0
     monkeypatch.setattr(b.time, "time", lambda: now)
@@ -1179,8 +1174,8 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     import base64
     import json as _json
 
-    from flash.providers.lambda_ import api as lambda_api
     from flash.providers.lambda_ import jobs
+    from flash.providers.lambda_.client import api as lambda_api
 
     launched = {}
     monkeypatch.setattr(
@@ -1221,8 +1216,8 @@ def test_lambda_warm_caller_uses_source_independent_preload_payload(monkeypatch)
     import json as _json
 
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
     from flash.providers.lambda_ import jobs
+    from flash.providers.lambda_.client import api as lambda_api
     from tests.test_lambda_runner import _inst
 
     launched = {}
@@ -1481,7 +1476,7 @@ def test_lambda_ladder_is_ordered_cheapest_first():
     Guards against someone appending a class without checking where it lands on price.
     """
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_.pricing import _STATIC_RATES
+    from flash.providers.lambda_.client.pricing import _STATIC_RATES
 
     rates = [_STATIC_RATES[c] for c in preload._LAMBDA_PRELOAD_GPU_LADDER]
     assert rates == sorted(rates), f"ladder must be cheapest-first, got {rates}"
@@ -1665,7 +1660,7 @@ def test_warm_stops_the_ladder_on_an_ambiguous_create(monkeypatch):
     Every class in a region shares one run_id, and UnreconciledCreateError means Lambda may have billed
     an instance we cannot see. The error exists to forbid another create, so it must end the ladder.
     """
-    from flash.providers.base import UnreconciledCreateError
+    from flash.providers.core.base import UnreconciledCreateError
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -1692,7 +1687,7 @@ def test_warm_ensures_the_region_filesystem_once_before_the_class_ladder(monkeyp
     Creation is non-idempotent; pre-ensuring makes later class attempts observe the existing mount
     instead of billing duplicate filesystems.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -1730,7 +1725,7 @@ def test_warm_skips_a_region_whose_created_filesystem_is_not_yet_listed(monkeypa
     Later `ensure_filesystem` calls are safe only after listing visibility; otherwise launch can
     submit a second non-idempotent create.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -1763,7 +1758,7 @@ def test_warm_does_not_launch_while_the_filesystem_is_unconfirmed(monkeypatch):
     Reconciliation failures can lose their sentinel under capacity wrapping. Launching anyway risks
     a second non-idempotent create, so skip the cold region.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -1825,7 +1820,7 @@ def test_warm_still_walks_the_ladder_when_lambda_was_never_reached(monkeypatch):
     Without this distinction the pre-ensure would fail on every host lacking LAMBDA_API_KEY, pin the
     ladder to a single class, and silently disable the class fallback this module exists to provide.
     """
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     preload, lj, _launched, _terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
@@ -1986,7 +1981,7 @@ def test_provisioned_region_snapshot_is_deadline_bounded(monkeypatch):
     line.
     """
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_.client import api as lambda_api
 
     seen = {}
 
@@ -2398,7 +2393,10 @@ def test_volume_holds_whole_catalog_with_largest_model_in_transit():
     Persistent volumes evict nothing, so download order cannot prevent the observed 200 GB
     "Disk quota exceeded" failure.
     """
-    from flash.runner import WEIGHT_CACHE_VOLUME_GB, weight_cache_catalog_peak_gb
+    from flash.runner.accounting.weight_cache import (
+        WEIGHT_CACHE_VOLUME_GB,
+        weight_cache_catalog_peak_gb,
+    )
 
     needed = weight_cache_catalog_peak_gb()
     assert needed <= WEIGHT_CACHE_VOLUME_GB, (
@@ -2415,7 +2413,7 @@ def test_preload_timeout_covers_a_fully_cold_whole_catalog_warm():
     """
     from flash.core.catalog import MODELS
     from flash.providers.artifacts.weight_cache import _PRELOAD_TIMEOUT_S
-    from flash.runner import _download_gb, _fits_weight_cache
+    from flash.runner.accounting.weight_cache import _download_gb, _fits_weight_cache
 
     measured_gb, measured_s = 70.0, 870.0  # observed cold 35B pull
     rate_gb_s = measured_gb / measured_s
@@ -2467,7 +2465,10 @@ def test_catalog_peak_counts_others_resident_not_just_the_largest():
     the largest model's own peak and the plain resident total.
     """
     from flash.core.catalog import MODELS
-    from flash.runner import _fits_weight_cache, weight_cache_catalog_peak_gb
+    from flash.runner.accounting.weight_cache import (
+        _fits_weight_cache,
+        weight_cache_catalog_peak_gb,
+    )
 
     sizes = sorted(
         ((info.params_b or 0.0) * 2.0 for info in MODELS.values() if _fits_weight_cache(info)),
@@ -2484,7 +2485,7 @@ def test_catalog_peak_counts_others_resident_not_just_the_largest():
 def test_partial_datacenter_names_the_models_that_failed(monkeypatch, caplog):
     """'partial' alone is unactionable: the summary must name each failed model and its reason."""
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     fingerprint = runpod_api.key_fingerprint("key")
     monkeypatch.setattr(preload, "catalog_model_ids", lambda: ["m1", "m2"])
@@ -2515,7 +2516,7 @@ def test_partial_datacenter_names_the_models_that_failed(monkeypatch, caplog):
 def test_ok_datacenter_logs_no_per_model_failures(monkeypatch, caplog):
     """A fully warmed DC must not emit failure lines (the summary stays quiet when nothing is wrong)."""
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     fingerprint = runpod_api.key_fingerprint("key")
     monkeypatch.setattr(preload, "catalog_model_ids", lambda: ["m1"])
@@ -2543,7 +2544,7 @@ def test_grow_raises_undersized_volumes_and_leaves_the_rest_alone(monkeypatch):
     Existing 100 GB volumes require REST growth to reach 250 GB or larger models still hit
     "Disk quota exceeded".
     """
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     calls = []
 
@@ -2585,7 +2586,7 @@ def test_grow_tolerates_a_volume_listing_without_usable_sizes(monkeypatch):
     Raising here would take down a preload for every datacenter over one bad row from the listing
     API, which is strictly worse than attaching a volume at whatever size it already has.
     """
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     patched = []
 
@@ -2629,8 +2630,8 @@ def test_one_stalling_volume_cannot_starve_the_rest_of_the_fleet(monkeypatch):
     """
     import types
 
-    from flash.providers._lifecycle import deadline as _deadline
-    from flash.providers.runpod import api
+    from flash.providers._lifecycle.net import deadline as _deadline
+    from flash.providers.runpod.client import api
 
     clock = {"t": 10_000.0}
     monkeypatch.setattr(_deadline, "time", types.SimpleNamespace(time=lambda: clock["t"]))
@@ -2671,7 +2672,6 @@ def test_assign_refreshes_a_stale_shared_cache_size():
 
     A correct volume name can still carry the stale 100 GB size and admit models that need 250 GB.
     """
-    from flash import runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
@@ -2681,14 +2681,14 @@ def test_assign_refreshes_a_stale_shared_cache_size():
             "run_id": "r",
             "gpu": {
                 "type": "H100",
-                "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
+                "network_volume": runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME,
                 "network_volume_gb": 100,
             },
         }
     )
-    out = runner._assign_weight_cache_volume(spec, info)
-    assert out.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME
-    assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB
+    out = runner_weight_cache._assign_weight_cache_volume(spec, info)
+    assert out.gpu.network_volume == runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME
+    assert out.gpu.network_volume_gb == runner_weight_cache.WEIGHT_CACHE_VOLUME_GB
 
 
 def test_assign_leaves_a_custom_volume_size_alone():
@@ -2697,7 +2697,6 @@ def test_assign_leaves_a_custom_volume_size_alone():
     A per-org volume is the caller's to size, and rewriting it to the managed number would silently
     change what they are billed for.
     """
-    from flash import runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
@@ -2708,7 +2707,7 @@ def test_assign_leaves_a_custom_volume_size_alone():
             "gpu": {"type": "H100", "network_volume": "my-org-cache", "network_volume_gb": 100},
         }
     )
-    out = runner._assign_weight_cache_volume(spec, info)
+    out = runner_weight_cache._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume == "my-org-cache"
     assert out.gpu.network_volume_gb == 100
 
@@ -2719,7 +2718,7 @@ def test_one_bad_volume_never_blocks_the_others(monkeypatch):
     Aborting the loop left later DCs' volumes unreconciled, so a run placed in one still hit
     "Disk quota exceeded" -- the failure this whole path exists to prevent.
     """
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     listed = [
         {"name": "flash-weights-us-ca-2", "id": "v1", "size": 100},

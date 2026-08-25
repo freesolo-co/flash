@@ -18,7 +18,7 @@ def test_qwen38_exact_parameter_count_reaches_vram_disk_and_cost() -> None:
     from flash.core.catalog import resolve_model
     from flash.cost import RunConfig, estimate_cost
     from flash.cost.analytical import setup_seconds
-    from flash.providers.allocator import required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb
 
     model = "Qwen/Qwen3.8-27B"
     config = RunConfig(

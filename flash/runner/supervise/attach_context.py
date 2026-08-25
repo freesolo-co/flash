@@ -7,10 +7,10 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from flash.core.spec import JobSpec
-from flash.providers._lifecycle.poll import _attempt_int
+from flash.providers._lifecycle.instances.poll import _attempt_int
 
 if TYPE_CHECKING:
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
 
 
 @dataclass(frozen=True)
@@ -35,8 +35,8 @@ def _build_attach_context(
     persisted_remote: dict,
 ) -> _AttachContext:
     """Validate the persisted handle and collect the inputs needed to poll it."""
-    from flash.providers.base import JobHandle
-    from flash.runner import get_status, source_snapshot_from_status
+    from flash.providers.core.base import JobHandle
+    from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
 
     remote = dict(persisted_remote)
     seed = int(remote.pop("seed", worker_spec.seed))
@@ -72,14 +72,16 @@ def _resolve_pending_runpod_context(
     """Adopt and durably persist an exact RunPod Pod before any recovered poll."""
     if context.handle.provider != "runpod":
         return context
-    from flash.providers.base import JobHandle
-    from flash.providers.runpod.pods import (
-        RunpodCreateAbsent,
-        RunpodPodHandle,
+    from flash.providers.core.base import JobHandle
+    from flash.providers.runpod.execution.identity import RunpodCreateAbsent, RunpodPodHandle
+    from flash.providers.runpod.execution.pods import (
         resolve_pending_handle,
         terminate_handle,
     )
-    from flash.runner import _compare_and_replace_remote, _record_cleanup_remote
+    from flash.runner.accounting.reconciliation import (
+        _compare_and_replace_remote,
+        _record_cleanup_remote,
+    )
     from flash.runner.supervise.lifecycle import _CompletedAttemptPending
 
     strict = RunpodPodHandle.from_dict(context.handle.to_dict())

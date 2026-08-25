@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.2.116"
+version = "1.2.117"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -101,8 +101,9 @@ serving = [
     # gets Pillow transitively via vllm, but this extra deliberately excludes vllm, so it has to
     # state Pillow itself.
     "pillow>=11",
-    # imported directly by `src/schemas.py`, `src/serving_io.py` and `src/settings.py`. it does
-    # arrive under `pydantic-settings`, but a direct module-scope import should not rely on
+    # imported directly by `src/io/schemas.py`, `src/io/requests.py` and
+    # `src/store/settings.py`. it does arrive under `pydantic-settings`, but a direct module-scope
+    # import should not rely on
     # another package's dependency to keep supplying it.
     "pydantic>=2.7.0",
     "pydantic-settings>=2.6.0",
@@ -165,12 +166,12 @@ Homepage = "https://github.com/freesolo-co/flash"
 Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
-flash = "flash.cli:main"
+flash = "flash.cli.parsing.main:main"
 # stable alias retained for existing operator automation and self-hosting instructions.
-flash-cli = "flash.cli:main"
+flash-cli = "flash.cli.parsing.main:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
-flash-server = "flash.server.__main__:main"
+flash-server = "flash.server.asgi.cli:main"
 
 [build-system]
 # bound the build backend to the validated major line for reproducible package builds.
@@ -190,7 +191,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.2.116"
+version = "1.2.117"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -316,7 +317,7 @@ ignore = [
 # Routes live inside the create_app() closure; with PEP 563 lazy annotations,
 # Annotated[..., Depends(closure_local)] cannot be resolved by get_type_hints,
 # so the definition-time `= Depends(...)` form is required here.
-"flash/server/app.py" = ["FAST002"]
+"flash/server/asgi/app.py" = ["FAST002"]
 # `_ScoredResponseText` subclasses `str` to stay grader-compatible while carrying the structured
 # views as attributes; __slots__ would defeat that.
-"flash/envs/adapter.py" = ["SLOT000"]
+"flash/envs/loading/adapter.py" = ["SLOT000"]

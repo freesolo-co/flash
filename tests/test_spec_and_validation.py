@@ -11,6 +11,11 @@ from dataclasses import fields, replace
 
 import pytest
 
+import flash.runner.lifecycle.preparation as runner_preparation
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as runner_submit
+import flash.runner.supervise.deploy as runner_deploy
 from flash.core.spec import (
     GpuSpec,
     JobSpec,
@@ -493,7 +498,7 @@ def test_gpu_sizing_consumes_the_canonical_warmstart_reference() -> None:
 
 
 def test_warmstart_placeholder_rank_does_not_reject_a_source_rank_that_fits_b200() -> None:
-    from flash.providers.allocator import required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb
 
     train = {
         "epochs": 1,
@@ -766,7 +771,7 @@ def test_env_ref_validator_matches_adapter_acceptor() -> None:
     # they must agree exactly (accept <-> no raise, reject <-> raise) or a ref accepted at submit
     # could fail on the worker (or vice-versa). _require_environment_ref now delegates to the
     # adapter's is_freesolo_environment_id; this pins that alignment across the grammar's corners.
-    from flash.envs.adapter import is_freesolo_environment_id
+    from flash.envs.loading.adapter import is_freesolo_environment_id
     from flash.schema.fields import _require_environment_ref
 
     corpus = [
@@ -1282,9 +1287,9 @@ def test_cost_quote_preserves_soft_provider_preference(monkeypatch) -> None:
     to be made reachable explicitly -- quoting lambda on the bare fixture plane would assert the
     very defect `test_cost_quote_skips_a_preference_this_plane_cannot_provision` guards against.
     """
-    import flash.providers as providers_registry
     from flash.cost.analytical import estimate_cost
     from flash.cost.spec import runconfig_from_spec
+    from flash.providers.core import registry as providers_registry
 
     spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda", "vast"]}))
     config = runconfig_from_spec(spec)
@@ -1305,9 +1310,9 @@ def test_cost_quote_skips_a_preference_this_plane_cannot_provision(monkeypatch) 
     get, and the server's affordability check runs on that estimate -- so a balance that covers the
     real allocation can be refused with a 402.
     """
-    import flash.providers as providers_registry
     from flash.cost.analytical import estimate_cost
     from flash.cost.spec import runconfig_from_spec
+    from flash.providers.core import registry as providers_registry
 
     spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"]}))
     config = runconfig_from_spec(spec)
@@ -1328,9 +1333,9 @@ def test_cost_quote_refuses_a_shape_no_configured_provider_can_rent(monkeypatch)
     for hardware this plane has no credentials for, which then passes the affordability check and
     only fails once live allocation runs -- after the run is recorded.
     """
-    import flash.providers as providers_registry
     from flash.cost.analytical import estimate_cost
     from flash.cost.spec import runconfig_from_spec
+    from flash.providers.core import registry as providers_registry
 
     spec = spec_from_dict(_raw(**{"gpu.providers": ["vast"], "gpu.type": "B200"}))
     config = runconfig_from_spec(spec)
@@ -1799,7 +1804,7 @@ def test_model_revision_force_pin_rejects_invalid_internal_states(overrides) -> 
 
 
 def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:
-    from flash.runner.preparation import _preparation_digest
+    from flash.runner.lifecycle.preparation import _preparation_digest
 
     scalar = JobSpec(
         model="Qwen/Qwen3.5-9B",
@@ -1821,7 +1826,7 @@ def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:
 
 def test_resubmitting_a_public_spec_gets_a_fresh_runner_pin(monkeypatch) -> None:
     """Round-tripping an auto-pinned run's public spec must keep the pin platform-managed."""
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     resolved_sha = "d" * 40
 
@@ -1847,7 +1852,7 @@ def test_resubmitting_a_public_spec_gets_a_fresh_runner_pin(monkeypatch) -> None
 
 
 def test_forced_sft_model_revision_verifies_and_retains_the_exact_pin(monkeypatch) -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     exact = "a" * 40
     moving_head = "b" * 40
@@ -1882,7 +1887,7 @@ def test_forced_sft_model_revision_verifies_and_retains_the_exact_pin(monkeypatc
 
 @pytest.mark.parametrize("reported", ["b" * 40, "A" * 40])
 def test_forced_model_revision_rejects_a_mismatched_hub_resolution(monkeypatch, reported) -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     class _Api:
         def __init__(self, *a, **k) -> None: ...
@@ -1905,7 +1910,7 @@ def test_forced_model_revision_rejects_a_mismatched_hub_resolution(monkeypatch, 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "opd"])
 def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algorithm) -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     exact = "c" * 40
     asked_for = []
@@ -1937,7 +1942,7 @@ def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algo
 
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
 def test_qwen38_catalog_revision_is_forced_and_verified(monkeypatch, algorithm) -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     exact = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
     asked_for = []
@@ -1961,7 +1966,7 @@ def test_qwen38_catalog_revision_is_forced_and_verified(monkeypatch, algorithm) 
 
 
 def test_qwen38_catalog_revision_rejects_inherited_qwen36_pin() -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     inherited = _job_from_dict(
         {
@@ -1976,7 +1981,7 @@ def test_qwen38_catalog_revision_rejects_inherited_qwen36_pin() -> None:
 
 
 def test_unmanaged_model_revision_is_rejected_and_runner_pin_is_unchanged() -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     with pytest.raises(ValueError, match="model_revision requires model_revision_auto=True"):
         _job_from_dict({"model_revision": "release-tag"})
@@ -1987,7 +1992,7 @@ def test_unmanaged_model_revision_is_rejected_and_runner_pin_is_unchanged() -> N
 
 
 def test_removing_model_revision_from_public_specs_keeps_new_digests_stable() -> None:
-    from flash.runner.preparation import _preparation_digest
+    from flash.runner.lifecycle.preparation import _preparation_digest
 
     public = spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft"))
     worker = replace(public, model_revision="a" * 40, model_revision_auto=True)
@@ -2011,7 +2016,7 @@ def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> No
     Built by round-tripping through to_dict() rather than by hand, so the test cannot assert a
     shape that submit does not actually produce.
     """
-    from flash.runner.preparation import _validate_effective_spec
+    from flash.runner.lifecycle.preparation import _validate_effective_spec
 
     public = spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", algorithm="sft"))
     worker = replace(public, model_revision="a" * 40, model_revision_auto=True)
@@ -2067,36 +2072,36 @@ def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fresh_orchestrator(tmp_path, monkeypatch):
+def _fresh_orchestrator(tmp_path, monkeypatch) -> None:
     from tests._helpers.runner import fresh_runner
 
-    return fresh_runner(tmp_path, monkeypatch)
+    fresh_runner(tmp_path, monkeypatch)
 
 
 def test_runs_file_path_rejects_traversal(tmp_path, monkeypatch) -> None:
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     for bad in ("../escape", "a/b", "", "x" * 200, ".hidden"):
         with pytest.raises(ValueError, match="invalid run_id"):
-            orch.runs_file_path(bad, ".json")
-    good = orch.runs_file_path("flash-123-abc", ".log")
+            runner_state.runs_file_path(bad, ".json")
+    good = runner_state.runs_file_path("flash-123-abc", ".log")
     assert good.endswith("flash-123-abc.log")
 
 
 def test_dry_run_submit_get_list_logs_cancel(tmp_path, monkeypatch) -> None:
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     spec = spec_from_dict(_raw())
 
-    status = orch.submit_job(spec, dry_run=True)
+    status = runner_submit.submit_job(spec, dry_run=True)
     assert status.state == "dry_run"
-    assert orch.get_status(status.run_id).state == "dry_run"
-    assert status.run_id in [r.run_id for r in orch.list_runs()]
-    assert orch.get_logs(status.run_id) == ""  # no log yet, no crash
+    assert runner_status.get_status(status.run_id).state == "dry_run"
+    assert status.run_id in [r.run_id for r in runner_status.list_runs()]
+    assert runner_status.get_logs(status.run_id) == ""  # no log yet, no crash
 
     # terminal runs cancel as a no-op (state preserved)
-    assert orch.cancel_run(status.run_id).state == "dry_run"
+    assert runner_deploy.cancel_run(status.run_id).state == "dry_run"
 
     with pytest.raises(FileNotFoundError, match="unknown run_id"):
-        orch.get_status("flash-000-nope")
+        runner_status.get_status("flash-000-nope")
 
 
 def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
@@ -2107,9 +2112,9 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
     # to an assumed row count -- including on the dry-run preview, which previews a real submit.
     from flash.core.spec import JobSpec
 
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        orch,
+        runner_preparation,
         "_resolve_model_revision",
         lambda s, **_kw: replace(s, model_revision="a" * 40, model_revision_auto=True),
     )
@@ -2119,10 +2124,12 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
         algorithm="sft",
         project="11111111-1111-4111-8111-111111111111",
     )
-    with pytest.raises(orch.WorkloadProfileUnavailable, match="requires an environment id"):
-        orch.submit_job(spec, dry_run=True)
+    with pytest.raises(
+        runner_preparation.WorkloadProfileUnavailable, match="requires an environment id"
+    ):
+        runner_submit.submit_job(spec, dry_run=True)
     with pytest.raises(FileNotFoundError):
-        orch.get_status(spec.run_id)
+        runner_status.get_status(spec.run_id)
 
 
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
@@ -2137,7 +2144,7 @@ def test_adapter_continuation_preparation_is_target_algorithm_agnostic(
     """
     from flash.core.spec import JobSpec, TrainSpec
 
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     spec = JobSpec(
         run_id=f"{algorithm}-warmstart",
         model="Qwen/Qwen3.5-9B",
@@ -2147,22 +2154,24 @@ def test_adapter_continuation_preparation_is_target_algorithm_agnostic(
     )
 
     with pytest.raises(ValueError, match="references unknown run 'source-run'"):
-        orch._prepare_init_from_adapter(spec)
+        runner_preparation._prepare_init_from_adapter(spec)
 
 
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     spec = spec_from_dict(_raw(), run_id="flash-1-x")
-    assert orch.artifacts_dir(spec).endswith(os.path.join("results", "runpod", "rl", "flash-1-x"))
-    assert orch.adapter_prefix(spec) == "rl/flash-1-x"
-    assert orch.adapter_ref(spec) is None
+    assert runner_state.artifacts_dir(spec).endswith(
+        os.path.join("results", "runpod", "rl", "flash-1-x")
+    )
+    assert runner_state.adapter_prefix(spec) == "rl/flash-1-x"
+    assert runner_state.adapter_ref(spec) is None
 
     # hf_repo and run_id are platform-managed: they survive the INTERNAL round trip
     # (to_internal_dict -> from_dict), which is what the worker/control plane use, not to_dict().
     d = spec.to_internal_dict()
     d["train"] = {**d["train"], "hf_repo": "Freesolo-Co/flashrun-flash-1-x"}
     spec_with_repo = _job_from_dict(d)
-    assert orch.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
+    assert runner_state.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
 
 
 # ---------------------------------------------------------------------------

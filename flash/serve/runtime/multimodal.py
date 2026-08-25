@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from flash.serve import request_validation as _shared
+from flash.serve.request import validation as _shared
 
 from .errors import MultimodalRequestError
 

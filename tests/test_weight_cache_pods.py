@@ -9,8 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.providers.runpod import api as runpod_api
-from flash.providers.runpod import resources
+from flash.providers.runpod.client import api as runpod_api
+from flash.providers.runpod.client import pods as runpod_pods
+from flash.providers.runpod.execution import resources
 
 
 def _fake_preload_intent(monkeypatch):
@@ -38,18 +39,18 @@ def _fake_preload_intent(monkeypatch):
 
 def test_ensure_account_volume_creates_exact_catalog_datacenter(monkeypatch):
     fingerprint = runpod_api.key_fingerprint("key")
-    created = runpod_api.RunpodNetworkVolume("vol-1", "flash-weights-us-ca-2", 250, "US-CA-2")
+    created = runpod_pods.RunpodNetworkVolume("vol-1", "flash-weights-us-ca-2", 250, "US-CA-2")
     monkeypatch.setattr(
         resources,
         "weight_cache_datacenters",
         lambda selected, **kwargs: ["US-CA-2"],
     )
     monkeypatch.setattr(
-        runpod_api, "list_network_volumes_for_fingerprint", lambda *args, **kwargs: []
+        runpod_pods, "list_network_volumes_for_fingerprint", lambda *args, **kwargs: []
     )
     calls = []
     monkeypatch.setattr(
-        runpod_api,
+        runpod_pods,
         "create_network_volume_for_fingerprint",
         lambda selected, **kwargs: calls.append((selected, kwargs)) or created,
     )
@@ -78,14 +79,14 @@ def test_ensure_account_volume_rejects_non_catalog_datacenter(monkeypatch):
 
 
 def test_network_volume_delete_requires_confirmed_absence(monkeypatch):
-    from flash.providers.runpod import pod_api
+    from flash.providers.runpod.client import pods as pod_api
 
     fingerprint = runpod_api.key_fingerprint("key")
     monkeypatch.setattr(pod_api, "_key_for_fingerprint", lambda selected: "key")
     monkeypatch.setattr(pod_api, "_mutation_once", lambda *args, **kwargs: None)
     listings = iter(
         [
-            [runpod_api.RunpodNetworkVolume("vol-1", "name", 250, "US-CA-2")],
+            [runpod_pods.RunpodNetworkVolume("vol-1", "name", 250, "US-CA-2")],
             [],
         ]
     )
@@ -100,11 +101,11 @@ def test_network_volume_delete_requires_confirmed_absence(monkeypatch):
 
 def test_preload_uses_exact_volume_and_shared_phase_lifecycle(monkeypatch):
     from flash.providers.artifacts import preload_runpod, weight_cache
-    from flash.providers.runpod import auth as runpod_auth
+    from flash.providers.runpod.client import auth as runpod_auth
 
     monkeypatch.setattr(runpod_auth, "ordered_keys", lambda: ["key"])
     published = _fake_preload_intent(monkeypatch)
-    volume = runpod_api.RunpodNetworkVolume("vol-1", "flash-weights-us-ca-2", 250, "US-CA-2")
+    volume = runpod_pods.RunpodNetworkVolume("vol-1", "flash-weights-us-ca-2", 250, "US-CA-2")
     monkeypatch.setattr(resources, "ensure_account_volume", lambda *args, **kwargs: volume)
     handle = SimpleNamespace(
         pod_id="pod-1",
@@ -154,7 +155,7 @@ def test_preload_reports_unconfirmed_pod_or_secret_cleanup(monkeypatch):
     from flash.providers.artifacts import preload_runpod, weight_cache
 
     _fake_preload_intent(monkeypatch)
-    volume = runpod_api.RunpodNetworkVolume("vol-1", "flash-weights-us-ca-2", 250, "US-CA-2")
+    volume = runpod_pods.RunpodNetworkVolume("vol-1", "flash-weights-us-ca-2", 250, "US-CA-2")
     monkeypatch.setattr(resources, "ensure_account_volume", lambda *args, **kwargs: volume)
     handle = SimpleNamespace(
         pod_id="pod-1",
@@ -203,7 +204,7 @@ def test_success_attempt_marker_without_result_evidence_fails(monkeypatch):
         preload_runpod, "make_hf_text_reader", lambda *args, **kwargs: next(readers)
     )
     monkeypatch.setattr(
-        runpod_api,
+        runpod_pods,
         "get_pod_for_fingerprint",
         lambda *args, **kwargs: SimpleNamespace(desired_status="TERMINATED"),
     )
@@ -220,13 +221,13 @@ def test_success_attempt_marker_without_result_evidence_fails(monkeypatch):
 
 def test_preload_ambiguous_create_never_retries_the_target(monkeypatch):
     from flash.providers.artifacts import preload_runpod, weight_cache
-    from flash.providers.base import UnreconciledCreateError
+    from flash.providers.core.base import UnreconciledCreateError
 
     _fake_preload_intent(monkeypatch)
     monkeypatch.setattr(
         resources,
         "ensure_account_volume",
-        lambda *args, **kwargs: runpod_api.RunpodNetworkVolume(
+        lambda *args, **kwargs: runpod_pods.RunpodNetworkVolume(
             "vol-1", "flash-weights-us-ca-2", 250, "US-CA-2"
         ),
     )
@@ -281,7 +282,7 @@ def test_warm_weight_cache_launches_every_account_datacenter_target(monkeypatch)
 
 def test_account_target_discovery_fails_closed_when_any_account_catalog_fails(monkeypatch):
     from flash.providers.artifacts import preload_runpod
-    from flash.providers.runpod import auth as runpod_auth
+    from flash.providers.runpod.client import auth as runpod_auth
 
     monkeypatch.setattr(runpod_auth, "ordered_keys", lambda: ["key-a", "key-b"])
     fp_a = runpod_api.key_fingerprint("key-a")
@@ -297,7 +298,7 @@ def test_account_target_discovery_fails_closed_when_any_account_catalog_fails(mo
 
 
 def test_ambiguous_payload_secret_is_adopted_without_second_create(monkeypatch):
-    from flash.providers.runpod import pods
+    from flash.providers.runpod.execution import pods
 
     intent = pods.RunpodPodHandle(
         instance_id="flash-preload-d1999999999-runpod-us-ca-2-abc-s0-a0",
@@ -318,19 +319,19 @@ def test_ambiguous_payload_secret_is_adopted_without_second_create(monkeypatch):
     )
     creates = []
     monkeypatch.setattr(
-        runpod_api,
+        runpod_pods,
         "create_secret_for_fingerprint",
         lambda *args, **kwargs: (
             creates.append(1)
-            or (_ for _ in ()).throw(runpod_api.RunpodMutationAmbiguous("unknown"))
+            or (_ for _ in ()).throw(runpod_pods.RunpodMutationAmbiguous("unknown"))
         ),
     )
     monkeypatch.setattr(
-        runpod_api,
+        runpod_pods,
         "list_secrets_for_fingerprint",
         lambda *args, **kwargs: (
             intent.account_id,
-            [runpod_api.RunpodSecret("secret-1", intent.payload_secret_name)],
+            [runpod_pods.RunpodSecret("secret-1", intent.payload_secret_name)],
         ),
     )
     adopted = pods._create_payload_secret(intent, "{}", deadline_at=time.time() + 60)
@@ -340,7 +341,7 @@ def test_ambiguous_payload_secret_is_adopted_without_second_create(monkeypatch):
 
 def test_killed_secret_create_recovers_exact_secret_without_second_mutation(monkeypatch):
     from flash.providers.artifacts import preload_runpod
-    from flash.providers.runpod import pods
+    from flash.providers.runpod.execution import pods
 
     spec = preload_runpod._preload_spec("RTX 4090", "run-id", 60)
     fingerprint = runpod_api.key_fingerprint("key")
@@ -372,16 +373,16 @@ def test_killed_secret_create_recovers_exact_secret_without_second_mutation(monk
             raise KeyboardInterrupt
         return "account-1", list(secrets)
 
-    monkeypatch.setattr(runpod_api, "list_secrets_for_fingerprint", list_secrets)
+    monkeypatch.setattr(runpod_pods, "list_secrets_for_fingerprint", list_secrets)
 
     def killed_create(selected, name, payload, **kwargs):
         creates.append(name)
-        secrets.append(runpod_api.RunpodSecret("secret-1", name))
-        raise runpod_api.RunpodMutationAmbiguous("response lost")
+        secrets.append(runpod_pods.RunpodSecret("secret-1", name))
+        raise runpod_pods.RunpodMutationAmbiguous("response lost")
 
-    monkeypatch.setattr(runpod_api, "create_secret_for_fingerprint", killed_create)
+    monkeypatch.setattr(runpod_pods, "create_secret_for_fingerprint", killed_create)
     monkeypatch.setattr(
-        runpod_api,
+        runpod_pods,
         "delete_secret_for_fingerprint",
         lambda selected, secret_id, name, **kwargs: deletes.append((secret_id, name)),
     )
@@ -405,7 +406,7 @@ def test_killed_secret_create_recovers_exact_secret_without_second_mutation(monk
 
 def test_pod_create_pending_cleanup_failure_retains_intent(monkeypatch):
     from flash.providers.artifacts import preload_runpod
-    from flash.providers.runpod import pods
+    from flash.providers.runpod.execution import pods
 
     pending = pods.RunpodPodHandle(
         instance_id="flash-preload-d1999999999-runpod-us-ca-2-abc-0123456789abcdef-12345678",
@@ -467,7 +468,7 @@ def test_prefetch_rejects_snapshot_outside_shared_mount(tmp_path, monkeypatch):
     monkeypatch.setenv("FLASH_WEIGHT_CACHE_DIR", str(shared))
     monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **kwargs: str(outside))
     monkeypatch.setattr(hf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(hf._w, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hf._worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
     with pytest.raises(RuntimeError, match="outside"):
         hf.prefetch_model("org/model")
 
@@ -488,7 +489,9 @@ def test_prefetch_heartbeat_proves_real_under_mount_weights(tmp_path, monkeypatc
     monkeypatch.setattr(hf, "gpu_diagnostics", dict)
     heartbeats = []
     monkeypatch.setattr(
-        hf._w, "heartbeat", lambda stage, **fields: heartbeats.append((stage, fields))
+        hf._worker_heartbeat,
+        "heartbeat",
+        lambda stage, **fields: heartbeats.append((stage, fields)),
     )
     assert isinstance(hf.prefetch_model("org/model"), float)
     cache = heartbeats[-1][1]["cache"]
@@ -503,7 +506,7 @@ def test_prefetch_heartbeat_proves_real_under_mount_weights(tmp_path, monkeypatc
 
 
 def test_bootstrap_rejects_partial_index_even_with_standalone_weight(tmp_path):
-    from flash.providers._lifecycle.bootstrap_preload import preload_snapshot_evidence
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
 
     cache = tmp_path / "hf-cache" / "hub"
     snapshot = cache / "models--org--model" / "snapshots" / "abc"
@@ -528,7 +531,7 @@ def test_bootstrap_rejects_under_mount_snapshot_without_weights(tmp_path, monkey
     import sys
     import types
 
-    from flash.providers._lifecycle import bootstrap
+    from flash.providers._lifecycle.bootstrapping import bootstrap
 
     cache = tmp_path / "hf-cache" / "hub"
     snapshot = cache / "models--org--model" / "snapshots" / "abc"
@@ -557,3 +560,8 @@ def test_cache_modules_do_not_import_runpod_sdk_or_serverless():
             source = stream.read()
         assert "runpod_flash" not in source
         assert "serverless" not in source.lower()
+
+    with open(os.path.join(root, "tests/conftest.py"), encoding="utf-8") as stream:
+        conftest = stream.read()
+    assert "runpod_flash" not in conftest
+    assert "list_endpoints" not in conftest

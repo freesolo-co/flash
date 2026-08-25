@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-import sys
 import types
 import uuid
 from typing import Any
@@ -25,12 +24,12 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from flash.serving.src.engine_support import _require_reasoning_api_compatibility
-from flash.serving.src.model_config import reasoning_parser_for
-from flash.serving.src.registry import AdapterRegistry
-from flash.serving.src.responses import openai_generate_fields
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
-from flash.serving.src.streaming import openai_chat_stream
+from flash.serving.src.engine.model_config import reasoning_parser_for
+from flash.serving.src.engine.support import _require_reasoning_api_compatibility
+from flash.serving.src.io.responses import openai_generate_fields
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.streaming import openai_chat_stream
+from flash.serving.src.store.registry import AdapterRegistry
 
 QWEN = "Qwen/Qwen3.5-9B"
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}
@@ -44,7 +43,7 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
 
 
 @pytest.fixture(scope="module")
-def modal_app_module():
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -57,23 +56,7 @@ def modal_app_module():
     app_mock.local_entrypoint.side_effect = _passthrough_decorator
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    _MISSING = object()
-    prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.modal_app", _MISSING)
-    sys.modules["modal"] = modal_stub
-    # Force a fresh import UNDER the stub (see test_serve_thinking.py for why).
-    sys.modules.pop("flash.serving.modal_app", None)
-
-    import flash.serving.modal_app as modal_app  # imported after the stub is installed
-
-    try:
-        yield modal_app
-    finally:
-        for name, prev in (("modal", prev_modal), ("modal_app", prev_modal_app)):
-            if prev is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
+    return load_modal_app_under_stub(modal_stub)
 
 
 class _Tok:
@@ -441,6 +424,45 @@ def test_thinking_constraint_requires_configured_parser(modal_app_module):
     with pytest.raises(ValueError, match="parser-enabled base model"):
         _generate(eng, messages=[{"role": "user", "content": "hi"}])
     assert eng.engine.sampling_params == []
+
+
+def test_stream_generate_attests_the_resolved_revision_before_deltas(modal_app_module):
+    eng = _engine(modal_app_module)
+    revision_id = "run-1@final." + "a" * 40
+    revision = AdapterRecord.model_validate(
+        {
+            "adapter_id": revision_id,
+            "repo_id": "org/run-1",
+            "org_id": "org-1",
+            "base_model": QWEN,
+            "checkpoint": "run-1",
+            "status": "ready",
+            "thinking": False,
+            "metadata": {
+                "record_type": "revision",
+                "run_id": "run-1",
+                "checkpoint_step": None,
+                "hf_revision": "a" * 40,
+            },
+        }
+    )
+
+    async def resolved_lora(_adapter_id, _record_dict=None):
+        return types.SimpleNamespace(lora_name=revision_id), revision
+
+    eng._lora_request = resolved_lora
+
+    async def first_event():
+        stream = eng._stream_generate({"adapter_id": revision_id, "prompt": "hi"})
+        try:
+            return await anext(stream)
+        finally:
+            await stream.aclose()
+
+    ready = asyncio.run(first_event())
+
+    assert ready["type"] == "ready"
+    assert ready["lora_request_adapter"] == revision_id
 
 
 def test_stream_generate_carries_structured_outputs(modal_app_module):

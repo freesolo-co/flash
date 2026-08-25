@@ -855,7 +855,7 @@ def preflight_validate_image_opd(spec, *, scan_packaged_environment: bool = True
     else:
         if not scan_packaged_environment:
             return
-        from flash.envs.loader import (
+        from flash.envs.loading.loader import (
             _packaged_dataset_file,
             _resolve_environment_reference,
             _resolve_path_arg,

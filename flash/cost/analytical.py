@@ -23,7 +23,7 @@ from flash.cost.facts import (
 )
 from flash.cost.types import CostEstimate, RunConfig
 from flash.engine.plan.steps import rl_data_parallel_cards, sft_data_parallel_cards
-from flash.providers.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
+from flash.providers.core.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY, opd_teacher_request_multiplier
 
 # FLOPs per token per active-parameter.
@@ -432,13 +432,13 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
     doomed launch. A pinned provider narrows that question to itself -- H100 is on RunPod, but a
     lambda-pinned quote may not borrow RunPod's freedom to rent any count.
     """
-    from flash.providers.base import (
+    from flash.providers.core.base import (
         GPU_INFO,
-        MAX_COMBINATION_CARDS,
         providers_for,
         wider_shape_remedy,
     )
-    from flash.providers.fit_errors import rents_arbitrary_card_counts
+    from flash.providers.core.fit_errors import rents_arbitrary_card_counts
+    from flash.providers.core.sharding import MAX_COMBINATION_CARDS
 
     def _in_play(gpu: str) -> tuple[str, ...]:
         carriers = providers_for(gpu)
@@ -481,7 +481,8 @@ def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]
     ranks it names a count that buys idle cards. The mirror has to hold in both directions or
     `--cost` promises a width submit rejects.
     """
-    from flash.providers.base import MAX_COMBINATION_CARDS, smallest_fitting_gpu_count
+    from flash.providers.core.base import smallest_fitting_gpu_count
+    from flash.providers.core.sharding import MAX_COMBINATION_CARDS
 
     width = smallest_fitting_gpu_count(
         need,
@@ -517,7 +518,7 @@ def _quote_gpu_ceiling(
     """
     if ceiling is not None:
         return geometry_safe_gpu_cap(config.model_id, ceiling, model_revision=config.model_revision)
-    from flash.providers.base import smallest_fitting_gpu_count
+    from flash.providers.core.base import smallest_fitting_gpu_count
 
     return (
         smallest_fitting_gpu_count(
@@ -534,7 +535,7 @@ def _offline_preferred_gpu_shape(config: RunConfig) -> tuple[str, int, int, str,
     """quote the first structurally usable preference, then cost-rank unnamed fallbacks."""
     from dataclasses import replace
 
-    from flash.providers import PROVIDER_NAMES, available_providers
+    from flash.providers.core.registry import PROVIDER_NAMES, available_providers
 
     # quote only what this plane can actually rent. `allocate()` starts from the configured set, so
     # a preference naming a provider this plane cannot provision is ignored there -- quoting it
@@ -597,14 +598,16 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
         thinking=config.thinking,
         model_revision=config.model_revision,
     )
-    from flash.providers.base import (
+    from flash.providers.core.base import (
         GPU_INFO,
-        MAX_COMBINATION_CARDS,
         authored_gpu_ceiling,
         canonical_gpu,
-        combined_vram_gb,
         providers_for,
         rentable_gpu_counts,
+    )
+    from flash.providers.core.sharding import (
+        MAX_COMBINATION_CARDS,
+        combined_vram_gb,
     )
 
     provider = config.provider if config.provider != "auto" else "auto"
@@ -662,7 +665,7 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
             # provider's offline static rate here; allocation may later select a different live rate,
             # but that operational price never changes the accepted customer quote.
             if provider == "lambda":
-                from flash.providers.lambda_.pricing import static_hourly_rate
+                from flash.providers.lambda_.client.pricing import static_hourly_rate
 
                 hourly = static_hourly_rate(gpu)
             else:
@@ -708,8 +711,8 @@ def _raise_no_fitting_shape(
     auto_cap: int,
 ) -> None:
     """Reject a run no rentable shape fits, naming what the quote was allowed to rank."""
-    from flash.providers.base import GPU_INFO, canonical_gpu
-    from flash.providers.fit_errors import vram_fit_error_message, vram_knob_advice
+    from flash.providers.core.base import GPU_INFO, canonical_gpu
+    from flash.providers.core.fit_errors import vram_fit_error_message, vram_knob_advice
 
     # a pinned class is blocked by the class itself, so name it -- the pool-wide message would
     # report the widest validated shape, which is not hardware this quote was ever allowed to

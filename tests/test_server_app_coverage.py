@@ -9,7 +9,7 @@ import types
 
 import pytest
 
-import flash.server.app as app_mod
+import flash.server.asgi.app as app_mod
 
 
 def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> None:
@@ -157,7 +157,7 @@ def test_run_server_builds_the_app_and_delegates_to_uvicorn(monkeypatch) -> None
     monkeypatch.setattr(app_mod, "create_app", lambda: application)
     # run_server preflights the operator's configuration before starting uvicorn; this test runs
     # with none set, so stub it out -- the preflight behaviour itself is covered separately.
-    monkeypatch.setattr("flash.providers.preflight.require_operator_config", lambda: None)
+    monkeypatch.setattr("flash.providers.core.preflight.require_operator_config", lambda: None)
 
     app_mod.run_server(host="0.0.0.0", port=9000)
 
@@ -171,7 +171,7 @@ def test_run_server_preflights_before_starting_uvicorn(monkeypatch) -> None:
     operator gets it rendered as an unhandled ASGI startup exception under ~20 frames of
     starlette/contextlib. Running the check first is what lets __main__ print `error: ...` instead.
     """
-    from flash.providers.preflight import PreflightError
+    from flash.providers.core.preflight import PreflightError
 
     fake_uvicorn = types.ModuleType("uvicorn")
     fake_uvicorn.run = lambda *_args, **_kwargs: pytest.fail(
@@ -183,7 +183,7 @@ def test_run_server_preflights_before_starting_uvicorn(monkeypatch) -> None:
     def _fail():
         raise PreflightError("HF_TOKEN is required")
 
-    monkeypatch.setattr("flash.providers.preflight.require_operator_config", _fail)
+    monkeypatch.setattr("flash.providers.core.preflight.require_operator_config", _fail)
 
     with pytest.raises(PreflightError, match="HF_TOKEN"):
         app_mod.run_server(host="0.0.0.0", port=9000)
@@ -202,11 +202,11 @@ def test_run_server_does_not_repeat_the_advisory_preflight_logging(monkeypatch) 
     monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
     monkeypatch.setattr(app_mod, "create_app", lambda: object())
     monkeypatch.setattr(
-        "flash.providers.preflight.require_operator_config",
+        "flash.providers.core.preflight.require_operator_config",
         lambda: seen.append("require"),
     )
     monkeypatch.setattr(
-        "flash.providers.preflight.check_run_preflight",
+        "flash.providers.core.preflight.check_run_preflight",
         lambda: seen.append("check"),
     )
 

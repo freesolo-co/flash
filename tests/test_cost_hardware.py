@@ -1,7 +1,7 @@
 """Cost estimator: GPU compute table, pricing/VRAM lookups, cheapest-fit selection.
 
 No network. The compute table and the selection rule must stay consistent with the
-RunPod GPU registry in ``flash.providers.base``.
+RunPod GPU registry in ``flash.providers.core.base``.
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from flash.cost.facts import GPU_COMPUTE_TFLOPS, gpu_tflops, gpu_vram_gb
-from flash.providers.base import GPU_INFO
+from flash.providers.core.base import GPU_INFO
 
 
 def test_compute_table_only_lists_real_classes():
@@ -75,20 +75,14 @@ def test_nvlink_classification_is_by_form_factor():
 
 
 def test_nvlink_classification_tracks_the_provisioned_board():
-    """classification must follow the exact board a multi-card run requests.
-
-    Multi-card provisioning is runpod-only, and the Pod request now carries one exact REST GPU type
-    id rather than an SDK pool with excluded members. Assert against that request identity so
-    re-pinning H100 to a PCIe board fails here instead of silently pricing it as NVLink.
-    """
+    """Classification must follow the exact REST GPU type a multi-card run provisions."""
     from flash.cost.facts import has_nvlink
-    from flash.providers.base import GPU_INFO
-    from flash.providers.runpod.gpus import gpu_type_id
+    from flash.providers.core.base import GPU_INFO
+    from flash.providers.runpod.client.gpus import gpu_type_id
 
-    expected = "NVIDIA H100 80GB HBM3"
-    assert GPU_INFO["H100"].runpod_gpu_type_id == expected
-    assert gpu_type_id("H100") == expected
-    assert "PCIe" not in gpu_type_id("H100")
+    h100_rest_id = "NVIDIA H100 80GB HBM3"
+    assert GPU_INFO["H100"].runpod_gpu_type_id == h100_rest_id
+    assert gpu_type_id("H100") == h100_rest_id
     assert has_nvlink("H100")
 
 
@@ -275,7 +269,7 @@ def test_ranking_prices_the_authored_rollout_batch_not_the_recipe_default():
     quote already reads the new key, so the two silently disagreed.
     """
     from flash.engine.plan.recipe import RECIPE
-    from flash.providers.base import run_config_for_ranking
+    from flash.providers.core.base import run_config_for_ranking
 
     authored = int(RECIPE.rl.prompts_per_step) // 2
     assert authored >= 1
@@ -313,7 +307,7 @@ def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
 
     from flash.cost.spec import _on_policy_prompts_per_step, _on_policy_requested_prompts_per_step
     from flash.engine.plan.recipe import RECIPE
-    from flash.providers.base import run_config_for_ranking
+    from flash.providers.core.base import run_config_for_ranking
 
     for algorithm in ("grpo", "opd"):
         default = int((RECIPE.opd if algorithm == "opd" else RECIPE.rl).prompts_per_step)
@@ -364,7 +358,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
     `runconfig_from_spec` fed `RunConfig.batch_size` the raw authored `prompts_per_step`, so a run
     with `prompts_per_step = 128, max_examples = 2` was quoted for a batch of 128 while training on
     2. The persisted quote is what a completed or cancelled run is charged against
-    (`flash/runner/costs.py`), and it also gates the pre-submit affordability check, so the gap both
+    (`flash/runner/accounting/costs.py`), and it also gates the pre-submit affordability check, so the gap both
     overcharges and can reject an affordable run.
 
     Internally inconsistent too: `spec_steps` already counted steps against the CAPPED batch, so one
@@ -372,7 +366,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
     """
     from flash.core.spec import JobSpec
     from flash.cost.spec import runconfig_from_spec
-    from flash.providers.base import run_config_for_ranking
+    from flash.providers.core.base import run_config_for_ranking
 
     base = {
         "model": "Qwen/Qwen3.5-9B",
@@ -503,8 +497,8 @@ def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     nvlink curve, which is precisely the direction the module warns about: it lets a pcie
     combination win on scaling it does not deliver, then bills both cards for the longer wall.
     """
-    from flash.providers.allocator import _step_cost_ranker
-    from flash.providers.base import Candidate, run_config_for_ranking
+    from flash.providers.core.allocator import _step_cost_ranker
+    from flash.providers.core.base import Candidate, run_config_for_ranking
 
     # the defect's root: the config the allocator ranks with never names a provider.
     assert run_config_for_ranking("Qwen/Qwen3.5-9B", "grpo").normalized().provider == "auto"
@@ -585,8 +579,8 @@ def test_sft_fit_credits_only_the_ranks_that_will_launch():
     rank with 24 GB and OOM'd on paid hardware. Allocating more cards must not be a way to pass a
     gate the executed run cannot pass.
     """
-    from flash.providers.allocator import _executed_gpu_count, _fits
-    from flash.providers.base import Candidate
+    from flash.providers.core.allocator import _executed_gpu_count, _fits
+    from flash.providers.core.base import Candidate
 
     need = 28.0
 

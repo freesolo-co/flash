@@ -269,7 +269,7 @@ def collect_inputs(
         "runtime_capsule_profiles_sha256": _sha256_file(
             root / "flash" / "runtime_capsule" / "profiles.py"
         ),
-        "source_snapshot_sha256": _sha256_file(root / "flash" / "source_snapshot.py"),
+        "archive_sha256": _sha256_file(root / "flash" / "snapshot" / "archive.py"),
     }
     return cache_inputs, base_inputs_partial
 
@@ -334,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
 
     root = Path(args.root)
     if args.print_baked_arches:
-        worker_source = root / "flash" / "providers" / "_lifecycle" / "worker.py"
+        worker_source = root / "flash" / "providers" / "_lifecycle" / "net" / "worker.py"
         try:
             arches = parse_baked_per_sm_arches(
                 worker_source.read_text(encoding="utf-8"), source=str(worker_source)
