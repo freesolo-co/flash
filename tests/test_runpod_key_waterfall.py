@@ -1,9 +1,4 @@
-"""RunPod multi-account key pool + quota waterfall.
-
-CPU-only; the REST layer drives a real urllib HTTPError through request_with_retries so
-the failover predicate's __cause__ inspection is genuinely exercised. The SDK deploy path
-is exercised against fake runpod_flash mocks.
-"""
+"""RunPod multi-account key pool and account-scoped REST failover."""
 
 from __future__ import annotations
 
@@ -12,15 +7,10 @@ import urllib.error
 
 import pytest
 
-# Captured at module-load time (before conftest._offline's autouse fixture fires).
-# conftest stubs `runpod_api.list_endpoints` to `lambda: []` for every test; tests that
-# exercise the real aggregation implementation restore it via this reference.
-from flash.providers.runpod.api import list_endpoints as _real_list_endpoints
-
 
 def _http_error(code: int, body: bytes = b"{}"):
     return urllib.error.HTTPError(
-        url="https://rest.runpod.io/v1/endpoints",
+        url="https://rest.runpod.io/v1/pods",
         code=code,
         msg="err",
         hdrs=None,
@@ -66,13 +56,12 @@ def test_advance_collapses_env_and_reorders(monkeypatch):
     assert keys.active_key() == "rk-b"
     # ordered_keys is active-first, then the rest (so a non-preferred account is still tried).
     assert keys.ordered_keys() == ["rk-b", "rk-a"]
-    # advance collapses RUNPOD_API_KEY to the active key for the runpod_flash SDK.
     assert os.environ["RUNPOD_API_KEY"] == "rk-b"
 
     # Pool cycles: the pointer wraps back to key #0 so recovered quota there is reused. advance_key
     # ALWAYS advances (and returns True) for a multi-key pool — the return value is NOT an
     # exhaustion signal (that depends on where a failover started, which advance_key can't know), so
-    # callers bound failovers by key_count() instead. See deploy_train_endpoint.
+    # callers bound failovers by key_count() instead. See deploy_train_Pod.
     assert keys.advance_key() is True
     assert keys.active_key() == "rk-a"
     assert os.environ["RUNPOD_API_KEY"] == "rk-a"
@@ -81,7 +70,7 @@ def test_advance_collapses_env_and_reorders(monkeypatch):
 def test_advance_key_count_bound_visits_every_account_from_any_start(monkeypatch):
     """advance_key() always advances (wrapping), so a COUNT bound of key_count()-1 visits every
     OTHER account exactly once — from ANY starting account, including mid-pool (a prior run may have
-    left the pointer advanced). This is the contract deploy_train_endpoint relies on; a wrap-to-0
+    left the pointer advanced). This is the contract deploy_train_Pod relies on; a wrap-to-0
     'exhaustion' heuristic would wrongly stop a mid-pool failover before the wrapped-over keys."""
     import flash.providers.runpod.auth as keys
 
@@ -145,14 +134,12 @@ def test_is_failover_error(monkeypatch):
     for code in (400, 409, 422, 500, 503):
         assert keys.is_failover_error(with_cause(code)) is False
 
-    # Non-HTTP failures are account-agnostic (the per-key retry loop already absorbed transient
-    # blips), so they do NOT fail over — neither a chained network error nor a bare exception.
+    # non-http failures are account-agnostic because the per-key retry loop already absorbed
+    # transient blips, so they do not fail over for a chained network error or a bare exception.
     net = RuntimeError("connection reset")
     net.__cause__ = urllib.error.URLError("connection reset")
     assert keys.is_failover_error(net) is False
-    assert (
-        keys.is_failover_error(RuntimeError("Max workers across all endpoints ... quota")) is False
-    )
+    assert keys.is_failover_error(RuntimeError("Max workers across all Pods ... quota")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +175,7 @@ def test_rest_waterfall_fails_over_on_401(monkeypatch):
         monkeypatch,
         lambda k: _http_error(401) if k == "rk-bad" else b'[{"id": "ep1"}]',
     )
-    out = runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/endpoints")
+    out = runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/pods")
     assert out == [{"id": "ep1"}]
     assert seen == ["rk-bad", "rk-good"]  # tried bad first, then failed over
 
@@ -200,9 +187,9 @@ def test_rest_waterfall_single_key_does_not_swallow_4xx(monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-only")
     keys.reset()
     _fake_urlopen_by_key(monkeypatch, lambda k: _http_error(403, b'{"error":"forbidden"}'))
-    # One key, no failover: the 403 surfaces (delete_endpoint relies on this to report failure).
+    # one key, no failover: the 403 surfaces so pod deletion can report failure.
     with pytest.raises(runpod_api.RunpodApiError, match="403"):
-        runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/endpoints")
+        runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/pods")
 
 
 def test_rest_waterfall_hard_4xx_not_retried_across_keys(monkeypatch):
@@ -214,7 +201,7 @@ def test_rest_waterfall_hard_4xx_not_retried_across_keys(monkeypatch):
     # A 400 is the same on every account -> raise immediately, do NOT try the second key.
     seen = _fake_urlopen_by_key(monkeypatch, lambda k: _http_error(400, b'{"error":"bad"}'))
     with pytest.raises(runpod_api.RunpodApiError, match="400"):
-        runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/endpoints")
+        runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/pods")
     assert seen == ["rk-a"]  # never tried rk-b
 
 
@@ -226,7 +213,7 @@ def test_rest_waterfall_all_keys_exhausted_raises(monkeypatch):
     keys.reset()
     seen = _fake_urlopen_by_key(monkeypatch, lambda k: _http_error(401))
     with pytest.raises(runpod_api.RunpodApiError):
-        runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/endpoints")
+        runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/pods")
     assert seen == ["rk-a", "rk-b"]  # both accounts attempted
 
 
@@ -245,7 +232,7 @@ def test_rest_waterfall_persistent_429_fails_over(monkeypatch):
         monkeypatch,
         lambda k: _http_error(429) if k == "rk-a" else b'{"ok": true}',
     )
-    out = runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/endpoints", retries=1)
+    out = runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/pods", retries=1)
     assert out == {"ok": True}
     assert "rk-b" in seen  # failed over after rk-a's 429 exhausted its retries
 
@@ -259,133 +246,78 @@ def test_rest_waterfall_persistent_5xx_does_not_fail_over(monkeypatch):
     keys.reset()
     seen = _fake_urlopen_by_key(monkeypatch, lambda k: _http_error(500, b"boom"))
     with pytest.raises(runpod_api.RunpodApiError):
-        runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/endpoints", retries=1)
+        runpod_api.request_with_retries(f"{runpod_api.REST_BASE}/pods", retries=1)
     assert "rk-b" not in seen  # never failed over on a server error
 
 
-# NOTE: the deploy_train_endpoint account-failover test lives in test_jobs.py (next to the
-# _patch_deploy_deps / _make_runpod_flash_mocks helpers it shares with the other deploy tests),
-# and the idle-endpoint reaper / run-aware protection tests live in test_idle_endpoint_reaper.py
-# and test_jobs.py (the proactive reclaim mechanism from #190).
-
-
-# ---------------------------------------------------------------------------
-# list_endpoints — multi-key aggregation and raise-on-failure contract
-# ---------------------------------------------------------------------------
-def test_list_endpoints_aggregates_across_all_keys(monkeypatch):
-    """Endpoints from every account are merged into a single list."""
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.auth as keys
-
-    monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
-    keys.reset()
-
-    responses = {
-        "rk-a": [{"id": "ep-a1"}, {"id": "ep-a2"}],
-        "rk-b": [{"id": "ep-b1"}],
+def _pod_row(pod_id: str, name: str) -> dict:
+    return {
+        "id": pod_id,
+        "name": name,
+        "desiredStatus": "RUNNING",
+        "imageName": "worker:latest",
+        "gpuCount": 1,
+        "containerDiskInGb": 120,
     }
 
-    def fake_for_key(key, target, **_kw):
-        return responses[key]
 
-    monkeypatch.setattr(runpod_api._CLIENT, "request_with_retries_for_key", fake_for_key)
-    # conftest._offline stubs list_endpoints → restore the real aggregating implementation.
-    monkeypatch.setattr(runpod_api, "list_endpoints", _real_list_endpoints)
+def test_list_pods_for_key_filters_to_flash_owned_names(monkeypatch):
+    import flash.providers.runpod.api as runpod_api
 
-    result = runpod_api.list_endpoints()
-    ids = {e["id"] for e in result}
-    assert ids == {"ep-a1", "ep-a2", "ep-b1"}
+    monkeypatch.setattr(
+        runpod_api._CLIENT,
+        "request_with_retries_for_key",
+        lambda *_args, **_kwargs: [
+            _pod_row("pod-a", "flash-0123456789ab-s0-a0"),
+            _pod_row("pod-foreign", "customer-workload"),
+        ],
+    )
+
+    assert [pod.id for pod in runpod_api.list_pods_for_key("rk-a")] == ["pod-a"]
 
 
-def test_list_endpoints_raises_when_any_key_fails(monkeypatch):
-    """A per-key failure propagates so callers don't act on a partial view."""
+def test_list_pods_by_key_reports_partial_account_failure_without_raw_keys(monkeypatch):
     import flash.providers.runpod.api as runpod_api
     import flash.providers.runpod.auth as keys
 
     monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b")
     keys.reset()
 
-    def fake_for_key(key, target, **_kw):
+    def fake_for_key(key, _target, **_kwargs):
         if key == "rk-a":
-            return [{"id": "ep-a1"}]
-        raise runpod_api.RunpodApiError("GET .../endpoints -> HTTP 500: Internal Server Error")
+            return [_pod_row("pod-a", "flash-0123456789ab-s0-a0")]
+        raise runpod_api.RunpodApiError("account listing failed")
 
     monkeypatch.setattr(runpod_api._CLIENT, "request_with_retries_for_key", fake_for_key)
-    monkeypatch.setattr(runpod_api, "list_endpoints", _real_list_endpoints)
 
-    with pytest.raises(runpod_api.RunpodApiError):
-        runpod_api.list_endpoints()
+    by_fingerprint, failed = runpod_api.list_pods_by_key()
+
+    assert [pod.id for pod in by_fingerprint[runpod_api.key_fingerprint("rk-a")]] == ["pod-a"]
+    assert failed == [runpod_api.key_fingerprint("rk-b")]
+    rendered = repr(by_fingerprint) + repr(failed)
+    assert "rk-a" not in rendered
+    assert "rk-b" not in rendered
 
 
-def test_list_endpoints_raises_when_no_key_configured(monkeypatch):
-    """No RUNPOD_API_KEY -> raise instead of returning [] without any authenticated call. Callers
-    (teardown/idle reaper) treat [] as 'fleet confirmed empty' and would act on a false view."""
+def test_list_pods_by_key_refuses_false_empty_view_without_credentials(monkeypatch):
     import flash.providers.runpod.api as runpod_api
     import flash.providers.runpod.auth as keys
 
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
     keys.reset()
+
+    with pytest.raises(runpod_api.RunpodApiError, match="refusing to report an empty Pod fleet"):
+        runpod_api.list_pods_by_key()
+
+
+def test_list_pods_for_key_rejects_non_list_response(monkeypatch):
+    import flash.providers.runpod.api as runpod_api
+
     monkeypatch.setattr(
         runpod_api._CLIENT,
         "request_with_retries_for_key",
-        lambda *a, **k: pytest.fail("must not hit RunPod with no key configured"),
+        lambda *_args, **_kwargs: {"unexpected": "shape"},
     )
-    monkeypatch.setattr(runpod_api, "list_endpoints", _real_list_endpoints)
 
-    with pytest.raises(runpod_api.RunpodApiError, match="not set"):
-        runpod_api.list_endpoints()
-
-
-def test_list_endpoints_raises_on_non_list_response(monkeypatch):
-    """A 200 whose body isn't a list is NOT an empty account — silently skipping it would yield a
-    partial fleet view callers trust as complete, so raise."""
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.auth as keys
-
-    monkeypatch.setenv("RUNPOD_API_KEY", "rk-a")
-    keys.reset()
-    monkeypatch.setattr(
-        runpod_api._CLIENT, "request_with_retries_for_key", lambda *a, **k: {"unexpected": "shape"}
-    )
-    monkeypatch.setattr(runpod_api, "list_endpoints", _real_list_endpoints)
-
-    with pytest.raises(runpod_api.RunpodApiError, match="unexpected /endpoints response"):
-        runpod_api.list_endpoints()
-
-
-# ---------------------------------------------------------------------------
-# billing_endpoints — account-scoped realized-cost query across the whole pool
-# ---------------------------------------------------------------------------
-def test_billing_endpoints_queries_every_pool_account(monkeypatch):
-    """An endpoint provisioned via quota-failover lives on a NON-active pool account; its billing
-    query must hit every account. A billing filter for a foreign endpointId returns a successful
-    empty 200 (not a 404), so a single-key waterfall stops at the active account and silently
-    reports $0. Best-effort: a single account's failure is skipped, not fatal."""
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.auth as keys
-
-    monkeypatch.setenv("RUNPOD_API_KEY", "rk-a,rk-b,rk-c")
-    keys.reset()
-
-    queried = []
-
-    def fake_for_key(key, target, **_kw):
-        queried.append(key)
-        if key == "rk-c":  # a flaky account must not abort the sweep
-            raise runpod_api.RunpodApiError("GET .../billing/endpoints -> HTTP 500")
-        # The endpoint is owned by rk-b; rk-a returns a successful EMPTY result for the filter.
-        return [{"endpointId": "ep-owned", "amount": 4.5}] if key == "rk-b" else []
-
-    monkeypatch.setattr(runpod_api._CLIENT, "request_with_retries_for_key", fake_for_key)
-
-    rows = runpod_api.billing_endpoints(
-        start_time="2026-06-01T00:00:00Z", end_time="2026-06-02T00:00:00Z", endpoint_id="ep-owned"
-    )
-    assert set(queried) == {
-        "rk-a",
-        "rk-b",
-        "rk-c",
-    }  # every account queried, not just the active one
-    assert rows == [
-        {"endpointId": "ep-owned", "amount": 4.5}
-    ]  # owner's rows; failing account skipped
+    with pytest.raises(runpod_api.RunpodApiError, match="/pods response must be a list"):
+        runpod_api.list_pods_for_key("rk-a")

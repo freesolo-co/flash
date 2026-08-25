@@ -82,50 +82,6 @@ __all__ = [
 ]
 
 
-def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
-    """Return canonical training-endpoint names derived from the run registry.
-
-    Include persisted and spec-derived names. Non-terminal names are protected; all known names
-    scope
-    reaping to this control plane.
-    """
-    from flash.core.spec import persisted_gpu_types
-    from flash.providers.base import canonical_gpu
-    from flash.providers.runpod.jobs import canonical_endpoint_name
-    from flash.providers.runpod.serverless import _run_suffix, endpoint_name
-    from flash.runner import TERMINAL_STATES
-
-    names: set[str] = set()
-
-    def _add(name: str | None) -> None:
-        if name:
-            names.add(canonical_endpoint_name(name))
-
-    for row in db.all_runs():
-        try:
-            status = get_status(row["run_id"])
-        except FileNotFoundError:
-            continue
-        if not include_terminal and status.state in TERMINAL_STATES:
-            continue
-        _add((status.remote or {}).get("endpoint_name"))
-        # index every acceptable class so fallback endpoints remain in the reaper's scope.
-        for gpu in persisted_gpu_types(status.spec):
-            with contextlib.suppress(Exception):
-                _add(endpoint_name(canonical_gpu(gpu), _run_suffix(status.run_id)))
-    return names
-
-
-def _protected_train_endpoint_names() -> set[str]:
-    """Endpoint names tied to a LIVE (non-terminal) run — never reaped (see ``_train_endpoint_names``)."""
-    return _train_endpoint_names(include_terminal=False)
-
-
-def _known_train_endpoint_names() -> set[str]:
-    """Endpoint names for EVERY run this plane has a record of — the reaper's multi-plane scope."""
-    return _train_endpoint_names(include_terminal=True)
-
-
 def _open_deployment_jobs() -> None:
     global _DEPLOYMENT_JOBS_ACCEPTING
     with _DEPLOYMENT_JOBS_LOCK:
@@ -180,44 +136,6 @@ def start_deployment_job(target, *args, **kwargs) -> bool:
             _DEPLOYMENT_JOBS.discard(thread)
             raise DeploymentJobStartError(str(exc)) from exc
     return False
-
-
-def _reap_idle_endpoints_once(min_idle_s: float) -> int:
-    """One run-aware sweep of idle, orphaned RunPod training endpoints. Returns count deleted."""
-    from flash.providers.runpod.jobs import _sweep_idle_flash_endpoints
-
-    return _sweep_idle_flash_endpoints(
-        _protected_train_endpoint_names(),
-        min_idle_s=min_idle_s,
-        known=_known_train_endpoint_names(),
-    )
-
-
-async def _reap_idle_endpoints_loop() -> None:
-    """Background loop: proactively delete idle, orphaned RunPod training endpoints (workers doing
-    nothing that still hold worker quota) so they don't linger between quota errors. Run-aware and
-    graced (see ``_sweep_idle_flash_endpoints``); the blocking RunPod calls are offloaded to a
-    thread, and a failed sweep is logged and retried next cycle."""
-    interval = 600.0  # sweep every 10 min
-    min_idle_s = 900.0  # only reap an endpoint idle for >= 15 min (well past any cold start)
-    # Startup heartbeat: the reaper otherwise logs nothing unless it deletes something, so an
-    # operator can't tell a silently-stalled reaper from a healthy one with nothing to reap. One
-    # INFO line at boot confirms the task is alive and pins its cadence.
-    _log.info(
-        "idle-endpoint reaper started (sweep every %ds, reap after %ds idle)",
-        int(interval),
-        int(min_idle_s),
-    )
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            deleted = await asyncio.to_thread(_reap_idle_endpoints_once, min_idle_s)
-            if deleted:
-                _log.info("reaped %d idle RunPod endpoint(s) doing nothing", deleted)
-        except asyncio.CancelledError:
-            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
-        except Exception:
-            _log.debug("idle-endpoint reaper sweep failed; retrying next cycle", exc_info=True)
 
 
 # states that may still own billed training instances and must be protected from orphan sweeps.
@@ -281,14 +199,12 @@ def _sweep_orphan_instances_once() -> int:
 
 
 async def _sweep_orphan_instances_loop() -> None:
-    """Background loop: proactively tear down orphaned instance-provider workers (billed instances
-    left by finished/crashed runs that the per-run ``finally`` teardown missed) so they stop
-    billing without waiting for the next control-plane restart. Covers all instance-billed
-    providers (Lambda, Vast). This is the in-lifetime counterpart of the instance providers'
-    startup ``sweep_orphans`` (``recover_runs``) — the instance analogue of
-    ``_reap_idle_endpoints_loop`` for RunPod. Blocking provider calls are offloaded to a thread; a
-    failed sweep is logged and retried next cycle."""
-    interval = 600.0  # sweep every 10 min (matches the RunPod idle reaper)
+    """Periodically tear down orphaned workers for every instance provider.
+
+    This is the in-lifetime counterpart of the startup sweep in ``recover_runs``. Blocking provider
+    calls run in a thread, and a failed sweep is logged and retried next cycle.
+    """
+    interval = 600.0
     while True:
         await asyncio.sleep(interval)
         try:
@@ -302,9 +218,7 @@ async def _sweep_orphan_instances_loop() -> None:
 
 
 def _instance_providers_configured() -> bool:
-    """True when an instance-based provider (Lambda or Vast) is configured on this plane, so the
-    periodic instance orphan sweep is worth running. RunPod-only planes skip it — RunPod has no
-    standing per-run billing to reap between restarts (its idle reaper covers warm endpoints)."""
+    """Return whether this plane has any configured instance provider to sweep."""
     from flash.providers import INSTANCE_PROVIDERS, available_providers
 
     return any(name in INSTANCE_PROVIDERS for name in available_providers())
@@ -344,23 +258,12 @@ def create_app():
         startup_charge_task = (
             asyncio.create_task(_charge_retry_startup()) if charge_retry_enabled() else None
         )
-        # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
-        # internal key is configured.
+        # periodic realized-cost reconciliation runs only when the operator internal key is configured.
         cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
-        # Periodic completion-charge retry: re-charge any run left pending/failed by a transient blip
-        # so it can't leak revenue. Same internal-key gate as the charge itself.
+        # periodic completion-charge retry recharges any run left pending or failed by a transient
+        # blip so it cannot leak revenue. it uses the same internal-key gate as the charge itself.
         charge_task = asyncio.create_task(_charge_retry_loop()) if charge_retry_enabled() else None
-        # Periodic idle-endpoint reaper: proactively delete RunPod training endpoints doing
-        # nothing (orphans from finished/crashed runs) so workers don't linger holding quota.
-        # Only when this plane manages RunPod (its API key is configured).
-        reap_task = (
-            asyncio.create_task(_reap_idle_endpoints_loop())
-            if os.environ.get("RUNPOD_API_KEY")
-            else None
-        )
-        # Periodic instance orphan sweep: proactively tear down Lambda instances left billing by
-        # finished/crashed runs (the in-lifetime counterpart of their startup sweep_orphans). Only
-        # when an instance provider is configured — RunPod-only planes have nothing standing to reap.
+        # periodically tear down orphaned runpod pods, lambda instances, and vast instances.
         sweep_task = (
             asyncio.create_task(_sweep_orphan_instances_loop())
             if _instance_providers_configured()
@@ -384,7 +287,6 @@ def create_app():
                 startup_charge_task,
                 cost_task,
                 charge_task,
-                reap_task,
                 sweep_task,
                 cleanup_task,
             ):

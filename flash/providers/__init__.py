@@ -4,7 +4,7 @@ The training worker (``flash.engine.worker``) reads a JobSpec from the environme
 from the HF dataset repo, and streams artifacts/heartbeats/metrics back to it. The provider
 owns pricing, provisioning, polling, cancellation, and teardown.
 
-  runpod      serverless Flash endpoints (always on)
+  runpod      Secure Cloud Pods (account-scoped, on-demand)
   lambda      Lambda Cloud GPU instances (instance-based complement; iff LAMBDA_API_KEY set)
   vast        Vast.ai verified-datacenter containers (live-market complement; iff VAST_API_KEY set)
 
@@ -48,10 +48,10 @@ def validated_provider_preferences(value, *, allow_empty: bool = False) -> tuple
     return tuple(result)
 
 
-# Instance-billed providers: they rent a VM/container that BILLS UNTIL TERMINATED, so they need the
-# generic instance-cleanup paths (retry teardown, gc-by-label) that endpoint-based RunPod doesn't.
-# Single source of truth — keep cleanup/realization sites pointed here so a new instance provider is
-# wired into every reaper by adding ONE name (not by hunting hardcoded ("lambda", "vast") tuples).
+# instance-billed providers rent a pod, vm, or container until exact teardown, so they share the
+# generic retry cleanup, run-label reconciliation, and realized-cost paths.
+# single source of truth: keep cleanup and realization sites pointed here so a new instance provider
+# is wired into every reaper by adding one name, not by hunting hardcoded provider tuples.
 INSTANCE_PROVIDERS: tuple[str, ...] = ("runpod", "lambda", "vast")
 
 

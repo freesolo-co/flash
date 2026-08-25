@@ -17,8 +17,8 @@ SOURCE_SNAPSHOT = valid_source_snapshot()
 
 def test_run_job_persists_flash_metrics(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.providers.runpod.serverless as flash_train
         import flash.runner as runner
+        from flash.providers._lifecycle import worker as flash_train
 
         importlib.reload(flash_train)
         importlib.reload(runner)
@@ -260,7 +260,7 @@ def test_publish_source_snapshot_creates_missing_repo(monkeypatch, tmp_path):
 
 
 def test_hf_call_honors_retry_after(monkeypatch):
-    import flash.providers.runpod.serverless as flash_train
+    from flash.providers._lifecycle import worker as flash_train
 
     sleeps: list[float] = []
     logs: list[tuple[str, tuple]] = []
@@ -291,7 +291,7 @@ def test_hf_call_honors_retry_after(monkeypatch):
 
 
 def test_hf_call_caps_http_date_retry_after(monkeypatch):
-    import flash.providers.runpod.serverless as flash_train
+    from flash.providers._lifecycle import worker as flash_train
 
     sleeps: list[float] = []
 

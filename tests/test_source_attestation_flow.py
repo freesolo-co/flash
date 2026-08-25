@@ -12,6 +12,33 @@ from flash.source_snapshot import (
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 SOURCE_SNAPSHOT = valid_source_snapshot()
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
+
+
+def _runpod_remote(*, attempt: int) -> dict:
+    return {
+        "provider": "runpod",
+        "instance_id": f"pod-{attempt}",
+        "phase": "exact",
+        "label": f"flash-run-s0-a{attempt}-0123456789abcdef-deadbeef",
+        "key_fingerprint": _RUNPOD_FINGERPRINT,
+        "account_id": "account-1",
+        "payload_secret_id": f"secret-{attempt}",
+        "payload_secret_name": "FLASH_PAYLOAD_0123456789abcdef",
+        "data_center_id": "US-KS-2",
+        "network_volume_id": None,
+        "container_disk_gb": 120,
+        "container_registry_auth_id": None,
+        "gpu_count": 1,
+        "image_name": None,
+        "gpu_type_id_override": None,
+        "allowed_cuda_versions": None,
+        "docker_start_cmd": [],
+        "gpu": "RTX 4090",
+        "hourly_usd": 0.69,
+        "attempt": attempt,
+        "started_ts": 100.0,
+    }
 
 
 def _status(*, attempt: int = 2, source_snapshot: dict | None = SOURCE_SNAPSHOT):
@@ -141,7 +168,7 @@ def test_recovery_completion_requires_attestation_before_done(monkeypatch, tmp_p
     assert completed.source_verified_attempt == 2
 
 
-def test_attach_freezes_top_level_descriptor_and_discards_legacy_prefix(
+def test_attach_freezes_top_level_descriptor_and_discards_noncanonical_code_prefix(
     monkeypatch, tmp_path
 ) -> None:
     import flash.runner as runner
@@ -157,16 +184,7 @@ def test_attach_freezes_top_level_descriptor_and_discards_legacy_prefix(
             "train": {"epochs": 1, "hf_repo": "org/repo"},
         }
     )
-    remote = {
-        "provider": "runpod",
-        "endpoint_id": "endpoint",
-        "endpoint_name": "name",
-        "key_fingerprint": "c" * 64,
-        "job_id": "job",
-        "attempt": 2,
-        "started_ts": 100.0,
-        "code_prefix": "code/legacy/flash",
-    }
+    remote = {**_runpod_remote(attempt=2), "code_prefix": "code/legacy/flash"}
     runner._save_status(
         runner.RunStatus(
             run_id="run-1",

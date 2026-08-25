@@ -23,11 +23,10 @@ __all__ = [
 
 logger = get_logger(__name__)
 
-# Cross-account reap/failover needs >= 2 distinct RunPod accounts. WARN-only: a single-account
-# pool still provisions, still reaps its own idle endpoints (the sweep lists per key), and only
-# loses the ability to ride out one account's quota/credit exhaustion by moving to another.
-# That is an availability property, not a correctness one, so it must not block a self-hosted
-# plane whose operator has exactly one RunPod account.
+# cross-account reap and failover need at least two distinct runpod accounts. warn only: a
+# single-account pool still provisions and sweeps its own pods, but cannot ride out that account's
+# quota or credit exhaustion by moving to another. this is an availability property, not a
+# correctness property, so it must not block a self-hosted plane with exactly one runpod account.
 _RECOMMENDED_RUNPOD_ACCOUNTS = 2
 
 # How an operator turns each provider on. Reported together when NONE is configured, so the
@@ -198,8 +197,8 @@ def _warn_degraded(configured: tuple[str, ...], runpod_keys) -> None:
             logger.warning(
                 "RUNPOD_API_KEY holds %d distinct account key(s); >= %d comma-separated keys are "
                 "recommended so a run can fail over when one account hits its quota or credit "
-                "limit. Runs still allocate and idle endpoints are still reaped within the "
-                "account you did configure.",
+                "limit. Runs still allocate and orphan Pods are still swept within the account "
+                "you did configure.",
                 distinct,
                 _RECOMMENDED_RUNPOD_ACCOUNTS,
             )

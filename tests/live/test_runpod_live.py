@@ -1,8 +1,4 @@
-"""Live, READ-ONLY RunPod smoke (opt-in, no GPU rental, no spend).
-
-Only read paths: API auth/reachability via the endpoints list and the provider's static
-pricing interface. Never deploys/runs anything.
-"""
+"""Live, read-only RunPod smoke for Pod inventory and static pricing."""
 
 from __future__ import annotations
 
@@ -18,13 +14,14 @@ def _require_key():
         pytest.skip("RUNPOD_API_KEY not set")
 
 
-def test_runpod_auth_and_list_endpoints():
-    """Auth + reachability: listing endpoints is a read-only account call."""
+def test_runpod_auth_and_list_pods():
+    """Authenticate every configured account through the read-only Pod inventory."""
     _require_key()
     from flash.providers.runpod import api as runpod_api
 
-    endpoints = runpod_api.list_endpoints()
-    assert isinstance(endpoints, list)  # 200 + a (possibly empty) list == authed & reachable
+    pods_by_account, failed = runpod_api.list_pods_by_key()
+    assert failed == []
+    assert isinstance(pods_by_account, dict)
 
 
 def test_runpod_provider_hourly_rate():

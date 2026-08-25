@@ -138,7 +138,7 @@ def test_api_parses_only_redacted_pod_fields():
         [
             {
                 "id": "pod123456",
-                "name": "flash-one",
+                "name": "flash-0123456789ab-s0-a0",
                 "desiredStatus": "RUNNING",
                 "imageName": "image:tag",
                 "gpuCount": 2,
@@ -173,7 +173,7 @@ def test_api_parses_only_redacted_pod_fields():
 def test_api_rejects_malformed_owned_pod_rows(field, value):
     row = {
         "id": "pod123456",
-        "name": "flash-one",
+        "name": "flash-0123456789ab-s0-a0",
         "desiredStatus": "PENDING",
         "imageName": "image:tag",
         "gpuCount": 1,

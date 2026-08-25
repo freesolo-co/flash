@@ -86,10 +86,24 @@ def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
 def _remote(*, attempt: int = 0) -> dict:
     return {
         "provider": "runpod",
-        "endpoint_id": f"endpoint-{attempt}",
-        "endpoint_name": f"endpoint-{attempt}-name",
+        "instance_id": f"pod-{attempt}",
+        "phase": "exact",
+        "label": f"flash-opd-s42-a{attempt}-0123456789abcdef-deadbeef",
         "key_fingerprint": _RUNPOD_FINGERPRINT,
-        "job_id": f"job-{attempt}",
+        "account_id": "account-1",
+        "payload_secret_id": f"secret-{attempt}",
+        "payload_secret_name": "FLASH_PAYLOAD_0123456789abcdef",
+        "data_center_id": "US-KS-2",
+        "network_volume_id": None,
+        "container_disk_gb": 120,
+        "container_registry_auth_id": None,
+        "gpu_count": 1,
+        "image_name": None,
+        "gpu_type_id_override": None,
+        "allowed_cuda_versions": None,
+        "docker_start_cmd": [],
+        "gpu": "RTX 4090",
+        "hourly_usd": 0.69,
         "attempt": attempt,
         "started_ts": float(attempt + 1),
     }
@@ -645,15 +659,13 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
                 return PollResult(False, failure="poll_error", detail="transient")
             return PollResult(True, metrics={"train_tokens": 1})
 
-        def cancel(self, handle):
-            event = ("cancel", handle.data["attempt"])
-            self.teardown.append(event)
-            self.events.append(event)
-
         def destroy(self, handle):
             event = ("destroy", handle.data["attempt"])
             self.teardown.append(event)
             self.events.append(event)
+
+        def run_instances_remaining(self, _run_id):
+            return []
 
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
@@ -671,7 +683,6 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     }
     assert provider.attempts == [0, 1]
     retry_submit = provider.events.index(("submit", 1))
-    assert provider.events.index(("cancel", 0)) < retry_submit
     assert provider.events.index(("destroy", 0)) < retry_submit
     assert [name for name, _kwargs in private_hf.calls] == ["repo_info", "get_paths_info"]
     assert private_hf.calls[1][1]["paths"] == [opd_optimizer_start_marker_path(spec.run_id, 0)]
@@ -731,11 +742,11 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
                 return PollResult(False, failure="poll_error", detail="transient")
             return PollResult(True, metrics={"train_tokens": 1})
 
-        def cancel(self, _handle):
-            return None
-
         def destroy(self, _handle):
             return None
+
+        def run_instances_remaining(self, _run_id):
+            return []
 
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
@@ -802,20 +813,20 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
         def poll(self, *_args, **_kwargs):
             return PollResult(False, failure="stalled", detail="worker stopped")
 
-        def cancel(self, _handle):
-            events.append("cancel")
-
         def destroy(self, _handle):
             events.append("destroy")
 
+        def run_instances_remaining(self, _run_id):
+            return []
+
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda _spec: None)
     resumed = []
     monkeypatch.setattr(runner, "_run_training", lambda *_args, **_kwargs: resumed.append(True))
 
     status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
 
-    assert events == ["cancel", "destroy"]
+    assert events == ["destroy"]
     assert resumed == []
     assert status.state == "failed"
     assert status.remote == _remote(attempt=0)
@@ -851,7 +862,7 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
     )
     started = []
     monkeypatch.setattr(runner, "_run_job_background", lambda *_args: started.append(True))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(_runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
     monkeypatch.setattr(providers, "configured_providers", list)
 

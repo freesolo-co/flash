@@ -49,17 +49,6 @@ def _vol_spec(name="flash-weights", gb=100, **gpu):
     )
 
 
-def _ndc() -> int:
-    """Size of the ALLOWED datacenter set (DataCenter.all()) — what the endpoint's `datacenter` list
-    spans. Derived from the same source the code uses, so it tracks the SDK's storage-DC set.
-    """
-    from flash.providers.runpod.jobs import weight_cache_datacenters
-
-    n = len(weight_cache_datacenters())
-    assert n > 1
-    return n
-
-
 def test_preload_cli_entrypoint_runs_as_a_subprocess():
     """`python -m ...weight_cache --dry-run` must reach the planner, not die on a NameError.
 
@@ -2386,24 +2375,6 @@ def test_cli_runpod_warm_gpu_falls_back_to_preload_default(monkeypatch):
     assert seen["gpu"] == "H100"
 
 
-def _poll_env(monkeypatch, statuses, workers):
-    """Wire _poll_until_done's two API calls: job status sequence + a fixed worker-health dict."""
-    from flash.providers.artifacts import weight_cache as preload
-
-    seq = list(statuses)
-    monkeypatch.setattr(
-        preload.runpod_api,
-        "job_status",
-        lambda *a, **k: {"status": seq.pop(0) if seq else "IN_QUEUE"},
-    )
-    monkeypatch.setattr(
-        preload.runpod_api,
-        "endpoint_health_for_fingerprint",
-        lambda *a, **k: {"workers": workers},
-    )
-    monkeypatch.setattr(preload.time, "sleep", lambda *_: None)
-
-
 def test_catalog_is_ordered_largest_first(monkeypatch):
     """Largest-first makes a capacity failure surface first instead of 20 minutes in.
 
@@ -2740,19 +2711,6 @@ def test_assign_leaves_a_custom_volume_size_alone():
     out = runner._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume == "my-org-cache"
     assert out.gpu.network_volume_gb == 100
-
-
-def test_grow_headroom_covers_every_account_in_the_pool(monkeypatch):
-    """The caller cannot fund a whole deploy from a single grow budget: failover reconciles again."""
-    from flash.providers.runpod import auth as rp_keys
-    from flash.providers.runpod import jobs
-
-    monkeypatch.setattr(rp_keys, "key_count", lambda: 3)
-    assert jobs.weight_cache_grow_headroom_s() == jobs.WEIGHT_CACHE_GROW_BUDGET_S * 3
-
-    # an unconfigured pool still funds the one attempt that runs
-    monkeypatch.setattr(rp_keys, "key_count", lambda: 0)
-    assert jobs.weight_cache_grow_headroom_s() == jobs.WEIGHT_CACHE_GROW_BUDGET_S
 
 
 def test_one_bad_volume_never_blocks_the_others(monkeypatch):

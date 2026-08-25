@@ -31,6 +31,8 @@ from flash.providers.runpod.api import (
 _GRAPHQL_URL = "https://api.runpod.io/graphql"
 _POD_QUERY = {"includeMachine": "true", "includeNetworkVolume": "true"}
 _POD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,127}")
+_MANAGED_TRAINING_POD_RE = re.compile(r"flash-[0-9a-f]{12}(?:-|$)")
+_MANAGED_PRELOAD_POD_RE = re.compile(r"flash-preload-d[0-9]{10,}(?:-|$)")
 _SECRET_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,127}")
 _SECRET_REFERENCE_RE = re.compile(r"\{\{ RUNPOD_SECRET_([A-Za-z][A-Za-z0-9_]{2,127}) \}\}")
 _CAPACITY_PATTERNS = (
@@ -235,6 +237,12 @@ def _parse_pod(row: object) -> RunpodPod:
     )
 
 
+def _managed_pod_name(name: object) -> bool:
+    if type(name) is not str:
+        return False
+    return bool(_MANAGED_TRAINING_POD_RE.match(name) or _MANAGED_PRELOAD_POD_RE.match(name))
+
+
 def _pod_rows(value: object, *, keep_name: str | None = None) -> list[RunpodPod]:
     if type(value) is not list:
         raise RunpodApiError("runpod /pods response must be a list")
@@ -245,7 +253,7 @@ def _pod_rows(value: object, *, keep_name: str | None = None) -> list[RunpodPod]
         name = raw.get("name")
         if keep_name is not None and name != keep_name:
             continue
-        if keep_name is None and not (isinstance(name, str) and name.startswith("flash-")):
+        if keep_name is None and not _managed_pod_name(name):
             continue
         pods.append(_parse_pod(raw))
     return pods

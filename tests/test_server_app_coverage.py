@@ -71,56 +71,6 @@ def _run_loop_once(monkeypatch, loop, worker):
         asyncio.run(loop())
 
 
-def test_idle_endpoint_loop_logs_successful_deletion(monkeypatch) -> None:
-    """The idle reaper must log nonzero deletions and propagate cancellation on the next cycle."""
-    messages = []
-    logger = types.SimpleNamespace(
-        info=lambda message, *args: messages.append(message % args),
-        debug=lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(app_mod, "_log", logger)
-    monkeypatch.setattr(app_mod, "_reap_idle_endpoints_once", lambda minimum: 2)
-
-    _run_loop_once(
-        monkeypatch, app_mod._reap_idle_endpoints_loop, lambda function, *args: function(*args)
-    )
-
-    assert any("reaped 2 idle RunPod endpoint" in message for message in messages)
-
-
-def test_idle_endpoint_loop_retries_after_a_sweep_failure(monkeypatch) -> None:
-    """A provider error must be logged and retried rather than terminating the idle reaper."""
-    messages = []
-    logger = types.SimpleNamespace(
-        info=lambda *args, **kwargs: None,
-        debug=lambda message, *args, **kwargs: messages.append(message % args),
-    )
-    monkeypatch.setattr(app_mod, "_log", logger)
-
-    def worker(function, *args):
-        raise RuntimeError("runpod unavailable")
-
-    _run_loop_once(monkeypatch, app_mod._reap_idle_endpoints_loop, worker)
-
-    assert messages == ["idle-endpoint reaper sweep failed; retrying next cycle"]
-
-
-def test_idle_endpoint_loop_propagates_cancellation_from_worker(monkeypatch) -> None:
-    """Cancellation raised during the offloaded sweep must escape immediately for clean shutdown."""
-
-    async def sleep(_seconds):
-        return None
-
-    async def to_thread(function, *args):
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(app_mod.asyncio, "sleep", sleep)
-    monkeypatch.setattr(app_mod.asyncio, "to_thread", to_thread)
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(app_mod._reap_idle_endpoints_loop())
-
-
 def test_instance_orphan_loop_logs_successful_sweep(monkeypatch) -> None:
     """The instance reaper must report torn-down workers before honoring shutdown cancellation."""
     messages = []

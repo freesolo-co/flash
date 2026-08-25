@@ -13,7 +13,7 @@ flash train run.toml
 
 The allocator picks the cheapest validated GPU class that fits the run, then supervises it
 server-side: stall watchdog, bounded auto-retry resuming from the last streamed checkpoint,
-and endpoint GC.
+and exact provider-resource cleanup.
 
 ## What this repository is
 
@@ -160,11 +160,9 @@ uv run pytest -q -m wallclock                 # asserts on real elapsed time; ru
 `mypy` also runs in CI but is **advisory** — it reports existing type errors without failing
 the build. Formatting is gated, so run `uv run ruff format .` before you push.
 
-> **The `flash` command can belong to something else.** The `server` and `dev` extras install
-> `runpod-flash`, which declares its own `flash` console script; whichever installs last wins,
-> and RunPod's exits 0 while doing nothing. Use **`flash-cli`** — the same entry point under a
-> name nothing else claims — or `python -m flash.cli` from a checkout. A base
-> `pip install freesolo-flash` is unaffected.
+> **`flash-cli` remains a stable alias.** Existing operator automation and self-hosting
+> instructions may use `flash-cli`; it invokes the same entry point as `flash`. From a checkout,
+> `uv run python -m flash.cli` is equivalent.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the branching model — in short, **pull requests go
 into `dev`**.
@@ -204,13 +202,17 @@ export FREESOLO_INTERNAL_KEY=$(openssl rand -hex 32)
 export HF_TOKEN=hf_...
 export FLASH_HF_NAMESPACE=your-hf-username   # a namespace your HF_TOKEN can write to
 export RUNPOD_API_KEY=...                    # or LAMBDA_API_KEY, or VAST_API_KEY
+# export RUNPOD_CONTAINER_REGISTRY_AUTH_ID=... # required only for a private worker image
 
 flash-server --host 0.0.0.0 --port 8080
 ```
 
 You need **one** of RunPod, Lambda, or Vast. Providers whose key is unset are never
 considered, and the allocator only proposes classes it can actually provision. Startup fails
-only when all three are missing.
+only when all three are missing. Managed RunPod training uses Secure Cloud, on-demand,
+non-interruptible Pods. The control plane creates an opaque payload secret, launches one exact
+Pod shape, and confirms both the Pod and secret are absent during teardown. The RunPod API key
+stays on the control plane and is never placed inside the Pod.
 
 `FLASH_STANDALONE=1` stops the plane calling out for project, environment, and billing
 validation, and trusts `FREESOLO_INTERNAL_KEY` as a single-tenant operator credential.

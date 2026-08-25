@@ -13,13 +13,23 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Added
 
-- A `flash-cli` console script, the same entry point as `flash` under a name nothing else
-  claims. The `server` and `dev` extras install `runpod-flash`, which declares its own `flash`
-  script; whichever distribution is installed last wins, so on a control-plane host
-  `pip install 'freesolo-flash[server]'` could leave `flash` running RunPod's CLI, which exits 0
-  and does nothing. `flash` is unchanged and remains correct on a base (client-only) install.
+- A `flash-cli` console script, the same entry point as `flash`, retained as a stable alias for
+  existing operator automation and self-hosting instructions.
 
 ### Changed
+
+- Managed RunPod training, cache preload, and kernel-cache baking now use Secure Cloud,
+  on-demand, non-interruptible Pods instead of Serverless endpoints and queue jobs. Flash uses
+  account-scoped REST APIs for Pods, payload secrets, network volumes, and catalog discovery;
+  records the complete non-secret owning-key fingerprint; keeps the RunPod API key out of Pods;
+  and confirms exact Pod plus payload-secret absence before retiring cleanup state. Shared cache
+  volumes are preserved, while malformed or handleless recovery is reconciled by the shared
+  run-label orphan sweep. The legacy endpoint reaper, endpoint billing, queue-job APIs,
+  `runpod-flash` dependency, and generated Serverless handler were removed. Operators upgrading
+  an existing plane must use the maintenance-window cutover documented in `SELF_HOSTING.md`.
+- Completed training continues to charge exactly the accepted submit-time estimate. Partial work
+  remains prorated from estimated completed work; measured RunPod Pod wall time and provider cost
+  are internal COGS and telemetry only and never reprice the customer quote.
 
 - `[train] init_from_adapter` now works for every source/target algorithm pair. SFT was rejected as
   a warm-start target, so an adapter could be continued only by GRPO or OPD; that restriction
@@ -137,13 +147,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   call, and which one wins is a race not worth depending on.
 
 - Commands printed for the operator to run (the resume/cancel hand-off after `flash train`,
-  usage strings, `next:` hints) now name the executable actually invoked rather than always
-  `flash`. On a host where `runpod-flash` owns the `flash` script, the printed
-  `flash runs cancel <run-id>` exited 0 without cancelling, leaving a run billing while the
-  operator believed they had stopped it. Reached through the `python -m flash.cli` escape hatch,
-  the printed command now names the interpreter that is actually running, rather than a bare
-  `python` that is absent on a python3-only host and may resolve to a different environment
-  inside a virtualenv.
+  usage strings, and `next:` hints) now name the executable actually invoked rather than always
+  `flash`. Reached through `python -m flash.cli`, the printed command names the interpreter that
+  is actually running rather than a bare `python` that may be absent or resolve to another
+  environment.
 
 - `flash env setup` scaffolded hosted-only environment instructions on every plane. A
   self-hosted plane cannot publish to Freesolo's managed environment hub, so the generated

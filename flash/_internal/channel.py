@@ -16,11 +16,8 @@ _DEFAULT_CLI_NAME = "flash-dev" if CHANNEL == "dev" else "flash"
 # banner.
 BRAND_NAME = _DEFAULT_CLI_NAME
 
-# Every console script in [project.scripts] that enters flash.cli:main, per channel. `flash` is
-# only correct to PRINT when the operator actually reached us through it: the `server` and `dev`
-# extras install runpod-flash, which claims the same script name, so on such a host `flash` may be
-# RunPod's CLI. Printing `flash runs cancel <id>` there tells the operator to run a command that
-# exits 0 without cancelling, leaving a billed run alive.
+# every console script in [project.scripts] that enters flash.cli:main, per channel. preserve the
+# exact name the operator used when rendering follow-up commands.
 _CLI_SCRIPT_NAMES = (
     frozenset({"flash-dev", "flash-dev-cli"})
     if CHANNEL == "dev"
@@ -49,8 +46,7 @@ def _entered_via_dash_m() -> bool:
 
     That slot holds either ``flash.cli`` or ``-mflash.cli``: a short option may be written with its
     value attached, and ``python -mflash.cli`` is an ordinary invocation, not a curiosity. Reading
-    only the separated form makes the attached one fall back to ``flash`` -- on precisely the host
-    where that name may be RunPod's CLI, which is the failure this function exists to prevent.
+    only the separated form makes the attached one fall back to the default script name.
     """
     if not sys.argv or sys.argv[0] != "-m":
         return False

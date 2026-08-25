@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.2.113"
+version = "1.2.114"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -43,10 +43,8 @@ gpu = [
     "freesolo>=0.4.2",
     "huggingface-hub>=1.2.0",
 ]
-# Control-plane / operator deps. runpod-flash (RunPod provider SDK) + huggingface-hub (provider
-# code upload + repo settings) are imported server-side; httpx is the serving client (flash/serve).
-# Keeping runpod-flash out of the base install also stops its `flash` console script shadowing
-# ours, so `pip install freesolo-flash` gives an unambiguous `flash` command. huggingface-hub>=1.2.0:
+# control-plane and operator deps. huggingface-hub handles provider code upload and repo settings;
+# httpx is the serving client. huggingface-hub>=1.2.0:
 # 1.2.0+ adds built-in RateLimit-header-aware 429 retry for downloads (resolvers) and paginated Hub
 # API calls. Our outer _hf_call wrappers stay on top: the library does not retry the complete mutating
 # operations (create_commit / create_repo / update_repo_settings) and the wrappers also bound an
@@ -61,7 +59,6 @@ server = [
     "uvicorn>=0.52,<1",
     # customer-owned modal lifecycle mutations execute in the control plane.
     "modal==1.5.4",
-    "runpod-flash>=1.19,<2",
     "httpx>=0.27",
     "jsonschema>=4.23",
     "referencing>=0.28.4",
@@ -141,7 +138,6 @@ dev = [
     # mirror server's 0.136 floor so dev remains compatible with the deployed serving extra pair.
     "fastapi>=0.136,<1",
     "uvicorn>=0.52,<1",
-    "runpod-flash>=1.19,<2",
     "httpx>=0.27",
     "jsonschema>=4.23",
     "referencing>=0.28.4",
@@ -167,11 +163,7 @@ Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
 flash = "flash.cli:main"
-# Same entry point as `flash`, under a name nothing else claims. The `server` and `dev` extras
-# pull in runpod-flash, which declares its own `flash` console script; whichever distribution is
-# installed last wins, so on a plane host `flash` can silently belong to runpod-flash. `flash-cli`
-# always reaches Flash. Keep both: on a base install `flash` is unambiguous and is what every
-# existing user has.
+# stable alias retained for existing operator automation and self-hosting instructions.
 flash-cli = "flash.cli:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
@@ -195,7 +187,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.2.113"
+version = "1.2.114"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

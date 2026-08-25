@@ -48,9 +48,8 @@ locally, whichever one `uv` picks is normally enough.
 CI also runs `uv run mypy flash`, but that job is advisory: it reports the existing type
 errors without failing the build, so you do not need a clean mypy run to contribute.
 
-To run the CLI from a dev checkout, use `uv run python -m flash.cli --help`. The `--dev`
-group installs `runpod-flash`, which also declares a `flash` console script, so plain
-`uv run flash` may resolve to RunPod's CLI instead of this one.
+To run the CLI from a dev checkout, use `uv run python -m flash.cli --help`. The
+`flash-cli` script remains a stable alias for operator automation.
 
 Formatting is enforced: CI runs `ruff format --check .` and fails on any drift, so run
 `uv run ruff format .` before you push. The whole tree is already formatted, so this

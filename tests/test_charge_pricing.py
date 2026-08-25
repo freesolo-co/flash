@@ -391,7 +391,7 @@ def test_cancel_run_prices_mid_training_cancel_at_actual_steps(monkeypatch, tmp_
     from flash.runner.supervise import deploy
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda spec: None)
     spec = _spec()
     runner._save_status(
         runner.RunStatus(
@@ -420,7 +420,7 @@ def test_cancel_near_completion_never_bills_above_the_accepted_quote(monkeypatch
     from flash.runner.supervise import deploy
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda spec: None)
     spec = _spec()  # 20 planned steps
     static_reprice = runner.charge_usd_for_spec(spec, steps=19)
     # the user accepted a live-market quote at half the static rate for the full run.
@@ -453,7 +453,7 @@ def test_cancel_run_prorates_the_persisted_quote(monkeypatch, tmp_path):
     from flash.runner.supervise import deploy
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda spec: None)
     spec = _spec()  # 20 planned steps
     runner._save_status(
         runner.RunStatus(
@@ -483,7 +483,7 @@ def test_cancel_run_prices_the_rented_basis_after_teardown_clears_the_handle(mon
     from flash.runner.supervise import deploy, lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda _spec: None)
     cfg = RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 1000, gpu_type="H100", gpu_count=2)
     spec_stub = _patched_cfg_spec(monkeypatch, cfg)
     torn_down = []
@@ -545,7 +545,7 @@ def test_cancel_run_with_malformed_quote_still_settles_as_a_billing_failure(monk
     from flash.runner.supervise import deploy
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda spec: None)
     spec = _spec()
     runner._save_status(
         runner.RunStatus(
@@ -571,7 +571,7 @@ def test_cancel_run_before_any_step_is_free(monkeypatch, tmp_path):
     from flash.runner.supervise import deploy
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda spec: None)
     spec = _spec()
     runner._save_status(
         runner.RunStatus(

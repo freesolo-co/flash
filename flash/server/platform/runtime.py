@@ -32,12 +32,11 @@ async def _reconcile_cost_loop() -> None:
     interval = 3600.0  # COGS reconcile sweep interval (fixed; flash is fully managed)
     while True:
         await asyncio.sleep(interval)
-        # Handle cancellation EXPLICITLY (re-raise it) and swallow only real Exceptions, exactly
-        # like the sibling reaper loops in app.py (_reap_idle_endpoints_loop /
-        # _sweep_orphan_instances_loop). On the supported Pythons (>=3.11) asyncio.CancelledError
-        # already derives from BaseException, so the old `contextlib.suppress(Exception)` did not
-        # swallow a shutdown cancel arriving during the blocking sweep — but being explicit makes the
-        # cancel path obvious and uniform, and logs a failed sweep instead of silently dropping it.
+        # handle cancellation explicitly by reraising it, and swallow only real exceptions, like the
+        # sibling _sweep_orphan_instances_loop in app.py. on supported python versions,
+        # the cancellation exception already derives from the base exception type, so suppressing
+        # ordinary exceptions did not swallow a shutdown cancellation during the blocking sweep.
+        # being explicit makes the path uniform and logs a failed sweep instead of dropping it.
         try:
             reported = await asyncio.to_thread(reconcile_once)
             if reported:
@@ -621,7 +620,7 @@ def _classify_recoverable_runs(
     the handle-less ones, deferred so the orphan sweep runs before their fresh allocation.
     """
     from flash.runner import (
-        _gc_run_endpoints,
+        _gc_run_resources,
         _mark_warmstart_source,
         _update,
         attach_run,
@@ -688,7 +687,7 @@ def _classify_recoverable_runs(
             # accepted while its response or handle was lost. A spec that won't parse can never be
             # resubmitted -> mark it terminally failed
             # (operator-visible, dropped from _RECOVERABLE so it isn't re-skipped every restart);
-            # otherwise GC any half-made endpoint and resubmit from scratch.
+            # otherwise GC any half-made provider resource and resubmit from scratch.
             try:
                 spec = JobSpec.from_dict(status.spec)
             except Exception as exc:
@@ -702,24 +701,14 @@ def _classify_recoverable_runs(
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):
                     _append_run_log(status.run_id, detail)
-                # The aborted attempt may STILL have registered its uniquely-named RunPod
-                # endpoint before crashing (the exact leak the good-spec branch's
-                # `_gc_run_endpoints` guards against). The `sweep_orphans` dispatch below is a
-                # no-op for RunPod, and the periodic idle reaper would only reclaim this after its
-                # 15-min idle grace — so tear it down by name HERE for immediate cleanup.
-                # `_gc_run_endpoints` needs a parsed `JobSpec`, which we don't have; but the
-                # endpoint name is derived deterministically from the run id + GPU class
-                # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
-                # persisted status without parsing the spec. Terminate by that reconstructed
-                # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
-                from flash.providers.runpod import terminate_persisted_endpoints
-
-                terminate_persisted_endpoints(status.spec, status.run_id)
+                # the shared orphan sweep runs after classification. this terminal run is known but
+                # not active, so any run-labeled Pod and its payload secret are eligible for exact
+                # cleanup without parsing the malformed spec.
                 continue
             # reap run-scoped resources from the parseable public spec before touching the private
-            # warm-start snapshot. source drift or snapshot tampering must not strand an endpoint.
+            # warm-start snapshot. source drift or snapshot tampering must not strand a worker.
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(spec)
+                _gc_run_resources(spec)
             try:
                 spec = reallocation_spec_from_status(status, verify_source=True)
                 # refresh the warm-start marker so recovery keeps an aged source protected.

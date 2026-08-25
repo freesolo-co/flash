@@ -790,9 +790,8 @@ def main(argv: list[str] | None = None) -> int:
         "--max-workers",
         type=int,
         default=4,
-        help="datacenters warmed concurrently. Each one deploys a preload endpoint, so this MUST stay "
-        "under your RunPod endpoint/worker quota (the documented default is 5); the default of 4 "
-        "leaves a 1-slot buffer. Raise it only if your account quota is higher.",
+        help="datacenters warmed concurrently. Each one launches a preload Pod, so this must stay "
+        "within your RunPod Pod quota; raise it only if every target account has capacity.",
     )
     ap.add_argument("--dry-run", action="store_true", help="print the plan, provision nothing")
     ap.add_argument(

@@ -2984,12 +2984,10 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
             os.waitpid(pid, 0)
 
 
-# the worker as the runpod handler really runs it: a short-lived process that records a straggler
-# and then EXITS, with no second job to sweep it. `_train_body.run_mode` in
-# `flash/providers/runpod/serverless/endpoints.py`
-# spawns one of these per phase and waits for it, so anything the phase leaves behind reparents to
-# the persistent handler -- which waits only on the worker -- and stays a zombie for the container's
-# life. driven as a subprocess because the leak is about process EXIT, which pytest cannot perform.
+# a short-lived worker process that records a straggler and then exits, with no second job to sweep
+# it. anything the phase leaves behind reparents to the persistent container launcher, which waits
+# only on the worker, and stays a zombie for the container's life. driven as a subprocess because
+# the leak is about process exit, which pytest cannot perform.
 _SHORT_LIVED_WORKER = r"""
 import os, sys, time
 sys.path.insert(0, {repo!r})
@@ -3106,8 +3104,8 @@ def test_every_test_touching_a_linux_only_api_carries_the_platform_guard():
     assert not unguarded, "these tests need @_needs_process_teardown:\n  " + "\n  ".join(unguarded)
 
 
-# the container topology, as a program: a stand-in for `/rp_handler.py` (pid 1, adopts orphans, only
-# ever waits on the worker) spawning the flash worker, which spawns the trainer, which spawns an
+# the container topology, as a program: a pid 1 launcher that adopts orphans and waits only on the
+# flash worker, which spawns the trainer, which spawns an
 # EngineCore and exits. run as a subprocess so the WORKER is not a subreaper unless the code under
 # test makes it one -- the pytest process cannot host this, because the fixture that gives these
 # tests adopted grandchildren manufactures exactly the condition production lacks.
@@ -3172,7 +3170,7 @@ os.waitpid(worker, 0)
 # state above was already recorded, so collecting it now costs the test nothing.
 #
 # reported rather than done silently: whether the leak is VISIBLE depends on the pid 1 the suite
-# happens to run under -- systemd reaps orphans, a container's `python rp_handler.py` does not -- so
+# happens to run under -- systemd reaps orphans while a minimal container launcher may not -- so
 # a test that only asks whether the pid disappeared cannot fail on the machine most likely to run
 # it. what this handler collected is the same either way.
 collected = []
@@ -3203,7 +3201,7 @@ def _run_topology_probe(*, claim: bool) -> tuple[str, str, int, list[int]]:
 def test_an_orphan_is_actually_reaped_in_the_container_process_topology():
     """The reaping only works if this process ADOPTS the orphan, and it is not pid 1.
 
-    Production reparents EngineCore to `/rp_handler.py`, beyond the worker's `waitpid` reach. Run in
+    A pid 1 container launcher reparents EngineCore beyond the worker's `waitpid` reach. Run in
     a subprocess because the test subreaper fixture would otherwise hide this topology.
     """
     claimed, state, _engine, _collected = _run_topology_probe(claim=True)

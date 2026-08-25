@@ -17,13 +17,6 @@ from flash.providers.base import (
 )
 
 
-def terminate_persisted_endpoints(spec: Any, run_id: str) -> None:
-    """Compatibility name for raw-spec recovery; the managed resource is now a Pod."""
-    from flash.providers.runpod.pods import destroy_run_pods
-
-    destroy_run_pods(run_id)
-
-
 class RunpodProvider(InstanceProvider):
     name = "runpod"
     _gpu_identity_attr = "runpod_gpu_type_id"

@@ -4,47 +4,9 @@ from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import dataclass, field
 from math import ceil
 
 from tests._helpers.profile import satisfy_sft_profile
-
-
-@dataclass
-class _FakeTemplate:
-    containerDiskInGb: int | None = 64
-
-
-@dataclass
-class _FakeConfig:
-    template: _FakeTemplate | None = field(default_factory=_FakeTemplate)
-
-
-def test_apply_disk_gb_raises_disk():
-    from flash.providers.runpod.jobs import apply_disk_gb
-
-    cfg = _FakeConfig()
-    apply_disk_gb(cfg, 160)
-    assert cfg.template.containerDiskInGb == 160
-
-
-def test_apply_disk_gb_never_shrinks():
-    """Configs carry a historical disk_gb=60 default; it must not shrink the 64 default."""
-    from flash.providers.runpod.jobs import apply_disk_gb
-
-    cfg = _FakeConfig()
-    apply_disk_gb(cfg, 60)
-    assert cfg.template.containerDiskInGb == 64
-
-
-def test_apply_disk_gb_noops():
-    from flash.providers.runpod.jobs import apply_disk_gb
-
-    cfg = _FakeConfig()
-    apply_disk_gb(cfg, None)
-    apply_disk_gb(cfg, 0)
-    assert cfg.template.containerDiskInGb == 64
-    apply_disk_gb(_FakeConfig(template=None), 160)  # missing template: warn, don't raise
 
 
 def test_oversized_catalog_models_carry_disk_floors():

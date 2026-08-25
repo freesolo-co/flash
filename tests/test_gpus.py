@@ -341,44 +341,6 @@ def test_config_gpu_type_is_empty_for_auto_and_preserves_pins():
         spec_from_dict(raw, run_id="x")
 
 
-def test_flash_gpu_enum_members():
-    pytest.importorskip("runpod_flash")
-
-    from flash.providers.runpod.gpus import flash_gpu
-
-    assert flash_gpu("RTX 5090").name == "NVIDIA_GEFORCE_RTX_5090"
-    assert flash_gpu("4090").name == "NVIDIA_GEFORCE_RTX_4090"
-    # B200 is newly added; resolving it fails fast (AttributeError) if the installed runpod_flash SDK
-    # doesn't expose the NVIDIA_B200 enum member, so CI catches an SDK/version gap before a live run.
-    assert flash_gpu("B200").name == "NVIDIA_B200"
-
-
-def test_explicit_gpu_pin_cannot_widen_to_its_whole_pool():
-    """An explicit class pin must serialize to that card, never to "any card in its pool".
-
-    The SDK's POOLS_TO_TYPES lists 1 of ADA_80_PRO's 3 real members, and to_gpu_ids_str derives
-    negations from that table, so an unpatched H100 pin sends a bare 'ADA_80_PRO' -- RunPod may
-    then assign an H100 NVL, which verify_gpu rejects as an exact-class mismatch.
-    """
-    pytest.importorskip("runpod_flash")
-
-    from runpod_flash.core.resources.gpu import GpuGroup
-
-    from flash.providers.runpod.gpus import flash_gpu
-
-    ids = GpuGroup.to_gpu_ids_str([flash_gpu("H100")])
-    assert "-NVIDIA H100 NVL" in ids
-    assert "-NVIDIA H100 PCIe" in ids
-
-    # repeated resolution must not accumulate duplicate negations
-    for _ in range(3):
-        flash_gpu("H100")
-    assert GpuGroup.to_gpu_ids_str([flash_gpu("H100")]) == ids
-
-    # classes whose SDK pool table is already complete stay exactly as they were
-    assert GpuGroup.to_gpu_ids_str([flash_gpu("A100 SXM")]) == "AMPERE_80,-NVIDIA A100 80GB PCIe"
-
-
 def test_gpu_short():
     from flash.providers.base import gpu_short
 
@@ -397,24 +359,6 @@ def test_config_defaults_gpu_to_auto():
     }
     spec = spec_from_dict(raw, run_id="x")
     assert spec.gpu.type == ""
-
-
-def test_build_worker_env():
-    from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
-
-    spec = JobSpec(
-        run_id="r1",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="grpo",
-        train=TrainSpec(epochs=1, max_examples=8),
-        seed=0,
-    )
-    env = build_worker_env(spec, 0)
-    assert env["RUN_ID"] == "r1"
-    assert env["BENCH_HF_MODEL"] == "Qwen/Qwen3.5-4B"
-    assert "RL_STEPS" not in env
-    assert "SFT_EPOCHS" not in env
 
 
 def test_grpo_kv_floor_escalates_large_group_long_context():

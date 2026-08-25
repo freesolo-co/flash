@@ -6,7 +6,6 @@ is not stubbed globally because client tests use a real loopback server.
 
 from __future__ import annotations
 
-import contextlib
 import os
 import shlex
 
@@ -332,24 +331,6 @@ def _rebind_worker_submodule_attributes():
 
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
-    # RunPod endpoint listing -> offline: the idle-endpoint sweep (deploy-time quota reclaim
-    # and the startup/post-run orphan sweep) lists account endpoints. Default to "no endpoints"
-    # so a sweep never reaches the real API; sweep tests monkeypatch it after this fixture.
-    import flash.providers.runpod.api as runpod_api
-
-    monkeypatch.setattr(runpod_api, "list_endpoints", list, raising=False)
-
-    # Credential scrubbing. Importing ``runpod_flash`` runs ``load_dotenv(find_dotenv(usecwd=True))``
-    # at module scope, which walks UP out of the repo and loads whatever .env it finds -- so on an
-    # operator box real keys appear in os.environ partway through the suite, as soon as some test
-    # first imports that package. Deleting a key BEFORE that import is worthless: load_dotenv skips
-    # names already set, so a name we just unset is exactly the one it fills back in.
-    #
-    # Force the import first, then delete. One ordering, one deletion pass, no name that can be
-    # scrubbed on the wrong side of the import.
-    with contextlib.suppress(Exception):  # package absent in a client-only checkout
-        import runpod_flash  # noqa: F401
-
     # scrub automatically forwarded secrets from the production key set so operator credentials
     # never enter fixtures. lambda/vast keys enable live providers, FREESOLO_API_KEY changes org
     # identity, and FLASH_STANDALONE/FLASH_HF_NAMESPACE change global mode. tests opt in after this

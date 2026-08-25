@@ -4,12 +4,11 @@ RunPod (always on) and the instance-based complements — Lambda (opt-in via LAM
 Vast (opt-in via VAST_API_KEY) — all implement the SAME ``base.Provider`` interface, so the
 orchestrator/allocator treat them interchangeably.
 
-Every provider carries the universal per-substrate surface below (``PROVIDER_MODULES``). Modules
-that only SOME providers need are divergence-driven, not part of the contract: ``gpus`` exists only
-where a provider translates friendly names to substrate ids (RunPod validated classes, Lambda's
-``instance_type_for``) — instance providers otherwise draw ``gpu_classes`` from the shared
-``base.gpu_classes_for``; ``train`` exists only for RunPod's serverless endpoint-deploy machinery
-(instance providers submit through ``jobs`` directly)."""
+Every provider carries the common per-substrate surface below (``PROVIDER_MODULES``). Lifecycle
+modules follow provider mechanics: Lambda and Vast submit through ``jobs``, while RunPod uses its
+Pod-specific transport, identity, cleanup, and resource modules. ``gpus`` exists where a provider
+translates friendly names to substrate ids; providers otherwise draw ``gpu_classes`` from the shared
+``base.gpu_classes_for``."""
 
 from __future__ import annotations
 
@@ -19,9 +18,10 @@ import pytest
 
 _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 
-# The universal per-provider surface: concerns every substrate must implement itself (no shared
-# default fits). ``gpus``/``train`` are intentionally NOT here — they're per-provider by necessity.
-PROVIDER_MODULES = ("api", "auth", "pricing", "jobs", "preflight")
+# the common per-provider surface concerns every substrate and has no shared default.
+PROVIDER_MODULES = ("api", "auth", "pricing", "preflight")
+INSTANCE_JOB_PROVIDERS = ("lambda", "vast")
+RUNPOD_MODULES = ("gpus", "pod_api", "pod_cleanup", "pod_identity", "pods", "resources")
 PROVIDER_METHODS = (
     "is_configured",
     "preflight",
@@ -63,11 +63,16 @@ def test_provider_implements_the_interface(provider):
 
 @pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
 def test_module_layout(provider):
-    """Every provider subpackage exposes the SAME public module set (the symmetry contract)."""
+    """every provider subpackage exposes the common public module set."""
     for mod in PROVIDER_MODULES:
         importlib.import_module(f"flash.providers.{_PKG[provider]}.{mod}")
     pkg = importlib.import_module(f"flash.providers.{_PKG[provider]}")
     assert hasattr(pkg, "PROVIDER")
+
+
+@pytest.mark.parametrize("provider", INSTANCE_JOB_PROVIDERS)
+def test_instance_job_module_layout(provider):
+    importlib.import_module(f"flash.providers.{_PKG[provider]}.jobs")
 
 
 @pytest.mark.parametrize("provider", ["lambda", "vast"])
@@ -154,7 +159,7 @@ def test_runpod_provider_implements_the_interface():
 
 
 def test_runpod_module_layout():
-    for mod in PROVIDER_MODULES:
+    for mod in RUNPOD_MODULES:
         importlib.import_module(f"flash.providers.runpod.{mod}")
     pkg = importlib.import_module("flash.providers.runpod")
     assert hasattr(pkg, "PROVIDER")
@@ -178,17 +183,16 @@ def test_sweep_orphans_is_part_of_the_protocol():
 
 
 def test_run_instances_remaining_is_optional_not_required_by_protocol():
-    # Copilot: run_instances_remaining is an OPTIONAL capability (Vast enumerates billable instances by
-    # run label; RunPod serverless self-reaps). It must NOT be on the @runtime_checkable Provider
-    # Protocol, or isinstance(runpod_provider, Provider) would go False and break the symmetry checks
-    # above. Vast implements it; RunPod does not; both still satisfy Provider. Detected via getattr.
+    # run_instances_remaining is an optional capability for providers that can prove exact run-label
+    # absence. it must not be on the runtime-checkable provider protocol, or providers without that
+    # stronger proof surface would fail the base symmetry check. detect it through getattr instead.
     from flash.providers import get_provider
     from flash.providers.base import Provider
 
-    assert "run_instances_remaining" not in dir(Provider)  # not a required Protocol member
-    assert hasattr(get_provider("vast"), "run_instances_remaining")  # Vast provides the capability
-    assert hasattr(get_provider("runpod"), "run_instances_remaining")  # Pods provide the capability
-    assert isinstance(get_provider("runpod"), Provider)  # still a Provider despite opting out
+    assert "run_instances_remaining" not in dir(Provider)  # not a required protocol member
+    assert hasattr(get_provider("vast"), "run_instances_remaining")  # vast provides the capability
+    assert hasattr(get_provider("runpod"), "run_instances_remaining")  # pods provide the capability
+    assert isinstance(get_provider("runpod"), Provider)  # still a provider despite opting out
 
 
 def test_static_pricing():
@@ -291,14 +295,14 @@ def test_allocation_summary_formats_runpod_choice():
 def test_jobhandle_roundtrip_tags_provider():
     from flash.providers.base import JobHandle
 
-    h = JobHandle(provider="runpod", data={"endpoint_id": "ep", "job_id": "j"})
+    h = JobHandle(provider="runpod", data={"instance_id": "pod-1"})
     d = h.to_dict()
     assert d["provider"] == "runpod"
     back = JobHandle.from_dict(d)
     assert back.provider == "runpod"
-    assert back.data == {"endpoint_id": "ep", "job_id": "j"}
+    assert back.data == {"instance_id": "pod-1"}
     with pytest.raises(ValueError, match="provider identity is missing or invalid"):
-        JobHandle.from_dict({"endpoint_id": "ep", "job_id": "j"})
+        JobHandle.from_dict({"instance_id": "pod-1"})
 
 
 def _runpod_pod_handle():

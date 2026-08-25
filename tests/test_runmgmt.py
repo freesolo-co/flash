@@ -15,19 +15,31 @@ _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
-def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):
-    remote = {
+def _runpod_remote(pod_id="pod-1", secret_id="secret-1", attempt=0, started_ts=1.0, **extra):
+    return {
         "provider": "runpod",
-        "endpoint_id": endpoint_id,
-        "endpoint_name": f"{endpoint_id}-name",
+        "instance_id": pod_id,
+        "phase": "exact",
+        "label": f"flash-runmgmt-s0-a{attempt}-0123456789abcdef-deadbeef",
         "key_fingerprint": _RUNPOD_FINGERPRINT,
+        "account_id": "account-1",
+        "payload_secret_id": secret_id,
+        "payload_secret_name": "FLASH_PAYLOAD_0123456789abcdef",
+        "data_center_id": "US-KS-2",
+        "network_volume_id": None,
+        "container_disk_gb": 120,
+        "container_registry_auth_id": None,
+        "gpu_count": 1,
+        "image_name": None,
+        "gpu_type_id_override": None,
+        "allowed_cuda_versions": None,
+        "docker_start_cmd": [],
+        "gpu": "RTX 4090",
+        "hourly_usd": 0.69,
         "attempt": attempt,
         "started_ts": started_ts,
         **extra,
     }
-    if job_id is not None:
-        remote["job_id"] = job_id
-    return remote
 
 
 def _lambda_remote(instance_id="instance", attempt=0, started_ts=1.0, **extra):
@@ -782,8 +794,8 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
             self.attempts.append(attempt)
             on_handle(
                 _runpod_remote(
-                    endpoint_id=f"endpoint-{attempt}",
-                    job_id=f"job-{attempt}",
+                    pod_id=f"endpoint-{attempt}",
+                    secret_id=f"job-{attempt}",
                     attempt=attempt,
                     started_ts=float(attempt + 1),
                 )
@@ -797,6 +809,9 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
 
         def destroy(self, _handle):
             return None
+
+        def run_instances_remaining(self, _run_id):
+            return []
 
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
@@ -864,8 +879,8 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
                 raise RuntimeError("provider accepted create but response was lost")
             on_handle(
                 _runpod_remote(
-                    endpoint_id="endpoint-1",
-                    job_id="job-1",
+                    pod_id="endpoint-1",
+                    secret_id="job-1",
                     attempt=attempt,
                     started_ts=float(attempt + 1),
                 )
@@ -943,8 +958,8 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
             self.attempts.append(attempt)
             on_handle(
                 _runpod_remote(
-                    endpoint_id=f"endpoint-{attempt}",
-                    job_id=f"job-{attempt}",
+                    pod_id=f"endpoint-{attempt}",
+                    secret_id=f"job-{attempt}",
                     attempt=attempt,
                     started_ts=float(attempt + 1),
                 )
@@ -959,6 +974,9 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
 
         def destroy(self, _handle):
             return None
+
+        def run_instances_remaining(self, _run_id):
+            return []
 
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
@@ -1298,7 +1316,7 @@ def test_multiprocess_attempt_reservations_preserve_concurrent_status_update(mon
     "remote",
     [
         _runpod_remote(attempt=2),
-        _runpod_remote(job_id=None, attempt=2),
+        _lambda_remote(attempt=2),
         _vast_remote(attempt=2),
     ],
 )
@@ -1319,20 +1337,31 @@ def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
         )
     )
 
+    stale = runner.get_status(spec.run_id)
     assert runner._compare_and_clear_remote(spec.run_id, remote) is True
-    assert runner.get_status(spec.run_id).remote is None
+    cleared = runner.get_status(spec.run_id)
+    assert cleared.remote is None
+    assert len(cleared.provider_cost_history or []) == 1
+    record = cleared.provider_cost_history[0]
+    assert record["provider"] == remote["provider"]
+    assert record["instance_id"] == remote["instance_id"]
+    assert record["attempt"] == remote["attempt"]
+    assert record["terminated_ts"] >= remote["started_ts"]
+    assert "payload_secret_id" not in record
+    assert "provider_cost_history" not in cleared.to_dict()
+
+    stale.error = "later stale writer"
+    runner._save_status(stale)
+    persisted = runner.get_status(spec.run_id)
+    assert persisted.provider_cost_history == [record]
 
 
 @pytest.mark.parametrize(
     ("original", "newer"),
     [
         (
-            _runpod_remote(job_id="job-old", attempt=1),
-            _runpod_remote(job_id="job-new", attempt=2, started_ts=2.0),
-        ),
-        (
-            _runpod_remote(job_id=None, attempt=1),
-            _runpod_remote(job_id="job-new", attempt=2, started_ts=2.0),
+            _runpod_remote(secret_id="job-old", attempt=1),
+            _runpod_remote(secret_id="job-new", attempt=2, started_ts=2.0),
         ),
         (
             _lambda_remote(instance_id="instance-old", attempt=1),
@@ -1369,7 +1398,7 @@ def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
     monkeypatch.setattr(runner, "RUNS_DIR", runs_dir)
     spec = JobSpec(run_id="cleanup-dedup", model="Qwen/Qwen3.5-4B", algorithm="sft")
     public_remote = _runpod_remote("endpoint-a", "job-a", attempt=0)
-    cleanup_remote = _runpod_remote("endpoint-b", None, attempt=1, started_ts=2.0)
+    cleanup_remote = _runpod_remote("pod-b", "secret-b", attempt=1, started_ts=2.0)
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -1481,214 +1510,191 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
 
 
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):
-    import flash.providers as providers
     import flash.runner as runner
     from flash.core.spec import JobSpec
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-drain", model="Qwen/Qwen3.5-4B", algorithm="sft")
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
     )
-    confirmed = _runpod_remote("endpoint-confirmed", "job-confirmed", attempt=1)
-    endpoint_only = _runpod_remote(
-        "endpoint-only",
-        None,
+    confirmed = _runpod_remote("pod-confirmed", "secret-confirmed", attempt=1)
+    unconfirmed = _runpod_remote(
+        "pod-unconfirmed",
+        "secret-unconfirmed",
         attempt=2,
         started_ts=2.0,
     )
-    unconfirmed = _runpod_remote(
-        "endpoint-unconfirmed",
-        "job-unconfirmed",
-        attempt=3,
-        started_ts=3.0,
-    )
-    for remote in (confirmed, endpoint_only, unconfirmed):
+    for remote in (confirmed, unconfirmed):
         assert runner._preserve_cleanup_remote(spec.run_id, remote) is True
 
     events = []
 
-    class Provider:
-        def cancel(self, handle):
-            data = handle.to_dict()
-            events.append(("cancel", data["endpoint_id"]))
-            if data["endpoint_id"] == "endpoint-unconfirmed":
-                raise RuntimeError("cancellation unconfirmed")
+    def teardown(handle, run_id):
+        events.append((handle.to_dict()["instance_id"], run_id))
+        if handle.to_dict()["instance_id"] == "pod-unconfirmed":
+            raise RuntimeError("Pod and secret deletion unconfirmed")
+        return True
 
-        def destroy(self, handle):
-            endpoint_id = handle.to_dict()["endpoint_id"]
-            events.append(("destroy", endpoint_id))
-            if endpoint_id == "endpoint-unconfirmed":
-                raise RuntimeError("endpoint deletion unconfirmed")
-
-    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
 
     attempted = runner._drain_cleanup_remotes(spec.run_id)
 
     assert attempted == {
-        ("runpod", 1, "endpoint-confirmed", "job-confirmed", _RUNPOD_FINGERPRINT),
-        ("runpod", 2, "endpoint-only", None, _RUNPOD_FINGERPRINT),
-        ("runpod", 3, "endpoint-unconfirmed", "job-unconfirmed", _RUNPOD_FINGERPRINT),
+        runner._remote_resource_identity(confirmed),
+        runner._remote_resource_identity(unconfirmed),
     }
     assert events == [
-        ("cancel", "endpoint-confirmed"),
-        ("destroy", "endpoint-confirmed"),
-        ("destroy", "endpoint-only"),
-        ("cancel", "endpoint-unconfirmed"),
-        ("destroy", "endpoint-unconfirmed"),
+        ("pod-confirmed", spec.run_id),
+        ("pod-unconfirmed", spec.run_id),
     ]
     raw = runner._load_status_json(spec.run_id)
     assert raw[runner._CLEANUP_REMOTES_KEY] == [unconfirmed]
     assert raw["remote"] == confirmed
 
 
-def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
+def test_cleanup_drain_retains_older_attempt_cost_while_newer_remote_stays_active(
     monkeypatch, tmp_path
 ):
-    """A deployed-format record still names a billable endpoint, so teardown must reach it.
-
-    `key_fingerprint` is validated at exactly 68 chars, but the deployed release writes the 16-char
-    form, so such a record fails the strict `from_dict` behind `_canonical_cleanup_remote` and
-    `_remote_resource_identity`. The teardown loop builds a base `JobHandle` (which validates only
-    `provider`) and `_delete_runpod_endpoint` resolves that exact fingerprint through
-    `resolve_prefix_key_fingerprint`. Filtering the record out before teardown would leave a live
-    RunPod endpoint billing forever with nothing left to delete it.
-    """
-    import json as _json
-
     import flash.runner as runner
     from flash.core.spec import JobSpec
-    from flash.providers.runpod import api as runpod_api
+    from flash.runner import reconciliation as runner_reconciliation
+    from flash.runner.supervise import lifecycle
+    from flash.server.domain import reconcile
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="cleanup-legacy", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id="cleanup-cost-history", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    older = _runpod_remote("pod-older", "secret-older", attempt=0, started_ts=1_000.0)
+    newer = _runpod_remote("pod-newer", "secret-newer", attempt=1, started_ts=3_000.0)
     runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
-    )
-    legacy_fingerprint = "rpk-" + "0" * 12
-    resolved_fingerprint = "rpk-" + "a" * 64
-    legacy = _runpod_remote("endpoint-legacy", None, attempt=1, key_fingerprint=legacy_fingerprint)
-    # the strict writer rejects the legacy record, so seed the status file directly.
-    path = runner.runs_file_path(spec.run_id, ".json")
-    with open(path) as f:
-        raw = _json.load(f)
-    raw[runner._CLEANUP_REMOTES_KEY] = [legacy]
-    with open(path, "w") as f:
-        _json.dump(raw, f)
-
-    def _key_for_fingerprint(fingerprint):
-        raise runpod_api.RunpodApiError("no configured key matches the stored fingerprint")
-
-    resolved = []
-    deleted = []
-
-    def resolve_legacy(endpoint_id, fingerprint):
-        resolved.append((endpoint_id, fingerprint))
-        return resolved_fingerprint
-
-    def delete_endpoint(endpoint_id, fingerprint):
-        deleted.append((endpoint_id, fingerprint))
-        return True
-
-    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", _key_for_fingerprint)
-    monkeypatch.setattr(runpod_api, "resolve_prefix_key_fingerprint", resolve_legacy)
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
-
-    attempted = runner._drain_cleanup_remotes(spec.run_id)
-
-    assert resolved == [("endpoint-legacy", legacy_fingerprint)], (
-        "the legacy fingerprint resolver was never reached"
-    )
-    assert deleted == [("endpoint-legacy", resolved_fingerprint)], (
-        "the billable endpoint was never deleted"
-    )
-    assert any("endpoint-legacy" in repr(item) for item in attempted)
-    # and the confirmed-deleted record must actually leave the file. removal derives its key from
-    # the same record the drain admitted, so a strict-only derivation would return None here and
-    # clear nothing -- leaving every later sweep to tear down an endpoint that is already gone.
-    with open(path) as f:
-        assert not _json.load(f).get(runner._CLEANUP_REMOTES_KEY), (
-            "the confirmed-deleted record survived, so every later sweep retries a deleted endpoint"
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="cancelled",
+            spec=spec.to_dict(),
+            created_at=900.0,
+            updated_at=4_800.0,
+            finished_at=4_800.0,
+            remote=newer,
+            estimated_cost_usd=9.5,
+            cost_usd=9.5,
         )
+    )
+    assert runner._record_cleanup_remote(spec.run_id, older) is True
+    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runner_reconciliation.time, "time", lambda: 2_800.0)
+
+    runner._drain_cleanup_remotes(spec.run_id)
+
+    status = runner.get_status(spec.run_id)
+    assert status.remote == newer
+    assert runner._CLEANUP_REMOTES_KEY not in runner._load_status_json(spec.run_id)
+    assert status.provider_cost_history == [
+        {
+            "account_id": "account-1",
+            "attempt": 0,
+            "data_center_id": "US-KS-2",
+            "gpu": "RTX 4090",
+            "gpu_count": 1,
+            "hourly_usd": 0.69,
+            "instance_id": "pod-older",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "provider": "runpod",
+            "started_ts": 1_000.0,
+            "terminated_ts": 2_800.0,
+        }
+    ]
+    assert "payload_secret_id" not in status.provider_cost_history[0]
+    posted: dict = {}
+    monkeypatch.setattr(reconcile, "_report", lambda body: posted.update(body) or True)
+    updates: dict = {}
+    monkeypatch.setattr(
+        runner,
+        "record_realized_cost",
+        lambda run_id, **fields: updates.update(run_id=run_id, **fields),
+    )
+
+    assert reconcile.reconcile_run(status, now=10_000.0) is True
+    expected = round((1_800.0 + 1_800.0) / 3_600.0 * 0.69, 6)
+    assert posted["realizedCostUsd"] == expected
+    assert posted["wallSeconds"] == 3_600.0
+    assert [item["resource_id"] for item in posted["source"]["attempts"]] == [
+        "pod-older",
+        "pod-newer",
+    ]
+    assert status.cost_usd == status.estimated_cost_usd == 9.5
+    assert updates["realized_cost_usd"] == expected
+
+
+def test_provider_cost_history_keeps_first_termination_but_rejects_billing_drift():
+    import flash.runner as runner
+
+    existing = {
+        "provider": "runpod",
+        "instance_id": "pod-1",
+        "attempt": 0,
+        "hourly_usd": 0.69,
+        "started_ts": 1_000.0,
+        "terminated_ts": 2_800.0,
+        "gpu": "RTX 4090",
+    }
+    later = {**existing, "terminated_ts": 3_000.0}
+
+    assert runner._merge_provider_cost_history([existing], [later]) == [existing]
+    with pytest.raises(RuntimeError, match="conflicts with the exact attempt"):
+        runner._merge_provider_cost_history([existing], [{**later, "hourly_usd": 0.99}])
 
 
 def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypatch, tmp_path):
     import flash.runner as runner
     from flash.core.spec import JobSpec
-    from flash.providers.runpod import api as runpod_api
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-absent", model="Qwen/Qwen3.5-4B", algorithm="sft")
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
     )
-    other_fingerprint = "rpk-" + "f" * 64
-    confirmed = _runpod_remote("endpoint-shared", "job-confirmed", attempt=1)
+    confirmed = _runpod_remote("pod-confirmed", "secret-confirmed", attempt=1)
     different_owner = _runpod_remote(
-        "endpoint-shared",
-        "job-confirmed",
+        "pod-other-owner",
+        "secret-other-owner",
         attempt=1,
-        key_fingerprint=other_fingerprint,
+        key_fingerprint="rpk-" + "f" * 64,
         started_ts=2.0,
     )
-    different_job = _runpod_remote(
-        "endpoint-shared",
-        "job-other",
+    different_secret = _runpod_remote(
+        "pod-other-secret",
+        "secret-other",
         attempt=1,
         started_ts=3.0,
     )
     different_attempt = _runpod_remote(
-        "endpoint-shared",
-        "job-confirmed",
+        "pod-other-attempt",
+        "secret-other-attempt",
         attempt=2,
         started_ts=4.0,
     )
-    for remote in (confirmed, different_owner, different_job, different_attempt):
+    remotes = (confirmed, different_owner, different_secret, different_attempt)
+    for remote in remotes:
         assert runner._preserve_cleanup_remote(spec.run_id, remote) is True
 
-    monkeypatch.setattr(
-        runpod_api,
-        "cancel_job",
-        lambda _endpoint_id, job_id, **_kwargs: {
-            "id": job_id,
-            "status": "CANCELLED",
-        },
-    )
-    monkeypatch.setattr(
-        runpod_api,
-        "delete_endpoint_for_fingerprint",
-        lambda _endpoint_id, _fingerprint: False,
-    )
-    exact_lookups = []
+    calls = []
 
-    def exact_lookup(endpoint_id, fingerprint):
-        exact_lookups.append((endpoint_id, fingerprint))
-        if len(exact_lookups) == 1:
+    def teardown(handle, run_id):
+        calls.append((handle.to_dict()["instance_id"], run_id))
+        if len(calls) == 1:
             return True
-        raise runpod_api.RunpodApiError("exact endpoint lookup unconfirmed")
+        raise RuntimeError("exact Pod and secret absence unconfirmed")
 
-    monkeypatch.setattr(runpod_api, "endpoint_absent_for_fingerprint", exact_lookup)
+    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
 
     attempted = runner._drain_cleanup_remotes(spec.run_id)
 
-    assert attempted == {
-        ("runpod", 1, "endpoint-shared", "job-confirmed", _RUNPOD_FINGERPRINT),
-        ("runpod", 1, "endpoint-shared", "job-confirmed", other_fingerprint),
-        ("runpod", 1, "endpoint-shared", "job-other", _RUNPOD_FINGERPRINT),
-        ("runpod", 2, "endpoint-shared", "job-confirmed", _RUNPOD_FINGERPRINT),
-    }
-    assert exact_lookups == [
-        ("endpoint-shared", _RUNPOD_FINGERPRINT),
-        ("endpoint-shared", other_fingerprint),
-        ("endpoint-shared", _RUNPOD_FINGERPRINT),
-        ("endpoint-shared", _RUNPOD_FINGERPRINT),
-    ]
+    assert attempted == {runner._remote_resource_identity(remote) for remote in remotes}
+    assert calls == [(remote["instance_id"], spec.run_id) for remote in remotes]
     raw = runner._load_status_json(spec.run_id)
-    assert raw[runner._CLEANUP_REMOTES_KEY] == [
-        different_owner,
-        different_job,
-        different_attempt,
-    ]
+    assert raw[runner._CLEANUP_REMOTES_KEY] == list(remotes[1:])
     assert raw["remote"] == confirmed
 
 
@@ -1832,8 +1838,11 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
         def destroy(self, _handle):
             return None
 
+        def run_instances_remaining(self, _run_id):
+            return []
+
     monkeypatch.setattr(providers, "get_provider", lambda _name: FailedProvider())
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda _spec: None)
     resumed = []
 
     def fake_run_training(_spec, _log, **kwargs):
@@ -1895,7 +1904,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
 
     monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
     monkeypatch.setattr(lifecycle, "_completed_attempt_metrics", completed_metrics)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         lifecycle,
         "_strict_teardown_handle",
@@ -1982,7 +1991,7 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
 
     monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
     monkeypatch.setattr(lifecycle, "_adopt_completed_attempt", capture_adopt)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda _spec: None)
 
     status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
 
@@ -2292,9 +2301,12 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
         def destroy(self, handle):
             teardown.append(("destroy", handle.to_dict()))
 
+        def run_instances_remaining(self, _run_id):
+            return []
+
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
     monkeypatch.setattr(
-        runner, "_gc_run_endpoints", lambda cleanup_spec: gc_runs.append(cleanup_spec.run_id)
+        runner, "_gc_run_resources", lambda cleanup_spec: gc_runs.append(cleanup_spec.run_id)
     )
     monkeypatch.setattr(runner, "_run_training", lambda *_args, **_kwargs: resumed.append(True))
 
@@ -2302,12 +2314,11 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
 
     assert polled == []
     assert resumed == []
-    assert len(completion_checks) == 1
-    assert completion_checks[0][1]["attempt"] == 0
-    assert [action for action, _handle in teardown] == ["cancel", "destroy"]
+    assert completion_checks == []
+    assert [action for action, _handle in teardown] == ["destroy"]
     assert gc_runs == [spec.run_id]
     assert status.state == "failed"
-    assert status.remote["endpoint_id"] == "endpoint-old"
+    assert status.remote["instance_id"] == "endpoint-old"
     assert "deadline exhausted" in status.error
 
 
@@ -2343,7 +2354,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
             raise AssertionError("expired recovery must not poll")
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda _spec: None)
     resumed = []
     monkeypatch.setattr(runner, "_run_training", lambda *_args, **_kwargs: resumed.append(True))
 
@@ -2353,45 +2364,6 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
     assert status.state == "failed"
     assert status.remote == remote
     assert "deadline exhausted" in status.error
-
-
-def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monkeypatch):
-    import flash.providers.runpod.jobs as jobs
-    import flash.providers.runpod.serverless as train
-    from flash.core.spec import JobSpec
-    from flash.providers.base import PollResult
-
-    spec = JobSpec(run_id="worker-attempt", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    payloads = []
-    handles = []
-    monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(
-        jobs,
-        "deploy_train_endpoint",
-        lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT),
-    )
-    monkeypatch.setattr(
-        jobs.runpod_api,
-        "submit_job",
-        lambda _endpoint, payload, **_kwargs: payloads.append(payload) or "job",
-    )
-    monkeypatch.setattr(
-        jobs,
-        "poll_job",
-        lambda *_args, **_kwargs: PollResult(True, metrics={"wall_seconds": 1.0}),
-    )
-
-    jobs.submit_run(
-        spec,
-        0,
-        attempt=2,
-        source_snapshot=_SOURCE_SNAPSHOT,
-        on_handle=handles.append,
-        deadline_at=10_000_000_000.0,
-    )
-
-    assert payloads[0]["env"]["ATTEMPT"] == "2"
-    assert handles[0]["attempt"] == 2
 
 
 def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, tmp_path):
@@ -2511,7 +2483,7 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     )
     monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
     monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(runner, "_mark_warmstart_source", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runner, "effective_spec_from_status", lambda _status, **_kwargs: spec)
     monkeypatch.setattr(providers, "configured_providers", list)
@@ -2553,154 +2525,6 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
         args for target, args, _daemon in started if target.__name__ == "_drain_cleanup_remotes_bg"
     ]
     assert drain_calls == [(spec.run_id,)]
-
-
-def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses(
-    monkeypatch, tmp_path
-):
-    # an algorithm dropped from the catalog while one of its runs is still nonterminal: the
-    # persisted spec stops parsing on the new build. attach_run parses before its except/finally
-    # exist, so dispatching it would kill the daemon thread with the run still `running` and the
-    # rented worker still billing. recovery has to decide this itself -- fail the run and remove
-    # the resource -- which is the disposition the handle-less branch already applies.
-    import flash.providers as providers
-    import flash.runner as runner
-    import flash.server.platform.runtime as runtime
-    from flash.core.spec import JobSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    remote = {"provider": "runpod", "endpoint_id": "ep-stale", "attempt": 0}
-    runner._save_status(
-        runner.RunStatus(
-            run_id="recover-unparseable",
-            state="running",
-            spec=JobSpec(
-                run_id="recover-unparseable", model="Qwen/Qwen3.5-4B", algorithm="sft"
-            ).to_dict(),
-            remote=dict(remote),
-        )
-    )
-    # the record has to be written the way an upgrade produces one: the OLD build persisted a spec
-    # it accepted, and only the new build rejects it. _save_status parses on the way in, so it can
-    # never store this -- edit the stored json in place, which is what "the algorithm was dropped
-    # from the catalog underneath a live run" actually looks like on disk.
-    stored_path = runner.runs_file_path("recover-unparseable", ".json")
-    with open(stored_path, encoding="utf-8") as handle:
-        stored = json.load(handle)
-    stored["spec"]["algorithm"] = "retired-algorithm"
-    with open(stored_path, "w", encoding="utf-8") as handle:
-        json.dump(stored, handle)
-    with pytest.raises(ValueError, match="unsupported algorithm"):
-        JobSpec.from_dict(stored["spec"])  # premise: this build cannot parse it
-    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": "recover-unparseable"}])
-    monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
-    monkeypatch.setattr(providers, "configured_providers", list)
-    torn: list[tuple[dict, str]] = []
-
-    def fake_teardown(handle, run_id):
-        torn.append((dict(handle), run_id))
-        return True
-
-    monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
-    attached: list[str] = []
-    # recover_runs imports attach_run from flash.runner inside the function, so patch it there.
-    monkeypatch.setattr(runner, "attach_run", lambda rid: attached.append(rid))
-
-    class Thread:
-        def __init__(self, *, target, args=(), daemon=False):
-            self._target, self._args = target, args
-
-        def start(self):
-            # only the cleanup drain is backgrounded here; attach_run must never be dispatched.
-            self._target(*self._args)
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
-
-    runtime.recover_runs()
-
-    assert attached == []
-    assert torn == [(remote, "recover-unparseable")]
-    status = runner.get_status("recover-unparseable")
-    assert status.state == "failed"
-    assert "persisted spec is malformed" in (status.error or "")
-
-
-def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):
-    # when `_strict_teardown_handle` cannot confirm the delete, the handle is recorded for the
-    # cleanup drain -- but this run's drain was already dispatched at the top of the loop and had
-    # snapshotted an empty list, and it returns early on empty. so the record sat there with nothing
-    # scheduled to retry it, and the worker kept billing until the next restart.
-    import flash.providers as providers
-    import flash.runner as runner
-    import flash.server.platform.runtime as runtime
-    from flash.core.spec import JobSpec
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    # a COMPLETE handle: `_record_cleanup_remote` drops anything it cannot resolve to an exact
-    # provider resource identity, so a partial one would make this test pass for the wrong reason.
-    remote = {
-        "provider": "runpod",
-        "endpoint_id": "ep-unconfirmed",
-        "endpoint_name": "flash-recover-unconfirmed",
-        "key_fingerprint": "rpk-" + "0" * 64,
-        "attempt": 0,
-        "started_ts": 1.0,
-    }
-    assert runner._remote_resource_identity(remote) is not None
-    runner._save_status(
-        runner.RunStatus(
-            run_id="recover-unconfirmed",
-            state="running",
-            spec=JobSpec(
-                run_id="recover-unconfirmed", model="Qwen/Qwen3.5-4B", algorithm="sft"
-            ).to_dict(),
-            remote=dict(remote),
-        )
-    )
-    stored_path = runner.runs_file_path("recover-unconfirmed", ".json")
-    with open(stored_path, encoding="utf-8") as handle:
-        stored = json.load(handle)
-    stored["spec"]["algorithm"] = "retired-algorithm"
-    with open(stored_path, "w", encoding="utf-8") as handle:
-        json.dump(stored, handle)
-    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": "recover-unconfirmed"}])
-    monkeypatch.setattr(providers, "configured_providers", list)
-
-    torn: list[str] = []
-
-    def fake_teardown(handle, run_id):
-        # the direct teardown is handed the raw dict; the drain rebuilds a JobHandle from the
-        # persisted record, so the two call sites are distinguishable here.
-        torn.append("drain" if hasattr(handle, "provider") else "direct")
-        return False  # unconfirmed, both times: this is the case that records for the drain
-
-    monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
-    monkeypatch.setattr(runner, "attach_run", lambda rid: None)
-    # persisting a cleanup record reports the new status, which blocks on its reporter thread. that
-    # thread is real in production; here the fake below would stand in for it and never run.
-    monkeypatch.setattr(runner, "_report_status", lambda status: None)
-
-    class Thread:
-        def __init__(self, *, target, args=(), daemon=False):
-            self._target, self._args = target, args
-
-        def start(self):
-            self._target(*self._args)
-
-    # patch the ATTRIBUTE recover_runs reads, not threading.Thread globally: the module-wide patch
-    # also replaced the status reporter's own worker thread, so nothing serviced its queue.
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
-
-    runtime.recover_runs()
-
-    # the drain runs twice: once before the teardown (nothing recorded yet, so it tears down
-    # nothing) and once after, which is the retry. without the second dispatch the sequence is
-    # ["direct"] and the recorded resource is never attempted at all.
-    assert torn == ["direct", "drain"]
-    # and it is still recorded, because the retry did not confirm the delete either -- so the next
-    # restart's drain will find it and try again, rather than the record being dropped unconfirmed.
-    with open(stored_path, encoding="utf-8") as handle:
-        assert json.load(handle)["cleanup_remotes"] == [remote]
 
 
 def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypatch, tmp_path):
@@ -3029,7 +2853,10 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
         def destroy(self, handle):
             self.teardown.append(("destroy", handle.to_dict()))
             if not cleanup_confirmed:
-                raise RuntimeError("endpoint deletion unconfirmed")
+                raise RuntimeError("Pod deletion unconfirmed")
+
+        def run_instances_remaining(self, _run_id):
+            return [] if cleanup_confirmed else ["endpoint-race"]
 
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
@@ -3044,13 +2871,13 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
 
     status = runner.get_status(spec.run_id)
     assert provider.submits == [0]
-    assert [event for event, _handle in provider.teardown] == ["cancel", "destroy"]
+    assert [event for event, _handle in provider.teardown] == ["destroy"]
     assert status.state == "cancelled"
     if cleanup_confirmed:
         assert status.remote is None
     else:
-        assert status.remote["endpoint_id"] == "endpoint-race"
-        assert status.remote["job_id"] == "job-race"
+        assert status.remote["instance_id"] == "endpoint-race"
+        assert status.remote["payload_secret_id"] == "job-race"
         assert status.remote["attempt"] == 0
         raw = runner._load_status_json(spec.run_id)
         assert raw[runner._CLEANUP_REMOTES_KEY] == [

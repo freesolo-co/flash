@@ -646,18 +646,33 @@ def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
     assert env["HF_TOKEN"] == "hf_real"
 
 
-def test_self_hosting_docs_do_not_promise_an_endpoint_concurrency_cap() -> None:
-    """Flash caps nothing here, so the docs must not imply it does.
+def test_self_hosting_docs_do_not_promise_a_pod_concurrency_cap() -> None:
+    """flash caps nothing here, so the docs must not imply it does.
 
-    The slot store that was meant to hold the account to 58 endpoints never enforced anything and
-    has been removed; RunPod's own account limit is the only ceiling. Promising a cap invites a
-    self-hoster to run bursts that RunPod, not Flash, ends up rejecting.
+    runpod's account pod quota is the only ceiling. promising a flash-owned cap invites a
+    self-hoster to run bursts that runpod, not flash, ends up rejecting.
     """
     import pathlib
 
     doc = (pathlib.Path(__file__).resolve().parent.parent / "SELF_HOSTING.md").read_text()
     assert "in-process semaphore, which is the correct" not in doc
-    assert "RunPod endpoint concurrency is not capped by Flash" in doc
+    assert "RunPod Pod concurrency is not capped by Flash" in doc
+
+
+def test_runpod_cutover_docs_include_executable_all_account_absence_proof() -> None:
+    """the pod-only release cannot clean old endpoints, so the runbook must prove the fleet empty."""
+    import pathlib
+
+    doc = (pathlib.Path(__file__).resolve().parent.parent / "SELF_HOSTING.md").read_text()
+    marker = "uv run python - <<'PY'\n"
+    assert marker in doc
+    script = doc.split(marker, 1)[1].split("\nPY\n```", 1)[0]
+    compile(script, "SELF_HOSTING.md runpod cutover", "exec")
+    assert '.split(",")' in script
+    assert 'name.startswith("flash-")' in script
+    assert 'name.startswith("live-flash-")' in script
+    assert "endpoint inventory failed" in script
+    assert "legacy training endpoint(s) remain" in script
 
 
 def test_the_serving_repos_are_not_on_the_training_path() -> None:

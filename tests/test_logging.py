@@ -40,7 +40,7 @@ def test_configure_logging_sets_level():
 def test_importing_flash_emits_no_stderr():
     # A fresh interpreter importing flash must produce no output.
     proc = subprocess.run(
-        [sys.executable, "-c", "import flash, flash.runner, flash.providers.runpod.serverless"],
+        [sys.executable, "-c", "import flash, flash.runner, flash.providers.runpod.pods"],
         cwd=ROOT,
         text=True,
         capture_output=True,

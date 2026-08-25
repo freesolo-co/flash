@@ -143,30 +143,14 @@ def _real_console_scripts() -> dict[str, str]:
 
 
 def test_flash_cli_alias_reaches_the_same_entry_point():
-    """`flash-cli` must exist and be the same entry point as `flash`.
-
-    The `server` and `dev` extras install runpod-flash, which declares its own `flash` console
-    script. Whichever distribution is installed last wins, so on a control-plane host `flash` can
-    silently belong to runpod-flash -- it exits 0 without doing anything. `flash-cli` is the name
-    nothing else claims, so it is what SELF_HOSTING.md points operators at.
-    """
+    """`flash-cli` remains a stable alias for existing operator automation."""
     scripts = _real_console_scripts()
     assert scripts.get("flash") == "flash.cli:main"
-    assert scripts.get("flash-cli") == scripts["flash"], (
-        "flash-cli must stay an alias of flash. SELF_HOSTING.md tells self-hosters to use it "
-        "when runpod-flash's console script shadows `flash`."
-    )
+    assert scripts.get("flash-cli") == scripts["flash"]
 
 
 def test_printed_commands_name_the_executable_the_operator_invoked():
-    """Generated commands must name the script actually run, not the channel default.
-
-    On the documented `[server]` install, `flash` can be runpod-flash's console script. Printing
-    `flash runs cancel <id>` there hands the operator a command that exits 0 without cancelling,
-    leaving a billed run alive -- so an operator who reached us via `flash-cli` must be told
-    `flash-cli`. Anything that is not one of our scripts (a test runner, a renamed copy) falls
-    back to the channel default so the hint stays copy-pasteable.
-    """
+    """Generated commands preserve the executable the operator invoked."""
     import importlib
     import sys
     from unittest import mock

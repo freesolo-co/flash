@@ -4,9 +4,7 @@ Shipped next to bootstrap.py and imported as a bare sibling module on the box, s
 stdlib-only and must never import flash. It is a leaf: the deadline check and the retriable error
 class arrive as arguments rather than by importing bootstrap back, which would be a cycle.
 
-The RunPod serverless handler carries its own copy of this logic because ``_train_body`` is
-serialized standalone to the worker and cannot import a sibling. The two classifiers must agree on
-what is retriable -- change both or neither.
+The runtime capsule ships this module beside the bootstrap entrypoint for every instance provider.
 """
 
 from __future__ import annotations

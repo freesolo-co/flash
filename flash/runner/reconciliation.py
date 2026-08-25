@@ -3,16 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import time
 
 import flash.runner as runner
 from flash.core.spec import JobSpec
 from flash.runner import RunStatus
-
-# the provider-allocated identifier that names the billable resource itself. every managed
-# instance provider now carries `instance_id`, including a runpod pending label before its pod id
-# is known. a record holding it still has something to reconcile when strict validation fails.
-_RESOURCE_ID_FIELDS = ("instance_id",)
 
 
 def _remote_resource_identity(remote: object) -> tuple | None:
@@ -75,6 +71,101 @@ def _expected_remote_matches(current: object, expected: dict | None) -> bool:
     )
 
 
+def _provider_cost_record(remote: dict, *, terminated_ts: float) -> dict | None:
+    """Return the immutable non-secret billing identity for one exact instance attempt."""
+    provider = remote.get("provider")
+    if provider == "runpod":
+        from flash.providers.runpod.pods import RunpodPodHandle
+
+        handle = RunpodPodHandle.from_dict(remote)
+        if handle.pending:
+            return None
+        provider_fields = {
+            "account_id": handle.account_id,
+            "data_center_id": handle.data_center_id,
+            "gpu_count": handle.gpu_count,
+            "key_fingerprint": handle.key_fingerprint,
+        }
+    elif provider == "lambda":
+        from flash.providers.lambda_.jobs.builders import LambdaJobHandle
+
+        handle = LambdaJobHandle.from_dict(remote)
+        provider_fields = {
+            "instance_type": handle.instance_type,
+            "region": handle.region,
+        }
+    elif provider == "vast":
+        from flash.providers.vast.jobs.builders import VastJobHandle
+
+        handle = VastJobHandle.from_dict(remote)
+        provider_fields = {
+            "machine_id": handle.machine_id,
+            "offer_id": handle.offer_id,
+        }
+    else:
+        return None
+    ended = float(terminated_ts)
+    if not math.isfinite(ended) or ended < handle.started_ts:
+        raise ValueError("provider attempt termination timestamp is invalid")
+    record = {
+        "provider": handle.provider,
+        "instance_id": handle.instance_id,
+        "hourly_usd": handle.hourly_usd,
+        "started_ts": handle.started_ts,
+        "terminated_ts": ended,
+        "attempt": handle.attempt,
+        "gpu": handle.gpu,
+        **provider_fields,
+    }
+    allocated_gpu = remote.get("allocated_gpu")
+    if type(allocated_gpu) is str and allocated_gpu:
+        record["allocated_gpu"] = allocated_gpu
+    allocated_gpu_count = remote.get("allocated_gpu_count")
+    if type(allocated_gpu_count) is int and allocated_gpu_count > 0:
+        record["allocated_gpu_count"] = allocated_gpu_count
+    return record
+
+
+def _provider_cost_key(record: dict) -> tuple:
+    return record.get("provider"), record.get("instance_id"), record.get("attempt")
+
+
+def _merge_provider_cost_history(existing: object, incoming: object) -> list[dict] | None:
+    merged: list[dict] = []
+    by_key: dict[tuple, dict] = {}
+    for value in (existing, incoming):
+        if value is None:
+            continue
+        if type(value) is not list or any(type(item) is not dict for item in value):
+            raise RuntimeError("persisted provider cost history is invalid")
+        for item in value:
+            record = dict(item)
+            key = _provider_cost_key(record)
+            prior = by_key.get(key)
+            if prior is not None:
+                stable_prior = {
+                    key: value for key, value in prior.items() if key != "terminated_ts"
+                }
+                stable_record = {
+                    key: value for key, value in record.items() if key != "terminated_ts"
+                }
+                if stable_prior != stable_record:
+                    raise RuntimeError("provider cost history conflicts with the exact attempt")
+                continue
+            by_key[key] = record
+            merged.append(record)
+    return merged or None
+
+
+def _append_provider_cost_record(status: RunStatus, remote: dict, *, terminated_ts: float) -> None:
+    record = runner._provider_cost_record(remote, terminated_ts=terminated_ts)
+    if record is None:
+        return
+    status.provider_cost_history = runner._merge_provider_cost_history(
+        status.provider_cost_history, [record]
+    )
+
+
 def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
     """Clear only the nonterminal remote that still names the destroyed resource."""
     if runner._remote_resource_identity(expected_remote) is None:
@@ -86,8 +177,10 @@ def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
             return False
         if not runner._expected_remote_matches(status.remote, expected_remote):
             return False
+        cleared_at = time.time()
+        runner._append_provider_cost_record(status, status.remote, terminated_ts=cleared_at)
         status.remote = None
-        status.updated_at = time.time()
+        status.updated_at = cleared_at
         runner._save_status_unlocked(status)
         report_status = status
     if report_status is not None:
@@ -335,75 +428,30 @@ def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bo
             remaining = [item for item in value if _teardown_removal_key(item) != expected_key]
             if len(remaining) == len(value):
                 return False
-            runner._save_status_unlocked(
-                runner._runstatus_from_json(raw),
-                _cleanup_remotes=remaining or None,
-            )
+            status = runner._runstatus_from_json(raw)
+            removed_at = time.time()
+            runner._append_provider_cost_record(status, expected_remote, terminated_ts=removed_at)
+            status.updated_at = removed_at
+            runner._save_status_unlocked(status, _cleanup_remotes=remaining or None)
             return True
         remaining = [record for record in records if _teardown_removal_key(record) != expected_key]
         if len(remaining) == len(records):
             return False
-        runner._save_status_unlocked(
-            runner._runstatus_from_json(raw),
-            _cleanup_remotes=remaining or None,
-        )
+        status = runner._runstatus_from_json(raw)
+        removed_at = time.time()
+        runner._append_provider_cost_record(status, expected_remote, terminated_ts=removed_at)
+        status.updated_at = removed_at
+        runner._save_status_unlocked(status, _cleanup_remotes=remaining or None)
     return True
 
 
-def _uncanonical_teardown_record(item: object) -> dict | None:
-    """Return a record that names a deletable resource but fails strict canonicalization."""
-    if not isinstance(item, dict):
-        return None
-    provider = item.get("provider")
-    if not isinstance(provider, str) or not provider:
-        return None
-    if not any(isinstance(item.get(field), str) and item[field] for field in _RESOURCE_ID_FIELDS):
-        return None
-    return dict(item)
-
-
-def _uncanonical_cleanup_remote_key(record: object) -> tuple | None:
-    """Dedupe key for a record the strict reader cannot canonicalize."""
-    if not isinstance(record, dict):
-        return None
-    identity = tuple(record.get(field) for field in _RESOURCE_ID_FIELDS)
-    if not any(identity):
-        return None
-    return (record.get("provider"), record.get("attempt"), identity)
-
-
 def _teardown_removal_key(record: object) -> tuple | None:
-    """The identity the teardown path selects a record by, strict when possible.
-
-    THE single derivation shared by the drain and the compare-and-remove that clears what the drain
-    confirmed deleted. It has to be one function: the drain admits uncanonical records so a resource
-    that fails strict validation still gets deleted, and if removal derived its key strictly instead
-    it would return `None` for exactly those records and clear nothing -- so a confirmed-deleted
-    resource would stay on disk and every later sweep would tear down something already gone,
-    forever. That is the failure the lenient branch below exists to prevent, reintroduced through
-    the key rather than through the reader.
-
-    The two shapes cannot be confused for each other: the strict key is the 2-tuple
-    `(identity, attempt)` and the lenient one is a 3-tuple, so they never compare equal and a record
-    that canonicalizes is matched by its strict key on both sides.
-    """
-    return runner._cleanup_remote_key(record) or _uncanonical_cleanup_remote_key(record)
+    """Return the strict identity used to select one confirmed cleanup record."""
+    return runner._cleanup_remote_key(record)
 
 
 def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
-    """Every cleanup record that yields a teardown handle, skipping the ones that cannot.
-
-    Only for the teardown path. Unlike the strict reader this never raises on a bad record, because
-    raising would strand every well-formed sibling that is still billing.
-
-    A record that fails canonicalization is still yielded verbatim when it names a resource. It is
-    NOT true that such a record has nothing to delete: `key_fingerprint` is validated at exactly 68
-    chars, while a deployed release writes the 16-char form, so every endpoint created by that
-    release fails `from_dict` here. `_delete_runpod_endpoint` resolves precisely that case through
-    `resolve_prefix_key_fingerprint`, and the teardown loop builds a base `JobHandle`, which
-    validates only `provider`. Dropping these records here is what strands them -- a live RunPod
-    endpoint then bills forever with nothing left to tear it down.
-    """
+    """Return each strict cleanup record independently, skipping malformed siblings."""
     with runner._status_guard(run_id):
         try:
             raw = runner._load_status_json(run_id)
@@ -416,8 +464,6 @@ def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
     seen = set()
     for item in value:
         record = runner._canonical_cleanup_remote(item)
-        if record is None:
-            record = _uncanonical_teardown_record(item)
         key = _teardown_removal_key(record)
         if record is None or key is None or key in seen:
             continue
@@ -428,10 +474,7 @@ def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
 
 def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     """Teardown every tracked resource independently, removing only confirmed exact records."""
-    # the strict snapshot raises on the FIRST record it cannot canonicalize, which strands every
-    # other tracked resource behind it. teardown is per-resource, so read the records leniently
-    # here. the strict reader stays in place for the write paths, where a malformed record must
-    # not be silently dropped from the file.
+    # teardown is per-resource, so a malformed sibling must not strand every strict record.
     try:
         records = runner._snapshot_cleanup_remotes(run_id)
     except Exception:
@@ -443,12 +486,7 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
     for record in records:
-        # a record that fails strict canonicalization still names a billable resource; the base
-        # JobHandle validates only `provider`, and the runpod teardown resolves the deployed
-        # 16-char fingerprint itself. skipping it here would leave that resource billing forever.
-        identity = runner._remote_resource_identity(record) or _uncanonical_cleanup_remote_key(
-            record
-        )
+        identity = runner._remote_resource_identity(record)
         if identity is None:
             continue
         attempted.add(identity)

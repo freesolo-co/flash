@@ -1,7 +1,6 @@
 """Daily realized-cost reconciliation for finished runs.
 
-Reports provider COGS with the operator key, best-effort and off-path. Attribution uses the last
-`RunStatus.remote`, so multi-resource retries may be undercounted.
+Reports aggregate provider COGS with the operator key, best-effort and off-path.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ import time
 import urllib.request
 
 from flash import runner
-from flash.providers.realized import realized_cost_for_remote
+from flash.providers.realized import RealizedCost, realized_cost_for_remote
 from flash.server.platform.auth import freesolo_base_url
 from flash.server.platform.internal_client import internal_key
 
@@ -79,29 +78,71 @@ def _due(status: runner.RunStatus, now: float) -> bool:
     )  # from teardown, not a later updated_at bump (see _terminal_ts)
     if age < _SETTLE_SECONDS or age > _WINDOW_SECONDS:
         return False
-    return bool(status.remote)
+    return bool(status.provider_cost_history or status.remote)
+
+
+def _attempt_cost_records(status: runner.RunStatus, *, run_end: float) -> list[dict]:
+    history = status.provider_cost_history or []
+    if type(history) is not list or any(type(item) is not dict for item in history):
+        raise ValueError("provider cost history is invalid")
+    records = []
+    seen = set()
+    for record in history:
+        key = (record.get("provider"), record.get("instance_id"), record.get("attempt"))
+        if key in seen:
+            raise ValueError("provider cost history contains a duplicate attempt")
+        seen.add(key)
+        records.append(dict(record))
+    if isinstance(status.remote, dict):
+        active = {**status.remote, "terminated_ts": run_end}
+        is_exact = active.get("provider") != "runpod" or active.get("phase") == "exact"
+        key = (active.get("provider"), active.get("instance_id"), active.get("attempt"))
+        if is_exact and key not in seen:
+            records.append(active)
+    return records
+
+
+def _aggregate_attempt_costs(status: runner.RunStatus, *, run_end: float) -> RealizedCost | None:
+    costs = []
+    for record in _attempt_cost_records(status, run_end=run_end):
+        ended = record.get("terminated_ts")
+        if isinstance(ended, bool) or not isinstance(ended, (int, float)):
+            raise ValueError("provider attempt termination timestamp is invalid")
+        cost = realized_cost_for_remote(
+            record,
+            start=float(record.get("started_ts") or status.created_at),
+            end=float(ended),
+            run_end=float(ended),
+        )
+        if cost is not None:
+            costs.append(cost)
+    if not costs:
+        return None
+    providers = {cost.provider for cost in costs}
+    by_resource: dict[str, float] = {}
+    for cost in costs:
+        for resource, amount in cost.by_resource.items():
+            by_resource[resource] = round(by_resource.get(resource, 0.0) + amount, 6)
+    return RealizedCost(
+        provider=next(iter(providers)) if len(providers) == 1 else "mixed",
+        realized_usd=round(sum(cost.realized_usd for cost in costs), 6),
+        by_resource=by_resource,
+        wall_seconds=sum(float(cost.wall_seconds or 0.0) for cost in costs),
+        source={"attempts": [cost.source for cost in costs]},
+    )
 
 
 def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool:
     """Pull + report realized cost for one run; mark it reconciled on success. Returns True when
     a positive realized cost was reported. A zero/None result leaves the run unreconciled so a
     later cycle (within the window) retries once the provider invoice settles."""
+    if status.reconciled_at is not None:
+        return False
     now = time.time() if now is None else now
     remote = status.remote or {}
     spec = status.spec or {}
-    # runpod's billing query needs a lower bound even though its endpoint invoice is authoritative.
-    # instance cost attribution independently requires a valid persisted started_ts and returns none
-    # when it is absent or malformed rather than substituting this bound.
-    start = float(remote.get("started_ts") or status.created_at)
-    # The run's true terminal time (~teardown / billing stop); see _terminal_ts for why this is
-    # the frozen finished_at rather than the mutable updated_at (which deploy/heartbeat move past
-    # teardown and would make the instance providers' flat $/hr bill until that later event).
     run_end = _terminal_ts(status)
-    # RunPod's billing query pads past run end so the settled invoice is in range; the instance
-    # providers bill flat $/hr to teardown, so they get the UN-padded run_end (no extra settle hour).
-    realized = realized_cost_for_remote(
-        remote, start=start, end=run_end + _SETTLE_SECONDS, run_end=run_end
-    )
+    realized = _aggregate_attempt_costs(status, run_end=run_end)
     if realized is None or realized.realized_usd <= 0:
         return False
 
@@ -109,7 +150,16 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
         "runId": status.run_id,
         "realizedCostUsd": realized.realized_usd,
         "provider": realized.provider,
-        "gpu": remote.get("allocated_gpu") or (spec.get("gpu") or {}).get("type"),
+        "gpu": remote.get("allocated_gpu")
+        or next(
+            (
+                record.get("allocated_gpu") or record.get("gpu")
+                for record in reversed(status.provider_cost_history or [])
+                if isinstance(record, dict)
+            ),
+            None,
+        )
+        or (spec.get("gpu") or {}).get("type"),
         "costByResource": realized.by_resource,
         "wallSeconds": realized.wall_seconds,
         "costBasis": "realized",

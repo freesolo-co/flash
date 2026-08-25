@@ -2066,9 +2066,8 @@ def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypa
 
 def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monkeypatch):
     from flash.providers._lifecycle.worker import build_worker_env
-    from flash.providers.base import PollResult
     from flash.providers.lambda_.jobs.builders import build_payload as build_lambda_payload
-    from flash.providers.runpod import jobs as runpod_jobs
+    from flash.providers.runpod.pods import _build_instance_payload as build_runpod_payload
     from flash.providers.vast.jobs.builders import build_payload as build_vast_payload
 
     spec = JobSpec(
@@ -2102,34 +2101,17 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=deadline,
     )
-    captured = {}
-    monkeypatch.setattr(
-        runpod_jobs,
-        "deploy_train_endpoint",
-        lambda *_args, **_kwargs: ("endpoint-id", "endpoint-name", "key-fingerprint"),
-    )
-
-    def submit_job(_endpoint, payload, **_kwargs):
-        captured["payload"] = payload
-        return "job-id"
-
-    monkeypatch.setattr(runpod_jobs.runpod_api, "submit_job", submit_job)
-    monkeypatch.setattr(
-        runpod_jobs,
-        "poll_job",
-        lambda *_args, **_kwargs: PollResult(True, metrics={}),
-    )
-    runpod_jobs.submit_run(
+    runpod_payload = build_runpod_payload(
         spec,
         42,
-        attempt=0,
-        runtime_secrets=runtime,
-        source_snapshot=_SOURCE_SNAPSHOT,
-        deadline_at=deadline,
+        0,
+        runtime,
+        _SOURCE_SNAPSHOT,
+        deadline,
     )
 
     serialized = json.dumps(
-        {"runpod": captured["payload"], "lambda": lambda_payload, "vast": vast_payload}
+        {"runpod": runpod_payload, "lambda": lambda_payload, "vast": vast_payload}
     )
     assert "parasail-worker-canary" not in serialized
     assert "parasail-control-plane-canary" not in serialized

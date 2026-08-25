@@ -1,7 +1,7 @@
 """Deploy, cancel, and recover run state transitions.
 
 Keep ``flash.runner`` imports function-local to avoid its import cycle and preserve package-level
-monkeypatch seams such as ``flash.runner._gc_run_endpoints``.
+monkeypatch seams such as ``flash.runner._gc_run_resources``.
 """
 
 from __future__ import annotations
@@ -232,6 +232,7 @@ def _clear_remote_if_unchanged(run_id: str, expected_remote: dict) -> bool:
     keep it, or the run loses the only handle to a live billing resource.
     """
     from flash.runner import (
+        _append_provider_cost_record,
         _remote_resource_identity,
         _report_status,
         _save_status_unlocked,
@@ -247,8 +248,10 @@ def _clear_remote_if_unchanged(run_id: str, expected_remote: dict) -> bool:
         current = get_status(run_id)
         if _remote_resource_identity(current.remote) != expected_identity:
             return False
+        cleared_at = time.time()
+        _append_provider_cost_record(current, current.remote, terminated_ts=cleared_at)
         current.remote = None
-        current.updated_at = time.time()
+        current.updated_at = cleared_at
         _save_status_unlocked(current)
         report_status = current
     if report_status is not None:
@@ -312,7 +315,7 @@ def _teardown_or_preserve_remote(run_id: str, remote: dict) -> bool:
             ) from None
         return False
     if not resource_deleted and not _record_cleanup_remote(run_id, remote):
-        raise RuntimeError(f"run {run_id} leaked endpoint cleanup target could not be preserved")
+        raise RuntimeError(f"run {run_id} leaked provider cleanup target could not be preserved")
     return True
 
 
@@ -705,7 +708,7 @@ def cancel_run(run_id: str) -> RunStatus:
     """Cancel training while preserving verified serving and durable cleanup targets."""
     from flash.runner import (
         TERMINAL_STATES,
-        _gc_run_endpoints,
+        _gc_run_resources,
         _update,
         effective_spec_from_status,
         get_status,
@@ -785,7 +788,7 @@ def cancel_run(run_id: str) -> RunStatus:
         )
         if cleanup_spec is not None:
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(cleanup_spec)
+                _gc_run_resources(cleanup_spec)
 
         status = get_status(run_id)
         entered_deployed = entered_deployed or status.state == "deployed"

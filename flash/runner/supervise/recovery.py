@@ -455,7 +455,7 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
     )
 
 
-def _gc_run_endpoints(spec: JobSpec) -> None:
+def _gc_run_resources(spec: JobSpec) -> None:
     """Best-effort teardown of every provider resource a run may have registered."""
     from flash.runner import (
         _drain_cleanup_remotes,

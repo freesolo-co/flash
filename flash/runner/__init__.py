@@ -161,6 +161,7 @@ class RunStatus:
     adapter_ref: str | None = None
     deployment: dict | None = None
     remote: dict | None = None
+    provider_cost_history: list[dict] | None = None
     # Instance providers (lambda/vast) configured WHEN THIS RUN WAS SUBMITTED — the set that could have
     # owned a pre-handle non-idempotent create. Recovery's phantom guard (_confirm_run_clear) fails
     # closed for any of these that is no longer configurable (so it can't ENUMERATE to prove clear),
@@ -203,6 +204,7 @@ class RunStatus:
         data.pop("report_sequence", None)
         # internal warm-start preparation (storage locators, digests) never leaves the server
         data.pop("effective_preparation", None)
+        data.pop("provider_cost_history", None)
         heartbeat = data.get("last_heartbeat")
         if isinstance(heartbeat, dict):
             heartbeat.pop("source_provenance", None)
@@ -289,6 +291,8 @@ def _status_storage_dict(status: RunStatus) -> dict:
     data = asdict(status)
     if data.get("source_snapshot") is None:
         data.pop("source_snapshot", None)
+    if data.get("provider_cost_history") is None:
+        data.pop("provider_cost_history", None)
     data["adapter_ref"] = (
         _adapter_ref_for_status(status) if status.state in {"done", "deployed"} else None
     )
@@ -740,6 +744,11 @@ def _save_status_unlocked(
         _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
     }
     data = _status_storage_dict(status)
+    provider_cost_history = _merge_provider_cost_history(
+        existing.get("provider_cost_history"), status.provider_cost_history
+    )
+    if provider_cost_history is not None:
+        data["provider_cost_history"] = provider_cost_history
     for key in _PRIVATE_STATUS_KEYS:
         value = private_values[key]
         if value is _PRIVATE_VALUE_UNSET:
@@ -818,6 +827,7 @@ from flash.runner.preparation import (  # noqa: E402,F401
     _warmstart_source_is_authorized,
 )
 from flash.runner.reconciliation import (  # noqa: E402,F401
+    _append_provider_cost_record,
     _canonical_cleanup_remote,
     _cleanup_remote_key,
     _cleanup_remotes_from_raw,
@@ -829,7 +839,9 @@ from flash.runner.reconciliation import (  # noqa: E402,F401
     _compare_and_replace_remote,
     _drain_cleanup_remotes,
     _expected_remote_matches,
+    _merge_provider_cost_history,
     _preserve_cleanup_remote,
+    _provider_cost_record,
     _record_cleanup_remote,
     _remote_resource_identity,
     _snapshot_cleanup_remotes,
@@ -878,7 +890,7 @@ from flash.runner.supervise.lifecycle import (  # noqa: E402,F401
     _spec_with_gpu,
     _submit_seed_supervised,
 )
-from flash.runner.supervise.recovery import _gc_run_endpoints  # noqa: E402,F401
+from flash.runner.supervise.recovery import _gc_run_resources  # noqa: E402,F401
 from flash.runner.supervise.transitions import (  # noqa: E402,F401
     mark_checkpoint_deployed,
     mark_deployed,

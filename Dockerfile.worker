@@ -75,8 +75,7 @@ RUN pip install --no-cache-dir \
     "tilelang==0.1.9" \
     "apache-tvm-ffi==0.1.9" \
     "hf_transfer==0.1.9" \
-    "freesolo==0.4.2" \
-    "runpod==1.12.0"
+    "freesolo==0.4.2"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
 # miscomputed with Triton>=3.4 (fla #640) — the fix is fla's TILELANG backend (correct there), so
@@ -246,7 +245,7 @@ RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_
 # could never be produced. The rest of the stack is mandatory.
 RUN python -c "import importlib.metadata as M; \
 import torch, transformers, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
-fla, bitsandbytes, hf_transfer, triton, freesolo, runpod; \
+fla, bitsandbytes, hf_transfer, triton, freesolo; \
 import importlib; \
 fa_ok = False; \
 exec('try:\n import flash_attn\n fa_ok = True\nexcept Exception:\n fa_ok = False'); \
@@ -259,7 +258,7 @@ ver = lambda n: M.version(n); \
 print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)', '| flash_attn_3', 'present (Hopper FA3)' if fa3_ok else 'ABSENT (SDPA on Hopper)', '| flashinfer', 'present (B200 MoE/attn)' if fi_ok else 'ABSENT (Triton fused-MoE fallback)'); \
 [print('  ', d, ver(d)) for d in ['transformers','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
 'accelerate','wandb','flash-linear-attention','bitsandbytes', \
-'hf-transfer','freesolo','runpod']]"
+'hf-transfer','freesolo']]"
 
 # ---------------------------------------------------------------------------------------------
 # verl venv (GRPO/OPD/SFT verl backends): ISOLATED from the main interpreter on purpose.

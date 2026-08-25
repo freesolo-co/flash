@@ -1,7 +1,4 @@
-"""Realized provider-cost reconciliation: RunPod shaping, dispatch, and reporting.
-
-Offline -- the provider HTTP calls and backend POST are stubbed, so nothing touches the network.
-"""
+"""Realized instance COGS reconciliation and customer-charge separation."""
 
 from __future__ import annotations
 
@@ -9,52 +6,43 @@ import pytest
 
 from flash import runner
 from flash.providers import realized
-from flash.providers.runpod.cost import shape_endpoint_cost
 from flash.server.domain import reconcile
-
-
-# --------------------------------------------------------------------------- RunPod shaping
-def test_runpod_shape_sums_amount_and_filters_by_endpoint():
-    rows = [
-        {"endpointId": "ep-1", "amount": 4.5, "timeBilledMs": 1_800_000},
-        {"endpointId": "ep-1", "amount": 1.25, "timeBilledMs": 600_000},
-        {"endpointId": "ep-other", "amount": 99.0, "timeBilledMs": 1_000},  # different run
-    ]
-    rc = shape_endpoint_cost(rows, endpoint_id="ep-1")
-    assert rc.provider == "runpod"
-    assert rc.realized_usd == 5.75
-    assert rc.by_resource == {"gpu": 5.75}
-    assert rc.wall_seconds == 2400.0  # (1_800_000 + 600_000) ms
-    assert rc.source == {"endpoint_id": "ep-1"}
-
-
-def test_runpod_shape_empty_is_zero():
-    rc = shape_endpoint_cost([], endpoint_id="ep-1")
-    assert rc.realized_usd == 0.0
-    assert rc.wall_seconds is None
-
-
-# --------------------------------------------------------------------------- provider dispatch
-def test_dispatch_runpod(monkeypatch):
-    from flash.providers.runpod import api
-
-    monkeypatch.setattr(
-        api, "billing_endpoints", lambda **kw: [{"endpointId": "ep-1", "amount": 3.0}]
-    )
-    rc = realized.realized_cost_for_remote(
-        {"provider": "runpod", "endpoint_id": "ep-1"}, start=0, end=100
-    )
-    assert rc is not None
-    assert rc.provider == "runpod"
-    assert rc.realized_usd == 3.0
 
 
 def test_dispatch_none_when_no_handle_or_unknown_provider():
     assert realized.realized_cost_for_remote(None, start=0, end=1) is None
     assert realized.realized_cost_for_remote({}, start=0, end=1) is None
     assert realized.realized_cost_for_remote({"provider": "gcp"}, start=0, end=1) is None
-    # runpod handle with no endpoint id -> nothing to query.
     assert realized.realized_cost_for_remote({"provider": "runpod"}, start=0, end=1) is None
+
+
+def test_runpod_realized_cost_uses_persisted_pod_wall_and_never_reprices_quote():
+    remote = {
+        "provider": "runpod",
+        "instance_id": "pod-1",
+        "hourly_usd": 4.0,
+        "started_ts": 1_000.0,
+    }
+    cost = realized.realized_cost_for_remote(
+        remote,
+        start=1_000.0,
+        end=20_000.0,
+        run_end=2_800.0,
+    )
+    assert cost is not None
+    assert cost.provider == "runpod"
+    assert cost.realized_usd == 2.0
+    assert cost.wall_seconds == 1_800.0
+    status = runner.RunStatus(
+        run_id="runpod-cogs",
+        state="done",
+        spec={},
+        estimated_cost_usd=9.5,
+        cost_usd=9.5,
+        realized_cost_usd=cost.realized_usd,
+    )
+    assert status.cost_usd == status.estimated_cost_usd == 9.5
+    assert status.realized_cost_usd == 2.0
 
 
 # --------------------------------------------------------------------------- reconcile selection
@@ -69,7 +57,7 @@ def _status(**kw) -> runner.RunStatus:
 def test_due_requires_billable_terminal_settled_unreconciled_with_handle():
     now = 1_000_000.0
     settled = now - 7200  # 2h ago (past the 1h settle delay, within the 7d window)
-    handle = {"provider": "runpod", "endpoint_id": "ep-1"}
+    handle = {"provider": "runpod", "instance_id": "pod-1"}
 
     assert reconcile._due(_status(state="done", updated_at=settled, remote=handle), now)
     # deployed runs have FINISHED training (cost is final) -> still reconciled
@@ -86,8 +74,17 @@ def test_due_requires_billable_terminal_settled_unreconciled_with_handle():
     assert not reconcile._due(
         _status(state="done", updated_at=settled, remote=handle, reconciled_at=now - 1), now
     )
-    # no provider handle to attribute cost
+    # no provider attribution to reconcile
     assert not reconcile._due(_status(state="done", updated_at=settled, remote=None), now)
+    assert reconcile._due(
+        _status(
+            state="cancelled",
+            updated_at=settled,
+            remote=None,
+            provider_cost_history=[{"provider": "runpod", "instance_id": "pod-1"}],
+        ),
+        now,
+    )
 
 
 def test_due_anchors_settle_and_window_to_finished_at_not_bumped_updated_at():
@@ -116,12 +113,110 @@ def test_due_anchors_settle_and_window_to_finished_at_not_bumped_updated_at():
     )
 
 
+def test_reconcile_excludes_a_pending_runpod_identity_from_provider_cogs():
+    status = _status(
+        remote={
+            "provider": "runpod",
+            "phase": "pod_create_pending",
+            "instance_id": "flash-0123456789ab-s0-a0",
+            "hourly_usd": 4.0,
+            "started_ts": 1_000.0,
+            "attempt": 0,
+        },
+        finished_at=2_800.0,
+    )
+
+    assert reconcile._aggregate_attempt_costs(status, run_end=2_800.0) is None
+
+
+def test_reconcile_aggregates_failed_attempt_and_success_without_repricing_customer(monkeypatch):
+    now = 1_000_000.0
+    status = _status(
+        run_id="retry-cogs",
+        updated_at=now - 7200,
+        estimated_cost_usd=9.5,
+        cost_usd=9.5,
+        provider_cost_history=[
+            {
+                "provider": "runpod",
+                "instance_id": "pod-failed",
+                "hourly_usd": 2.0,
+                "started_ts": 1_000.0,
+                "terminated_ts": 2_800.0,
+                "attempt": 0,
+                "gpu": "RTX 5090",
+                "gpu_count": 1,
+            }
+        ],
+        remote={
+            "provider": "runpod",
+            "instance_id": "pod-success",
+            "phase": "exact",
+            "label": "flash-0123456789ab-s0-a1-0123456789abcdef-deadbeef",
+            "key_fingerprint": "rpk-" + "a" * 64,
+            "account_id": "account-1",
+            "payload_secret_id": "secret-1",
+            "payload_secret_name": "FLASH_PAYLOAD_0123456789abcdef",
+            "data_center_id": "US-KS-2",
+            "network_volume_id": None,
+            "container_disk_gb": 120,
+            "container_registry_auth_id": None,
+            "gpu_count": 1,
+            "image_name": None,
+            "gpu_type_id_override": None,
+            "allowed_cuda_versions": None,
+            "docker_start_cmd": [],
+            "gpu": "RTX 5090",
+            "hourly_usd": 4.0,
+            "attempt": 1,
+            "started_ts": now - 9000.0,
+        },
+    )
+    status.finished_at = now - 7200.0
+    posted: dict = {}
+    monkeypatch.setattr(reconcile, "_report", lambda body: posted.update(body) or True)
+    updates: dict = {}
+    monkeypatch.setattr(
+        runner,
+        "record_realized_cost",
+        lambda run_id, **kw: updates.update(run_id=run_id, **kw),
+    )
+
+    assert reconcile.reconcile_run(status, now=now) is True
+    assert posted["realizedCostUsd"] == 3.0
+    assert posted["wallSeconds"] == 3600.0
+    assert posted["costByResource"] == {"gpu": 3.0}
+    assert [item["resource_id"] for item in posted["source"]["attempts"]] == [
+        "pod-failed",
+        "pod-success",
+    ]
+    assert status.cost_usd == status.estimated_cost_usd == 9.5
+    assert updates == {
+        "run_id": "retry-cogs",
+        "realized_cost_usd": 3.0,
+        "reconciled_at": now,
+    }
+
+    status.reconciled_at = now
+    monkeypatch.setattr(
+        reconcile,
+        "_report",
+        lambda _body: pytest.fail("a reconciled aggregate must not be reported twice"),
+    )
+    assert reconcile.reconcile_run(status, now=now + 1) is False
+
+
 def test_reconcile_run_reports_and_persists(monkeypatch):
     now = 1_000_000.0
     status = _status(
         run_id="r-pos",
         updated_at=now - 7200,
-        remote={"provider": "runpod", "endpoint_id": "ep-5", "allocated_gpu": "RTX 5090"},
+        remote={
+            "provider": "runpod",
+            "phase": "exact",
+            "instance_id": "pod-5",
+            "allocated_gpu": "RTX 5090",
+        },
     )
     monkeypatch.setattr(
         reconcile,
@@ -263,7 +358,10 @@ def test_reconcile_rejects_a_run_without_finished_at(monkeypatch):
 
 def test_reconcile_run_skips_zero_and_unreported(monkeypatch):
     now = 1_000_000.0
-    status = _status(updated_at=now - 7200, remote={"provider": "runpod", "endpoint_id": "e"})
+    status = _status(
+        updated_at=now - 7200,
+        remote={"provider": "runpod", "phase": "exact", "instance_id": "pod-e"},
+    )
 
     # zero realized cost (invoice not settled) -> not reconciled, retried later
     monkeypatch.setattr(
@@ -307,10 +405,9 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
     )
     remote = {
         "provider": "runpod",
-        "endpoint_id": "ep-1",
-        "endpoint_name": "flash-r-adv-a0",
-        "key_fingerprint": "rpk-" + "0" * 64,
-        "job_id": "job-1",
+        "phase": "exact",
+        "instance_id": "pod-1",
+        "hourly_usd": 1.0,
         "attempt": 0,
         "started_ts": created_at + 100.0,
     }
@@ -364,10 +461,14 @@ def test_reconcile_once_sweeps_due_runs(monkeypatch):
     now = 1_000_000.0
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "k")
     due = _status(
-        run_id="due", updated_at=now - 7200, remote={"provider": "runpod", "endpoint_id": "e"}
+        run_id="due",
+        updated_at=now - 7200,
+        remote={"provider": "runpod", "phase": "exact", "instance_id": "pod-e"},
     )
     not_due = _status(
-        run_id="fresh", updated_at=now - 60, remote={"provider": "runpod", "endpoint_id": "e"}
+        run_id="fresh",
+        updated_at=now - 60,
+        remote={"provider": "runpod", "phase": "exact", "instance_id": "pod-e"},
     )
     monkeypatch.setattr(runner, "list_runs", lambda: [due, not_due])
     seen: list[str] = []

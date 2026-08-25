@@ -1,20 +1,11 @@
-"""verify cancellation stops a remote flash worker across processes.
-
-the deploying process may be gone by the time a cancellation arrives, so cancellation must use
-``terminate_endpoint`` to find the persisted runpod resource and delete it through the api before
-billing continues.
-"""
+"""Verify cancellation tears down exact provider resources across processes."""
 
 from __future__ import annotations
 
 import json
-import sys
-import types
 
 import pytest
 
-import flash.providers.runpod.serverless as ftrain
-from flash.providers.runpod.serverless import _run_suffix, _select_endpoint_resources, endpoint_name
 from tests._helpers.runner import provisioned_status
 from tests._helpers.source_snapshot import valid_source_snapshot
 
@@ -22,104 +13,30 @@ _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
-def _remote(endpoint_id, job_id, attempt):
+def _remote(pod_id, secret_id, attempt):
     return {
         "provider": "runpod",
-        "endpoint_id": endpoint_id,
-        "endpoint_name": f"flash-{endpoint_id}",
+        "instance_id": pod_id,
+        "phase": "exact",
+        "label": f"flash-cancel-s0-a{attempt}-0123456789abcdef-deadbeef",
         "key_fingerprint": _RUNPOD_FINGERPRINT,
-        "job_id": job_id,
+        "account_id": "account-1",
+        "payload_secret_id": secret_id,
+        "payload_secret_name": "FLASH_PAYLOAD_0123456789abcdef",
+        "data_center_id": "US-KS-2",
+        "network_volume_id": None,
+        "container_disk_gb": 120,
+        "container_registry_auth_id": None,
+        "gpu_count": 1,
+        "image_name": None,
+        "gpu_type_id_override": None,
+        "allowed_cuda_versions": None,
+        "docker_start_cmd": [],
+        "gpu": "RTX 5090",
+        "hourly_usd": 0.69,
         "attempt": attempt,
         "started_ts": float(attempt + 1),
     }
-
-
-def _res(name):
-    return types.SimpleNamespace(name=name)
-
-
-def test_isolate_flash_state_resets_runpod_flash_manager_on_scope_change(tmp_path, monkeypatch):
-    import flash.providers.runpod.serverless.endpoints as ep_mod
-
-    for mod_name in (
-        "runpod_flash",
-        "runpod_flash.core",
-        "runpod_flash.core.resources",
-    ):
-        stub = types.ModuleType(mod_name)
-        stub.__path__ = []
-        monkeypatch.setitem(sys.modules, mod_name, stub)
-
-    class FakeRM:
-        pass
-
-    FakeRM._resources = {"old-class": object()}
-    FakeRM._resource_configs = {"old-class": "hash"}
-    FakeRM._deployment_locks = {"old-class": object()}
-    FakeRM._resources_initialized = True
-
-    fake_instance = types.SimpleNamespace(
-        _resources={"old-instance": object()},
-        _resource_configs={"old-instance": "hash"},
-        _deployment_locks={"old-instance": object()},
-    )
-    FakeRM._instances = {FakeRM: fake_instance}
-
-    rm_mod = types.ModuleType("runpod_flash.core.resources.resource_manager")
-    rm_mod.ResourceManager = FakeRM
-    rm_mod.FLASH_STATE_DIR = tmp_path / "old"
-    rm_mod.RESOURCE_STATE_FILE = tmp_path / "old" / "resources.pkl"
-    rm_mod.RUNPOD_FLASH_DIR = tmp_path / "old"
-    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", rm_mod)
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    ep_mod.isolate_flash_state("run-a")
-
-    state_dir = tmp_path / ".flash" / "flash-state" / "run-a"
-    assert state_dir == rm_mod.FLASH_STATE_DIR
-    assert state_dir / "resources.pkl" == rm_mod.RESOURCE_STATE_FILE
-    assert state_dir == rm_mod.RUNPOD_FLASH_DIR
-    assert FakeRM._resources == {}
-    assert FakeRM._resource_configs == {}
-    assert FakeRM._deployment_locks == {}
-    assert fake_instance._resources == {}
-    assert fake_instance._resource_configs == {}
-    assert fake_instance._deployment_locks == {}
-    assert FakeRM._resources_initialized is False
-
-    FakeRM._resources["kept"] = object()
-    fake_instance._resources["kept"] = object()
-    FakeRM._resources_initialized = True
-    ep_mod.isolate_flash_state("run-a")
-
-    assert "kept" in FakeRM._resources
-    assert "kept" in fake_instance._resources
-    assert FakeRM._resources_initialized is True
-
-
-def test_select_matches_live_prefixed_endpoint():
-    target = endpoint_name("RTX 5090", _run_suffix("flash-123-c220526e"))  # flash-5090-c220526e
-    resources = {
-        "u1": _res(f"live-{target}"),  # the live-provisioned resource for this run
-        "u2": _res("flash-5090-deadbeef"),  # a different run
-        "u3": _res("live-flash-4090-c220526e"),  # different GPU class
-    }
-    assert _select_endpoint_resources(resources, target) == ["u1"]
-
-
-def test_select_empty_target_matches_nothing():
-    assert _select_endpoint_resources({"u1": _res("live-flash-5090-x")}, "") == []
-
-
-def test_terminate_endpoint_never_raises_when_sdk_missing(monkeypatch):
-    # ensure_auth raises (no key) -> terminate_endpoint must swallow and return a result list
-    import flash.providers.runpod.auth as auth
-
-    monkeypatch.setattr(auth, "ensure_auth", lambda: (_ for _ in ()).throw(RuntimeError("no key")))
-    out = ftrain.terminate_endpoint("RTX 5090", "flash-1-abcd1234")
-    assert isinstance(out, list)
-    assert out
-    assert out[0]["success"] is False
 
 
 @pytest.mark.parametrize("failed_revocation_call", [1, 2])
@@ -164,7 +81,7 @@ def test_cancel_run_revocation_failure_defers_until_after_fence_and_teardown(
         return True
 
     monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
 
     with pytest.raises(RuntimeError, match=f"revocation failure {failed_revocation_call}"):
         orch.cancel_run(spec.run_id)
@@ -174,67 +91,6 @@ def test_cancel_run_revocation_failure_defers_until_after_fence_and_teardown(
     assert persisted.remote is None
     assert teardown_calls == [("runpod", spec.run_id, "cancelled")]
     assert revocation_calls == 2
-
-
-def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
-    import flash.runner as orch
-
-    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.core.spec import JobSpec
-
-    spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-4B",
-            "algorithm": "grpo",
-            "gpu": {"type": "RTX 5090"},
-            "run_id": "flash-9-feedface",
-        }
-    )
-    st = provisioned_status(orch, spec, state="running")
-    orch._save_status(st)
-
-    calls = {}
-
-    def fake_terminate(gpu, run_id):
-        calls["gpu"] = gpu
-        calls["run_id"] = run_id
-        return [{"success": True}]
-
-    monkeypatch.setattr(ftrain, "terminate_endpoint", fake_terminate)
-
-    out = orch.cancel_run(spec.run_id)
-    assert calls == {"gpu": "RTX 5090", "run_id": "flash-9-feedface"}, (
-        "must terminate the remote endpoint"
-    )
-    assert out.state == "cancelled"
-
-
-def test_cancel_tears_down_every_acceptable_class_of_an_ordered_pin(tmp_path, monkeypatch):
-    """Cancellation tears down every endpoint name an ordered pin could select."""
-    import flash.runner as orch
-
-    monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
-    from flash.core.spec import JobSpec
-
-    spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-4B",
-            "algorithm": "grpo",
-            "gpu": {"type": ["A100 PCIe", "A100 SXM"]},
-            "run_id": "flash-9-feedface",
-        }
-    )
-    orch._save_status(provisioned_status(orch, spec, state="running"))
-
-    terminated: list[str] = []
-    monkeypatch.setattr(
-        ftrain,
-        "terminate_endpoint",
-        lambda gpu, run_id: terminated.append(gpu) or [{"success": True}],
-    )
-
-    assert orch.cancel_run(spec.run_id).state == "cancelled"
-    assert terminated == ["A100 PCIe", "A100 SXM"]
 
 
 def test_terminal_charge_uses_the_selected_fallback_after_remote_cleanup(monkeypatch):
@@ -282,7 +138,7 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     orch._save_status(st)
 
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
-    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda *a, **k: [{"success": True}])
 
     out = orch.cancel_run(spec.run_id)
     assert out.state == "cancelled"
@@ -307,10 +163,10 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
     monkeypatch.setattr(
         deploy, "undeploy_adapter", lambda rid, *a, **k: undeployed.append(rid) or ["x"]
     )
-    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda *a, **k: [{"success": True}])
 
     # Inject the deploy race at the last step before the terminal write (after the entry snapshot).
-    real_gc = orch._gc_run_endpoints
+    real_gc = orch._gc_run_resources
 
     def gc_then_deploy(s):
         real_gc(s)
@@ -321,7 +177,7 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
             verification_generation=orch.verified_adapter_revision_generation(spec.run_id),
         )
 
-    monkeypatch.setattr(orch, "_gc_run_endpoints", gc_then_deploy)
+    monkeypatch.setattr(orch, "_gc_run_resources", gc_then_deploy)
 
     out = orch.cancel_run(spec.run_id)
     assert out.state == "cancelled"
@@ -352,7 +208,7 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
     orch._save_status(st)
 
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
-    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda *a, **k: [{"success": True}])
 
     # The undeploy write must route through the lock-guarded helper (not a bare _save_status
     # outside _STATUS_LOCK, the old racy path); that helper holds _STATUS_LOCK.
@@ -395,7 +251,7 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
     orch._save_status(st)
 
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **k: ["flash-serve-5090-x"])
-    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda *a, **k: [{"success": True}])
 
     # Inject the race: a concurrent mark_undeployed flips the run to terminal `done` AFTER
     # cancel_run's initial get_status (state="deployed") but BEFORE the deployment is retired.
@@ -437,7 +293,7 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
     )
     orch._save_status(st)
 
-    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda *a, **k: [{"success": True}])
 
     # The racing undeploy flips the run to terminal `done` mid-cancel (after cancel_run's
     # initial non-terminal read, before its final `cancelled` write).
@@ -476,7 +332,7 @@ def test_cancel_loses_to_racing_genuine_completion_done(tmp_path, monkeypatch):
         assert orch.get_status(spec.run_id).state == "done"  # the genuine finish landed
         return [{"success": True}]
 
-    monkeypatch.setattr(ftrain, "terminate_endpoint", racing_completion)
+    monkeypatch.setattr(orch, "_gc_run_resources", racing_completion)
 
     out = orch.cancel_run(spec.run_id)
     assert out.state == "done", (
@@ -485,90 +341,6 @@ def test_cancel_loses_to_racing_genuine_completion_done(tmp_path, monkeypatch):
     assert orch.get_status(spec.run_id).state == "done"
     assert out.cost_usd == 1.23, "the finished run's real result (cost) must be preserved"
     assert out.artifacts_dir == "/runs/finished"
-
-
-def test_terminate_endpoint_holds_lock_across_isolation(monkeypatch):
-    """Regression (6 bot threads): isolate_flash_state() + the ResourceManager lookup must run
-    UNDER FLASH_SDK_LOCK, not just the undeploy. isolate_flash_state swaps runpod_flash's
-    process-wide registry globals, so a concurrent deploy could swap the scope mid-teardown.
-    Asserts the lock is held when isolate_flash_state runs (and released afterward)."""
-    import flash.providers.runpod.auth as auth
-
-    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
-    held = {}
-
-    def rec_isolate(scope=None):
-        held["locked"] = ftrain.FLASH_SDK_LOCK.locked()
-        raise RuntimeError("short-circuit before the real SDK lookup")
-
-    monkeypatch.setattr(ftrain.endpoints, "isolate_flash_state", rec_isolate)
-    out = ftrain.terminate_endpoint("RTX 5090", "flash-1-abcd1234")
-    assert held.get("locked") is True, "isolate_flash_state must run while holding FLASH_SDK_LOCK"
-    assert ftrain.FLASH_SDK_LOCK.locked() is False, "lock must be released after terminate"
-    assert isinstance(out, list)  # still never raises
-    assert out
-    assert out[0]["success"] is False
-
-
-def test_terminate_endpoint_from_async_context_does_not_raise(monkeypatch):
-    """verify terminate_endpoint works inside an active event loop.
-
-    it must move ``asyncio.run`` to another thread because calling it directly from fastapi/uvicorn or
-    any async context raises RuntimeError.
-    """
-    import asyncio
-    import sys
-    import types as _types
-
-    import flash.providers.runpod.auth as auth
-    import flash.providers.runpod.serverless.endpoints as ep_mod
-    from flash.providers.base import canonical_gpu
-
-    run_id = "flash-1-abcd1234"
-    friendly = canonical_gpu("RTX 5090")
-    target = endpoint_name(friendly, _run_suffix(run_id))
-    resource_name = f"live-{target}"
-
-    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
-    monkeypatch.setattr(ep_mod, "isolate_flash_state", lambda _: None)
-
-    # The registry-less REST sweep runs after the undeploy and would report every configured
-    # account as unreachable (offline suite), appending a failure row this assertion would then
-    # have to spell out. Stub it clear: this test is about the event loop, not the sweep.
-    import flash.providers.runpod.api as runpod_api
-
-    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", lambda **_: ({}, []))
-
-    async def fake_undeploy(uid, **_):
-        return {"success": True, "name": resource_name}
-
-    fake_resource = _types.SimpleNamespace(name=resource_name)
-    fake_rm = _types.SimpleNamespace(
-        list_all_resources=lambda: {"uid-1": fake_resource},
-        undeploy_resource=fake_undeploy,
-    )
-
-    fake_rm_mod = _types.ModuleType("runpod_flash.core.resources.resource_manager")
-    fake_rm_mod.ResourceManager = lambda: fake_rm
-
-    for mod_name in (
-        "runpod_flash",
-        "runpod_flash.core",
-        "runpod_flash.core.resources",
-        "runpod_flash.core.resources.resource_manager",
-    ):
-        if mod_name not in sys.modules:
-            stub = _types.ModuleType(mod_name)
-            stub.__path__ = []  # mark as package so sub-imports don't raise
-            monkeypatch.setitem(sys.modules, mod_name, stub)
-    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", fake_rm_mod)
-
-    async def _call():
-        return ftrain.terminate_endpoint("RTX 5090", run_id)
-
-    result = asyncio.run(_call())
-    assert isinstance(result, list)
-    assert result == [{"success": True, "name": resource_name}]
 
 
 def test_cancel_run_noop_when_terminal(tmp_path, monkeypatch):
@@ -581,7 +353,7 @@ def test_cancel_run_noop_when_terminal(tmp_path, monkeypatch):
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="done", spec=spec.to_dict()))
 
     called = {"v": False}
-    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: called.__setitem__("v", True))
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda *a, **k: called.__setitem__("v", True))
     out = orch.cancel_run(spec.run_id)
     assert out.state == "done"
     assert called["v"] is False, "must not tear down endpoints for an already-terminal run"
@@ -595,52 +367,53 @@ def test_cancel_run_retries_durable_cleanup_for_cancelled_run(tmp_path, monkeypa
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancelled-1"})
     orch._save_status(orch.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict()))
-    remote = _remote("endpoint-cleanup", "job-cleanup", 1)
+    remote = _remote("pod-cleanup", "job-cleanup", 1)
     assert orch._preserve_cleanup_remote(spec.run_id, remote) is True
     events = []
 
     class Provider:
-        def cancel(self, handle):
-            events.append(("cancel", handle.to_dict()["job_id"]))
-
         def destroy(self, handle):
-            events.append(("destroy", handle.to_dict()["endpoint_id"]))
+            events.append(("destroy", handle.to_dict()["instance_id"]))
+
+        def run_instances_remaining(self, _run_id):
+            return []
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
 
     out = orch.cancel_run(spec.run_id)
 
     assert out.state == "cancelled"
-    assert events == [("cancel", "job-cleanup"), ("destroy", "endpoint-cleanup")]
+    assert events == [("destroy", "pod-cleanup")]
     assert orch._CLEANUP_REMOTES_KEY not in orch._load_status_json(spec.run_id)
 
 
-def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
-    tmp_path, monkeypatch
-):
+def test_cancel_run_accepts_confirmed_pod_delete_after_cancel_ack_failure(tmp_path, monkeypatch):
     import flash.providers as providers
     import flash.runner as orch
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-retry"})
-    remote = {**_remote("endpoint-exact", "job-exact", 7), "seed": 42}
-    orch._save_status(provisioned_status(orch, spec, state="running", remote=remote))
+    remote = {**_remote("pod-exact", "job-exact", 7), "seed": 42}
+    status = provisioned_status(orch, spec, state="running", remote=remote)
+    status.estimated_cost_usd = 9.5
+    status.cost_usd = 9.5
+    orch._save_status(status)
     events = []
 
     class Provider:
-        def cancel(self, handle):
-            data = handle.to_dict()
-            events.append(("cancel", data["endpoint_id"], data["job_id"], data["attempt"]))
-            raise RuntimeError("cancellation acknowledgement failed")
-
         def destroy(self, handle):
             data = handle.to_dict()
-            events.append(("destroy", data["endpoint_id"], data.get("job_id"), data["attempt"]))
+            events.append(
+                ("destroy", data["instance_id"], data.get("payload_secret_id"), data["attempt"])
+            )
+
+        def run_instances_remaining(self, _run_id):
+            return []
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
     gc_calls = []
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda value: gc_calls.append(value.run_id))
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda value: gc_calls.append(value.run_id))
 
     result = orch.cancel_run(spec.run_id)
     raw = orch._load_status_json(spec.run_id)
@@ -648,11 +421,30 @@ def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
     assert result.state == "cancelled"
     assert raw["remote"] is None
     assert orch._CLEANUP_REMOTES_KEY not in raw
-    assert gc_calls == [spec.run_id]
-    assert events == [
-        ("cancel", "endpoint-exact", "job-exact", 7),
-        ("destroy", "endpoint-exact", "job-exact", 7),
+    assert raw["provider_cost_history"] == [
+        {
+            "account_id": "account-1",
+            "attempt": 7,
+            "data_center_id": "US-KS-2",
+            "gpu": "RTX 5090",
+            "gpu_count": 1,
+            "hourly_usd": 0.69,
+            "instance_id": "pod-exact",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "provider": "runpod",
+            "started_ts": 8.0,
+            "terminated_ts": raw["provider_cost_history"][0]["terminated_ts"],
+        }
     ]
+    assert "payload_secret_id" not in raw["provider_cost_history"][0]
+    assert result.cost_usd == result.estimated_cost_usd == 9.5
+    from flash.server.domain import reconcile
+
+    aggregate = reconcile._aggregate_attempt_costs(result, run_end=result.finished_at)
+    assert aggregate is not None
+    assert aggregate.realized_usd > 0
+    assert gc_calls == [spec.run_id]
+    assert events == [("destroy", "pod-exact", "job-exact", 7)]
 
 
 def test_cancel_run_failed_teardown_does_not_replace_racing_public_remote(tmp_path, monkeypatch):
@@ -662,8 +454,8 @@ def test_cancel_run_failed_teardown_does_not_replace_racing_public_remote(tmp_pa
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-race"})
-    original_remote = _remote("endpoint-original", "job-original", 2)
-    replacement_remote = _remote("endpoint-replacement", "job-replacement", 3)
+    original_remote = _remote("pod-original", "job-original", 2)
+    replacement_remote = _remote("pod-replacement", "job-replacement", 3)
     orch._save_status(
         orch.RunStatus(
             run_id=spec.run_id,
@@ -674,17 +466,14 @@ def test_cancel_run_failed_teardown_does_not_replace_racing_public_remote(tmp_pa
     )
 
     class Provider:
-        def cancel(self, _handle):
+        def destroy(self, _handle):
             current = orch.get_status(spec.run_id)
             current.remote = replacement_remote
             orch._save_status(current)
-            raise RuntimeError("cancellation acknowledgement failed")
-
-        def destroy(self, _handle):
-            raise RuntimeError("endpoint deletion failed")
+            raise RuntimeError("Pod deletion failed")
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
 
     out = orch.cancel_run(spec.run_id)
     raw = orch._load_status_json(spec.run_id)
@@ -710,7 +499,7 @@ def test_cancel_run_marks_billing_failed_when_pricing_falls_back(tmp_path, monke
     )
     monkeypatch.setattr(orch, "actual_steps_run", lambda _status: 1)
     monkeypatch.setattr(orch, "charge_usd_for_spec", lambda *a, **kw: kw["fallback"])
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
 
     status = orch.cancel_run(spec.run_id)
 
@@ -727,7 +516,7 @@ def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path,
 
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-clean"})
-    remote = _remote("endpoint-clean", "job-clean", 3)
+    remote = _remote("pod-clean", "job-clean", 3)
     orch._save_status(
         orch.RunStatus(
             run_id=spec.run_id,
@@ -739,19 +528,19 @@ def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path,
     events = []
 
     class Provider:
-        def cancel(self, handle):
-            events.append(("cancel", handle.to_dict()["job_id"]))
-
         def destroy(self, handle):
-            events.append(("destroy", handle.to_dict()["endpoint_id"]))
+            events.append(("destroy", handle.to_dict()["instance_id"]))
+
+        def run_instances_remaining(self, _run_id):
+            return []
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
 
     out = orch.cancel_run(spec.run_id)
 
     assert out.state == "cancelled"
-    assert events == [("cancel", "job-clean"), ("destroy", "endpoint-clean")]
+    assert events == [("destroy", "pod-clean")]
     assert orch._CLEANUP_REMOTES_KEY not in orch._load_status_json(spec.run_id)
 
 
@@ -761,12 +550,12 @@ def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path,
 def _make_poll_provider(monkeypatch, *, on_poll):
     """Wire flash.providers.get_provider to a stub provider whose poll() runs ``on_poll``.
 
-    Also no-ops _gc_run_endpoints so attach_run's teardown doesn't reach the real SDK.
+    Also no-ops _gc_run_resources so attach_run's teardown doesn't reach the real SDK.
     """
     import flash.providers as providers
     import flash.runner as orch
 
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda *a, **k: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda *a, **k: None)
 
     class _StubProvider:
         def poll(self, handle, spec, seed, *, log=None, _deadline_at=None):
@@ -777,6 +566,9 @@ def _make_poll_provider(monkeypatch, *, on_poll):
 
         def destroy(self, _handle):
             return None
+
+        def run_instances_remaining(self, _run_id):
+            return []
 
     monkeypatch.setattr(providers, "get_provider", lambda name: _StubProvider())
 
@@ -959,11 +751,11 @@ def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path,
     events = []
 
     class StubProvider:
-        def cancel(self, handle):
-            events.append("provider-cancel")
-
         def destroy(self, handle):
             events.append("provider-destroy")
+
+        def run_instances_remaining(self, _run_id):
+            return []
 
     real_read = verified_revisions.read_verified_adapter_revisions
 
@@ -972,7 +764,7 @@ def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path,
         return real_read(target)
 
     monkeypatch.setattr(providers, "get_provider", lambda _provider: StubProvider())
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: events.append("endpoint-gc"))
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: events.append("provider-gc"))
     monkeypatch.setattr(verified_revisions, "read_verified_adapter_revisions", read_verified)
     monkeypatch.setattr(
         deploy,
@@ -983,9 +775,8 @@ def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path,
     out = orch.cancel_run(run_id)
 
     assert events == [
-        "provider-cancel",
         "provider-destroy",
-        "endpoint-gc",
+        "provider-gc",
         "serving-decision",
     ]
     assert out.state == "cancelled"
@@ -999,7 +790,7 @@ def test_cancel_preserves_ready_verified_same_step_checkpoint(tmp_path, monkeypa
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-preserve"
     deployment = _ready_checkpoint(orch, run_id, 80)
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy,
         "adapter_alias_target",
@@ -1042,7 +833,7 @@ def test_cancel_preserves_busy_attempt_previous_checkpoint_without_alias_lookup(
         "previous_deployment": previous,
     }
     orch._save_status(status)
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy,
         "adapter_alias_target",
@@ -1119,7 +910,7 @@ def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path
 
     alias_reads = []
     monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy,
         "adapter_alias_target",
@@ -1178,7 +969,7 @@ def test_cancel_contended_unknown_activation_is_fenced_before_wait(tmp_path, mon
             self.held = False
 
     monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy, "adapter_alias_target", lambda _target: previous["adapter_revision"]
     )
@@ -1247,7 +1038,7 @@ def test_cancel_contended_predecessor_recommit_failure_stays_fenced_and_revokes(
     undeploys = []
     monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
     monkeypatch.setattr(orch, "mark_checkpoint_deployed", fail_predecessor_restore)
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy, "adapter_alias_target", lambda _target: previous["adapter_revision"]
     )
@@ -1329,7 +1120,7 @@ def test_cancel_contended_fence_revokes_when_alias_changes_before_lock_release(
 
     undeploys = []
     monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(deploy, "adapter_alias_target", lambda _target: alias_target[0])
 
     def undeploy(target):
@@ -1364,7 +1155,7 @@ def test_cancel_unknown_outcome_restores_live_verified_previous_checkpoint(tmp_p
     status.deployment = busy
     orch._save_status(status)
     alias_reads = []
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy,
         "adapter_alias_target",
@@ -1408,7 +1199,7 @@ def test_cancel_checkpoint_restore_survives_owned_run_state_race(
     status = orch.get_status(run_id)
     status.deployment = busy
     orch._save_status(status)
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy, "adapter_alias_target", lambda _run_id: previous["adapter_revision"]
     )
@@ -1491,7 +1282,7 @@ def test_cancel_restore_failure_revokes_instead_of_leaving_reconciling_authority
     status = orch.get_status(run_id)
     status.deployment = busy
     orch._save_status(status)
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy, "adapter_alias_target", lambda _run_id: previous["adapter_revision"]
     )
@@ -1539,7 +1330,7 @@ def test_cancel_restore_ack_failure_preserves_persisted_verified_checkpoint(tmp_
     status = orch.get_status(run_id)
     status.deployment = busy
     orch._save_status(status)
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy, "adapter_alias_target", lambda _run_id: previous["adapter_revision"]
     )
@@ -1603,7 +1394,7 @@ def test_cancel_unknown_outcome_revokes_attempted_live_checkpoint(
     }
     orch._save_status(status)
     undeploys = []
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: live_revision)
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
 
@@ -1635,7 +1426,7 @@ def test_cancel_unknown_outcome_rejects_unverified_divergent_checkpoint(tmp_path
     }
     orch._save_status(status)
     undeploys = []
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: divergent_revision)
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
 
@@ -1672,7 +1463,7 @@ def test_cancel_unknown_outcome_alias_failure_revokes_fail_closed(
             raise deploy.ServingError("alias read failed")
 
     undeploys = []
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(deploy, "adapter_alias_target", alias_target)
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
 
@@ -1706,7 +1497,7 @@ def test_cancel_unknown_outcome_never_preserves_verified_final_alias(tmp_path, m
         expected_generation=orch.verified_adapter_revision_generation(run_id),
     )
     undeploys = []
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: final_revision)
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
 
@@ -1763,7 +1554,7 @@ def test_cancel_revokes_final_deployment(tmp_path, monkeypatch):
         verification_generation=orch.verified_adapter_revision_generation(run_id),
     )
     undeployed = []
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeployed.append(target))
 
     out = orch.cancel_run(run_id)
@@ -1800,7 +1591,7 @@ def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
         expected_generation=orch.verified_adapter_revision_generation(run_id),
     )
     undeployed = []
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeployed.append(target))
 
     out = orch.cancel_run(run_id)
@@ -1847,7 +1638,7 @@ def test_cancel_active_deployment_with_malformed_spec_still_revokes(tmp_path, mo
     backend_calls = []
     gc_calls = []
     monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: gc_calls.append(_spec))
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: gc_calls.append(_spec))
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: backend_calls.append(target))
 
     out = orch.cancel_run(run_id)
@@ -1883,7 +1674,7 @@ def test_cancel_backend_success_local_commit_failure_is_not_backend_uncertainty(
         expected_generation=orch.verified_adapter_revision_generation(run_id),
     )
     backend_calls = []
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: backend_calls.append(target))
     monkeypatch.setattr(
         orch,
@@ -1911,7 +1702,7 @@ def test_repeated_cancel_preserves_checkpoint_serving(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-repeat"
     deployment = _ready_checkpoint(orch, run_id, 40)
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy,
         "undeploy_adapter",
@@ -1945,7 +1736,7 @@ def test_cancel_preserved_checkpoint_prunes_other_verified_revisions(tmp_path, m
             revision,
             expected_generation=orch.verified_adapter_revision_generation(run_id),
         )
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy,
         "undeploy_adapter",
@@ -1976,7 +1767,7 @@ def test_cancel_checkpoint_prune_failure_is_retryable_without_revocation(tmp_pat
         older_revision,
         expected_generation=orch.verified_adapter_revision_generation(run_id),
     )
-    monkeypatch.setattr(orch, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda _spec: None)
     monkeypatch.setattr(
         deploy,
         "undeploy_adapter",
@@ -2039,7 +1830,7 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
         raise deploy.ServingError("backend unavailable")
 
     monkeypatch.setattr(deploy, "undeploy_adapter", fail_undeploy)
-    monkeypatch.setattr(ftrain, "terminate_endpoint", lambda *a, **k: [{"success": True}])
+    monkeypatch.setattr(orch, "_gc_run_resources", lambda *a, **k: [{"success": True}])
 
     with pytest.raises(orch.DeploymentRevocationError) as excinfo:
         orch.cancel_run(run_id)
@@ -2067,112 +1858,3 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
 # every configured account and delete it. an unconfirmed delete must surface as a failed result
 # rather than a silent success, or a live endpoint keeps billing while the run looks cleaned up.
 # ---------------------------------------------------------------------------
-def _fake_sdk_with_orphan(monkeypatch, *, rest_find, rest_delete, resources=None, undeploy=None):
-    """Stub auth + a resource registry so terminate_endpoint reaches the REST fallback.
-
-    ``resources`` defaults to an empty registry (nothing to undeploy, straight to REST). Pass one
-    plus ``undeploy`` to drive the registry leg too. ``rest_find`` may raise to model an
-    unreachable account-enumeration API.
-    """
-    import types as _types
-
-    import flash.providers.runpod.api as runpod_api
-    import flash.providers.runpod.auth as auth
-    import flash.providers.runpod.serverless.endpoints as ep_mod
-    from flash.providers.base import canonical_gpu
-
-    monkeypatch.setattr(auth, "ensure_auth", lambda: None)
-    monkeypatch.setattr(ep_mod, "isolate_flash_state", lambda *a, **k: None)
-
-    registry = resources or {}
-    fake_rm = _types.SimpleNamespace(
-        list_all_resources=lambda: registry,
-        undeploy_resource=undeploy,
-    )
-    fake_rm_mod = _types.ModuleType("runpod_flash.core.resources.resource_manager")
-    fake_rm_mod.ResourceManager = lambda: fake_rm
-    for mod_name in (
-        "runpod_flash",
-        "runpod_flash.core",
-        "runpod_flash.core.resources",
-        "runpod_flash.core.resources.resource_manager",
-    ):
-        if mod_name not in sys.modules:
-            stub = types.ModuleType(mod_name)
-            stub.__path__ = []
-            monkeypatch.setitem(sys.modules, mod_name, stub)
-    monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", fake_rm_mod)
-
-    target = endpoint_name(canonical_gpu("RTX 5090"), _run_suffix("flash-q-1"))
-    monkeypatch.setattr(
-        runpod_api, "list_endpoints_by_key", lambda: ({_RUNPOD_FINGERPRINT: rest_find(target)}, [])
-    )
-    monkeypatch.setattr(
-        runpod_api,
-        "delete_endpoint_for_fingerprint",
-        lambda endpoint_id, _fingerprint: rest_delete(endpoint_id),
-    )
-    return target
-
-
-def test_terminate_deletes_a_rest_discovered_orphan(monkeypatch):
-    deleted = []
-    target = _fake_sdk_with_orphan(
-        monkeypatch,
-        rest_find=lambda t: [{"id": "ep-orphan", "name": t}],
-        rest_delete=lambda eid: deleted.append(eid) or True,
-    )
-
-    out = ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-
-    assert deleted == ["ep-orphan"], "an orphan matching the run must be deleted on its account"
-    assert {"success": True, "name": target, "message": "deleted via REST API"} in out
-
-
-def test_terminate_reports_an_unconfirmed_rest_delete_as_failure(monkeypatch):
-    # a delete the API would not confirm must NOT be reported as success: the endpoint may still
-    # be live and billing, and cancellation is what the caller believes just happened.
-    target = _fake_sdk_with_orphan(
-        monkeypatch,
-        rest_find=lambda t: [{"id": "ep-orphan", "name": t}],
-        rest_delete=lambda _eid: False,
-    )
-
-    out = ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-
-    assert {
-        "success": False,
-        "name": target,
-        "message": "REST endpoint deletion was unconfirmed",
-    } in out
-
-
-def test_terminate_keeps_undeploy_failures_when_rest_enumeration_is_unreachable(monkeypatch):
-    """terminate_endpoint is best-effort: it must never raise, and never lose what it learned.
-
-    An undeploy that raises becomes a failure row rather than escaping, and a REST enumeration that
-    is unreachable is swallowed -- but the earlier undeploy failure must survive that swallow. A
-    caller that saw an empty list here would read 'nothing to clean up' from what was really 'the
-    API could not tell us', and stop chasing an endpoint that is still billing.
-    """
-
-    async def _undeploy_boom(_uid, **_):
-        raise RuntimeError("undeploy boom")
-
-    def _enumeration_down(_target):
-        raise RuntimeError("REST API down")
-
-    _fake_sdk_with_orphan(
-        monkeypatch,
-        resources={"u1": _res(f"live-{endpoint_name('RTX 5090', _run_suffix('flash-q-1'))}")},
-        undeploy=_undeploy_boom,
-        rest_find=_enumeration_down,
-        rest_delete=lambda _eid: True,
-    )
-
-    out = ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
-
-    assert isinstance(out, list), "an unreachable REST API must be swallowed, not raised"
-    assert any(
-        r.get("success") is False and "undeploy boom" in str(r.get("message")) for r in out
-    ), "the undeploy failure must survive the swallowed enumeration error"

@@ -48,11 +48,10 @@ class ProfileError(ValueError):
 class RunPodGpu:
     """one runpod gpu type id with the container and volume sizing it is validated for.
 
-    ``gpu_type_id`` is runpod's own display id (the value its api returns as ``gpuTypeId``), not a
-    flash GPU_CLASSES name. flash's runpod training path resolves cards through the runpod-flash
-    SDK's ``GpuType`` enum, which the serving path deliberately does not import: the provisioning
-    transport speaks the rest api directly, and the SDK is not in the serving install. The two are
-    also not interchangeable strings, so this is stated rather than translated.
+    ``gpu_type_id`` is runpod's exact gpu type id, returned by its api as ``gpuTypeId``, not a flash
+    GPU_CLASSES name. managed training and customer-owned serving both pass exact ids to the rest api.
+    the profile keeps the provider id explicit because it is not interchangeable with the friendly
+    flash gpu name used for catalog and validation policy.
     """
 
     gpu_type_id: str

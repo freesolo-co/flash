@@ -256,7 +256,7 @@ def _upload_console_snapshot(
     itself -- losing the failure detail the control plane reads, including the wall-clock-cap marker.
 
     The terminal snapshot keeps the canonical ``console_<mode>.txt`` the control plane reads; the
-    periodic one takes the attempt-scoped name it reads separately, matching the serverless handler,
+    periodic one takes the attempt-scoped name it reads separately, matching instance polling,
     so a retry cannot overwrite the attempt that reproduced the failure. This module can never
     import flash, so the format is spelled out here and pinned against
     ``flash.adapters.artifacts.attempt_scoped_artifact_name`` by test rather than by coincidence --

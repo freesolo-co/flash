@@ -387,36 +387,6 @@ def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
     assert single_96 in _oom_escalated([single_96], _candidate_usable_vram_gb(triple_40))
 
 
-def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
-    from flash.providers.runpod.jobs import surfaced_worker_flags
-
-    say = lambda _m: None  # noqa: E731
-    reads = {"n": 0}
-
-    def reader(force=False):
-        reads["n"] += 1
-        return {"oom": True, "attempt": 0, "retriable": False, "stage": "rl_train"}
-
-    _key, retriable, oom = surfaced_worker_flags(reader, None, say, 0, launch_ts=1.0)
-    assert (retriable, oom) == (False, True)
-    assert reads["n"] == 1
-    assert surfaced_worker_flags(
-        lambda force=False: {"retriable": True, "attempt": 0, "ts": 10_500.0},
-        None,
-        say,
-        0,
-        launch_ts=10_000.0,
-    )[1:] == (True, False)
-    assert surfaced_worker_flags(
-        lambda force=False: {"retriable": True, "attempt": 1, "ts": 10_500.0},
-        None,
-        say,
-        0,
-        launch_ts=10_000.0,
-    )[1:] == (False, False)
-    assert surfaced_worker_flags(None, None, say)[1:] == (False, False)
-
-
 def test_heartbeat_oom_for_attempt_gates_stale_flag():
     from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
 
@@ -491,35 +461,6 @@ def test_heartbeat_oom_rejects_malformed_current_attempt(malformed_attempt):
     from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": 1}, malformed_attempt) is False
-
-
-def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
-
-    monkeypatch.setattr(jobs.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(
-        runpod_api,
-        "job_status",
-        lambda _eid, _jid, **_kw: {"status": "FAILED", "error": "x"},
-    )
-    handle = jobs.JobHandle("ep", "name", "rpk-" + "0" * 64, "job", 2, 1.0)
-
-    res = jobs.poll_job(
-        handle,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: {"oom": True, "attempt": 2},
-        current_attempt=2,
-    )
-    assert res.failure == "oom"
-
-    res = jobs.poll_job(
-        handle,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: {"oom": True, "attempt": 1},
-        current_attempt=2,
-    )
-    assert res.failure == "job_failed"
 
 
 def test_worker_failure_flags_prioritize_retriable_over_oom(monkeypatch):

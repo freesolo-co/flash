@@ -565,10 +565,10 @@ def _schedule_attach_reconciliation(
             )
         finally:
             try:
-                from flash.runner import TERMINAL_STATES, _gc_run_endpoints, get_status
+                from flash.runner import TERMINAL_STATES, _gc_run_resources, get_status
 
                 if get_status(run_id).state in TERMINAL_STATES:
-                    _gc_run_endpoints(worker_spec)
+                    _gc_run_resources(worker_spec)
             except Exception:
                 pass
             with _ATTACH_RECONCILING_LOCK:
@@ -592,7 +592,7 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     # attach_run is dispatched on a daemon thread, so an escaped parse failure is silent: the run
     # stays nonterminal with a live handle and its worker keeps billing. A spec stops parsing when
     # the plane upgrades past an algorithm a still-in-flight run was accepted under. It cannot be
-    # resumed, so fail it closed and tear the worker down. `_gc_run_endpoints` needs a parsed spec
+    # resumed, so fail it closed and tear the worker down. `_gc_run_resources` needs a parsed spec
     # we do not have; the pod label is derived from the run id, which remains readable
     # from the raw persisted status, which is the same route recover_runs takes for its own
     # unparseable-spec branch.
@@ -607,9 +607,6 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     if not resource_deleted:
         _record_cleanup_remote(run_id, persisted_remote)
     _compare_and_fail_remote(run_id, persisted_remote, detail)
-    from flash.providers.runpod import terminate_persisted_endpoints
-
-    terminate_persisted_endpoints(status.spec, run_id)
     print(f"attach: {run_id} {detail}", file=log)
     return get_status(run_id)
 
@@ -830,7 +827,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     from flash.runner import (
         TERMINAL_STATES,
         _compare_and_fail_remote,
-        _gc_run_endpoints,
+        _gc_run_resources,
         _load_run_deadline_at,
         _record_cleanup_remote,
         _RunCancelled,
@@ -969,5 +966,5 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
         if cleanup_terminal:
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(worker_spec)
+                _gc_run_resources(worker_spec)
     return status_for_return()

@@ -28,17 +28,6 @@ FUNCTION_MAX = 150
 GATED_PACKAGE = "flash"
 SKIP_DIRS = {"__pycache__", ".git", ".venv", "build", ".ruff_cache"}
 
-# Functions whose source is extracted and shipped elsewhere to run standalone, so a helper they
-# call is simply absent at the far end. Splitting one of these passes every local test and then
-# raises NameError on the worker, which is why they are listed rather than left to a judgement
-# call. Each entry needs the mechanism that ships it, so the exemption can be rechecked when that
-# mechanism changes. Keep this list short: it is an escape hatch for a transport boundary, never
-# for a function that is merely hard to split.
-SOURCE_SHIPPED = {
-    # broad serverless deletion is deferred to task 4; this extractor remains active until then.
-    "flash/providers/runpod/serverless/endpoints.py::_train_body",
-}
-
 
 def _walk_defs(node: ast.AST, prefix: str = ""):
     """Yield (qualified_name, def_node) for every function defined under `node`."""
@@ -62,8 +51,8 @@ def _length(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
     return node.end_lineno - node.lineno + 1
 
 
-def _all_oversized(root: str) -> list[tuple[int, str, str, int]]:
-    """Every function over the limit, before SOURCE_SHIPPED is applied."""
+def oversized(root: str) -> list[tuple[int, str, str, int]]:
+    """Return every production function over the limit."""
     found = []
     for dirpath, dirnames, filenames in os.walk(os.path.join(root, GATED_PACKAGE)):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
@@ -88,35 +77,9 @@ def _all_oversized(root: str) -> list[tuple[int, str, str, int]]:
     return found
 
 
-def oversized(root: str) -> list[tuple[int, str, str, int]]:
-    return [
-        entry for entry in _all_oversized(root) if f"{entry[1]}::{entry[2]}" not in SOURCE_SHIPPED
-    ]
-
-
-def stale_exemptions(root: str) -> list[str]:
-    """Entries in SOURCE_SHIPPED that no longer name an oversized function.
-
-    An exemption list rots silently: the function gets split, renamed, or deleted, and the entry
-    stays behind exempting nothing. Reporting those keeps the list honest, so it can only shrink
-    by being noticed.
-    """
-    live = set()
-    for _lines, rel, qualname, _lineno in _all_oversized(root):
-        live.add(f"{rel}::{qualname}")
-    return sorted(SOURCE_SHIPPED - live)
-
-
 def main() -> int:
     root = sys.argv[1] if len(sys.argv) > 1 else "."
-    stale = stale_exemptions(root)
     found = oversized(root)
-    if stale:
-        print(f"{len(stale)} stale entr(ies) in SOURCE_SHIPPED -- no longer oversized:")
-        for entry in stale:
-            print(f"    {entry}")
-        print("\nRemove the entry: the exemption is no longer carrying anything.")
-        return 1
     if not found:
         return 0
     print(f"{len(found)} function(s) over the {FUNCTION_MAX}-line limit:")

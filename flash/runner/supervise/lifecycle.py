@@ -103,7 +103,7 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
     from flash.runner import (
         RUNS_DIR,
         TERMINAL_STATES,
-        _gc_run_endpoints,
+        _gc_run_resources,
         _run_job_inner,
         _update,
         get_status,
@@ -145,11 +145,11 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
                     )
                 time.sleep(min(_STAGED_ENVIRONMENT_RETRY_S, remaining))
     finally:
-        # gc registered endpoints because undeleted endpoints count against the account-wide worker quota.
+        # gc registered provider resources because leaked workers continue billing and consume quota.
         # skip when the run is still non-terminal: another live supervisor then owns the durable handle,
         # and reaping here would tear down its still-active provider resources.
         if get_status(spec.run_id).state in TERMINAL_STATES:
-            _gc_run_endpoints(spec)
+            _gc_run_resources(spec)
 
 
 def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:

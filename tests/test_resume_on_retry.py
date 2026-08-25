@@ -608,13 +608,27 @@ def _alloc():
     )
 
 
-def _runpod_handle(endpoint_id="ep", job_id="j", attempt=0):
+def _runpod_handle(pod_id="pod-1", _unused="", attempt=0):
     return {
         "provider": "runpod",
-        "endpoint_id": endpoint_id,
-        "endpoint_name": f"{endpoint_id}-name",
+        "instance_id": pod_id,
+        "phase": "exact",
+        "label": f"flash-retry-s0-a{attempt}-0123456789abcdef-deadbeef",
         "key_fingerprint": _RUNPOD_FINGERPRINT,
-        "job_id": job_id,
+        "account_id": "account-1",
+        "payload_secret_id": f"secret-{attempt}",
+        "payload_secret_name": "FLASH_PAYLOAD_0123456789abcdef",
+        "data_center_id": "US-KS-2",
+        "network_volume_id": None,
+        "container_disk_gb": 120,
+        "container_registry_auth_id": None,
+        "gpu_count": 1,
+        "image_name": None,
+        "gpu_type_id_override": None,
+        "allowed_cuda_versions": None,
+        "docker_start_cmd": [],
+        "gpu": "RTX 4090",
+        "hourly_usd": 0.69,
         "attempt": attempt,
         "started_ts": float(attempt + 1),
     }
@@ -650,10 +664,11 @@ def _lambda_handle(attempt=0):
 
 @pytest.fixture
 def orch(monkeypatch, tmp_path):
-    """The runner package wired to a tmp run-store, with the inter-attempt RunPod teardown stubbed."""
+    """Return the runner with a temporary store and offline RunPod teardown."""
     from flash import runner
     from flash.providers import allocator
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import PROVIDER as runpod_provider
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
@@ -662,13 +677,10 @@ def orch(monkeypatch, tmp_path):
     # post-allocation quote refresh resolve revision-specific geometry from the hub. these tests are
     # about the retry loop, so read the catalog's numbers instead of the network.
     stub_revision_geometry(monkeypatch)
-    # The retry loop tears the prior attempt's endpoint down before relaunching; keep it off-network.
-    monkeypatch.setattr(
-        runpod_api,
-        "cancel_job",
-        lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
-    )
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *a, **k: True)
+    # the retry loop tears the prior attempt's pod down and proves absence before relaunching.
+    monkeypatch.setattr(runpod_provider, "destroy", lambda _handle: None)
+    monkeypatch.setattr(runpod_provider, "run_instances_remaining", lambda _run_id: [])
+    monkeypatch.setattr(lifecycle, "_await_runpod_completed_metrics", lambda *args, **kwargs: None)
     return runner
 
 
@@ -692,7 +704,7 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
     silently turn every "retry from last checkpoint" into a restart from scratch.
     """
     from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod import PROVIDER as rp_jobs
 
     calls = []
 
@@ -703,7 +715,7 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
             return PollResult(False, failure=failure, detail="infra")
         return PollResult(True, metrics={"train_tokens": 4096})
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "_submit_run", fake_submit)
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
@@ -820,58 +832,6 @@ def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orc
     assert remote.get("instance_id") == "i-1"
 
 
-@pytest.mark.parametrize("terminal_status", ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"])
-def test_terminal_runpod_job_allows_retry_and_persists_leaked_endpoint(
-    orch, monkeypatch, terminal_status
-):
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
-
-    submits = []
-
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        submits.append(attempt)
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
-        if attempt == 0:
-            return PollResult(False, failure="stalled", detail="infra")
-        return PollResult(True, metrics={"train_tokens": 4096})
-
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
-    monkeypatch.setattr(
-        runpod_api,
-        "delete_endpoint_for_fingerprint",
-        lambda *_args, **_kwargs: False,
-    )
-    monkeypatch.setattr(
-        runpod_api,
-        "job_status",
-        lambda *_args, **_kwargs: {"status": terminal_status},
-    )
-    # a COMPLETED job whose output never lands makes _await_runpod_completed_metrics poll for the
-    # bounded metrics-lag grace window before falling through to a retry. drive a fake clock that
-    # advances on sleep so that ~120s window elapses in fake time instead of real seconds (and the
-    # loop can never wall-clock hang the suite). the fail/cancel/timeout statuses are not terminal-ok,
-    # so they never enter the pending poll and this is inert for them.
-    import time as _time
-
-    fake_clock = {"now": 1_000.0}
-    monkeypatch.setattr(_time, "time", lambda: fake_clock["now"])
-    monkeypatch.setattr(
-        _time, "sleep", lambda seconds: fake_clock.__setitem__("now", fake_clock["now"] + seconds)
-    )
-    spec = _spec(run_id=f"flash-terminal-{terminal_status.lower()}")
-    _seed_status(orch, spec)
-
-    metrics = orch._submit_seed_supervised(spec, 0, io.StringIO())
-
-    assert metrics["train_tokens"] == 4096
-    assert submits == [0, 1]
-    raw = orch._load_status_json(spec.run_id)
-    assert [item["endpoint_id"] for item in raw[orch._CLEANUP_REMOTES_KEY]] == ["ep0"]
-    assert orch.get_status(spec.run_id).remote["endpoint_id"] == "ep1"
-
-
 def test_await_runpod_completed_metrics_bounds_pending_poll_to_grace(monkeypatch):
     # a terminal-ok runpod job whose output never becomes readable must not pin the supervisor for
     # the remainder of a (default 24h) run wall deadline: the synchronous metrics-lag poll is bounded
@@ -944,134 +904,14 @@ def test_await_runpod_completed_metrics_checks_cancellation_before_sleep(monkeyp
     assert checks == [True]
 
 
-@pytest.mark.parametrize(
-    ("teardown_failure", "status_mode"),
-    [
-        ("cancel", "in_progress"),
-        ("delete_false", "in_progress"),
-        ("delete_exception", "raises"),
-    ],
-)
-def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
-    orch, monkeypatch, teardown_failure, status_mode
-):
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
-    from flash.providers.runpod import serverless as runpod_train
-
-    submits = []
-    teardown_events = []
-
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        submits.append(attempt)
-        on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
-        return PollResult(False, failure="stalled", detail="infra")
-
-    def cancel_job(endpoint_id, job_id, **_kw):
-        teardown_events.append(("cancel", endpoint_id, job_id))
-        if teardown_failure == "cancel":
-            raise RuntimeError("private cancellation response")
-        return {"id": job_id, "status": "CANCELLED"}
-
-    def delete_endpoint(endpoint_id, _fingerprint):
-        teardown_events.append(("delete", endpoint_id))
-        if teardown_failure == "delete_false":
-            return False
-        if teardown_failure == "delete_exception":
-            raise RuntimeError("private deletion response")
-        return teardown_failure != "cancel"
-
-    def job_status(*_args, **_kwargs):
-        if status_mode == "raises":
-            raise RuntimeError("private status response")
-        return {"status": "IN_PROGRESS"}
-
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
-    monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
-    monkeypatch.setattr(runpod_api, "job_status", job_status)
-    monkeypatch.setattr(runpod_train, "terminate_endpoint", lambda *_args, **_kwargs: None)
-
-    spec = _spec()
-    _seed_status(orch, spec)
-    log = io.StringIO()
-
-    with pytest.raises(RuntimeError, match="teardown could not be confirmed") as caught:
-        orch._submit_seed_supervised(spec, 0, log)
-
-    assert submits == [0]
-    assert teardown_events[:2] == [("cancel", "ep0", "j0"), ("delete", "ep0")]
-    assert "teardown unconfirmed" in log.getvalue()
-    assert "private" not in log.getvalue()
-    assert "private" not in str(caught.value)
-    remote = orch.get_status(spec.run_id).remote
-    assert remote is not None
-    assert remote.get("endpoint_id") == "ep0"
-    assert remote.get("job_id") == "j0"
-
-
-def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, monkeypatch):
-    """Codex: after a CONFIRMED teardown the in-memory last_handle must be cleared, not just the
-    persisted remote. Otherwise a retry that fails BEFORE provisioning a new handle (allocation/search
-    error -> on_handle never fires) leaves the prior, already-torn-down handle live, so the NEXT retry
-    re-tears-down that already-gone resource. For an instance provider a transient destroy/list failure
-    on that phantom re-teardown would mis-classify as the unconfirmed-teardown FATAL path though no
-    prior worker remains; for RunPod it re-issues a redundant cancel/delete. Sequence: attempt 0
-    provisions ep0 then fails infra; attempt 1 confirms ep0's teardown then fails no_capacity (no new
-    handle); attempt 2 must NOT touch ep0 again (last_handle cleared) and must succeed."""
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs as rp_jobs
-
-    # cancel_job fires ONLY in the inter-attempt teardown block (never in the success _gc_seen_endpoints
-    # sweep, which only delete_endpoints), so counting it cleanly isolates re-teardown.
-    cancels: list[str] = []
-    monkeypatch.setattr(
-        runpod_api,
-        "cancel_job",
-        lambda eid, jid, **_kw: cancels.append(eid) or {"id": jid, "status": "CANCELLED"},
-    )
-
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        if attempt == 0:
-            on_handle(_runpod_handle("ep0", "j0"))  # provisioned, then lost infra-shaped
-            return PollResult(False, failure="stalled", detail="infra")
-        if attempt == 1:
-            # Allocation/search-shaped failure BEFORE a new handle is recorded (on_handle never fires).
-            # last_handle must already be EMPTY here (ep0's teardown was confirmed at the top of this
-            # attempt), so the next retry has no stale handle to re-tear-down.
-            return PollResult(False, failure="no_capacity", detail="search flaked")
-        on_handle(_runpod_handle("ep2", "j2", 2))  # fresh endpoint on the final retry
-        return PollResult(True, metrics={"train_tokens": 4096})
-
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
-
-    spec = _spec()
-    _seed_status(orch, spec)
-    log = io.StringIO()
-
-    metrics = orch._submit_seed_supervised(spec, 0, log)
-
-    assert metrics["train_tokens"] == 4096, "the run must reach the successful final retry"
-    assert cancels == ["ep0"], (
-        "ep0 must be torn down exactly once, never re-torn after confirmed clear"
-    )
-
-
 def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
-    """A genuine worker error (the run's own code crashed) must NOT consume a retry.
+    """a genuine worker error must fail immediately without consuming a retry.
 
-    Only infra-shaped failures resume; a real training crash would just reproduce on a fresh
-    host, so it fails immediately instead of burning the budget on a doomed resume.
-
-    Uses the REAL failure label a worker/code crash produces — ``job_failed`` (the providers emit
-    ``"job_preempted" if retriable else "job_failed"``, e.g. runpod/jobs.py) — NOT a placeholder, so
-    this actually guards the classification: if ``job_failed`` were ever added to the supervisor's
-    infra-shaped retry set, this test would FAIL (it'd relaunch a doomed crash and burn GPU budget).
+    only infrastructure-shaped failures resume. the active providers emit ``job_failed`` for a
+    non-retriable worker crash, so this test guards that label against accidental retry classification.
     """
     from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod import PROVIDER as rp_jobs
 
     calls = []
 
@@ -1080,7 +920,7 @@ def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
         on_handle(_runpod_handle())
         return PollResult(False, failure="job_failed", detail="ValueError in reward_fn")
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "_submit_run", fake_submit)
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
@@ -1098,7 +938,7 @@ def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
     TERMINAL (job_failed), NOT as the generic ``poll_error`` flake — retrying would rent a SECOND box
     while the phantom from this attempt may still surface and bill under the still-active run."""
     from flash.providers.base import UnreconciledCreateError
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod import PROVIDER as rp_jobs
 
     calls = []
 
@@ -1106,7 +946,7 @@ def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
         calls.append(attempt)
         raise UnreconciledCreateError("ambiguous vast create; aborting the offer walk")
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "_submit_run", fake_submit)
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
@@ -1126,7 +966,7 @@ def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypa
     the run is failing. Each new attempt must announce itself and disown what is above it.
     """
     from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod import PROVIDER as rp_jobs
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         if attempt == 0:
@@ -1135,7 +975,7 @@ def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypa
         print("worker: stage=rl_step attempt=1 step=1", file=log)
         return PollResult(True, metrics={"train_tokens": 4096})
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "_submit_run", fake_submit)
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
@@ -1161,7 +1001,7 @@ def test_the_marker_does_not_claim_one_previous_attempt_after_two_failures(orch,
     owner for the bytes above.
     """
     from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod import PROVIDER as rp_jobs
 
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         if attempt < 2:
@@ -1169,7 +1009,7 @@ def test_the_marker_does_not_claim_one_previous_attempt_after_two_failures(orch,
             return PollResult(False, failure="stalled", detail="infra")
         return PollResult(True, metrics={"train_tokens": 4096})
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "_submit_run", fake_submit)
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
@@ -1186,11 +1026,11 @@ def test_the_marker_does_not_claim_one_previous_attempt_after_two_failures(orch,
 def test_a_single_attempt_run_gets_no_boundary_marker(orch, monkeypatch):
     """Attempt 0 has nothing above it to disown. A header on the common path is pure noise."""
     from flash.providers.base import PollResult
-    from flash.providers.runpod import jobs as rp_jobs
+    from flash.providers.runpod import PROVIDER as rp_jobs
 
     monkeypatch.setattr(
         rp_jobs,
-        "submit_run",
+        "_submit_run",
         lambda *a, **k: PollResult(True, metrics={"train_tokens": 4096}),
     )
     spec = _spec()

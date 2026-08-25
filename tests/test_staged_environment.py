@@ -33,6 +33,33 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 _SHA = "a" * 40
 _OTHER_SHA = "b" * 40
 _REVISION = "c" * 40
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
+
+
+def _runpod_remote(*, attempt: int = 0) -> dict:
+    return {
+        "provider": "runpod",
+        "instance_id": f"pod-{attempt}",
+        "phase": "exact",
+        "label": f"flash-staged-s0-a{attempt}-0123456789abcdef-deadbeef",
+        "key_fingerprint": _RUNPOD_FINGERPRINT,
+        "account_id": "account-1",
+        "payload_secret_id": f"secret-{attempt}",
+        "payload_secret_name": "FLASH_PAYLOAD_0123456789abcdef",
+        "data_center_id": "US-KS-2",
+        "network_volume_id": None,
+        "container_disk_gb": 120,
+        "container_registry_auth_id": None,
+        "gpu_count": 1,
+        "image_name": None,
+        "gpu_type_id_override": None,
+        "allowed_cuda_versions": None,
+        "docker_start_cmd": [],
+        "gpu": "RTX 4090",
+        "hourly_usd": 0.69,
+        "attempt": attempt,
+        "started_ts": time.time(),
+    }
 
 
 def _spec(
@@ -704,14 +731,7 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
     public = _spec(package=None, resolved_sha="")
     worker = _spec(package=package)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    remote = {
-        "provider": "runpod",
-        "endpoint_id": "ep",
-        "job_id": "job",
-        "key_fingerprint": "rpk-0123456789ab",
-        "attempt": 0,
-        "started_ts": time.time(),
-    }
+    remote = _runpod_remote()
     status = _prepared_status(public, worker, state="running")
     status.remote = remote
     runner._save_status(
@@ -771,14 +791,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
     public = _spec(package=None, resolved_sha="")
     worker = _spec(package=package)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    remote = {
-        "provider": "runpod",
-        "endpoint_id": "ep",
-        "job_id": "job",
-        "key_fingerprint": "rpk-0123456789ab",
-        "attempt": 0,
-        "started_ts": time.time(),
-    }
+    remote = _runpod_remote()
     status = _prepared_status(public, worker, state="running")
     status.remote = remote
     deadline_at = status.created_at + worker.gpu.max_wall_seconds

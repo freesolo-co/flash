@@ -7,7 +7,7 @@ This is an operator deployment, not a one-command install: you supply the GPU cr
 you hold the auth key, and you decide which of the three providers to use. What it gets
 you is the whole training path - SFT, GRPO, and on-policy distillation on verl with
 colocated vLLM rollouts, the allocator, the stall watchdog, checkpoint streaming, and
-endpoint GC - pointed at hardware you pay for directly.
+exact provider-resource cleanup - pointed at hardware you pay for directly.
 
 ## What you need
 
@@ -58,12 +58,8 @@ lives in its own venv, and a plain `pip install freesolo` lands in your shell's 
 environment and refuses a generic `github:` ref outright, which is the only kind a standalone plane
 accepts - so installing the SDK does not make it usable self-hosted.)
 
-The `server` extra pulls in `runpod-flash`, which declares its own `flash` console script.
-Whichever distribution installs last wins, so on a plane host the bare `flash` command may launch
-RunPod's CLI instead of this one - it exits 0 and does nothing, which is easy to miss. Use
-**`flash-cli`**: the same CLI under a name nothing else claims. Check with `flash --help`; if it
-does not mention `train`, use `flash-cli` (or `python -m flash.cli`) wherever this guide says
-`flash`. A client-only machine that never installs the `server` extra is unaffected.
+`flash-cli` is retained as a stable alias of `flash` for existing operator automation. From a
+checkout, `uv run python -m flash.cli` invokes the same CLI.
 
 `flash-server` speaks plain HTTP. For anything but loopback, put a TLS-terminating reverse proxy
 (nginx, Caddy, a cloud load balancer) in front of it and point DNS for your hostname at the proxy -
@@ -235,8 +231,82 @@ provision. Startup fails only when **all three** are missing.
 
 A single RunPod key works. It logs a warning at startup because a one-account pool cannot
 ride out that account's quota or credit exhaustion by moving to another - an availability
-property, not a correctness one. Runs still allocate, and idle endpoints are still reaped
-within the account you configured.
+property, not a correctness one. Multiple comma-separated keys are tried account by account;
+each persisted Pod handle records the complete non-secret fingerprint of its owning key so
+polling and teardown continue against that exact account after failover.
+
+Managed RunPod training uses Secure Cloud, on-demand, non-interruptible Pods. Each attempt
+creates one opaque payload secret and one exact Pod with the authored GPU count. The provider
+API key remains control-plane-only; the Pod receives only the opaque secret reference. If the
+worker image is private, set `RUNPOD_CONTAINER_REGISTRY_AUTH_ID` to a RunPod registry credential
+id. Shared model caches use account-owned network volumes and are preserved by run cleanup.
+Cancellation, recovery, and the periodic orphan sweep require confirmed Pod and payload-secret
+absence before a strict cleanup record is retired.
+
+## RunPod Serverless to Pod maintenance cutover
+
+Use this exact order when upgrading a plane that previously launched managed RunPod Serverless
+training endpoints:
+
+1. Pause new training submissions.
+2. Drain every old Serverless training job.
+3. Inventory every configured account with the command below. Delete each endpoint it reports by
+   exact id in that owning RunPod account, then rerun the command until it exits successfully.
+4. Preserve the shared model-cache network volumes.
+5. Deploy the Pod-only Flash release.
+6. Run one minimal training launch and verify its artifact, exact Pod teardown, and payload-secret absence.
+7. Rerun the endpoint inventory and require another successful empty result.
+8. Reopen submissions.
+
+The old training path named its endpoints `flash-*`; RunPod could expose the same endpoint as
+`live-flash-*`. This check queries every comma-separated `RUNPOD_API_KEY` account independently,
+prints only endpoint ids and names, exits nonzero if any account cannot be listed, and exits nonzero
+while either legacy name remains. It reads credentials from the environment and never places them in
+command arguments:
+
+```bash
+uv run python - <<'PY'
+import json
+import os
+import sys
+import urllib.request
+
+keys = [value.strip() for value in os.environ.get("RUNPOD_API_KEY", "").split(",") if value.strip()]
+if not keys:
+    raise SystemExit("RUNPOD_API_KEY has no configured accounts")
+
+remaining = []
+for account, key in enumerate(keys, start=1):
+    request = urllib.request.Request(
+        "https://rest.runpod.io/v1/endpoints",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            rows = json.load(response)
+    except Exception as exc:
+        print(f"account {account}: endpoint inventory failed: {type(exc).__name__}", file=sys.stderr)
+        raise SystemExit(2) from None
+    if not isinstance(rows, list):
+        raise SystemExit(f"account {account}: endpoint inventory was not a list")
+    for row in rows:
+        if not isinstance(row, dict):
+            raise SystemExit(f"account {account}: endpoint inventory row was invalid")
+        endpoint_id = row.get("id")
+        name = row.get("name")
+        if isinstance(name, str) and (name.startswith("flash-") or name.startswith("live-flash-")):
+            remaining.append((account, endpoint_id, name))
+
+for account, endpoint_id, name in remaining:
+    print(f"account {account}: delete endpoint id={endpoint_id!r} name={name!r}")
+if remaining:
+    raise SystemExit(f"{len(remaining)} legacy training endpoint(s) remain")
+print("all configured RunPod accounts contain no legacy training endpoints")
+PY
+```
+
+Do not deploy the Pod-only release while old Serverless jobs are still active. The Pod release
+intentionally contains no endpoint queue, billing, or compatibility cleanup path.
 
 ## What `FLASH_STANDALONE=1` does
 
@@ -316,13 +386,9 @@ nobody had checked. Writing the entry means the numbers are real.
 Gated repos (Llama among them) still require you to have accepted the licence on your HF
 account, and private repos need `HF_TOKEN` to have read access.
 
-> **RunPod endpoint concurrency is not capped by Flash**, on a self-hosted plane or a
-> managed one. Flash used to carry a slot store intended to hold the account to a
-> 58-endpoint ceiling, but it was claimed from a code path the live deploy replaced and so
-> never enforced anything; it has been removed rather than left to imply a guarantee. If
-> you expect many concurrent runs, cap them upstream of Flash or raise the worker quota on
-> your RunPod account - otherwise a large enough burst hits RunPod's account limit and the
-> excess deploys fail there.
+> **RunPod Pod concurrency is not capped by Flash.** If you expect many concurrent runs,
+> cap them upstream or raise the Pod quota on each configured RunPod account. A large enough
+> burst otherwise reaches the provider limit and the excess Pod creations fail there.
 
 ### The security model
 
