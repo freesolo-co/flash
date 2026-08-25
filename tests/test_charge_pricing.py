@@ -427,36 +427,74 @@ def test_actual_steps_run_reads_current_fence_progress():
             progress=progress,
         )
 
-    assert runner_costs.actual_steps_run(
-        status({"attempt_id": 2, "fence": 9, "completed_steps": 7})
-    ) == 7
+    assert (
+        runner_costs.actual_steps_run(status({"attempt_id": 2, "fence": 9, "completed_steps": 7}))
+        == 7
+    )
     assert runner_costs.actual_steps_run(status(None)) == 0
-    assert runner_costs.actual_steps_run(
-        status({"attempt_id": 1, "fence": 8, "completed_steps": 12})
-    ) == 0
-    assert runner_costs.actual_steps_run(
-        status(
-            {
-                "attempt_id": 2,
-                "fence": 9,
-                "training_entered": True,
-                "completed_steps": 0,
-            }
+    assert (
+        runner_costs.actual_steps_run(status({"attempt_id": 1, "fence": 8, "completed_steps": 12}))
+        == 0
+    )
+    assert (
+        runner_costs.actual_steps_run(
+            status(
+                {
+                    "attempt_id": 2,
+                    "fence": 9,
+                    "training_entered": True,
+                    "completed_steps": 0,
+                }
+            )
         )
-    ) == 1
-    assert runner_costs.actual_steps_run(
-        status(
-            {
-                "attempt_id": 2,
-                "fence": 9,
-                "training_entered": False,
-                "completed_steps": 0,
-            }
+        == 1
+    )
+    assert (
+        runner_costs.actual_steps_run(
+            status(
+                {
+                    "attempt_id": 2,
+                    "fence": 9,
+                    "training_entered": False,
+                    "completed_steps": 0,
+                }
+            )
         )
-    ) == 0
+        == 0
+    )
 
 
 # --------------------------------------------------------------------------- cancel re-pricing
+
+
+def _attempt_progress(
+    completed_steps: int | None,
+    *,
+    attempt_id: int = 0,
+    fence: int = 1,
+    training_entered: bool = True,
+) -> dict:
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    attempt = AttemptRecord(
+        attempt_id=attempt_id,
+        fence=fence,
+        state="active",
+        reserved_at=1.0,
+        grant_deadline_at=2.0,
+        work_deadline_at=3.0,
+        result_deadline_at=5.0,
+        run_deadline_at=4.0,
+    )
+    progress = None
+    if completed_steps is not None:
+        progress = {
+            "attempt_id": attempt_id,
+            "fence": fence,
+            "training_entered": training_entered,
+            "completed_steps": completed_steps,
+        }
+    return {"attempt": attempt.to_dict(), "progress": progress}
 
 
 def test_cancel_run_prices_mid_training_cancel_at_actual_steps(monkeypatch, tmp_path):
@@ -472,7 +510,7 @@ def test_cancel_run_prices_mid_training_cancel_at_actual_steps(monkeypatch, tmp_
             spec=spec.to_dict(),
             billing_context={"org_id": "o"},
             billing_state="pending",
-            last_heartbeat={"stage": "rl_step", "step": 10},
+            **_attempt_progress(10),
         )
     )
 
@@ -506,7 +544,7 @@ def test_cancel_near_completion_never_bills_above_the_accepted_quote(monkeypatch
             billing_context={"org_id": "o"},
             billing_state="pending",
             estimated_cost_usd=accepted_quote,
-            last_heartbeat={"stage": "rl_step", "step": 19},
+            **_attempt_progress(19),
         )
     )
 
@@ -535,7 +573,7 @@ def test_cancel_run_prorates_the_persisted_quote(monkeypatch, tmp_path):
             billing_context={"org_id": "o"},
             billing_state="pending",
             estimated_cost_usd=8.0,
-            last_heartbeat={"stage": "rl_step", "step": 10},
+            **_attempt_progress(10),
         )
     )
 
@@ -583,11 +621,12 @@ def test_cancel_run_prices_the_rented_basis_after_teardown_clears_the_handle(mon
                 "gpu": "H100",
                 "hourly_usd": 1.0,
                 "attempt": 1,
+                "fence": 1,
                 "started_ts": 1.0,
                 "allocated_gpu": "H100",
                 "allocated_gpu_count": 2,
             },
-            last_heartbeat={"stage": "sft_step", "step": 1},
+            **_attempt_progress(1, attempt_id=1),
         )
     )
 
@@ -631,7 +670,7 @@ def test_cancel_run_with_malformed_quote_still_settles_as_a_billing_failure(monk
             billing_context={"org_id": "o"},
             billing_state="pending",
             estimated_cost_usd="not-a-number",
-            last_heartbeat={"stage": "rl_step", "step": 10},
+            **_attempt_progress(10),
         )
     )
 
@@ -656,7 +695,7 @@ def test_cancel_run_before_any_step_is_free(monkeypatch, tmp_path):
             spec=spec.to_dict(),
             billing_context={"org_id": "o"},
             billing_state="pending",
-            last_heartbeat=None,  # cancelled during cold-start/setup, no training step reported
+            **_attempt_progress(None),
         )
     )
 
