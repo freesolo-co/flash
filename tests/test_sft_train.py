@@ -4954,6 +4954,7 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
         os.makedirs(adapter_dir, exist_ok=True)
         with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "wb") as fh:
             fh.write(b"w" * 2048)
+        pathlib.Path(adapter_dir, "adapter_config.json").write_text("{}")
 
     rl_train_module = rl_checkpoints._rl_train()
     monkeypatch.setattr(rl_train_module, "export_peft_adapter", fake_export)
@@ -4968,6 +4969,7 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     )
 
     monkeypatch.setattr(rl_checkpoints._w, "upload_resume_checkpoint", lambda *a, **kw: True)
+    monkeypatch.setattr(rl_checkpoints._w, "hf_upload_folder", lambda *a, **kw: True)
 
     local_dir = tmp_path / "ckpts"
     export_root = tmp_path / "rl-exports"
@@ -4977,10 +4979,15 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     # step exactly as it does in a real run.
     (local_dir / "latest_checkpointed_iteration.txt").write_text("4")
 
+    metric_evidence = rl_train_module._StepMetricState(resume_step=0)
+    for step in range(1, 5):
+        metric_evidence.record_grad_norm(step, 0.25)
+
     uploader = rl_checkpoints._VerlResumeUploader(
         local_dir=str(local_dir),
         resume_step=0,
         required_steps=(4,),
+        metric_evidence=metric_evidence,
         export_root=str(export_root),
         python_bin="/verl/python",
         model_id="org/model",
@@ -4994,6 +5001,7 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
         if step in uploader.required_steps and step not in uploader.staged_adapters:
             uploader.staged_adapters[step] = uploader._stage_deployable(step, path)
             uploader.lifecycle.mark_staged(step)
+            uploader._make_required_adapter_durable(step, uploader.staged_adapters[step])
             uploader._publish_ready()
         uploader.lifecycle.mark_discovered(step)
     uploader._publish_ready()
