@@ -128,6 +128,9 @@ serve-runtime = [
 dev = [
     "mypy>=1.13.0",
     "pytest>=9.0.3",
+    # rollout identity tests serialize generated actor classes directly. the removed runpod sdk
+    # supplied cloudpickle transitively, so keep the test contract explicit after the pod cutover.
+    "cloudpickle>=3.1,<4",
     # dependency contract tests parse exact pins without relying on a transitive install.
     "packaging>=24,<27",
     # Upper bound tracks uv.lock (ruff 0.16.x), which is what CI lints with. Without it, an
@@ -220,6 +223,9 @@ conflicts = [
 dev = [
     "mypy>=1.13.0",
     "pytest>=9.0.3",
+    # rollout identity tests serialize generated actor classes directly. the removed runpod sdk
+    # supplied cloudpickle transitively, so keep the test contract explicit after the pod cutover.
+    "cloudpickle>=3.1,<4",
     # dependency contract tests parse exact pins without relying on a transitive install.
     "packaging>=24,<27",
     # Keep in lockstep with the `dev` extra above and with uv.lock.

@@ -180,9 +180,10 @@ def test_dockerfile_serve_uses_existing_cuda_family_and_frozen_lock() -> None:
     # image states a pytorch base whose cuda matches its own stack.
     assert base.startswith("FROM pytorch/pytorch:")
     assert "-cuda13." in base, "serving needs a cuda 13 base for vllm's compiled extension"
-    assert next(line for line in worker.splitlines() if line.startswith("FROM ")).startswith(
-        "FROM pytorch/pytorch:"
+    worker_runtime = next(
+        line for line in worker.splitlines() if line.startswith("FROM pytorch/pytorch:")
     )
+    assert "-cuda12.8-" in worker_runtime
     assert "libcudart.so.13" in source, "the cuda pairing must be asserted at build time"
     # The shared base ships /usr/lib/python3.12/EXTERNALLY-MANAGED, so a pip install into the
     # system interpreter fails with "externally-managed-environment" (PEP 668) unless this is
