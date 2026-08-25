@@ -483,7 +483,7 @@ def stub_serving_registry(monkeypatch):
     """Patch GET /adapters to return the given records (deploy read-back verification)."""
 
     def _stub(*records: dict):
-        import flash.serve.request.transport as serving_transport
+        import httpx
 
         class _RegistryResp:
             status_code = 200
@@ -494,6 +494,6 @@ def stub_serving_registry(monkeypatch):
             def json(self) -> dict:
                 return {"ok": True, "adapters": list(records)}
 
-        monkeypatch.setattr(serving_transport.httpx, "get", lambda *a, **k: _RegistryResp())
+        monkeypatch.setattr(httpx, "get", lambda *a, **k: _RegistryResp())
 
     return _stub

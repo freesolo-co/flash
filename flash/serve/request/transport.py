@@ -5,8 +5,10 @@ from __future__ import annotations
 import atexit
 import os
 import threading
+from typing import TYPE_CHECKING
 
-import httpx
+if TYPE_CHECKING:
+    import httpx
 
 from flash.serve.contract.errors import ServingError
 from flash.serve.contract.responses import serving_status_error
@@ -31,6 +33,8 @@ def _url_origin(url: httpx.URL) -> tuple[str, str, int | None]:
 
 def _configured_serving_origin() -> tuple[str, str, int | None] | None:
     """Return the configured serving origin, or None when it cannot be parsed."""
+    import httpx
+
     configured = (os.environ.get("FREESOLO_SERVING_URL") or "").strip()
     base = serving_control_url(configured or default_serving_url())
     try:
@@ -58,6 +62,8 @@ def _strip_internal_key_off_origin(request: httpx.Request) -> None:
 
 
 def _new_serving_client(**kwargs) -> httpx.Client:
+    import httpx
+
     return httpx.Client(
         follow_redirects=True,
         max_redirects=_MAX_REDIRECTS,
@@ -76,6 +82,8 @@ def _http_client() -> httpx.Client:
 
 
 def _chat_http_client() -> httpx.Client:
+    import httpx
+
     global _CHAT_HTTP_CLIENT
     if _CHAT_HTTP_CLIENT is None:
         with _HTTP_CLIENT_LOCK:
@@ -87,6 +95,8 @@ def _chat_http_client() -> httpx.Client:
 
 
 def _stream_http_client() -> httpx.Client:
+    import httpx
+
     global _STREAM_HTTP_CLIENT
     if _STREAM_HTTP_CLIENT is None:
         with _HTTP_CLIENT_LOCK:
@@ -118,6 +128,8 @@ def serving_request(
     timeout_s: float | None = None,
 ) -> httpx.Response:
     """Issue a serving request and translate transport failures."""
+    import httpx
+
     timeout = 60.0 if timeout_s is None else min(60.0, max(0.0, float(timeout_s)))
     kwargs: dict = {
         "headers": _internal_key_header(),

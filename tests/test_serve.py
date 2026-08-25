@@ -11,6 +11,7 @@ import json
 import sys
 import types
 
+import httpx
 import pytest
 
 import flash.serve.contract.errors as serving_errors
@@ -32,11 +33,11 @@ def _stub_shared_http_client(monkeypatch):
 
     class _Client:
         def request(self, method, url, **kwargs):
-            return getattr(transport.httpx, method.lower())(url, **kwargs)
+            return getattr(httpx, method.lower())(url, **kwargs)
 
         def post(self, url, **kwargs):
             timeout = kwargs.pop("timeout", None)
-            client = transport.httpx.Client(
+            client = httpx.Client(
                 follow_redirects=True,
                 max_redirects=100,
                 timeout=timeout,
@@ -45,7 +46,7 @@ def _stub_shared_http_client(monkeypatch):
 
         def stream(self, method, url, **kwargs):
             timeout = kwargs.pop("timeout", None)
-            client = transport.httpx.Client(
+            client = httpx.Client(
                 follow_redirects=True,
                 max_redirects=100,
                 timeout=timeout,
@@ -145,12 +146,12 @@ def _capture_registration_body(
         seen["json"] = json
         return _Resp()
 
-    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "post", fake_post)
     run_id = deploy_kwargs.get("run_id", "flash-7-abcd")
     stub_serving_registry(
         {"adapter_id": run_id, "subfolder": f"{deploy_kwargs['adapter_prefix']}/adapter"}
     )
-    registry_get = serving_transport.httpx.get
+    registry_get = httpx.get
 
     class _HealthResp(_Resp):
         def json(self):
@@ -166,7 +167,7 @@ def _capture_registration_body(
             return _HealthResp()
         return registry_get(url, **kwargs)
 
-    monkeypatch.setattr(serving_transport.httpx, "get", fake_get)
+    monkeypatch.setattr(httpx, "get", fake_get)
     d.deploy_adapter(**deploy_kwargs)
     return seen["json"]
 
@@ -483,7 +484,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
         seen["follow_redirects"] = follow_redirects
         return _Resp()
 
-    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
         {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
@@ -625,13 +626,9 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
 
         def raise_for_status(self):
             if health_case == "http_error":
-                request = serving_transport.httpx.Request("GET", "https://serve.example/healthz")
-                response = serving_transport.httpx.Response(
-                    503, request=request, text="unavailable"
-                )
-                raise serving_transport.httpx.HTTPStatusError(
-                    "unavailable", request=request, response=response
-                )
+                request = httpx.Request("GET", "https://serve.example/healthz")
+                response = httpx.Response(503, request=request, text="unavailable")
+                raise httpx.HTTPStatusError("unavailable", request=request, response=response)
 
         def json(self):
             if health_case == "invalid_json":
@@ -652,16 +649,16 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
     def fake_get(url, **_kwargs):
         assert url == "https://serve.example/healthz"
         if health_case == "unreachable":
-            request = serving_transport.httpx.Request("GET", url)
-            raise serving_transport.httpx.ConnectError("connection refused", request=request)
+            request = httpx.Request("GET", url)
+            raise httpx.ConnectError("connection refused", request=request)
         return _HealthResp()
 
     def fake_post(url, **_kwargs):
         posts.append(url)
         pytest.fail("adapter registration must not be attempted")
 
-    monkeypatch.setattr(serving_transport.httpx, "get", fake_get)
-    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx, "post", fake_post)
 
     with pytest.raises(serving_errors.ServingError, match=match):
         d.deploy_adapter(
@@ -707,8 +704,8 @@ def test_missing_provenance_only_still_deploys(monkeypatch, tmp_path):
         posts.append(url)
         raise RuntimeError("REACHED_POST")  # stop after proving the capability gate let us through
 
-    monkeypatch.setattr(serving_transport.httpx, "get", fake_get)
-    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx, "post", fake_post)
 
     with pytest.raises(RuntimeError, match="REACHED_POST"):
         d.deploy_adapter(
@@ -757,8 +754,8 @@ def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatc
         captured["budget_s"] = budget_s
         return {}
 
-    monkeypatch.setattr(serving_transport.httpx, "get", fake_get)
-    monkeypatch.setattr(serving_transport.httpx, "post", lambda *args, **kwargs: _Resp())
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: _Resp())
     monkeypatch.setattr(d, "_wait_revision_ready", wait_ready)
 
     d.deploy_adapter(
@@ -1242,7 +1239,7 @@ def test_registered_adapter_caps_request_timeout(monkeypatch):
         return Response()
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    monkeypatch.setattr(serving_transport.httpx, "get", fake_get)
+    monkeypatch.setattr(httpx, "get", fake_get)
 
     assert d._registered_adapter("run-1", timeout_s=0.75) is None
     assert seen["timeout"] == 0.75
@@ -1294,7 +1291,7 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_servin
         seen["json"] = json
         return _Resp()
 
-    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
         {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
@@ -1339,7 +1336,7 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
         seen["json"] = json
         return _Resp()
 
-    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
         {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
@@ -1377,9 +1374,9 @@ def test_deploy_propagates_serving_error(monkeypatch, tmp_path):
         status_code = 500
 
         def raise_for_status(self):
-            raise serving_transport.httpx.HTTPStatusError("boom", request=None, response=None)
+            raise httpx.HTTPStatusError("boom", request=None, response=None)
 
-    monkeypatch.setattr(serving_transport.httpx, "post", lambda *a, **k: _Resp())
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp())
     with pytest.raises(ServingError):
         d.deploy_adapter(
             run_id="r1",
@@ -1416,11 +1413,11 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
         seen["follow_redirects"] = follow_redirects
         return _Resp(200)
 
-    monkeypatch.setattr(serving_transport.httpx, "delete", fake_delete)
+    monkeypatch.setattr(httpx, "delete", fake_delete)
     # no registry-readback get: the structured undeploy response (disabled_aliases /
     # disabled_revisions / serving_deregistered) is authoritative.
     monkeypatch.setattr(
-        serving_transport.httpx,
+        httpx,
         "get",
         lambda *a, **k: pytest.fail("undeploy must not read the registry back"),
     )
@@ -1433,7 +1430,7 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
     assert seen["follow_redirects"] is True
 
     # A 404 (already gone) returns an empty list, not an error.
-    monkeypatch.setattr(serving_transport.httpx, "delete", lambda *a, **k: _Resp(404))
+    monkeypatch.setattr(httpx, "delete", lambda *a, **k: _Resp(404))
     assert d.undeploy_adapter("flash-7-abcd")["serving_deregistered"] is False
 
 
@@ -1449,10 +1446,10 @@ def test_undeploy_propagates_serving_error(monkeypatch):
             self.text = "kaboom"
 
         def raise_for_status(self):
-            raise serving_transport.httpx.HTTPStatusError("boom", request=None, response=self)
+            raise httpx.HTTPStatusError("boom", request=None, response=self)
 
     # Non-404 (500) → ServingError carrying the upstream status, not a raw httpx error.
-    monkeypatch.setattr(serving_transport.httpx, "delete", lambda *a, **k: _Resp(500))
+    monkeypatch.setattr(httpx, "delete", lambda *a, **k: _Resp(500))
     with pytest.raises(serving_errors.ServingError) as ei:
         d.undeploy_adapter("flash-7-abcd")
     assert ei.value.status_code == 500
@@ -1462,19 +1459,17 @@ def test_undeploy_propagates_serving_error(monkeypatch):
     # message can raise TypeError before undeploy_adapter() can translate it, so mirror the real
     # undeploy call (DELETE {serving}/adapters/{run_id}).
     def _boom_delete(*a, **k):
-        raise serving_transport.httpx.RequestError(
+        raise httpx.RequestError(
             "no route to host",
-            request=serving_transport.httpx.Request(
-                "DELETE", "https://serve.example/adapters/flash-7-abcd"
-            ),
+            request=httpx.Request("DELETE", "https://serve.example/adapters/flash-7-abcd"),
         )
 
-    monkeypatch.setattr(serving_transport.httpx, "delete", _boom_delete)
+    monkeypatch.setattr(httpx, "delete", _boom_delete)
     with pytest.raises(serving_errors.ServingError):
         d.undeploy_adapter("flash-7-abcd")
 
     # A 404 short-circuits before raise_for_status(), so it stays a no-op success (not a ServingError).
-    monkeypatch.setattr(serving_transport.httpx, "delete", lambda *a, **k: _Resp(404))
+    monkeypatch.setattr(httpx, "delete", lambda *a, **k: _Resp(404))
     assert d.undeploy_adapter("flash-7-abcd")["serving_deregistered"] is False
 
 
@@ -1516,7 +1511,7 @@ def test_chat_classifies_retryable_alias_smoke_503_for_the_expected_revision(mon
         def post(self, *args, **kwargs):
             return Response()
 
-    monkeypatch.setattr(serving_transport.httpx, "Client", Client)
+    monkeypatch.setattr(httpx, "Client", Client)
 
     with pytest.raises(serving_errors.RetryableServingUnavailable) as exc_info:
         d.chat(
@@ -1556,9 +1551,7 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
 
         def __init__(self):
             self.headers = {"Retry-After": "1"}
-            self.request = serving_transport.httpx.Request(
-                "POST", "https://serve.example/v1/chat/completions"
-            )
+            self.request = httpx.Request("POST", "https://serve.example/v1/chat/completions")
 
         def json(self):
             return {
@@ -1570,9 +1563,7 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
             }
 
         def raise_for_status(self):
-            raise serving_transport.httpx.HTTPStatusError(
-                "unavailable", request=self.request, response=self
-            )
+            raise httpx.HTTPStatusError("unavailable", request=self.request, response=self)
 
     class Client:
         def __init__(self, *args, **kwargs):
@@ -1587,9 +1578,9 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
         def post(self, *args, **kwargs):
             return Response()
 
-    monkeypatch.setattr(serving_transport.httpx, "Client", Client)
+    monkeypatch.setattr(httpx, "Client", Client)
 
-    with pytest.raises(serving_transport.httpx.HTTPStatusError):
+    with pytest.raises(httpx.HTTPStatusError):
         d.chat(
             revision,
             [{"role": "user", "content": "hello"}],
@@ -1637,7 +1628,7 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
             seen["headers"] = headers or {}
             return _Resp()
 
-    monkeypatch.setattr(serving_transport.httpx, "Client", _FakeClient)
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
     out = d.chat(
         run_id="flash-7-abcd",
         messages=[{"role": "user", "content": "2+2?"}],
@@ -1741,7 +1732,7 @@ def test_chat_stream_yields_openai_sse_content(monkeypatch):
             seen["headers"] = headers or {}
             return _StreamResp()
 
-    monkeypatch.setattr(serving_transport.httpx, "Client", _FakeClient)
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
 
     chunks = list(
         serving_streaming.chat_stream(
@@ -1786,7 +1777,7 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
         kwargs["transport"] = transport
         return real_client(*args, **kwargs)
 
-    monkeypatch.setattr(serving_transport.httpx, "Client", _client)
+    monkeypatch.setattr(httpx, "Client", _client)
 
     assert list(
         serving_streaming.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])

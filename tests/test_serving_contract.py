@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import types
 
+import httpx
 import pytest
 
 import flash.serve.contract.errors as serving_errors
@@ -25,7 +26,7 @@ from flash.serve.deployment.deploy import Deployment, deploy_adapter, undeploy_a
 def _stub_shared_http_client(monkeypatch):
     class _Client:
         def request(self, method, url, **kwargs):
-            return getattr(serving_transport.httpx, method.lower())(url, **kwargs)
+            return getattr(httpx, method.lower())(url, **kwargs)
 
     client = _Client()
     monkeypatch.setattr(serving_transport, "_http_client", lambda: client)
@@ -144,7 +145,7 @@ def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
     req = httpx.Request("POST", "https://serve.example/adapters")
     resp = httpx.Response(500, text="no base-model engines loaded", request=req)
     _stub_deploy_preconditions(monkeypatch, deploy_mod)
-    monkeypatch.setattr(serving_transport.httpx, "post", lambda *a, **k: resp)
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
         deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0")
@@ -164,7 +165,7 @@ def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     req = httpx.Request("POST", "https://serve.example/adapters")
     resp = httpx.Response(401, text="invalid internal key", request=req)
     _stub_deploy_preconditions(monkeypatch, deploy_mod)
-    monkeypatch.setattr(serving_transport.httpx, "post", lambda *a, **k: resp)
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
         deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0")
@@ -243,7 +244,7 @@ def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch
         raise httpx.ConnectError("connection refused", request=httpx.Request("POST", url))
 
     _stub_deploy_preconditions(monkeypatch, deploy_mod)
-    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "post", fake_post)
     with pytest.raises(ServingError) as ei:
         deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0")
     assert ei.value.status_code is None
@@ -272,7 +273,7 @@ def test_undeploy_calls_freesolo_delete(monkeypatch):
         deleted_urls.append(url)
         return _Resp()
 
-    monkeypatch.setattr(serving_transport.httpx, "delete", fake_delete)
+    monkeypatch.setattr(httpx, "delete", fake_delete)
     out = undeploy_adapter("flash-1-abc")
     assert out["run_id"] == "flash-1-abc"
     assert out["disabled_aliases"] == ["flash-1-abc"]
@@ -288,7 +289,7 @@ def test_undeploy_404_is_clean(monkeypatch):
         def raise_for_status(self):  # pragma: no cover
             raise AssertionError("404 must not raise")
 
-    monkeypatch.setattr(serving_transport.httpx, "delete", lambda *a, **k: _Resp())
+    monkeypatch.setattr(httpx, "delete", lambda *a, **k: _Resp())
     assert undeploy_adapter("flash-1-gone") == {
         "run_id": "flash-1-gone",
         "disabled_aliases": [],

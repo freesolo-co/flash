@@ -255,7 +255,10 @@ def test_status_uses_immutable_identity_for_removed_model(
         seen.append(bundle.spec.adapters[0].base_model)
         return _result(bundle, "absent")
 
-    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _modal)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
+        _modal,
+    )
 
     assert cmd_serve_status(args) == 0
     assert seen == [retired_model]

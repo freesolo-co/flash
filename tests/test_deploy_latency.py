@@ -5,6 +5,7 @@ import sys
 import threading
 import types
 
+import httpx
 import pytest
 
 import flash.serve.contract.errors as serving_errors
@@ -38,7 +39,7 @@ def test_control_http_client_is_reused_and_all_clients_close(monkeypatch):
             self.closed = True
 
     serving_transport._close_http_client()
-    monkeypatch.setattr(serving_transport.httpx, "Client", _Client)
+    monkeypatch.setattr(httpx, "Client", _Client)
 
     serving_transport.serving_request("GET", "https://serve.example/healthz")
     serving_transport.serving_request("POST", "https://serve.example/adapters", json={"id": "r1"})
@@ -89,7 +90,7 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
 
         def __enter__(self):
             if not self.client.pool.acquire(blocking=False):
-                raise serving_transport.httpx.PoolTimeout("pool exhausted", request=self.request)
+                raise httpx.PoolTimeout("pool exhausted", request=self.request)
             return self
 
         def __exit__(self, *_args):
@@ -111,12 +112,12 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
             created.append(self)
 
         def stream(self, method, url, **_kwargs):
-            return _StreamResponse(self, serving_transport.httpx.Request(method, url))
+            return _StreamResponse(self, httpx.Request(method, url))
 
         def request(self, method, url, **_kwargs):
-            request = serving_transport.httpx.Request(method, url)
+            request = httpx.Request(method, url)
             if not self.pool.acquire(blocking=False):
-                raise serving_transport.httpx.PoolTimeout("pool exhausted", request=request)
+                raise httpx.PoolTimeout("pool exhausted", request=request)
             try:
                 return _UndeployResponse()
             finally:
@@ -126,7 +127,7 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
             self.closed = True
 
     serving_transport._close_http_client()
-    monkeypatch.setattr(serving_transport.httpx, "Client", _PoolLimitedClient)
+    monkeypatch.setattr(httpx, "Client", _PoolLimitedClient)
 
     stream = serving_streaming.chat_stream("run-1", [{"role": "user", "content": "hello"}])
     assert next(stream) == "held"
@@ -199,7 +200,7 @@ def test_normal_chat_pool_cannot_starve_control_requests(monkeypatch):
             self.closed = True
 
     serving_transport._close_http_client()
-    monkeypatch.setattr(serving_transport.httpx, "Client", _PoolLimitedClient)
+    monkeypatch.setattr(httpx, "Client", _PoolLimitedClient)
 
     thread = threading.Thread(
         target=lambda: chat_result.append(
@@ -407,7 +408,7 @@ def test_bounded_smoke_chat_uses_isolated_client(monkeypatch):
         def post(self, *_args, **_kwargs):
             return _Response()
 
-    monkeypatch.setattr(serving_transport.httpx, "Client", _Client)
+    monkeypatch.setattr(httpx, "Client", _Client)
     monkeypatch.setattr(
         serving_transport,
         "_http_client",

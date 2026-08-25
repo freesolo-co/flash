@@ -105,16 +105,16 @@ def test_every_shipped_worker_actually_reaches_wandb():
     without_wandb = set()
     for algorithm in ALGORITHMS:
         # JobSpec.phase is the algorithm -> worker-module mapping (grpo runs the rl worker); the
-        # entry module delegates to its {phase}_train.py, which owns the verl launch.
+        # entry modules delegate to the trainer runner that owns the verl launch.
         phase = JobSpec(algorithm=algorithm).phase
         source = "".join(
             (worker_dir / name).read_text()
-            for name in (f"{phase}.py", f"{phase}_train.py")
+            for name in (f"{phase}.py", f"{phase}_train.py", f"{phase}_train_runner.py")
             if (worker_dir / name).exists()
         )
         # resolve_verl_loggers() is what adds "wandb" to trainer.logger. metadata readers do not
         # start a run, so accepting one as evidence would let the warning lie again.
-        if "resolve_verl_loggers" not in source:
+        if "resolve_verl_loggers(" not in source:
             without_wandb.add(algorithm)
 
     # an empty catalog would satisfy the assertion below without having checked anything, so the

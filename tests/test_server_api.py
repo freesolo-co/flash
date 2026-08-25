@@ -16,6 +16,7 @@ import time
 from dataclasses import replace
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 import flash.core.spec as runner_spec
@@ -7328,13 +7329,9 @@ def test_chat_stream_upstream_error_before_first_byte_is_502(api, monkeypatch):
             return False
 
         def raise_for_status(self):
-            request = serving_transport.httpx.Request(
-                "POST", "https://serve.example/v1/chat/completions"
-            )
-            response = serving_transport.httpx.Response(502, request=request)
-            raise serving_transport.httpx.HTTPStatusError(
-                "bad gateway", request=request, response=response
-            )
+            request = httpx.Request("POST", "https://serve.example/v1/chat/completions")
+            response = httpx.Response(502, request=request)
+            raise httpx.HTTPStatusError("bad gateway", request=request, response=response)
 
     class _FakeClient:
         def stream(self, method, url, **kwargs):
