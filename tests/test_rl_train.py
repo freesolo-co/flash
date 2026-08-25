@@ -1299,6 +1299,7 @@ def _overrides_cfg(**over):
         "lora_alpha": 64,
         "target_modules": "all-linear",
         "exclude_modules": None,
+        "fsdp_generation": 2,
         "lr": 1e-5,
         "group_size": 8,
         "prompts_per_step": 16,
@@ -1490,6 +1491,7 @@ def test_build_verl_training_cfg_resolves_expert_targets_from_the_catalog_id():
             "ppo_epochs": 1,
             "steps": 60,
             "warmstart_adapter": "",
+            "fsdp_generation": 2,
             "verl_total_epochs": 1,
             "save_freq": 20,
             "ckpt_to_keep": 1,
@@ -1818,6 +1820,7 @@ def _mem_util_inp(**over):
         "model_revision": "",
         "engine_len": 2048,
         "group_size": 8,
+        "fsdp_generation": 2,
         "lora_rank": 32,
     }
     inp.update(over)
@@ -1897,6 +1900,7 @@ def test_gpu_mem_util_sizing_reaches_the_launch_config():
             "ppo_epochs": 1,
             "steps": 60,
             "warmstart_adapter": "",
+            "fsdp_generation": 2,
             "verl_total_epochs": 1,
             "save_freq": 20,
             "ckpt_to_keep": 1,
@@ -2155,6 +2159,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
             "ppo_epochs": 1,
             "steps": 60,
             "warmstart_adapter": "",
+            "fsdp_generation": 2,
             "model_id": model_id,
             "verl_total_epochs": 2,
             "save_freq": 20,
@@ -2220,6 +2225,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "ppo_epochs": 1,
         "steps": 60,
         "warmstart_adapter": "",
+        "fsdp_generation": 2,
         "model_id": "Qwen/Qwen3.5-9B",
         "verl_total_epochs": 2,
         "save_freq": 20,
@@ -4219,7 +4225,9 @@ def test_build_verl_overrides_enables_resume_mode():
 
 def test_restore_verl_resume_is_a_noop_without_a_checkpoint(tmp_path, monkeypatch):
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: None)
-    assert rl_train._restore_verl_resume(str(tmp_path), world_size=1) == 0
+    assert (
+        rl_train._restore_verl_resume(str(tmp_path), world_size=1, expected_fsdp_generation=2) == 0
+    )
     assert not (tmp_path / "latest_checkpointed_iteration.txt").exists()
 
 
@@ -4237,7 +4245,9 @@ def test_restore_verl_resume_stages_the_checkpoint_where_verl_looks(tmp_path, mo
     local_dir.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(src))
 
-    assert rl_train._restore_verl_resume(str(local_dir), world_size=1) == 7
+    assert (
+        rl_train._restore_verl_resume(str(local_dir), world_size=1, expected_fsdp_generation=2) == 7
+    )
     # verl discovers the checkpoint through this marker plus the global_step_N layout.
     assert (local_dir / "latest_checkpointed_iteration.txt").read_text().strip() == "7"
     assert (local_dir / "global_step_7" / "actor" / "model.safetensors").read_text() == "weights"
@@ -4248,7 +4258,9 @@ def test_restore_verl_resume_rejects_an_unparseable_checkpoint_path(tmp_path, mo
     bad.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(bad))
     with pytest.raises(RuntimeError, match="invalid GRPO resume checkpoint path"):
-        rl_train._restore_verl_resume(str(tmp_path / "ckpt"), world_size=1)
+        rl_train._restore_verl_resume(
+            str(tmp_path / "ckpt"), world_size=1, expected_fsdp_generation=2
+        )
 
 
 def _write_step(local_dir, step):

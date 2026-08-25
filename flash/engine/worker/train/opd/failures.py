@@ -18,6 +18,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from flash.engine.verl_policy import FsdpGeneration
 from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.sft_train import (
     SHIM_FRAGMENT_FAILED_EXIT_CODE,
@@ -27,9 +28,7 @@ from flash.engine.worker.sft_train import (
 from flash.engine.worker.train.opd.bridge import _TeacherAlignmentBridge
 from flash.engine.worker.train.opd.child.bridge import _render_rollout_failure
 from flash.engine.worker.verl.checkpoints import (
-    FsdpGeneration,
-    checkpoint_world_size,
-    resume_checkpoint_is_loadable,
+    inspect_resume_checkpoint,
     resume_topology_matches,
     resume_upload_unavailable,
 )
@@ -386,20 +385,18 @@ def _restore_verl_resume(
         # exactly this checkpoint. discarding it and restarting from step 0 would repeat
         # already-billed teacher work and optimizer steps outside what the gate approved, so an
         # incompatible native checkpoint fails closed here instead of starting fresh.
-        if not resume_checkpoint_is_loadable(
+        inspection = inspect_resume_checkpoint(
             resume,
             world_size=world_size,
             expected_fsdp_generation=expected_fsdp_generation,
-        ):
-            written = checkpoint_world_size(resume)
+        )
+        if not inspection.loadable:
             raise RuntimeError(
                 f"permanent OPD resume failure: pinned resume revision {revision!r} names "
-                f"checkpoint {os.path.basename(resume)}, which is not complete "
-                f"fsdp{expected_fsdp_generation} native state for this attempt's world size "
-                f"{world_size} (stamped world size "
-                f"{written if written is not None else 'unknown'}). restarting from step 0 would "
-                "violate the pinned-resume contract, so this attempt refuses to train; relaunch "
-                f"from a compatible complete fsdp{expected_fsdp_generation} checkpoint."
+                f"checkpoint {os.path.basename(resume)}, rejected because "
+                f"{inspection.diagnostic()}. restarting from step 0 would violate the pinned-resume "
+                "contract, so this attempt refuses to train; relaunch from a compatible complete "
+                f"fsdp{expected_fsdp_generation} checkpoint."
             )
     elif not resume_topology_matches(
         resume,

@@ -17,6 +17,7 @@ import shutil
 import subprocess
 from collections.abc import Sequence
 
+from flash.engine.verl_policy import FsdpGeneration
 from flash.engine.worker.backend_common import (
     CAUSAL_CONV1D_REQUIREMENT,
     FLA_REQUIREMENT,
@@ -864,19 +865,9 @@ def rollout_layered_summon_overrides(target_parameters: Sequence[str] | None) ->
     return ["actor_rollout_ref.rollout.layered_summon=true"]
 
 
-def actor_fsdp_strategy_overrides(*, require_fsdp2: bool) -> list[str]:
-    """render one explicit bare actor strategy override.
-
-    callers state the algorithm's validated requirement instead of letting this shared boundary infer
-    it from targeting. grpo requires fsdp2 for dense and fused-expert actors. opd keeps dense actors on
-    fsdp1 because live opd fsdp2 was not validated, while fused-expert opd requires fsdp2 because peft
-    ``target_parameters`` registers parametrizations on named tensors that fsdp1 cannot preserve.
-
-    this is independent of ``fsdp_config.reshard_after_forward``. that field continues to select the
-    allocator-approved zero-2 or zero-3 behavior within the chosen generation. ``strategy`` is
-    declared in ``actor/dp_actor.yaml``, so the override must stay bare and have exactly one writer.
-    """
-    strategy = "fsdp2" if require_fsdp2 else "fsdp"
+def actor_fsdp_strategy_overrides(fsdp_generation: FsdpGeneration) -> list[str]:
+    """render one explicit bare actor strategy override from the resolved private policy."""
+    strategy = "fsdp2" if fsdp_generation == 2 else "fsdp"
     return [f"actor_rollout_ref.actor.strategy={strategy}"]
 
 

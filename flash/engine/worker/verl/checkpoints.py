@@ -17,9 +17,8 @@ import re
 import shutil
 import subprocess
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import Any
 
-from flash._internal.fileio import reject_duplicate_keys
 from flash.adapters.fused_experts import (
     fused_expert_lora_tensor_pairs,
     is_non_language_lora_key,
@@ -32,6 +31,13 @@ from flash.adapters.lora_rank import (
     lora_tensor_rank_disagrees,
     strict_declared_lora_ranks,
 )
+from flash.engine.verl_checkpoint import (
+    VERL_FSDP_CONFIG_FILE,
+    FsdpCheckpointInspection,
+    FsdpManifestFile,
+    inspect_fsdp_checkpoint_manifest,
+)
+from flash.engine.verl_policy import FsdpGeneration
 from flash.engine.worker.model.lora import (
     _open_safetensors_numpy,
     _read_adapter_tensor_metadata,
@@ -62,6 +68,7 @@ _DISK_EXHAUSTED_MARKERS = (
     "os error 122",
 )
 _SHORT_WRITE_MARKERS = ("unexpected pos",)
+_FSDP_MODEL_SHARD_RE = re.compile(r"model_world_size_(\d+)_rank_\d+\.pt")
 
 # disk size is platform-managed, so checkpoint frequency is the reachable remedy.
 _FEWER_CHECKPOINTS_ADVICE = (
@@ -274,108 +281,41 @@ def undiscovered_checkpoint_dirs(
     return sorted(found)
 
 
-# verl stamps the fsdp generation and writing topology next to the shards on every save. flash reads
-# that authoritative stamp rather than inferring generation from filenames or writing a second one.
-VERL_FSDP_CONFIG_FILE = "fsdp_config.json"
-
-# every native resume requires the model, optimizer, and extra state written by each rank. parsing
-# rank as an integer also exposes duplicate representations such as rank_0 and rank_00.
-_FSDP_SHARD_RE = re.compile(r"(model|optim|extra_state)_world_size_(\d+)_rank_(\d+)\.pt")
-_FSDP_MODEL_SHARD_RE = re.compile(r"model_world_size_(\d+)_rank_\d+\.pt")
-_REQUIRED_FSDP_SHARD_CLASSES = ("model", "optim", "extra_state")
-_REJECT_DUPLICATE_FSDP_CONFIG_KEYS = reject_duplicate_keys(
-    lambda key: ValueError(f"duplicate fsdp config key: {key}")
-)
-
-
-def _valid_positive_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
-
-
-def _checkpoint_fsdp_stamp(actor_dir: str) -> tuple[int, int] | None:
-    """return the stamped ``(fsdp version, world size)``, or none when either field is invalid."""
-    try:
-        with open(os.path.join(actor_dir, VERL_FSDP_CONFIG_FILE), encoding="utf-8") as file:
-            decoded = json.load(file, object_pairs_hook=_REJECT_DUPLICATE_FSDP_CONFIG_KEYS)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(decoded, dict):
-        return None
-    version = decoded.get("FSDP_version")
-    world_size = decoded.get("world_size")
-    if not _valid_positive_int(version) or not _valid_positive_int(world_size):
-        return None
-    return version, world_size
-
-
-def _readable_regular_file(path: str) -> bool:
-    """whether ``path`` resolves to a nonempty regular file readable in binary mode."""
-    if not os.path.isfile(path):
-        return False
-    try:
-        with open(path, "rb") as file:
-            return file.read(1) != b""
-    except OSError:
-        return False
-
-
-def _complete_fsdp_shards(actor_dir: str, *, world_size: int) -> bool:
-    """whether the directory has exactly the canonical, readable native fsdp shard set."""
-    try:
-        names = os.listdir(actor_dir)
-    except OSError:
-        return False
-    actual: set[str] = set()
-    for name in names:
-        match = _FSDP_SHARD_RE.fullmatch(name)
-        if match is None:
-            if any(name.startswith(f"{kind}_world_size_") for kind in _REQUIRED_FSDP_SHARD_CLASSES):
-                return False
-            continue
-        _kind, width_text, rank_text = match.groups()
-        width = int(width_text)
-        rank = int(rank_text)
-        if width_text != str(width) or rank_text != str(rank):
-            return False
-        actual.add(name)
-    expected = {
-        f"{kind}_world_size_{world_size}_rank_{rank}.pt"
-        for kind in _REQUIRED_FSDP_SHARD_CLASSES
-        for rank in range(world_size)
-    }
-    if actual != expected:
-        return False
-    return all(_readable_regular_file(os.path.join(actor_dir, name)) for name in expected)
-
-
-def checkpoint_world_size(step_dir: str) -> int | None:
-    """the stamped rank count for ``step_dir``, or none when the native stamp is unreadable."""
-    stamp = _checkpoint_fsdp_stamp(resolve_checkpoint_actor_dir(step_dir))
-    return stamp[1] if stamp is not None else None
-
-
-FsdpGeneration = Literal[1, 2]
-
-
-def resume_checkpoint_is_loadable(
+def inspect_resume_checkpoint(
     resume_dir: str,
     *,
     world_size: int,
     expected_fsdp_generation: FsdpGeneration,
-) -> bool:
-    """whether the expected fsdp actor can load ``resume_dir`` without recovery.
-
-    native resume fails closed unless verl's stamp names the exact expected generation and current
-    rank count, and every rank has exactly one model, optimizer, and extra-state shard. exported peft
-    warm starts do not use this path and remain independent of native checkpoint generation.
-
-    quiet by design: ``resume_topology_matches`` below is the loud form that explains a discard, but
-    candidate ranking must probe several downloads before making any discard decision.
-    """
+) -> FsdpCheckpointInspection:
+    """Parse and validate one local native checkpoint exactly once."""
     actor_dir = resolve_checkpoint_actor_dir(resume_dir)
-    if _checkpoint_fsdp_stamp(actor_dir) != (expected_fsdp_generation, world_size):
-        return False
-    return _complete_fsdp_shards(actor_dir, world_size=world_size)
+    try:
+        with open(os.path.join(actor_dir, VERL_FSDP_CONFIG_FILE), "rb") as file:
+            stamp_raw = file.read()
+    except OSError:
+        stamp_raw = None
+    try:
+        names = os.listdir(actor_dir)
+    except OSError:
+        names = []
+    files = []
+    for name in names:
+        path = os.path.join(actor_dir, name)
+        size = None
+        if os.path.isfile(path):
+            try:
+                with open(path, "rb") as file:
+                    if file.read(1):
+                        size = os.path.getsize(path)
+            except OSError:
+                pass
+        files.append(FsdpManifestFile(name, size if size is not None else 0))
+    return inspect_fsdp_checkpoint_manifest(
+        stamp_raw,
+        files,
+        expected_generation=expected_fsdp_generation,
+        expected_world_size=world_size,
+    )
 
 
 def resume_topology_matches(
@@ -384,30 +324,20 @@ def resume_topology_matches(
     world_size: int,
     expected_fsdp_generation: FsdpGeneration,
     job_label: str,
+    inspection: FsdpCheckpointInspection | None = None,
 ) -> bool:
-    """whether the expected fsdp actor can load ``resume_dir``'s complete native state.
-
-    infra recovery may change card count, and the training paths intentionally use different fsdp
-    generations. verl native checkpoints are not cross-generation or cross-width artifacts, and a
-    partial upload can omit one state class or rank while still leaving a plausible directory.
-    discarding any unverified native state restarts from step 0 through the existing recovery path.
-
-    there is no single-gpu exemption: the retry's current shape is not evidence of the checkpoint's
-    writer shape. the authoritative fsdp stamp and exact rank-complete model, optimizer, and
-    extra-state shard sets must all agree before staging.
-    """
-    if resume_checkpoint_is_loadable(
-        resume_dir,
-        world_size=world_size,
-        expected_fsdp_generation=expected_fsdp_generation,
-    ):
+    """Inspect one native checkpoint and report why it is discarded."""
+    if inspection is None:
+        inspection = inspect_resume_checkpoint(
+            resume_dir,
+            world_size=world_size,
+            expected_fsdp_generation=expected_fsdp_generation,
+        )
+    if inspection.loadable:
         return True
-    written = checkpoint_world_size(resume_dir)
     print(
-        f"[{job_label}] discarding resume checkpoint {os.path.basename(resume_dir)}: it is not a "
-        f"complete fsdp{expected_fsdp_generation} checkpoint; its stamped world size "
-        f"{written if written is not None else 'unknown'} and this attempt runs at {world_size}; "
-        "restarting from step 0",
+        f"[{job_label}] discarding resume checkpoint {os.path.basename(resume_dir)}: "
+        f"{inspection.diagnostic()}; restarting from step 0",
         flush=True,
     )
     return False
@@ -420,6 +350,7 @@ def stage_verl_resume(
     job_label: str,
     world_size: int,
     expected_fsdp_generation: FsdpGeneration,
+    inspection: FsdpCheckpointInspection | None = None,
 ) -> int:
     """stage a downloaded ``checkpoint-N`` into local_dir where verl looks; return its step.
 
@@ -440,6 +371,7 @@ def stage_verl_resume(
         world_size=world_size,
         expected_fsdp_generation=expected_fsdp_generation,
         job_label=job_label,
+        inspection=inspection,
     ):
         return 0
     shutil.copytree(resume_dir, os.path.join(local_dir, f"global_step_{step}"), dirs_exist_ok=True)

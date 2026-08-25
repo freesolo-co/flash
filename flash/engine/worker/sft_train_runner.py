@@ -17,6 +17,7 @@ from math import gcd
 from flash.adapters.targets import resolve_lora_targeting
 from flash.core.catalog import get_model
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
+from flash.engine.verl_policy import _resolve_fsdp_generation
 from flash.engine.worker import sft_train as _sft_train
 from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
@@ -620,6 +621,8 @@ def _prepare_sft_child(
     # probe is part of the setup silence that wrap exists to cover, and because a packed run must
     # take the RAISING gate there rather than the soft form.
     world_size, micro_batch = _resolve_sft_width_and_micro_batch(options, data, model)
+    target_parameters = _w.lora_target_parameters(options.model_id)
+    fsdp_generation = _resolve_fsdp_generation("sft", target_parameters)
     config = {
         "train_files": data.train_file,
         "train_batch_size": model.train_batch_size,
@@ -632,7 +635,8 @@ def _prepare_sft_child(
         "lora_alpha": model.lora_alpha,
         "target_modules": model.target_modules,
         "exclude_modules": None,
-        "target_parameters": _w.lora_target_parameters(options.model_id),
+        "target_parameters": target_parameters,
+        "fsdp_generation": fsdp_generation,
         "lora_adapter_path": model.warmstart_adapter,
         "ulysses_sp_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
         "lr": options.learning_rate,
@@ -683,7 +687,11 @@ def _prepare_sft_child(
     # shards by data and the width is bounded by the batch and the row count, so the two differ
     # whenever either fails to divide the allocation -- passing gpu_count here would discard a
     # checkpoint that matches the run about to start, and keep one that does not.
-    resume_step = _sft_train._restore_verl_resume(options.paths.local_dir, world_size=world_size)
+    resume_step = _sft_train._restore_verl_resume(
+        options.paths.local_dir,
+        world_size=world_size,
+        expected_fsdp_generation=fsdp_generation,
+    )
     watcher = _sft_train._VerlCheckpointWatcher(
         local_dir=options.paths.local_dir,
         export_root=options.paths.export_root,

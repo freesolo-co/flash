@@ -3751,7 +3751,7 @@ def test_restore_verl_resume_rejects_the_other_fsdp_generation(
 
     with pytest.raises(
         RuntimeError,
-        match=rf"not complete fsdp{expected_fsdp_generation} native state",
+        match="fsdp generation mismatch",
     ):
         _restore_verl_resume(
             str(local_dir),
@@ -6453,6 +6453,7 @@ def _config(**overrides):
         "lora_alpha": 64,
         "target_modules": "all-linear",
         "exclude_modules": None,
+        "fsdp_generation": 1,
         "learning_rate": 1e-5,
         "local_dir": "/w/checkpoints",
         "save_freq": 20,
@@ -6517,6 +6518,8 @@ def _materialized_opd_save_freq(
         update_horizon=horizon,
         local_dir="/checkpoints",
         prompt_pool_fingerprint="fingerprint",
+        target_parameters=target_parameters,
+        fsdp_generation=2 if target_parameters else 1,
     )
     monkeypatch.setattr(runner._opd_train, "_cached_model_path", lambda *_args: "/model")
     monkeypatch.setattr(runner._opd_train, "resolve_verl_loggers", lambda _caps: ["console"])
@@ -6524,7 +6527,9 @@ def _materialized_opd_save_freq(
     monkeypatch.setattr(
         runner._opd_train._w,
         "lora_target_parameters",
-        lambda _model_id: target_parameters,
+        lambda _model_id: (_ for _ in ()).throw(
+            AssertionError("resolved OPD targeting must not be recomputed")
+        ),
     )
     monkeypatch.setattr(runner, "_write_child_shims", lambda *_args: ("entry.py", "reward.py"))
 
@@ -6677,7 +6682,12 @@ def test_overrides_omit_layered_summon_for_dense_models():
     ],
 )
 def test_overrides_select_the_explicit_opd_fsdp_strategy(target_parameters, expected_strategy):
-    built = build_opd_overrides(_config(target_parameters=target_parameters))
+    built = build_opd_overrides(
+        _config(
+            target_parameters=target_parameters,
+            fsdp_generation=2 if target_parameters else 1,
+        )
+    )
     overrides = dict(value.split("=", 1) for value in built)
     assert overrides["actor_rollout_ref.actor.strategy"] == expected_strategy
     # dict() would silently keep the last of a duplicated key, so count the exact bare override
@@ -6792,6 +6802,8 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
             lora_rank=32,
             lora_alpha=64,
             target_modules="all-linear",
+            target_parameters=None,
+            fsdp_generation=1,
             exclude_modules="text-export-policy",
             warmstart_adapter=None,
         ),
@@ -6868,6 +6880,8 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
                 lora_rank=32,
                 lora_alpha=64,
                 target_modules="all-linear",
+                target_parameters=None,
+                fsdp_generation=1,
                 exclude_modules=None,
                 warmstart_adapter=None,
             ),

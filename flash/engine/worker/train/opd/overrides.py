@@ -39,6 +39,7 @@ _REQUIRED_OVERRIDE_KEYS = (
     "lora_rank",
     "lora_alpha",
     "target_modules",
+    "fsdp_generation",
     "learning_rate",
     "local_dir",
     "save_freq",
@@ -151,7 +152,7 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         f"actor_rollout_ref.actor.fsdp_config.reshard_after_forward={_hydra_val(bool(config.get('reshard_after_forward', True)))}",
         # dense opd stays on the live-validated fsdp1 path. fused-expert target_parameters requires
         # fsdp2 so peft can parametrize named tensors. reshard_after_forward remains independent.
-        *actor_fsdp_strategy_overrides(require_fsdp2=bool(config.get("target_parameters"))),
+        *actor_fsdp_strategy_overrides(config["fsdp_generation"]),
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the rl driver.
         *trainer_dtype_overrides(),
         "actor_rollout_ref.rollout.name=vllm",

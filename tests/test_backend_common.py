@@ -4859,15 +4859,32 @@ def test_rollout_layered_summon_uses_a_bare_override_not_an_append():
 
 
 @pytest.mark.parametrize(
-    ("require_fsdp2", "expected"),
-    [(False, "fsdp"), (True, "fsdp2")],
+    ("fsdp_generation", "expected"),
+    [(1, "fsdp"), (2, "fsdp2")],
 )
-def test_actor_fsdp_strategy_renders_the_explicit_requirement(require_fsdp2, expected):
+def test_actor_fsdp_strategy_renders_the_resolved_generation(fsdp_generation, expected):
     from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
 
-    assert actor_fsdp_strategy_overrides(require_fsdp2=require_fsdp2) == [
+    assert actor_fsdp_strategy_overrides(fsdp_generation) == [
         f"actor_rollout_ref.actor.strategy={expected}"
     ]
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "target_parameters", "expected"),
+    [
+        ("sft", None, 2),
+        ("sft", ["mlp.experts.gate_up_proj"], 2),
+        ("grpo", None, 2),
+        ("grpo", ["mlp.experts.gate_up_proj"], 2),
+        ("opd", None, 1),
+        ("opd", ["mlp.experts.gate_up_proj"], 2),
+    ],
+)
+def test_private_fsdp_policy_matrix(algorithm, target_parameters, expected):
+    from flash.engine.verl_policy import _resolve_fsdp_generation
+
+    assert _resolve_fsdp_generation(algorithm, target_parameters) == expected
 
 
 def test_actor_fsdp_strategy_uses_a_bare_override_not_an_append():
@@ -4875,7 +4892,7 @@ def test_actor_fsdp_strategy_uses_a_bare_override_not_an_append():
     # prefix would be an append to an existing key and fail the config merge.
     from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
 
-    (override,) = actor_fsdp_strategy_overrides(require_fsdp2=True)
+    (override,) = actor_fsdp_strategy_overrides(2)
     assert not override.startswith("+")
     assert override.startswith("actor_rollout_ref.actor.strategy=")
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import flash.runner as runner
+from flash.adapters.fused_experts import lora_target_parameters
+from flash.engine.verl_policy import _resolve_fsdp_generation
 
 
 def _infer_next_attempt(raw: dict) -> int:
@@ -44,9 +46,9 @@ def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
 def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]:
     """Verify one locked opd retry snapshot: its attempt, resume revision, and checkpoint width.
 
-    The width is the rank count the pinned checkpoint's fsdp shards were written at, or ``None``
-    when nothing is pinned (no mutation) or the shards named no single width. A pinned retry has to
-    be allocated at exactly that count -- see ``verify_opd_replacement_safe``.
+    The width is the validated stamped rank count, or ``None`` when nothing is pinned because no
+    mutation occurred. A pinned retry has to be allocated at exactly that count, as enforced by
+    ``verify_opd_replacement_safe``.
     """
     with runner._status_guard(run_id):
         raw = runner._load_status_json(run_id)
@@ -71,6 +73,7 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]
         # from.
         phase = spec.phase
         seed = spec.seed
+        fsdp_generation = _resolve_fsdp_generation("opd", lora_target_parameters(spec.model))
     from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     verified = verify_opd_replacement_safe(
@@ -80,6 +83,7 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]
         next_attempt=next_attempt,
         contract_version=contract_version,
         phase=phase,
+        expected_fsdp_generation=fsdp_generation,
     )
     resume_revision, checkpoint_world_size = verified if verified is not None else (None, None)
     return next_attempt, resume_revision, checkpoint_world_size

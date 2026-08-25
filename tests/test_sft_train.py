@@ -58,6 +58,7 @@ def _cfg(**over):
         "lora_alpha": 32,
         "target_modules": "all-linear",
         "exclude_modules": None,
+        "fsdp_generation": 2,
         "ulysses_sp_size": 2,
         "lr": 1e-4,
         "warmup_ratio": 0.03,
@@ -3286,7 +3287,11 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     spec, captured = _stub_sft_run(monkeypatch)
     # max_steps is 2, so resuming at 2 means the watcher never runs and finalization is the only
     # path left that can publish the step.
-    monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, *, world_size: 2)
+    monkeypatch.setattr(
+        sft_train,
+        "_restore_verl_resume",
+        lambda local_dir, *, world_size, expected_fsdp_generation: 2,
+    )
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         raise AssertionError("a run resumed at its horizon must not start the child")
@@ -3832,6 +3837,7 @@ def test_sft_never_enables_liger_because_it_zeroes_the_lora_gradient():
         "lora_rank": 32,
         "lora_alpha": 64,
         "target_modules": "all-linear",
+        "fsdp_generation": 2,
         "lora_adapter_path": None,
         "ulysses_sp_size": 1,
         "lr": 1e-4,
@@ -4287,7 +4293,8 @@ def test_sft_resume_guard_checks_the_launched_width_not_the_allocation():
     from flash.engine.worker import sft_train_runner
 
     src = inspect.getsource(sft_train_runner._prepare_sft_child)
-    assert "_restore_verl_resume(options.paths.local_dir, world_size=world_size)" in src
+    assert "world_size=world_size" in src
+    assert "expected_fsdp_generation=fsdp_generation" in src
     assert "world_size=options.gpu_count" not in src
 
     # and the resolved width must be established before the resume call that consumes it.

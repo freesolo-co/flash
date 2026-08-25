@@ -375,7 +375,14 @@ def _rl_resume(monkeypatch, tmp_path, src, *, world_size):
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(src))
-    return rl_train._restore_verl_resume(str(local_dir), world_size=world_size), local_dir
+    return (
+        rl_train._restore_verl_resume(
+            str(local_dir),
+            world_size=world_size,
+            expected_fsdp_generation=2,
+        ),
+        local_dir,
+    )
 
 
 def test_matching_world_size_resumes(monkeypatch, tmp_path):
@@ -400,8 +407,8 @@ def test_mismatched_world_size_discards_instead_of_crashing(monkeypatch, tmp_pat
     assert not (local_dir / "global_step_7").exists()
     line = capsys.readouterr().out
     assert "discarding resume checkpoint checkpoint-7" in line
-    assert "world size 4" in line
-    assert "runs at 2" in line
+    assert "stamped 4" in line
+    assert "expected 2" in line
 
 
 def test_fsdp1_same_width_is_discarded(monkeypatch, tmp_path, capsys):
@@ -424,7 +431,7 @@ def test_native_resume_requires_the_exact_fsdp_generation(
     checkpoint_fsdp_generation,
     expected_loadable,
 ):
-    from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
+    from flash.engine.worker.verl.checkpoints import inspect_resume_checkpoint
 
     src = _staged_checkpoint(
         tmp_path,
@@ -435,11 +442,11 @@ def test_native_resume_requires_the_exact_fsdp_generation(
     )
 
     assert (
-        resume_checkpoint_is_loadable(
+        inspect_resume_checkpoint(
             str(src),
             world_size=2,
             expected_fsdp_generation=expected_fsdp_generation,
-        )
+        ).loadable
         is expected_loadable
     )
 
@@ -570,7 +577,7 @@ def test_unknown_topology_is_always_discarded(monkeypatch, tmp_path, world_size,
 
     assert step == 0, "unreadable topology must never be staged, at any world size"
     assert not (local_dir / "global_step_5").exists()
-    assert "world size unknown" in capsys.readouterr().out
+    assert "invalid or missing fsdp stamp" in capsys.readouterr().out
 
 
 def test_sft_flat_layout_is_guarded_too(monkeypatch, tmp_path, capsys):
@@ -582,10 +589,16 @@ def test_sft_flat_layout_is_guarded_too(monkeypatch, tmp_path, capsys):
     local_dir.mkdir()
     monkeypatch.setattr(sft_train._w, "hf_resume_checkpoint", lambda *a, **k: str(src))
 
-    assert sft_train._restore_verl_resume(str(local_dir), world_size=2) == 9
+    assert (
+        sft_train._restore_verl_resume(str(local_dir), world_size=2, expected_fsdp_generation=2)
+        == 9
+    )
     shutil.rmtree(local_dir)
     local_dir.mkdir()
-    assert sft_train._restore_verl_resume(str(local_dir), world_size=4) == 0
+    assert (
+        sft_train._restore_verl_resume(str(local_dir), world_size=4, expected_fsdp_generation=2)
+        == 0
+    )
     assert not (local_dir / "global_step_9").exists()
     assert "[SFT] discarding resume checkpoint checkpoint-9" in capsys.readouterr().out
 
@@ -600,7 +613,10 @@ def test_sft_flat_layout_is_guarded_too(monkeypatch, tmp_path, capsys):
         nested=False,
     )
     monkeypatch.setattr(sft_train._w, "hf_resume_checkpoint", lambda *a, **k: str(fsdp1))
-    assert sft_train._restore_verl_resume(str(local_dir), world_size=2) == 0
+    assert (
+        sft_train._restore_verl_resume(str(local_dir), world_size=2, expected_fsdp_generation=2)
+        == 0
+    )
     assert not (local_dir / "global_step_10").exists()
 
 
@@ -623,6 +639,21 @@ def _fake_hf_resume_checkpoint_over(*candidates):
     return _resume
 
 
+def _count_resume_inspections(monkeypatch, caller_module):
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    original = verl_checkpoints.inspect_resume_checkpoint
+    counts = {}
+
+    def inspect(path, **kwargs):
+        counts[path] = counts.get(path, 0) + 1
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(caller_module, "inspect_resume_checkpoint", inspect)
+    monkeypatch.setattr(verl_checkpoints, "inspect_resume_checkpoint", inspect)
+    return counts
+
+
 def test_grpo_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     monkeypatch, tmp_path
 ):
@@ -634,7 +665,9 @@ def test_grpo_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     stayed the remote max -- exactly the repeat-discard loop this fix closes.
     """
     from flash.engine.worker import rl_train
+    from flash.engine.worker.train.rl import checkpoints as rl_checkpoints
 
+    counts = _count_resume_inspections(monkeypatch, rl_checkpoints)
     incompatible = _staged_checkpoint(tmp_path, 7, world_size=4, shards=4)
     compatible = _staged_checkpoint(tmp_path, 3, world_size=2, shards=2)
     local_dir = tmp_path / "ckpt"
@@ -645,9 +678,10 @@ def test_grpo_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
         _fake_hf_resume_checkpoint_over(incompatible, compatible),
     )
 
-    step = rl_train._restore_verl_resume(str(local_dir), world_size=2)
+    step = rl_train._restore_verl_resume(str(local_dir), world_size=2, expected_fsdp_generation=2)
 
     assert step == 3
+    assert counts == {str(incompatible): 1, str(compatible): 1}
     assert (local_dir / "global_step_3" / "actor" / "model.safetensors").exists()
     assert not (local_dir / "global_step_7").exists()
 
@@ -658,6 +692,7 @@ def test_sft_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     """Same repeat-discard-loop fix as the GRPO case, for SFT's flat (non-nested) checkpoint layout."""
     from flash.engine.worker import sft_train
 
+    counts = _count_resume_inspections(monkeypatch, sft_train)
     incompatible = _staged_checkpoint(tmp_path, 9, world_size=4, shards=4, nested=False)
     compatible = _staged_checkpoint(tmp_path, 5, world_size=2, shards=2, nested=False)
     local_dir = tmp_path / "ckpt"
@@ -668,7 +703,11 @@ def test_sft_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
         _fake_hf_resume_checkpoint_over(incompatible, compatible),
     )
 
-    assert sft_train._restore_verl_resume(str(local_dir), world_size=2) == 5
+    assert (
+        sft_train._restore_verl_resume(str(local_dir), world_size=2, expected_fsdp_generation=2)
+        == 5
+    )
+    assert counts == {str(incompatible): 1, str(compatible): 1}
     assert (local_dir / "global_step_5" / "model.safetensors").exists()
     assert not (local_dir / "global_step_9").exists()
 
