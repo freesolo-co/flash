@@ -2076,6 +2076,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     from flash.providers.core.base import PollResult
     from flash.providers.lambda_.jobs.builders import build_payload as build_lambda_payload
     from flash.providers.runpod.execution import job_execution as runpod_job_execution
+    from flash.providers.runpod.execution import polling as runpod_polling
     from flash.providers.vast.jobs.builders import build_payload as build_vast_payload
 
     spec = JobSpec(
@@ -2122,7 +2123,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
 
     monkeypatch.setattr(runpod_job_execution.runpod_api, "submit_job", submit_job)
     monkeypatch.setattr(
-        runpod_job_execution,
+        runpod_polling,
         "poll_job",
         lambda *_args, **_kwargs: PollResult(True, metrics={}),
     )

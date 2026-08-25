@@ -23,7 +23,9 @@ from flash.cli.commands.ops.worker_output import (
     _worker_sections,
     live_attempt_of,
 )
-from flash.cli.ui import render
+from flash.cli.ui import cost as cost_ui
+from flash.cli.ui import heartbeat as heartbeat_ui
+from flash.cli.ui import render, tables
 from flash.client import ApiClient, client_from_config
 from flash.runner.lifecycle.state import TERMINAL_STATES
 
@@ -41,9 +43,9 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     # `live_attempt` owns the provenance order (live `remote.attempt` first, heartbeat only when
     # `remote` is absent rather than cleared at teardown) and is shared with the worker-artifact
     # labelling below, so the spinner and the appended sections name the same current attempt.
-    attempt = render.live_attempt(status)
+    attempt = heartbeat_ui.live_attempt(status)
     if isinstance(heartbeat, dict):
-        heartbeat_age_seconds = render._heartbeat_age_seconds(heartbeat.get("ts"))
+        heartbeat_age_seconds = heartbeat_ui._heartbeat_age_seconds(heartbeat.get("ts"))
         # stage and step come from the heartbeat, attempt from `remote` below. during the relaunch
         # window those are two different attempts, so printing them side by side reads as progress
         # the replacement worker has not made: `stage=sft_step step=455 attempt=1` attributes the
@@ -57,12 +59,12 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         # itself or `step=455` reads as the replacement's progress. `heartbeat_is_superseded` is
         # exactly that pair of conditions, shared with the status panel so the two surfaces cannot
         # disagree about whether a run is between attempts.
-        stale_heartbeat = render.heartbeat_is_superseded(status, heartbeat)
+        stale_heartbeat = heartbeat_ui.heartbeat_is_superseded(status, heartbeat)
         stage = heartbeat.get("stage")
         if stage:
             parts.append(f"stage={stage}")
             if state == "running":
-                warmup = render.warmup_message(
+                warmup = heartbeat_ui.warmup_message(
                     stage,
                     heartbeat_age_seconds,
                     not stale_heartbeat,
@@ -100,8 +102,8 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     # there, and dropping it only here made the same terminal run read as costed in one surface and
     # uncosted in another. what stays suppressed is the pre-settlement zero -- state carries no cost
     # yet, and `cost=$0.0000` on a queued run states a charge nobody has computed.
-    amount, is_estimate = render.run_cost(status)
-    settled = str(status.get("state") or "") in render.SETTLED_COST_STATES
+    amount, is_estimate = cost_ui.run_cost(status)
+    settled = str(status.get("state") or "") in cost_ui.SETTLED_COST_STATES
     if amount or is_estimate or settled:
         parts.append(f"cost={'~' if is_estimate else ''}${amount:.4f}")
     realized = status.get("realized_cost_usd")
@@ -322,7 +324,7 @@ def cmd_runs(args) -> int:
             print("no runs yet")
         return 0
     if render.styled():
-        print(render.runs_table(runs))
+        print(tables.runs_table(runs))
         return 0
     print(f"{'RUN_ID':<32}  {'STATE':<11}  {'ALGO':<5}  {'COST($)':>8}  {'GPU':<22}  MODEL")
     for r in sorted(runs, key=lambda r: r.get("updated_at", 0), reverse=True):
@@ -330,7 +332,7 @@ def cmd_runs(args) -> int:
         model = spec.get("model", "")
         algorithm = str(spec.get("algorithm") or "-").upper()
         where = render.gpu_label(spec, r.get("remote") or {})
-        amount, is_estimate = render.run_cost(r)
+        amount, is_estimate = cost_ui.run_cost(r)
         cost = f"{'~' if is_estimate else ''}{amount:.4f}"
         print(
             f"{r['run_id']:<32}  {r['state']:<11}  {algorithm:<5}  {cost:>8}  {where:<22}  {model}"
@@ -393,7 +395,7 @@ def cmd_checkpoints(args) -> int:
             print(message, file=sys.stderr)
         return 0
     if render.styled():
-        print(render.checkpoints_table(args.run_id, checkpoints))
+        print(tables.checkpoints_table(args.run_id, checkpoints))
         return 0
     from flash.schema import format_checkpoint_ref
 

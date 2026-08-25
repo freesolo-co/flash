@@ -158,7 +158,7 @@ def _confirm_run_clear(spec) -> bool:
     ``submitted_instance_providers`` also blocks when it is now unconfigurable, because a lost
     non-idempotent create such as Vast ``PUT /asks`` may still be billing without a handle.
     """
-    from flash.providers import INSTANCE_PROVIDERS, configured_providers, get_provider
+    from flash.providers.core.registry import INSTANCE_PROVIDERS, configured_providers, get_provider
 
     try:
         recorded_raw = getattr(get_status(spec.run_id), "submitted_instance_providers", None)
@@ -699,7 +699,7 @@ def _classify_recoverable_runs(
                 # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
                 # persisted status without parsing the spec. Terminate by that reconstructed
                 # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
-                from flash.providers.runpod import terminate_persisted_endpoints
+                from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
 
                 terminate_persisted_endpoints(status.spec, status.run_id)
                 continue
@@ -728,7 +728,7 @@ def _classify_recoverable_runs(
 
 def _sweep_provider_orphans(active: set[str], known: set[str]) -> None:
     """Reap orphaned per-run provider resources; each provider sweeps its own."""
-    from flash.providers import configured_providers
+    from flash.providers.core.registry import configured_providers
 
     for prov in configured_providers():
         with contextlib.suppress(Exception):

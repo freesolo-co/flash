@@ -450,8 +450,8 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
 
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", fake_urlopen)
 
-    import flash.providers as providers_mod
     import flash.server.asgi.app as app_mod
+    from flash.providers.core import registry as providers_mod
 
     importlib.reload(app_mod)
     # The Lambda key above (required by the new preflight) makes configured_providers()

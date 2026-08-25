@@ -135,9 +135,9 @@ def test_nothing_fits_names_constraint(monkeypatch):
 
 
 def test_allocate_provider_constraint_never_falls_through(monkeypatch):
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate
+    from flash.providers.core.registry import get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
@@ -164,9 +164,9 @@ def test_allocate_provider_constraint_never_falls_through(monkeypatch):
 
 
 def test_soft_provider_preference_ranks_ahead_of_cost_without_dropping_fallbacks(monkeypatch):
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate
+    from flash.providers.core.registry import get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("vast", "runpod", "lambda"))
@@ -198,9 +198,9 @@ def test_soft_provider_preference_ranks_ahead_of_cost_without_dropping_fallbacks
 
 
 def test_soft_provider_preference_preserves_cost_order_within_one_rank(monkeypatch):
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate
+    from flash.providers.core.registry import get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
@@ -255,9 +255,9 @@ def test_allocate_rejects_unconfigured_provider(monkeypatch):
 
 
 def test_allocate_gpu_type_never_widens_or_escalates(monkeypatch):
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate
+    from flash.providers.core.registry import get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))
@@ -290,9 +290,9 @@ def test_allocate_gpu_type_fallbacks_widen_the_search_without_dictating_the_winn
     pinned run somewhere to go when its first class is out of capacity. Order is preference, not
     priority: the survivors still compete on cost, so naming a class first does not make the run pay
     more for it."""
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate
+    from flash.providers.core.registry import get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
@@ -320,9 +320,9 @@ def test_allocate_gpu_type_fallbacks_widen_the_search_without_dictating_the_winn
 
 
 def test_allocate_rejects_an_unsatisfiable_fallback(monkeypatch):
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, UnsupportedGpuError
+    from flash.providers.core.registry import get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
@@ -343,9 +343,9 @@ def test_allocate_rejects_an_unsatisfiable_fallback(monkeypatch):
 
 
 def test_allocate_ordered_lambda_pin_classifies_impossible_shapes_as_unsupported(monkeypatch):
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, UnsupportedGpuError
+    from flash.providers.core.registry import get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda",))
@@ -396,9 +396,9 @@ def test_allocate_gpu_type_enforces_vram_and_provider_support(monkeypatch):
 
 @pytest.mark.parametrize("provider", ["lambda", "vast"])
 def test_exact_dynamic_provider_empty_capacity_is_retryable(monkeypatch, provider):
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import CapacityLookupError
+    from flash.providers.core.registry import get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: (provider,))
@@ -426,9 +426,9 @@ def test_sft_width_that_never_fits_is_terminal_not_a_capacity_retry(monkeypatch,
 
     Parametrized over both branches because a pin and an unpinned search classify separately.
     """
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, CapacityLookupError, UnsupportedGpuError
+    from flash.providers.core.registry import get_provider
 
     # 200 GB does not fit one H100 card, and the clamp means one card is all that ever launches.
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 200)
@@ -470,9 +470,9 @@ def test_lookup_blip_is_only_retryable_when_a_launchable_shape_exists(monkeypatc
     Both halves are asserted: the blip must STILL be retryable when a launchable shape does exist, or
     this guard would trade a retry bug for an outage that kills every run.
     """
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import CapacityLookupError, UnsupportedGpuError
+    from flash.providers.core.registry import get_provider
 
     def _blip(need, constraints):
         raise CapacityLookupError("lambda live capacity lookup failed")
@@ -496,9 +496,9 @@ def test_lookup_blip_is_only_retryable_when_a_launchable_shape_exists(monkeypatc
 
 
 def test_exact_runpod_empty_capacity_stays_terminal(monkeypatch):
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import UnsupportedGpuError
+    from flash.providers.core.registry import get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
@@ -514,9 +514,9 @@ def test_exact_runpod_empty_capacity_stays_terminal(monkeypatch):
 
 
 def test_allocate_gpu_type_ignores_ineligible_provider_blip(monkeypatch):
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import CapacityLookupError, UnsupportedGpuError
+    from flash.providers.core.registry import get_provider
 
     calls: list[str] = []
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
@@ -551,8 +551,8 @@ def _raise_capacity_blip(*a, **k):
 
 
 def _stub_alloc(monkeypatch, *, runpod, lambda_, vast):
-    from flash.providers import get_provider
     from flash.providers.core import allocator
+    from flash.providers.core.registry import get_provider
 
     monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 24)
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda", "vast"))
@@ -1322,8 +1322,8 @@ def test_vast_candidates_searches_at_effective_disk(monkeypatch):
     # MIN_DISK_GB)) the submit path provisions with — else a high-disk run is advertised Vast
     # capacity that only exists at the 60 GB floor and then can't actually rent (an impossible
     # attempt a max_retries=0 run never escapes).
-    from flash.providers import get_provider
     from flash.providers.core.base import AllocationConstraints
+    from flash.providers.core.registry import get_provider
     from flash.providers.vast import jobs as vast_jobs
 
     captured = {}
@@ -1348,8 +1348,8 @@ def test_vast_candidates_threads_max_wall_seconds(monkeypatch):
     # the allocator's Vast capacity search must thread the run's wall cap so usable_offers applies
     # the duration floor — else the allocator advertises Vast classes whose only live offers expire
     # before the run finishes (fatal for a max_retries=0 run).
-    from flash.providers import get_provider
     from flash.providers.core.base import AllocationConstraints
+    from flash.providers.core.registry import get_provider
     from flash.providers.vast import jobs as vast_jobs
 
     captured = {}

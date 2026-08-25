@@ -567,7 +567,7 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     if not resource_deleted:
         _record_cleanup_remote(run_id, persisted_remote)
     _compare_and_fail_remote(run_id, persisted_remote, detail)
-    from flash.providers.runpod import terminate_persisted_endpoints
+    from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
 
     terminate_persisted_endpoints(status.spec, run_id)
     print(f"attach: {run_id} {detail}", file=log)
@@ -821,7 +821,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     source_snapshot = None
     log = log_stream or sys.stderr
 
-    from flash.providers import get_provider
+    from flash.providers.core.registry import get_provider
 
     try:
         worker_spec = effective_spec_from_status(status)

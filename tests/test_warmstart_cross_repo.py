@@ -819,8 +819,8 @@ def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_pa
 
 
 def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path):
-    import flash.providers as providers
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     public = JobSpec.from_dict(

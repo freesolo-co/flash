@@ -53,7 +53,7 @@ def test_env_list_filters_non_environments_and_uses_styled_renderer(
     seen = []
     monkeypatch.setattr(env_list_commands.render, "styled", lambda: True)
     monkeypatch.setattr(
-        env_list_commands.render,
+        env_list_commands.env_panels,
         "env_list",
         lambda paths, *, published, unavailable: seen.extend(paths) or "styled-envs",
     )
@@ -127,7 +127,7 @@ def test_checkpoints_empty_and_styled_paths(monkeypatch, capsys) -> None:
 
     client._checkpoints = [{"step": 12}]
     monkeypatch.setattr(
-        commands.render, "checkpoints_table", lambda run_id, rows: "checkpoint-table"
+        commands.tables, "checkpoints_table", lambda run_id, rows: "checkpoint-table"
     )
     assert commands.cmd_checkpoints(SimpleNamespace(run_id="flash-1")) == 0
     assert capsys.readouterr().out == "checkpoint-table\n"
@@ -163,7 +163,7 @@ def test_deployments_empty_and_styled_paths(monkeypatch, capsys) -> None:
     assert capsys.readouterr().out == "empty-deployments\n"
 
     client._deployments = [{"run_id": "flash-1", "deployment": {"state": "ready"}}]
-    monkeypatch.setattr(commands.render, "deployments_table", lambda rows: "deployment-table")
+    monkeypatch.setattr(commands.tables, "deployments_table", lambda rows: "deployment-table")
     assert deploy_commands.cmd_deployments(SimpleNamespace(json=False)) == 0
     assert capsys.readouterr().out == "deployment-table\n"
 

@@ -735,9 +735,9 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
 ):
     import io
 
-    import flash.providers as providers
     import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
@@ -814,9 +814,9 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
 def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
     import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
@@ -887,9 +887,9 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
 def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
     import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
@@ -977,9 +977,9 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
 def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
     import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
@@ -1485,8 +1485,8 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
 
 
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):
-    import flash.providers as providers
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-drain", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1792,8 +1792,8 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
     expected_next = 2
     import io
 
-    import flash.providers as providers
     from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core import registry as providers
     from flash.providers.core.base import PollResult
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -2243,9 +2243,9 @@ def test_completed_attempt_metrics_bounds_marker_to_wall_grace(monkeypatch, mark
 def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
     import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -2313,8 +2313,8 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
 def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
     from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -2358,6 +2358,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
 def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monkeypatch):
     import flash.providers._lifecycle.net.worker as train
     import flash.providers.runpod.execution.job_execution as job_execution
+    import flash.providers.runpod.execution.polling as polling
     from flash.core.spec import JobSpec
     from flash.providers.core.base import PollResult
 
@@ -2376,7 +2377,7 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
         lambda _endpoint, payload, **_kwargs: payloads.append(payload) or "job",
     )
     monkeypatch.setattr(
-        job_execution,
+        polling,
         "poll_job",
         lambda *_args, **_kwargs: PollResult(True, metrics={"wall_seconds": 1.0}),
     )
@@ -2496,9 +2497,9 @@ def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch
 def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     monkeypatch, tmp_path, status_read_fails
 ):
-    import flash.providers as providers
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="recover-pending", model="Qwen/Qwen3.5-9B", algorithm="sft")
@@ -2563,9 +2564,9 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
     # persisted spec remains structurally parseable, but catalog eligibility fails on the new build.
     # dispatching attach_run would otherwise leave the run active long enough to reach provider work,
     # so startup recovery must fail it and remove the resource before dispatch.
-    import flash.providers as providers
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     remote = {"provider": "runpod", "endpoint_id": "ep-stale", "attempt": 0}
@@ -2627,9 +2628,9 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
 def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
     monkeypatch, tmp_path, retired_model
 ):
-    import flash.providers as providers
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="retired-handleless", model="Qwen/Qwen3.5-9B", algorithm="sft")
@@ -2659,7 +2660,7 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
     )
     terminated = []
     monkeypatch.setattr(
-        "flash.providers.runpod.terminate_persisted_endpoints",
+        "flash.providers.runpod.execution.provider.terminate_persisted_endpoints",
         lambda raw_spec, run_id: terminated.append((raw_spec["model"], run_id)),
     )
 
@@ -2685,9 +2686,9 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
     # cleanup drain -- but this run's drain was already dispatched at the top of the loop and had
     # snapshotted an empty list, and it returns early on empty. so the record sat there with nothing
     # scheduled to retry it, and the worker kept billing until the next restart.
-    import flash.providers as providers
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     # a COMPLETE handle: `_record_cleanup_remote` drops anything it cannot resolve to an exact
@@ -3015,9 +3016,9 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
 ):
     import io
 
-    import flash.providers as providers
     import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
@@ -3109,9 +3110,9 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
 def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypatch, tmp_path):
     import io
 
-    import flash.providers as providers
     import flash.providers.core.allocator as allocator
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise import lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry

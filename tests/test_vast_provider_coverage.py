@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from flash.providers.core.base import AllocationConstraints, CapacityLookupError, JobHandle
-from flash.providers.vast import VastProvider
+from flash.providers.vast.execution.provider import VastProvider
 
 
 def test_vast_provider_delegates_credentials_pricing_gc_and_orphan_sweep(monkeypatch) -> None:

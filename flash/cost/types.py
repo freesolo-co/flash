@@ -8,8 +8,8 @@ from flash.core.catalog import normalize_algorithm, optimizer_batch_key, samples
 from flash.core.spec import parse_positive_int_tuple
 from flash.cost.currency import format_usd
 from flash.engine.plan.recipe import RECIPE
-from flash.providers import PROVIDER_NAMES, validated_provider_preferences
 from flash.providers.core.base import GPU_INFO, canonical_gpu, providers_for
+from flash.providers.core.registry import PROVIDER_NAMES, validated_provider_preferences
 
 
 def vram_clause(per_card_gb: int, offered_gb: int, gpu_count: int) -> str:

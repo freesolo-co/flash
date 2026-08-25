@@ -134,20 +134,6 @@ class JobHandle:
         return cls(endpoint_id, endpoint_name, fingerprint, job_id, attempt, started_ts)
 
 
-def _is_workers_quota_error(exc: Exception) -> bool:
-    """True when a RunPod exception signals the account worker quota is exhausted."""
-    msg = str(exc).lower()
-    return "max workers across all endpoints" in msg
-
-
-def _is_balance_error(exc: Exception) -> bool:
-    """True when RunPod refuses to create an endpoint because the account is out of balance.
-
-    Fail over immediately: another account may have funds, while sweeping cannot repair balance.
-    """
-    return "account balance" in str(exc).lower()
-
-
 def _safe_failure_text(value: object, limit: int = FAILURE_TEXT_LIMIT) -> str:
     """Redact credentials out of one part of a user-visible RunPod failure detail.
 

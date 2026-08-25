@@ -8,6 +8,9 @@ checked-in source is the prod channel, and the build-time rewrites produce a coh
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import flash.serve.contract.urls as serving_urls
@@ -23,6 +26,46 @@ def _load_build_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_ui_leaf_modules_import_cold() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import flash.cli.ui.env_panels; import flash.cli.ui.tables",
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_heartbeat_interpretation_does_not_import_rendering() -> None:
+    script = (
+        "import sys; from flash.cli.ui import heartbeat; "
+        "heartbeat._heartbeat_pairs({'state': 'running', "
+        "'last_heartbeat': {'stage': 'sft_initializing', 'ts': 1}}); "
+        "assert 'flash.cli.ui.render' not in sys.modules"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_checked_in_source_is_prod_channel():
@@ -197,6 +240,7 @@ def test_operator_hints_follow_flash_cli_invocation():
     from unittest import mock
 
     from flash._internal import channel
+    from flash.cli.ui import env_panels, render
     from flash.cli.ui import env_panels as env_panels_module
     from flash.cli.ui import render as render_module
     from flash.cli.ui import tables as tables_module
@@ -205,8 +249,7 @@ def test_operator_hints_follow_flash_cli_invocation():
     outputs: dict[str, str] = {}
     try:
         with mock.patch.object(sys, "argv", ["/usr/local/bin/flash-cli"]):
-            # env_panels before render: it binds CLI_NAME with a from-import, so reloading it
-            # after channel is what re-reads the name, and render re-exports its `env_list`.
+            # reload each canonical owner after channel so its imported CLI_NAME follows argv.
             importlib.reload(channel)
             importlib.reload(tables_module)
             importlib.reload(env_panels_module)
@@ -220,11 +263,13 @@ def test_operator_hints_follow_flash_cli_invocation():
                 "flash/cli/ui/render.py:env_setup": render.env_setup(
                     ["environment.py"], "11111111-1111-4111-8111-111111111111"
                 ),
-                "flash/cli/ui/render.py:env_list(local)": render.env_list(["."]),
-                "flash/cli/ui/render.py:env_list(empty)": render.env_list([]),
-                "flash/cli/ui/tables.py:models_table": render.models_table([{"id": "acme/model"}]),
-                "flash/cli/ui/tables.py:projects_table": render.projects_table([]),
-                "flash/cli/ui/tables.py:checkpoints_table": render.checkpoints_table(
+                "flash/cli/ui/render.py:env_list(local)": env_panels.env_list(["."]),
+                "flash/cli/ui/render.py:env_list(empty)": env_panels.env_list([]),
+                "flash/cli/ui/tables.py:models_table": tables_module.models_table(
+                    [{"id": "acme/model"}]
+                ),
+                "flash/cli/ui/tables.py:projects_table": tables_module.projects_table([]),
+                "flash/cli/ui/tables.py:checkpoints_table": tables_module.checkpoints_table(
                     "run-1", [{"step": 1}]
                 ),
             }
@@ -640,7 +685,7 @@ def test_rewrite_pyproject_retargets_only_the_project_table():
         'flash = "flash.cli.main:main"\n'
         "# Operator-only console script.\n"
         'flash-cli = "flash.cli.main:main"\n'
-        'flash-server = "flash.server.__main__:main"\n'
+        'flash-server = "flash.server.asgi.cli:main"\n'
         "\n"
         "[tool.flash-dev]\n"
         'version = "9.9.9"\n'
@@ -651,7 +696,7 @@ def test_rewrite_pyproject_retargets_only_the_project_table():
     assert 'name = "freesolo-flash-dev"' in out
     assert 'flash-dev = "flash.cli.main:main"' in out
     assert 'flash-dev-cli = "flash.cli.main:main"' in out
-    assert 'flash-dev-server = "flash.server.__main__:main"' in out
+    assert 'flash-dev-server = "flash.server.asgi.cli:main"' in out
     # No un-renamed script key survives: each would collide with the prod package.
     assert "\nflash = " not in out
     assert "\nflash-cli = " not in out

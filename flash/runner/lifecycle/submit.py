@@ -91,12 +91,12 @@ def prepare_job(
         except ValueError as exc:
             raise ServingPreflightError(str(exc)) from exc
     if spec.gpu.provider or spec.gpu.providers or spec.gpu.type:
-        from flash.providers import (
+        from flash.providers.core.base import providers_for
+        from flash.providers.core.registry import (
             PROVIDER_NAMES,
             available_providers,
             validated_provider_preferences,
         )
-        from flash.providers.core.base import providers_for
 
         configured = available_providers()
         provider = spec.gpu.provider.strip().lower()
@@ -282,7 +282,7 @@ def submit_job(
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
-    from flash.providers import INSTANCE_PROVIDERS, available_providers
+    from flash.providers.core.registry import INSTANCE_PROVIDERS, available_providers
 
     source_snapshot = None
     if not dry_run:

@@ -509,9 +509,9 @@ def test_heartbeat_oom_rejects_malformed_current_attempt(malformed_attempt):
 
 def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
     from flash.providers.runpod.client import api as runpod_api
-    from flash.providers.runpod.execution import job_execution, jobs
+    from flash.providers.runpod.execution import jobs, polling
 
-    monkeypatch.setattr(job_execution.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(polling.time, "sleep", lambda _s: None)
     monkeypatch.setattr(
         runpod_api,
         "job_status",
@@ -519,7 +519,7 @@ def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
     )
     handle = jobs.JobHandle("ep", "name", "rpk-" + "0" * 64, "job", 2, 1.0)
 
-    res = job_execution.poll_job(
+    res = polling.poll_job(
         handle,
         interval_s=0,
         heartbeat_reader=lambda force=False: {"oom": True, "attempt": 2},
@@ -527,7 +527,7 @@ def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
     )
     assert res.failure == "oom"
 
-    res = job_execution.poll_job(
+    res = polling.poll_job(
         handle,
         interval_s=0,
         heartbeat_reader=lambda force=False: {"oom": True, "attempt": 1},

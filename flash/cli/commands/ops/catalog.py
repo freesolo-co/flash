@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from flash.cli.ui import render
+from flash.cli.ui import render, tables
 from flash.core.catalog import public_model_rows
 
 
 def cmd_models(args) -> int:
     rows = public_model_rows()
     if render.styled():
-        print(render.models_table(rows))
+        print(tables.models_table(rows))
         return 0
     for row in rows:
         print(row["id"])
@@ -32,7 +32,7 @@ def cmd_gpus(args) -> int:
     )
     if render.styled():
         rows = [(info.name, info.vram_gb, runpod_rates.get(info.name)) for info in infos]
-        print(render.gpus_table(rows, tip))
+        print(tables.gpus_table(rows, tip))
         return 0
 
     def fmt_rate(v: float | None) -> str:

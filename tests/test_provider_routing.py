@@ -167,7 +167,7 @@ def test_control_plane_rejects_a_profiler_result_with_the_wrong_identity(orch, m
 def test_exact_only_preflight_rejects_unconfigured_provider_set_before_persistence(
     orch, monkeypatch
 ):
-    import flash.providers as providers
+    from flash.providers.core import registry as providers
 
     persisted = []
     spec = satisfy_sft_profile(monkeypatch, _spec(type="H200"))
@@ -183,7 +183,7 @@ def test_exact_only_preflight_rejects_unconfigured_provider_set_before_persisten
 
 
 def test_preflight_rejects_an_unreachable_fallback_class(orch, monkeypatch) -> None:
-    import flash.providers as providers
+    from flash.providers.core import registry as providers
 
     spec = satisfy_sft_profile(
         monkeypatch,
@@ -280,7 +280,7 @@ def test_selected_fallback_preserves_the_authored_acceptable_set(orch) -> None:
 
 def test_terminate_persisted_endpoints_isolates_each_gpu_failure(monkeypatch) -> None:
     import flash.providers.runpod.serverless.endpoints as serverless
-    from flash.providers import runpod
+    from flash.providers.runpod.execution import provider as runpod
 
     calls: list[str] = []
 
@@ -1339,9 +1339,9 @@ def test_a_named_alternative_still_gets_its_own_look_after_the_first_class_refus
 def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monkeypatch):
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, PollResult
-    from flash.providers.runpod import RunpodProvider
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import job_execution as rp_jobs
+    from flash.providers.runpod.execution.provider import RunpodProvider
 
     candidates = (
         Candidate("runpod", "RTX 4090", 0.39, 24),
@@ -2476,8 +2476,8 @@ def _submit_failure(provider_obj):
     """
     import contextlib as _contextlib
 
-    import flash.providers as _providers
     import flash.server.domain.teacher.broker as _broker
+    from flash.providers.core import registry as _providers
     from flash.runner.supervise import seed_submission as _ss
 
     @_contextlib.contextmanager

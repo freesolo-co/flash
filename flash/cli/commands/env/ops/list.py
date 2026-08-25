@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from flash._internal.channel import CLI_NAME
-from flash.cli.ui import render
+from flash.cli.ui import env_panels, render
 from flash.client import ClientError
 from flash.client.config import load_credentials
 
@@ -68,7 +68,7 @@ def cmd_env_list(args) -> int:
     paths = _local_env_sources()
     published, unavailable = _published_envs()
     if render.styled():
-        print(render.env_list(paths, published=published, unavailable=unavailable))
+        print(env_panels.env_list(paths, published=published, unavailable=unavailable))
         return 0
     if published:
         print('published environments (reference one with `[environment] id = "<id>"`):')

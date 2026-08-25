@@ -5,16 +5,14 @@ attempt, and -- when it is old -- which of the several very different things tha
 panel cannot observe the worker directly, so every hint here is written to state what the age does
 and does not prove, rather than to reassure.
 
-The rendering primitives stay in `flash.cli.ui.render`; this module holds the interpretation. Split
-out to keep `render.py` under the file-size limit, and imported back into `render` so
-`render._heartbeat_pairs(...)` and friends keep resolving -- which is how the status panel and the
-CLI tests reach them.
+The rendering primitives stay in `flash.cli.ui.render`; this module owns heartbeat interpretation.
 """
 
 from __future__ import annotations
 
 import math
 import time
+from collections.abc import Callable
 
 
 def _heartbeat_age_seconds(value: object) -> float | None:
@@ -411,7 +409,9 @@ def _step_timing_pairs(
     return pairs
 
 
-def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
+def _heartbeat_pairs(
+    obj: dict, *, format_hint: Callable[[str], str] = str
+) -> list[tuple[str, str]]:
     """Worker heartbeat rows for the status panel: stage, step, age, and a quiet-is-normal hint."""
     hb = obj.get("last_heartbeat")
     if not isinstance(hb, dict) or not hb.get("stage"):
@@ -490,9 +490,7 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         # the progress row already explains this silence, and does it more precisely. show one or
         # the other, never both, or the panel gives two readings of the same quiet.
         if running and not explained and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
-            from flash.cli.ui.render import _dim
-
-            age += _dim(f"  ({_QUIET_HEARTBEAT_HINT})")
+            age += format_hint(f"  ({_QUIET_HEARTBEAT_HINT})")
         pairs.append(("heartbeat", age))
     if explained:
         pairs.append(("progress", explained))

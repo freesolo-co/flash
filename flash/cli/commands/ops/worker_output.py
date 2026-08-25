@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from flash.cli.ui import heartbeat as heartbeat_ui
 from flash.cli.ui import render
 from flash.client import ClientError
 
@@ -105,7 +106,7 @@ def live_attempt_of(run: Mapping[str, object]) -> int | str | None:
     log paths must derive this from the SAME rule, or a follow that ends mid-teardown prints the
     unmarked dead heartbeats the non-follow path tags.
     """
-    attempt = render.live_attempt(run)
+    attempt = heartbeat_ui.live_attempt(run)
     if attempt is None and run.get("remote", False) is None:
         return _NO_LIVE_WORKER
     return attempt

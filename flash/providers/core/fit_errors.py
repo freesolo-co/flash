@@ -115,7 +115,7 @@ def rents_arbitrary_card_counts(providers: Iterable[str]) -> bool:
     Used to decide whether a suggested width can be promised; the same attribute classifies an
     empty candidate set as retryable capacity in ``allocator._raise_no_candidate_error``.
     """
-    from flash.providers import get_provider
+    from flash.providers.core.registry import get_provider
 
     return any(not getattr(get_provider(name), "live_capacity", False) for name in providers)
 

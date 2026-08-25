@@ -46,6 +46,6 @@ def test_lambda_list_filesystems_is_reachable():
 def test_lambda_provider_hourly_rate():
     """The provider interface returns a positive static $/hr for a known class."""
     _require_key()
-    from flash.providers import get_provider
+    from flash.providers.core.registry import get_provider
 
     assert get_provider("lambda").hourly_rate("A10") > 0

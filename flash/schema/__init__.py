@@ -25,7 +25,6 @@ from flash.core.spec import (
     parse_seed,
     require_project_id,
 )
-from flash.providers import PROVIDER_NAMES, validated_provider_preferences
 from flash.providers.core.base import (
     UnsupportedGpuError,
     authored_gpu_ceiling,
@@ -34,6 +33,7 @@ from flash.providers.core.base import (
     provisional_gpu,
     provisional_gpu_count,
 )
+from flash.providers.core.registry import PROVIDER_NAMES, validated_provider_preferences
 from flash.schema.fields import (
     ConfigError,
     _coerce_scalar,

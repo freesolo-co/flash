@@ -44,7 +44,7 @@ def test_vast_search_offers_read_only():
 def test_vast_usable_offers_and_pricing():
     """usable_offers maps live offers to managed classes; pricing reads the cheapest live offer."""
     _require_key()
-    from flash.providers import get_provider
+    from flash.providers.core.registry import get_provider
     from flash.providers.vast.jobs import usable_offers
 
     offers = usable_offers(24, disk_gb=60)

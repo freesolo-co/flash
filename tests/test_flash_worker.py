@@ -1453,7 +1453,7 @@ def test_first_console_snapshot_precedes_stall_teardown():
     from flash.providers._lifecycle.bootstrapping import console as bootstrap_console
 
     importlib.import_module("flash.providers.runpod.execution.jobs")
-    poll_job = importlib.import_module("flash.providers.runpod.execution.job_execution").poll_job
+    poll_job = importlib.import_module("flash.providers.runpod.execution.polling").poll_job
     defaults = inspect.signature(poll_job).parameters
     training_stall_s = defaults["stall_after_s"].default
     setup_grace_s = defaults["setup_grace_s"].default

@@ -2334,8 +2334,8 @@ def test_a_fully_blacklisted_first_page_widens_the_search_before_giving_up(monke
 
 def test_gc_frees_the_runs_dead_machine_set(monkeypatch):
     """The blacklist is process-local state, so the run's reap has to release it."""
-    from flash.providers.vast import PROVIDER
     from flash.providers.vast import jobs as vast
+    from flash.providers.vast.execution.provider import PROVIDER
 
     spec = _spec()
     vast._note_dead_machine(spec.run_id, 10)
@@ -2618,8 +2618,8 @@ def test_provider_destroy_raises_on_unconfirmed_teardown(monkeypatch):
     STILL billing. ``VastProvider.destroy`` must SURFACE that (raise) instead of returning normally —
     else the best-effort callers log "terminated" and clear the handle while it keeps billing."""
     from flash.providers.core.base import JobHandle
-    from flash.providers.vast import PROVIDER
     from flash.providers.vast.client import api as vast_api
+    from flash.providers.vast.execution.provider import PROVIDER
 
     handle = JobHandle.from_dict(_handle().to_dict())
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: False)  # unconfirmed
@@ -2634,9 +2634,9 @@ def test_provider_destroy_raises_on_unconfirmed_teardown(monkeypatch):
 
 def test_provider_initial_and_reattached_poll_use_same_absolute_deadline(monkeypatch):
     from flash.providers.core.base import JobHandle, PollResult
-    from flash.providers.vast import VastProvider
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api
+    from flash.providers.vast.execution.provider import VastProvider
 
     deadline_at = 12_345.0
     captured = []
@@ -2666,9 +2666,9 @@ def test_provider_poll_recovery_unconfirmed_teardown_escalates_to_run_scoped_rea
     active-run label and billing, with no persisted handle."""
     from flash.providers.artifacts import hf as _hf_artifacts
     from flash.providers.core.base import JobHandle, PollResult
-    from flash.providers.vast import PROVIDER
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api
+    from flash.providers.vast.execution.provider import PROVIDER
 
     monkeypatch.setattr(
         vast_api, "destroy_instance", lambda iid: False
@@ -2690,9 +2690,9 @@ def test_provider_poll_recovery_confirmed_teardown_skips_run_scoped_reap(monkeyp
     """A confirmed recovery teardown needs no extra run-scoped reap (no redundant list+destroy)."""
     from flash.providers.artifacts import hf as _hf_artifacts
     from flash.providers.core.base import JobHandle, PollResult
-    from flash.providers.vast import PROVIDER
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api
+    from flash.providers.vast.execution.provider import PROVIDER
 
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)  # confirmed
     monkeypatch.setattr(vast, "poll_vast_job", lambda *a, **k: PollResult(True, metrics={}))
@@ -2706,8 +2706,8 @@ def test_provider_poll_recovery_confirmed_teardown_skips_run_scoped_reap(monkeyp
 
 def test_provider_destroy_rejects_incomplete_handle_before_api_call(monkeypatch):
     from flash.providers.core.base import JobHandle
-    from flash.providers.vast import PROVIDER
     from flash.providers.vast.client import api as vast_api
+    from flash.providers.vast.execution.provider import PROVIDER
 
     seen = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: seen.append(iid) or False)

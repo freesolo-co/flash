@@ -106,8 +106,8 @@ class _SubmitContext:
         # only runpod handles carry an endpoint_id, so this set is empty on a plane without it.
         if not self.seen_endpoints:
             return
-        from flash.providers import get_provider
         from flash.providers.core.base import JobHandle
+        from flash.providers.core.registry import get_provider
 
         rp = get_provider("runpod")
         for remote in self.seen_endpoints.values():
@@ -249,8 +249,8 @@ def _require_opd_configuration(ctx: _SubmitContext) -> None:
 def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     if not ctx.last_handle:
         return None
-    from flash.providers import get_provider
     from flash.providers.core.base import JobHandle
+    from flash.providers.core.registry import get_provider
     from flash.runner.accounting.reconciliation import (
         _compare_and_clear_remote,
         _record_cleanup_remote,
@@ -511,8 +511,8 @@ def _pinned_to_resume_width(allocation, resume_world_size: int | None):
 def _build_candidate_plan(
     ctx: _SubmitContext, prepared: _PreparedAttempt, allocation
 ) -> _CandidatePlan | None:
-    from flash.providers import get_provider
     from flash.providers.core.allocator import allocation_summary
+    from flash.providers.core.registry import get_provider
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
     from flash.runner.supervise.lifecycle import _spec_with_gpu
 
@@ -606,12 +606,12 @@ def _submit_provider(
     prepared: _PreparedAttempt,
     plan: _CandidatePlan,
 ):
-    from flash.providers import get_provider
     from flash.providers.core.base import (
         PollResult,
         RunExhaustedProviderPoolError,
         UnreconciledCreateError,
     )
+    from flash.providers.core.registry import get_provider
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at, _worker_deadline_at
     from flash.runner.supervise.errors import _TerminalHandleRace
     from flash.server.domain.teacher.broker import teacher_attempt_transport
@@ -761,7 +761,7 @@ def _handle_failure(
     prepared: _PreparedAttempt,
     outcome: _AttemptOutcome,
 ) -> _FailureDecision:
-    from flash.providers import get_provider
+    from flash.providers.core.registry import get_provider
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 

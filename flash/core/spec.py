@@ -449,7 +449,7 @@ class GpuSpec:
 
     def __post_init__(self) -> None:
         # coerce/validate here so every path (from_dict and direct construction) is guarded.
-        from flash.providers import validated_provider_preferences
+        from flash.providers.core.registry import validated_provider_preferences
 
         providers = validated_provider_preferences(
             self.providers, allow_empty=isinstance(self.providers, tuple)

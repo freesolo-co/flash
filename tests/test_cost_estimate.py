@@ -210,9 +210,9 @@ def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
 
 
 def test_selected_candidate_replaces_the_provisional_quote(monkeypatch):
-    from flash.providers import get_provider
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate
+    from flash.providers.core.registry import get_provider
     from flash.providers.lambda_.client import api as lambda_api
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod", "lambda"))

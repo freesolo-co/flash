@@ -12,6 +12,11 @@ import argparse
 import pytest
 
 import flash.cli.parsing.main as cli
+from flash.cli.commands.env.testing.eval import cmd_env_eval
+from flash.cli.commands.ops.account import cmd_projects_create, cmd_projects_list
+from flash.cli.commands.ops.catalog import cmd_models
+from flash.cli.commands.ops.deploy import cmd_chat, cmd_deployments
+from flash.cli.commands.ops.runs import cmd_runs, cmd_status
 
 
 def _registered_subcommands() -> set[str]:
@@ -72,35 +77,35 @@ def test_grouped_command_argparse_contracts() -> None:
     parser = cli._build_parser()
     args = parser.parse_args(["models", "deployments", "--json"])
     assert args.json is True
-    assert args.func is cli.cmd_deployments
+    assert args.func is cmd_deployments
 
     args = parser.parse_args(["runs", "status", "run-1", "-f", "--json"])
     assert args.run_id == "run-1"
     assert args.follow is True
     assert args.json is True
-    assert args.func is cli.cmd_status
+    assert args.func is cmd_status
 
     args = parser.parse_args(["models", "chat", "run-1", "-m", "hello"])
     assert args.run_id == "run-1"
     assert args.message == "hello"
-    assert args.func is cli.cmd_chat
+    assert args.func is cmd_chat
 
     args = parser.parse_args(["env", "eval", "run-1", "--suite", "math", "--concurrency", "4"])
     assert args.target == "run-1"
     assert args.suite == "math"
     assert args.concurrency == 4
-    assert args.func is cli.cmd_env_eval
+    assert args.func is cmd_env_eval
     # the evaluated run names the environment, so there is no second positional to take one
     # locally. asserted here because the parser is the only place that refusal is expressed.
     with pytest.raises(SystemExit):
         parser.parse_args(["env", "eval", "run-1", "./my-env"])
 
     args = parser.parse_args(["projects", "list"])
-    assert args.func is cli.cmd_projects_list
+    assert args.func is cmd_projects_list
 
     args = parser.parse_args(["projects", "create", "my project"])
     assert args.name == "my project"
-    assert args.func is cli.cmd_projects_create
+    assert args.func is cmd_projects_create
 
 
 def test_bare_group_commands_keep_their_pre_grouping_behavior() -> None:
@@ -112,14 +117,14 @@ def test_bare_group_commands_keep_their_pre_grouping_behavior() -> None:
     parser = cli._build_parser()
 
     args = parser.parse_args(["models"])
-    assert args.func is cli.cmd_models
+    assert args.func is cmd_models
 
     args = parser.parse_args(["runs"])
-    assert args.func is cli.cmd_runs
+    assert args.func is cmd_runs
 
     # the grouped forms still resolve to the same handlers.
-    assert parser.parse_args(["models", "list"]).func is cli.cmd_models
-    assert parser.parse_args(["runs", "list"]).func is cli.cmd_runs
+    assert parser.parse_args(["models", "list"]).func is cmd_models
+    assert parser.parse_args(["runs", "list"]).func is cmd_runs
 
 
 def test_root_model_commands_are_not_registered() -> None:

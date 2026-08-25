@@ -15,7 +15,7 @@ import threading
 import time
 
 from flash._internal.channel import CLI_NAME
-from flash.cli.ui import render
+from flash.cli.ui import render, tables
 from flash.client import ApiError, ClientError, client_from_config
 
 # the states a deployment sits in before the requested revision is actually servable, mirroring
@@ -822,7 +822,7 @@ def cmd_deployments(args) -> int:
             print("no active deployments")
         return 0
     if render.styled():
-        print(render.deployments_table(rows))
+        print(tables.deployments_table(rows))
         return 0
     print(
         f"{'RUN ID':<30}  {'STEP':<6}  {'REVISION':<40}  {'STATE':<14}  "

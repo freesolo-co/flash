@@ -1,16 +1,13 @@
 """Table renderers for `flash` list commands.
 
 The primitives these build on (`_table`, `_paint`, `header`, ...) stay in
-`flash.cli.ui.render`; this module holds the per-command table layouts. Split out to keep
-`render.py` under the file-size limit.
-
-Imported back into `flash.cli.ui.render` so `render.runs_table(...)` keeps resolving, which
-is how every call site and `monkeypatch.setattr(commands.render, ...)` reach these.
+`flash.cli.ui.render`; this module owns the per-command table layouts.
 """
 
 from __future__ import annotations
 
 from flash._internal.channel import CLI_NAME
+from flash.cli.ui import cost
 from flash.cli.ui.render import (
     _ACCENT2,
     _AMBER,
@@ -27,10 +24,9 @@ from flash.cli.ui.render import (
     _safe,
     _table,
     arrow,
+    gpu_label,
     header,
-    run_cost,
 )
-from flash.core.spec import persisted_gpu_types
 
 
 def models_table(rows: list[dict]) -> str:
@@ -70,12 +66,6 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
     return _safe(f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}")
 
 
-def gpu_label(spec: dict, remote: dict) -> str:
-    """Human-facing GPU label. Provider metadata stays internal."""
-    authored = " | ".join(persisted_gpu_types(spec))
-    return remote.get("allocated_gpu") or authored
-
-
 def runs_table(runs: list[dict]) -> str:
     """Runs list: state badges + cost, newest first."""
     body = []
@@ -85,7 +75,7 @@ def runs_table(runs: list[dict]) -> str:
         algorithm = str(spec.get("algorithm") or "-").upper()
         where = gpu_label(spec, r.get("remote") or {})
         color, uni, ascii_dot = _STATE_STYLE.get(str(r.get("state", "")).lower(), (_GRAY, "•", "-"))
-        amount, is_estimate = run_cost(r)
+        amount, is_estimate = cost.run_cost(r)
         # `~` marks the submit-time quote for a run that has not settled, so a column of live runs
         # does not read as a column of free ones.
         body.append(

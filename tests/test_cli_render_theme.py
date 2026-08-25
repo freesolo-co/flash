@@ -15,7 +15,8 @@ import flash.cli.commands.ops.deploy as cli_deploy
 import flash.cli.commands.ops.runs as cli_runs
 import flash.cli.parsing.main as cli
 from flash import __version__
-from flash.cli.ui import render
+from flash.cli.ui import env_panels, render, tables
+from flash.cli.ui import heartbeat as heartbeat_ui
 
 
 class _Client:
@@ -105,7 +106,7 @@ def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
         },
         "remote": {"allocated_gpu": "RTX 4090", "provider": "runpod", "flash_arm": "runpod"},
     }
-    runs = render.runs_table([run])
+    runs = tables.runs_table([run])
     status = render.run_status(run)
     assert "RTX 4090" in runs
     assert "RTX 4090" in status
@@ -130,7 +131,7 @@ def test_runs_and_status_prefer_allocated_gpu(monkeypatch) -> None:
         },
         "remote": {"allocated_gpu": "B200"},
     }
-    runs = render.runs_table([allocated_run])
+    runs = tables.runs_table([allocated_run])
     status = render.run_status(allocated_run)
     status_panel = status.split("details", 1)[0]
     assert "B200" in runs
@@ -143,7 +144,7 @@ def test_runs_and_status_prefer_allocated_gpu(monkeypatch) -> None:
         "state": "done",
         "spec": {"gpu": {"type": "RTX Pro 6000"}},
     }
-    assert "RTX Pro 6000" in render.runs_table([spec_only_run])
+    assert "RTX Pro 6000" in tables.runs_table([spec_only_run])
     assert "RTX Pro 6000" in render.run_status(spec_only_run)
 
     # the removed legacy remote["gpu"] key is no longer honored: the label resolves from the
@@ -154,8 +155,8 @@ def test_runs_and_status_prefer_allocated_gpu(monkeypatch) -> None:
         "spec": {"gpu": {"type": "RTX Pro 6000"}},
         "remote": {"gpu": "B200"},
     }
-    assert "B200" not in render.runs_table([legacy_key_run])
-    assert "RTX Pro 6000" in render.runs_table([legacy_key_run])
+    assert "B200" not in tables.runs_table([legacy_key_run])
+    assert "RTX Pro 6000" in tables.runs_table([legacy_key_run])
 
 
 def test_color_respects_no_color(monkeypatch) -> None:
@@ -218,19 +219,19 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
 
     monkeypatch.setattr(render.sys, "stdout", _AsciiStdout())
     outputs = [
-        render.models_table([{"id": "acme/x"}]),
-        render.gpus_table([("RTX 5090", 32, 0.99)], "Tip: selection is automatic — no pinning"),
-        render.runs_table([{"run_id": "r", "state": "done", "spec": {}}]),
-        render.deployments_table([{"run_id": "r", "deployment": {"state": "ready"}}]),
+        tables.models_table([{"id": "acme/x"}]),
+        tables.gpus_table([("RTX 5090", 32, 0.99)], "Tip: selection is automatic — no pinning"),
+        tables.runs_table([{"run_id": "r", "state": "done", "spec": {}}]),
+        tables.deployments_table([{"run_id": "r", "deployment": {"state": "ready"}}]),
         render.env_setup(
             ["environment.py", "dataset/train.jsonl", "configs/rl.toml"],
             "11111111-1111-4111-8111-111111111111",
         ),
-        render.env_list([]),
+        env_panels.env_list([]),
         render.empty("runs", "0 runs", "no runs yet — submit one with `flash train`"),
         render.submitted("flash-xyz"),
         render.run_status({"run_id": "r", "state": "failed", "spec": {}, "error": "boom — bad"}),
-        render.checkpoints_table(
+        tables.checkpoints_table(
             "r", [{"step": 8, "repo_id": "acme/x", "subfolder": "grpo/step-8"}]
         ),
         render.cancelled({"run_id": "r", "state": "cancelled"}),
@@ -254,7 +255,7 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
 
-    ck = render.checkpoints_table(
+    ck = tables.checkpoints_table(
         "flash-1", [{"step": 8, "repo_id": "acme/x", "subfolder": "grpo/step-8"}]
     )
     # themed header + table, not a bare `step N` list
@@ -886,7 +887,7 @@ def test_run_status_explains_warmup_when_heartbeat_matches_attempt(monkeypatch, 
 
 
 def test_heartbeat_is_current_attempt_rejects_malformed_identities() -> None:
-    is_current = render.heartbeat_is_current_attempt
+    is_current = heartbeat_ui.heartbeat_is_current_attempt
 
     # a malformed heartbeat attempt cannot prove it is the live attempt, so it earns no reassurance
     # and must never crash the display path (e.g. on inf, which the old int() coercion raised on).
@@ -908,7 +909,7 @@ def test_live_attempt_is_one_rule_for_every_surface_that_names_an_attempt() -> N
     They are read within one screen of each other, so two provenance rules read as a run that is on
     two attempts at once -- and the artifact labels would call the live attempt's console "previous".
     """
-    live = render.live_attempt
+    live = heartbeat_ui.live_attempt
 
     # the plane's live attempt wins over the ping, which may be the superseded worker's.
     assert live({"remote": {"attempt": 2}, "last_heartbeat": {"attempt": 1}}) == 2
@@ -964,9 +965,8 @@ def test_progress_age_always_adds_to_heartbeat_age(monkeypatch):
 
 
 def test_fresh_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch):
-    from flash.cli.ui import heartbeat
 
-    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
     obj = {
         "state": "running",
         "last_heartbeat": {
@@ -978,20 +978,19 @@ def test_fresh_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch
         },
     }
 
-    pairs = heartbeat._heartbeat_pairs(obj)
+    pairs = heartbeat_ui._heartbeat_pairs(obj)
     assert ("worker", "rl_step · step 14 · alive ping") in pairs
     assert ("heartbeat", "10s ago") in pairs
     progress = dict(pairs)["progress"]
     assert "last known progress can be as old as 1810.0s" in progress
     assert "upload throttling no longer explains the gap" in progress
-    assert heartbeat._QUIET_HEARTBEAT_HINT not in progress
+    assert heartbeat_ui._QUIET_HEARTBEAT_HINT not in progress
     assert len([label for label, _ in pairs if label == "progress"]) == 1
 
 
 def test_fresh_opd_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch):
-    from flash.cli.ui import heartbeat
 
-    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
     obj = {
         "state": "running",
         "last_heartbeat": {
@@ -1003,7 +1002,7 @@ def test_fresh_opd_liveness_upload_surfaces_worker_measured_progress_gap(monkeyp
         },
     }
 
-    pairs = heartbeat._heartbeat_pairs(obj)
+    pairs = heartbeat_ui._heartbeat_pairs(obj)
     assert ("worker", "opd_step · step 1 · alive ping") in pairs
     assert ("heartbeat", "10s ago") in pairs
     progress = dict(pairs)["progress"]
@@ -1012,9 +1011,8 @@ def test_fresh_opd_liveness_upload_surfaces_worker_measured_progress_gap(monkeyp
 
 
 def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
-    from flash.cli.ui import heartbeat
 
-    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
     base = {
         "state": "running",
         "remote": {"attempt": 2},
@@ -1027,7 +1025,7 @@ def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch)
     }
 
     def progress(hb: dict) -> str:
-        return dict(heartbeat._heartbeat_pairs(dict(base, last_heartbeat=hb)))["progress"]
+        return dict(heartbeat_ui._heartbeat_pairs(dict(base, last_heartbeat=hb)))["progress"]
 
     old_hint = progress(old_worker)
     assert progress({**old_worker, "progress_age_s": 220.0}) == old_hint
@@ -1038,9 +1036,8 @@ def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch)
     "bad_progress_age", [10**400, float("inf"), float("nan"), -1.0, True, "bad"]
 )
 def test_invalid_progress_age_falls_back_to_legacy_hint(monkeypatch, bad_progress_age):
-    from flash.cli.ui import heartbeat
 
-    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
     base = {
         "state": "running",
         "remote": {"attempt": 2},
@@ -1052,11 +1049,11 @@ def test_invalid_progress_age_falls_back_to_legacy_hint(monkeypatch, bad_progres
         "ts": 800.0,
     }
 
-    legacy = dict(heartbeat._heartbeat_pairs({**base, "last_heartbeat": heartbeat_base}))[
+    legacy = dict(heartbeat_ui._heartbeat_pairs({**base, "last_heartbeat": heartbeat_base}))[
         "progress"
     ]
     invalid = dict(
-        heartbeat._heartbeat_pairs(
+        heartbeat_ui._heartbeat_pairs(
             {
                 **base,
                 "last_heartbeat": {**heartbeat_base, "progress_age_s": bad_progress_age},
@@ -1067,9 +1064,8 @@ def test_invalid_progress_age_falls_back_to_legacy_hint(monkeypatch, bad_progres
 
 
 def test_missing_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
-    from flash.cli.ui import heartbeat
 
-    monkeypatch.setattr(heartbeat.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
     obj = {
         "state": "running",
         "remote": {"attempt": 2},
@@ -1081,7 +1077,7 @@ def test_missing_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
         },
     }
 
-    assert heartbeat._heartbeat_pairs(obj) == [
+    assert heartbeat_ui._heartbeat_pairs(obj) == [
         ("worker", "rl_step · step 14"),
         ("heartbeat", "20m ago"),
         (
@@ -1104,6 +1100,7 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     """
     import time as _time
 
+    from flash.cli.ui import heartbeat as heartbeat_ui
     from flash.cli.ui import render
 
     monkeypatch.setenv("FLASH_STYLE", "1")
@@ -1143,7 +1140,7 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
 
     # one explanation for one silence: the quiet hint points at `runs log`, which reads the same
     # frozen heartbeats, so it must not ride along with the progress row.
-    assert render._QUIET_HEARTBEAT_HINT not in out
+    assert heartbeat_ui._QUIET_HEARTBEAT_HINT not in out
 
     # a SETUP stage has no step to be stale about -- it gets the warmup/quiet hints instead.
     setup = dict(base, last_heartbeat={"stage": "sft_initializing", "ts": _time.time() - 1200})
@@ -1201,6 +1198,7 @@ def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
     """
     import time as _time
 
+    from flash.cli.ui import heartbeat as heartbeat_ui
     from flash.cli.ui import render
 
     monkeypatch.setenv("FLASH_STYLE", "1")
@@ -1226,7 +1224,7 @@ def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
     # sends that user to wait for an attempt change that is never coming.
     assert "uploads may be failing" in out
     # one explanation per silence: the generic hint must not ride along with the specific one.
-    assert render._QUIET_HEARTBEAT_HINT not in out
+    assert heartbeat_ui._QUIET_HEARTBEAT_HINT not in out
 
     # inside the cadence, silence is ordinary and must stay unremarked by this hint.
     fresh = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 300})
@@ -1554,6 +1552,7 @@ def test_quiet_hint_does_not_send_users_to_an_hourly_log(monkeypatch):
     """
     import time as _time
 
+    from flash.cli.ui import heartbeat as heartbeat_ui
     from flash.cli.ui import render
 
     monkeypatch.setenv("FLASH_STYLE", "1")
@@ -1567,7 +1566,7 @@ def test_quiet_hint_does_not_send_users_to_an_hourly_log(monkeypatch):
     }
     out = render.run_status(quiet).split("details")[0]
 
-    assert render._QUIET_HEARTBEAT_HINT in out
+    assert heartbeat_ui._QUIET_HEARTBEAT_HINT in out
     assert "runs log" not in out
     # it has to name the surfaces that do update while the run is live.
     assert "the age above" in out

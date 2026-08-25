@@ -200,7 +200,9 @@ def test_sweep_instances_dispatches_active_set_and_sums(monkeypatch):
     monkeypatch.setattr(app_mod, "_known_run_ids", lambda: {"flash-live", "flash-done"})
     lam = _FakeProvider("lambda", torn=["i-1", "i-2"])
     rp = _FakeProvider("runpod", torn=[])  # no-op for RunPod, still dispatched
-    monkeypatch.setattr("flash.providers.configured_providers", lambda: [rp, lam], raising=False)
+    monkeypatch.setattr(
+        "flash.providers.core.registry.configured_providers", lambda: [rp, lam], raising=False
+    )
 
     # 2 lambda + 0 runpod torn down.
     assert app_mod._sweep_orphan_instances_once() == 2
@@ -216,22 +218,30 @@ def test_sweep_instances_one_provider_blip_does_not_skip_others(monkeypatch):
     monkeypatch.setattr(app_mod, "_known_run_ids", lambda: set())
     boom = _FakeProvider("lambda", raises=True)
     ok = _FakeProvider("runpod", torn=["vm-1", "vm-2"])
-    monkeypatch.setattr("flash.providers.configured_providers", lambda: [boom, ok], raising=False)
+    monkeypatch.setattr(
+        "flash.providers.core.registry.configured_providers", lambda: [boom, ok], raising=False
+    )
 
     # The raising provider is swallowed; the other still reaps.
     assert app_mod._sweep_orphan_instances_once() == 2
 
 
 def test_instance_providers_configured_gating(monkeypatch):
-    monkeypatch.setattr("flash.providers.available_providers", lambda: ("runpod",), raising=False)
+    monkeypatch.setattr(
+        "flash.providers.core.registry.available_providers", lambda: ("runpod",), raising=False
+    )
     assert app_mod._instance_providers_configured() is False
 
     monkeypatch.setattr(
-        "flash.providers.available_providers", lambda: ("runpod", "lambda"), raising=False
+        "flash.providers.core.registry.available_providers",
+        lambda: ("runpod", "lambda"),
+        raising=False,
     )
     assert app_mod._instance_providers_configured() is True
 
-    monkeypatch.setattr("flash.providers.available_providers", lambda: ("lambda",), raising=False)
+    monkeypatch.setattr(
+        "flash.providers.core.registry.available_providers", lambda: ("lambda",), raising=False
+    )
     assert app_mod._instance_providers_configured() is True
 
 
@@ -257,7 +267,9 @@ def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": r} for r in statuses])
     monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
     # Make the instance provider "configured" so the real one is dispatched (RunPod absent here).
-    monkeypatch.setattr("flash.providers.available_providers", lambda: ("lambda",), raising=False)
+    monkeypatch.setattr(
+        "flash.providers.core.registry.available_providers", lambda: ("lambda",), raising=False
+    )
 
     lam_instances = [
         {"id": "i-live", "name": lambda_jobs.instance_label("flash-live", 0, 0)},  # live -> KEEP
@@ -294,7 +306,9 @@ def test_sweep_spares_other_control_planes_live_instances(monkeypatch):
     monkeypatch.setattr(
         app_mod, "get_status", lambda rid: RunStatus(run_id="flash-mine", state="running", spec={})
     )
-    monkeypatch.setattr("flash.providers.available_providers", lambda: ("lambda",), raising=False)
+    monkeypatch.setattr(
+        "flash.providers.core.registry.available_providers", lambda: ("lambda",), raising=False
+    )
 
     lam_instances = [
         {"id": "i-mine", "name": lambda_jobs.instance_label("flash-mine", 0, 0)},  # ours, live

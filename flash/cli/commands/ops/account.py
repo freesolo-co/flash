@@ -8,7 +8,7 @@ import uuid
 
 from flash import __version__
 from flash._internal.channel import BRAND_NAME, CLI_NAME
-from flash.cli.ui import render
+from flash.cli.ui import render, tables
 from flash.client import (
     ApiClient,
     ClientError,
@@ -246,7 +246,7 @@ def cmd_projects_list(args) -> int:
         raise ClientError(f"not logged in. Run `{CLI_NAME} login` before listing projects")
     projects = list_projects(api_key)
     if render.styled():
-        print(render.projects_table(projects))
+        print(tables.projects_table(projects))
         return 0
     for project in projects:
         project_id = str(project.get("id") or "").strip()

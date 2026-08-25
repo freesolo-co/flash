@@ -7,12 +7,6 @@ from dataclasses import replace
 from typing import NoReturn
 
 from flash._internal.logging import get_logger
-from flash.providers import (
-    PROVIDER_NAMES,
-    available_providers,
-    get_provider,
-    validated_provider_preferences,
-)
 from flash.providers.core.base import (
     GPU_INFO,
     Allocation,
@@ -38,6 +32,12 @@ from flash.providers.core.fit_errors import (
     rents_arbitrary_card_counts,
     vram_fit_error_message,
     widenable_gpu_names,
+)
+from flash.providers.core.registry import (
+    PROVIDER_NAMES,
+    available_providers,
+    get_provider,
+    validated_provider_preferences,
 )
 from flash.providers.core.sharding import (
     MAX_COMBINATION_CARDS,

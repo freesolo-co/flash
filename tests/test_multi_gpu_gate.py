@@ -156,8 +156,8 @@ def test_provider_only_offers_counts_it_can_rent(all_providers_configured, provi
     because vllm asserts ``num_attention_heads % tp_size == 0`` for the rollout engine, and every
     managed model's head count is a power of two: a 3-card box would abort at engine init.
     """
-    from flash.providers import get_provider
     from flash.providers.core.base import AllocationConstraints, rentable_gpu_counts
+    from flash.providers.core.registry import get_provider
 
     # spelled out rather than taken from rentable_gpu_counts: the providers call that same helper, so
     # comparing candidates against it would compare the code to itself and could never disagree.
@@ -183,8 +183,8 @@ def test_single_card_constraint_yields_only_single_card_offers(all_providers_con
     The pairing that makes the count-aware path failable: with the cap at 1 a provider that ignored
     the constraint entirely would still look correct in the max_gpu_count=8 test above.
     """
-    from flash.providers import available_providers, get_provider
     from flash.providers.core.base import AllocationConstraints
+    from flash.providers.core.registry import available_providers, get_provider
 
     checked = []
     for name in available_providers():
@@ -272,9 +272,9 @@ def test_lambda_missing_required_count_sku_is_terminal(monkeypatch):
     capacity failures. A shape Lambda does not sell can never recover by retrying.
     """
     from flash.providers.core.base import AllocationConstraints, UnsupportedGpuError
-    from flash.providers.lambda_ import LambdaProvider
     from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_.client.gpus import instance_type_for
+    from flash.providers.lambda_.execution.provider import LambdaProvider
 
     gpu = "A100 SXM 40GB"
 
@@ -1432,7 +1432,7 @@ def test_vast_keeps_confirmed_shapes_when_another_count_query_fails():
     total lookup failure may raise.
     """
     from flash.providers.core.base import AllocationConstraints, CapacityLookupError
-    from flash.providers.vast import VastProvider
+    from flash.providers.vast.execution.provider import VastProvider
 
     provider = VastProvider()
     fitting_vram = min(g.vram_gb for g in provider.gpu_classes())

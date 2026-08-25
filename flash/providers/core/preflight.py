@@ -119,7 +119,7 @@ def require_operator_config() -> None:
     ASGI server built through ``create_app()``. Pure reads, apart from re-stripping already-stripped
     env vars, so running it twice changes nothing.
     """
-    from flash.providers import available_providers
+    from flash.providers.core.registry import available_providers
     from flash.server.platform.auth import standalone
 
     _normalize_operator_credentials()
@@ -183,7 +183,7 @@ def require_operator_config() -> None:
 
 def check_run_preflight() -> None:
     """Raise PreflightError if the plane cannot run a job; warn on degraded-but-workable config."""
-    from flash.providers import available_providers
+    from flash.providers.core.registry import available_providers
     from flash.providers.runpod.client import auth as runpod_keys
 
     require_operator_config()

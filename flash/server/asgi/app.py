@@ -260,7 +260,7 @@ def _sweep_orphan_instances_once() -> int:
     Pass active ids as a callable so providers list first and read protection state afterward;
     instance APIs expose no creation timestamp for a reliable age grace.
     """
-    from flash.providers import configured_providers
+    from flash.providers.core.registry import configured_providers
 
     torn = 0
     for prov in configured_providers():
@@ -306,7 +306,7 @@ def _instance_providers_configured() -> bool:
     """True when an instance-based provider (Lambda or Vast) is configured on this plane, so the
     periodic instance orphan sweep is worth running. RunPod-only planes skip it — RunPod has no
     standing per-run billing to reap between restarts (its idle reaper covers warm endpoints)."""
-    from flash.providers import INSTANCE_PROVIDERS, available_providers
+    from flash.providers.core.registry import INSTANCE_PROVIDERS, available_providers
 
     return any(name in INSTANCE_PROVIDERS for name in available_providers())
 

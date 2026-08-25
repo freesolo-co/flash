@@ -601,8 +601,8 @@ def test_cancel_run_noop_when_terminal(tmp_path, monkeypatch):
 
 
 def test_cancel_run_retries_durable_cleanup_for_cancelled_run(tmp_path, monkeypatch):
-    import flash.providers as providers
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancelled-1"})
@@ -632,8 +632,8 @@ def test_cancel_run_retries_durable_cleanup_for_cancelled_run(tmp_path, monkeypa
 def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
     tmp_path, monkeypatch
 ):
-    import flash.providers as providers
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-retry"})
@@ -671,8 +671,8 @@ def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
 
 
 def test_cancel_run_failed_teardown_does_not_replace_racing_public_remote(tmp_path, monkeypatch):
-    import flash.providers as providers
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-race"})
@@ -734,8 +734,8 @@ def test_cancel_run_marks_billing_failed_when_pricing_falls_back(tmp_path, monke
 
 
 def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path, monkeypatch):
-    import flash.providers as providers
     from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-clean"})
@@ -775,7 +775,7 @@ def _make_poll_provider(monkeypatch, *, on_poll):
 
     Also no-ops _gc_run_endpoints so attach_run's teardown doesn't reach the real SDK.
     """
-    import flash.providers as providers
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda *a, **k: None)
 
@@ -964,9 +964,9 @@ def _ready_checkpoint(run_id: str, step: int, *, remote: dict | None = None) -> 
 
 
 def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path, monkeypatch):
-    import flash.providers as providers
     import flash.runner.results.verified_revisions as verified_revisions
     import flash.serve.deployment.deploy as deploy
+    from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-order"

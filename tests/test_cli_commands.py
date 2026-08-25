@@ -21,6 +21,7 @@ from flash.cli.commands.ops import log_follow
 from flash.cli.commands.ops import runs as run_commands
 from flash.cli.commands.ops import traces as cli_traces
 from flash.cli.commands.ops import train as train_commands
+from flash.cli.ui import cost as cost_ui
 from flash.client.config import DEFAULT_API_URL
 from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
@@ -4928,7 +4929,7 @@ def test_log_follow_progress_shows_a_settled_zero_like_the_other_surfaces() -> N
     (0.0, False) there. Suppressing it only in follow made the same finished run read as costed in
     one place and uncosted in another, which is the inconsistency, not the zero.
     """
-    for state in sorted(cli.render.SETTLED_COST_STATES):
+    for state in sorted(cost_ui.SETTLED_COST_STATES):
         _state, progress = run_commands._log_follow_progress(
             {"state": state, "cost_usd": 0.0}, state
         )

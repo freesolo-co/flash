@@ -287,9 +287,9 @@ def api(tmp_path, monkeypatch):
     importlib.reload(app_mod)
     # configured provider keys would trigger orphan sweeps and status reporting. stub both because
     # these billing tests assert only on the API response and must remain network-free.
-    import flash.providers as providers_mod
     import flash.server.domain.registry.projects as projects_mod
     import flash.server.domain.registry.runs as runs
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(

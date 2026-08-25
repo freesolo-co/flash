@@ -610,8 +610,8 @@ def test_next_attempt_cas_race_blocks_opd_reservation(monkeypatch, tmp_path):
 
 
 def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypatch, tmp_path):
-    import flash.providers as providers
     import flash.providers.core.allocator as allocator
+    from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
 
@@ -683,8 +683,8 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
 
 
 def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch, tmp_path):
-    import flash.providers as providers
     import flash.providers.core.allocator as allocator
+    from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
 
@@ -780,7 +780,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
 
 
 def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkeypatch, tmp_path):
-    import flash.providers as providers
+    from flash.providers.core import registry as providers
     from flash.providers.core.base import PollResult
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -834,7 +834,7 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
 
 
 def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_path):
-    import flash.providers as providers
+    from flash.providers.core import registry as providers
     from flash.server.platform import runtime as _runtime
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))

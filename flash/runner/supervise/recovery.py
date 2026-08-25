@@ -146,7 +146,7 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
 
 def _worker_provably_gone(run_id: str, handle) -> bool:
     """Return true only when the captured attempt cannot still have a live worker."""
-    from flash.providers import INSTANCE_PROVIDERS, get_provider
+    from flash.providers.core.registry import INSTANCE_PROVIDERS, get_provider
 
     try:
         handle = _canonical_provider_handle(handle)
@@ -188,7 +188,7 @@ def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
 
     fingerprint = data.get("key_fingerprint")
     if canonical is not None:
-        from flash.providers import get_provider
+        from flash.providers.core.registry import get_provider
 
         get_provider("runpod").destroy(canonical)
         return
@@ -257,7 +257,7 @@ def _strict_teardown_handle(handle, run_id: str) -> bool:
     RunPod job proven terminal while its endpoint deletion remains unconfirmed; callers must persist
     that exact endpoint in cleanup_remotes before clearing the active remote.
     """
-    from flash.providers import INSTANCE_PROVIDERS, get_provider
+    from flash.providers.core.registry import INSTANCE_PROVIDERS, get_provider
 
     raw = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
     if raw.get("provider") == "runpod":
@@ -630,7 +630,7 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
                 _record_cleanup_remote(spec.run_id, status.remote)
         except Exception:
             pass
-    from flash.providers import available_providers, get_provider
+    from flash.providers.core.registry import available_providers, get_provider
 
     # Sweep every CONFIGURED provider, including RunPod (whose gc also reaps the rN-suffixed
     # endpoints the persisted handle cannot name). Gating on available_providers() is what makes

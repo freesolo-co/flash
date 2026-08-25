@@ -1287,9 +1287,9 @@ def test_cost_quote_preserves_soft_provider_preference(monkeypatch) -> None:
     to be made reachable explicitly -- quoting lambda on the bare fixture plane would assert the
     very defect `test_cost_quote_skips_a_preference_this_plane_cannot_provision` guards against.
     """
-    import flash.providers as providers_registry
     from flash.cost.analytical import estimate_cost
     from flash.cost.spec import runconfig_from_spec
+    from flash.providers.core import registry as providers_registry
 
     spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda", "vast"]}))
     config = runconfig_from_spec(spec)
@@ -1310,9 +1310,9 @@ def test_cost_quote_skips_a_preference_this_plane_cannot_provision(monkeypatch) 
     get, and the server's affordability check runs on that estimate -- so a balance that covers the
     real allocation can be refused with a 402.
     """
-    import flash.providers as providers_registry
     from flash.cost.analytical import estimate_cost
     from flash.cost.spec import runconfig_from_spec
+    from flash.providers.core import registry as providers_registry
 
     spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"]}))
     config = runconfig_from_spec(spec)
@@ -1333,9 +1333,9 @@ def test_cost_quote_refuses_a_shape_no_configured_provider_can_rent(monkeypatch)
     for hardware this plane has no credentials for, which then passes the affordability check and
     only fails once live allocation runs -- after the run is recorded.
     """
-    import flash.providers as providers_registry
     from flash.cost.analytical import estimate_cost
     from flash.cost.spec import runconfig_from_spec
+    from flash.providers.core import registry as providers_registry
 
     spec = spec_from_dict(_raw(**{"gpu.providers": ["vast"], "gpu.type": "B200"}))
     config = runconfig_from_spec(spec)

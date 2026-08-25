@@ -133,10 +133,10 @@ def make_client(tmp_path, monkeypatch):
     # configured_providers() treat it as live, so create_app()'s lifespan recover_runs() would
     # dispatch real sweep_orphans() list calls — and the urllib->TestClient shim below isn't installed
     # until AFTER create_app() runs. Stub the provider set to empty so startup stays hermetic.
-    import flash.providers as providers_mod
     import flash.server.domain.registry.environment_registry as environment_registry
     import flash.server.domain.registry.projects as projects_mod
     import flash.server.domain.registry.runs as runs
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(environment_registry, "require_environment_project", lambda **_kwargs: None)

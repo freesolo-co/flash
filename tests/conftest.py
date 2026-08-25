@@ -396,7 +396,7 @@ def _offline(monkeypatch):
     # Provider singletons are @cache'd per name, and is_configured() now reads the env, so a test
     # that sets or clears a provider key would otherwise see the PREVIOUS test's answer. Clear
     # around every test: the cache exists to avoid re-importing, not to freeze configuration.
-    import flash.providers as _providers
+    from flash.providers.core import registry as _providers
 
     _providers._get_provider.cache_clear()
 

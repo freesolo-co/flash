@@ -535,7 +535,7 @@ def _offline_preferred_gpu_shape(config: RunConfig) -> tuple[str, int, int, str,
     """quote the first structurally usable preference, then cost-rank unnamed fallbacks."""
     from dataclasses import replace
 
-    from flash.providers import PROVIDER_NAMES, available_providers
+    from flash.providers.core.registry import PROVIDER_NAMES, available_providers
 
     # quote only what this plane can actually rent. `allocate()` starts from the configured set, so
     # a preference naming a provider this plane cannot provision is ignored there -- quoting it

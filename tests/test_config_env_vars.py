@@ -218,7 +218,7 @@ class TestLogFormat:
 class TestServerBind:
     @staticmethod
     def _main():
-        return importlib.import_module("flash.server.__main__")
+        return importlib.import_module("flash.server.asgi.cli")
 
     def _parsed(self, monkeypatch, argv, env):
         main = self._main()
@@ -317,7 +317,7 @@ class TestServerPreflightFailure:
 
     @staticmethod
     def _main():
-        return importlib.import_module("flash.server.__main__")
+        return importlib.import_module("flash.server.asgi.cli")
 
     def _run(self, monkeypatch, capsys, exc):
         main = self._main()

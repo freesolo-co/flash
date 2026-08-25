@@ -14,6 +14,7 @@ from __future__ import annotations
 import sys
 import time
 
+from flash.cli.ui import heartbeat as heartbeat_ui
 from flash.cli.ui import render
 from flash.cli.ui.tty import TtyStatusLine
 from flash.client import ApiError, ClientError, RequestTimeoutError, ServiceUnreachableError
@@ -174,7 +175,7 @@ def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
         return []
     # during a retry, status.remote.attempt can already point at the replacement worker while
     # last_heartbeat still belongs to the prior attempt; don't render that stale attempt's rows
-    if not render.heartbeat_is_current_attempt(status, heartbeat):
+    if not heartbeat_ui.heartbeat_is_current_attempt(status, heartbeat):
         return []
     metrics_last = heartbeat.get("metrics_last")
     if not isinstance(metrics_last, list):

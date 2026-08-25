@@ -33,7 +33,7 @@ def realized_cost_for_remote(
         from flash.providers.runpod.client.cost import realized_cost as runpod_realized
 
         return runpod_realized(remote.get("endpoint_id"), start=start, end=end)
-    from flash.providers import INSTANCE_PROVIDERS
+    from flash.providers.core.registry import INSTANCE_PROVIDERS
 
     if provider in INSTANCE_PROVIDERS:
         # Both instance-billed providers: realized COGS == wall-clock x the instance's flat $/hr

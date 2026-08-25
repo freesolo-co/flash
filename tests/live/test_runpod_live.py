@@ -30,7 +30,7 @@ def test_runpod_auth_and_list_endpoints():
 def test_runpod_provider_hourly_rate():
     """The provider interface returns a positive static $/hr."""
     _require_key()
-    from flash.providers import get_provider
+    from flash.providers.core.registry import get_provider
 
     rate = get_provider("runpod").hourly_rate("RTX 5090")
     assert rate > 0

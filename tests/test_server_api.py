@@ -171,8 +171,8 @@ def api(tmp_path, monkeypatch):
     # break test hermeticity. These API tests don't exercise orphan reaping, so stub the
     # provider set to empty: preflight still passes on the keys, but startup stays CPU-only
     # with no network.
-    import flash.providers as providers_mod
     import flash.server.domain.registry.runs as runs
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     # The dummy FREESOLO_INTERNAL_KEY also enables the best-effort backend reporting path: a dry-run
@@ -8233,7 +8233,7 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
         def sweep_orphans(self, **k):
             return []
 
-    import flash.providers as providers_mod
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
 
@@ -8252,8 +8252,8 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
 
 
 def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_path):
-    import flash.providers as providers_mod
     import flash.server.platform.db as db_mod
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
@@ -8294,9 +8294,9 @@ def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_p
 
 
 def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
-    import flash.providers as providers_mod
     import flash.server.platform.db as db_mod
     from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
@@ -8392,8 +8392,8 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
         def sweep_orphans(self, **k):
             return []
 
-    import flash.providers as providers_mod
     import flash.server.platform.runtime as rt
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
     # Disable the background retry budget so the defer is a clean no-op for this assertion (no lingering
@@ -8445,8 +8445,8 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     resubmitted = []
     monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s: resubmitted.append(s.run_id))
 
-    import flash.providers as providers_mod
     import flash.server.platform.runtime as rt
+    from flash.providers.core import registry as providers_mod
 
     # Vast is no longer configured -> omitted from configured_providers(); the real get_provider("vast")
     # still exposes run_instances_remaining, so the recorded-but-unconfigurable provider can't be
@@ -8506,8 +8506,8 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
 
     monkeypatch.setattr(runner_lifecycle, "_run_job", fake_run_job)
 
-    import flash.providers as providers_mod
     import flash.server.platform.runtime as rt
+    from flash.providers.core import registry as providers_mod
 
     # Vast unconfigurable now: the OLD unconditional guard would fail closed here and defer forever. A
     # queued run must resubmit anyway, because it provably never created the phantom the guard protects
@@ -8569,7 +8569,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
         runner_lifecycle, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set())
     )
 
-    import flash.providers as providers_mod
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(providers_mod, "configured_providers", list)
 
@@ -8633,7 +8633,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
         def sweep_orphans(self, **k):
             return []
 
-    import flash.providers as providers_mod
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_NewVast()])
 
@@ -8699,7 +8699,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
         def sweep_orphans(self, **k):
             return []
 
-    import flash.providers as providers_mod
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
 
@@ -8765,7 +8765,7 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
         def sweep_orphans(self, **k):
             return []
 
-    import flash.providers as providers_mod
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
 
@@ -8960,9 +8960,9 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     # recovery pass).
     import threading
 
-    import flash.providers as providers_mod
     import flash.providers.runpod.serverless.endpoints as runpod_train
     import flash.server.platform.db as db_mod
+    from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
@@ -9028,7 +9028,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     )
 
     # The orphan sweep must still run after the loop. recover_runs resolves it via a
-    # function-local `from flash.providers import configured_providers`, so patch the
+    # function-local `from flash.providers.core.registry import configured_providers`, so patch the
     # package attr; record that sweep_orphans fired.
     swept = threading.Event()
 

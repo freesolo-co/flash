@@ -176,7 +176,7 @@ flash = "flash.cli.parsing.main:main"
 flash-cli = "flash.cli.parsing.main:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
-flash-server = "flash.server.__main__:main"
+flash-server = "flash.server.asgi.cli:main"
 
 [build-system]
 # bound the build backend to the validated major line for reproducible package builds.

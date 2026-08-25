@@ -29,7 +29,7 @@ def _gpu_rate(gpu_type: str, provider: str = "") -> float:
     provider-registry problem must degrade to the flat estimate rather than fail the metrics write.
     """
     try:
-        from flash.providers import available_providers, get_provider
+        from flash.providers.core.registry import available_providers, get_provider
 
         # use the billing substrate first when known, then any other configured provider that offers
         # the class, so a plane without runpod still prices its runs.
@@ -180,7 +180,7 @@ def _rented_basis(remote) -> tuple[str, str, int]:
     provider = provider.strip().lower() if isinstance(provider, str) else ""
     if provider:
         try:
-            from flash.providers import PROVIDER_NAMES
+            from flash.providers.core.registry import PROVIDER_NAMES
 
             if provider not in PROVIDER_NAMES:
                 provider = ""

@@ -722,8 +722,8 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
     worker over it (double-bill + corrupt the shared seed-scoped DONE/metrics). Force-reap the run's
     label (provider.gc, run-scoped / not active-shielded) and FAIL the seed terminally; the handle is
     preserved (not cleared) for the run's outer GC."""
-    import flash.providers as providers
     from flash.providers.core import allocator
+    from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate, PollResult
 
     submits = []

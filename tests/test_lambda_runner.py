@@ -1319,8 +1319,9 @@ def test_launch_refuses_a_disk_undersized_refreshed_candidate(monkeypatch):
 
 def test_live_candidates_drop_skus_that_cannot_hold_the_run_disk(monkeypatch):
     from flash.providers.core.base import AllocationConstraints
-    from flash.providers.lambda_ import PROVIDER, jobs
+    from flash.providers.lambda_ import jobs
     from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
 
     monkeypatch.setattr(
         lambda_api,
@@ -2565,7 +2566,7 @@ def test_poll_recovered_deadline_without_artifacts_still_stalls(monkeypatch):
 def test_provider_initial_and_reattached_poll_use_same_absolute_deadline(monkeypatch):
     """Initial and reattached polling consume the same persisted terminal cutoff."""
     from flash.providers.core.base import JobHandle, PollResult
-    from flash.providers.lambda_ import LambdaProvider, jobs
+    from flash.providers.lambda_.execution.provider import LambdaProvider, jobs
 
     deadline_at = 12_345.0
     captured = []
@@ -2605,7 +2606,7 @@ def test_provider_poll_uses_uniform_wait_ignoring_on_last_gpu(monkeypatch):
     first_liveness / setup grace — the poll relies on its unscaled defaults, matching the submit path.
     (on_last_gpu stays a Provider-interface param for RunPod; the instance providers ignore it.)"""
     from flash.providers.core.base import JobHandle
-    from flash.providers.lambda_ import LambdaProvider
+    from flash.providers.lambda_.execution.provider import LambdaProvider
 
     captured = {}
 
@@ -3052,8 +3053,8 @@ def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
 # provider object dispatch + capacity-aware allocation
 # ---------------------------------------------------------------------------
 def test_provider_cancel_destroy_require_authoritative_teardown(monkeypatch):
-    from flash.providers import get_provider
     from flash.providers.core.base import JobHandle
+    from flash.providers.core.registry import get_provider
     from flash.providers.lambda_.client import api as lambda_api
 
     terminated = []

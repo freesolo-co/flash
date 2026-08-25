@@ -47,9 +47,9 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
 
-    import flash.providers as providers_mod
     import flash.server.asgi.app as app_mod
     import flash.server.domain.registry.runs as runs
+    from flash.providers.core import registry as providers_mod
 
     importlib.reload(app_mod)
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
