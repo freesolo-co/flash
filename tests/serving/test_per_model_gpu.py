@@ -599,8 +599,8 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
     """The pool never updates autoscaling and still dispatches demand-driven remote calls."""
     mod = modal_app_module
     bound_models: list[str] = []
-    generate_calls: list[tuple[dict, dict, str | None]] = []
-    stream_calls: list[tuple[dict, dict, str | None]] = []
+    generate_calls: list[tuple[dict, dict, str | None, str]] = []
+    stream_calls: list[tuple[dict, dict, str | None, str]] = []
     register_calls: list[tuple[dict, str | None]] = []
 
     class _Dump:
@@ -609,20 +609,26 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
             value: dict,
             *,
             deployment_generation: str | None = None,
+            generation_id: str | None = None,
         ) -> None:
             self.value = value
             self.deployment_generation = deployment_generation
+            self.generation_id = generation_id
 
         def model_dump(self, *, by_alias: bool) -> dict:
             assert by_alias is True
             return self.value
 
-    async def _generate(payload: dict, record: dict, checkpoint: str | None) -> dict:
-        generate_calls.append((payload, record, checkpoint))
+    async def _generate(
+        payload: dict, record: dict, checkpoint: str | None, generation_id: str
+    ) -> dict:
+        generate_calls.append((payload, record, checkpoint, generation_id))
         return {"ok": True}
 
-    async def _stream_generate(payload: dict, record: dict, checkpoint: str | None):
-        stream_calls.append((payload, record, checkpoint))
+    async def _stream_generate(
+        payload: dict, record: dict, checkpoint: str | None, generation_id: str
+    ):
+        stream_calls.append((payload, record, checkpoint, generation_id))
         yield {"delta": "hello"}
         yield {"delta": " world"}
 
@@ -648,7 +654,11 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
 
     monkeypatch.setattr(mod, "_engine_cls_for", lambda _base_model: _bind)
     pool = mod._ModalEnginePool()
-    payload = _Dump({"messages": [{"role": "user", "content": "hello"}]})
+    generation_id = "fsgen-00000000000000000000000000000001"
+    payload = _Dump(
+        {"messages": [{"role": "user", "content": "hello"}]},
+        generation_id=generation_id,
+    )
     record = _Dump(
         {"adapter_id": "run@step-1.sha"},
         deployment_generation="generation-1",
@@ -691,6 +701,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
             "deployment_generation": "generation-1",
         },
         "step-1",
+        generation_id,
     )
     assert generate_calls == [expected_inference_call]
     assert stream_calls == [expected_inference_call]

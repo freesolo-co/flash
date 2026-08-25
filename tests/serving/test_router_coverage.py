@@ -4,10 +4,8 @@ Offline & hermetic (matches the sibling suites): pure helpers are exercised dire
 run through a FastAPI TestClient against a fake engine pool.
 
 Targets branches the existing suites miss:
-  router: ``_usage_block`` bad-cached fallback, ``_response_format_to_spec`` non-dict/text, the
-  bearer/authorizer auth failures, the streaming replay + checkpoint-ref branches, the empty-delta
-  skip, the drop of an untokened stream report, the tombstone-persist-failure rollback, and the
-  lifespan startup-cancel / aclose-error shutdown paths.
+  router: ``_usage_block`` bad-cached fallback, ``_response_format_to_spec`` non-dict/text,
+  bearer/authorizer auth failures, and durable-versus-auxiliary shutdown behavior.
 """
 
 from __future__ import annotations
@@ -20,15 +18,23 @@ from flash.serving.src.responses import (
     _response_format_to_spec,
     _usage_block,
 )
-from flash.serving.src.router import AdapterRouter, build_serving_app
+from flash.serving.src.router import (
+    AdapterRouter,
+)
+from flash.serving.src.router import (
+    build_offline_serving_app as build_serving_app,
+)
+from flash.serving.src.router import (
+    build_serving_app as build_durable_serving_app,
+)
 from flash.serving.src.schemas import AdapterRecord
 from flash.serving.src.structured_outputs import StructuredOutputsError
 
 QWEN = "Qwen/Qwen3.5-9B"
 
 
-async def _allow(_token: str, _adapter_id: str):
-    return None
+async def _allow(_token: str, _adapter_id: str) -> str:
+    return "org-1"
 
 
 def _rec(adapter_id: str, base_model: str = QWEN, **overrides) -> AdapterRecord:
@@ -195,88 +201,53 @@ class FakePool:
 
 
 # --------------------------------------------------------------------------------------------
-# router lifespan: client close errors are swallowed on shutdown
+# router lifespan: durable state errors are observable; auxiliary client cleanup is best effort
 # --------------------------------------------------------------------------------------------
 
 
-def test_shutdown_swallows_client_aclose_errors():
-    """On shutdown the app closes reporter/authorizer httpx clients via aclose(); an aclose that
-    raises is swallowed so it can't fail shutdown."""
+def test_shutdown_propagates_usage_store_close_failure():
+    from flash.serving.src.usage_outbox import OfflineUsageStore, UsageOutboxError
 
-    class Reporter:
+    class Store(OfflineUsageStore):
+        enabled = True
+
+        async def aclose(self):
+            raise UsageOutboxError("durable_close_failed")
+
+    app = build_durable_serving_app(
+        FakePool(),
+        AdapterRouter([_rec("qa")]),
+        usage_store=Store(),
+        chat_authorizer=_allow,
+    )
+    with (
+        pytest.raises(UsageOutboxError, match="durable_close_failed"),
+        TestClient(app) as client,
+    ):
+        assert client.get("/healthz").status_code == 200
+
+
+def test_shutdown_swallows_authorizer_aclose_errors():
+    from flash.serving.src.usage_outbox import OfflineUsageStore
+
+    class Authorizer:
         def __init__(self):
             self.closed = False
 
-        async def __call__(self, usage):  # pragma: no cover - not invoked in this test
-            pass
+        async def __call__(self, _token, _adapter_id):
+            return "org-1"
 
         async def aclose(self):
             self.closed = True
             raise RuntimeError("client already closed")
 
-    reporter = Reporter()
-    router = AdapterRouter([_rec("qa")])
-    app = build_serving_app(FakePool(), router, chat_authorizer=_allow, usage_reporter=reporter)
+    authorizer = Authorizer()
+    app = build_durable_serving_app(
+        FakePool(),
+        AdapterRouter([_rec("qa")]),
+        usage_store=OfflineUsageStore(),
+        chat_authorizer=authorizer,
+    )
     with TestClient(app) as client:
         assert client.get("/healthz").status_code == 200
-    # Shutdown invoked aclose() (error swallowed) and the context exited cleanly.
-    assert reporter.closed is True
-
-
-def test_shutdown_cancels_timed_out_usage_report_before_closing_client(monkeypatch):
-    import asyncio
-    import threading
-
-    import flash.serving.src.router as router_module
-
-    monkeypatch.setattr(router_module, "_USAGE_REPORT_DRAIN_TIMEOUT_SECONDS", 0.01)
-    started = threading.Event()
-    cancelled = threading.Event()
-    close_saw_cancelled = {"value": False}
-
-    class Reporter:
-        async def __call__(self, usage):
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
-
-        async def aclose(self):
-            close_saw_cancelled["value"] = cancelled.is_set()
-
-    class MeteringPool(FakePool):
-        async def generate(self, base_model, payload, record, *, expected_checkpoint=None):
-            return {
-                "ok": True,
-                "text": f"[{base_model}] reply",
-                "finish_reason": "stop",
-                "prompt_tokens": 2,
-                "completion_tokens": 1,
-                # a revision request is refused unless the engine attests what it served
-                "lora_request_adapter": record.adapter_id,
-            }
-
-    reporter = Reporter()
-    revision_id = f"qa@final.{'a' * 40}"
-    revision = _rec(
-        revision_id,
-        org_id="org-1",
-        checkpoint="qa",
-        metadata={
-            "record_type": "revision",
-            "run_id": "qa",
-            "checkpoint_step": None,
-            "hf_revision": "a" * 40,
-        },
-    )
-    router = AdapterRouter([revision])
-    app = build_serving_app(MeteringPool(), router, chat_authorizer=_allow, usage_reporter=reporter)
-    with TestClient(app, headers={"Authorization": "Bearer k"}) as client:
-        response = client.post("/generate", json={"adapter_id": revision_id, "prompt": "hi"})
-        assert response.status_code == 200
-        assert started.wait(timeout=5)
-
-    assert cancelled.is_set()
-    assert close_saw_cancelled["value"] is True
+    assert authorizer.closed is True

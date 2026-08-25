@@ -93,11 +93,10 @@ class Settings(BaseSettings):
         default="",
         validation_alias="FREESOLO_DEPLOYMENT_ID",
     )
-    # The platform backend (FastAPI) base URL. Serving POSTs each request's token + GPU-time usage to
-    # {backend_url}/api/billing/serving-usage and authorizes external chat via
-    # {backend_url}/api/serving/authorize, both authed with ``internal_key``. Each needs BOTH set;
-    # either unset disables that path. No default URL on purpose: a hardcoded prod default would make
-    # a non-prod deploy with FREESOLO_INTERNAL_KEY silently bill real orgs.
+    # The platform backend (FastAPI) base URL. Durable outbox delivery settles usage through
+    # {backend_url}/api/billing/serving-usage/durable and external chat authorization uses
+    # {backend_url}/api/serving/authorize, both authenticated with ``internal_key``. Hosted serving
+    # requires complete backend, Supabase, deployment, and credential wiring; no default URL exists.
     backend_url: str = Field(
         default="",
         validation_alias="PLATFORM_BACKEND_URL",
