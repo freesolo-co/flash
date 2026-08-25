@@ -4935,17 +4935,16 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
 ):
     """the rl half of the same contract, driven across the two sweeps that actually span it.
 
-    The rl uploader stages an adapter on the sweep a checkpoint appears and publishes it on a LATER
-    one, once the gradient gate opens -- `staged_adapters` carries the path between them. That gap is
-    the whole reason the sft deletion cannot be lifted into shared code.
+    the rl uploader stages an adapter on the sweep a checkpoint appears and publishes it on a later
+    one, once the terminal publication latch opens. `staged_adapters` carries the path between them.
+    that gap is the whole reason the sft deletion cannot be lifted into shared code.
 
-    The gate is what opens the gap, so the test has to close it. An earlier version passed
-    `had_gradient=lambda: True` and hand-called `_stage_deployable` then `_publish_ready`, which
-    manufactured a two-sweep sequence that production would never produce: with the gate already
-    open, `_run` stages and publishes in ONE iteration, so the window where the adapter must survive
-    on disk unpublished never opened and a cleanup placed there would have stayed green. Bugbot
-    caught that. Here the gate starts shut and the checkpoint is discovered through `_pending`, so
-    the retention window is the real one.
+    the latch is what opens the gap, so the test has to open it. an earlier version hand-called
+    `_stage_deployable` then `_publish_ready` with publication already allowed, which manufactured a
+    two-sweep sequence production would never produce: `_run` stages and publishes in one iteration,
+    so the window where the adapter must survive on disk unpublished never opened and a cleanup placed
+    there would have stayed green. bugbot caught that. here the latch starts shut and the checkpoint
+    is discovered through `_pending`, so the retention window is the real one.
     """
     from flash.engine.worker.train.rl import checkpoints as rl_checkpoints
 
@@ -4978,7 +4977,6 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     # step exactly as it does in a real run.
     (local_dir / "latest_checkpointed_iteration.txt").write_text("4")
 
-    gate_open = False
     uploader = rl_checkpoints._VerlResumeUploader(
         local_dir=str(local_dir),
         resume_step=0,
@@ -4988,10 +4986,9 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
         model_id="org/model",
         model_revision="commit",
         preprocessor=types.SimpleNamespace(save_pretrained=lambda path: None),
-        had_gradient=lambda: gate_open,
     )
 
-    # sweep one, gate SHUT: the step is staged because verl may prune its checkpoint at any time,
+    # sweep one, latch shut: the step is staged because verl may prune its checkpoint at any time,
     # but nothing may be published yet. this is the window the adapter has to survive.
     for step, path in uploader._pending():
         if step in uploader.required_steps and step not in uploader.staged_adapters:
@@ -5002,17 +4999,17 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     uploader._publish_ready()
 
     adapter_dir = uploader.staged_adapters[4]
-    assert published == [], "the gradient gate was shut, so nothing may have been published"
+    assert published == [], "the publication latch was shut, so nothing may have been published"
     assert os.path.exists(os.path.join(adapter_dir, "adapter_model.safetensors")), (
-        "the rl watcher discarded a staged adapter while the gradient gate was still shut"
+        "the rl watcher discarded a staged adapter while the publication latch was still shut"
     )
 
     # verl is free to prune its own checkpoint now; only `export_root` carries the step forward.
     shutil.rmtree(checkpoint_dir)
 
-    # sweep two, gate OPEN: the surviving directory is read back out of the staged adapters and
+    # sweep two, latch open: the surviving directory is read back out of the staged adapters and
     # published.
-    gate_open = True
+    uploader.allow_deployable_publication()
     uploader._publish_ready()
 
     assert published == [adapter_dir], "the staged adapter never reached publication"
