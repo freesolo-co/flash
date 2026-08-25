@@ -10,6 +10,14 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from .errors import RuntimeConfigurationError
+from .sampling import (
+    validate_choice_count,
+    validate_logprobs,
+    validate_penalty,
+    validate_sampling_relationships,
+    validate_seed,
+    validate_top_logprobs,
+)
 from .structured_outputs import normalize_structured_outputs
 
 _REVISION_RE = re.compile(r"[0-9a-f]{40}")
@@ -364,6 +372,12 @@ class GenerationRequest:
     max_tokens: int = 1024
     temperature: float = 0.0
     top_p: float = 0.95
+    n: int = 1
+    seed: int | None = None
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    logprobs: bool = False
+    top_logprobs: int = 0
     thinking: bool | None = None
     chat_template_kwargs: Mapping[str, Any] = field(default_factory=dict)
     structured_outputs: Any = None
@@ -404,6 +418,26 @@ class GenerationRequest:
             validate_generation_temperature(self.temperature),
         )
         object.__setattr__(self, "top_p", validate_generation_top_p(self.top_p))
+        object.__setattr__(self, "n", validate_choice_count(self.n))
+        object.__setattr__(self, "seed", validate_seed(self.seed))
+        object.__setattr__(
+            self,
+            "frequency_penalty",
+            validate_penalty(self.frequency_penalty, "frequency_penalty"),
+        )
+        object.__setattr__(
+            self,
+            "presence_penalty",
+            validate_penalty(self.presence_penalty, "presence_penalty"),
+        )
+        object.__setattr__(self, "logprobs", validate_logprobs(self.logprobs))
+        object.__setattr__(self, "top_logprobs", validate_top_logprobs(self.top_logprobs))
+        validate_sampling_relationships(
+            n=self.n,
+            temperature=self.temperature,
+            logprobs=self.logprobs,
+            top_logprobs=self.top_logprobs,
+        )
         object.__setattr__(
             self,
             "thinking",
@@ -422,19 +456,37 @@ class GenerationRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationChoice:
+    """one indexed completed output choice."""
+
+    index: int
+    text: str
+    finish_reason: str | None
+    token_ids: tuple[int, ...]
+    logprobs: list[dict[str, Any]] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class GenerationResult:
-    """completed generation text, identity, and accounting."""
+    """completed indexed choices, identity, and aggregate accounting."""
 
     request_id: str
     adapter_id: str | None
     incarnation: str | None
-    text: str
-    finish_reason: str | None
+    choices: tuple[GenerationChoice, ...]
     prompt_tokens: int
     completion_tokens: int
     cached_tokens: int
     cached_tokens_reported: bool
     thinking: bool | None
+
+    @property
+    def text(self) -> str:
+        return self.choices[0].text
+
+    @property
+    def finish_reason(self) -> str | None:
+        return self.choices[0].finish_reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -451,22 +503,34 @@ class StreamReady:
 
 @dataclass(frozen=True, slots=True)
 class StreamDelta:
-    """one normalized text delta."""
+    """one normalized indexed choice delta."""
 
+    index: int
     text: str
+    logprobs: list[dict[str, Any]] | None = None
     type: Literal["delta"] = field(default="delta", init=False)
 
 
 @dataclass(frozen=True, slots=True)
+class StreamChoiceFinished:
+    """one indexed choice terminal."""
+
+    index: int
+    text: str
+    finish_reason: str
+    token_ids: tuple[int, ...]
+    type: Literal["choice_finished"] = field(default="choice_finished", init=False)
+
+
+@dataclass(frozen=True, slots=True)
 class StreamFinished:
-    """terminal stream accounting and normalized full text."""
+    """request-level aggregate stream accounting."""
 
     request_id: str
     runtime_id: str
     adapter_id: str | None
     incarnation: str | None
-    text: str
-    finish_reason: str | None
+    choices: tuple[GenerationChoice, ...]
     prompt_tokens: int
     completion_tokens: int
     cached_tokens: int
@@ -474,8 +538,16 @@ class StreamFinished:
     thinking: bool | None
     type: Literal["finished"] = field(default="finished", init=False)
 
+    @property
+    def text(self) -> str:
+        return self.choices[0].text
 
-StreamEvent = StreamReady | StreamDelta | StreamFinished
+    @property
+    def finish_reason(self) -> str | None:
+        return self.choices[0].finish_reason
+
+
+StreamEvent = StreamReady | StreamDelta | StreamChoiceFinished | StreamFinished
 
 
 @dataclass(frozen=True, slots=True)

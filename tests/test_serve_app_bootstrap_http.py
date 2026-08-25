@@ -29,8 +29,10 @@ from flash.serve.app.http import (
 from flash.serve.app.manifest import build_serving_manifest
 from flash.serve.app.openai import ReasoningDeltaSplitter, split_reasoning
 from flash.serve.runtime import (
+    GenerationChoice,
     GenerationResult,
     PromptError,
+    StreamChoiceFinished,
     StreamDelta,
     StreamFinished,
     StreamReady,
@@ -75,8 +77,14 @@ class _FakeRuntime:
             request_id="request-1",
             adapter_id=request.adapter_id,
             incarnation=request.expected_incarnation,
-            text="why</think>answer",
-            finish_reason="stop",
+            choices=(
+                GenerationChoice(
+                    index=0,
+                    text="why</think>answer",
+                    finish_reason="stop",
+                    token_ids=(1, 2),
+                ),
+            ),
             prompt_tokens=5,
             completion_tokens=2,
             cached_tokens=3,
@@ -675,20 +683,20 @@ def test_stream_primes_before_200_splits_reasoning_and_emits_one_real_finish() -
     incarnation = owner.models["run-1"].adapter.aggregate_sha256
     runtime.stream_events = [
         StreamReady("request-2", "runtime", revision, incarnation, True),
-        StreamDelta("why</thi"),
-        StreamDelta("nk>answer"),
+        StreamDelta(0, "why</thi"),
+        StreamDelta(0, "nk>answer"),
+        StreamChoiceFinished(0, "why</think>answer", "stop", (1, 2)),
         StreamFinished(
-            "request-2",
-            "runtime",
-            revision,
-            incarnation,
-            "why</think>answer",
-            "stop",
-            5,
-            2,
-            1,
-            True,
-            True,
+            request_id="request-2",
+            runtime_id="runtime",
+            adapter_id=revision,
+            incarnation=incarnation,
+            choices=(GenerationChoice(0, "why</think>answer", "stop", (1, 2)),),
+            prompt_tokens=5,
+            completion_tokens=2,
+            cached_tokens=1,
+            cached_tokens_reported=True,
+            thinking=True,
         ),
     ]
     app = create_app(owner, bearer_token=AUTH_TOKEN)
@@ -738,36 +746,35 @@ def test_stream_missing_duplicate_or_failed_terminal_is_sanitized_without_fake_s
     incarnation = owner.models["run-1"].adapter.aggregate_sha256
     ready = StreamReady("request-3", "runtime", revision, incarnation, True)
     terminal = StreamFinished(
-        "request-3",
-        "runtime",
-        revision,
-        incarnation,
-        "answer",
-        "stop",
-        2,
-        1,
-        0,
-        False,
-        True,
+        request_id="request-3",
+        runtime_id="runtime",
+        adapter_id=revision,
+        incarnation=incarnation,
+        choices=(GenerationChoice(0, "answer", "stop", (1,)),),
+        prompt_tokens=2,
+        completion_tokens=1,
+        cached_tokens=0,
+        cached_tokens_reported=False,
+        thinking=True,
     )
     mismatched_terminal = StreamFinished(
-        "request-3",
-        "other-runtime",
-        revision,
-        incarnation,
-        "answer",
-        "stop",
-        2,
-        1,
-        0,
-        False,
-        True,
+        request_id="request-3",
+        runtime_id="other-runtime",
+        adapter_id=revision,
+        incarnation=incarnation,
+        choices=(GenerationChoice(0, "answer", "stop", (1,)),),
+        prompt_tokens=2,
+        completion_tokens=1,
+        cached_tokens=0,
+        cached_tokens_reported=False,
+        thinking=True,
     )
+    choice_terminal = StreamChoiceFinished(0, "answer", "stop", (1,))
     scenarios = (
-        [ready, StreamDelta("partial")],
-        [ready, terminal, terminal],
-        [ready, mismatched_terminal],
-        [ready, StreamDelta("partial"), RuntimeError("secret engine failure")],
+        [ready, StreamDelta(0, "partial")],
+        [ready, choice_terminal, terminal, terminal],
+        [ready, choice_terminal, mismatched_terminal],
+        [ready, StreamDelta(0, "partial"), RuntimeError("secret engine failure")],
     )
     app = create_app(owner, bearer_token=AUTH_TOKEN)
     for events in scenarios:

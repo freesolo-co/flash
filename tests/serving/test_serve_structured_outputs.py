@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from flash.serve.request.openai import parse_chat_request
 from flash.serving.src.engine.model_config import reasoning_parser_for
 from flash.serving.src.engine.support import _require_reasoning_api_compatibility
 from flash.serving.src.io.responses import openai_generate_fields
@@ -90,7 +91,9 @@ class _CaptureEngine:
         self.reasoning_ended.append(reasoning_ended)
         self.reasoning_parser_kwargs.append(reasoning_parser_kwargs)
         yield types.SimpleNamespace(
-            outputs=[types.SimpleNamespace(text="ok", finish_reason="stop", token_ids=[1, 2])],
+            outputs=[
+                types.SimpleNamespace(index=0, text="ok", finish_reason="stop", token_ids=[1, 2])
+            ],
             prompt_token_ids=[1],
             num_cached_tokens=0,
         )
@@ -117,7 +120,10 @@ class _RepeatedDeltaEngine(_CaptureEngine):
             yield types.SimpleNamespace(
                 outputs=[
                     types.SimpleNamespace(
-                        text=text, finish_reason=finish_reason, token_ids=[token_id]
+                        index=0,
+                        text=text,
+                        finish_reason=finish_reason,
+                        token_ids=[token_id],
                     )
                 ],
                 prompt_token_ids=[1, 2],
@@ -165,7 +171,9 @@ class _CleanupEngine(_CaptureEngine):
         async def output_stream():
             try:
                 yield types.SimpleNamespace(
-                    outputs=[types.SimpleNamespace(text="ok", finish_reason=None, token_ids=[1])],
+                    outputs=[
+                        types.SimpleNamespace(index=0, text="ok", finish_reason=None, token_ids=[1])
+                    ],
                     prompt_token_ids=[1],
                     num_cached_tokens=0,
                 )
@@ -224,7 +232,11 @@ def test_nonstream_generation_requires_a_real_finish_reason(modal_app_module) ->
     class _NonterminalEngine:
         async def generate(self, *_args, **_kwargs):
             yield types.SimpleNamespace(
-                outputs=[types.SimpleNamespace(text="partial", finish_reason=None, token_ids=[1])],
+                outputs=[
+                    types.SimpleNamespace(
+                        index=0, text="partial", finish_reason=None, token_ids=[1]
+                    )
+                ],
                 prompt_token_ids=[1],
                 num_cached_tokens=0,
             )
@@ -476,7 +488,12 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
             eng._stream_generate({"adapter_id": "r1", "prompt": "hi", "structured_outputs": SCHEMA})
         )
     )
-    assert [event["type"] for event in events] == ["ready", "delta", "final"]
+    assert [event["type"] for event in events] == [
+        "ready",
+        "delta",
+        "choice_finished",
+        "final",
+    ]
     ready = events[0].copy()
     assert ready.pop("inference_time_seconds") >= 0
     # the two ids are uuid4-derived, so they cannot be spelled literally. pin their shape here and
@@ -502,7 +519,9 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     assert delta.pop("inference_time_seconds") >= 0
     assert delta == {
         "type": "delta",
+        "index": 0,
         "text": "ok",
+        "logprobs": None,
         "thinking": False,
         "prompt_token_ids": [1],
         "completion_token_ids": [1, 2],
@@ -515,7 +534,7 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
         "engine_replica_id": replica_id,
         "checkpoint": "",
     }
-    assert events[-1]["finish_reason"] == "stop"
+    assert events[-2]["finish_reason"] == "stop"
     assert events[-1]["prompt_tokens"] == 1
     assert events[-1]["completion_tokens"] == 2
     sp = eng.engine.sampling_params[-1]
@@ -759,14 +778,29 @@ def test_stop_reaches_sampling_params_when_streaming(modal_app_module):
     events = asyncio.run(
         _drain(eng._stream_generate({"adapter_id": "r1", "prompt": "hi", "stop": ["</s>"]}))
     )
-    assert [event["type"] for event in events] == ["ready", "delta", "final"]
+    assert [event["type"] for event in events] == [
+        "ready",
+        "delta",
+        "choice_finished",
+        "final",
+    ]
     assert eng.engine.sampling_params[-1].stop == ["</s>"]
 
 
 def test_openai_body_forwards_stop():
     """The OpenAI chat-completions translation must not drop the standard `stop` field."""
-    assert openai_generate_fields({"messages": [], "stop": ["</s>"]}, "r1")["stop"] == ["</s>"]
-    assert openai_generate_fields({"messages": []}, "r1")["stop"] is None
+    with_stop = parse_chat_request(
+        {"model": "r1", "messages": [{"role": "user", "content": "hi"}], "stop": ["</s>"]},
+        require_model=True,
+        allow_managed_selectors=False,
+    )
+    without_stop = parse_chat_request(
+        {"model": "r1", "messages": [{"role": "user", "content": "hi"}]},
+        require_model=True,
+        allow_managed_selectors=False,
+    )
+    assert openai_generate_fields(with_stop, "r1")["stop"] == ["</s>"]
+    assert openai_generate_fields(without_stop, "r1")["stop"] is None
 
 
 @pytest.mark.parametrize("bad", [123, {"a": 1}, ["ok", ""], ["ok", 5]])

@@ -269,6 +269,12 @@ def test_chat_forwards_supported_openai_fields_and_enforces_run_contract(api, mo
         "max_tokens": 17,
         "thinking": False,
         "top_p": 0.8,
+        "n": 1,
+        "seed": None,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "logprobs": False,
+        "top_logprobs": 0,
         "stop": ["</answer>", "shared", "caller-stop"],
         "chat_template_kwargs": {
             "custom_template_flag": "kept",
@@ -332,12 +338,6 @@ def test_chat_rejects_mismatched_backend_provenance(api, monkeypatch):
     [
         "tools",
         "tool_choice",
-        "n",
-        "seed",
-        "frequency_penalty",
-        "presence_penalty",
-        "logprobs",
-        "top_logprobs",
         "service_tier",
         "modalities",
         "enable_thinking",
@@ -467,11 +467,15 @@ def test_chat_rejects_non_strict_json_schema_response_format(api, monkeypatch):
 
 
 def test_chat_stream_preserves_raw_openai_sse_and_provenance_headers(api, monkeypatch):
+    import flash.runner.lifecycle.state as runner_state
     import flash.runner.lifecycle.status as runner_status
     import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
-    revision = runner_status.get_status(run_id).deployment["adapter_revision"]
+    status = runner_status.get_status(run_id)
+    status.spec["thinking"] = False
+    runner_state._save_status(status)
+    revision = status.deployment["adapter_revision"]
     frames = [
         b'data: {"id":"chatcmpl-1","choices":[{"index":2,"delta":{"content":"hi"},"finish_reason":null}]}\n\n',
         b'data: {"id":"chatcmpl-1","choices":[{"index":2,"delta":{},"finish_reason":"length"}]}\n\n',
@@ -512,7 +516,14 @@ def test_chat_stream_preserves_raw_openai_sse_and_provenance_headers(api, monkey
             "model": "ignored",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": True,
+            "temperature": 0.5,
             "top_p": 0.7,
+            "n": 3,
+            "seed": 42,
+            "frequency_penalty": -0.5,
+            "presence_penalty": 0.75,
+            "logprobs": True,
+            "top_logprobs": 4,
             "stream_options": {"include_usage": True},
         },
         headers=_bearer(key),
@@ -531,6 +542,12 @@ def test_chat_stream_preserves_raw_openai_sse_and_provenance_headers(api, monkey
     assert closed == [True]
     assert seen["run_id"] == revision
     assert seen["top_p"] == 0.7
+    assert seen["n"] == 3
+    assert seen["seed"] == 42
+    assert seen["frequency_penalty"] == -0.5
+    assert seen["presence_penalty"] == 0.75
+    assert seen["logprobs"] is True
+    assert seen["top_logprobs"] == 4
     assert seen["stream_options"] == {"include_usage": True}
 
 

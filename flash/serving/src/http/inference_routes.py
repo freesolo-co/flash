@@ -17,13 +17,21 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from flash.serve.app.openai import OpenAIRequestError, parse_stream_options
+from flash.serve.request.openai import (
+    OpenAIRequestError,
+    parse_chat_request,
+    reject_thinking_logprobs,
+)
 from flash.serving.src.accounting.usage import captured_now, new_request_identity
 from flash.serving.src.accounting.usage_outbox import UsageOutboxError
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.io.multimodal import _prepare_generate_request
 from flash.serving.src.io.provenance import _provenance_headers, _revision_provenance
-from flash.serving.src.io.requests import _expected_checkpoint, _parse_generate
+from flash.serving.src.io.requests import (
+    _expected_checkpoint,
+    _parse_generate,
+    _parse_openai_generate,
+)
 from flash.serving.src.io.responses import (
     _inference_json_response,
     openai_chat_completion,
@@ -31,7 +39,6 @@ from flash.serving.src.io.responses import (
 )
 from flash.serving.src.io.schemas import GenerateRequest
 from flash.serving.src.io.streaming import _close_async_iterator
-from flash.serving.src.io.structured_outputs import StructuredOutputsError
 
 _FLASH_CHECKPOINT_MODEL_RE = re.compile(
     r"(?P<run_id>flash-[0-9]{1,20}-[0-9a-f]{8})/step-[0-9]{1,18}"
@@ -135,22 +142,38 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     adapter_id = _openai_adapter_id(payload)
     traffic = await context.authorize_inference(request, adapter_id)
     _validate_openai_model_id(adapter_id)
-    stream = payload.get("stream", False)
-    if type(stream) is not bool:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "stream must be a boolean")
     try:
-        include_usage = parse_stream_options(payload.get("stream_options"), stream)
+        normalized = parse_chat_request(
+            payload,
+            require_model=True,
+            allow_managed_selectors=False,
+        )
+    except OpenAIRequestError as exc:
+        request_status = (
+            status.HTTP_400_BAD_REQUEST
+            if str(exc).startswith(("message ", "stream must"))
+            else status.HTTP_422_UNPROCESSABLE_ENTITY
+        )
+        raise HTTPException(request_status, str(exc)) from exc
+    requested, target = await context.lookup.resolve(adapter_id)
+    effective_thinking = target.thinking
+    if target.serve_base_model:
+        override = normalized.chat_template_kwargs.get("enable_thinking")
+        if type(override) is bool:
+            effective_thinking = override
+    try:
+        reject_thinking_logprobs(thinking=effective_thinking, logprobs=normalized.logprobs)
     except OpenAIRequestError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-    requested, target = await context.lookup.resolve(adapter_id)
-    try:
-        fields = openai_generate_fields(payload, adapter_id)
-    except StructuredOutputsError as exc:
-        # Malformed OpenAI response_format (json_schema with no schema, or an unknown type) ->
-        # 422, not 500.
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-    req = _parse_generate(fields)
+    generate_fields = openai_generate_fields(normalized, adapter_id)
+    generate_fields["chat_template_kwargs"] = {
+        **normalized.chat_template_kwargs,
+        "enable_thinking": effective_thinking,
+    }
+    req = _parse_openai_generate(generate_fields)
     context.reject_unsettleable_thinking(req, target)
+    stream = normalized.stream
+    include_usage = normalized.include_usage
     await _prepare_generate_request(req, target)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     identity = new_request_identity(request, openai_completion_id=completion_id, traffic=traffic)
@@ -301,6 +324,7 @@ async def _stream_chat_completion(
                 include_usage=include_usage,
                 usage_session=usage_session,
                 thinking=thinking,
+                choice_count=getattr(req, "n", 1),
             ),
             media_type="text/event-stream",
             # Disable proxy and CDN buffering so each SSE chunk reaches the client immediately.

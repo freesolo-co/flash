@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request, status
 from pydantic import ValidationError
 
 from flash.serving.src.engine.model_config import base_models, is_supported_base_model
+from flash.serving.src.io.openai_request import OpenAIGenerateRequest
 from flash.serving.src.io.schemas import GenerateRequest
 
 
@@ -16,6 +17,13 @@ def _parse_generate(data: dict[str, Any]) -> GenerateRequest:
     # untyped dict body -> surface a bad shape as 422, not 500.
     try:
         return GenerateRequest.model_validate(data)
+    except ValidationError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+
+def _parse_openai_generate(data: dict[str, Any]) -> OpenAIGenerateRequest:
+    try:
+        return OpenAIGenerateRequest.model_validate(data)
     except ValidationError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 

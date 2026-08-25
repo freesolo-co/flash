@@ -13,6 +13,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Added
 
+- OpenAI chat serving now preserves mirror sampling controls across packaged, hosted, and managed
+  entry points: up to four indexed choices, signed seeds, frequency and presence penalties, and
+  OpenAI token logprobs. Buffered and raw SSE responses retain independent choice terminals and
+  aggregate request usage; the decoded text-only stream remains single-choice.
 - A `flash-cli` console script, the same entry point as `flash` under a name nothing else
   claims. The `server` and `dev` extras install `runpod-flash`, which declares its own `flash`
   script; whichever distribution is installed last wins, so on a control-plane host

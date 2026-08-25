@@ -5,9 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import inspect
 import json
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import Awaitable
 from contextlib import suppress
 from typing import Any
 
@@ -22,24 +21,41 @@ from flash.serve.runtime import (
     RuntimeConfigurationError,
     RuntimeNotReadyError,
     ServingRuntimeError,
-    StreamDelta,
-    StreamFinished,
     StreamReady,
 )
 
-from .bootstrap import PublishedAdapter, ServingBootstrap
+from .bootstrap import ServingBootstrap
+from .chat_stream import close_iterator, stream_chat_body
 from .openai import (
     OpenAIRequestError,
-    ReasoningDeltaSplitter,
     nonstream_response,
     parse_chat_request,
     provenance_payload,
-    sse_data,
-    stream_chunk,
-    usage_stream_chunk,
 )
 
 _REJECTED_AUTH_DIGEST = hashlib.sha256(b"flash-rejected-authorization").digest()
+
+
+async def _stream_body(
+    event_stream: Any,
+    ready: StreamReady,
+    resolved: Any,
+    provenance: dict[str, Any],
+    *,
+    include_usage: bool,
+    choice_count: int = 1,
+):
+    """preserve the historical packaged stream helper seam."""
+
+    async for chunk in stream_chat_body(
+        event_stream,
+        ready,
+        resolved,
+        provenance,
+        choice_count=choice_count,
+        include_usage=include_usage,
+    ):
+        yield chunk
 
 
 class _RequestBodyTooLarge(ValueError):
@@ -158,16 +174,16 @@ def create_app(
         try:
             first = await _await_until_disconnect(request, anext(event_stream))
         except asyncio.CancelledError:
-            await _close_iterator(event_stream)
+            await close_iterator(event_stream)
             raise
         except AdapterNotFoundError:
-            await _close_iterator(event_stream)
+            await close_iterator(event_stream)
             return _error(404, "model_not_found", "requested model is not deployed")
         except (PromptError, RuntimeConfigurationError):
-            await _close_iterator(event_stream)
+            await close_iterator(event_stream)
             return _error(400, "invalid_request", "generation request was rejected")
         except (EngineDeadError, RuntimeNotReadyError, ServingRuntimeError, Exception):
-            await _close_iterator(event_stream)
+            await close_iterator(event_stream)
             return _error(503, "service_unavailable", "generation service is unavailable")
         if (
             type(first) is not StreamReady
@@ -175,13 +191,14 @@ def create_app(
             or first.incarnation != resolved.adapter.aggregate_sha256
             or first.thinking != resolved.adapter.thinking_default
         ):
-            await _close_iterator(event_stream)
+            await close_iterator(event_stream)
             return _error(503, "service_unavailable", "generation stream did not become ready")
         body = _stream_body(
             event_stream,
             first,
             resolved,
             provenance,
+            choice_count=parsed.generation.n,
             include_usage=parsed.include_usage,
         )
         return StreamingResponse(body, media_type="text/event-stream", headers=headers)
@@ -312,96 +329,3 @@ def _error(
         status_code=status,
         headers=headers,
     )
-
-
-async def _stream_body(
-    event_stream: AsyncIterator[Any],
-    ready: StreamReady,
-    resolved: PublishedAdapter,
-    provenance: dict[str, Any],
-    *,
-    include_usage: bool,
-) -> AsyncIterator[bytes]:
-    splitter = ReasoningDeltaSplitter(thinking=bool(ready.thinking))
-    finished: StreamFinished | None = None
-    succeeded = False
-    try:
-        yield sse_data(
-            stream_chunk(
-                request_id=ready.request_id,
-                model=resolved.requested_model,
-                delta={"role": "assistant", "content": ""},
-                provenance=provenance,
-            )
-        )
-        async for event in event_stream:
-            if type(event) is StreamDelta and finished is None:
-                for key, value in splitter.feed(event.text):
-                    yield sse_data(
-                        stream_chunk(
-                            request_id=ready.request_id,
-                            model=resolved.requested_model,
-                            delta={key: value},
-                        )
-                    )
-                continue
-            if type(event) is StreamFinished and finished is None:
-                finished = event
-                continue
-            raise RuntimeError("invalid stream event order")
-        if finished is None or finished.finish_reason is None:
-            raise RuntimeError("stream ended without a real terminal event")
-        if (
-            finished.request_id != ready.request_id
-            or finished.runtime_id != ready.runtime_id
-            or finished.adapter_id != resolved.adapter.adapter_revision
-            or finished.incarnation != resolved.adapter.aggregate_sha256
-            or finished.thinking != ready.thinking
-        ):
-            raise RuntimeError("stream terminal identity mismatch")
-        for key, value in splitter.finish():
-            yield sse_data(
-                stream_chunk(
-                    request_id=ready.request_id,
-                    model=resolved.requested_model,
-                    delta={key: value},
-                )
-            )
-        yield sse_data(
-            stream_chunk(
-                request_id=ready.request_id,
-                model=resolved.requested_model,
-                delta={},
-                finish_reason=finished.finish_reason,
-                provenance=provenance,
-            )
-        )
-        if include_usage:
-            yield sse_data(usage_stream_chunk(finished, resolved.requested_model, provenance))
-        succeeded = True
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        yield sse_data(
-            {
-                "error": {
-                    "message": "generation stream terminated",
-                    "type": "server_error",
-                    "code": "stream_terminated",
-                }
-            }
-        )
-    finally:
-        await _close_iterator(event_stream)
-    if succeeded:
-        yield sse_data("[DONE]")
-
-
-async def _close_iterator(iterator: AsyncIterator[Any]) -> None:
-    close = getattr(iterator, "aclose", None)
-    if close is None:
-        return
-    with suppress(Exception):
-        result = close()
-        if inspect.isawaitable(result):
-            await result

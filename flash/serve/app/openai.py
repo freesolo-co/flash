@@ -7,7 +7,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from flash.serve.request.openai import OpenAIRequestError, parse_stream_options  # noqa: F401
+from flash.serve.request.openai import (  # noqa: F401
+    OpenAIRequestError,
+    parse_stream_options,
+    reject_thinking_logprobs,
+)
 from flash.serve.request.openai import (
     parse_chat_request as parse_normalized_chat_request,
 )
@@ -39,6 +43,10 @@ def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAICha
     )
     if request.model != resolved.requested_model:
         raise OpenAIRequestError("resolved model binding does not match the request")
+    reject_thinking_logprobs(
+        thinking=resolved.adapter.thinking_default,
+        logprobs=request.logprobs,
+    )
     generation = GenerationRequest(
         adapter_id=resolved.adapter.adapter_revision,
         expected_incarnation=resolved.adapter.aggregate_sha256,
@@ -46,6 +54,12 @@ def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAICha
         max_tokens=request.max_tokens,
         temperature=request.temperature,
         top_p=request.top_p,
+        n=request.n,
+        seed=request.seed,
+        frequency_penalty=request.frequency_penalty,
+        presence_penalty=request.presence_penalty,
+        logprobs=request.logprobs,
+        top_logprobs=request.top_logprobs,
         thinking=resolved.adapter.thinking_default,
         stop=request.stop,
         chat_template_kwargs=request.chat_template_kwargs,
@@ -174,22 +188,26 @@ def nonstream_response(
     manifest: ServingManifest,
     resolved: PublishedAdapter,
 ) -> dict[str, Any]:
-    reasoning, content = split_reasoning(result.text, thinking=bool(result.thinking))
-    message: dict[str, Any] = {"role": "assistant", "content": content}
-    if reasoning is not None:
-        message["reasoning_content"] = reasoning
+    choices = []
+    for choice in result.choices:
+        reasoning, content = split_reasoning(choice.text, thinking=bool(result.thinking))
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if reasoning is not None:
+            message["reasoning_content"] = reasoning
+        choices.append(
+            {
+                "index": choice.index,
+                "message": message,
+                "finish_reason": choice.finish_reason,
+                "logprobs": {"content": choice.logprobs} if choice.logprobs is not None else None,
+            }
+        )
     return {
         "id": f"chatcmpl-{result.request_id}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": resolved.requested_model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": result.finish_reason,
-            }
-        ],
+        "choices": choices,
         "usage": usage_payload(
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
@@ -205,7 +223,9 @@ def stream_chunk(
     request_id: str,
     model: str,
     delta: dict[str, Any],
+    index: int = 0,
     finish_reason: str | None = None,
+    logprobs: list[dict[str, Any]] | None = None,
     provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -213,7 +233,14 @@ def stream_chunk(
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        "choices": [
+            {
+                "index": index,
+                "delta": delta,
+                "finish_reason": finish_reason,
+                "logprobs": {"content": logprobs} if logprobs is not None else None,
+            }
+        ],
     }
     if provenance is not None:
         payload["flash_provenance"] = provenance
