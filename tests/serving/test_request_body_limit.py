@@ -5,7 +5,8 @@ from typing import Any
 
 from flash.serve.contract import MAX_CHAT_REQUEST_BYTES
 from flash.serving.src.body_limit import RequestBodyLimitMiddleware
-from flash.serving.src.router import AdapterRouter, build_serving_app
+from flash.serving.src.router import AdapterRouter
+from flash.serving.src.router import build_offline_serving_app as build_serving_app
 
 
 def _scope(
@@ -99,7 +100,7 @@ def test_hosted_app_caps_chunked_body_without_reading_past_rejection(monkeypatch
     from flash.serving.src import router as router_module
 
     monkeypatch.setattr(router_module, "MAX_CHAT_REQUEST_BYTES", 4)
-    app = router_module.build_serving_app(
+    app = router_module.build_offline_serving_app(
         object(), AdapterRouter(), internal_key="synthetic-internal-key"
     )
     chunks = [

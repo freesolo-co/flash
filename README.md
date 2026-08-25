@@ -44,6 +44,10 @@ path is self-hostable end to end — see **[SELF_HOSTING.md](SELF_HOSTING.md)**.
 
 ## Using the hosted service
 
+The active training and hosted-serving catalog is `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
+`Qwen/Qwen3.6-35B-A3B`. The retired dense Qwen3.6 27B identity is never translated into Qwen3.8,
+and customer-owned Modal or RunPod serving remains limited to Qwen3.5 9B.
+
 `flash login` is not interactive. Export `FREESOLO_API_KEY` first so the key does not appear in process listings:
 
 ```bash
@@ -68,7 +72,7 @@ authenticated organization before Flash allocates anything:
 
 ```toml
 project = "your-project-uuid"
-model = "Qwen/Qwen3.5-4B"
+model = "Qwen/Qwen3.5-9B"
 algorithm = "sft"
 
 [environment]
@@ -169,7 +173,7 @@ into `dev`**.
 
 ### Layout
 
-- `flash/core/catalog.py` — curated model catalog (Qwen3.5 and Qwen3.6, dense and MoE), VRAM
+- `flash/core/catalog.py` — curated model catalog (Qwen3.5, Qwen3.8 dense, and Qwen3.6 MoE), VRAM
   sizing, and each model's `thinking` capability
 - `flash/schema/`, `flash/core/spec.py` — TOML to `JobSpec`
 - `flash/runner/` — server-side run supervisor (durable job handle, retries, cost guard)

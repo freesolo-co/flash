@@ -74,7 +74,6 @@ _RUNPOD_L40S = RunPodGpu(gpu_type_id="NVIDIA L40S", container_disk_gb=100, volum
 # 24 GB card, so the VOLUME (weights and adapters) is sized down relative to the 9B set. the
 # container disk is NOT sized down: it holds the same image on either card. both ids are the exact
 # `gpuTypes.id` strings the runpod api returns ("NVIDIA L4", "NVIDIA L40S"), not display names.
-_RUNPOD_L4 = RunPodGpu(gpu_type_id="NVIDIA L4", container_disk_gb=100, volume_size_gb=60)
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,42 +248,6 @@ _PROFILES: dict[str, ServingProfile] = {
         processor_kwargs={},
         modal_gpu="L40S",
         runpod_gpu=_RUNPOD_L40S,
-    ),
-    "Qwen/Qwen3.5-4B": ServingProfile(
-        model_id="Qwen/Qwen3.5-4B",
-        modality="multimodal",
-        served_model="Freesolo-Co/Qwen3.5-4B-FP8",
-        tokenizer_model="Freesolo-Co/Qwen3.5-4B-FP8",
-        dtype="bfloat16",
-        # none, not "fp8": these checkpoints declare quant_method "compressed-tensors" in
-        # their own config, and vllm rejects a `quantization` argument that disagrees with
-        # the checkpoint rather than treating it as a hint. the checkpoint is the authority,
-        # so nothing is forced here.
-        quantization=None,
-        # fp8 for the same reason as the 9B above.
-        kv_cache_dtype="fp8",
-        max_model_len=32768,
-        max_num_seqs=8,
-        max_loras=16,
-        max_cpu_loras=16,
-        max_lora_rank=128,
-        max_num_batched_tokens=None,
-        # 0.98, not the 9B's 0.90: the catalog states it per model and _require_catalog_agreement
-        # rejects any drift from it, so this is copied from the catalog rather than chosen here.
-        gpu_memory_utilization=0.98,
-        cpu_offload_gb=0.0,
-        # image-capable for the same reason as the 9B above.
-        image_limit=4,
-        mm_processor_cache_gb=0.0,
-        # true for the same reason as the 9B above.
-        enable_tower_connector_lora=True,
-        # qwen3 for the same reason as the 9B above.
-        reasoning_parser="qwen3",
-        engine_args={},
-        tokenizer_kwargs={},
-        processor_kwargs={},
-        modal_gpu="L4",
-        runpod_gpu=_RUNPOD_L4,
     ),
 }
 

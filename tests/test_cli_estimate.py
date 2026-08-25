@@ -112,7 +112,7 @@ def test_required_save_density_adds_wall_time_and_cost_without_changing_steps():
 
     for method in ("sft", "grpo"):
         common = {
-            "model_id": "Qwen/Qwen3.5-4B",
+            "model_id": "Qwen/Qwen3.5-9B",
             "method": method,
             "steps": 10,
             "seq_len": 1024,
@@ -142,7 +142,7 @@ def test_required_save_overhead_uses_contractual_commit_counts():
     )
     from flash.cost.facts import total_params_b
 
-    model_id = "Qwen/Qwen3.5-4B"
+    model_id = "Qwen/Qwen3.5-9B"
     save_at_steps = (2, 4, 6)
     common = {
         "model_id": model_id,
@@ -166,7 +166,7 @@ def test_opd_required_saves_add_overhead_without_changing_steps():
     from flash.cost.analytical import estimate_cost
 
     common = {
-        "model_id": "Qwen/Qwen3.5-4B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "method": "opd",
         "steps": 10,
         "seq_len": 1024,
@@ -223,7 +223,7 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
 
     def _opd(teacher=None):
         raw = copy.deepcopy(GRPO_RAW)
-        raw["model"] = "Qwen/Qwen3.5-4B"
+        raw["model"] = "Qwen/Qwen3.5-9B"
         raw["algorithm"] = "opd"
         raw["train"].update(
             {"epochs": 1, "max_examples": 40, "prompts_per_step": 8, "group_size": 1}
@@ -252,7 +252,7 @@ def test_sft_cost_requires_the_measured_workload_rather_than_deriving_one():
     """
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
             "train": {"max_examples": 320, "batch_size": 16, "epochs": 2},
@@ -278,7 +278,7 @@ def test_sft_cost_reads_the_horizon_and_tokens_the_profile_measured():
     spec = attach_sft_profile(
         spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
                 "train": {"max_examples": 320, "batch_size": 16, "epochs": 2},
@@ -307,7 +307,7 @@ def test_sft_cost_rejects_a_profile_keyed_to_a_different_workload():
     spec = attach_sft_profile(
         spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
                 "train": {"max_examples": 320, "batch_size": 16, "epochs": 2},
@@ -322,12 +322,12 @@ def test_sft_cost_rejects_a_profile_keyed_to_a_different_workload():
 
 
 def test_runconfig_preserves_positional_seq_len_compatibility():
-    cfg = RunConfig("Qwen/Qwen3.5-4B", "sft", 10, 2048)
+    cfg = RunConfig("Qwen/Qwen3.5-9B", "sft", 10, 2048)
     assert cfg.seq_len == 2048
     assert cfg.train_tokens is None
 
 
-def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
+def test_cmd_train_cost_prints_server_quote_without_submitting(tmp_path, monkeypatch, capsys):
     cfg = tmp_path / "run.toml"
     cfg.write_text(
         'model = "Qwen/Qwen3.5-9B"\n'
@@ -350,18 +350,20 @@ def test_cmd_train_cost_prints_breakdown_without_submitting(tmp_path, capsys):
         dry_run=False,
         background=False,
     )
-    # --cost is local: it must NOT touch the control-plane client. GRPO needs no env load, and
-    # estimate_cost sizes VRAM offline, so no network is required for a listed model.
+    client = _use_client(monkeypatch, _QuotingClient({"estimated_cost_usd": 4.25}))
+
     rc = cmd_train(args)
     out = capsys.readouterr().out
     assert rc == 0
+    assert client.calls[0]["dry_run"] is True
+    assert client.calls[0]["spec"]["algorithm"] == "grpo"
     assert "TOTAL" in out
-    assert "$" in out
-    assert "GPU" in out  # the breakdown names the chosen (provisional cheapest-fit) class
+    assert "$4.25" in out
+    assert "GPU" not in out  # the server response does not expose allocation details
 
 
 SFT_TOML = (
-    'model = "Qwen/Qwen3.5-4B"\n'
+    'model = "Qwen/Qwen3.5-9B"\n'
     'project = "11111111-1111-4111-8111-111111111111"\n'
     'algorithm = "sft"\n'
     "[environment]\n"
@@ -1009,8 +1011,7 @@ def test_sft_cost_forwards_declared_secrets_without_printing_them(tmp_path, monk
 
 
 def test_sft_cost_warns_when_an_env_key_shadows_the_saved_login(tmp_path, monkeypatch, capsys):
-    """the generic ``--cost`` hook stays quiet because it cannot know the algorithm yet. sft does
-    reach an organization for the server-side dataset estimate, so it warns for itself."""
+    """the cost command warns after parsing because every quote reaches an organization."""
     from flash.cli import commands
 
     monkeypatch.setattr(commands, "shadowed_login_warning", lambda: "shadowed!")
@@ -1021,51 +1022,79 @@ def test_sft_cost_warns_when_an_env_key_shadows_the_saved_login(tmp_path, monkey
 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "opd"])
-def test_warm_start_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
-    """warm-start grpo/opd keep the local analytical quote until PR2 profiles their rollouts.
-
-    Asserted by making the client constructor itself fatal: a passing quote then proves no
-    authenticated request was possible, not merely that none was observed.
-    """
+def test_warm_start_non_sft_cost_uses_the_authoritative_server_quote(
+    tmp_path, monkeypatch, capsys, algorithm
+):
+    """warm-start grpo/opd use submit preparation so the resolved source rank prices the quote."""
     from flash.cli import commands
 
-    def _forbidden(*_a, **_kw):
-        raise AssertionError(f"{algorithm} --cost must not contact the control plane")
-
-    monkeypatch.setattr(commands, "client_from_config", _forbidden)
+    client = _use_client(
+        monkeypatch,
+        _QuotingClient(
+            {
+                "estimated_cost_usd": 1.005,
+                "prompt_budget": {
+                    "algorithm": algorithm,
+                    "context_source": "recipe_default",
+                    "prompt_budget_is_upper_bound": True,
+                    "engine_len": 4096,
+                    "max_completion": 512,
+                    "prompt_budget": 3584,
+                    "warm_start_context": 2048,
+                },
+            }
+        ),
+    )
     monkeypatch.setattr(commands, "shadowed_login_warning", lambda: "shadowed!")
-    monkeypatch.setenv("FLASH_STYLE", "0")
-    # group_size 2 is grpo's floor (advantages are group-relative) and is valid for opd too.
-    body = SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"').replace(
-        "batch_size = 8\n",
-        'prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\ninit_from_adapter = "source-run"\n',
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("WARM_START_TOKEN", "server-only-secret")
+    # group_size 2 is grpo's floor and is valid for opd too.
+    body = (
+        SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"')
+        .replace(
+            'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n',
+            'id = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
+            'secrets = ["WARM_START_TOKEN"]\n',
+        )
+        .replace(
+            "batch_size = 8\n",
+            "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
+            'init_from_adapter = "source-run"\n',
+        )
     )
 
     assert cmd_train(_sft_args(tmp_path, body)) == 0
     captured = capsys.readouterr()
+
+    assert len(client.calls) == 1
+    call = client.calls[0]
+    assert call["dry_run"] is True
+    assert call["spec"]["train"]["init_from_adapter"] == "source-run"
+    assert call["runtime_secrets"] == {"WARM_START_TOKEN": "server-only-secret"}
+    assert call["client_train_schema"]["version"]
+    assert "init_from_adapter" in call["client_train_schema"]["authored_keys"]
+    assert f"{1.005:.2f}" == "1.00", "the fixture must expose half-even formatting"
+    assert "$1.01" in captured.out
     assert "TOTAL" in captured.out
+    assert "server-only-secret" not in captured.out + captured.err + repr(call["spec"])
     assert "published environment" not in captured.out
     assert "source rows in published copy" not in captured.out
     assert "selected from" not in captured.out
-    assert "shadowed!" not in captured.err
-    assert (
-        "warning: warm-start (train.init_from_adapter) cost is a provisional rank-1 estimate. "
-        "The authoritative source adapter rank is resolved server-side and can change the selected "
-        "hardware and cost in either direction. Run `flash train --dry-run` for a quote using the "
-        "resolved source rank.\n" in captured.err
-    )
+    assert "shadowed!" in captured.err
+    assert f"{algorithm.upper()} derives a prompt budget of at most 3584 tokens" in captured.err
+    assert "warm-start source was configured with max_context_tokens=2048" in captured.err
+    assert "provisional rank-1" not in captured.err
 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "opd"])
-def test_plain_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorithm):
-    """Ordinary grpo/opd quotes stay local independently of the warm-start branch."""
+def test_plain_non_sft_cost_uses_the_authoritative_server_quote(
+    tmp_path, monkeypatch, capsys, algorithm
+):
+    """ordinary grpo/opd use preparation so resolved revision and disk cannot change the quote."""
     from flash.cli import commands
 
-    monkeypatch.setattr(
-        commands,
-        "client_from_config",
-        lambda *_a, **_kw: pytest.fail(f"{algorithm} --cost must not contact the control plane"),
-    )
+    client = _use_client(monkeypatch, _QuotingClient({"estimated_cost_usd": 3.25}))
+    monkeypatch.setattr(commands, "shadowed_login_warning", lambda: "shadowed!")
     monkeypatch.setenv("FLASH_STYLE", "0")
     body = SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"').replace(
         "batch_size = 8\n", "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
@@ -1073,44 +1102,38 @@ def test_plain_non_sft_cost_stays_offline(tmp_path, monkeypatch, capsys, algorit
 
     assert cmd_train(_sft_args(tmp_path, body)) == 0
     captured = capsys.readouterr()
+    assert len(client.calls) == 1
+    call = client.calls[0]
+    assert call["dry_run"] is True
+    assert call["spec"]["algorithm"] == algorithm
+    assert call["client_train_schema"]["version"]
+    assert "$3.25" in captured.out
     assert "TOTAL" in captured.out
+    assert "shadowed!" in captured.err
     assert "warm-start" not in captured.err
 
 
-def test_warm_start_cost_quotes_the_card_the_parser_accepts(tmp_path, capsys, monkeypatch):
-    """The quote must not refuse the exact configuration the parser now admits.
-
-    `estimate_cost` reads the rank for both the price and the exact-card fit, so quoting at the
-    serialization placeholder rejected a single B200 as needing 199 GB and advised `--gpus 2`, a
-    shortfall the real source rank may not have. Sized at the rank-1 vram lower bound it fits in 180
-    GB, while the warning accurately labels the dollars as provisional.
-    """
-    from flash.cli import commands
-
-    monkeypatch.setattr(
-        commands,
-        "client_from_config",
-        lambda *_a, **_kw: pytest.fail("offline quote must not contact the plane"),
-    )
-    monkeypatch.setenv("FLASH_STYLE", "0")
+def test_warm_start_exact_card_cost_uses_the_server_prepared_quote(tmp_path, capsys, monkeypatch):
+    """an exact card pin is priced only after preparation resolves the source adapter rank."""
+    client = _use_client(monkeypatch, _QuotingClient({"estimated_cost_usd": 6.5}))
     body = SFT_TOML.replace('algorithm = "sft"', 'algorithm = "grpo"').replace(
         "batch_size = 8\n",
-        'prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\ninit_from_adapter = "source-run"\n',
+        "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
+        'init_from_adapter = "source-run"\n',
     )
-    # SFT_TOML ends with an empty `[gpu]`, so the pin is appended into that section.
-    body = body.replace('model = "Qwen/Qwen3.5-4B"', 'model = "Qwen/Qwen3.6-35B-A3B"')
+    # sft_toml ends with an empty `[gpu]`, so the pin is appended into that section.
+    body = body.replace('model = "Qwen/Qwen3.5-9B"', 'model = "Qwen/Qwen3.6-35B-A3B"')
     body += 'type = "B200"\ncount = 1\n'
 
     assert cmd_train(_sft_args(tmp_path, body)) == 0
     captured = capsys.readouterr()
-    assert "TOTAL" in captured.out
+
+    assert client.calls[0]["dry_run"] is True
+    assert client.calls[0]["spec"]["gpu"]["type"] == "B200"
+    assert client.calls[0]["spec"]["gpu"]["count"] == 1
+    assert "$6.50" in captured.out
     assert "--gpus 2" not in captured.err
-    assert (
-        "warning: warm-start (train.init_from_adapter) cost is a provisional rank-1 estimate. "
-        "The authoritative source adapter rank is resolved server-side and can change the selected "
-        "hardware and cost in either direction. Run `flash train --dry-run` for a quote using the "
-        "resolved source rank.\n" in captured.err
-    )
+    assert "provisional" not in captured.err
 
 
 def _warm_start_rank_boundary_config():
@@ -1168,7 +1191,7 @@ def test_higher_warm_start_rank_can_select_cheaper_hardware(monkeypatch):
 def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
     cfg = tmp_path / "run.toml"
     cfg.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
         "[environment]\n"
@@ -1184,7 +1207,7 @@ def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
 
     with pytest.raises(
         ValueError,
-        match=r"train\.max_context_tokens=33000 exceeds Qwen/Qwen3\.5-4B's serving max_model_len=32768",
+        match=r"train\.max_context_tokens=33000 exceeds Qwen/Qwen3\.5-9B's serving max_model_len=32768",
     ):
         cmd_train(args)
 

@@ -335,7 +335,7 @@ def _record(**extra) -> AdapterRecord:
         {
             "adapter_id": "a",
             "repo_id": "org/a",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "thinking": True,
             **extra,
         }

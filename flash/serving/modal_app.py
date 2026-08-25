@@ -6,6 +6,7 @@ README to deploy.
 
 import asyncio
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +45,6 @@ if _validate_deploy_wiring:
         load_dotenv(REPO_DIR / ".env")
 
 APP_NAME = "freesolo-lora-serving"  # hardcoded; no deploy-time knob
-_USAGE_REPORT_RETRY_DELAYS_SECONDS = (0.1, 0.25, 0.5)
 # branded serving hostname, served alongside the default *.modal.run url once dns + tls resolve.
 # this remains environment-driven because custom domains must already be verified in the target modal
 # workspace. production keeps the domain optional for local and fork workspaces, while the official
@@ -317,7 +317,12 @@ def _engine_class_name(gpu: str, max_inputs: int) -> str:
     return f"{base}_c{max_inputs}"
 
 
-def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int) -> Any:
+def _build_engine(
+    gpu: str,
+    class_name: str,
+    max_inputs: int,
+    target_inputs: int,
+) -> Any:
     """Register one Modal ``@app.cls`` LoraEngine pinned to ``gpu``.
 
     Modal fixes a class's GPU at decoration time, so the A100-80GB 35B model and the L4 models need
@@ -352,8 +357,11 @@ def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int
             payload_dict: dict[str, Any],
             record_dict: dict[str, Any] | None = None,
             expected_checkpoint: str | None = None,
+            generation_id: str | None = None,
         ) -> dict[str, Any]:
-            return await self._generate(payload_dict, record_dict, expected_checkpoint)
+            return await self._generate(
+                payload_dict, record_dict, expected_checkpoint, generation_id
+            )
 
         @modal.method(is_generator=True)
         async def stream_generate(
@@ -361,9 +369,10 @@ def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int
             payload_dict: dict[str, Any],
             record_dict: dict[str, Any] | None = None,
             expected_checkpoint: str | None = None,
+            generation_id: str | None = None,
         ):
             async for event in self._stream_generate(
-                payload_dict, record_dict, expected_checkpoint
+                payload_dict, record_dict, expected_checkpoint, generation_id
             ):
                 yield event
 
@@ -451,11 +460,15 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
+        generation_id = payload.generation_id
+        if not generation_id:
+            raise RuntimeError("generation id is required before modal dispatch")
         engine = _engine_cls_for(base_model)(base_model=base_model)
         return await engine.generate.remote.aio(
             payload.model_dump(by_alias=True),
             self._record_payload(record),
             expected_checkpoint,
+            generation_id,
         )
 
     async def stream_generate(
@@ -466,11 +479,15 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ):
+        generation_id = payload.generation_id
+        if not generation_id:
+            raise RuntimeError("generation id is required before modal dispatch")
         engine = _engine_cls_for(base_model)(base_model=base_model)
         remote_stream = engine.stream_generate.remote_gen.aio(
             payload.model_dump(by_alias=True),
             self._record_payload(record),
             expected_checkpoint,
+            generation_id,
         )
         try:
             async for event in remote_stream:
@@ -497,54 +514,14 @@ class _ModalEnginePool:
         await engine.unregister.remote.aio(adapter_id, expected_generation)
 
 
-def _build_usage_reporter(settings: Any) -> Any:
-    """Build the serving->backend usage reporter, or None when not configured.
+def _build_usage_outbox(settings: Any) -> Any:
+    """Build mandatory durable accounting for the hosted serving application."""
+    from flash.serving.src.usage_outbox import DurableUsageOutbox
 
-    Returns an async ``report(usage)`` that POSTs one request's token + GPU-time usage to the
-    backend's ``/api/billing/serving-usage`` (authenticated with the shared internal key).
-    The router calls it as a managed detached task, so a failure here never affects serving.
-    When ``internal_key`` is unset, returns None to disable reporting entirely.
-
-    A single persistent ``httpx.AsyncClient`` is shared across all report calls: it keeps the
-    TCP/TLS connection to the backend alive between calls, eliminating per-report handshake
-    overhead (typically 20-80 ms per TLS round-trip on the first call of each burst).
-    """
-    base = (settings.backend_url or "").rstrip("/")
-    key = settings.internal_key
-    if not base or not key:
-        return None
-    url = f"{base}/api/billing/serving-usage"
-
-    import httpx
-
-    _client = httpx.AsyncClient(
-        timeout=10.0,
-        headers={"Authorization": f"Bearer {key}"},
+    return DurableUsageOutbox(
+        settings,
+        worker_id=f"serving-{settings.deployment_id}-{os.getpid()}-{uuid.uuid4().hex}",
     )
-
-    async def report(usage: dict[str, Any]) -> None:
-        stable_request_id = bool(str(usage.get("requestId") or "").strip())
-        for attempt in range(len(_USAGE_REPORT_RETRY_DELAYS_SECONDS) + 1):
-            try:
-                resp = await _client.post(url, json=usage)
-            except httpx.TransportError:
-                if not stable_request_id or attempt >= len(_USAGE_REPORT_RETRY_DELAYS_SECONDS):
-                    raise
-            else:
-                status_code = getattr(resp, "status_code", 200)
-                retryable_status = status_code in {408, 429} or status_code >= 500
-                if not retryable_status or not stable_request_id:
-                    resp.raise_for_status()
-                    return
-                if attempt >= len(_USAGE_REPORT_RETRY_DELAYS_SECONDS):
-                    resp.raise_for_status()
-                    return
-            await asyncio.sleep(_USAGE_REPORT_RETRY_DELAYS_SECONDS[attempt])
-
-    # Expose the client's aclose so the app can close it on shutdown (avoids leaked sockets /
-    # "Unclosed client" ResourceWarnings); build_serving_app wires this to a FastAPI shutdown hook.
-    report.aclose = _client.aclose
-    return report
 
 
 # Short-TTL positive-authorization cache + single-flight for the serving->backend authorize call.
@@ -720,7 +697,7 @@ def _base_model_records() -> list:
             repo_id=m,
             base_model=m,
             serve_base_model=True,
-            thinking=True,
+            thinking=False,
             org_id=None,
             status="ready",
         )
@@ -761,8 +738,8 @@ def router():
         reload_records=lambda: load_adapters(settings) + _base_model_records(),
         lookup_record=lambda adapter_id: get_adapter(adapter_id, settings),
         reload_interval_seconds=cfg.RELOAD_INTERVAL_SECONDS,
-        # Meter each generation to the backend (fire-and-forget); None disables it.
-        usage_reporter=_build_usage_reporter(settings),
+        # durable capture is required in configured serving deployments.
+        usage_store=_build_usage_outbox(settings),
         # External chat auth is ALWAYS enforced: a request needs a Freesolo API key whose org owns
         # the adapter (the backend authorizes), or the shared internal key to bypass. The authorizer
         # must be wired (backend URL + internal key) or non-internal chat fails closed.

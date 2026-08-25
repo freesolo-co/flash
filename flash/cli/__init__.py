@@ -840,10 +840,8 @@ def _warn_if_login_shadowed(args) -> None:
     """Surface an ambient FREESOLO_API_KEY that binds a command to another org."""
     if getattr(args, "func", None) not in _ORG_BINDING_COMMANDS:
         return
-    # `train --cost` cannot be classified here: the algorithm is only known once the config is
-    # parsed, which happens inside the command. grpo/opd stay catalog-only and must not warn about
-    # an org they never reach; sft authenticates to request the server-side dataset estimate, so it
-    # emits this warning itself (see commands._cmd_train_cost_sft).
+    # `train --cost` parses its config inside the command and every algorithm authenticates for the
+    # server-prepared quote. that path emits this warning itself after parsing, so suppress it here.
     if getattr(args, "cost", False):
         return
     message = shadowed_login_warning()

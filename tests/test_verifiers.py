@@ -2264,7 +2264,7 @@ def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "thinking": True,
             "environment": {"id": "org/env"},
@@ -2288,9 +2288,7 @@ def _thinking_env(monkeypatch, sdk_env, *, prompt_opens_thinking: bool):
 
 
 def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monkeypatch):
-    from flash.engine.worker import opd_train as opd_mod
-    from flash.engine.worker import opd_train_runner
-    from flash.engine.worker.model.decoding import prompt_opens_thinking
+    from flash.engine.worker.train.opd import prompt_preparation
     from flash.engine.worker.train.opd.state import _OpdRequest
 
     class _Tokenizer:
@@ -2298,11 +2296,18 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
         eos_token = "<eos>"
 
         def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+            self,
+            messages,
+            *,
+            tokenize,
+            add_generation_prompt,
+            enable_thinking,
+            preserve_thinking,
         ):
             assert messages == [{"role": "user", "content": "go"}]
             assert add_generation_prompt is True
             assert enable_thinking is True
+            assert preserve_thinking is False
             if tokenize:
                 return [10, 11]
             return "<|im_start|>assistant\n<think>\n"
@@ -2318,20 +2323,33 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     tokenizer = _Tokenizer()
     monkeypatch.setattr(
-        opd_mod,
+        prompt_preparation,
         "_w",
-        types.SimpleNamespace(
-            THINKING=True,
-            load_tokenizer=lambda model_id, revision: tokenizer,
-            prompt_opens_thinking=prompt_opens_thinking,
-        ),
+        types.SimpleNamespace(THINKING=True),
     )
-    monkeypatch.setattr(opd_mod, "_thinking_prefill_text", lambda _tokenizer: "<think>\n")
-    monkeypatch.setattr(opd_mod, "clamp_engine_len", lambda requested, _limit: requested)
-    monkeypatch.setattr(opd_mod, "model_max_position_embeddings", lambda *_args: None)
-    monkeypatch.setattr(opd_mod, "validate_glue_template", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        opd_mod,
+        prompt_preparation,
+        "load_tokenizer",
+        lambda model_id, revision: tokenizer,
+    )
+    monkeypatch.setattr(
+        prompt_preparation,
+        "_thinking_prefill_text",
+        lambda _tokenizer: "<think>\n",
+    )
+    monkeypatch.setattr(
+        prompt_preparation,
+        "clamp_engine_len",
+        lambda requested, _limit: requested,
+    )
+    monkeypatch.setattr(prompt_preparation, "model_max_position_embeddings", lambda *_args: None)
+    monkeypatch.setattr(
+        prompt_preparation,
+        "validate_glue_template",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        prompt_preparation,
         "liveness_heartbeat",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
@@ -2351,7 +2369,7 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
         model_id="model",
         model_revision="revision",
     )
-    opd_train_runner._prepare_prompts(
+    prompt_preparation.prepare_prompts(
         request,
         [
             (

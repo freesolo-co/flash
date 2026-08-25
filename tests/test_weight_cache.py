@@ -43,7 +43,7 @@ def _oversized_model_info():
 
 def _vol_spec(name="flash-weights", gb=100, **gpu):
     return JobSpec(
-        model="m",
+        model="Qwen/Qwen3.5-9B",
         gpu=GpuSpec(network_volume=name, network_volume_gb=gb, **gpu),
         seed=0,
     )
@@ -229,11 +229,11 @@ def test_prefetch_model_downloads_to_shared_mount_and_links(tmp_path, monkeypatc
     monkeypatch.setenv("FLASH_WEIGHT_CACHE_DIR", shared_hub)
     hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
 
-    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B")
 
     # downloaded straight onto the shared mount, NOT the ephemeral default
     expected = {
-        "repo_id": "Qwen/Qwen3.5-0.8B",
+        "repo_id": "Qwen/Qwen3.5-9B",
         "cache_dir": shared_hub,
         "ignore_patterns": ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
     }
@@ -241,7 +241,7 @@ def test_prefetch_model_downloads_to_shared_mount_and_links(tmp_path, monkeypatc
         {**expected, "local_files_only": True},
         {**expected, "local_files_only": False},
     ]
-    folder = "models--Qwen--Qwen3.5-0.8B"
+    folder = "models--Qwen--Qwen3.5-9B"
     dst = ephemeral_hub / folder
     # the base model is now visible in the ephemeral cache as a SYMLINK pointing back to the mount
     assert _os.path.islink(dst)
@@ -257,7 +257,7 @@ def test_prefetch_model_uses_ephemeral_default_without_shared_cache(tmp_path, mo
     ephemeral_hub = tmp_path / "ephemeral" / "hub"
     hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
 
-    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B")
 
     assert calls[0]["cache_dir"] is None  # ephemeral default cache, a correct cold run
     assert not ephemeral_hub.exists()  # nothing linked
@@ -271,7 +271,7 @@ def test_prefetch_model_falls_back_to_ephemeral_when_mount_absent(tmp_path, monk
     ephemeral_hub = tmp_path / "ephemeral" / "hub"
     hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
 
-    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B")
 
     assert (
         calls[0]["cache_dir"] is None
@@ -283,7 +283,7 @@ def test_prefetch_model_starts_no_download_at_deadline(tmp_path, monkeypatch):
     hf, calls = _patch_prefetch_io(monkeypatch, tmp_path / "ephemeral" / "hub")
     monkeypatch.setattr(hf._w, "_remaining_worker_wall_seconds", lambda: 0.0)
 
-    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B")
 
     assert calls == []
 
@@ -333,7 +333,7 @@ def test_instance_payload_strips_runpod_volume_redirect():
     # network_volume is managed -> carried by the internal dict (the leak source that build_worker_env
     # turns into the /runpod-volume redirect).
     spec = JobSpec.from_dict(
-        {**_vol_spec().to_internal_dict(), "run_id": "r", "model": "Qwen/Qwen3.5-0.8B"}
+        {**_vol_spec().to_internal_dict(), "run_id": "r", "model": "Qwen/Qwen3.5-9B"}
     )
     assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"].startswith(
         "/runpod-volume"
@@ -369,7 +369,7 @@ def test_assign_weight_cache_keeps_a_custom_volume():
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "run_id": "r",
             "gpu": {
                 "type": "A10",
@@ -522,7 +522,7 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
         monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "environment": {"id": "github:o/r@main:env/environment.py"},
                 "train": {"epochs": 1, "max_examples": 8},
@@ -662,7 +662,7 @@ def test_catalog_model_ids_are_the_cache_fitting_catalog():
     assert ids <= set(MODELS)
     # The whole catalog fits the volume, so the large checkpoints — the ones with the
     # slowest cold downloads — are warmed too.
-    assert "Qwen/Qwen3.6-27B" in ids
+    assert "Qwen/Qwen3.8-27B" in ids
     assert "Qwen/Qwen3.6-35B-A3B" in ids
 
 
@@ -926,7 +926,7 @@ def test_warm_weight_cache_defaults_to_full_fleet_and_catalog(monkeypatch):
 def _preload_spec():
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "run_id": "flash-1700000000-abcd1234",
             "train": {"epochs": 1, "max_examples": 8, "hf_repo": "org/repo"},
@@ -1204,7 +1204,7 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
         instances=[_inst()],
         attempt=0,
         mode="preload",
-        models=["Qwen/Qwen3.5-0.8B"],
+        models=["Qwen/Qwen3.5-9B"],
         deadline_at=10_000_000_000.0,
     )
     # decode the base64 payload embedded in the cache user_data
@@ -1212,7 +1212,7 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     b64 = ud.split("FLASH_PAYLOAD_EOF")[1].strip()
     payload = _json.loads(base64.b64decode(b64))
     assert payload["mode"] == "preload"
-    assert payload["models"] == ["Qwen/Qwen3.5-0.8B"]
+    assert payload["models"] == ["Qwen/Qwen3.5-9B"]
     assert "source_snapshot" not in payload
 
 

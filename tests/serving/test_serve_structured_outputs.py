@@ -32,7 +32,7 @@ from flash.serving.src.responses import openai_generate_fields
 from flash.serving.src.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.streaming import openai_chat_stream
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}
 
 
@@ -333,7 +333,7 @@ def test_reasoning_state_matches_effective_thinking_mode(modal_app_module):
     _generate(non_thinking, structured_outputs={"json": SCHEMA})
     assert non_thinking.engine.reasoning_ended[-1] is True
     assert non_thinking.engine.reasoning_parser_kwargs[-1] == {
-        "chat_template_kwargs": {"enable_thinking": False}
+        "chat_template_kwargs": {"enable_thinking": False, "preserve_thinking": False}
     }
 
     thinking = _engine(modal_app_module, thinking=False, default={"json": SCHEMA})
@@ -344,7 +344,11 @@ def test_reasoning_state_matches_effective_thinking_mode(modal_app_module):
     )
     assert thinking.engine.reasoning_ended[-1] is False
     assert thinking.engine.reasoning_parser_kwargs[-1] == {
-        "chat_template_kwargs": {"tools": ["search"], "enable_thinking": True}
+        "chat_template_kwargs": {
+            "tools": ["search"],
+            "enable_thinking": True,
+            "preserve_thinking": False,
+        }
     }
 
 
@@ -458,15 +462,18 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     # dict would compare the value to itself and pin nothing at all.
     request_id = ready.pop("request_id")
     replica_id = ready.pop("engine_replica_id")
-    assert uuid.UUID(request_id).version == 4
+    assert uuid.UUID(hex=request_id.removeprefix("fsgen-")).version == 4
     assert uuid.UUID(hex=replica_id).version == 4
     assert ready == {
         "type": "ready",
         "thinking": False,
+        "prompt_token_ids": [1],
+        "completion_token_ids": [1, 2],
         "prompt_tokens": 1,
         "completion_tokens": 2,
         "cached_tokens": 0,
         "cached_tokens_reported": True,
+        "reasoning_tokens": 0,
         "checkpoint": "",
     }
     delta = events[1].copy()
@@ -474,10 +481,14 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     assert delta == {
         "type": "delta",
         "text": "ok",
+        "thinking": False,
+        "prompt_token_ids": [1],
+        "completion_token_ids": [1, 2],
         "prompt_tokens": 1,
         "completion_tokens": 2,
         "cached_tokens": 0,
         "cached_tokens_reported": True,
+        "reasoning_tokens": 0,
         "request_id": request_id,
         "engine_replica_id": replica_id,
         "checkpoint": "",
@@ -536,11 +547,20 @@ def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
         for event in events:
             yield event
 
+    class UsageSession:
+        async def finalize(self, _result):
+            return None
+
+        async def capture(self, _result):
+            return None
+
+        async def fail(self, _result, _code):
+            return None
+
     async def drain():
         return [
             chunk
             async for chunk in openai_chat_stream(
-                MagicMock(),
                 MagicMock(),
                 record=record,
                 events=event_stream(),
@@ -548,7 +568,7 @@ def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
                 completion_id="completion-1",
                 created=1,
                 include_usage=True,
-                caller_org=None,
+                usage_session=UsageSession(),
             )
         ]
 
@@ -581,10 +601,13 @@ def test_stream_close_after_ready_closes_inner_generator(modal_app_module):
         assert ready == {
             "type": "ready",
             "thinking": False,
+            "prompt_token_ids": [1],
+            "completion_token_ids": [1],
             "prompt_tokens": 1,
             "completion_tokens": 1,
             "cached_tokens": 0,
             "cached_tokens_reported": True,
+            "reasoning_tokens": 0,
             "request_id": ready["request_id"],
             "engine_replica_id": ready["engine_replica_id"],
             "checkpoint": "",
@@ -608,8 +631,18 @@ def test_streaming_and_non_streaming_reasoning_state_match(modal_app_module):
     assert events[-1]["type"] == "final"
     assert eng.engine.reasoning_ended == [False, False]
     assert eng.engine.reasoning_parser_kwargs == [
-        {"chat_template_kwargs": {"enable_thinking": True}},
-        {"chat_template_kwargs": {"enable_thinking": True}},
+        {
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "preserve_thinking": False,
+            }
+        },
+        {
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "preserve_thinking": False,
+            }
+        },
     ]
     assert (
         eng.engine.sampling_params[0].structured_outputs

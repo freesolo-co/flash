@@ -58,7 +58,7 @@ def _preload_spec(gpu: str, run_id: str, timeout_s: int):
 
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "run_id": run_id,
             "train": {

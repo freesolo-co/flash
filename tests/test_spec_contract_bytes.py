@@ -43,7 +43,7 @@ def canonical(payload: dict) -> str:
 
 def spec(**overrides) -> JobSpec:
     raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "project": PROJECT,
         "environment": {"id": "owner/project/env"},
@@ -180,7 +180,7 @@ def test_removed_train_key_tolerance_does_not_extend_to_other_sections():
     with pytest.raises(ValueError, match="gpu has unknown key"):
         JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "project": PROJECT,
                 "environment": {"id": "owner/project/env"},
@@ -202,7 +202,7 @@ def test_unknown_keys_inside_a_section_are_fatal(section, payload):
     with pytest.raises(ValueError, match=f"{section} has unknown key"):
         JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "project": PROJECT,
                 "environment": {"id": "owner/project/env"},
@@ -216,7 +216,7 @@ def test_unknown_persisted_keys_are_still_fatal():
     with pytest.raises(ValueError, match="unknown key"):
         JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "project": PROJECT,
                 "environment": {"id": "owner/project/env"},
@@ -230,7 +230,7 @@ def test_sft_batch_size_is_not_migrated():
     """`batch_size` means a different quantity on sft, so the rollout migration must not touch it."""
     decoded = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "project": PROJECT,
             "environment": {"id": "owner/project/env"},
@@ -245,7 +245,7 @@ def test_ordered_gpu_pin_round_trips_through_the_public_spelling():
     """Public list form and internal head-plus-fallbacks form are alternate spellings of one pin."""
     decoded = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "project": PROJECT,
             "environment": {"id": "owner/project/env"},

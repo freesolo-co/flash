@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 
 from flash.core.catalog import normalize_algorithm, optimizer_batch_key, samples_on_policy
 from flash.core.spec import parse_positive_int_tuple
+from flash.cost.currency import format_usd
 from flash.engine.plan.recipe import RECIPE
 from flash.providers import PROVIDER_NAMES, validated_provider_preferences
 from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
@@ -345,7 +346,7 @@ class CostEstimate:
                 f"Teacher API: ${self.teacher_api_usd:.2f} (Parasail teacher token spend on the "
                 "platform-managed teacher key — tracked separately, NOT included in TOTAL)"
             )
-        lines.append(f"TOTAL      : ${self.total_usd:.2f}")
+        lines.append(f"TOTAL      : {format_usd(self.total_usd)}")
         if self.notes:
             lines.append("Notes      :")
             lines.extend(f"  - {n}" for n in self.notes)

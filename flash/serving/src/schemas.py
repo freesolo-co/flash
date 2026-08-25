@@ -381,6 +381,9 @@ def internal_adapter_payload(record: AdapterRecord) -> dict[str, Any]:
 
 class GenerateRequest(BaseModel):
     adapter_id: str
+    # the cpu front door overwrites this before every production dispatch. direct offline engine
+    # tests may omit it, in which case the engine supplies a test-only id before calling vllm.
+    generation_id: str | None = None
     prompt: str | None = None
     messages: list[dict[str, Any]] | None = None
     max_tokens: int = 1024
@@ -456,6 +459,16 @@ class GenerateRequest(BaseModel):
         if invalid_prompt or invalid_messages or has_prompt == has_messages:
             raise ValueError("exactly one nonempty prompt or messages source is required")
         return self
+
+    @field_validator("generation_id")
+    @classmethod
+    def validate_generation_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped or len(stripped) > 512:
+            raise ValueError("generation_id must be 1-512 characters")
+        return stripped
 
     @field_validator("adapter_id")
     @classmethod

@@ -560,7 +560,7 @@ def _worker_artifacts(spec) -> dict[str, str]:
 
 
 def _teardown_unrecoverable_remote(status) -> None:
-    """Stop the billable worker of a handle-backed run whose spec this build cannot parse.
+    """Stop the billable worker of a handle-backed run this build cannot activate.
 
     The run is already marked failed by the caller; what remains is the rented resource. Teardown
     runs off the persisted handle alone, so it works for exactly the spec the parse rejected.
@@ -624,6 +624,7 @@ def _classify_recoverable_runs(
         _mark_warmstart_source,
         _update,
         attach_run,
+        effective_spec_from_status,
         get_status,
         reallocation_spec_from_status,
     )
@@ -653,14 +654,14 @@ def _classify_recoverable_runs(
             # handle and the run id, never a parsed spec, so removal does not depend on the parse
             # that just failed.
             try:
-                JobSpec.from_dict(status.spec)
+                effective_spec_from_status(status)
             except Exception as exc:
                 _log.warning(
-                    "marking run %s failed: persisted spec could not be parsed for reattach",
+                    "marking run %s failed: persisted spec could not be activated for reattach",
                     status.run_id,
                     exc_info=True,
                 )
-                detail = f"unrecoverable: persisted spec is malformed: {exc}"
+                detail = f"unrecoverable: persisted spec cannot be activated: {exc}"
                 with contextlib.suppress(Exception):
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):
@@ -690,13 +691,14 @@ def _classify_recoverable_runs(
             # otherwise GC any half-made provider resource and resubmit from scratch.
             try:
                 spec = JobSpec.from_dict(status.spec)
+                effective_spec_from_status(status)
             except Exception as exc:
                 _log.warning(
-                    "marking run %s failed: persisted spec could not be parsed",
+                    "marking run %s failed: persisted spec could not be activated",
                     status.run_id,
                     exc_info=True,
                 )
-                detail = f"unrecoverable: persisted spec is malformed: {exc}"
+                detail = f"unrecoverable: persisted spec cannot be activated: {exc}"
                 with contextlib.suppress(Exception):
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):

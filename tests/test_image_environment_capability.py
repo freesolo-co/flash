@@ -69,11 +69,11 @@ def test_dynamic_image_capability_requires_an_image_capable_model_and_opd_teache
 
     validate_image_observation_environment(
         dynamic,
-        _spec("Qwen/Qwen3.5-4B"),
+        _spec("Qwen/Qwen3.5-9B"),
     )
     validate_image_observation_environment(
         dynamic,
-        _spec("Qwen/Qwen3.5-4B", "opd", "qwen3-vl-235b"),
+        _spec("Qwen/Qwen3.5-9B", "opd", "qwen3-vl-235b"),
     )
     validate_image_observation_environment(
         static,
@@ -88,5 +88,5 @@ def test_dynamic_image_capability_requires_an_image_capable_model_and_opd_teache
     with pytest.raises(ValueError, match=r"selected teacher 'glm-5\.2' cannot see images"):
         validate_image_observation_environment(
             dynamic,
-            _spec("Qwen/Qwen3.5-4B", "opd", "glm-5.2"),
+            _spec("Qwen/Qwen3.5-9B", "opd", "glm-5.2"),
         )

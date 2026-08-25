@@ -15,12 +15,12 @@ def test_oversized_catalog_models_carry_disk_floors():
 
     disk_floor_models = {
         "Qwen/Qwen3.5-9B",
-        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
     assert all(m.min_disk_gb == 0 for m in MODELS.values() if m.id not in disk_floor_models)
     assert MODELS["Qwen/Qwen3.5-9B"].min_disk_gb == 120
-    assert MODELS["Qwen/Qwen3.6-27B"].min_disk_gb == 160
+    assert MODELS["Qwen/Qwen3.8-27B"].min_disk_gb == 160
     assert MODELS["Qwen/Qwen3.6-35B-A3B"].min_disk_gb == 200
 
 

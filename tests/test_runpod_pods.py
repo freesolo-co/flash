@@ -31,7 +31,7 @@ def _resolve_owner_key(monkeypatch):
 
 def _spec(*, gpu: str = "H100", count: int = 1, volume: str | None = None) -> JobSpec:
     return JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         run_id="runpod-pod-test",
         gpu=GpuSpec(
             type=gpu,

@@ -38,7 +38,7 @@ def _representative_config() -> dict:
     carries — model, algorithm, environment id, and train params — matching what the
     SDK/agent author into flash.toml."""
     return {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "environment": {
@@ -64,7 +64,7 @@ def test_backend_run_config_parses_into_valid_jobspec() -> None:
     algorithm, environment id, and train params intact."""
     spec = spec_from_dict(_representative_config(), run_id="flash-test-1")
     assert isinstance(spec, JobSpec)
-    assert spec.model == "Qwen/Qwen3.5-4B"
+    assert spec.model == "Qwen/Qwen3.5-9B"
     assert spec.project == "11111111-1111-4111-8111-111111111111"
     assert spec.algorithm == "grpo"
     assert spec.environment.id == "github:owner/repo@main:my-env/environment.py"
@@ -118,7 +118,7 @@ def test_sft_backend_config_maps_to_jobspec() -> None:
     """The other algorithm the backend/agent emit: an SFT config (epochs-driven) must
     also map to a valid JobSpec."""
     config = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "sft",
         "environment": {"id": "github:owner/repo@main:my-env/environment.py"},
@@ -141,7 +141,7 @@ def test_backend_config_missing_required_fields_is_rejected_consistently() -> No
     required user field — see test_backend_run_config_parses_into_valid_jobspec.)
     """
     no_env = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 10},
@@ -158,7 +158,7 @@ def test_stale_local_env_path_is_rejected_at_both_layers() -> None:
     re-hydrated spec can sneak a local path onto the worker.
     """
     stale = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "environment": {"path": "environments/local_env.py"},

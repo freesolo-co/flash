@@ -32,9 +32,13 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import AdapterRouter, build_serving_app
+from flash.serving.src.router import (
+    AdapterRouter,
+    build_offline_serving_app,
+    build_serving_app,
+)
 from flash.serving.src.schemas import AdapterRecord
-from tests.serving.conftest import attest
+from tests.serving.conftest import RecordingUsageStore, attest
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -228,7 +232,7 @@ def _new_authorizer(modal_app_module):
     )
 
 
-_QWEN = "Qwen/Qwen3.5-0.8B"
+_QWEN = "Qwen/Qwen3.5-9B"
 _INTERNAL_KEY = "fs-internal"
 
 
@@ -236,15 +240,20 @@ class _CountingPool:
     def __init__(self) -> None:
         self.generate_calls = 0
 
-    async def generate(self, _base_model, _payload, record, *, expected_checkpoint=None):
+    async def generate(self, _base_model, payload, record, *, expected_checkpoint=None):
         self.generate_calls += 1
         return attest(
             record,
             {
                 "text": "hi",
                 "finish_reason": "stop",
+                "prompt_token_ids": [1],
+                "completion_token_ids": [2],
                 "prompt_tokens": 1,
                 "completion_tokens": 1,
+                "cached_tokens_reported": False,
+                "reasoning_tokens": 0,
+                "request_id": payload.generation_id,
                 "checkpoint": "",
             },
         )
@@ -261,23 +270,25 @@ class _CountingPool:
         return None
 
 
-def _base_model_client(authorize, pool, *, usage_reporter=None) -> TestClient:
+def _base_model_client(authorize, pool, *, usage_store=None) -> TestClient:
     record = AdapterRecord(
         adapter_id=_QWEN,
         repo_id=_QWEN,
         base_model=_QWEN,
         serve_base_model=True,
-        thinking=True,
+        thinking=False,
         org_id=None,
         status="ready",
     )
+    builder = build_serving_app if usage_store is not None else build_offline_serving_app
+    kwargs = {"usage_store": usage_store} if usage_store is not None else {}
     return TestClient(
-        build_serving_app(
+        builder(
             pool,
             AdapterRouter([record]),
             internal_key=_INTERNAL_KEY,
             chat_authorizer=authorize,
-            usage_reporter=usage_reporter,
+            **kwargs,
         )
     )
 
@@ -309,12 +320,9 @@ def test_malformed_200_fails_closed_without_dispatch_or_cache(
     )
     authorize = _new_authorizer(modal_app_module)
     pool = _CountingPool()
-    reports: list[dict[str, Any]] = []
+    store = RecordingUsageStore()
 
-    async def capture(usage: dict[str, Any]) -> None:
-        reports.append(usage)
-
-    with _base_model_client(authorize, pool, usage_reporter=capture) as client:
+    with _base_model_client(authorize, pool, usage_store=store) as client:
         denied = _chat(client, Authorization="Bearer fs-user-key")
         assert denied.status_code == 503
         assert pool.generate_calls == 0
@@ -326,8 +334,10 @@ def test_malformed_200_fails_closed_without_dispatch_or_cache(
     assert internal.status_code == 200
     assert pool.generate_calls == 2
     assert calls["n"] == 2
-    assert len(reports) == 1
-    assert reports[0]["orgId"] == "org-1"
+    assert len(store.finalized) == 2
+    assert store.finalized[0].principal.orgId == "org-1"
+    assert store.finalized[1].principal.kind == "trusted_internal"
+    assert store.finalized[1].principal.orgId is None
 
 
 def test_cancelled_waiter_does_not_cancel_shared_authorization(modal_app_module, monkeypatch):

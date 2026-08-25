@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from flash.serving.src.model_config import (
+    _QWEN38_HOSTED_CANDIDATE,
     SERVING_MODELS,
     base_models,
     engine_overrides_for,
@@ -17,13 +18,9 @@ from flash.serving.src.model_config import (
 )
 
 
-def test_catalog_has_the_expected_models() -> None:
+def test_catalog_has_only_canary_qualified_active_models() -> None:
     assert set(base_models()) == {
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
-        "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
-        "Qwen/Qwen3.6-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
 
@@ -37,18 +34,14 @@ def test_catalog_entries_are_wellformed() -> None:
 def test_every_catalog_model_has_an_intentional_image_classification() -> None:
     image_models = {model for model in base_models() if supports_image_input(model)}
     assert image_models == {
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
-        "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
-        "Qwen/Qwen3.6-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
     assert all(image_limit_for(model) == 4 for model in image_models)
 
 
 def test_uncataloged_base_models_are_not_supported() -> None:
-    assert is_supported_base_model("Qwen/Qwen3.5-4B") is True
+    assert is_supported_base_model("Qwen/Qwen3.5-9B") is True
     assert is_supported_base_model("openai/gpt-oss-20b") is False
     with pytest.raises(ValueError, match="Unsupported base model"):
         gpu_for("openai/gpt-oss-20b")
@@ -64,7 +57,6 @@ def test_no_model_runs_language_model_only() -> None:
     # vision-tower LoRA keys need the vision encoder loaded to bind to. Every base loads the whole
     # VL model (the 35B included) — none carries the text-only skip.
     assert "language_model_only" not in engine_overrides_for("Qwen/Qwen3.6-35B-A3B")
-    assert "language_model_only" not in engine_overrides_for("Qwen/Qwen3.6-27B")
     assert "language_model_only" not in engine_overrides_for("Qwen/Qwen3.5-9B")
 
 
@@ -93,11 +85,7 @@ def test_dense_models_serve_fp8_and_35b_serves_bf16_base() -> None:
     # every dense catalog model loads a pre-quantized FP8 checkpoint with no online quantization.
     # serve_model_for() resolves it and engine_overrides_for() injects it as serve_model_id.
     expected_fp8 = {
-        "Qwen/Qwen3.5-0.8B": "Freesolo-Co/Qwen3.5-0.8B-FP8",
-        "Qwen/Qwen3.5-2B": "Freesolo-Co/Qwen3.5-2B-FP8",
-        "Qwen/Qwen3.5-4B": "Freesolo-Co/Qwen3.5-4B-FP8",
         "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
-        "Qwen/Qwen3.6-27B": "Freesolo-Co/Qwen3.6-27B-FP8",
     }
     for base, ckpt in expected_fp8.items():
         assert serve_model_for(base) == ckpt
@@ -119,18 +107,6 @@ def test_no_bitsandbytes_anywhere() -> None:
         assert entry.get("load_format") != "bitsandbytes"
 
 
-def test_4b_has_l4_rank128_serving_overrides() -> None:
-    ov = engine_overrides_for("Qwen/Qwen3.5-4B")
-    assert ov["max_loras"] == 16
-    assert ov["max_lora_rank"] == 128
-    assert ov["max_model_len"] == 32768
-    assert ov["max_num_seqs"] == 8
-    # 4B stays on the cheap L4 tier and uses the validated high memory fraction.
-    assert gpu_for("Qwen/Qwen3.5-4B") == "L4"
-    assert ov["gpu_memory_utilization"] == 0.98
-    assert ov["enforce_eager"] is False
-
-
 def test_9b_has_l40s_rank128_serving_overrides() -> None:
     ov = engine_overrides_for("Qwen/Qwen3.5-9B")
     assert ov["max_loras"] == 16
@@ -145,23 +121,33 @@ def test_9b_has_l40s_rank128_serving_overrides() -> None:
     )  # CUDA graphs on (~10x faster decode on this hybrid GDN model)
 
 
-def test_27b_has_h100_rank64_serving_overrides() -> None:
-    base_model = "Qwen/Qwen3.6-27B"
-    ov = engine_overrides_for(base_model)
-    assert base_model in base_models()
-    assert supports_image_input(base_model) is True
-    assert image_limit_for(base_model) == 4
-    assert ov["serve_model_id"] == "Freesolo-Co/Qwen3.6-27B-FP8"
-    assert gpu_for(base_model) == "H100"
+def test_qwen38_27b_is_a_pinned_pending_hosted_candidate() -> None:
+    base_model = "Qwen/Qwen3.8-27B"
+    candidate = _QWEN38_HOSTED_CANDIDATE
+    assert candidate["base_model"] == base_model
+    ov = candidate["engine"]
+
+    assert base_model not in base_models()
+    assert is_supported_base_model(base_model) is False
+    for active_lookup in (engine_overrides_for, gpu_for, image_limit_for, serve_model_for):
+        with pytest.raises(ValueError, match="Unsupported base model"):
+            active_lookup(base_model)
+    assert ov["serve_model_id"] == "Qwen/Qwen3.8-27B-FP8"
     assert ov["max_loras"] == 16
     assert ov["max_lora_rank"] == 64
     assert ov["max_model_len"] == 32768
     assert ov["max_num_seqs"] == 8
     assert ov["gpu_memory_utilization"] == 0.90
-    assert (
-        ov["enforce_eager"] is False
-    )  # CUDA graphs on (~7x faster decode on this hybrid GDN model)
+    assert ov["enforce_eager"] is False
     assert ov["reasoning_parser"] == "qwen3"
+    assert ov["model_revision"] == "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
+    assert {
+        key: ov[key] for key in ("model_revision", "tokenizer_revision", "processor_revision")
+    } == {
+        "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+        "tokenizer_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        "processor_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    }
     assert "language_model_only" not in ov
 
 
@@ -180,18 +166,3 @@ def test_35b_has_h200_bf16_rank64_six_loras_overrides() -> None:
         ov["gpu_memory_utilization"] == 0.90
     )  # headroom above the weights + 6 x 64 LoRA buffer for KV + graphs
     assert ov["enforce_eager"] is False  # CUDA graphs on for the bf16/H200 path
-
-
-def test_small_l4_models_allow_rank128_serving() -> None:
-    for model in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"):
-        ov = engine_overrides_for(model)
-        assert ov["max_lora_rank"] == 128
-        assert ov["max_model_len"] == 32768
-        assert "max_loras" not in ov  # still uses the global 16-hot-LoRA default
-        # small L4 tiers pin the same 0.98 GPU memory fraction as the 4B.
-        # the extra headroom pays for the rank-128 LoRA buffer.
-        assert ov["gpu_memory_utilization"] == 0.98
-        # ...and cap max_num_seqs to the container's concurrency ceiling (modal_app.MAX_INPUTS=64)
-        # so the engine stops over-reserving activation/graph memory for ~1000 unreachable sequences
-        # (vLLM's default) and reclaims it as KV cache.
-        assert ov["max_num_seqs"] == 64

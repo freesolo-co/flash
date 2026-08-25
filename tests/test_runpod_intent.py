@@ -47,7 +47,7 @@ class _RemoteRepo:
 
 def _spec() -> JobSpec:
     return JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         run_id="intent-test",
         gpu=GpuSpec(type="RTX 4090", disk_gb=60),
     )

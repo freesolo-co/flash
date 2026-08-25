@@ -51,7 +51,7 @@ def test_cancel_run_revocation_failure_defers_until_after_fence_and_teardown(
     monkeypatch.setattr(orch, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "gpu": {"type": "RTX 5090"},
             "run_id": f"flash-revoke-failure-{failed_revocation_call}",
@@ -1601,7 +1601,13 @@ def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
     assert orch.read_verified_adapter_revisions(run_id) == frozenset()
 
 
-def test_cancel_active_deployment_with_malformed_spec_still_revokes(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "retired_model",
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
+)
+def test_cancel_active_removed_model_still_cleans_up_and_revokes(
+    tmp_path, monkeypatch, retired_model
+):
     import flash.runner as orch
     import flash.serve.deploy as deploy
     import flash.server.platform.locks as locks
@@ -1618,7 +1624,7 @@ def test_cancel_active_deployment_with_malformed_spec_still_revokes(tmp_path, mo
         )
     )
     raw = orch._load_status_json(run_id)
-    raw["spec"] = ["malformed-spec"]
+    raw["spec"]["model"] = retired_model
     with open(orch.runs_file_path(run_id, ".json"), "w") as file:
         json.dump(raw, file)
 
@@ -1643,7 +1649,7 @@ def test_cancel_active_deployment_with_malformed_spec_still_revokes(tmp_path, mo
 
     out = orch.cancel_run(run_id)
 
-    assert gc_calls == []
+    assert [spec.model for spec in gc_calls] == [retired_model]
     assert backend_calls == [run_id]
     assert out.state == "cancelled"
     assert out.deployment["state"] == "undeployed"
@@ -1850,11 +1856,3 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
     assert retried.state == "cancelled"
     assert retried.deployment["state"] == "undeployed"
     assert orch.read_verified_adapter_revisions(run_id) == frozenset()
-
-
-# ---------------------------------------------------------------------------
-# registry-less REST fallback in terminate_endpoint: when the resource registry has lost the
-# endpoint (e.g. across a container restart), cleanup still has to find the orphan by name on
-# every configured account and delete it. an unconfirmed delete must surface as a failed result
-# rather than a silent success, or a live endpoint keeps billing while the run looks cleaned up.
-# ---------------------------------------------------------------------------

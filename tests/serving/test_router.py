@@ -15,20 +15,18 @@ import time
 import pytest
 from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.testclient import TestClient
-from starlette.responses import StreamingResponse
 
 from flash.serving.src.adapter_routes import remove_adapter
-from flash.serving.src.router import AdapterRouter, build_serving_app
+from flash.serving.src.context import ServingContext
+from flash.serving.src.router import AdapterRouter
+from flash.serving.src.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.schemas import AdapterRecord
-from flash.serving.src.serving_io import _sse
-from flash.serving.src.streaming import _produce_openai_chat_stream, openai_chat_stream
 from tests.serving.conftest import attest
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
-    """Permissive chat authorizer for routing tests (auth is always enforced; these
-    tests exercise routing/metering, not auth)."""
-    return
+async def _allow(_token: str, _adapter_id: str) -> str:
+    """Permissive attributed authorizer for routing tests."""
+    return "org-1"
 
 
 def _serve(*args, **kwargs):
@@ -39,8 +37,8 @@ def _serve(*args, **kwargs):
     return TestClient(build_serving_app(*args, **kwargs), headers={"Authorization": "Bearer t"})
 
 
-QWEN = "Qwen/Qwen3.5-0.8B"
-QWEN_2B = "Qwen/Qwen3.5-2B"
+QWEN = "Qwen/Qwen3.5-9B"
+QWEN_35B = "Qwen/Qwen3.6-35B-A3B"
 
 
 def _revision_id(run_id: str) -> str:
@@ -170,6 +168,8 @@ class FakePool:
                 "adapter_id": payload.adapter_id,
                 "text": f"[{base_model}] reply",
                 "finish_reason": "stop",
+                "prompt_token_ids": [4, 5],
+                "completion_token_ids": [1, 2, 3],
                 "token_ids": [1, 2, 3],
                 "inference_time_seconds": 0.01,
                 "checkpoint": checkpoint,
@@ -218,12 +218,31 @@ class FakePool:
 
 @pytest.fixture
 def app_setup():
-    # 2 adapters on the 0.8B base (share one GPU), 1 on the 2B base (its own GPU).
-    revisions = [_rec("qa", QWEN), _rec("qb", QWEN), _rec("mc", QWEN_2B)]
+    # two adapters share the 9b engine, while one adapter uses the separate 35b engine.
+    revisions = [_rec("qa", QWEN), _rec("qb", QWEN), _rec("mc", QWEN_35B)]
     router = AdapterRouter([*revisions, *(_alias(revision) for revision in revisions)])
     pool = FakePool()
     client = _serve(pool, router, internal_key="sekret")
     return client, pool, router
+
+
+def test_unregister_safe_records_exact_gpu_cleanup_failure(capsys):
+    class _FailingPool:
+        async def unregister(self, base_model, adapter_id, expected_generation):
+            raise RuntimeError(
+                f"exact eviction failed for {base_model} {adapter_id} {expected_generation}"
+            )
+
+    context = object.__new__(ServingContext)
+    context.pool = _FailingPool()
+
+    asyncio.run(context.unregister_safe(QWEN, "active@final.sha", "generation-1"))
+
+    assert (
+        f"hosted adapter gpu cleanup failed for active@final.sha on {QWEN}: "
+        f"RuntimeError('exact eviction failed for {QWEN} active@final.sha generation-1')"
+        in capsys.readouterr().out
+    )
 
 
 def test_healthz_reports_one_gpu_per_base_model(app_setup):
@@ -236,12 +255,10 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
         "revision_provenance",
         "thinking_structured_outputs_deferred_v1",
     ]
-    assert body["base_models"] == [QWEN, QWEN_2B]  # sorted by model id
+    assert body["base_models"] == [QWEN, QWEN_35B]  # sorted by model id
     assert body["gpus"] == 2  # two configured supported base-model engines
-    # Per-model GPU tier (replaces the misleading single configuredGpu): both test models are small
-    # so they map to the cheap FP8-capable L4; gpu_tiers is the distinct set actually in use.
-    assert body["gpu_by_model"] == {QWEN: "L4", QWEN_2B: "L4"}
-    assert body["gpu_tiers"] == ["L4"]
+    assert body["gpu_by_model"] == {QWEN: "L40S", QWEN_35B: "H200"}
+    assert body["gpu_tiers"] == ["H200", "L40S"]
     assert "configuredGpu" not in body  # the single-GPU field is gone (per-model now)
     assert body["adapters"] == 6
 
@@ -333,8 +350,8 @@ def test_generate_routes_to_the_adapters_base_model(app_setup):
     client, pool, _ = app_setup
     assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 200
     assert client.post("/generate", json={"adapter_id": "mc", "prompt": "hi"}).status_code == 200
-    # qa -> 0.8B engine, mc -> 2B engine.
-    assert pool.generated == [(QWEN, _revision_id("qa")), (QWEN_2B, _revision_id("mc"))]
+    # each adapter dispatches to its own active base-model engine.
+    assert pool.generated == [(QWEN, _revision_id("qa")), (QWEN_35B, _revision_id("mc"))]
 
 
 def test_chat_template_kwargs_forwarded_on_generate(app_setup):
@@ -604,17 +621,23 @@ def test_many_adapters_share_one_base_model_engine(app_setup):
     }
 
 
-def test_generate_endpoint_returns_snake_case_body(app_setup):
-    """The client-facing /generate response is snake_case end-to-end: the engine RPC dict is now
-    snake_case (see modal_app.py::_generate) and the router returns it verbatim, so no camelCase
-    key can reach the caller."""
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/generate", {"adapter_id": "qa", "prompt": "hi"}),
+        ("/adapters/qa/generate", {"prompt": "hi"}),
+    ],
+)
+def test_raw_generate_responses_exclude_internal_fields(app_setup, path, payload):
     client, _, _ = app_setup
-    body = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).json()
+    body = client.post(path, json=payload).json()
     assert body["adapter_id"] == "qa"
     assert body["finish_reason"] == "stop"
     assert body["token_ids"] == [1, 2, 3]
     assert body["text"] == f"[{QWEN}] reply"
-    # None of the old camelCase spellings survive anywhere in the response.
+    assert "prompt_token_ids" not in body
+    assert "completion_token_ids" not in body
+    # none of the old camelcase spellings survive anywhere in the response.
     for camel in ("adapterId", "finishReason", "tokenIds", "inferenceTimeSeconds", "requestId"):
         assert camel not in body
 
@@ -629,8 +652,8 @@ def test_openai_chat_completions_routes_and_shapes(app_setup):
     body = resp.json()
     assert body["object"] == "chat.completion"
     assert body["model"] == "mc"
-    assert body["choices"][0]["message"]["content"] == f"[{QWEN_2B}] reply"
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert body["choices"][0]["message"]["content"] == f"[{QWEN_35B}] reply"
+    assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
 
 
 def test_external_openai_chat_forwards_system_prompts(app_setup):
@@ -645,7 +668,7 @@ def test_external_openai_chat_forwards_system_prompts(app_setup):
     )
 
     assert resp.status_code == 200, resp.text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
     assert pool.messages[-1] == messages
 
 
@@ -664,7 +687,7 @@ def test_internal_openai_chat_can_send_system_prompts(app_setup):
     )
 
     assert resp.status_code == 200, resp.text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
 
 
 def test_external_generate_forwards_system_prompts(app_setup):
@@ -700,11 +723,11 @@ def test_openai_chat_completions_streams_sse_chunks(app_setup):
 
     assert '"delta":{"role":"assistant"}' in text
     assert '"delta":{"content":"[' in text
-    assert f"{QWEN_2B}] " in text
+    assert f"{QWEN_35B}] " in text
     assert '"delta":{"content":"reply"}' in text
     assert '"finish_reason":"stop"' in text
     assert "data: [DONE]" in text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
+    assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
 
 
 def test_openai_chat_completions_stream_can_include_usage(app_setup):
@@ -723,355 +746,7 @@ def test_openai_chat_completions_stream_can_include_usage(app_setup):
         text = resp.read().decode("utf-8")
 
     assert '"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}' in text
-    assert pool.generated == [(QWEN_2B, _revision_id("mc"))]
-
-
-def test_streaming_usage_reporter_fires_and_is_not_gc_dropped(app_setup):
-    # The streaming path meters via a bare asyncio.create_task. asyncio only keeps a WEAK ref to
-    # such a task, so the router holds its own strong ref (a pending-tasks set) to keep the billing
-    # report alive until it settles. Consuming the whole stream must deliver exactly one report.
-    _, pool, router = app_setup
-    reports: list[dict] = []
-
-    async def reporter(usage: dict) -> None:
-        reports.append(usage)
-
-    client = _serve(pool, router, usage_reporter=reporter)
-    with client.stream(
-        "POST",
-        "/v1/chat/completions",
-        json={
-            "model": "mc",
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": True,
-        },
-    ) as resp:
-        assert resp.status_code == 200
-        resp.read()  # drain the full stream so the final chunk schedules the report
-
-    assert len(reports) == 1
-    assert reports[0]["promptTokens"] == 2
-    assert reports[0]["completionTokens"] == 2
-    assert reports[0]["requestId"] == "req-stream"
-
-
-def _metered_chat_stream(events, reports):
-    record = _rec("metered", QWEN)
-    router = AdapterRouter([record])
-
-    def schedule_usage(_record, final, _caller_org):
-        reports.append(final.copy())
-
-    return openai_chat_stream(
-        router,
-        schedule_usage,
-        record=record,
-        events=events,
-        adapter_id=record.adapter_id,
-        completion_id="chatcmpl-metered",
-        created=123,
-        include_usage=True,
-        caller_org=None,
-    )
-
-
-def test_disconnect_after_role_chunk_preserves_ready_usage():
-    async def scenario():
-        reports = []
-        never = asyncio.Event()
-
-        async def events():
-            await asyncio.sleep(0.01)
-            yield {
-                "type": "ready",
-                "prompt_tokens": 11,
-                "completion_tokens": 1,
-                "request_id": "req-role-disconnect",
-            }
-            await never.wait()
-
-        stream = _metered_chat_stream(events(), reports)
-        role_chunk = await anext(stream)
-        await stream.aclose()
-        return role_chunk, reports
-
-    role_chunk, reports = asyncio.run(scenario())
-    assert b'"role":"assistant"' in role_chunk
-    assert reports == [
-        {
-            "type": "ready",
-            "prompt_tokens": 11,
-            "completion_tokens": 1,
-            "request_id": "req-role-disconnect",
-        }
-    ]
-
-
-def test_stream_disconnect_closes_engine_and_schedules_partial_usage_once():
-    async def scenario():
-        release_final = asyncio.Event()
-        sent_partial = asyncio.Event()
-        disconnect_sent = asyncio.Event()
-        engine_closed = asyncio.Event()
-        reports = []
-
-        class Events:
-            def __init__(self):
-                self.index = 0
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                self.index += 1
-                if self.index == 1:
-                    return {
-                        "type": "delta",
-                        "text": "partial",
-                        "prompt_tokens": 11,
-                        "completion_tokens": 3,
-                        "request_id": "req-disconnected",
-                    }
-                if self.index == 2:
-                    await release_final.wait()
-                    return {
-                        "type": "final",
-                        "finish_reason": "stop",
-                        "prompt_tokens": 11,
-                        "completion_tokens": 7,
-                        "request_id": "req-disconnected",
-                    }
-                raise StopAsyncIteration
-
-            async def aclose(self):
-                engine_closed.set()
-
-        response = StreamingResponse(_metered_chat_stream(Events(), reports))
-
-        async def receive():
-            await sent_partial.wait()
-            disconnect_sent.set()
-            return {"type": "http.disconnect"}
-
-        async def send(message):
-            if (
-                message["type"] == "http.response.body"
-                and b'"content":"partial"' in message["body"]
-            ):
-                sent_partial.set()
-
-        response_task = asyncio.create_task(
-            response(
-                {"type": "http", "asgi": {"spec_version": "2.3"}},
-                receive,
-                send,
-            )
-        )
-        await disconnect_sent.wait()
-        done, _ = await asyncio.wait({response_task}, timeout=0.1)
-        closed_before_terminal = engine_closed.is_set()
-        reports_before_terminal = reports.copy()
-        release_final.set()
-        await response_task
-        return done, closed_before_terminal, reports_before_terminal, reports
-
-    done, engine_closed, reports_before_terminal, reports = asyncio.run(scenario())
-    assert done, "the response kept draining engine tokens after the client disconnected"
-    assert engine_closed, "the disconnect did not close the engine iterator"
-    expected = [
-        {
-            "type": "delta",
-            "text": "partial",
-            "prompt_tokens": 11,
-            "completion_tokens": 3,
-            "request_id": "req-disconnected",
-        }
-    ]
-    assert reports_before_terminal == expected
-    assert reports == expected
-
-
-def test_stream_normal_completion_schedules_usage_once_without_changing_bytes():
-    async def scenario():
-        reports = []
-        source_tasks = []
-        response_task = asyncio.current_task()
-
-        async def events():
-            source_tasks.append(asyncio.current_task())
-            yield {"type": "delta", "text": "answer"}
-            yield {
-                "type": "final",
-                "finish_reason": "stop",
-                "prompt_tokens": 3,
-                "completion_tokens": 2,
-                "request_id": "req-complete",
-            }
-
-        chunks = [chunk async for chunk in _metered_chat_stream(events(), reports)]
-        assert len(source_tasks) == 1
-        assert source_tasks[0] is not response_task
-        return chunks, reports
-
-    chunks, reports = asyncio.run(scenario())
-    assert chunks == [
-        _sse(
-            {
-                "id": "chatcmpl-metered",
-                "object": "chat.completion.chunk",
-                "created": 123,
-                "model": _revision_id("metered"),
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
-        ),
-        _sse(
-            {
-                "id": "chatcmpl-metered",
-                "object": "chat.completion.chunk",
-                "created": 123,
-                "model": _revision_id("metered"),
-                "choices": [{"index": 0, "delta": {"content": "answer"}, "finish_reason": None}],
-            }
-        ),
-        _sse(
-            {
-                "id": "chatcmpl-metered",
-                "object": "chat.completion.chunk",
-                "created": 123,
-                "model": _revision_id("metered"),
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
-            }
-        ),
-        _sse("[DONE]"),
-    ]
-    assert reports == [
-        {
-            "type": "final",
-            "finish_reason": "stop",
-            "prompt_tokens": 3,
-            "completion_tokens": 2,
-            "request_id": "req-complete",
-        }
-    ]
-
-
-def test_stream_engine_error_schedules_latest_observed_usage_once():
-    async def scenario():
-        reports = []
-
-        async def events():
-            yield {
-                "type": "delta",
-                "text": "partial",
-                "prompt_tokens": 5,
-                "completion_tokens": 2,
-                "request_id": "req-engine-error",
-            }
-            raise ValueError("engine stream failed")
-
-        async for _chunk in _metered_chat_stream(events(), reports):
-            pass
-        return reports
-
-    reports = asyncio.run(scenario())
-    assert reports == [
-        {
-            "type": "delta",
-            "text": "partial",
-            "prompt_tokens": 5,
-            "completion_tokens": 2,
-            "request_id": "req-engine-error",
-        }
-    ]
-
-
-def test_stream_disconnect_and_engine_error_schedule_usage_once():
-    async def scenario():
-        reports = []
-        disconnected = asyncio.Event()
-        output = asyncio.Queue()
-        record = _rec("metered", QWEN)
-        router = AdapterRouter([record])
-
-        async def events():
-            yield {
-                "type": "delta",
-                "text": "partial",
-                "prompt_tokens": 7,
-                "completion_tokens": 4,
-                "request_id": "req-disconnect-error",
-            }
-            disconnected.set()
-            raise ValueError("engine stream failed")
-
-        def schedule_usage(_record, usage, _caller_org):
-            reports.append(usage.copy())
-
-        await _produce_openai_chat_stream(
-            router,
-            schedule_usage,
-            output,
-            disconnected,
-            record=record,
-            events=events(),
-            adapter_id=record.adapter_id,
-            completion_id="chatcmpl-metered",
-            created=123,
-            include_usage=True,
-            caller_org=None,
-            thinking=False,
-        )
-        return reports
-
-    reports = asyncio.run(scenario())
-    assert reports == [
-        {
-            "type": "delta",
-            "text": "partial",
-            "prompt_tokens": 7,
-            "completion_tokens": 4,
-            "request_id": "req-disconnect-error",
-        }
-    ]
-
-
-def test_stream_engine_error_reaches_connected_client_without_usage():
-    async def scenario():
-        reports = []
-        source_tasks = []
-        response_task = asyncio.current_task()
-
-        async def events():
-            source_tasks.append(asyncio.current_task())
-            yield {"type": "delta", "text": "partial"}
-            raise ValueError("engine stream failed")
-
-        chunks = [chunk async for chunk in _metered_chat_stream(events(), reports)]
-        assert len(source_tasks) == 1
-        assert source_tasks[0] is not response_task
-        return chunks, reports
-
-    chunks, reports = asyncio.run(scenario())
-    assert b'"content":"partial"' in chunks[-3]
-    assert chunks[-2:] == [
-        _sse(
-            {
-                "id": "chatcmpl-metered",
-                "object": "chat.completion.chunk",
-                "created": 123,
-                "model": _revision_id("metered"),
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
-                "error": {
-                    "message": "engine stream failed",
-                    "type": "engine_error",
-                    "code": 400,
-                },
-            }
-        ),
-        _sse("[DONE]"),
-    ]
-    assert reports == []
+    assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
 
 
 def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):
@@ -1097,8 +772,9 @@ def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):
 def test_openai_chat_rejects_non_boolean_stream_after_authorization(stream):
     authorizations: list[str] = []
 
-    async def _authorize(_token: str, adapter_id: str) -> None:
+    async def _authorize(_token: str, adapter_id: str) -> str:
         authorizations.append(adapter_id)
+        return "org-1"
 
     pool = FakePool()
     client = _serve(pool, _router_for("qa", QWEN), chat_authorizer=_authorize)
@@ -1372,33 +1048,6 @@ def test_openai_chat_completions_includes_usage_when_engine_reports_counts():
     }
 
 
-def test_usage_reporter_fires_with_token_counts_and_gpu_time():
-    """After a successful generation the router meters it (background task): the reporter is
-    called once with token counts + gpu seconds, keyed by the adapter and its base model."""
-    router = _router_for("qa", QWEN)
-    reports: list[dict] = []
-
-    async def reporter(usage: dict) -> None:
-        reports.append(usage)
-
-    client = _serve(_MeteringPool(), router, usage_reporter=reporter, deployment_id="deployment-3")
-    resp = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"})
-    assert resp.status_code == 200
-    assert len(reports) == 1
-    u = reports[0]
-    assert u["adapterId"] == "qa"
-    assert u["baseModel"] == QWEN
-    assert u["promptTokens"] == 7
-    assert u["completionTokens"] == 3
-    # An engine that doesn't report cached tokens meters 0 (no discount), never a missing key.
-    assert u["cachedTokens"] == 0
-    assert u["cachedTokensReported"] is False
-    assert u["gpuSeconds"] == 0.25
-    assert u["requestId"]  # a stable idempotency key is generated per report
-    assert u["engineReplicaId"] == "replica-7"
-    assert u["servingDeploymentId"] == "deployment-3"
-
-
 def test_generate_response_strips_internal_cache_attribution():
     router = _router_for("qa", QWEN)
     client = _serve(_MeteringPool(), router)
@@ -1407,129 +1056,6 @@ def test_generate_response_strips_internal_cache_attribution():
 
     assert "cached_tokens_reported" not in body
     assert "engine_replica_id" not in body
-
-
-def test_usage_report_uses_engine_request_id_for_idempotency():
-    """The report's requestId is the engine's stable per-generation id (so a future report retry
-    dedupes via the (org_id, request_id) key), not a fresh uuid minted per delivery."""
-    router = _router_for("qa", QWEN)
-    reports: list[dict] = []
-
-    class _IdPool(_MeteringPool):
-        async def generate(
-            self,
-            base_model: str,
-            payload,
-            record,
-            *,
-            expected_checkpoint: str | None = None,
-        ) -> dict:
-            out = await super().generate(
-                base_model,
-                payload,
-                record,
-                expected_checkpoint=expected_checkpoint,
-            )
-            out["request_id"] = "gen-123"  # what the real engine returns
-            return out
-
-    async def reporter(usage: dict) -> None:
-        reports.append(usage)
-
-    client = _serve(_IdPool(), router, usage_reporter=reporter)
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 200
-    assert reports[0]["requestId"] == "gen-123"
-
-
-def test_usage_reporter_failure_does_not_break_serving():
-    """Metering is fire-and-forget: a reporter that raises must not surface to the caller."""
-    router = _router_for("qa", QWEN)
-
-    async def boom(usage: dict) -> None:
-        raise RuntimeError("backend down")
-
-    client = _serve(_MeteringPool(), router, usage_reporter=boom)
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 200
-
-
-def test_nonstream_usage_report_is_detached_from_response_lifecycle():
-    import asyncio
-    import threading
-
-    router = _router_for("qa", QWEN)
-    started = threading.Event()
-    release = threading.Event()
-    response_done = threading.Event()
-    response: dict[str, object] = {}
-
-    async def reporter(usage: dict) -> None:
-        started.set()
-        await asyncio.to_thread(release.wait)
-
-    with _serve(_MeteringPool(), router, usage_reporter=reporter) as client:
-
-        def _send() -> None:
-            try:
-                response["value"] = client.post(
-                    "/generate", json={"adapter_id": "qa", "prompt": "hi"}
-                )
-            finally:
-                response_done.set()
-
-        worker = threading.Thread(target=_send)
-        worker.start()
-        assert started.wait(timeout=5)
-        completed_while_reporter_blocked = response_done.wait(timeout=0.5)
-        release.set()
-        worker.join(timeout=5)
-
-    assert completed_while_reporter_blocked is True
-    assert response["value"].status_code == 200
-
-
-def test_shutdown_drains_usage_reports_before_closing_reporter():
-    import asyncio
-    import threading
-
-    router = _router_for("qa", QWEN)
-    started = threading.Event()
-    release = threading.Event()
-    finished = threading.Event()
-    close_saw_finished = {"value": False}
-
-    async def reporter(usage: dict) -> None:
-        started.set()
-        await asyncio.to_thread(release.wait)
-        finished.set()
-
-    async def _aclose() -> None:
-        close_saw_finished["value"] = finished.is_set()
-
-    reporter.aclose = _aclose
-    timer = threading.Timer(0.1, release.set)
-    with _serve(_MeteringPool(), router, usage_reporter=reporter) as client:
-        assert (
-            client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 200
-        )
-        assert started.wait(timeout=5)
-        timer.start()
-    timer.join(timeout=5)
-
-    assert finished.is_set()
-    assert close_saw_finished["value"] is True
-
-
-def test_no_reporting_when_engine_omits_token_counts(app_setup):
-    """The base FakePool returns no token counts -> nothing to meter, reporter is never called."""
-    _, pool, router = app_setup
-    reports: list[dict] = []
-
-    async def reporter(usage: dict) -> None:
-        reports.append(usage)
-
-    client = _serve(pool, router, usage_reporter=reporter)
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 200
-    assert reports == []
 
 
 class _CachedMeteringPool(FakePool):
@@ -1587,43 +1113,6 @@ class _CachedMeteringPool(FakePool):
             "request_id": "req-cached",
             "checkpoint": checkpoint,
         }
-
-
-def test_usage_reporter_forwards_cached_tokens():
-    """A prefix-cache hit is metered: the reporter receives cachedTokens for the backend discount."""
-    router = _router_for("qa", QWEN)
-    reports: list[dict] = []
-
-    async def reporter(usage: dict) -> None:
-        reports.append(usage)
-
-    client = _serve(_CachedMeteringPool(), router, usage_reporter=reporter)
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 200
-    assert reports[0]["cachedTokens"] == 6
-    assert reports[0]["cachedTokensReported"] is True
-    assert reports[0]["engineReplicaId"] == "replica-cached"
-    assert reports[0]["promptTokens"] == 10
-
-
-def test_streaming_usage_reporter_forwards_cached_tokens():
-    router = _router_for("qa", QWEN)
-    reports: list[dict] = []
-
-    async def reporter(usage: dict) -> None:
-        reports.append(usage)
-
-    client = _serve(_CachedMeteringPool(), router, usage_reporter=reporter)
-    with client.stream(
-        "POST",
-        "/v1/chat/completions",
-        json={"model": "qa", "messages": [{"role": "user", "content": "hi"}], "stream": True},
-    ) as resp:
-        assert resp.status_code == 200
-        resp.read()
-    assert len(reports) == 1
-    assert reports[0]["cachedTokens"] == 6
-    assert reports[0]["cachedTokensReported"] is True
-    assert reports[0]["engineReplicaId"] == "replica-cached"
 
 
 def test_openai_usage_exposes_cached_tokens_in_prompt_details():
@@ -1869,24 +1358,6 @@ def test_miss_refresh_failure_propagates():
     client = TestClient(app, raise_server_exceptions=False, headers={"Authorization": "Bearer t"})
     resp = client.post("/generate", json={"adapter_id": "ghost", "prompt": "x"})
     assert resp.status_code == 500
-
-
-def test_usage_reporter_client_closed_on_shutdown():
-    # The persistent httpx client must be closed on app shutdown (no leaked sockets). build_serving_app
-    # wires the reporter's aclose into a FastAPI lifespan; TestClient's context manager runs it.
-    router = _router_for("qa", QWEN)
-    closed = {"v": False}
-
-    async def reporter(usage: dict) -> None:
-        return None
-
-    async def _aclose() -> None:
-        closed["v"] = True
-
-    reporter.aclose = _aclose
-    with _serve(FakePool(), router, usage_reporter=reporter):
-        pass
-    assert closed["v"] is True
 
 
 def test_concurrent_misses_hydrate_in_order_without_stampeding():

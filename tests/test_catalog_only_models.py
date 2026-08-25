@@ -27,8 +27,8 @@ def test_an_uncataloged_model_is_rejected_with_the_fork_instruction():
 
 
 def test_catalog_model_resolves_normally():
-    info = resolve_model("Qwen/Qwen3.5-4B", "grpo")
-    assert info.id == "Qwen/Qwen3.5-4B"
+    info = resolve_model("Qwen/Qwen3.5-9B", "grpo")
+    assert info.id == "Qwen/Qwen3.5-9B"
 
 
 def test_the_parser_rejects_an_uncataloged_model_before_submit():
@@ -43,14 +43,14 @@ def test_model_policy_is_no_longer_an_accepted_config_key():
     # The key is gone, not merely ignored: a config carrying it must fail loudly rather than
     # silently training something other than what it asked for.
     with pytest.raises(ConfigError, match="unknown config key"):
-        spec_from_dict(_raw(model="Qwen/Qwen3.5-4B", model_policy="allow"))
+        spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", model_policy="allow"))
 
 
 def test_a_catalog_spec_round_trips_without_a_policy_field():
-    spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-4B"))
+    spec = spec_from_dict(_raw(model="Qwen/Qwen3.5-9B"))
     payload = spec.to_dict()
     assert "model_policy" not in payload
-    assert spec_from_dict(payload).model == "Qwen/Qwen3.5-4B"
+    assert spec_from_dict(payload).model == "Qwen/Qwen3.5-9B"
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,10 @@ Two credentials and at least one GPU account:
 
 Everything else is optional.
 
+The active training catalog is Qwen3.5 9B, Qwen3.8 27B, and Qwen3.6 35B-A3B. Customer-owned
+serving through `flash serve deploy` remains Qwen3.5 9B-only; the hosted 27B profile is not a
+customer-provider placement contract.
+
 ## Quickstart
 
 ```bash
@@ -105,7 +109,7 @@ has nothing to enumerate and says so; keep track of the ids you use:
 
 ```toml
 project = "11111111-1111-4111-8111-111111111111"
-model = "Qwen/Qwen3.5-4B"
+model = "Qwen/Qwen3.5-9B"
 algorithm = "sft"
 
 [environment]
@@ -442,9 +446,9 @@ export MODAL_TOKEN_ID=... MODAL_TOKEN_SECRET=...
 
 flash serve deploy \
   --provider modal \
-  --model Qwen/Qwen3.5-4B \
+  --model Qwen/Qwen3.5-9B \
   --run <run-id> \
-  --deployment-id my-4b-serving \
+  --deployment-id my-9b-serving \
   --image ghcr.io/freesolo-co/freesolo-flash-serve@sha256:<digest> \
   --artifact-repo <hub-repo> \
   --artifact-subfolder <path-within-repo> \
@@ -466,9 +470,9 @@ them -- `placement_for` rejects the other provider's inputs instead of ignoring 
 ```bash
 flash serve deploy \
   --provider runpod \
-  --model Qwen/Qwen3.5-4B \
+  --model Qwen/Qwen3.5-9B \
   --run <run-id> \
-  --deployment-id my-4b-serving \
+  --deployment-id my-9b-serving \
   --image ghcr.io/freesolo-co/freesolo-flash-serve@sha256:<digest> \
   --artifact-repo <hub-repo> \
   --artifact-subfolder <path-within-repo> \

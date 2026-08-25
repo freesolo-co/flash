@@ -1170,6 +1170,26 @@ def test_text_job_does_not_police_reserved_placeholders():
     assert rows[0]["prompt"] == [{"role": "user", "content": "what does <image> mean?"}]
 
 
+def test_text_block_grpo_rows_flatten_content_without_python_repr():
+    rows = rl_train.build_verl_dataset_rows(
+        [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "hello "},
+                        {"type": "text", "text": "world"},
+                    ],
+                }
+            ]
+        ],
+        [0],
+        ["a"],
+    )
+
+    assert rows[0]["prompt"] == [{"role": "user", "content": "hello world"}]
+
+
 def test_mixed_job_parquet_round_trips_the_images_column(tmp_path):
     # Dataset.from_list infers ONE type per column across all rows. in a mixed job the text rows
     # have an empty images list, and inference on an all-empty-or-partly-empty column can land on a
@@ -1203,18 +1223,68 @@ def test_mixed_job_parquet_round_trips_the_images_column(tmp_path):
     assert [f.name for f in images_type.value_type] == ["image"]
     assert pa.types.is_string(images_type.value_type.field("image").type)
     assert table.column("extra_info").to_pylist()[1]["index"] == 1
+    assert table.column("prompt").to_pylist() == [row["prompt"] for row in rows]
 
 
-def test_text_only_parquet_does_not_pin_the_multimodal_schema(tmp_path):
-    # the control: a text job's rows have no images column at all, so pinning the multimodal schema
-    # would fail the write outright.
+def test_text_only_parquet_omits_multimodal_and_reasoning_fields_when_unauthored(tmp_path):
     rows = rl_train.build_verl_dataset_rows([[{"role": "user", "content": "q"}]], [0], ["a"])
     path = str(tmp_path / "train.parquet")
     rl_train.write_verl_grpo_parquet(rows, path)
 
     import pyarrow.parquet as pq
 
-    assert "images" not in pq.read_table(path).schema.names
+    table = pq.read_table(path)
+    assert "images" not in table.schema.names
+    prompt_type = table.schema.field("prompt").type.value_type
+    assert "reasoning_content" not in [field.name for field in prompt_type]
+
+
+def test_text_only_parquet_preserves_reasoning_first_authored_on_a_later_row(tmp_path):
+    rows = rl_train.build_verl_dataset_rows(
+        [
+            [{"role": "user", "content": "first"}],
+            [
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "answer", "reasoning_content": "old"},
+            ],
+        ],
+        [0, 1],
+        ["a", "b"],
+    )
+    path = str(tmp_path / "reasoning.parquet")
+
+    rl_train.write_verl_grpo_parquet(rows, path)
+
+    datasets = pytest.importorskip("datasets")
+    restored = datasets.Dataset.from_parquet(path)
+    assert restored[1]["prompt"][1]["reasoning_content"] == "old"
+    assert "reasoning_content" in restored.features["prompt"].feature
+
+
+def test_grpo_reasoning_only_assistant_round_trips_with_empty_content(tmp_path):
+    rows = rl_train.build_verl_dataset_rows(
+        [[{"role": "assistant", "content": None, "reasoning_content": "working"}]],
+        [0],
+        ["a"],
+    )
+    path = str(tmp_path / "reasoning-only.parquet")
+
+    rl_train.write_verl_grpo_parquet(rows, path)
+
+    datasets = pytest.importorskip("datasets")
+    restored = datasets.Dataset.from_parquet(path)
+    assert restored[0]["prompt"] == [
+        {"role": "assistant", "content": "", "reasoning_content": "working"}
+    ]
+
+
+def test_grpo_rows_reject_non_string_authored_reasoning():
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        rl_train.build_verl_dataset_rows(
+            [[{"role": "assistant", "content": "answer", "reasoning_content": ["old"]}]],
+            [0],
+            ["a"],
+        )
 
 
 # ------------------------------- override generation -------------------------------
@@ -1332,6 +1402,8 @@ def test_build_verl_overrides_carries_dr_grpo_recipe():
     assert "trainer.max_actor_ckpt_to_keep=1" in o
     assert "trainer.logger=[console]" in o
     assert "data.train_batch_size=16" in o
+    assert "+data.apply_chat_template_kwargs.enable_thinking=false" in o
+    assert "+data.apply_chat_template_kwargs.preserve_thinking=false" in o
     # truncated importance sampling: token-level, cap 2.0 (matches flash's tis recipe).
     assert "algorithm.rollout_correction.rollout_is=token" in o
     assert "algorithm.rollout_correction.rollout_is_threshold=2.0" in o
@@ -1730,7 +1802,7 @@ def test_build_verl_training_cfg_carries_the_multimodal_flag():
 
 def _mem_util_inp(**over):
     inp = {
-        "model_id": "Qwen/Qwen3.5-4B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "model_revision": "",
         "engine_len": 2048,
         "group_size": 8,
@@ -1753,7 +1825,7 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
     from flash.engine.plan.vram import colocate_kv_util
     from flash.providers.base import get_gpu_info
 
-    info = MODELS["Qwen/Qwen3.5-4B"]
+    info = MODELS["Qwen/Qwen3.5-9B"]
     want = colocate_kv_util(
         float(info.params_b),
         2048,
@@ -1781,9 +1853,9 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
         lora_rank=32,
     )
     assert got == want == explicit_tp_one
-    # 9.4 gb weights + 12 gb sleep kv + 0.15597568 gb rank-32 adapter, all inside vllm's 80 gb share.
-    assert got * 80 == pytest.approx(21.55597568)
-    assert got.hex() == "0x1.13ea9f00f2d56p-2"
+    # the current 9b geometry, kv reserve, and rank-32 adapter fit inside vllm's 80 gb share.
+    assert got * 80 == pytest.approx(31.605060096)
+    assert got.hex() == "0x1.948b75ff05902p-2"
     # and it is genuinely NOT the old constant, so the test cannot pass on an unwired build.
     assert got != rl_train._DEFAULT_GPU_MEM_UTIL
     assert got < rl_train._DEFAULT_GPU_MEM_UTIL
@@ -1819,7 +1891,7 @@ def test_gpu_mem_util_sizing_reaches_the_launch_config():
         },
         train_files="/w/t.parquet",
         val_files="/w/v.parquet",
-        model_path="Qwen/Qwen3.5-4B",
+        model_path="Qwen/Qwen3.5-9B",
         thinking=False,
         loggers=["console"],
         fp8_kv=False,
@@ -1940,7 +2012,7 @@ def test_multigpu_gpu_mem_util_caps_the_sizer_at_the_previous_constant(monkeypat
 
 def test_multigpu_gpu_mem_util_never_exceeds_the_previous_constant():
     default = rl_train._DEFAULT_GPU_MEM_UTIL
-    model_ids = ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-35B-A3B")
+    model_ids = ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B")
     for model_id in model_ids:
         for gpu_type in ("H100", "H200", "B200"):
             for tensor_parallel in (2, 4, 8):
@@ -1982,7 +2054,7 @@ def test_gpu_mem_util_keeps_the_constant_where_the_model_does_not_apply(monkeypa
     assert (
         rl_train.resolve_gpu_mem_util(
             _mem_util_inp(
-                model_id="Qwen/Qwen3.5-4B",
+                model_id="Qwen/Qwen3.5-9B",
                 model_revision="a" * 40,
             ),
             gpu_type="H100",
@@ -2110,7 +2182,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
     # and the override is scoped: an ordinary model keeps verl's own sleep/wake offload, which is
     # what lets a large rollout fit alongside the training weights.
     for key in ("free_cache_engine", "enable_sleep_mode"):
-        assert not [a for a in _argv("Qwen/Qwen3.5-4B") if key in a]
+        assert not [a for a in _argv("Qwen/Qwen3.5-9B") if key in a]
 
 
 def test_build_verl_training_cfg_derives_engine_len_and_budget():
@@ -2136,7 +2208,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "ppo_epochs": 1,
         "steps": 60,
         "warmstart_adapter": "",
-        "model_id": "Qwen/Qwen3.5-4B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "verl_total_epochs": 2,
         "save_freq": 20,
         "ckpt_to_keep": 1,
@@ -2355,7 +2427,7 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, 
         required_steps=(10, 20),
         export_root=str(tmp_path / "exports"),
         python_bin="python",
-        model_id="Qwen/Qwen3.5-0.8B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="rev",
         preprocessor=_Tok(),
     )
@@ -2445,7 +2517,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"prompts_per_step": 16, "epochs": 2},
         }
@@ -5172,7 +5244,7 @@ def _capability_resolve(
     train=None,
     overrides=None,
     processor=None,
-    model="Qwen/Qwen3.5-0.8B",
+    model="Qwen/Qwen3.5-9B",
     gpu_count=1,
 ):
     """run the resolver against one env, with everything else on the supported path."""
@@ -5334,6 +5406,84 @@ def test_top_level_record_image_reaches_actor_and_environment_prompts():
 
     assert any(block == {"type": "image"} for block in prompts[0]["prompt"][0]["content"])
     assert any(block == {"type": "image"} for block in prompts[0]["env_prompt"][0]["content"])
+
+
+def test_text_prompts_freeze_qwen38_reasoning_fields_for_child_parity():
+    from flash.engine.worker.train.rl import inputs as rl_inputs
+
+    prompts = rl_inputs._build_grpo_prompts(
+        [{}],
+        [
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "<think>old</think>answer"},
+                {"role": "user", "content": "question"},
+            ]
+        ],
+        False,
+        None,
+        _CapabilityTokenizer(),
+        None,
+        32,
+    )
+
+    expected = {
+        "role": "assistant",
+        "reasoning_content": "old",
+        "content": "answer",
+    }
+    assert prompts[0]["prompt"][1] == expected
+    assert prompts[0]["env_prompt"][1] == expected
+
+
+def test_multimodal_prompts_preserve_reasoning_content_through_processor_and_child_transport(
+    tmp_path,
+):
+    from flash.engine.worker.train.rl import inputs as rl_inputs
+    from flash.engine.worker.train.rl.verl_config import (
+        build_verl_dataset_rows,
+        write_verl_grpo_parquet,
+    )
+
+    class _RecordingProcessor(_CapabilityProcessor):
+        def __init__(self):
+            super().__init__()
+            self.template_messages = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["preserve_thinking"] is False
+            self.template_messages = messages
+            return "prompt"
+
+    processor = _RecordingProcessor()
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": _capability_image_uri()}},
+            ],
+        },
+    ]
+
+    prompts = rl_inputs._build_grpo_prompts(
+        [{}], [messages], True, processor, processor.tokenizer, None, 32
+    )
+    row = build_verl_dataset_rows([prompts[0]["prompt"]], [0], [""], [prompts[0]["images"]])[0]
+
+    expected = {"role": "assistant", "reasoning_content": "old", "content": "answer"}
+    assert processor.template_messages[1]["reasoning_content"] == "old"
+    assert processor.template_messages[1]["content"] == [{"type": "text", "text": "answer"}]
+    assert prompts[0]["env_prompt"][1] == processor.template_messages[1]
+    assert row["prompt"][1] == expected
+
+    datasets = pytest.importorskip("datasets")
+    path = tmp_path / "reasoning.parquet"
+    write_verl_grpo_parquet([row], str(path))
+    restored = datasets.Dataset.from_parquet(str(path))[0]["prompt"]
+    assert restored[1] == expected
 
 
 def test_multimodal_budget_filter_measures_the_expanded_prompt(monkeypatch):
@@ -5755,8 +5905,10 @@ class _BridgeGlueProcessor:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.image_counts = []
+        self.template_kwargs = []
 
     def apply_chat_template(self, messages, **kwargs):
+        self.template_kwargs.append(kwargs)
         return self.tokenizer.apply_chat_template(messages, **kwargs)
 
     def image_processor(self, *, images, return_tensors):
@@ -5815,6 +5967,70 @@ def test_bridge_start_lets_a_per_example_budget_lower_the_cap_but_never_raise_it
     assert _bridge(_BridgeEnv(max_episode_turns=0), max_turns=4).start(
         {"index": 0, "session_id": "a"}
     ) == {"max_turns": 1}
+
+
+def test_bridge_start_authenticates_reasoning_content_and_rejects_malformed_metadata():
+    from flash.engine.worker.train.rl.multi_turn import _BadRequest
+
+    env = _BridgeEnv()
+    prompt = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+        {"role": "user", "content": "question"},
+    ]
+    bridge = _bridge(env, examples=[{"index": 0}], env_prompts=[prompt])
+
+    assert bridge.start(
+        {
+            "index": 0,
+            "session_id": "reasoning",
+            "raw_prompt": prompt,
+            "prompt_ids": [],
+            "image_count": 0,
+            "image_digests": [],
+        }
+    ) == {"max_turns": 4}
+    assert bridge._sessions["reasoning"]["messages"] == prompt
+
+    with pytest.raises(_BadRequest, match="does not match the frozen environment prompt"):
+        _bridge(env, examples=[{"index": 0}], env_prompts=[prompt]).start(
+            {
+                "index": 0,
+                "session_id": "wrong-reasoning",
+                "raw_prompt": [
+                    *prompt[:1],
+                    {**prompt[1], "reasoning_content": "different"},
+                    *prompt[2:],
+                ],
+                "prompt_ids": [],
+                "image_count": 0,
+                "image_digests": [],
+            }
+        )
+
+    malformed = [*prompt[:1], {**prompt[1], "reasoning_content": ["old"]}, *prompt[2:]]
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        _bridge(env, examples=[{"index": 0}], env_prompts=[prompt]).start(
+            {
+                "index": 0,
+                "session_id": "bad-reasoning",
+                "raw_prompt": malformed,
+                "prompt_ids": [],
+                "image_count": 0,
+                "image_digests": [],
+            }
+        )
+    with pytest.raises(ValueError, match="unsupported transcript metadata"):
+        _bridge(env, examples=[{"index": 0}], env_prompts=[prompt]).start(
+            {
+                "index": 0,
+                "session_id": "bad-metadata",
+                "raw_prompt": [{**prompt[0], "name": None}, *prompt[1:]],
+                "prompt_ids": [],
+                "image_count": 0,
+                "image_digests": [],
+            }
+        )
 
 
 def test_bridge_start_passes_the_index_aligned_prepared_prompt_into_state_creation():
@@ -6143,6 +6359,7 @@ def test_bridge_normalizes_and_authenticates_every_supported_image_reply_shape(s
     assert out["image_count"] == 1
     assert out["image_digests"] == bridge._sessions["a"]["image_digests"]
     assert processor.image_counts == [1]
+    assert processor.template_kwargs[-1]["preserve_thinking"] is False
     image.close()
 
 
@@ -8717,7 +8934,7 @@ def _shim_files(tmp_path):
 def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_path):
     files = _shim_files(tmp_path)
     inp = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
+        "model_id": "Qwen/Qwen3.5-9B",
         # one card: the rank/device assertion renders empty, so it owes no marker here. the
         # multi-card case is pinned by the test below.
         "dp_cards": 1,
@@ -8765,7 +8982,7 @@ def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_
 def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_cards(tmp_path):
     files = _shim_files(tmp_path)
     inp = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "dp_cards": 2,
         "reentrant_checkpointing": True,
         "multimodal": False,

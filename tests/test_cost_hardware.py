@@ -248,7 +248,7 @@ def test_a_vast_sharded_quote_reads_the_provider_off_the_run_config():
 
     def cfg(provider, method="grpo"):
         return RunConfig(
-            model_id="Qwen/Qwen3.5-4B", method=method, steps=10, provider=provider, gpu_count=2
+            model_id="Qwen/Qwen3.5-9B", method=method, steps=10, provider=provider, gpu_count=2
         )
 
     for method in ("grpo", "sft"):
@@ -284,15 +284,15 @@ def test_ranking_prices_the_authored_rollout_batch_not_the_recipe_default():
 
     for algorithm in ("grpo", "opd"):
         train = {"epochs": 1, "group_size": 4, "prompts_per_step": authored}
-        config = run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+        config = run_config_for_ranking("Qwen/Qwen3.5-9B", algorithm, train=train)
         assert config.batch_size == authored, algorithm
         assert config.normalized().batch_size == authored, algorithm
 
     # sft still authors the batch under its own name, and it is a different quantity.
-    sft = run_config_for_ranking("Qwen/Qwen3.5-4B", "sft", train={"epochs": 1, "batch_size": 4})
+    sft = run_config_for_ranking("Qwen/Qwen3.5-9B", "sft", train={"epochs": 1, "batch_size": 4})
     assert sft.batch_size == 4
     # an unauthored rollout batch still falls through to the recipe default.
-    bare = run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo", train={"epochs": 1})
+    bare = run_config_for_ranking("Qwen/Qwen3.5-9B", "grpo", train={"epochs": 1})
     assert bare.batch_size is None
     assert bare.normalized().batch_size == RECIPE.rl.prompts_per_step
 
@@ -336,7 +336,7 @@ def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
                 train["prompts_per_step"] = authored
             if retained is not None:
                 train["max_examples"] = retained
-            config = run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+            config = run_config_for_ranking("Qwen/Qwen3.5-9B", algorithm, train=train)
             assert config.batch_size == expected, (algorithm, authored, retained)
             # what actually gets priced, after the recipe fills any remaining None.
             assert config.normalized().batch_size == (
@@ -346,7 +346,7 @@ def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
     # sft is untouched: its `batch_size` is examples per update on a dataset it may revisit across
     # epochs, so a small `max_examples` does not bound it the way a rollout pool bounds a step.
     sft = run_config_for_ranking(
-        "Qwen/Qwen3.5-4B", "sft", train={"epochs": 1, "batch_size": 8, "max_examples": 2}
+        "Qwen/Qwen3.5-9B", "sft", train={"epochs": 1, "batch_size": 8, "max_examples": 2}
     )
     assert sft.batch_size == 8
 
@@ -375,7 +375,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
     from flash.providers.base import run_config_for_ranking
 
     base = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "H100", "count": 1},
     }
@@ -411,7 +411,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
             )
             quoted = runconfig_from_spec(spec).normalized().batch_size
             ranked = (
-                run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+                run_config_for_ranking("Qwen/Qwen3.5-9B", algorithm, train=train)
                 .normalized()
                 .batch_size
             )
@@ -507,9 +507,9 @@ def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     from flash.providers.base import Candidate, run_config_for_ranking
 
     # the defect's root: the config the allocator ranks with never names a provider.
-    assert run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo").normalized().provider == "auto"
+    assert run_config_for_ranking("Qwen/Qwen3.5-9B", "grpo").normalized().provider == "auto"
 
-    key = _step_cost_ranker("Qwen/Qwen3.5-4B", "grpo", None, False, "")
+    key = _step_cost_ranker("Qwen/Qwen3.5-9B", "grpo", None, False, "")
     assert key is not None, "this model must be priceable, or the assertions below prove nothing"
 
     def at(provider, hourly=2.0):
@@ -551,7 +551,7 @@ def test_a_live_vast_allocation_is_requoted_without_nvlink_credit():
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
 
-    config = RunConfig(model_id="Qwen/Qwen3.5-4B", method="grpo", steps=20)
+    config = RunConfig(model_id="Qwen/Qwen3.5-9B", method="grpo", steps=20)
     assert config.normalized().provider == "auto", "an auto run is the case that was mispriced"
 
     def quote(provider, gpu_count=2):
@@ -667,7 +667,7 @@ def test_sft_fit_credits_only_the_ranks_that_will_launch():
         train = {"prompts_per_step": prompts} | ({"group_size": group} if group else {})
         quoted = executed_gpu_count(
             RunConfig(
-                model_id="Qwen/Qwen3.5-4B",
+                model_id="Qwen/Qwen3.5-9B",
                 method=method,
                 steps=10,
                 batch_size=prompts,

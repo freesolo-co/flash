@@ -68,7 +68,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         spec = JobSpec(
             run_id="flash-run",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=2),
             gpu=GpuSpec(type=""),
@@ -79,8 +79,8 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         assert status.state == "done", status.error
         from flash.providers.runpod.pricing import hourly_rate
 
-        # We charge the QUOTE (flash.cost estimate); the measured 1h-on-a-4090 cost lands in metrics.json.
-        assert status.cost_usd == runner.charge_usd_for_spec(spec), status.cost_usd
+        # the full run charges the persisted accepted quote; measured cost lands in metrics.json.
+        assert status.cost_usd == status.estimated_cost_usd, status.cost_usd
         assert publication_events == ["published"]
         assert captured["gpu"] == ""
         assert captured["seed"] == 123
@@ -104,7 +104,7 @@ def test_source_publication_failure_is_generic_at_submission_and_api_boundary(mo
 
     spec = JobSpec(
         run_id="source-publication-failure",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(hf_repo="private-org/private-run-repo"),
     )

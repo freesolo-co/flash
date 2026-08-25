@@ -51,7 +51,7 @@ def _spec(run_id="flash-1700000001-rt01", algorithm="sft", **gpu_kw) -> JobSpec:
     return attach_sft_profile(
         JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": algorithm,
                 "run_id": run_id,
                 "environment": {
@@ -80,6 +80,8 @@ def _public_spec(run_id="flash-1700000001-rt01", algorithm="sft") -> JobSpec:
     spec instead of a second hand-written copy that could drift from it.
     """
     public = _spec(run_id=run_id, algorithm=algorithm).to_dict()
+    # submission tests exercise environment and persistence boundaries, not an exact gpu pin.
+    public["gpu"]["type"] = ""
     return JobSpec.from_dict({**public, "run_id": run_id})
 
 
@@ -606,15 +608,13 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
 
     def fake_estimate(_spec, *, allocation=None):
         quote_allocations.append(allocation)
-        total_usd = 7.0 if allocation is not None else 1.0
-        return type("Estimate", (), {"total_usd": total_usd})()
+        return type("Estimate", (), {"total_usd": 1.0})()
 
     def fake_runpod_submit(run_spec, seed, **kwargs):
         status = orch.get_status(run_spec.run_id)
         persisted = status.effective_preparation["worker_spec"]
-        assert status.estimated_cost_usd == 7.0
-        assert quote_allocations[-1] is not None
-        assert quote_allocations[-1].gpu == "RTX 5090"
+        assert status.estimated_cost_usd == 1.0
+        assert quote_allocations == [None]
         assert persisted["environment"]["resolved_sha"] == resolved_sha
         assert persisted["gpu"]["type"] == "RTX 5090"
         assert persisted["gpu"]["network_volume"] == "flash-weights"
@@ -1468,9 +1468,9 @@ def test_select_candidate_escapes_a_failed_preferred_provider():
 def test_select_candidate_keeps_the_allocators_per_step_ranking():
     """The picker must take the allocator's order, not re-price the list by hourly rate.
 
-    ``allocate()`` ranks on the dollars one optimizer STEP costs, so a faster card can rank first
-    while costing more per hour -- the real Qwen3.5-0.8B OPD case ranks the $0.99/hr RTX 5090 ahead
-    of the $0.69/hr RTX 4090. Re-sorting here on total $/hr overrode that on the FIRST paid attempt,
+    ``allocate()`` ranks on the dollars one optimizer step costs, so a faster card can rank first
+    while costing more per hour. a measured opd case ranks the $0.99/hr rtx 5090 ahead of the
+    $0.69/hr rtx 4090. re-sorting here on total $/hr overrode that on the first paid attempt,
     running the slower card for more total money. Ordering is the allocator's job; this picker only
     demotes failed providers and tried shapes.
     """
@@ -1770,7 +1770,7 @@ def test_config_gpu_fields(monkeypatch):
     from flash.schema import spec_from_dict
 
     base = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "train": {"epochs": 1, "max_examples": 8},
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
@@ -1907,6 +1907,7 @@ def test_retry_message_does_not_deny_a_provider_that_is_in_the_candidate_list(or
     from flash.providers import allocator
     from flash.providers.base import Candidate, PollResult
     from flash.providers.runpod import PROVIDER as runpod_provider
+    from flash.providers.vast import PROVIDER as vast_provider
 
     # two providers, both of which this run burns through.
     candidates = (
@@ -1922,6 +1923,15 @@ def test_retry_message_does_not_deny_a_provider_that_is_in_the_candidate_list(or
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(runpod_provider, "_submit_run", fake_rp)
+    monkeypatch.setattr(
+        vast_provider,
+        "_submit_run",
+        lambda *_a, **_kw: PollResult(
+            False,
+            failure="no_capacity",
+            detail="job stuck IN_QUEUE",
+        ),
+    )
     spec = _spec(max_retries=2)
     _seed_status(orch, spec)
     log = io.StringIO()
@@ -2158,99 +2168,6 @@ def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
     action = _retry_action_line(log.getvalue(), 0)
     assert "expecting to retry on H100 @ runpod again" in action, action
     assert "no untried GPU class fits this run" in action, action
-
-
-def test_workload_profile_mismatch_fails_fast_instead_of_retrying(orch, monkeypatch):
-    """A profile whose identity does not match the spec is terminal, not infrastructure.
-
-    The selected-quote refresh re-derives the profile digest from the effective spec, so a mismatch
-    resolves identically on every attempt. Classifying it as infra-shaped burns the run's whole
-    retry budget on real ``time.sleep`` backoffs before failing anyway -- the shape that wedged the
-    suite for 20 minutes on a single test."""
-    from flash.engine.profiling.workload_profile import WorkloadProfileMismatch
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import PROVIDER as runpod_provider
-
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
-
-    submits = []
-
-    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
-        submits.append(attempt)
-        return PollResult(True, metrics={"train_tokens": 4096})
-
-    monkeypatch.setattr(runpod_provider, "_submit_run", fake_rp)
-
-    import flash.cost.spec as cost_spec
-
-    def refuse(*_a, **_kw):
-        raise WorkloadProfileMismatch("workload profile input digest does not match")
-
-    monkeypatch.setattr(cost_spec, "estimate_for_spec", refuse)
-
-    # any sleep here means the failure was misclassified as a transient the run should wait out.
-    slept = []
-    from flash.runner.supervise import lifecycle
-
-    monkeypatch.setattr(lifecycle.time, "sleep", lambda s: slept.append(s))
-
-    spec = _spec(max_retries=2)
-    _seed_status(orch, spec)
-    with pytest.raises(WorkloadProfileMismatch):
-        orch._submit_seed_supervised(
-            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
-        )
-
-    assert submits == []  # never reached a provider
-    assert slept == []  # and never backed off waiting for it to clear
-
-
-def test_unknown_prompt_pool_size_fails_fast_instead_of_retrying(orch, monkeypatch):
-    """A spec that states no prompt-pool size states none on every attempt.
-
-    Same shape as the profile mismatch above, and it has to be classified the same way. grpo/opd
-    price their horizon from a stated pool size and refuse to guess without one; this refresh asks
-    for a PREDICTED horizon (there are no completed steps to prorate from), which is exactly the
-    question the refusal exists to answer. Retrying re-asks it and gets the same refusal, so an
-    in-flight unbounded run would spend its entire retry budget on backoff sleeps before failing.
-    """
-    from flash.cost.spec import UnknownPromptPoolSize
-    from flash.providers import allocator
-    from flash.providers.base import PollResult
-    from flash.providers.runpod import PROVIDER as runpod_provider
-
-    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc())
-
-    submits = []
-
-    def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
-        submits.append(attempt)
-        return PollResult(True, metrics={"train_tokens": 4096})
-
-    monkeypatch.setattr(runpod_provider, "_submit_run", fake_rp)
-
-    import flash.cost.spec as cost_spec
-
-    def refuse(*_a, **_kw):
-        raise UnknownPromptPoolSize("cannot price grpo without a prompt-pool size")
-
-    monkeypatch.setattr(cost_spec, "estimate_for_spec", refuse)
-
-    slept = []
-    from flash.runner.supervise import lifecycle
-
-    monkeypatch.setattr(lifecycle.time, "sleep", lambda s: slept.append(s))
-
-    spec = _spec(max_retries=2)
-    _seed_status(orch, spec)
-    with pytest.raises(UnknownPromptPoolSize):
-        orch._submit_seed_supervised(
-            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
-        )
-
-    assert submits == []  # never reached a provider
-    assert slept == []  # and never burned the retry budget re-asking an unanswerable question
 
 
 def test_submit_supplies_the_worker_pip_when_the_author_declared_none() -> None:
