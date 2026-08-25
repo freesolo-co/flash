@@ -483,7 +483,9 @@ class _Engine:
         assert image_data.getpixel((0, 0)) == (10, 20, 30)
         self.prompt_inputs.append(prompt_input)
         yield types.SimpleNamespace(
-            outputs=[types.SimpleNamespace(text="ok", finish_reason="stop", token_ids=[7, 8])],
+            outputs=[
+                types.SimpleNamespace(index=0, text="ok", finish_reason="stop", token_ids=[7, 8])
+            ],
             prompt_token_ids=list(range(17)),
             num_cached_tokens=0,
         )

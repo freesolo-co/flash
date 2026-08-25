@@ -11,12 +11,10 @@ import inspect
 import json
 import os
 import shutil
-import sys
-import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any
 
 # Adapter-cache paths and token accounting live in engine_support.py, alongside
 # _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
@@ -37,24 +35,11 @@ from flash.serving.src.engine.support import (
     _adapter_source_cache_dir,
     _adapter_source_ident,
     _assert_source_cache_containment,
-    _cached_tokens_reported,
     _engine_is_dead,
     _load_adapters_for_base,
-    _num_cached_tokens,
-    _num_prompt_tokens,
     _safe_chat_template_kwargs,
-    _stream_text_delta,
-    _stream_usage_fields,
     enforce_expected_checkpoint,
 )
-
-
-class _StreamUsageContext(TypedDict):
-    start: float
-    request_id: str
-    engine_replica_id: str
-    checkpoint: str
-    thinking: bool
 
 
 class _LoraEngineImpl:
@@ -426,16 +411,14 @@ class _LoraEngineImpl:
     def _effective_chat_template_kwargs(
         self, payload: Any, thinking_default: bool | None = None
     ) -> dict[str, Any]:
-        """Sanitized caller chat_template_kwargs, with ``enable_thinking`` fixed per-adapter.
+        """sanitized template kwargs with one already-resolved authoritative thinking value.
 
-        ``enable_thinking`` is not a caller knob: always inject the adapter's trained value even if
-        the caller tried to supply an override. This is the parity fix: without it the template can
-        run in a mode other than the adapter's training mode, so a thinking=false adapter may emit a
-        reasoning preamble ("…</think>{json}") for callers that omit or override the flag.
+        immutable adapters always supply their persisted training mode. base-model requests may
+        supply the validated per-call override resolved by ``_thinking_default``. injecting that
+        resolved value here keeps prompt rendering, parser state, and accounting aligned.
 
-        ``thinking_default`` is the value RESOLVED alongside the LoRA weights (carried out of
-        ``_lora_request`` under its adapter lock), so prompt rendering stays bound to the same
-        record as the weights during same-id redeploys.
+        for an immutable adapter, ``thinking_default`` is resolved alongside the lora weights under
+        the adapter lock, so prompt rendering stays bound to the same record during redeploys.
         """
         ctk = _safe_chat_template_kwargs(getattr(payload, "chat_template_kwargs", None))
         if not isinstance(thinking_default, bool):
@@ -642,91 +625,15 @@ class _LoraEngineImpl:
         expected_checkpoint: str | None = None,
         generation_id: str | None = None,
     ) -> dict[str, Any]:
-        from vllm import SamplingParams
-        from vllm.sampling_params import RequestOutputKind
+        from flash.serving.src.engine.generation import generate
 
-        from flash.serving.src.io.schemas import GenerateRequest
-
-        payload = GenerateRequest.model_validate(payload_dict)
-        # Modal may route here to a container that never saw the registration -> adopt the forwarded
-        # record (revive=False, so it can't resurrect an id just undeployed here). Carry the resolved
-        # record so the prompt's thinking default binds to the SAME record the weights came from.
-        lora_request, record = await self._lora_request(payload.adapter_id, record_dict)
-        lora_request_attestation = self._lora_request_attestation(record, lora_request)
-        active_checkpoint = self._enforce_expected_checkpoint(record, expected_checkpoint)
-        thinking_default = self._thinking_default(record, payload)
-        structured_outputs, reasoning_ended, reasoning_parser_kwargs = (
-            self._structured_outputs_state(payload, record, thinking_default)
+        return await generate(
+            self,
+            payload_dict,
+            record_dict,
+            expected_checkpoint,
+            generation_id,
         )
-        # FINAL_ONLY: the non-streaming caller only wants the completed text, so tell vLLM to emit a
-        # single terminal RequestOutput instead of one cumulative object per decoded token. Saves N
-        # Python-object allocations + detokenizations per request on the hot path.
-        sampling_params = SamplingParams(
-            temperature=payload.temperature,
-            max_tokens=payload.max_tokens,
-            top_p=payload.top_p,
-            output_kind=RequestOutputKind.FINAL_ONLY,
-            structured_outputs=structured_outputs,
-            stop=payload.stop,
-        )
-        request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
-        start = time.time()
-        final_output = None
-        prompt_input = await self._prepare_prompt_input(payload, thinking_default)
-        try:
-            async for out in self.engine.generate(
-                prompt_input,
-                sampling_params,
-                request_id,
-                lora_request=lora_request,
-                reasoning_ended=reasoning_ended,
-                reasoning_parser_kwargs=reasoning_parser_kwargs,
-            ):
-                final_output = out
-        except Exception:
-            # A dead EngineCore raises here (EngineDeadError). Recycle this container immediately so
-            # the NEXT request lands on a fresh engine instead of looping 500s on a corpse (the
-            # background liveness monitor is the backstop; this makes the common path instant).
-            self._self_heal_if_dead("generate")
-            raise
-        finally:
-            self._close_prompt_images(prompt_input)
-        if final_output is None:
-            raise RuntimeError("vLLM returned no output")
-        output = final_output.outputs[0]
-        finish_reason = getattr(output, "finish_reason", None)
-        if finish_reason is None:
-            raise RuntimeError("vLLM generation ended without a finish reason")
-        completion_token_ids = list(getattr(output, "token_ids", []) or [])
-        prompt_token_ids = list(getattr(final_output, "prompt_token_ids", []) or [])
-        prompt_tokens = _num_prompt_tokens(final_output)
-        return {
-            "ok": True,
-            "adapter_id": payload.adapter_id,
-            **(
-                {"lora_request_adapter": lora_request_attestation}
-                if lora_request_attestation is not None
-                else {}
-            ),
-            "text": output.text,
-            "finish_reason": finish_reason,
-            "token_ids": completion_token_ids,
-            "prompt_token_ids": prompt_token_ids,
-            "completion_token_ids": completion_token_ids,
-            **({"reasoning_tokens": 0} if not thinking_default else {}),
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": len(completion_token_ids),
-            # Prefix-cached prompt tokens (served from the KV cache, prefill skipped). With
-            # prefix caching ON this is non-zero whenever a prompt shares a prefix with an
-            # earlier one; the backend bills these at a discount. 0 on a build that omits it.
-            "cached_tokens": _num_cached_tokens(final_output),
-            "cached_tokens_reported": _cached_tokens_reported(final_output),
-            "inference_time_seconds": time.time() - start,
-            "request_id": request_id,
-            "engine_replica_id": self._replica_identifier(),
-            "checkpoint": active_checkpoint,
-            "thinking": thinking_default,
-        }
 
     async def _stream_generate(
         self,
@@ -735,138 +642,22 @@ class _LoraEngineImpl:
         expected_checkpoint: str | None = None,
         generation_id: str | None = None,
     ):
-        from vllm import SamplingParams
-        from vllm.sampling_params import RequestOutputKind
+        from flash.serving.src.engine.generation import stream_generate
 
-        from flash.serving.src.io.schemas import GenerateRequest
-
-        payload = GenerateRequest.model_validate(payload_dict)
-        lora_request, record = await self._lora_request(payload.adapter_id, record_dict)
-        # the ready event carries the resolved adapter identity to the router before response headers
-        # are sent, so a mismatched immutable adapter fails before any token is emitted.
-        lora_request_attestation = self._lora_request_attestation(record, lora_request)
-        active_checkpoint = self._enforce_expected_checkpoint(record, expected_checkpoint)
-        # resolve structured outputs and advance vllm before the ready event so validation failures
-        # remain clean responses instead of surfacing after streaming has started.
-        thinking_default = self._thinking_default(record, payload)
-        structured_outputs, reasoning_ended, reasoning_parser_kwargs = (
-            self._structured_outputs_state(payload, record, thinking_default)
+        stream = stream_generate(
+            self,
+            payload_dict,
+            record_dict,
+            expected_checkpoint,
+            generation_id,
         )
-        sampling_params = SamplingParams(
-            temperature=payload.temperature,
-            max_tokens=payload.max_tokens,
-            top_p=payload.top_p,
-            output_kind=RequestOutputKind.DELTA,
-            structured_outputs=structured_outputs,
-            stop=payload.stop,
-        )
-        request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
-        start = time.time()
-        prompt_input = await self._prepare_prompt_input(payload, thinking_default)
-        output_stream = None
         try:
-            try:
-                output_stream = self.engine.generate(
-                    prompt_input,
-                    sampling_params,
-                    request_id,
-                    lora_request=lora_request,
-                    reasoning_ended=reasoning_ended,
-                    reasoning_parser_kwargs=reasoning_parser_kwargs,
-                )
-                first_output = await anext(output_stream)
-            except StopAsyncIteration as exc:
-                raise RuntimeError("vLLM returned no output") from exc
-            except Exception:
-                self._self_heal_if_dead("stream_generate")
-                raise
-
-            first_token_ids = list(getattr(first_output.outputs[0], "token_ids", []) or [])
-            completion_token_ids: list[int] = []
-            usage_context: _StreamUsageContext = {
-                "start": start,
-                "request_id": request_id,
-                "engine_replica_id": self._replica_identifier(),
-                "checkpoint": active_checkpoint,
-                "thinking": thinking_default,
-            }
-
-            def usage_fields(request_output: Any) -> dict[str, Any]:
-                return _stream_usage_fields(request_output, completion_token_ids, **usage_context)
-
-            # ``thinking`` rides the ready event because it must be known before the first delta.
-            # usage rides it too because vllm has already produced its first output, and a client may
-            # disconnect before the first text delta reaches the front door.
-            yield {
-                "type": "ready",
-                "thinking": thinking_default,
-                **(
-                    {"lora_request_adapter": lora_request_attestation}
-                    if lora_request_attestation is not None
-                    else {}
-                ),
-                **_stream_usage_fields(first_output, first_token_ids, **usage_context),
-            }
-            final_output = None
-            previous_text = ""
-            out = first_output
-            try:
-                while True:
-                    final_output = out
-                    output = out.outputs[0]
-                    text = output.text or ""
-                    token_ids = list(getattr(output, "token_ids", []) or [])
-                    if token_ids:
-                        # _stream_generate pins delta output, so each chunk is new tokens appended
-                        # without inspecting contents; test_serve_structured_outputs.py pins the
-                        # sampling-param output kind that enforces this contract.
-                        completion_token_ids.extend(token_ids)
-                    delta = ""
-                    if text:
-                        delta, previous_text = _stream_text_delta(text, previous_text)
-                    yield {
-                        "type": "delta",
-                        "text": delta,
-                        **usage_fields(out),
-                    }
-                    try:
-                        out = await anext(output_stream)
-                    except StopAsyncIteration:
-                        break
-            except Exception:
-                self._self_heal_if_dead("stream_generate")
-                raise
-            if final_output is None:
-                raise RuntimeError("vLLM returned no output")
-            output = final_output.outputs[0]
-            yield {
-                "type": "final",
-                "ok": True,
-                "adapter_id": payload.adapter_id,
-                "finish_reason": getattr(output, "finish_reason", None),
-                **usage_fields(final_output),
-                # see generate(): the rendered thinking mode, which the streamed text alone
-                # cannot reveal.
-                "thinking": thinking_default,
-            }
+            async for event in stream:
+                yield event
         finally:
-            try:
-                if output_stream is not None:
-                    close = getattr(output_stream, "aclose", None)
-                    if close is not None:
-                        active_exception = sys.exc_info()[0] is not None
-                        try:
-                            result = close()
-                            if inspect.isawaitable(result):
-                                await result
-                        # only swallow ordinary close errors while already unwinding;
-                        # control-flow exceptions (CancelledError, KeyboardInterrupt,
-                        # SystemExit) must always propagate rather than be masked here.
-                        except Exception:
-                            if not active_exception:
-                                raise
-            finally:
-                self._close_prompt_images(prompt_input)
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
 
     async def _unregister(
         self,

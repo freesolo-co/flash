@@ -100,6 +100,12 @@ class _LoRARequest:
         self.lora_path = path
 
 
+class _Logprob:
+    def __init__(self, value: float, token: str) -> None:
+        self.logprob = value
+        self.decoded_token = token
+
+
 class _SamplingParams:
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
@@ -237,13 +243,17 @@ def _output(
     prompt_tokens: int = 3,
     cached_tokens: Any = 0,
     finish_reason: str | None = "stop",
+    index: int = 0,
+    logprobs: Any = None,
 ):
     return SimpleNamespace(
         outputs=[
             SimpleNamespace(
+                index=index,
                 text=text,
                 token_ids=token_ids,
                 finish_reason=finish_reason,
+                logprobs=logprobs,
             )
         ],
         prompt_token_ids=list(range(prompt_tokens)),
@@ -581,6 +591,37 @@ def test_adapterless_structured_generation_binds_default_thinking_false() -> Non
     asyncio.run(runtime.close())
 
 
+def test_packaged_engine_threads_top_logprobs_through_buffered_and_streaming() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    candidates = {2: _Logprob(-1.0, "b"), 1: _Logprob(-0.1, "a")}
+    engine.responses.append([_output("a", [1], logprobs=[candidates])])
+
+    result = asyncio.run(
+        runtime.generate(GenerationRequest(prompt="hello", logprobs=True, top_logprobs=1))
+    )
+    assert result.choices[0].logprobs is not None
+    assert [record["token"] for record in result.choices[0].logprobs[0]["top_logprobs"]] == ["b"]
+
+    engine.responses.append([_output("a", [1], logprobs=[candidates])])
+
+    async def collect():
+        return [
+            event
+            async for event in runtime.stream(
+                GenerationRequest(prompt="hello", logprobs=True, top_logprobs=0)
+            )
+        ]
+
+    events = asyncio.run(collect())
+    delta = next(event for event in events if isinstance(event, StreamDelta))
+    assert delta.logprobs is not None
+    assert delta.logprobs[0]["top_logprobs"] == []
+    asyncio.run(runtime.close())
+
+
 def test_stream_trusts_pinned_delta_output_and_counts_chunks() -> None:
     runtime = VllmLoraRuntime(EngineConfig(model="model"))
     asyncio.run(runtime.start())
@@ -589,7 +630,7 @@ def test_stream_trusts_pinned_delta_output_and_counts_chunks() -> None:
     # no delta reports a cache count, so the finished event must report cache state as unreported.
     engine.responses.append(
         [
-            _output("he", [1], prompt_tokens=4, cached_tokens=None),
+            _output("he", [1], prompt_tokens=4, cached_tokens=None, finish_reason=None),
             _output("llo", [2, 3], prompt_tokens=4, cached_tokens=None, finish_reason=None),
             _output("!", [4], prompt_tokens=4, cached_tokens=None),
         ]
@@ -616,7 +657,12 @@ def _delta_without_prompt_metadata(text: str, token_ids: list[int], finish_reaso
     """a delta carrying no prompt or cache metadata, as vllm emits after the first one."""
     return SimpleNamespace(
         outputs=[
-            SimpleNamespace(text=text, token_ids=token_ids, finish_reason=finish_reason),
+            SimpleNamespace(
+                index=0,
+                text=text,
+                token_ids=token_ids,
+                finish_reason=finish_reason,
+            ),
         ],
     )
 
