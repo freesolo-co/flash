@@ -97,7 +97,9 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
 
         def iter_lines(self):
             yield 'data: {"choices":[{"delta":{"content":"held"}}]}'
+            yield ""
             yield "data: [DONE]"
+            yield ""
 
     class _PoolLimitedClient:
         def __init__(self, **kwargs):

@@ -11,6 +11,8 @@ and re-exported by `deploy`, which has no other use for them.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 _TAG_CLOSE = "</think>"
 _TAG_OPEN = "<think>"
 
@@ -171,19 +173,19 @@ def _delimiter_may_complete(text: str, reasoning: str) -> bool:
     return _TAG_CLOSE.startswith(stripped[len(body) :].strip())
 
 
-def _strip_retained_close(text: str, reasoning: str, start: int = 0) -> tuple[str | None, int]:
+def _strip_retained_close(
+    text: str,
+    reasoning: str,
+    start: int = 0,
+    *,
+    find_delimiter: Callable[[str, int], int] = _find_delimiter,
+) -> tuple[str | None, int]:
     """Drop a retained sampled ``</think>`` from the head of the post-reasoning content.
 
     Return ``None`` while a split delimiter may still be arriving. Resume from ``start`` to avoid
     rescanning the growing buffer; end-of-stream distinguishes a delayed answer from the tag itself.
     """
-    # resolved through `flash.serve.deploy` rather than called directly: the streaming tests
-    # measure buffer rescans by patching `deploy._find_delimiter`, and this is the call site
-    # that walks the closing buffer. A direct call would bypass the instrumentation and report
-    # zero scans, which no growth assertion can distinguish from a linear scan.
-    from flash.serve import deploy as _deploy
-
-    close = _deploy._find_delimiter(text, start)
+    close = find_delimiter(text, start)
     if close >= 0:
         end = _retained_delimiter_end(text, close, reasoning)
         if end is not None:

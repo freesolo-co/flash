@@ -225,8 +225,8 @@ class FakePool:
         *,
         expected_checkpoint: str | None = None,
     ):
-        del base_model, payload, record, expected_checkpoint
-        yield {"type": "ready", "checkpoint": ""}
+        del base_model, payload, expected_checkpoint
+        yield attest(record, {"type": "ready", "checkpoint": ""})
         yield {"type": "final", "prompt_tokens": 1, "completion_tokens": 1}
 
 
@@ -1397,7 +1397,7 @@ def test_chat_completion_stream_emits_provenance_headers(setup) -> None:
 
     async def _stream(base_model, payload, record, *, expected_checkpoint=None):
         del base_model, payload, expected_checkpoint
-        yield {"type": "ready", "checkpoint": record.checkpoint}
+        yield attest(record, {"type": "ready", "checkpoint": record.checkpoint})
         yield {"type": "final", "prompt_tokens": 1, "completion_tokens": 1}
 
     pool.stream_generate = _stream
@@ -1474,8 +1474,11 @@ def test_chat_completion_stream_replay_path_reports_revision_checkpoint(setup) -
     checkpoint = f"{RUN_ID}/step-20"
 
     async def _stream_without_ready(base_model, payload, record, *, expected_checkpoint=None):
-        del base_model, payload, record, expected_checkpoint
-        yield {"type": "final", "prompt_tokens": 1, "completion_tokens": 1}
+        del base_model, payload, expected_checkpoint
+        yield attest(
+            record,
+            {"type": "final", "prompt_tokens": 1, "completion_tokens": 1},
+        )
 
     pool.stream_generate = _stream_without_ready
     with client.stream(

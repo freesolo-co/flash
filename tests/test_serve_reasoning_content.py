@@ -17,8 +17,10 @@ from flash.client.http import ClientError
 
 
 def _sse(*deltas: dict) -> list[str]:
-    lines = [f"data: {json.dumps({'choices': [{'delta': d}]})}" for d in deltas]
-    lines.append("data: [DONE]")
+    lines: list[str] = []
+    for delta in deltas:
+        lines.extend([f"data: {json.dumps({'choices': [{'delta': delta}]})}", ""])
+    lines.extend(["data: [DONE]", ""])
     return lines
 
 
@@ -430,13 +432,44 @@ def test_a_non_thinking_stream_yields_each_delta_as_it_arrives():
 def test_an_engine_error_raises_after_yielding_partial_content():
     lines = [
         f"data: {json.dumps({'choices': [{'delta': {'content': 'partial'}}]})}",
+        "",
         f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'error'}], 'error': {'message': 'engine stream failed', 'type': 'engine_error', 'code': 500}})}",
-        "data: [DONE]",
+        "",
     ]
     stream = deploy._openai_stream_content(iter(lines), thinking=False)
 
     assert next(stream) == "partial"
     with pytest.raises(ClientError, match="engine stream failed"):
+        next(stream)
+
+
+@pytest.mark.parametrize(
+    ("tail", "message"),
+    [
+        (
+            [
+                f"data: {json.dumps({'error': {'message': 'engine stream failed'}})}",
+                "",
+            ],
+            "engine stream failed",
+        ),
+        (["data: {", ""], "invalid openai sse json"),
+        ([], r"terminal \[DONE\]"),
+    ],
+    ids=["engine-error", "malformed-sse", "premature-eof"],
+)
+def test_a_reasoning_block_closes_before_stream_errors(tail: list[str], message: str) -> None:
+    lines = [
+        f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': 'why'}}]})}",
+        "",
+        *tail,
+    ]
+    stream = deploy._openai_stream_content(iter(lines), thinking=True)
+
+    assert next(stream) == "<think>"
+    assert next(stream) == "why"
+    assert next(stream) == "</think>"
+    with pytest.raises(ClientError, match=message):
         next(stream)
 
 

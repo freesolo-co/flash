@@ -23,6 +23,7 @@ from flash.serve.deploy import (
     undeploy_adapter,
 )
 from flash.serve.deploy import chat as serve_chat
+from flash.serve.deploy import chat_sse as serve_chat_sse
 from flash.serve.deploy import chat_stream as serve_chat_stream
 from flash.serve.export import export_adapter
 from flash.server.platform import db
@@ -75,6 +76,7 @@ __all__ = [
     "recover_runs",
     "run_server",
     "serve_chat",
+    "serve_chat_sse",
     "serve_chat_stream",
     "start_deployment_job",
     "submit_job",

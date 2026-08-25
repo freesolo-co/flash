@@ -6,11 +6,17 @@ to keep that module under the file-size limit.
 
 from __future__ import annotations
 
-import json
-import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
+from flash._internal.openai_sse import (
+    DeltaEvent,
+    ErrorEvent,
+    OpenAISSEError,
+    iter_openai_sse_events,
+    sse_data_is_terminal,
+)
 from flash.client.http import ClientError
+from flash.serve._chat_transport import OpenAIStreamResponse
 from flash.serve.thinking import (
     _TAG_CLOSE,
     _TAG_OPEN,
@@ -20,51 +26,17 @@ from flash.serve.thinking import (
     _is_terminal_reasoning_repeat,
     _strip_retained_close,
 )
+from flash.serve.thinking import (
+    _find_delimiter as _default_find_delimiter,
+)
 
 
-def _deploy():
-    """The deploy module, imported lazily because it re-exports this one.
-
-    Everything reached through it is a seam the serving tests replace with
-    `monkeypatch.setattr(deploy, ...)` -- the key header, both http clients, the base url, and
-    `_find_delimiter` (patched to count buffer scans) -- so a `from ... import` would capture the
-    original before the patch is applied. The import is deferred to call time rather than done at
-    module level so that importing this module on its own does not re-enter `deploy` mid-body.
-    """
-    from flash.serve import deploy
-
-    return deploy
-
-
-def _internal_key_header():
-    return _deploy()._internal_key_header()
-
-
-def _stream_http_client():
-    return _deploy()._stream_http_client()
-
-
-def serving_openai_base_url():
-    return _deploy().serving_openai_base_url()
-
-
-def _find_delimiter(*args, **kwargs):
-    return _deploy()._find_delimiter(*args, **kwargs)
-
-
-def _raise_for_stream_error(chunk: dict) -> None:
-    choices = chunk.get("choices") or []
-    failed = any(
-        isinstance(choice, dict) and choice.get("finish_reason") == "error" for choice in choices
-    )
-    error = chunk.get("error")
-    if not failed and not isinstance(error, dict):
-        return
-    message = error.get("message") if isinstance(error, dict) else None
-    raise ClientError(str(message or "chat stream ended with an engine error"))
-
-
-def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[str]:
+def _openai_stream_content(
+    lines: Iterator[str],
+    *,
+    thinking: bool,
+    find_delimiter: Callable[[str, int], int] = _default_find_delimiter,
+) -> Iterator[str]:
     # reasoning arrives on its own delta field (see _balanced_thinking_content). re-open the block
     # around it and close it at the answer boundary, so the streamed text matches the balanced
     # string the non-streaming path returns.
@@ -89,25 +61,22 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
     held_text = ""
     # how far into `held_text` the delimiter search has already looked.
     held_scanned = 0
-    for line in lines:
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        data = line.removeprefix("data:").strip()
-        if data == "[DONE]":
-            break
-        if not data:
-            continue
-        chunk = json.loads(data)
-        _raise_for_stream_error(chunk)
-        for choice in chunk.get("choices") or []:
-            delta = (choice.get("delta") or {}) if isinstance(choice, dict) else {}
-            raw_reasoning = delta.get("reasoning_content")
+    try:
+        events = iter_openai_sse_events(f"{line}\n" for line in lines)
+        for event in events:
+            if isinstance(event, ErrorEvent):
+                if reasoning_open:
+                    reasoning_open = False
+                    yield _TAG_CLOSE
+                raise ClientError(event.message)
+            if not isinstance(event, DeltaEvent):
+                continue
+            raw_reasoning = event.reasoning_content
             # `thinking` gates this as it gates `_balanced_thinking_content`, and for the same
             # reason: this path also backs the public chat route. tested by type, not falsiness --
             # a model that closed its reasoning immediately streams `reasoning_content: ""`, which
             # still needs a pair.
-            if thinking and isinstance(raw_reasoning, str):
+            if thinking and raw_reasoning is not None:
                 if held:
                     # the backend splits after all, so whatever arrived first was answer text and
                     # not an unopened block. release it untouched, delta by delta as it arrived.
@@ -136,9 +105,8 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                 if raw_reasoning:
                     reasoning_text += raw_reasoning
                     yield raw_reasoning
-            content = delta.get("content") or ""
+            content = event.content or ""
             if content:
-                content = str(content)
                 if reasoning_open:
                     reasoning_open = False
                     reasoning_done = True
@@ -149,7 +117,10 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                 if closing is not None:
                     closing += content
                     answer, closing_scanned = _strip_retained_close(
-                        closing, reasoning_text, closing_scanned
+                        closing,
+                        reasoning_text,
+                        closing_scanned,
+                        find_delimiter=find_delimiter,
                     )
                     if answer is None:
                         # the tag may still be completing across deltas. keep buffering.
@@ -164,7 +135,7 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                     # resume where the last scan stopped: rescanning the whole buffer per delta is
                     # quadratic in the completion length, and token-sized deltas make that the
                     # common case. only the last few characters can still be a partial tag.
-                    close = _find_delimiter(held_text, held_scanned)
+                    close = find_delimiter(held_text, held_scanned)
                     if close < 0:
                         held_scanned = max(0, len(held_text) - (len(_TAG_CLOSE) - 1))
                         continue
@@ -185,6 +156,11 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                     )
                     continue
                 yield content
+    except OpenAISSEError as exc:
+        if reasoning_open:
+            reasoning_open = False
+            yield _TAG_CLOSE
+        raise ClientError(str(exc)) from exc
     if reasoning_open:
         # generation stopped inside the block (a length cap, usually). still close it: an
         # unbalanced opener is the same defect as the unbalanced closer, mirrored.
@@ -200,79 +176,85 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
         yield from held
 
 
-def chat_stream(
-    run_id: str,
-    messages: list[dict],
-    temperature: float = 0.0,
-    max_tokens: int = 512,
-    thinking: bool = False,
-    stop: list[str] | None = None,
+def _next_sse_frame_end(buffered: bytearray, *, final: bool = False) -> int | None:
+    line_start = 0
+    index = 0
+    while index < len(buffered):
+        value = buffered[index]
+        if value == 10:
+            line_end = index + 1
+        elif value == 13:
+            if index + 1 == len(buffered) and not final:
+                return None
+            line_end = index + (2 if buffered[index + 1 : index + 2] == b"\n" else 1)
+        else:
+            index += 1
+            continue
+        if index == line_start:
+            return line_end
+        line_start = line_end
+        index = line_end
+    return None
+
+
+def _complete_sse_frames(chunks: Iterator[bytes]) -> Iterator[bytes]:
+    """yield only complete sse frames while preserving every upstream byte."""
+
+    buffered = bytearray()
+    first_frame = True
+    for chunk in chunks:
+        buffered.extend(chunk)
+        while end := _next_sse_frame_end(buffered):
+            frame = bytes(buffered[:end])
+            del buffered[:end]
+            terminal_data = frame.removeprefix(b"\xef\xbb\xbf") if first_frame else frame
+            first_frame = False
+            terminal = sse_data_is_terminal(terminal_data)
+            yield frame
+            if terminal:
+                return
+    while end := _next_sse_frame_end(buffered, final=True):
+        frame = bytes(buffered[:end])
+        del buffered[:end]
+        terminal_data = frame.removeprefix(b"\xef\xbb\xbf") if first_frame else frame
+        first_frame = False
+        terminal = sse_data_is_terminal(terminal_data)
+        yield frame
+        if terminal:
+            return
+    if buffered:
+        raise ClientError("chat stream ended with an incomplete server-sent event frame")
+    raise ClientError("chat stream ended before the terminal [DONE] event")
+
+
+def _streamed_body(
+    upstream: OpenAIStreamResponse,
+    *,
+    thinking: bool,
+    find_delimiter: Callable[[str, int], int],
 ) -> Iterator[str]:
-    """Yield text deltas from the freesolo OpenAI-compatible streaming endpoint.
+    """decode one validated response while retaining its lifetime through exhaustion."""
 
-    ``stop`` carries the run's own stop sequences, as in ``chat``.
-
-    Not a generator function: the upstream request is sent and its status validated here, at
-    call time. The caller hands the returned iterator to a ``StreamingResponse``, and a
-    generator would defer the request (and ``raise_for_status``) until iteration, after the
-    200 and headers had been flushed, so an upstream 4xx/5xx could only surface as a
-    truncated success.
-    """
-    base = serving_openai_base_url()
-    body = {
-        "model": run_id,
-        "messages": messages,
-        "max_tokens": int(max_tokens),
-        "temperature": float(temperature),
-        "chat_template_kwargs": {"enable_thinking": bool(thinking)},
-        "stream": True,
-    }
-    if stop:
-        body["stop"] = [str(value) for value in stop]
-    ctx = _stream_http_client().stream(
-        "POST",
-        f"{base}/chat/completions",
-        json=body,
-        headers=_internal_key_header(),
-        timeout=30 * 60.0,
-    )
-    resp = ctx.__enter__()
-    try:
-        resp.raise_for_status()
-    except BaseException:
-        ctx.__exit__(*sys.exc_info())
-        raise
-    stream = _streamed_body(ctx, resp, thinking=thinking)
-    # advance to the priming yield before handing the generator out: close() on a generator
-    # that was never started skips its finally block, and that block is what releases the
-    # upstream connection when the caller closes without iterating.
-    next(stream)
-    return stream
-
-
-def _streamed_body(ctx, resp, *, thinking: bool) -> Iterator[str]:
-    """Decode the already-validated streaming response, closing it on every exit path.
-
-    ``ctx`` is the entered ``client.stream`` context manager; exiting it closes ``resp``.
-    the leading empty yield is a priming value consumed by ``chat_stream`` so the generator
-    is running before it is handed out (see there).
-    """
+    response = upstream.response
     try:
         yield ""
-        if "application/json" in resp.headers.get("content-type", ""):
-            # client.stream() leaves body unread; must call resp.read() before .json().
-            resp.read()
-            payload = resp.json()
+        content_type = response.headers.get("content-type", "")
+        media_type = content_type.partition(";")[0].strip().lower()
+        if media_type == "application/json":
+            # client.stream() leaves body unread; must call read before json.
+            response.read()
+            payload = response.json()
             content = _balanced_thinking_content(
                 (payload.get("choices") or [{}])[0].get("message") or {}, thinking=thinking
             )
             if content:
                 yield str(content)
             return
-        yield from _openai_stream_content(resp.iter_lines(), thinking=thinking)
+        yield from _openai_stream_content(
+            response.iter_lines(),
+            thinking=thinking,
+            find_delimiter=find_delimiter,
+        )
     finally:
-        # runs on normal exhaustion, on a mid-stream error, and on close() from a client
-        # disconnect. a mid-stream error keeps propagating, which makes the server abort the
-        # chunked response, so the client sees a truncated-transfer error instead of a clean
-        # eof it would mistake for a finished answer.
-        ctx.__exit__(None, None, None)
+        # runs on normal exhaustion, a midstream error, or downstream disconnect.
+        upstream.close()
