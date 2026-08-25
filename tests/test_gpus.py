@@ -157,7 +157,7 @@ def test_cheapest_gpu_policy(monkeypatch):
         gpus.cheapest_gpu(4096, gpu_count=4)
     # static rates cover every RunPod-provisionable class
     rates = pricing.static_rates()
-    assert set(rates) == {name for name, info in gpus.GPU_INFO.items() if info.enum_member}
+    assert set(rates) == {name for name, info in gpus.GPU_INFO.items() if info.runpod_gpu_type_id}
 
 
 def test_sft_provisional_count_credits_only_the_batch_bound_width():

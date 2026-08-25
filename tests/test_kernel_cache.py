@@ -27,6 +27,17 @@ class _FakeTorch:
     compiler = types.SimpleNamespace(load_cache_artifacts=lambda blob: None)
 
 
+def _assert_isolated_backend_paths():
+    paths = {
+        var: os.path.realpath(os.environ[var]) for var in kernel_warmup.KERNEL_CACHE_ENV_SUBDIRS
+    }
+    assert all(not path.startswith("/opt/flash/kernelcache") for path in paths.values())
+    for left, left_subdir in kernel_warmup.KERNEL_CACHE_ENV_SUBDIRS.items():
+        for right, right_subdir in kernel_warmup.KERNEL_CACHE_ENV_SUBDIRS.items():
+            if left_subdir != right_subdir:
+                assert paths[left] != paths[right]
+
+
 def test_kernel_warmup_out_overrides_existing_cache_env(monkeypatch, tmp_path):
     monkeypatch.setenv("TRITON_CACHE_DIR", "/old/triton")
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", "/old/inductor")
@@ -69,6 +80,7 @@ def test_worker_skips_baked_cache_when_arch_mismatches(monkeypatch, tmp_path):
 
     assert kernel_warmup.load_mega_cache() is False
     assert loaded["called"] is False
+    _assert_isolated_backend_paths()
 
 
 def test_worker_skips_baked_cache_when_arch_undetermined(monkeypatch, tmp_path):
@@ -104,3 +116,4 @@ def test_worker_skips_baked_cache_when_arch_undetermined(monkeypatch, tmp_path):
 
     assert kernel_warmup.load_mega_cache() is False
     assert loaded["called"] is False
+    _assert_isolated_backend_paths()

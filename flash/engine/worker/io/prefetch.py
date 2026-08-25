@@ -161,6 +161,39 @@ class _SnapshotWeightsMissing(RuntimeError):
     """A forced re-download still produced a snapshot without model weights."""
 
 
+class _SnapshotOutsideSharedCache(RuntimeError):
+    """Hugging Face resolved a shared-cache download outside the mounted cache root."""
+
+
+def _snapshot_under_cache(snapshot_dir: str, cache_dir: str) -> bool:
+    try:
+        snapshot = os.path.realpath(snapshot_dir)
+        root = os.path.realpath(cache_dir)
+        return os.path.commonpath((snapshot, root)) == root
+    except (OSError, ValueError):
+        return False
+
+
+def _snapshot_cache_evidence(snapshot_dir: str | None, cache_dir: str | None) -> dict:
+    evidence = {
+        "shared_mount": bool(cache_dir),
+        "snapshot_preexisting": False,
+        "snapshot_under_mount": False,
+        "weights_present": False,
+        "snapshot_relative": None,
+    }
+    if not snapshot_dir or not cache_dir:
+        return evidence
+    under_mount = _snapshot_under_cache(snapshot_dir, cache_dir)
+    evidence["snapshot_under_mount"] = under_mount
+    if under_mount:
+        evidence["weights_present"] = _snapshot_has_weights(snapshot_dir)
+        evidence["snapshot_relative"] = os.path.relpath(
+            os.path.realpath(snapshot_dir), os.path.realpath(cache_dir)
+        )
+    return evidence
+
+
 def _snapshot_has_weights(snapshot_dir: str) -> bool:
     """True when a downloaded snapshot contains resolvable model weights (all indexed shards)."""
     weight_names = ("model", "pytorch_model", "tf_model", "flax_model")
@@ -198,92 +231,107 @@ def _snapshot_has_weights(snapshot_dir: str) -> bool:
 
 
 def prefetch_model(model_id: str, revision: str = "") -> float:
-    """Pull base-model weights into the HF cache up front; return seconds spent.
-
-    When the shared weight-cache volume is attached, downloads onto the mount and symlinks into
-    the ephemeral cache so trainer/vLLM get a cache hit without re-downloading (#252).
-    """
+    """Pull base-model weights up front and emit verified shared-cache evidence."""
     from huggingface_hub import snapshot_download
 
     shared_hub = _hf()._shared_weight_cache_dir()
+    ignore = ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
+    evidence = _snapshot_cache_evidence(None, shared_hub)
     t0 = time.time()
-    # Cold downloads can take tens of GB; liveness_heartbeat keeps the worker alive during the fetch.
     from flash.engine.worker.io.heartbeat import liveness_heartbeat
+
+    def local_probe() -> None:
+        if not shared_hub:
+            return
+        try:
+            path = snapshot_download(
+                repo_id=model_id,
+                cache_dir=shared_hub,
+                ignore_patterns=ignore,
+                local_files_only=True,
+                **model_revision_kwargs(revision),
+            )
+        except Exception:
+            return
+        probed = _snapshot_cache_evidence(path, shared_hub)
+        if probed["snapshot_under_mount"] and probed["weights_present"]:
+            evidence.update(probed)
+            evidence["snapshot_preexisting"] = True
+
+    def download() -> None:
+        _hf()._require_hf_deadline_allowance()
+        local_path = snapshot_download(
+            repo_id=model_id,
+            cache_dir=shared_hub,
+            ignore_patterns=ignore,
+            **model_revision_kwargs(revision),
+        )
+        if not isinstance(local_path, str) or not os.path.isdir(local_path):
+            if shared_hub:
+                raise _SnapshotWeightsMissing(
+                    f"model snapshot for {model_id} did not resolve to a shared-cache directory"
+                )
+            return
+        if shared_hub and not _snapshot_under_cache(local_path, shared_hub):
+            raise _SnapshotOutsideSharedCache(
+                f"model snapshot for {model_id} resolved outside the mounted shared cache"
+            )
+        if not _snapshot_has_weights(local_path):
+            print(f"prefetch_model: cached snapshot for {model_id} has no weights; re-downloading")
+            local_path = snapshot_download(
+                repo_id=model_id,
+                cache_dir=shared_hub,
+                ignore_patterns=ignore,
+                force_download=True,
+                **model_revision_kwargs(revision),
+            )
+            if not isinstance(local_path, str) or not os.path.isdir(local_path):
+                raise _SnapshotWeightsMissing(
+                    f"model snapshot for {model_id} did not resolve after forced download"
+                )
+            if shared_hub and not _snapshot_under_cache(local_path, shared_hub):
+                raise _SnapshotOutsideSharedCache(
+                    f"model snapshot for {model_id} resolved outside the mounted shared cache"
+                )
+            if not _snapshot_has_weights(local_path):
+                raise _SnapshotWeightsMissing(
+                    f"model snapshot for {model_id} has no weights after forced download"
+                )
+        preexisting = evidence["snapshot_preexisting"]
+        evidence.update(_snapshot_cache_evidence(local_path, shared_hub))
+        evidence["snapshot_preexisting"] = preexisting
+        if shared_hub and not (evidence["snapshot_under_mount"] and evidence["weights_present"]):
+            raise _SnapshotOutsideSharedCache(
+                f"model snapshot for {model_id} lacks verified shared-cache weights"
+            )
+        if shared_hub:
+            _link_base_model_into_ephemeral_cache(model_id, shared_hub)
 
     with liveness_heartbeat(
         "model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub)
     ):
-
-        def _download() -> None:
-            _hf()._require_hf_deadline_allowance()
-            local_path = snapshot_download(
-                repo_id=model_id,
-                cache_dir=shared_hub,
-                ignore_patterns=["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
-                **model_revision_kwargs(revision),
-            )
-            # a shared-volume snapshot can be stale/partial (e.g. a serving preload that only
-            # warmed configs): snapshot_download returns it as a cache hit without weights, and
-            # the trainer then fails offline with "no pytorch_model.bin or model.safetensors".
-            # validate weights exist before trusting the hit; one forced re-download repairs it.
-            if (
-                isinstance(local_path, str)
-                and os.path.isdir(local_path)
-                and not _snapshot_has_weights(local_path)
-            ):
-                print(
-                    f"prefetch_model: cached snapshot for {model_id} has no weight files; re-downloading"
-                )
-                local_path = snapshot_download(
-                    repo_id=model_id,
-                    cache_dir=shared_hub,
-                    ignore_patterns=[
-                        "*.pth",
-                        "*.gguf",
-                        "original/*",
-                        "*.onnx",
-                        "*.msgpack",
-                        "*.h5",
-                    ],
-                    force_download=True,
-                    **model_revision_kwargs(revision),
-                )
-                if (
-                    isinstance(local_path, str)
-                    and os.path.isdir(local_path)
-                    and not _snapshot_has_weights(local_path)
-                ):
-                    raise _SnapshotWeightsMissing(
-                        f"model snapshot for {model_id} has no weight files even after a forced "
-                        "re-download; the repo layout is unsupported or the cache volume is corrupt"
-                    )
-            if shared_hub:
-                _link_base_model_into_ephemeral_cache(model_id, shared_hub)
-
+        local_probe()
         if revision:
             try:
-                _download()
-            except Exception as e:
-                if _prefetch_error_is_retriable(e):
-                    detail = sanitize_diagnostic(e, limit=500)
-                    raise RetriableInfraError(f"pinned model prefetch failed: {detail}") from e
+                download()
+            except Exception as exc:
+                if _prefetch_error_is_retriable(exc):
+                    detail = sanitize_diagnostic(exc, limit=500)
+                    raise RetriableInfraError(f"pinned model prefetch failed: {detail}") from exc
                 raise
         else:
             try:
-                _download()
-            except _SnapshotWeightsMissing:
-                # a FORCED re-download still had no weights — swallowing it would let the trainer
-                # fail later with a far more confusing offline error. propagate.
+                download()
+            except (_SnapshotWeightsMissing, _SnapshotOutsideSharedCache):
                 raise
-            except Exception as e:
-                # transient fetch errors stay non-fatal on the default revision: the trainer's own
-                # cache lookup may still succeed (warm cache), and prefetch is best-effort there.
-                print("prefetch_model warn:", e)
+            except Exception as exc:
+                print("prefetch_model warn:", exc)
     secs = round(time.time() - t0, 1)
     _hf()._w.heartbeat(
         "model_prefetched",
         model=model_id,
         download_seconds=secs,
+        cache=evidence,
         hf_transfer=os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
         gpu=_hf().gpu_diagnostics(),
     )

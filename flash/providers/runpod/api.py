@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import time
 import urllib.error
+import urllib.request
 from typing import Any
 
 from flash._internal.logging import get_logger
@@ -15,7 +16,16 @@ from flash.providers.runpod import auth as _keys
 logger = get_logger(__name__)
 
 REST_BASE = "https://rest.runpod.io/v1"
+CATALOG_BASE = "https://api.runpod.io/v2/catalog"
 QUEUE_BASE = "https://api.runpod.ai/v2"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 
 def key_fingerprint(key: str) -> str:
@@ -455,3 +465,33 @@ def _billing_rows(out) -> list[dict]:
         rows = out.get("data") or out.get("endpoints") or out.get("billing")
         return rows if isinstance(rows, list) else []
     return []
+
+
+# persistent Pod training API
+from flash.providers.runpod.pod_api import (  # noqa: E402,F401
+    RunpodCapacityError,
+    RunpodDataCenter,
+    RunpodMutationAmbiguous,
+    RunpodNetworkVolume,
+    RunpodPod,
+    RunpodRequestError,
+    RunpodSecret,
+    _graphql_error_status,
+    _mutation_once,
+    _parse_data_centers,
+    _parse_pod,
+    _parse_secret_account,
+    _pod_rows,
+    create_network_volume_for_fingerprint,
+    create_pod_for_fingerprint,
+    create_secret_for_fingerprint,
+    delete_pod_for_fingerprint,
+    delete_secret_for_fingerprint,
+    get_pod_for_fingerprint,
+    grow_network_volumes_for_fingerprint,
+    list_network_volumes_for_fingerprint,
+    list_pods_by_key,
+    list_pods_for_key,
+    list_secrets_for_fingerprint,
+    list_storage_datacenters_for_fingerprint,
+)

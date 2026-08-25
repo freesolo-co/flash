@@ -826,6 +826,7 @@ from flash.runner.reconciliation import (  # noqa: E402,F401
     _compare_and_fail_remote,
     _compare_and_prepare_resubmit,
     _compare_and_remove_cleanup_remote,
+    _compare_and_replace_remote,
     _drain_cleanup_remotes,
     _expected_remote_matches,
     _preserve_cleanup_remote,

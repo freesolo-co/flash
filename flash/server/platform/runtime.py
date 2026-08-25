@@ -322,9 +322,16 @@ def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | No
     providers = {
         str(name)
         for name in (getattr(status, "submitted_instance_providers", None) or [])
-        if name in {"vast", "lambda"}
+        if name in {"runpod", "vast", "lambda"}
     }
     for provider in sorted(providers):
+        runpod_provider = None
+        remaining = []
+        if provider == "runpod":
+            from flash.providers import get_provider
+
+            runpod_provider = get_provider("runpod")
+            remaining = runpod_provider.run_instances_remaining(spec.run_id)
         metrics = _completed_attempt_metrics(
             spec,
             provider=provider,
@@ -333,6 +340,12 @@ def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | No
             deadline_at=deadline_at,
         )
         if metrics is not None:
+            if runpod_provider is not None and remaining:
+                runpod_provider.gc(spec)
+                if runpod_provider.run_instances_remaining(spec.run_id):
+                    raise RuntimeError(
+                        "runpod handleless completion cleanup could not be confirmed"
+                    )
             return metrics
     return None
 

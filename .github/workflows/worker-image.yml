@@ -46,10 +46,11 @@ on:
       - .github/workflows/worker-image.yml
       - flash/**
       - pyproject.toml
-      # The baked rp_handler is generated from _train_body at build time (docker/make_rp_handler.py),
-      # so handler changes (e.g. the weight-cache preload branch) MUST rebuild the image. flash/**
-      # covers the handler source (endpoints.py); the generator lives outside flash/, so watch it too.
-      - docker/make_rp_handler.py
+      # The persistent Pod launcher and shared capsule are copied or generated at build time, so a
+      # change to either input must rebuild the worker image even though both live outside flash/**.
+      - docker/runpod_pod_launcher.py
+      - docker/bake_pod_entry.py
+      - docker/build_instance_capsule.py
       # The fp_cache/fp_base labels are computed by this script at build time, so a change to the
       # fingerprint logic must rebuild :cu128 to re-stamp them (else auto-rebake never reclassifies).
       - docker/kernel_fingerprint.py

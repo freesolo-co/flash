@@ -1,6 +1,6 @@
 # Cheap per-arch RE-LAYER: graft the EXISTING baked mega-cache onto a freshly rebuilt :cu128 base,
 # with NO GPU. Used by auto-rebake.yml when fp_cache is unchanged (the cache is still valid) but the
-# base moved (fp_base changed) -- e.g. an FA2/FA3/causal-conv1d/rp_handler bump. The valid cache
+# base moved (fp_base changed) -- e.g. an FA2/FA3/causal-conv1d/Pod-launcher bump. The valid cache
 # already lives inside the currently-published per-arch tag, so OLDCACHE IS the cache store; we just
 # re-stack it on the new base. This is what makes a base-only change free (vs a paid GPU re-warm).
 #
@@ -13,7 +13,10 @@ FROM ${BASE}
 
 # Match Dockerfile.worker / Dockerfile.kernelcache so the layer is self-contained even on an older base.
 ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
-    TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor
+    TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor \
+    FLASHINFER_CUBIN_DIR=/opt/flash/kernelcache/flashinfer_cubin \
+    FLASHINFER_CACHE_DIR=/opt/flash/kernelcache/flashinfer \
+    FLASHINFER_WORKSPACE_BASE=/opt/flash/kernelcache/flashinfer
 
 # Pull the warmed cache straight out of the old per-arch image -- no GPU, no external cache store.
 COPY --from=oldcache /opt/flash/kernelcache /opt/flash/kernelcache

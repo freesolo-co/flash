@@ -7,7 +7,7 @@ def static_rates() -> dict[str, float]:
     """Friendly GPU name -> static $/hr snapshot."""
     from flash.providers.base import static_rates_for
 
-    return static_rates_for("enum_member")
+    return static_rates_for("runpod_gpu_type_id")
 
 
 def hourly_rate(gpu_name: str) -> float:

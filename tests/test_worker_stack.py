@@ -1116,7 +1116,7 @@ def test_venv_sanity_block_uses_no_cuda_gated_probe():
     root = pathlib.Path(__file__).resolve().parent.parent
     dockerfile = (root / "Dockerfile.worker").read_text()
     venv_sanity = dockerfile[dockerfile.index("# Sanity: the verl venv must be able to LAUNCH") :]
-    venv_sanity = venv_sanity[: venv_sanity.index("# RunPod Serverless worker entrypoint")]
+    venv_sanity = venv_sanity[: venv_sanity.index("# persistent RunPod Pods")]
 
     for probe in ("is_flash_linear_attention_available", "is_causal_conv1d_available"):
         assert f"assert {probe}()" not in venv_sanity, (
@@ -2215,7 +2215,12 @@ def test_worker_image_rebuilds_when_the_cudart_extractor_changes():
     root = pathlib.Path(__file__).resolve().parent.parent
     workflow = (root / ".github" / "workflows" / "worker-image.yml").read_text()
 
-    for script in ("docker/extract_cudart_fix.py", "docker/make_rp_handler.py"):
+    for script in (
+        "docker/extract_cudart_fix.py",
+        "docker/runpod_pod_launcher.py",
+        "docker/bake_pod_entry.py",
+        "docker/build_instance_capsule.py",
+    ):
         assert f"- {script}" in workflow, (
             f"worker-image.yml does not rebuild on {script}; a change to a build-time generator "
             "would ship an image built from the old one."

@@ -137,7 +137,7 @@ def widenable_gpu_names(
     pool = (
         gpu_names
         if gpu_names is not None
-        else tuple(g.name for g in GPU_CLASSES if g.enum_member and g.validated)
+        else tuple(g.name for g in GPU_CLASSES if g.runpod_gpu_type_id and g.validated)
     )
     return tuple(
         name

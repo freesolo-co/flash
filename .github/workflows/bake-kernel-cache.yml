@@ -78,53 +78,25 @@ jobs:
     # 47min is the slowest run on record (the rest sit at 12-23min); 120 absorbs a slow provider
     # allocation without letting a hung bake hold the runner for the 6-hour default.
     #
-    # This bounds the RUNNER, and only indirectly the spend. The rented pod is released by the
-    # `finally` in docker/bake_kernel_cache.py, so the pod outlives the timeout in exactly the case
-    # the timeout exists for: if the controller is wedged inside a blocking call, GitHub kills it
-    # and that `finally` may never complete, leaving a billed pod with nothing left to terminate it.
-    # Closing that needs a server-side pod lifetime or an out-of-band reaper -- a change to the bake
-    # tooling rather than to this workflow, so it is deliberately NOT bundled here. Until then, read
-    # this cap as "the runner stops waiting", not "the bill stops".
+    # This bounds the runner. The controller durably publishes every Pod lifecycle phase under the
+    # stable workflow identity below, so a retried job reconciles and terminates an interrupted prior
+    # Pod and payload secret before it permits another paid create.
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - {
-              sm: sm80,
-              arch: "8.0",
-              allowed_cuda: "",
-            }
-          - {
-              sm: sm86,
-              arch: "8.6",
-              allowed_cuda: "",
-            }
+          - { sm: sm80, arch: "8.0", allowed_cuda: "" }
+          - { sm: sm86, arch: "8.6", allowed_cuda: "" }
           # the controller walks ordered same-sm secure-cloud gpu types from its per-sm map.
           # preferred datacenter cards stay first, but one empty sku cannot strand this architecture
           # on a stale image and send ordinary starts through jit.
-          - {
-              sm: sm89,
-              arch: "8.9",
-              allowed_cuda: "",
-            }
-          - {
-              sm: sm90,
-              arch: "9.0",
-              allowed_cuda: "",
-            }
+          - { sm: sm89, arch: "8.9", allowed_cuda: "" }
+          - { sm: sm90, arch: "9.0", allowed_cuda: "" }
           # blackwell needs cuda-13 hosts to jit its ptx (matches min_cuda_for in the provider).
-          - {
-              sm: sm120,
-              arch: "12.0",
-              allowed_cuda: "13.0",
-            }
+          - { sm: sm120, arch: "12.0", allowed_cuda: "13.0" }
           # datacenter blackwell is distinct from sm120. b200 is the only validated sm100 type.
-          - {
-              sm: sm100,
-              arch: "10.0",
-              allowed_cuda: "13.0",
-            }
+          - { sm: sm100, arch: "10.0", allowed_cuda: "13.0" }
     steps:
       # Gate FIRST (no checkout needed) so skipped arches do no crane / checkout / build work.
       - name: Should bake ${{ matrix.sm }}?
@@ -222,6 +194,7 @@ jobs:
         run: |
           uv run python docker/bake_kernel_cache.py \
             --arch "${{ matrix.arch }}" --sm "${{ matrix.sm }}" \
+            --workflow-id "$GITHUB_RUN_ID-${{ matrix.sm }}" \
             --allowed-cuda "${{ matrix.allowed_cuda }}" \
             --image "$BASE_IMAGE" \
             --out build/kernel_cache

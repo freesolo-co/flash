@@ -235,13 +235,10 @@ def load_mega_cache() -> bool:
     meta_file = os.path.join(DEFAULT_CACHE_DIR, MEGA_CACHE_META_FILENAME)
 
     def _reject(reason: str) -> bool:
-        # Repoint triton/inductor off baked trees so JIT compiles fresh; wrong-arch entries would collide.
+        # repoint every backend off baked trees so wrong-arch artifacts cannot be reused.
         print(f"[kernel-cache] {reason} -> first-run JIT fallback")
         scratch = os.path.join(tempfile.gettempdir(), "flash-kernelcache-jit")
-        for sub, var in (("triton", "TRITON_CACHE_DIR"), ("inductor", "TORCHINDUCTOR_CACHE_DIR")):
-            d = os.path.join(scratch, sub)
-            os.makedirs(d, exist_ok=True)
-            os.environ[var] = d
+        _point_backends_at(scratch)
         return False
 
     if not os.path.isfile(cache_file):

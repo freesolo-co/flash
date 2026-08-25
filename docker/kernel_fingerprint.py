@@ -15,8 +15,8 @@ Two fingerprints, because "out of date" has two flavors with very different cost
     itself (it decides which kernels get compiled).
 
   * fp_base = hash of everything else baked into :cu128 that is NOT in the cache (FA2 wheel spec
-    AND their sha256 digests, causal-conv1d, the non-kernel pip stack, and the baked rp_handler =
-    endpoints.py + make_rp_handler.py). Changing one of these leaves the cache valid but means the
+    AND their sha256 digests, causal-conv1d, the non-kernel pip stack, and the baked Pod launcher
+    plus shared instance-capsule builder). Changing one of these leaves the cache valid but means the
     per-arch tag is sitting on an old base, so it just needs a cheap re-layer (no GPU). fp_base folds
     fp_cache in, so it always moves when fp_cache does.
 
@@ -37,7 +37,8 @@ correctness, and the alternatives over-fire the paid GPU bake):
     at runtime, so a change there only risks a stale (mostly sm90) cache that cold-JITs. Hashing all
     of perf / bake_pod_entry would re-warm 5 GPUs on every unrelated edit.
 
-stdlib only, no flash/torch import, so it runs under a bare python3 in CI (no uv sync needed).
+stdlib only in the driver. capsule hashing imports the repository's stdlib-only runtime_capsule
+package in an isolated child process; neither path imports torch or needs uv sync.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ import ast
 import hashlib
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -72,6 +74,23 @@ def _search(pattern: str, text: str, what: str, *, flags: int = 0) -> str:
 
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _instance_capsule_sha256(root: Path) -> str:
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from flash.runtime_capsule import build_capsule
+archive, _manifest = build_capsule("instance-bootstrap", root=Path(sys.argv[1]))
+sys.stdout.buffer.write(archive)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(root)],
+        check=True,
+        capture_output=True,
+    )
+    return hashlib.sha256(completed.stdout).hexdigest()
 
 
 def parse_baked_per_sm_arches(text: str, *, source: str = "_lifecycle/worker.py") -> list[str]:
@@ -232,10 +251,24 @@ def collect_inputs(
         # whole-Dockerfile hash catches ANY base change the parsed fields miss (apt/ENV/CMD/cache-dir);
         # it lives in fp_base, so such a change triggers only the FREE re-layer, never a paid re-warm.
         "dockerfile_sha256": _sha256_file(root / "Dockerfile.worker"),
-        "endpoints_sha256": _sha256_file(
-            root / "flash" / "providers" / "runpod" / "serverless" / "endpoints.py"
+        "runpod_pod_launcher_sha256": _sha256_file(root / "docker" / "runpod_pod_launcher.py"),
+        "bake_pod_entry_sha256": _sha256_file(root / "docker" / "bake_pod_entry.py"),
+        "build_instance_capsule_sha256": _sha256_file(
+            root / "docker" / "build_instance_capsule.py"
         ),
-        "make_rp_handler_sha256": _sha256_file(root / "docker" / "make_rp_handler.py"),
+        "instance_capsule_sha256": _instance_capsule_sha256(root),
+        "runtime_capsule_init_sha256": _sha256_file(
+            root / "flash" / "runtime_capsule" / "__init__.py"
+        ),
+        "runtime_capsule_build_sha256": _sha256_file(
+            root / "flash" / "runtime_capsule" / "build.py"
+        ),
+        "runtime_capsule_manifest_sha256": _sha256_file(
+            root / "flash" / "runtime_capsule" / "manifest.py"
+        ),
+        "runtime_capsule_profiles_sha256": _sha256_file(
+            root / "flash" / "runtime_capsule" / "profiles.py"
+        ),
         "source_snapshot_sha256": _sha256_file(root / "flash" / "source_snapshot.py"),
     }
     return cache_inputs, base_inputs_partial

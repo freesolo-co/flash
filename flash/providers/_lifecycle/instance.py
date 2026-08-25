@@ -193,6 +193,7 @@ def build_payload(
     models: list | None = None,
     source_snapshot: dict | None = None,
     deadline_at: float | None = None,
+    preserve_runpod_volume: bool = False,
 ) -> dict:
     """The bootstrap's input — field-compatible with the RunPod ``_train_body`` payload, plus the
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
@@ -206,14 +207,14 @@ def build_payload(
     from flash.source_snapshot import parse_descriptor
 
     canonical_seed = require_matching_seed(spec, seed)
-    # strip the runpod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.
-    env = strip_runpod_volume_env(
-        build_worker_env(
-            spec,
-            canonical_seed,
-            runtime_secrets=runtime_secrets,
-        )
+    env = build_worker_env(
+        spec,
+        canonical_seed,
+        runtime_secrets=runtime_secrets,
     )
+    # lambda and vast do not mount /runpod-volume. the RunPod Pod path preserves the redirect.
+    if not preserve_runpod_volume:
+        env = strip_runpod_volume_env(env)
     if cache_host_mount and not env.get("FLASH_WEIGHT_CACHE_DIR") and not env.get("HF_HOME"):
         env["FLASH_WEIGHT_CACHE_DIR"] = f"{CACHE_HF_HOME}/hub"
     absolute_deadline = require_deadline_at(deadline_at)

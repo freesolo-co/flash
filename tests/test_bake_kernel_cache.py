@@ -1,17 +1,12 @@
-"""unit tests for docker/bake_kernel_cache.py's pod-create gpu walk.
-
-the bake rents a gpu of one arch, and runpod picks the host at create time. a scarce type is regularly
-rejected for capacity even when another same-sm type is free. these tests pin the split: a capacity
-rejection must walk to the next type, and a real error must still fail immediately.
-
-docker/ is not a package, so import the module by path (same style as test_kernel_fingerprint.py).
-"""
+"""Contracts for the strict RunPod Pod kernel-cache bake controller."""
 
 from __future__ import annotations
 
 import importlib.util
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,145 +16,244 @@ BAKE_SCRIPT = ROOT / "docker" / "bake_kernel_cache.py"
 
 def _load_bake():
     spec = importlib.util.spec_from_file_location("bake_kernel_cache", BAKE_SCRIPT)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 bake = _load_bake()
-
-CAPACITY_MSG = (
-    "This machine does not have the resources to deploy your pod. Please try a different machine"
-)
-
-
-class _FakeRunpod:
-    """create_pod that raises the queued errors, then returns a pod."""
-
-    def __init__(self, errors):
-        self.errors = list(errors)
-        self.calls = []
-
-    def create_pod(self, **kwargs):
-        self.calls.append(kwargs)
-        if self.errors:
-            raise self.errors.pop(0)
-        return {"id": "pod-1"}
-
-
-@pytest.fixture
-def no_sleep(monkeypatch):
-    """backoff sleeps are real seconds; record them instead of waiting."""
-    slept = []
-    monkeypatch.setattr(bake.time, "sleep", slept.append)
-    return slept
-
-
-@pytest.mark.parametrize(
-    "msg",
-    [
-        CAPACITY_MSG,
-        "There are no longer any instances available with the requested specifications.",
-        "There are no longer any instances available with enough disk space.",
-        "no instances available",
-    ],
-)
-def test_capacity_shapes_are_retryable(msg):
-    assert bake._is_capacity_error(RuntimeError(msg))
-
-
-@pytest.mark.parametrize(
-    "msg",
-    [
-        "Unauthorized",
-        "invalid api key",
-        "Your account has exceeded its spend limit",
-        "manifest unknown: image not found",
-    ],
-)
-def test_real_errors_are_not_capacity(msg):
-    assert not bake._is_capacity_error(RuntimeError(msg))
-
-
-def test_walks_to_next_gpu_type_on_capacity_rejection(no_sleep):
-    rp = _FakeRunpod([RuntimeError(CAPACITY_MSG), RuntimeError(CAPACITY_MSG)])
-    pod, selected = bake._create_pod_with_gpu_walk(
-        rp,
-        gpu_type_ids=("NVIDIA RTX A6000", "NVIDIA A40", "NVIDIA RTX A5000"),
-        name="bake",
-    )
-    assert pod == {"id": "pod-1"}
-    assert selected == "NVIDIA RTX A5000"
-    assert len(rp.calls) == 3
-    assert [c["gpu_type_id"] for c in rp.calls] == [
-        "NVIDIA RTX A6000",
-        "NVIDIA A40",
-        "NVIDIA RTX A5000",
-    ]
-    assert no_sleep == []
-
-
-def test_retries_the_full_walk_after_backoff(no_sleep):
-    rp = _FakeRunpod([RuntimeError(CAPACITY_MSG)] * 3)
-    pod, selected = bake._create_pod_with_gpu_walk(
-        rp,
-        gpu_type_ids=("NVIDIA H200", "NVIDIA H100 80GB HBM3"),
-        rounds=2,
-        backoff_s=(1,),
-    )
-    assert pod == {"id": "pod-1"}
-    assert selected == "NVIDIA H100 80GB HBM3"
-    assert [c["gpu_type_id"] for c in rp.calls] == [
-        "NVIDIA H200",
-        "NVIDIA H100 80GB HBM3",
-        "NVIDIA H200",
-        "NVIDIA H100 80GB HBM3",
-    ]
-    assert 1 <= no_sleep[0] <= 1.25
-
-
-def test_gives_up_after_the_round_budget(no_sleep):
-    gpu_type_ids = ("NVIDIA RTX A6000", "NVIDIA A40")
-    rp = _FakeRunpod([RuntimeError(CAPACITY_MSG)] * (bake.CREATE_ROUNDS * len(gpu_type_ids)))
-    with pytest.raises(RuntimeError, match="no capacity across gpu walk"):
-        bake._create_pod_with_gpu_walk(rp, gpu_type_ids=gpu_type_ids)
-    assert len(rp.calls) == bake.CREATE_ROUNDS * len(gpu_type_ids)
-    assert len(no_sleep) == bake.CREATE_ROUNDS - 1
-
-
-def test_non_capacity_error_fails_fast(no_sleep):
-    rp = _FakeRunpod([RuntimeError("Unauthorized")])
-    with pytest.raises(RuntimeError, match="Unauthorized"):
-        bake._create_pod_with_gpu_walk(rp, gpu_type_ids=("NVIDIA H200", "NVIDIA H100 80GB HBM3"))
-    assert len(rp.calls) == 1
-    assert no_sleep == []
-
-
-def test_backoff_grows_and_is_bounded(no_sleep):
-    rp = _FakeRunpod([RuntimeError(CAPACITY_MSG)] * 3)
-    bake._create_pod_with_gpu_walk(rp, gpu_type_ids=("NVIDIA L40S",), rounds=4, backoff_s=(1, 2))
-    # jitter adds up to 25%, and the last entry repeats for every further round.
-    assert 1 <= no_sleep[0] <= 1.25
-    assert 2 <= no_sleep[1] <= 2.5
-    assert 2 <= no_sleep[2] <= 2.5
 
 
 def test_default_gpu_walk_covers_every_baked_arch():
     from flash.providers._lifecycle.worker import BAKED_PER_SM_ARCHES
 
     assert set(bake.GPU_WALK_BY_SM) == BAKED_PER_SM_ARCHES
-    assert all(len(types) == len(set(types)) for types in bake.GPU_WALK_BY_SM.values())
-    assert all(types for types in bake.GPU_WALK_BY_SM.values())
-    all_types = [gpu_type for types in bake.GPU_WALK_BY_SM.values() for gpu_type in types]
+    all_types = [gpu for choices in bake.GPU_WALK_BY_SM.values() for gpu in choices]
+    assert all(bake.GPU_WALK_BY_SM.values())
     assert len(all_types) == len(set(all_types))
 
 
-def test_bake_goes_through_the_gpu_walk_helper():
-    """the warm step runs this script, and its create must not bypass the gpu walk."""
-    wf = (ROOT / ".github" / "workflows" / "bake-kernel-cache.yml").read_text()
-    assert "uv run python docker/bake_kernel_cache.py" in wf
-    assert "--gpu-type-id" not in wf
-    body = BAKE_SCRIPT.read_text().split("def main()")[1]
-    assert "_create_pod_with_gpu_walk(" in body
-    assert "runpod.create_pod(" not in body
+def test_capacity_only_walk_uses_shared_phase_aware_launcher(monkeypatch):
+    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod import auth as runpod_auth
+    from flash.providers.runpod import pods
+
+    attempts = []
+    monkeypatch.setattr(runpod_auth, "ordered_keys", lambda: ["key-a", "key-b"])
+
+    def callback(value):
+        return None
+
+    def guard():
+        return None
+
+    def launch(spec, seed, **kwargs):
+        attempts.append(
+            (
+                kwargs["fingerprint"],
+                kwargs["gpu_type_id_override"],
+                kwargs["on_handle"],
+                kwargs["cleanup_guard"],
+            )
+        )
+        if len(attempts) < 3:
+            raise runpod_api.RunpodCapacityError("full")
+        return SimpleNamespace(pod_id="pod-1", key_fingerprint=kwargs["fingerprint"])
+
+    monkeypatch.setattr(pods, "launch_payload_pod", launch)
+    handle, selected = bake._launch_with_gpu_walk(
+        SimpleNamespace(seed=0),
+        "{}",
+        image="image@sha256:abc",
+        gpu_type_ids=("gpu-a", "gpu-b"),
+        allowed_cuda=("13.0",),
+        deadline_at=time.time() + 60,
+        on_handle=callback,
+        cleanup_guard=guard,
+        rounds=1,
+    )
+    assert handle.pod_id == "pod-1"
+    assert selected == "gpu-a"
+    assert attempts == [
+        (runpod_api.key_fingerprint("key-a"), "gpu-a", callback, guard),
+        (runpod_api.key_fingerprint("key-a"), "gpu-b", callback, guard),
+        (runpod_api.key_fingerprint("key-b"), "gpu-a", callback, guard),
+    ]
+
+
+def test_non_capacity_failure_never_walks_to_another_gpu(monkeypatch):
+    from flash.providers.runpod import auth as runpod_auth
+    from flash.providers.runpod import pods
+
+    calls = []
+    monkeypatch.setattr(runpod_auth, "ordered_keys", lambda: ["key-a"])
+
+    def fail(*args, **kwargs):
+        calls.append(kwargs["gpu_type_id_override"])
+        raise RuntimeError("unauthorized")
+
+    monkeypatch.setattr(pods, "launch_payload_pod", fail)
+    with pytest.raises(RuntimeError, match="unauthorized"):
+        bake._launch_with_gpu_walk(
+            SimpleNamespace(seed=0),
+            "{}",
+            image="image",
+            gpu_type_ids=("gpu-a", "gpu-b"),
+            allowed_cuda=(),
+            deadline_at=time.time() + 60,
+            rounds=2,
+            backoff_s=(0,),
+        )
+    assert calls == ["gpu-a"]
+
+
+@pytest.mark.parametrize(
+    ("sm", "allowed", "expected"),
+    [
+        ("sm80", None, ["12.8"]),
+        ("sm86", None, ["12.8"]),
+        ("sm89", None, ["12.8"]),
+        ("sm90", None, ["12.8"]),
+        ("sm100", ("13.0",), ["13.0"]),
+        ("sm120", ("13.0",), ["13.0"]),
+    ],
+)
+def test_bake_launch_boundary_cuda_floor(monkeypatch, sm, allowed, expected):
+    from flash.providers.runpod import auth as runpod_auth
+    from flash.providers.runpod import pods
+    from flash.providers.runpod.pod_identity import RunpodPodHandle, payload_for_handle
+
+    monkeypatch.setattr(runpod_auth, "ordered_keys", lambda: ["key"])
+    observed = []
+
+    def launch(spec, seed, **kwargs):
+        observed.append(kwargs)
+        return SimpleNamespace(pod_id="pod-1", key_fingerprint=kwargs["fingerprint"])
+
+    monkeypatch.setattr(pods, "launch_payload_pod", launch)
+
+    def callback(value):
+        return None
+
+    def guard():
+        return None
+
+    bake._launch_with_gpu_walk(
+        SimpleNamespace(seed=0),
+        "{}",
+        image="image",
+        gpu_type_ids=(bake.GPU_WALK_BY_SM[sm][0],),
+        allowed_cuda=allowed,
+        deadline_at=time.time() + 60,
+        on_handle=callback,
+        cleanup_guard=guard,
+        rounds=1,
+    )
+    assert observed[0]["allowed_cuda_versions"] == allowed
+    assert observed[0]["on_handle"] is callback
+    assert observed[0]["cleanup_guard"] is guard
+    handle = RunpodPodHandle(
+        instance_id="label",
+        gpu="RTX 4090",
+        hourly_usd=0.0,
+        attempt=0,
+        started_ts=time.time(),
+        phase=pods.PRE_POD_CREATE,
+        label="label",
+        key_fingerprint="rpk-" + "0" * 64,
+        account_id="account",
+        payload_secret_id="secret",
+        payload_secret_name="FLASH_PAYLOAD_0123456789abcdef",
+        data_center_id=None,
+        network_volume_id=None,
+        container_disk_gb=60,
+        gpu_count=1,
+        image_name="image",
+        gpu_type_id_override=bake.GPU_WALK_BY_SM[sm][0],
+        allowed_cuda_versions=allowed,
+    )
+    assert payload_for_handle(handle)["allowedCudaVersions"] == expected
+
+
+def test_empty_allowed_cuda_means_no_override():
+    assert bake._allowed_cuda_override("") is None
+    assert bake._allowed_cuda_override("13.0") == ("13.0",)
+
+
+def test_bake_payload_is_opaque_secret_content_not_process_environment(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "ambient-secret")
+    payload = bake._launch_payload("owner/repo", "9.0", "request-secret")
+    assert '"mode":"kernel_bake"' in payload
+    assert '"hf_token":"request-secret"' in payload
+    assert "RUNPOD_API_KEY" not in payload
+
+
+def test_bake_recovery_retains_intent_when_cleanup_is_unconfirmed(monkeypatch):
+    from flash.providers.runpod import pods
+
+    pending = pods.RunpodPodHandle(
+        instance_id="label-0123456789abcdef-12345678",
+        gpu="RTX 4090",
+        hourly_usd=0.0,
+        attempt=0,
+        started_ts=time.time(),
+        phase=pods.POD_CREATE_PENDING,
+        label="label-0123456789abcdef-12345678",
+        key_fingerprint="rpk-" + "0" * 64,
+        account_id="account",
+        payload_secret_id="secret",
+        payload_secret_name="FLASH_PAYLOAD_0123456789abcdef",
+        data_center_id=None,
+        network_volume_id=None,
+        container_disk_gb=60,
+        gpu_count=1,
+    )
+    record = {
+        "owner": "bake-owner",
+        "run_id": "run-id",
+        "seed": 0,
+        "handle": pending.to_dict(),
+    }
+    published = []
+    cleared = []
+    store = SimpleNamespace(
+        owner="new-owner",
+        claim_expired=lambda: record,
+        renew=lambda: record,
+        publish_active=lambda *args: published.append(args),
+        clear=lambda: cleared.append(True),
+    )
+    exact = SimpleNamespace(to_dict=lambda: {**pending.to_dict(), "phase": pods.EXACT})
+    monkeypatch.setattr(pods, "resolve_pending_handle", lambda *args, **kwargs: exact)
+    monkeypatch.setattr(
+        pods,
+        "terminate_handle",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("secret still present")),
+    )
+    with pytest.raises(RuntimeError, match="secret still present"):
+        bake._recover_bake_intent(store, 60)
+    assert store.owner == "new-owner"
+    assert published
+    assert cleared == []
+
+
+def test_bake_workflow_passes_stable_run_identity_and_documents_recovery():
+    workflow = (ROOT / ".github" / "workflows" / "bake-kernel-cache.yml").read_text()
+    assert '--workflow-id "$GITHUB_RUN_ID-${{ matrix.sm }}"' in workflow
+    assert "retried job reconciles and terminates an interrupted prior" in workflow
+    assert "leaving a billed pod" not in workflow.lower()
+
+
+def test_bake_scripts_use_static_launcher_and_no_runpod_sdk():
+    controller = BAKE_SCRIPT.read_text()
+    launcher = (ROOT / "docker" / "runpod_pod_launcher.py").read_text()
+    dockerfile = (ROOT / "Dockerfile.worker").read_text()
+    intent_helper = (ROOT / "flash" / "providers" / "runpod" / "hf_intent.py").read_text()
+    assert "launch_payload_pod(" in controller
+    assert "import runpod" not in controller
+    assert "runpod.create_pod" not in controller
+    assert 'parsed.get("mode") == "kernel_bake"' in launcher
+    assert "docker/bake_pod_entry.py" in dockerfile
+    assert "serialized_payload" not in intent_helper
+    assert '"token"' not in intent_helper

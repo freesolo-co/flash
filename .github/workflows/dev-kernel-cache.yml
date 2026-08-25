@@ -12,7 +12,9 @@ on:
       - .github/workflows/bake-kernel-cache.yml
       - .github/workflows/dev-kernel-cache.yml
       - docker/kernel_fingerprint.py
-      - docker/make_rp_handler.py
+      - docker/runpod_pod_launcher.py
+      - docker/bake_pod_entry.py
+      - docker/build_instance_capsule.py
       - docker/extract_cudart_fix.py
       - flash/**
       - pyproject.toml

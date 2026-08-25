@@ -17,7 +17,7 @@ class GpuClass:
     """One managed GPU class with its provider identity/metadata."""
 
     name: str
-    enum_member: str | None  # runpod_flash GpuType member name; None -> not on RunPod
+    runpod_gpu_type_id: str | None  # RunPod REST gpuTypeId; None -> not on RunPod
     vram_gb: int
     short: str  # endpoint-name-safe token
     sm: str
@@ -35,7 +35,7 @@ class GpuClass:
 GPU_CLASSES: tuple[GpuClass, ...] = (
     GpuClass(
         "RTX 4090",
-        "NVIDIA_GEFORCE_RTX_4090",
+        "NVIDIA GeForce RTX 4090",
         24,
         "4090",
         "sm89",
@@ -45,7 +45,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     ),
     GpuClass(
         "RTX 5090",
-        "NVIDIA_GEFORCE_RTX_5090",
+        "NVIDIA GeForce RTX 5090",
         32,
         "5090",
         "sm120",
@@ -71,7 +71,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     ),
     GpuClass(
         "A100 PCIe",
-        "NVIDIA_A100_80GB_PCIe",
+        "NVIDIA A100 80GB PCIe",
         80,
         "a100pcie",
         "sm80",
@@ -81,7 +81,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     ),
     GpuClass(
         "A100 SXM",
-        "NVIDIA_A100_SXM4_80GB",
+        "NVIDIA A100-SXM4-80GB",
         80,
         "a100sxm",
         "sm80",
@@ -91,7 +91,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     ),
     GpuClass(
         "H100",
-        "NVIDIA_H100_80GB_HBM3",
+        "NVIDIA H100 80GB HBM3",
         80,
         "h100",
         "sm90",
@@ -106,7 +106,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     ),
     GpuClass(
         "H200",
-        "NVIDIA_H200",
+        "NVIDIA H200",
         141,
         "h200",
         "sm90",
@@ -115,7 +115,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     ),
     GpuClass(
         "RTX Pro 6000",
-        "NVIDIA_RTX_PRO_6000_BLACKWELL_SERVER_EDITION",
+        "NVIDIA RTX PRO 6000 Blackwell Server Edition",
         96,
         "pro6000",
         "sm120",
@@ -126,7 +126,7 @@ GPU_CLASSES: tuple[GpuClass, ...] = (
     # 180 GB usable (NVIDIA advertises 192 GB; size to the safe 180 per RunPod/Lambda listings).
     GpuClass(
         "B200",
-        "NVIDIA_B200",
+        "NVIDIA B200",
         180,
         "b200",
         "sm100",
@@ -270,7 +270,7 @@ def get_gpu_info(name: str) -> GpuClass:
 
 def gpu_classes_for(identity_attr: str) -> list[GpuClass]:
     """Managed GPU classes a provider can provision: those whose per-provider identity field is set
-    (``enum_member`` for RunPod, ``lambda_name`` for Lambda, ``vast_name`` for Vast). One catalog query
+    (``runpod_gpu_type_id`` for RunPod, ``lambda_name`` for Lambda, ``vast_name`` for Vast). One catalog query
     shared by every provider's ``gpu_classes()`` so the "which classes do I offer" rule can't drift."""
     return [g for g in GPU_INFO.values() if getattr(g, identity_attr)]
 
@@ -311,7 +311,7 @@ def providers_for(name: str) -> tuple[str, ...]:
     """Providers that can provision this GPU class."""
     info = get_gpu_info(name)
     out: list[str] = []
-    if info.enum_member:
+    if info.runpod_gpu_type_id:
         out.append("runpod")
     if info.lambda_name:
         out.append("lambda")
@@ -484,7 +484,7 @@ def authored_gpu_ceiling(gpu_type: str, gpu_count: int | None) -> int | None:
 def _eligible_gpu_infos(gpu_names: tuple[str, ...] | None = None) -> tuple[GpuClass, ...]:
     """Return the validated structural pool used by offline sizing."""
     if gpu_names is None:
-        return tuple(g for g in GPU_CLASSES if g.enum_member and g.validated)
+        return tuple(g for g in GPU_CLASSES if g.runpod_gpu_type_id and g.validated)
     names = set(gpu_names)
     return tuple(g for g in GPU_CLASSES if g.name in names and g.validated)
 

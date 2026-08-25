@@ -165,7 +165,7 @@ def test_gpu_classes_match_runpod_rows():
     from flash.providers.base import GPU_INFO
 
     rp = {g.name for g in get_provider("runpod").gpu_classes()}
-    assert rp == {g.name for g in GPU_INFO.values() if g.enum_member}
+    assert rp == {g.name for g in GPU_INFO.values() if g.runpod_gpu_type_id}
 
 
 def test_sweep_orphans_is_part_of_the_protocol():
@@ -187,7 +187,7 @@ def test_run_instances_remaining_is_optional_not_required_by_protocol():
 
     assert "run_instances_remaining" not in dir(Provider)  # not a required Protocol member
     assert hasattr(get_provider("vast"), "run_instances_remaining")  # Vast provides the capability
-    assert not hasattr(get_provider("runpod"), "run_instances_remaining")  # RunPod opts out
+    assert hasattr(get_provider("runpod"), "run_instances_remaining")  # Pods provide the capability
     assert isinstance(get_provider("runpod"), Provider)  # still a Provider despite opting out
 
 
@@ -301,37 +301,43 @@ def test_jobhandle_roundtrip_tags_provider():
         JobHandle.from_dict({"endpoint_id": "ep", "job_id": "j"})
 
 
+def _runpod_pod_handle():
+    from flash.providers.runpod.pods import EXACT, RunpodPodHandle
+
+    return RunpodPodHandle(
+        instance_id="pod123",
+        gpu="H100",
+        hourly_usd=3.29,
+        attempt=0,
+        started_ts=1.0,
+        phase=EXACT,
+        label="flash-test-s0-a0-0123456789abcdef-deadbeef",
+        key_fingerprint=_RUNPOD_FINGERPRINT,
+        account_id="account123",
+        payload_secret_id="secret123",
+        payload_secret_name="FLASH_PAYLOAD_0123456789abcdef",
+        data_center_id=None,
+        network_volume_id=None,
+        container_disk_gb=120,
+        gpu_count=1,
+    )
+
+
 def test_provider_cancel_destroy_dispatch(monkeypatch):
     from flash.providers import get_provider
     from flash.providers.base import JobHandle
-    from flash.providers.runpod import api as rp_api
+    from flash.providers.runpod import pods
 
-    cancelled, deleted = [], []
+    terminated = []
     monkeypatch.setattr(
-        rp_api,
-        "cancel_job",
-        lambda e, j, **_kw: cancelled.append((e, j)) or {"id": j, "status": "CANCELLED"},
+        pods,
+        "terminate_handle",
+        lambda handle, **kwargs: terminated.append(handle.instance_id),
     )
-    monkeypatch.setattr(
-        rp_api,
-        "delete_endpoint_for_fingerprint",
-        lambda e, _fingerprint: deleted.append(e) or True,
-    )
-    handle = JobHandle(
-        "runpod",
-        {
-            "endpoint_id": "ep",
-            "endpoint_name": "n",
-            "key_fingerprint": _RUNPOD_FINGERPRINT,
-            "job_id": "j",
-            "attempt": 0,
-            "started_ts": 1.0,
-        },
-    )
+    handle = JobHandle.from_dict(_runpod_pod_handle().to_dict())
     get_provider("runpod").cancel(handle)
     get_provider("runpod").destroy(handle)
-    assert cancelled == [("ep", "j")]
-    assert deleted == ["ep"]
+    assert terminated == ["pod123", "pod123"]
 
 
 def test_runpod_destroy_accepts_exact_owner_404_confirmation(monkeypatch):
@@ -339,32 +345,21 @@ def test_runpod_destroy_accepts_exact_owner_404_confirmation(monkeypatch):
     from flash.providers.base import JobHandle
     from flash.providers.runpod import api as rp_api
 
-    lookups = []
+    deleted = []
+    secrets = []
     monkeypatch.setattr(
         rp_api,
-        "delete_endpoint_for_fingerprint",
-        lambda endpoint_id, _fingerprint: False,
+        "delete_pod_for_fingerprint",
+        lambda pod_id, fingerprint, **kwargs: deleted.append((pod_id, fingerprint)),
     )
     monkeypatch.setattr(
         rp_api,
-        "endpoint_absent_for_fingerprint",
-        lambda endpoint_id, fingerprint: lookups.append((endpoint_id, fingerprint)) or True,
+        "delete_secret_for_fingerprint",
+        lambda fingerprint, secret_id, secret_name, **kwargs: secrets.append(secret_id),
     )
-    handle = JobHandle(
-        "runpod",
-        {
-            "endpoint_id": "ep-unconfirmed",
-            "endpoint_name": "n",
-            "key_fingerprint": _RUNPOD_FINGERPRINT,
-            "job_id": "j",
-            "attempt": 0,
-            "started_ts": 1.0,
-        },
-    )
-
-    get_provider("runpod").destroy(handle)
-
-    assert lookups == [("ep-unconfirmed", _RUNPOD_FINGERPRINT)]
+    get_provider("runpod").destroy(JobHandle.from_dict(_runpod_pod_handle().to_dict()))
+    assert deleted == [("pod123", _RUNPOD_FINGERPRINT)]
+    assert secrets == ["secret123"]
 
 
 def test_runpod_destroy_rejects_non_authoritative_absence_result(monkeypatch):
@@ -374,28 +369,13 @@ def test_runpod_destroy_rejects_non_authoritative_absence_result(monkeypatch):
 
     monkeypatch.setattr(
         rp_api,
-        "delete_endpoint_for_fingerprint",
-        lambda endpoint_id, _fingerprint: False,
+        "delete_pod_for_fingerprint",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            rp_api.RunpodApiError("Pod deletion is unconfirmed")
+        ),
     )
-    monkeypatch.setattr(
-        rp_api,
-        "endpoint_absent_for_fingerprint",
-        lambda endpoint_id, fingerprint: False,
-    )
-    handle = JobHandle(
-        "runpod",
-        {
-            "endpoint_id": "ep-unconfirmed",
-            "endpoint_name": "n",
-            "key_fingerprint": _RUNPOD_FINGERPRINT,
-            "job_id": "j",
-            "attempt": 0,
-            "started_ts": 1.0,
-        },
-    )
-
     with pytest.raises(rp_api.RunpodApiError, match="unconfirmed"):
-        get_provider("runpod").destroy(handle)
+        get_provider("runpod").destroy(JobHandle.from_dict(_runpod_pod_handle().to_dict()))
 
 
 @pytest.mark.parametrize(

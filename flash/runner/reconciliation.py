@@ -9,10 +9,10 @@ import flash.runner as runner
 from flash.core.spec import JobSpec
 from flash.runner import RunStatus
 
-# the provider-allocated identifier that names the billable resource itself, per provider handle
-# above: runpod carries `endpoint_id`, lambda and vast carry `instance_id`. a record holding one of
-# these still has something to delete even when the rest of it fails strict validation.
-_RESOURCE_ID_FIELDS = ("endpoint_id", "instance_id")
+# the provider-allocated identifier that names the billable resource itself. every managed
+# instance provider now carries `instance_id`, including a runpod pending label before its pod id
+# is known. a record holding it still has something to reconcile when strict validation fails.
+_RESOURCE_ID_FIELDS = ("instance_id",)
 
 
 def _remote_resource_identity(remote: object) -> tuple | None:
@@ -22,15 +22,19 @@ def _remote_resource_identity(remote: object) -> tuple | None:
     provider = remote.get("provider")
     try:
         if provider == "runpod":
-            from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+            from flash.providers.runpod.pods import RunpodPodHandle as RunpodJobHandle
 
             handle = RunpodJobHandle.from_dict(remote)
             return (
                 provider,
                 handle.attempt,
-                handle.endpoint_id,
-                handle.job_id,
+                handle.phase,
+                handle.instance_id,
+                handle.label,
                 handle.key_fingerprint,
+                handle.account_id,
+                handle.payload_secret_id,
+                handle.payload_secret_name,
             )
         if provider == "lambda":
             from flash.providers.lambda_.jobs.builders import LambdaJobHandle
@@ -86,6 +90,61 @@ def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
         status.updated_at = time.time()
         runner._save_status_unlocked(status)
         report_status = status
+    if report_status is not None:
+        runner._report_status(report_status)
+    return True
+
+
+def _compare_and_replace_remote(
+    run_id: str,
+    expected_remote: dict,
+    replacement_remote: dict,
+) -> bool:
+    """Replace one pending RunPod identity with its exact Pod identity atomically."""
+    try:
+        from flash.providers.runpod.pod_identity import PHASE_ORDER
+        from flash.providers.runpod.pods import RunpodPodHandle
+
+        expected = RunpodPodHandle.from_dict(expected_remote)
+        replacement = RunpodPodHandle.from_dict(replacement_remote)
+    except (TypeError, ValueError):
+        return False
+    stable_expected = (
+        expected.attempt,
+        expected.key_fingerprint,
+        expected.account_id,
+        expected.payload_secret_name,
+        expected.gpu,
+        expected.gpu_count,
+    )
+    stable_replacement = (
+        replacement.attempt,
+        replacement.key_fingerprint,
+        replacement.account_id,
+        replacement.payload_secret_name,
+        replacement.gpu,
+        replacement.gpu_count,
+    )
+    if (
+        not expected.pending
+        or PHASE_ORDER[replacement.phase] <= PHASE_ORDER[expected.phase]
+        or stable_expected != stable_replacement
+    ):
+        return False
+    report_status: RunStatus | None = None
+    with runner._status_guard(run_id):
+        status = runner.get_status(run_id)
+        if status.state in runner.TERMINAL_STATES:
+            return False
+        if not runner._expected_remote_matches(status.remote, expected_remote):
+            return False
+        status.remote = {**status.remote, **replacement.to_dict()}
+        status.updated_at = time.time()
+        runner._save_status_unlocked(status)
+        report_status = status
+    confirmed = runner.get_status(run_id)
+    if not runner._expected_remote_matches(confirmed.remote, replacement.to_dict()):
+        raise RuntimeError("exact provider handle replacement was not durably confirmed")
     if report_status is not None:
         runner._report_status(report_status)
     return True
@@ -210,7 +269,7 @@ def _canonical_cleanup_remote(remote: object) -> dict | None:
     provider = remote.get("provider")
     try:
         if provider == "runpod":
-            from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+            from flash.providers.runpod.pods import RunpodPodHandle as RunpodJobHandle
 
             return RunpodJobHandle.from_dict(remote).to_dict()
         if provider == "lambda":

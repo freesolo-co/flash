@@ -30,20 +30,11 @@ from flash.providers.artifacts.hf import make_hf_text_reader
 # stayed green (importing the module executes the whole file, bottom import included). tests that
 # patch `weight_cache.<name>` keep working because the names still land in this module's namespace.
 from flash.providers.artifacts.preload_runpod import (  # noqa: F401
-    _NO_CAPACITY_GRACE_S,
     _PRELOAD_GPU,
     _PRELOAD_TIMEOUT_S,
-    _QUEUED,
-    _THROTTLED_GRACE_S,
-    _UNHEALTHY_GRACE_S,
-    NoCapacityError,
-    _any_worker,
-    _has_worker,
-    _only_unhealthy_workers,
-    _poll_until_done,
+    _account_storage_datacenters,
+    _account_storage_targets,
     _preload_one_dc,
-    _throttled_workers,
-    _worker_counts,
     catalog_model_ids,
     teardown_lambda_filesystems,
     teardown_weight_cache,
@@ -52,32 +43,7 @@ from flash.providers.artifacts.preload_runpod import (  # noqa: F401
 from flash.providers.base import UnreconciledCreateError
 from flash.providers.runpod import api as runpod_api  # noqa: F401
 
-# several names below have no call site here since the runpod half moved to `.preload_runpod`,
-# but they are kept imported on purpose: the preload tests patch them on THIS module and that
-# half reads them back through it. an autofix that drops them as unused breaks those tests.
-from flash.providers.runpod.jobs import (  # noqa: F401
-    GraceTimer,
-    decode_output,
-    deploy_train_endpoint,
-    weight_cache_datacenters,
-    weight_cache_volume_name,
-)
-
 logger = get_logger(__name__)
-
-
-def _run_async(coro):
-    """Run a coroutine from sync code even if an event loop is already running."""
-    import asyncio as _asyncio
-
-    try:
-        _asyncio.get_running_loop()
-    except RuntimeError:
-        return _asyncio.run(coro)
-    import concurrent.futures
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(_asyncio.run, coro).result()
 
 
 _LAMBDA_PRELOAD_GPU = "A10"
@@ -656,8 +622,7 @@ def _resolve_cli_selection(ap, args) -> tuple[list[str], list[str], bool, int | 
 
 
 def _default_dcs() -> list[str]:
-    # Lazy: weight_cache_datacenters() imports runpod_flash; avoid importing it on instance-only hosts.
-    return [dc.value for dc in weight_cache_datacenters()]
+    return _account_storage_datacenters()
 
 
 def _run_lambda_mode(args, models: list[str]) -> int | None:
@@ -723,17 +688,15 @@ def _run_teardown_mode(args, parsed_dcs: list[str], scoped: bool) -> int | None:
     if not args.teardown:
         return None
     if scoped:
-        from runpod_flash.core.resources.datacenter import DataCenter
-
-        bad = []
-        for d in parsed_dcs:
-            try:
-                DataCenter.from_string(d)
-            except Exception:
-                bad.append(d)
+        try:
+            available = set(_account_storage_datacenters())
+        except Exception as exc:
+            print(f"--teardown --datacenters: could not validate account catalog ({exc})")
+            return 2
+        bad = sorted(set(parsed_dcs) - available)
         if bad:
             print(
-                f"--teardown --datacenters: invalid datacenter id(s): {', '.join(bad)} "
+                f"--teardown --datacenters: unavailable datacenter id(s): {', '.join(bad)} "
                 "— refusing to run (nothing deleted)"
             )
             return 2
@@ -766,7 +729,15 @@ def _run_teardown_mode(args, parsed_dcs: list[str], scoped: bool) -> int | None:
 
 
 def _run_runpod_warm(args, models: list[str], parsed_dcs: list[str]) -> int:
-    dcs = parsed_dcs or _default_dcs()
+    if args.dry_run and not parsed_dcs:
+        try:
+            dcs = _default_dcs()
+        except Exception as exc:
+            print(f"would warm account-discovered datacenter(s): unavailable in dry run ({exc})")
+            print(f"with {len(models)} model(s): {', '.join(models)}")
+            return 0
+    else:
+        dcs = parsed_dcs or _default_dcs()
     if args.dry_run:
         print(f"would warm {len(dcs)} datacenter(s): {', '.join(dcs)}")
         print(f"with {len(models)} model(s): {', '.join(models)}")
@@ -782,10 +753,10 @@ def _run_runpod_warm(args, models: list[str], parsed_dcs: list[str]) -> int:
     failed = [r for r in results if r.get("status") != "ok"]
     for r in results:
         print(
-            f"  {r['datacenter']}: {r['status']}"
+            f"  {r.get('account', 'acct?')}/{r['datacenter']}: {r['status']}"
             + (f" ({r.get('error')})" if r.get("error") else "")
         )
-    print(f"{len(results) - len(failed)}/{len(results)} datacenters warmed")
+    print(f"{len(results) - len(failed)}/{len(results)} account/datacenter targets warmed")
     return 1 if failed else 0
 
 

@@ -8,7 +8,7 @@ name: auto-rebake per-arch kernel cache
 #   * fp_cache changed -> promote a matching dev-ready cache by free re-layer. a real gpu re-warm is
 #     only the fail-safe when the required candidate is absent.
 #   * fp_cache same but fp_base changed -> the cache is still valid, the base just moved (FA wheel /
-#     causal-conv1d / rp_handler / a non-kernel dep) -> a FREE re-layer grafts the existing cache onto
+#     causal-conv1d / Pod launcher / a non-kernel dep) -> a FREE re-layer grafts the existing cache onto
 #     the fresh base (docker/Dockerfile.kernelcache.relayer), no GPU.
 #   * both same -> skip (this is the pure-flash-code case the old reminder over-fired on).
 #

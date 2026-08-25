@@ -1,3 +1,14 @@
+# build the shared instance capsule without copying the flash source tree into the final image.
+FROM python:3.12-slim AS capsule-builder
+WORKDIR /src
+COPY flash/__init__.py flash/__init__.py
+COPY flash/_internal/__init__.py flash/_internal/channel.py flash/_internal/
+COPY flash/runtime_capsule/ flash/runtime_capsule/
+COPY flash/providers/_lifecycle/ flash/providers/_lifecycle/
+COPY flash/source_snapshot.py flash/source_snapshot.py
+COPY docker/build_instance_capsule.py docker/build_instance_capsule.py
+RUN PYTHONPATH=/src python docker/build_instance_capsule.py /src /instance-bootstrap.pyz
+
 # Flash prebuilt WORKER image — the full training stack baked in for RunPod workers.
 # the worker fetches one pinned source archive at runtime; the trusted verifier is baked here.
 #
@@ -466,12 +477,10 @@ print('  entrypoints: main_ppo (grpo), main_ppo_sync (opd), sft_trainer (sft)');
 print('  qwen3.5 archs registered; mask_truncated_completions present'); \
 print('  gdn boundary resets: fla', M.version('flash-linear-attention'), 'and causal_conv1d installed and importable (capability itself is cuda-gated, asserted on the worker)')"
 
-# RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
-# from the real _train_body source in providers/runpod/serverless/endpoints.py (single source of truth;
-# _train_body is self-contained — every name is imported inside its body) and run it as the CMD so the
-# image is a self-contained RunPod Serverless worker. Build context is the repo root.
-COPY flash/providers/runpod/serverless/endpoints.py flash/source_snapshot.py docker/make_rp_handler.py /tmp/rpgen/
-RUN cp /tmp/rpgen/source_snapshot.py /source_snapshot.py \
-    && python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/endpoints.py /tmp/rpgen/source_snapshot.py /rp_handler.py \
-    && python -c "import ast; ast.parse(open('/rp_handler.py').read()); print('rp_handler OK')"
-CMD ["python", "-u", "/rp_handler.py"]
+# persistent RunPod Pods resolve only the opaque payload secret reference into this process.
+# lambda and vast provide explicit command overrides, so their launch paths remain unchanged.
+COPY --from=capsule-builder /instance-bootstrap.pyz /opt/flash/instance-bootstrap.pyz
+COPY docker/runpod_pod_launcher.py docker/bake_pod_entry.py /opt/flash/
+RUN chmod 0755 /opt/flash/instance-bootstrap.pyz /opt/flash/runpod_pod_launcher.py \
+    /opt/flash/bake_pod_entry.py
+CMD ["python", "-u", "/opt/flash/runpod_pod_launcher.py"]

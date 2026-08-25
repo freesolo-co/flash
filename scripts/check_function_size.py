@@ -35,10 +35,7 @@ SKIP_DIRS = {"__pycache__", ".git", ".venv", "build", ".ruff_cache"}
 # mechanism changes. Keep this list short: it is an escape hatch for a transport boundary, never
 # for a function that is merely hard to split.
 SOURCE_SHIPPED = {
-    # `docker/make_rp_handler.py` AST-extracts this at image build time and writes it into
-    # `/rp_handler.py`, which the worker image runs as its CMD with nothing else from flash on the
-    # path. `tests/test_flash_worker.py` pins the same contract from the other side: every name it
-    # uses must be imported inside its own body.
+    # broad serverless deletion is deferred to task 4; this extractor remains active until then.
     "flash/providers/runpod/serverless/endpoints.py::_train_body",
 }
 

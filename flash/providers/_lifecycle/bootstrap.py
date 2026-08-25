@@ -1,7 +1,7 @@
 """Bootstrap shared by instance-based providers (e.g. Lambda). Runs inside the worker container.
 
 Stdlib + huggingface_hub only — never import flash here. Reads payload from ``/root/flash/payload.json``.
-Launch scripts must ship ``bootstrap_console.py``, ``bootstrap_secrets.py`` and ``bootstrap_pip.py``.
+Launch scripts must ship the bootstrap console, secrets, pip, and preload helper modules.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ if __package__:
     from flash import source_snapshot as _source_snapshot
     from flash.providers._lifecycle import bootstrap_console as _bootstrap_console
     from flash.providers._lifecycle import bootstrap_pip
+    from flash.providers._lifecycle.bootstrap_preload import preload_snapshot_evidence
     from flash.providers._lifecycle.bootstrap_secrets import (
         _payload_secrets,
         _read_console_tail,
@@ -34,6 +35,7 @@ else:
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
     import source_snapshot as _source_snapshot  # type: ignore[no-redef]
+    from bootstrap_preload import preload_snapshot_evidence  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
         _read_console_tail,
@@ -797,7 +799,7 @@ def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Eve
 
 
 def run_preload(payload: dict) -> dict:
-    """Download models into the bind-mounted weight cache. Fails if cache isn't mounted to avoid warming ephemeral disk."""
+    """Download models only into a verified bind-mounted weight cache."""
     env = payload.get("env") or {}
     cache_dir = env.get("FLASH_WEIGHT_CACHE_DIR") or ""
     token = env.get("HF_TOKEN")
@@ -826,32 +828,38 @@ def run_preload(payload: dict) -> dict:
     from huggingface_hub import snapshot_download
 
     ignore_patterns = ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
-    done, already, failed = [], [], {}
+    done, already, failed, resolved = [], [], {}, {}
     for repo_id in payload.get("models") or []:
         try:
-            # Probe with local_files_only first (HF's own resolution, not a dir-name guess).
             try:
-                snapshot_download(
+                local = snapshot_download(
                     repo_id=repo_id,
                     token=token,
                     cache_dir=cache_dir,
                     ignore_patterns=ignore_patterns,
                     local_files_only=True,
                 )
+                resolved[repo_id] = preload_snapshot_evidence(local, cache_dir)
                 already.append(repo_id)
-                print(f"preload: {repo_id} -> {cache_dir} (cached)", flush=True)
+                print(f"preload: {repo_id} (verified cached)", flush=True)
                 continue
             except Exception:
                 pass
-            snapshot_download(
+            local = snapshot_download(
                 repo_id=repo_id, token=token, cache_dir=cache_dir, ignore_patterns=ignore_patterns
             )
+            resolved[repo_id] = preload_snapshot_evidence(local, cache_dir)
             done.append(repo_id)
-            print(f"preload: {repo_id} -> {cache_dir} (downloaded)", flush=True)
+            print(f"preload: {repo_id} (verified downloaded)", flush=True)
         except Exception as exc:
             failed[repo_id] = _safe_detail(exc, secrets=_payload_secrets(payload))
             print(f"preload FAILED {repo_id}: {failed[repo_id]}", flush=True)
-    return {"preloaded": done, "already_cached": already, "failed": failed}
+    return {
+        "preloaded": done,
+        "already_cached": already,
+        "failed": failed,
+        "resolved_snapshots": resolved,
+    }
 
 
 def main() -> int:

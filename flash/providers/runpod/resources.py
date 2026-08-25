@@ -57,20 +57,92 @@ def _jobs():
 _VOLUME_INCAPABLE_DATACENTERS = frozenset({"US-MO-1"})
 
 
-def weight_cache_datacenters() -> list:
-    """Every volume-capable RunPod DC (DataCenter.all() minus _VOLUME_INCAPABLE_DATACENTERS)."""
+def weight_cache_datacenters(
+    fingerprint: str | None = None, *, deadline_at: float | None = None
+) -> list:
+    """Return storage-capable data centers for one account or the deferred Serverless path."""
+    if fingerprint is not None:
+        if deadline_at is None:
+            raise ValueError("account-scoped RunPod data center discovery needs a deadline")
+        return runpod_api.list_storage_datacenters_for_fingerprint(
+            fingerprint, deadline_at=deadline_at
+        )
     from runpod_flash.core.resources.datacenter import DataCenter
 
     return [dc for dc in DataCenter.all() if dc.value not in _VOLUME_INCAPABLE_DATACENTERS]
 
 
 def weight_cache_volume_name(base: str, dc) -> str:
-    """Physical volume name for ``base`` in datacenter ``dc``.
+    """Physical volume name for ``base`` in one exact data center."""
+    data_center_id = dc if isinstance(dc, str) else dc.value
+    return f"{base}-{data_center_id.lower()}"
 
-    DC MUST be in the name: the SDK keys resource tracking on name alone (no datacenter), so same-named
-    volumes across DCs collide and the 2nd deploy crashes (unimplemented undeploy).
-    """
-    return f"{base}-{dc.value.lower()}"
+
+def ensure_account_volume(
+    fingerprint: str,
+    *,
+    base: str,
+    data_center_id: str,
+    size_gb: int,
+    deadline_at: float,
+):
+    """Return one exact account/DC volume after strict create or grow reconciliation."""
+    if data_center_id not in weight_cache_datacenters(fingerprint, deadline_at=deadline_at):
+        raise runpod_api.RunpodApiError(
+            f"runpod data center {data_center_id} does not support account network volumes"
+        )
+    name = weight_cache_volume_name(base, data_center_id)
+    volumes = runpod_api.list_network_volumes_for_fingerprint(fingerprint, deadline_at=deadline_at)
+    matches = [
+        volume
+        for volume in volumes
+        if volume.name == name and volume.data_center_id == data_center_id
+    ]
+    if len(matches) > 1:
+        raise runpod_api.RunpodApiError(
+            f"runpod network volume {name} is duplicated in {data_center_id}"
+        )
+    if not matches:
+        try:
+            volume = runpod_api.create_network_volume_for_fingerprint(
+                fingerprint,
+                name=name,
+                size_gb=size_gb,
+                data_center_id=data_center_id,
+                deadline_at=deadline_at,
+            )
+        except runpod_api.RunpodMutationAmbiguous:
+            refreshed = runpod_api.list_network_volumes_for_fingerprint(
+                fingerprint, deadline_at=deadline_at
+            )
+            reconciled = [
+                item
+                for item in refreshed
+                if item.name == name and item.data_center_id == data_center_id
+            ]
+            if len(reconciled) != 1:
+                from flash.providers.base import UnreconciledCreateError
+
+                raise UnreconciledCreateError(
+                    f"RunPod network volume creation could not be reconciled in {data_center_id}"
+                ) from None
+            volume = reconciled[0]
+    else:
+        volume = matches[0]
+    if volume.size_gb >= size_gb:
+        return volume
+    runpod_api.grow_network_volumes_for_fingerprint(
+        fingerprint, {name: size_gb}, deadline_at=deadline_at
+    )
+    refreshed = runpod_api.list_network_volumes_for_fingerprint(
+        fingerprint, deadline_at=deadline_at
+    )
+    grown = [
+        item for item in refreshed if item.name == name and item.data_center_id == data_center_id
+    ]
+    if len(grown) != 1 or grown[0].size_gb < size_gb:
+        raise runpod_api.RunpodApiError(f"runpod network volume {name} did not reach {size_gb} GB")
+    return grown[0]
 
 
 def weight_cache_volumes(spec) -> list:

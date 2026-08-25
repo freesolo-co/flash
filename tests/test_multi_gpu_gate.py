@@ -326,7 +326,7 @@ def test_lambda_sku_miss_is_provider_local_during_auto_allocation(monkeypatch):
             return [Candidate("runpod", "H100", 3.29, 80, 2)]
 
         def gpu_classes(self):
-            return gpu_classes_for("enum_member")
+            return gpu_classes_for("runpod_gpu_type_id")
 
     providers = {"lambda": _LambdaMiss(), "runpod": _RunPodHit()}
     monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda", "runpod"))

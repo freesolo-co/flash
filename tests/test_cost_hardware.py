@@ -86,7 +86,7 @@ def test_nvlink_classification_tracks_the_provisioned_board():
     from flash.providers.base import GPU_INFO
     from flash.providers.runpod.gpus import _POOL_MEMBERS_MISSING_FROM_SDK
 
-    assert GPU_INFO["H100"].enum_member == "NVIDIA_H100_80GB_HBM3"  # sxm, not the pcie board
+    assert GPU_INFO["H100"].runpod_gpu_type_id == "NVIDIA H100 80GB HBM3"  # sxm, not the pcie board
     assert has_nvlink("H100")
     # the non-sxm members of the same runpod pool are negated, so a pin cannot land on them.
     assert _POOL_MEMBERS_MISSING_FROM_SDK["ADA_80_PRO"] == ("NVIDIA H100 PCIe", "NVIDIA H100 NVL")

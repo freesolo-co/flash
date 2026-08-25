@@ -60,7 +60,7 @@ def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
     assert a.min_vram_gb < 24  # a sub-24 GB run the synthetic unvalidated card also fits
     # The synthetic class is cheaper and fits, yet is excluded because it is unvalidated.
     assert any(
-        (not g.validated) and g.enum_member and g.vram_gb >= a.min_vram_gb
+        (not g.validated) and g.runpod_gpu_type_id and g.vram_gb >= a.min_vram_gb
         for g in GPU_INFO.values()
     )
     assert all(c.gpu in VALIDATED for c in a.candidates)
@@ -1275,7 +1275,7 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
             max_auto_vram = max(
                 combined_vram_gb(gpu.vram_gb, auto_cap)
                 for gpu in GPU_INFO.values()
-                if gpu.enum_member and gpu.validated
+                if gpu.runpod_gpu_type_id and gpu.validated
             )
             if need > max_auto_vram:
                 with pytest.raises(UnsupportedGpuError):
@@ -1377,7 +1377,7 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
             )
             preview_info = get_gpu_info(preview_gpu)
             assert preview_info.validated
-            assert preview_info.enum_member
+            assert preview_info.runpod_gpu_type_id
             # sharding is not free: combined_vram_gb applies the per-card overhead, so two cards hold
             # less than twice one card. sizing with a naive sum would overstate what the shape holds.
             assert combined_vram_gb(preview_info.vram_gb, cards) >= need, (
@@ -1394,7 +1394,7 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
             assert alloc.provider == "runpod"
             assert alloc.min_vram_gb == need
             assert alloc_info.validated
-            assert alloc_info.enum_member
+            assert alloc_info.runpod_gpu_type_id
             assert combined_vram_gb(alloc_info.vram_gb, cards) >= need, (
                 model_id,
                 algo,

@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +23,12 @@ import pytest
 from packaging.requirements import Requirement
 from packaging.version import Version
 
+from flash.runtime_capsule.profiles import get_profile
+
 ROOT = Path(__file__).resolve().parent.parent
+INSTANCE_PROFILE_SOURCES = tuple(
+    source for source, _member in get_profile("instance-bootstrap").sources
+)
 KERNEL_FINGERPRINT_SCRIPT = ROOT / "docker" / "kernel_fingerprint.py"
 AUTO_REBAKE_ARCH_COMMAND = "arches=$(python3 docker/kernel_fingerprint.py --print-baked-arches)"
 
@@ -99,8 +105,14 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
         "causal_conv1d",
         "pip_base",
         "dockerfile_sha256",
-        "endpoints_sha256",
-        "make_rp_handler_sha256",
+        "runpod_pod_launcher_sha256",
+        "bake_pod_entry_sha256",
+        "build_instance_capsule_sha256",
+        "instance_capsule_sha256",
+        "runtime_capsule_init_sha256",
+        "runtime_capsule_build_sha256",
+        "runtime_capsule_manifest_sha256",
+        "runtime_capsule_profiles_sha256",
     ):
         assert base_partial[key], f"base input {key} not populated"
 
@@ -110,6 +122,78 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
     assert sha in cache_inputs["fla"]
     # the cache toolchain must NOT leak into the base pip list (else a cache-toolchain bump would fire a re-layer)
     assert not any("liger-kernel" in s or "tilelang" in s for s in base_partial["pip_base"])
+
+
+@pytest.mark.parametrize(
+    "input_name",
+    [
+        "runpod_pod_launcher_sha256",
+        "bake_pod_entry_sha256",
+        "build_instance_capsule_sha256",
+    ],
+)
+def test_pod_launcher_inputs_move_the_worker_base_fingerprint(input_name):
+    cache_inputs, base_partial = kf.collect_inputs(ROOT)
+    fp_cache0, fp_base0, _ = kf.compute_fingerprints(cache_inputs, base_partial)
+    changed = {**base_partial, input_name: base_partial[input_name] + "x"}
+    fp_cache1, fp_base1, _ = kf.compute_fingerprints(cache_inputs, changed)
+    assert fp_cache1 == fp_cache0
+    assert fp_base1 != fp_base0
+
+
+def _copy_fingerprint_inputs(destination: Path) -> None:
+    for path in (
+        "Dockerfile.worker",
+        ".github/workflows/worker-image.yml",
+        "docker/bake_pod_entry.py",
+        "docker/build_instance_capsule.py",
+        "docker/runpod_pod_launcher.py",
+        "flash/__init__.py",
+        "flash/_internal/__init__.py",
+        "flash/_internal/channel.py",
+        "flash/engine/worker/runtime/kernel_warmup.py",
+        *INSTANCE_PROFILE_SOURCES,
+        "flash/runtime_capsule/__init__.py",
+        "flash/runtime_capsule/build.py",
+        "flash/runtime_capsule/manifest.py",
+        "flash/runtime_capsule/profiles.py",
+        "flash/source_snapshot.py",
+    ):
+        source = ROOT / path
+        target = destination / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+
+@pytest.mark.parametrize("path", INSTANCE_PROFILE_SOURCES)
+def test_each_capsule_profile_source_moves_only_fp_base(tmp_path, path):
+    _copy_fingerprint_inputs(tmp_path)
+    fp_cache0, fp_base0, _, _ = kf.fingerprints(tmp_path)
+    target = tmp_path / path
+    target.write_bytes(target.read_bytes() + b"\n# fingerprint mutation\n")
+    fp_cache1, fp_base1, _, _ = kf.fingerprints(tmp_path)
+    assert fp_cache1 == fp_cache0
+    assert fp_base1 != fp_base0
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docker/build_instance_capsule.py",
+        "flash/runtime_capsule/__init__.py",
+        "flash/runtime_capsule/build.py",
+        "flash/runtime_capsule/manifest.py",
+        "flash/runtime_capsule/profiles.py",
+    ],
+)
+def test_each_capsule_construction_input_moves_only_fp_base(tmp_path, path):
+    _copy_fingerprint_inputs(tmp_path)
+    fp_cache0, fp_base0, _, _ = kf.fingerprints(tmp_path)
+    target = tmp_path / path
+    target.write_bytes(target.read_bytes() + b"\n# fingerprint mutation\n")
+    fp_cache1, fp_base1, _, _ = kf.fingerprints(tmp_path)
+    assert fp_cache1 == fp_cache0
+    assert fp_base1 != fp_base0
 
 
 def test_dockerfile_only_change_is_a_free_relayer():
@@ -331,7 +415,7 @@ def test_baked_arch_workflows_match_canonical_source():
     matrix_arch_list = [
         match.group(1)
         for line in include_block
-        if (match := re.fullmatch(r"\s*sm:\s*(sm[0-9]+),?\s*", line))
+        if (match := re.search(r"(?:^|[,{]\s*)sm:\s*(sm[0-9]+)(?:\s*[,}])", line))
     ]
     matrix_arches = set(matrix_arch_list)
 

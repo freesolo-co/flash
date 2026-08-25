@@ -323,7 +323,7 @@ def cmd_gpus(args) -> int:
 
     runpod_rates = runpod_static_rates()
     infos = sorted(
-        (info for info in GPU_INFO.values() if info.enum_member), key=lambda g: g.hourly_usd
+        (info for info in GPU_INFO.values() if info.runpod_gpu_type_id), key=lambda g: g.hourly_usd
     )
     tip = (
         "Tip: GPU allocation is automatic by default.\n"

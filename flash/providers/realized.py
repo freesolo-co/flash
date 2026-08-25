@@ -29,10 +29,6 @@ def realized_cost_for_remote(
     if not remote:
         return None
     provider = remote.get("provider")
-    if provider == "runpod":
-        from flash.providers.runpod.cost import realized_cost as runpod_realized
-
-        return runpod_realized(remote.get("endpoint_id"), start=start, end=end)
     from flash.providers import INSTANCE_PROVIDERS
 
     if provider in INSTANCE_PROVIDERS:

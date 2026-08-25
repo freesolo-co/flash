@@ -12,12 +12,18 @@ from __future__ import annotations
 
 import contextlib
 import time
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from flash.core.spec import JobSpec
 from flash.envs.staged import StagedEnvironmentTransientError
 from flash.providers._lifecycle.poll import _attempt_int
+from flash.runner.supervise.attach_context import (
+    _AttachContext,
+    _build_attach_context,
+    _PendingRunpodCreateAbsent,
+    _resolve_pending_runpod_context,
+)
 
 # imported by value rather than through `_deploy()`: the set and its lock are mutated in place and
 # never rebound, so both modules share the one object, and the tests that assert on membership read
@@ -303,6 +309,111 @@ def _wait_for_replacement_window(worker_spec: JobSpec, deadline_at: float) -> bo
     return False
 
 
+def _resume_reconciled_after_teardown(
+    run_id: str,
+    worker_spec: JobSpec,
+    expected_remote: dict,
+    next_attempt: int,
+    source_snapshot: dict | None,
+    log,
+    failure: str,
+) -> None:
+    """Retry one confirmed-safe replacement until ownership changes or it completes."""
+    from flash.runner import (
+        TERMINAL_STATES,
+        _compare_and_fail_remote,
+        _remote_resource_identity,
+        get_status,
+    )
+
+    expected_identity = _remote_resource_identity(expected_remote)
+    while True:
+        try:
+            _deploy()._resume_after_confirmed_teardown(
+                run_id,
+                worker_spec,
+                expected_remote,
+                next_attempt,
+                source_snapshot,
+                log,
+                failure=failure,
+            )
+        except Exception as exc:
+            try:
+                current = get_status(run_id)
+            except Exception:
+                time.sleep(_deploy()._ATTACH_RECONCILE_INTERVAL_S)
+                continue
+            if current.state in TERMINAL_STATES:
+                return
+            if current.remote is None:
+                try:
+                    if _compare_and_fail_remote(run_id, None, str(exc)):
+                        return
+                except Exception:
+                    time.sleep(_deploy()._ATTACH_RECONCILE_INTERVAL_S)
+                    continue
+                return
+            if _remote_resource_identity(current.remote) != expected_identity:
+                return
+            time.sleep(_deploy()._ATTACH_RECONCILE_INTERVAL_S)
+            continue
+        return
+
+
+def _resolve_reconciled_runpod_remote(
+    run_id: str,
+    expected_remote: dict,
+    worker_spec: JobSpec,
+    log,
+):
+    """Resolve a durable pending RunPod creation before ordinary reconciliation."""
+    from flash.providers.base import JobHandle
+    from flash.runner import (
+        TERMINAL_STATES,
+        _load_run_deadline_at,
+        _remote_resource_identity,
+        get_status,
+    )
+    from flash.runner.supervise.lifecycle import _CompletedAttemptPending
+
+    expected_identity = _remote_resource_identity(expected_remote)
+    handle = JobHandle.from_dict(expected_remote)
+    while handle.provider == "runpod" and handle.data.get("instance_id") == handle.data.get(
+        "label"
+    ):
+        status = get_status(run_id)
+        if (
+            status.state in TERMINAL_STATES
+            or _remote_resource_identity(status.remote) != expected_identity
+        ):
+            return None
+        deadline_at = _load_run_deadline_at(run_id)
+        if time.time() >= deadline_at:
+            break
+        context = _build_attach_context(worker_spec, expected_remote)
+        try:
+            context = _resolve_pending_runpod_context(run_id, context, deadline_at=deadline_at)
+        except _PendingRunpodCreateAbsent as exc:
+            _resume_reconciled_after_teardown(
+                run_id,
+                worker_spec,
+                exc.context.persisted_remote,
+                exc.context.next_attempt,
+                exc.context.source_snapshot,
+                log,
+                failure="runpod pending create was authoritatively absent",
+            )
+            return None
+        except _CompletedAttemptPending:
+            time.sleep(_deploy()._ATTACH_RECONCILE_INTERVAL_S)
+            continue
+        expected_remote = context.persisted_remote
+        expected_identity = _remote_resource_identity(expected_remote)
+        handle = context.handle
+    return expected_remote, expected_identity, handle
+
+
 def _reconcile_attached_remote(
     run_id: str,
     expected_remote: dict,
@@ -313,7 +424,6 @@ def _reconcile_attached_remote(
     failure: str,
 ) -> None:
     """Reconcile one exact maybe-live attempt until it is gone or the wall deadline expires."""
-    from flash.providers.base import JobHandle
     from flash.runner import (
         TERMINAL_STATES,
         _compare_and_fail_remote,
@@ -330,8 +440,10 @@ def _reconcile_attached_remote(
         _worker_provably_gone,
     )
 
-    expected_identity = _remote_resource_identity(expected_remote)
-    handle = JobHandle.from_dict(expected_remote)
+    resolved = _resolve_reconciled_runpod_remote(run_id, expected_remote, worker_spec, log)
+    if resolved is None:
+        return
+    expected_remote, expected_identity, handle = resolved
     while True:
         try:
             status = get_status(run_id)
@@ -355,10 +467,12 @@ def _reconcile_attached_remote(
         try:
             completed_metrics = _runpod_completed_metrics(
                 expected_remote,
+                spec=worker_spec,
                 deadline_at=deadline_at,
+                log=log,
             )
         except _CompletedAttemptPending:
-            # the queue job already completed but its metrics are still landing; keep
+            # the worker already completed but its metrics are still landing; keep
             # reconciling (do not tear it down) until they are readable -- but do not sleep
             # past the grace cutoff, or a run that fails at the cutoff keeps reconciling a
             # full interval beyond it before terminating.
@@ -411,36 +525,15 @@ def _reconcile_attached_remote(
                 cleanup_preserved = False
             if not cleanup_preserved:
                 continue
-        try:
-            _deploy()._resume_after_confirmed_teardown(
-                run_id,
-                worker_spec,
-                expected_remote,
-                next_attempt,
-                source_snapshot,
-                log,
-                failure=failure,
-            )
-        except Exception as exc:
-            try:
-                current = get_status(run_id)
-            except Exception:
-                time.sleep(_deploy()._ATTACH_RECONCILE_INTERVAL_S)
-                continue
-            if current.state in TERMINAL_STATES:
-                return
-            if current.remote is None:
-                try:
-                    if _compare_and_fail_remote(run_id, None, str(exc)):
-                        return
-                except Exception:
-                    time.sleep(_deploy()._ATTACH_RECONCILE_INTERVAL_S)
-                    continue
-                return
-            if _remote_resource_identity(current.remote) != expected_identity:
-                return
-            time.sleep(_deploy()._ATTACH_RECONCILE_INTERVAL_S)
-            continue
+        _resume_reconciled_after_teardown(
+            run_id,
+            worker_spec,
+            expected_remote,
+            next_attempt,
+            source_snapshot,
+            log,
+            failure,
+        )
         return
 
 
@@ -490,51 +583,6 @@ def _schedule_attach_reconciliation(
     return True
 
 
-@dataclass(frozen=True)
-class _AttachContext:
-    worker_spec: JobSpec
-    persisted_remote: dict
-    handle: JobHandle
-    seed: int
-    recovered_attempt: int
-    next_attempt: int
-    source_snapshot: dict | None
-
-
-def _build_attach_context(
-    worker_spec: JobSpec,
-    persisted_remote: dict,
-) -> _AttachContext:
-    """Validate the persisted handle and collect the inputs needed to poll it."""
-    from flash.providers.base import JobHandle
-    from flash.runner import get_status, source_snapshot_from_status
-
-    remote = dict(persisted_remote)
-    seed = int(remote.pop("seed", worker_spec.seed))
-    remote.pop("code_prefix", None)
-    source_snapshot = source_snapshot_from_status(get_status(worker_spec.run_id))
-    provider_name = remote.get("provider")
-    if not isinstance(provider_name, str) or not provider_name:
-        raise ValueError("persisted provider identity is missing or invalid")
-    recovered_attempt = _attempt_int(remote.get("attempt"))
-    if recovered_attempt is None:
-        raise ValueError("persisted attempt identity is missing or invalid")
-    # strip the allocation stamp off the HANDLE copy only: `JobHandle.from_dict` round-trips
-    # unknown keys, and the stamp belongs to `persisted_remote`, which `_carry_allocation_stamp`
-    # reads whole when adopting metrics.
-    remote.pop("allocated_gpu", None)
-    remote.pop("allocated_gpu_count", None)
-    return _AttachContext(
-        worker_spec=worker_spec,
-        persisted_remote=persisted_remote,
-        handle=JobHandle.from_dict(remote),
-        seed=seed,
-        recovered_attempt=recovered_attempt,
-        next_attempt=recovered_attempt + 1,
-        source_snapshot=source_snapshot,
-    )
-
-
 def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log) -> RunStatus:
     """Tear down and fail a run whose persisted public spec cannot be parsed."""
     from flash.providers.base import JobHandle
@@ -545,7 +593,7 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     # stays nonterminal with a live handle and its worker keeps billing. A spec stops parsing when
     # the plane upgrades past an algorithm a still-in-flight run was accepted under. It cannot be
     # resumed, so fail it closed and tear the worker down. `_gc_run_endpoints` needs a parsed spec
-    # we do not have; the endpoint name is derived from the run id plus GPU class, both readable
+    # we do not have; the pod label is derived from the run id, which remains readable
     # from the raw persisted status, which is the same route recover_runs takes for its own
     # unparseable-spec branch.
     detail = f"unrecoverable: persisted spec is malformed: {exc}"
@@ -589,10 +637,12 @@ def _handle_attach_wall_deadline(
     deadline_at = _load_run_deadline_at(run_id)
     metrics = _runpod_completed_metrics(
         context.persisted_remote,
+        spec=context.worker_spec,
         deadline_at=deadline_at,
+        log=log,
     )
     started_ts = context.persisted_remote.get("started_ts")
-    if metrics is None and started_ts is not None:
+    if metrics is None and context.handle.provider != "runpod" and started_ts is not None:
         metrics = _completed_attempt_metrics(
             context.worker_spec,
             provider=context.handle.provider,
@@ -667,7 +717,9 @@ def _handle_failed_attach_poll(
     print(f"attach: {run_id} ended ({result.failure}); evaluating recovery", file=log)
     completed_metrics = _runpod_completed_metrics(
         context.persisted_remote,
+        spec=context.worker_spec,
         deadline_at=_load_run_deadline_at(run_id),
+        log=log,
     )
     if completed_metrics is not None:
         # the job completed. adoption may return False (a transient defer, e.g. a
@@ -714,7 +766,7 @@ def _handle_failed_attach_poll(
         and not resource_deleted
         and not _record_cleanup_remote(run_id, context.persisted_remote)
     ):
-        raise RuntimeError("leaked endpoint cleanup target could not be persisted")
+        raise RuntimeError("incomplete provider cleanup target could not be persisted")
     if worker_gone:
         return _deploy()._resume_after_confirmed_teardown(
             run_id,
@@ -825,6 +877,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             poll_spec = _spec_with_remaining_wall(worker_spec, require_provider_minimum=False)
         except RuntimeError as exc:
             return _handle_attach_wall_deadline(run_id, context, log, exc)
+        context = _resolve_pending_runpod_context(
+            run_id,
+            context,
+            deadline_at=_load_run_deadline_at(run_id),
+        )
+        persisted_remote = context.persisted_remote
         print(
             f"attaching to {run_id}: provider={context.handle.provider} {context.handle.data}",
             file=log,
@@ -841,6 +899,17 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if not result.ok:
             return _handle_failed_attach_poll(run_id, context, result, log)
         _adopt_attached_poll_result(run_id, context, result, log)
+        return status_for_return()
+    except _PendingRunpodCreateAbsent as exc:
+        _resume_reconciled_after_teardown(
+            run_id,
+            worker_spec,
+            exc.context.persisted_remote,
+            exc.context.next_attempt,
+            exc.context.source_snapshot,
+            log,
+            "runpod pending create was authoritatively absent",
+        )
         return status_for_return()
     except _CompletedAttemptPending as exc:
         _deploy()._schedule_attach_reconciliation(

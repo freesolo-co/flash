@@ -1,15 +1,15 @@
-"""RunPod provider for Flash."""
+"""RunPod Secure Cloud Pod provider for managed training."""
 
 from __future__ import annotations
 
-import contextlib
+import time
 from typing import Any
 
-from flash.providers._lifecycle.deadline import deadline_kwargs
+from flash.providers._lifecycle.instance import InstanceJobHandle
+from flash.providers._lifecycle.provider import InstanceProvider
 from flash.providers.base import (
     AllocationConstraints,
     Candidate,
-    GpuClass,
     JobHandle,
     PollResult,
     Provider,
@@ -18,87 +18,95 @@ from flash.providers.base import (
 
 
 def terminate_persisted_endpoints(spec: Any, run_id: str) -> None:
-    """Best-effort teardown for every GPU class named by a raw persisted spec."""
-    from flash.core.spec import persisted_gpu_types
-    from flash.providers.runpod.serverless import terminate_endpoint
+    """Compatibility name for raw-spec recovery; the managed resource is now a Pod."""
+    from flash.providers.runpod.pods import destroy_run_pods
 
-    for gpu_type in persisted_gpu_types(spec):
-        with contextlib.suppress(Exception):
-            terminate_endpoint(gpu_type, run_id)
+    destroy_run_pods(run_id)
 
 
-class RunpodProvider:
+class RunpodProvider(InstanceProvider):
     name = "runpod"
-    # Optional capability (read via getattr, kept off the runtime_checkable Protocol like
-    # run_instances_remaining): only RunPod offers the shared weight-cache network volume, so the
-    # runner's one-shot cache-less retry fallback is gated on it. Instance providers omit it -> False.
+    _gpu_identity_attr = "runpod_gpu_type_id"
+    # runpod accepts a card count directly; its static class table defines rentable shapes.
+    live_capacity = False
     supports_weight_cache = True
 
+    @property
+    def _handle_cls(self) -> type[InstanceJobHandle]:
+        from flash.providers.runpod.pods import RunpodPodHandle
+
+        return RunpodPodHandle
+
     def is_configured(self) -> bool:
-        # require a usable parsed key pool, not merely a set env var. otherwise the allocator ranks
-        # RunPod classes the operator cannot provision.
-        from flash.providers.runpod import auth
+        from flash.providers.runpod.auth import keys
 
-        return bool(auth.keys())
+        return bool(keys())
 
-    def preflight(self, require_hf: bool = True) -> list[str]:
+    def _load_api_key(self) -> Any:
+        from flash.providers.runpod.auth import load_api_key
+
+        return load_api_key()
+
+    def _missing_credentials(self, require_hf: bool) -> list[str]:
         from flash.providers.runpod.preflight import missing_credentials
 
         return missing_credentials(require_hf=require_hf)
 
-    def gpu_classes(self) -> list[GpuClass]:
-        from flash.providers.runpod.gpus import gpu_classes
-
-        return gpu_classes()
-
-    def hourly_rate(self, gpu: str) -> float:
+    def _hourly_rate(self, gpu: str) -> float:
         from flash.providers.runpod.pricing import hourly_rate
 
         return hourly_rate(gpu)
 
-    def live_candidates(
-        self, need_vram_gb: int, constraints: AllocationConstraints
-    ) -> list[Candidate]:
-        """RunPod validated classes fitting the VRAM requirement, priced by the static table.
-
-        RunPod takes the card count as a launch parameter and bills per card, so every allowed count
-        is offered at the same per-card rate; the allocator picks which one the run actually needs.
-        """
-        return [
-            Candidate("runpod", g.name, self.hourly_rate(g.name), g.vram_gb, count)
-            for g in self.gpu_classes()
-            if g.vram_gb >= need_vram_gb and g.validated
-            for count in rentable_gpu_counts(constraints.max_gpu_count)
-        ]
-
-    def submit_run(
+    def _submit_run(
         self,
         spec,
         seed: int,
         *,
-        log: Any = None,
-        on_handle: Any = None,
-        attempt: int = 0,
-        runtime_secrets: dict[str, str] | None = None,
-        on_last_gpu: bool = False,
-        source_snapshot: dict | None = None,
-        _deadline_at: float | None = None,
+        log: Any,
+        on_handle: Any,
+        attempt: int,
+        runtime_secrets: dict[str, str] | None,
+        source_snapshot: dict | None,
+        deadline_at: float | None,
     ) -> PollResult:
-        from flash.core.spec import require_matching_seed
-        from flash.providers.runpod.jobs import submit_run
+        from flash.providers.runpod.pods import submit_runpod_pod
 
-        seed = require_matching_seed(spec, seed)
-        kwargs = {
-            "log": log,
-            "on_handle": on_handle,
-            "attempt": attempt,
-            "on_last_gpu": on_last_gpu,
-            "source_snapshot": source_snapshot,
-            **deadline_kwargs(submit_run, _deadline_at),
-        }
-        if runtime_secrets:
-            kwargs["runtime_secrets"] = runtime_secrets
-        return submit_run(spec, seed, **kwargs)
+        return submit_runpod_pod(
+            spec,
+            seed,
+            log=log,
+            on_handle=on_handle,
+            attempt=attempt,
+            runtime_secrets=runtime_secrets,
+            source_snapshot=source_snapshot,
+            deadline_at=deadline_at,
+        )
+
+    def _poll_job(
+        self,
+        handle: JobHandle,
+        spec,
+        seed: int,
+        *,
+        log: Any,
+        heartbeat_reader: Any,
+        deadline_at: float | None,
+    ) -> PollResult:
+        from flash.providers.runpod.pods import poll_runpod_pod
+
+        return poll_runpod_pod(
+            handle,
+            spec,
+            seed,
+            log=log,
+            heartbeat_reader=heartbeat_reader,
+            deadline_at=deadline_at,
+        )
+
+    def _teardown_reattached(self, handle: JobHandle, spec) -> None:
+        from flash.providers.runpod.pods import terminate_handle
+
+        terminate_handle(handle, deadline_at=time.time() + 120.0)
 
     def poll(
         self,
@@ -109,113 +117,77 @@ class RunpodProvider:
         log: Any = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        from flash.core.spec import gpu_count_of, require_matching_seed
-        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
-        from flash.providers.runpod.jobs import (
-            make_hf_failure_detail_reader,
-            make_hf_heartbeat_reader,
-            poll_job,
-            stall_kwargs,
-        )
+        """Poll a recovered Pod and require complete Pod plus secret teardown."""
+        from flash.core.spec import require_matching_seed
+        from flash.providers.artifacts.hf import heartbeat_reader_for
 
         seed = require_matching_seed(spec, seed)
-        hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}"
-        hd = handle.to_dict()
-        rh = RunpodJobHandle.from_dict(hd)
-        if not rh.job_id:
-            raise ValueError("endpoint-only RunPod handles cannot be polled")
-        reader = (
-            make_hf_heartbeat_reader(
-                hf_repo,
-                prefix,
-                **deadline_kwargs(make_hf_heartbeat_reader, _deadline_at),
+        reader = heartbeat_reader_for(spec, deadline_at=_deadline_at)
+        strict = self._handle_cls.from_dict(handle.to_dict())
+        if strict.pending:
+            raise ValueError(
+                "pending RunPod Pod handles must be resolved and persisted before polling"
             )
-            if hf_repo
-            else None
-        )
-        failure_reader = (
-            make_hf_failure_detail_reader(
-                hf_repo,
-                prefix,
-                spec.phase,
-                attempt=rh.attempt,
-                **deadline_kwargs(make_hf_failure_detail_reader, _deadline_at),
-            )
-            if hf_repo
-            else None
-        )
         if log is not None:
-            print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
-        on_last_gpu = bool(hd.get("on_last_gpu", False))
-        return poll_job(
-            rh,
-            log=log,
-            heartbeat_reader=reader,
-            failure_detail_reader=failure_reader,
-            current_attempt=rh.attempt,
-            **deadline_kwargs(poll_job, _deadline_at),
-            # the persisted scarcity flag controls stall grace, not capacity wording. recovery
-            # rebuilds the unpinned allocation with a fresh candidate set, so claiming no escalation
-            # remains would be false.
-            #
-            # the card count comes from the spec rather than the handle's `allocated_gpu_count`:
-            # attach polls the persisted EFFECTIVE worker spec, which submission already stamped
-            # with the count allocation resolved, and the attach context pops that handle key off
-            # before the handle reaches here. same number, but sourced where it is always present.
-            **stall_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
-        )
+            print(f"attaching: runpod instance={strict.instance_id}", file=log, flush=True)
+        try:
+            result = self._poll_job(
+                strict,
+                spec,
+                seed,
+                log=log,
+                heartbeat_reader=reader,
+                deadline_at=_deadline_at,
+            )
+        except BaseException:
+            try:
+                self._teardown_reattached(strict, spec)
+            except Exception:
+                from flash.runner import _record_cleanup_remote
+
+                _record_cleanup_remote(spec.run_id, strict.to_dict())
+            raise
+        try:
+            self._teardown_reattached(strict, spec)
+        except Exception:
+            from flash.runner import _record_cleanup_remote
+
+            if not _record_cleanup_remote(spec.run_id, strict.to_dict()):
+                raise RuntimeError("runpod cleanup target could not be persisted") from None
+        return result
+
+    def _gc(self, run_id: str) -> None:
+        from flash.providers.runpod.pods import destroy_run_pods
+
+        destroy_run_pods(run_id)
+
+    def _sweep_orphans(self, *, active_labels, known_labels) -> list[str]:
+        from flash.providers.runpod.pods import sweep_orphan_pods
+
+        return sweep_orphan_pods(active_labels=active_labels, known_labels=known_labels)
+
+    def live_candidates(
+        self, need_vram_gb: int, constraints: AllocationConstraints
+    ) -> list[Candidate]:
+        return [
+            Candidate("runpod", gpu.name, self.hourly_rate(gpu.name), gpu.vram_gb, count)
+            for gpu in self.gpu_classes()
+            if gpu.vram_gb >= need_vram_gb and gpu.validated
+            for count in rentable_gpu_counts(constraints.max_gpu_count)
+        ]
 
     def cancel(self, handle: JobHandle) -> None:
-        from flash.providers.runpod import api as runpod_api
-        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+        from flash.providers.runpod.pods import terminate_handle
 
-        strict = RunpodJobHandle.from_dict(handle.to_dict())
-        if not strict.job_id:
-            raise runpod_api.RunpodApiError("runpod cancellation could not be confirmed")
-        response = runpod_api.cancel_job(
-            strict.endpoint_id,
-            strict.job_id,
-            key_fingerprint=strict.key_fingerprint,
-        )
-        if (
-            not isinstance(response, dict)
-            or response.get("id") != strict.job_id
-            or response.get("status") != "CANCELLED"
-        ):
-            raise runpod_api.RunpodApiError("runpod cancellation could not be confirmed")
+        strict = self._handle_cls.from_dict(handle.to_dict())
+        terminate_handle(strict, deadline_at=time.time() + 120.0)
 
-    def destroy(self, handle: JobHandle) -> None:
-        from flash.providers.runpod import api as runpod_api
-        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+    destroy = cancel
 
-        strict = RunpodJobHandle.from_dict(handle.to_dict())
-        if runpod_api.delete_endpoint_for_fingerprint(strict.endpoint_id, strict.key_fingerprint):
-            return
+    def run_instances_remaining(self, run_id: str) -> list[str]:
+        from flash.providers.runpod.pods import run_pods_remaining
 
-        if (
-            runpod_api.endpoint_absent_for_fingerprint(strict.endpoint_id, strict.key_fingerprint)
-            is not True
-        ):
-            raise runpod_api.RunpodApiError(
-                f"runpod delete_endpoint({strict.endpoint_id}) unconfirmed; endpoint may still bill"
-            )
-
-    def gc(self, spec) -> None:
-        from flash.providers.runpod.serverless import terminate_endpoint
-
-        # every acceptable class, not just the head: allocation ranks a multi-class pin on cost and
-        # may rent a fallback, whose endpoint name is derived from that class. matching is by name,
-        # so naming a class this run never rented is a no-op.
-        for gpu_type in spec.gpu.acceptable_types:
-            terminate_endpoint(gpu_type, spec.run_id)
-
-    def sweep_orphans(
-        self,
-        active_labels: set[str] | None = None,
-        known_labels: set[str] | None = None,
-    ) -> list[int]:
-        return []
+        return run_pods_remaining(run_id)
 
 
 PROVIDER: Provider = RunpodProvider()
