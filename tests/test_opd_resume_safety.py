@@ -980,11 +980,12 @@ def _install_marker_gate(
     checkpoint_state=None,
     state_download_error=None,
     fsdp_generation=1,
+    fsdp_world_size=2,
     shard_size_overrides=None,
 ):
     """Install one validated marker plus pinned checkpoint listing and metadata reads."""
     present_path = opd_optimizer_start_marker_path("run-1", 1)
-    seen = {"list_revision": None, "downloads": []}
+    seen = {"list_revision": None, "downloads": [], "path_info_requests": []}
 
     class Api:
         def repo_info(self, **_kwargs):
@@ -992,6 +993,7 @@ def _install_marker_gate(
 
         def get_paths_info(self, **kwargs):
             requested = kwargs.get("paths", [])
+            seen["path_info_requests"].append(requested)
             if present_path in requested:
                 return [SimpleNamespace(path=present_path, size=1)]
             available = (
@@ -1023,7 +1025,9 @@ def _install_marker_gate(
             return str(path)
         if kwargs["filename"].endswith("/actor/fsdp_config.json"):
             path = tmp_path / "fsdp_config.json"
-            path.write_text(json.dumps({"FSDP_version": fsdp_generation, "world_size": 2}))
+            path.write_text(
+                json.dumps({"FSDP_version": fsdp_generation, "world_size": fsdp_world_size})
+            )
             return str(path)
         if state_download_error is not None:
             raise state_download_error
@@ -1169,6 +1173,20 @@ def test_gate_blocks_wrong_private_fsdp_generation(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="fsdp generation mismatch"):
         _run_gate()
+
+
+def test_gate_rejects_oversized_fsdp_width_before_expanding_shard_paths(monkeypatch, tmp_path):
+    seen = _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_sharded_ckpt(40, 2),
+        fsdp_world_size=9,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid or missing fsdp stamp"):
+        _run_gate()
+
+    assert len(seen["path_info_requests"]) == 1
 
 
 @pytest.mark.parametrize(

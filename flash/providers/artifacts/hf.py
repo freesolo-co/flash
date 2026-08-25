@@ -152,6 +152,48 @@ def _opd_resume_checkpoint(
     return _RemoteResumeCheckpoint(step, prefix, inspection)
 
 
+def _validate_opd_optimizer_start_markers(
+    *,
+    hf_repo: str,
+    paths: list[str],
+    present: dict[str, object],
+    revision: str,
+    token: str | None,
+    run_id: str,
+    seed: int,
+    version: int,
+) -> None:
+    """download and decode every optimizer-start marker found at the pinned revision."""
+    for attempt, path in enumerate(paths):
+        if path not in present:
+            continue
+        try:
+            from huggingface_hub import hf_hub_download
+
+            local_path = hf_hub_download(
+                repo_id=hf_repo,
+                repo_type="dataset",
+                filename=path,
+                revision=revision,
+                token=token,
+                force_download=True,
+            )
+            with open(local_path, "rb") as file:
+                raw = file.read()
+            decode_opd_optimizer_start_json(
+                raw,
+                run_id=run_id,
+                attempt=attempt,
+                seed=seed,
+                version=version,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "opd retry evidence is unverifiable; replacement is blocked"
+            ) from exc
+        # one validated marker proves mutation; keep validating every present marker.
+
+
 def verify_opd_replacement_safe(
     *,
     hf_repo: str,
@@ -225,38 +267,16 @@ def verify_opd_replacement_safe(
         ) from exc
     if not present:
         return None
-    mutated = False
-    for attempt, path in enumerate(paths):
-        if path not in present:
-            continue
-        try:
-            from huggingface_hub import hf_hub_download
-
-            local_path = hf_hub_download(
-                repo_id=hf_repo,
-                repo_type="dataset",
-                filename=path,
-                revision=revision,
-                token=token,
-                force_download=True,
-            )
-            with open(local_path, "rb") as file:
-                raw = file.read()
-            decode_opd_optimizer_start_json(
-                raw,
-                run_id=run_id,
-                attempt=attempt,
-                seed=seed,
-                version=version,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "opd retry evidence is unverifiable; replacement is blocked"
-            ) from exc
-        # one validated marker proves mutation; keep validating every present marker.
-        mutated = True
-    if not mutated:
-        return None
+    _validate_opd_optimizer_start_markers(
+        hf_repo=hf_repo,
+        paths=paths,
+        present=present,
+        revision=revision,
+        token=token,
+        run_id=run_id,
+        seed=seed,
+        version=version,
+    )
     # the replacement gate uses the same dependency-light native manifest invariants as worker
     # preflight. tensor deserialization remains worker-side.
     selected = _opd_resume_checkpoint(

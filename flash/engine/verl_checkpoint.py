@@ -11,6 +11,7 @@ from flash._internal.fileio import reject_duplicate_keys
 from flash.engine.verl_policy import FsdpGeneration
 
 VERL_FSDP_CONFIG_FILE = "fsdp_config.json"
+_MAX_NATIVE_FSDP_WORLD_SIZE = 8
 _REQUIRED_SHARD_CLASSES = ("model", "optim", "extra_state")
 _SHARD_RE = re.compile(r"(model|optim|extra_state)_world_size_(\d+)_rank_(\d+)\.pt")
 _REJECT_DUPLICATE_CONFIG_KEYS = reject_duplicate_keys(
@@ -60,7 +61,9 @@ def parse_fsdp_stamp(raw: bytes | str | None) -> tuple[int, int] | None:
         return None
     generation = _positive_int(decoded.get("FSDP_version"))
     width = _positive_int(decoded.get("world_size"))
-    return (generation, width) if generation is not None and width is not None else None
+    if generation is None or width is None or width > _MAX_NATIVE_FSDP_WORLD_SIZE:
+        return None
+    return generation, width
 
 
 def inspect_fsdp_checkpoint_manifest(
