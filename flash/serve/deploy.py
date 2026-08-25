@@ -354,6 +354,10 @@ def deploy_adapter(
     Thinking adapters with structured outputs require serving to advertise deferred constraint
     support before the immutable revision is registered.
     """
+    from flash.serving.src.model_config import is_supported_base_model
+
+    if not is_supported_base_model(model):
+        raise ValueError(f"model {model!r} is not active in hosted serving")
     validate_serving_lora_rank(model, lora_rank, rank_source="configured train.lora_rank")
     subfolder = f"{adapter_prefix}/adapter"
     dep = deployment_record(

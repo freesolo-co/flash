@@ -14,7 +14,7 @@ from flash.serving.src.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.serving_io import _sse
 from flash.serving.src.streaming import openai_chat_stream, prepare_stream
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 
 
 def _record() -> AdapterRecord:

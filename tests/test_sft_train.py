@@ -396,7 +396,7 @@ def test_sft_quote_credits_only_the_ranks_that_will_execute():
     from flash.cost.types import RunConfig
 
     def speedup(method: str, batch: int, cards: int) -> float:
-        config = RunConfig(model_id="Qwen/Qwen3.5-4B", method=method, steps=10, batch_size=batch)
+        config = RunConfig(model_id="Qwen/Qwen3.5-9B", method=method, steps=10, batch_size=batch)
         return analytical.method_card_speedup(config, cards, "H100", "runpod")
 
     one_card = speedup("sft", 1, 1)
@@ -524,7 +524,7 @@ def test_batch_is_the_isolation_lever_that_replaces_the_removed_flag(support, ex
     from flash.engine.profiling.sft_workload import _packing_mode
 
     packing_mode, architecture_mode = _packing_mode(
-        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
         "rev",
         multimodal=False,
         allow_packing=True,
@@ -808,8 +808,10 @@ class _PreparedSourceProcessor:
         return_dict=False,
         return_tensors=None,
         enable_thinking=False,
+        preserve_thinking=False,
     ):
         assert enable_thinking is False
+        assert preserve_thinking is False
         prepared = any(
             isinstance(message.get("content"), list)
             and any(
@@ -1598,7 +1600,7 @@ def test_mrope_processor_check_matches_every_image_training_model():
     # config model_type for the catalog's image-training models. Qwen3.6-* ship as qwen3_5 configs
     # (the product version is not the architecture), and the -A3B moe variant is a separate one.
     model_types = {"qwen3_5", "qwen3_5_moe"}
-    assert len(_IMAGE_TRAINING_MODELS) == 6, (
+    assert len(_IMAGE_TRAINING_MODELS) == 3, (
         "the image-training catalog changed; confirm the new models' config model_type is covered"
     )
 
@@ -1607,7 +1609,7 @@ def test_mrope_processor_check_matches_every_image_training_model():
         assert entry, f"transformers has no image processor mapped for {model_type}"
         # every variant is checked, not just the default: the substring test is what makes the
         # branch tolerate the Fast/Pil suffixes, and a real model advertises the suffixed name
-        # (Qwen3.5-0.8B's preprocessor_config.json says Qwen2VLImageProcessorFast).
+        # (the surviving qwen3.5-9b preprocessor config names qwen2vlimageprocessorfast).
         names = list(entry.values()) if isinstance(entry, dict) else [entry]
         for name in names:
             assert literal in name, (
@@ -2619,7 +2621,7 @@ def _stub_sft_run(
     monkeypatch.setattr(catalog, "resolve_vocab_size", lambda *_args, **_kwargs: 151936)
 
     spec = SimpleNamespace(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         model_revision="a" * 40,
         algorithm="sft",
         seed=7,
@@ -2728,8 +2730,10 @@ def _stub_sft_run(
             tokenize,
             add_generation_prompt,
             enable_thinking,
+            preserve_thinking,
         ):
             assert tokenize is False
+            assert preserve_thinking is False
             rendered = "".join(
                 f"<{message['role']}>{message['content']}</{message['role']}>"
                 for message in messages
@@ -3292,7 +3296,7 @@ def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
         env=None,
         started_at=0.0,
         gpu_probe={"memory_gb": 24, "capability": [8, 9]},
-        model_id="Qwen/Qwen3.5-0.8B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="revision",
         epochs=1,
         learning_rate=5e-5,
@@ -3987,7 +3991,7 @@ def test_sft_hardware_ranking_prices_the_profiled_batch_not_the_authored_one(mon
 
     # the overrides must actually reach the config ranking prices, not just be computed.
     config = run_config_for_ranking(
-        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
         "sft",
         train={"batch_size": 8, "max_context_tokens": 4096},
         overrides=overrides,
@@ -4006,7 +4010,7 @@ def test_sft_hardware_ranking_prices_the_profiled_batch_not_the_authored_one(mon
     monkeypatch.setattr(cost_spec, "_sft_profile", boom)
     assert cost_spec.sft_ranking_overrides(spec) == {}
     fallback = run_config_for_ranking(
-        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
         "sft",
         train={"batch_size": 8},
         overrides=cost_spec.sft_ranking_overrides(spec),
@@ -4034,9 +4038,9 @@ def test_sft_vram_sizing_uses_the_profiled_batch_not_the_authored_one(monkeypatc
     authored = {"batch_size": 8, "max_context_tokens": 4096}
     overrides = {"batch_size": 1, "seq_len": 1404, "sft_retained_examples": 10}
 
-    sized_authored = allocator.required_vram_gb("Qwen/Qwen3.5-4B", "sft", train=authored)
+    sized_authored = allocator.required_vram_gb("Qwen/Qwen3.5-9B", "sft", train=authored)
     sized_executed = allocator.required_vram_gb(
-        "Qwen/Qwen3.5-4B", "sft", train={"batch_size": 1, "max_context_tokens": 1404}
+        "Qwen/Qwen3.5-9B", "sft", train={"batch_size": 1, "max_context_tokens": 1404}
     )
     assert sized_executed < sized_authored, (
         f"sizing off the authored batch reserves {sized_authored} GB for work that needs "
@@ -4053,7 +4057,7 @@ def test_sft_vram_sizing_uses_the_profiled_batch_not_the_authored_one(monkeypatc
     # allocation itself may fail on provider availability; sizing runs first, which is the contract
     # under test.
     with contextlib.suppress(Exception):
-        allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=authored, overrides=overrides)
+        allocator.allocate("Qwen/Qwen3.5-9B", "sft", train=authored, overrides=overrides)
     assert captured["train"] == {"batch_size": 1, "max_context_tokens": 1404}, (
         f"allocate() sized VRAM from {captured.get('train')!r}; it must pass the profile-overridden "
         "knobs or submit reserves for a batch the run never executes"
@@ -4062,11 +4066,11 @@ def test_sft_vram_sizing_uses_the_profiled_batch_not_the_authored_one(monkeypatc
     # a dataclass train table must substitute the same way, and absent overrides must not touch it.
     spec_train = TrainSpec(batch_size=8, max_context_tokens=4096)
     with contextlib.suppress(Exception):
-        allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=spec_train, overrides=overrides)
+        allocator.allocate("Qwen/Qwen3.5-9B", "sft", train=spec_train, overrides=overrides)
     assert captured["train"].batch_size == 1
     assert captured["train"].max_context_tokens == 1404
     with contextlib.suppress(Exception):
-        allocator.allocate("Qwen/Qwen3.5-4B", "sft", train=spec_train)
+        allocator.allocate("Qwen/Qwen3.5-9B", "sft", train=spec_train)
     assert captured["train"] is spec_train
 
 
@@ -4169,7 +4173,7 @@ def test_sft_idle_card_advice_does_not_shrink_the_memory_the_run_is_running_on()
 
     The idle-card warning fires on a rented shape the fit gate already accepted, and the ranks that
     joined are what hold the model. Dropping to the next rentable divisor is a VRAM change, not just
-    a billing one: Qwen3.6-27B sft at 32k is sized at 159 GB, a 4x H100 rental launching 3 ranks
+    a billing one: Qwen3.8-27B sft at 32k is sized at 159 GB, a 4x H100 rental launching 3 ranks
     provides 191.6 GB and runs, but batch 6 over 6 rows advised "allocate 2 card(s)" -- 130.4 GB,
     which the fit gate rejects. Acting on that remedy turns a working run into an unplaceable one.
 
@@ -4234,7 +4238,7 @@ def test_sft_quote_credits_the_width_the_rows_allow_not_just_the_batch():
 
     def speedup(rows):
         config = RunConfig(
-            model_id="Qwen/Qwen3.5-4B",
+            model_id="Qwen/Qwen3.5-9B",
             method="sft",
             steps=10,
             batch_size=8,

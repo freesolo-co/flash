@@ -3,7 +3,6 @@
 import json
 import os
 import shutil
-import struct
 from types import SimpleNamespace
 
 import pytest
@@ -40,16 +39,17 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
         # without them as an incomplete transfer, so the stub materializes both.
         with open(os.path.join(adapter_dir, "adapter_config.json"), "w", encoding="utf-8") as fh:
             json.dump({"peft_type": "LORA"}, fh)
-        tensor_name = "base_model.model.layers.0.q_proj.lora_A.default.weight"
-        header = json.dumps(
-            {tensor_name: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
-        ).encode()
         with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "wb") as fh:
-            fh.write(struct.pack("<Q", len(header)))
-            fh.write(header)
-            fh.write(struct.pack("<f", 1.0))
+            fh.write(b"fixture")
 
     monkeypatch.setattr(W, "HF_REPO", hf_repo, raising=False)
+    monkeypatch.setattr(
+        "flash.engine.worker.model.adapter._warmstart_adapter_is_loadable",
+        lambda adapter_dir: (
+            os.path.isfile(os.path.join(adapter_dir, "adapter_config.json"))
+            and os.path.isfile(os.path.join(adapter_dir, "adapter_model.safetensors"))
+        ),
+    )
     import huggingface_hub
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
@@ -177,7 +177,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     source = JobSpec.from_dict(
         {
             "run_id": "source-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "train": {"hf_repo": "owner/source-runs"},
         }
@@ -186,7 +186,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {
                 "init_from_adapter": "source-run",
@@ -208,7 +208,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
         return {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "base_model_name_or_path": "Qwen/Qwen3.5-9B",
             "r": 32,
             "rank_pattern": {"module": 64},
             "lora_alpha": 64,
@@ -245,14 +245,14 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     assert source_context is None
 
 
-def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
+def test_qwen36_adapter_is_never_reinterpreted_as_qwen38(monkeypatch):
     import flash.runner as R
     from flash.core.spec import JobSpec
 
     source = JobSpec.from_dict(
         {
             "run_id": "source-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.6-27B",
             "model_revision": "a" * 40,
             "model_revision_auto": True,
             "algorithm": "sft",
@@ -263,7 +263,38 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.8-27B",
+            "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+            "model_revision_auto": True,
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run"},
+        }
+    )
+    monkeypatch.setattr(R, "get_status", lambda run_id: source_status)
+
+    with pytest.raises(ValueError, match=r"unsupported model 'Qwen/Qwen3\.6-27B'"):
+        R._prepare_init_from_adapter(child, token="token")
+
+
+def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
+    import flash.runner as R
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-9B",
+            "model_revision": "a" * 40,
+            "model_revision_auto": True,
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    source_status = provisioned_status(R, source, state="done")
+    child = JobSpec.from_dict(
+        {
+            "run_id": "child-run",
+            "model": "Qwen/Qwen3.5-9B",
             "model_revision": "b" * 40,
             "model_revision_auto": True,
             "algorithm": "grpo",
@@ -287,7 +318,7 @@ def test_unmanaged_source_revision_is_rejected_during_decode():
         JobSpec.from_dict(
             {
                 "run_id": "source-run",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "model_revision": _REVISION,
                 "algorithm": "sft",
                 "train": {"hf_repo": "owner/source-runs"},
@@ -303,7 +334,7 @@ def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
     source = JobSpec.from_dict(
         {
             "run_id": "source-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "model_revision": _REVISION,
             "model_revision_auto": True,
             "algorithm": "sft",
@@ -314,7 +345,7 @@ def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"init_from_adapter": "source-run"},
         }
@@ -347,12 +378,11 @@ def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
 def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeypatch):
     """The inherited pin must be on the spec BEFORE `resolve_model` sizes the run.
 
-    Sizing reads the revision: `resolve_model` re-derives params/vocab from the pinned commit and
-    raises `min_disk_gb` to `ceil(2 * params_b) + 64`, which for half of today's catalog exceeds the
-    catalog default (Qwen3.5-4B: 0 -> 73). Inheriting inside `_prepare_init_from_adapter`, which
-    runs after `resolve_model`, `_with_model_disk`, and `_assign_weight_cache_volume`, provisions
-    the child as if unpinned while training it pinned, and skips the geometry validation the pin
-    exists to enforce.
+    Sizing reads the revision: `resolve_model` re-derives params and vocab from the pinned commit,
+    validates them against the catalog row, and applies the revision-specific disk floor. Inheriting
+    inside `_prepare_init_from_adapter`, which runs after `resolve_model`, `_with_model_disk`, and
+    `_assign_weight_cache_volume`, provisions the child as if unpinned while training it pinned and
+    skips the geometry validation the pin exists to enforce.
 
     So this asserts the ORDER, not just the final value: what `resolve_model` was handed. The
     sibling test above covers the value; only this one fails if the inheritance moves back down.
@@ -366,7 +396,7 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
     source = JobSpec.from_dict(
         {
             "run_id": "source-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "model_revision": _REVISION,
             "model_revision_auto": True,
             "algorithm": "sft",
@@ -377,7 +407,7 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"init_from_adapter": "source-run", "lora_rank": 8, "lora_alpha": 16},
         }
@@ -405,7 +435,7 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
         lambda adapter_ref, token, revision: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "base_model_name_or_path": "Qwen/Qwen3.5-9B",
             "r": 64,
             "lora_alpha": 128,
             # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
@@ -437,7 +467,7 @@ def _auto_pinned_source(R, *, org_id="org-a"):
     source = JobSpec.from_dict(
         {
             "run_id": "source-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "model_revision": _REVISION,
             "model_revision_auto": True,
             "algorithm": "sft",
@@ -456,7 +486,7 @@ def _unpinned_child():
     return JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"init_from_adapter": "source-run"},
         }
@@ -562,7 +592,7 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     source = JobSpec.from_dict(
         {
             "run_id": "source-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "train": {"hf_repo": "owner/source-runs", "max_context_tokens": 8192},
         }
@@ -571,7 +601,7 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     child = JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {
                 "init_from_adapter": "source-run/step-20",
@@ -598,7 +628,7 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
         lambda adapter_ref, token, revision: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "base_model_name_or_path": "Qwen/Qwen3.5-9B",
             "r": 64,
             "lora_alpha": 128,
             # peft>=0.19 writes this on every save; submit rejects an unmarked adapter, and
@@ -645,7 +675,7 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
     public = JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"init_from_adapter": "source-run", "lora_rank": 8},
         }
@@ -754,7 +784,7 @@ def test_public_status_redacts_internal_storage_ref_on_valid_spec(stored_ref, ex
 
     raw_spec = {
         "run_id": "child-run",
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "gpu": {"type": "RTX 4090"},
         "train": {"init_from_adapter": stored_ref, "init_from_adapter_revision": _REVISION},
@@ -777,7 +807,7 @@ def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_pa
     public = JobSpec.from_dict(
         {
             "run_id": "legacy-child",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"init_from_adapter": "source-run"},
         }
@@ -804,7 +834,7 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
     public = JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "gpu": {"type": "RTX 4090"},
             "train": {"init_from_adapter": "source-run", "lora_rank": 8},
@@ -865,7 +895,7 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
     public = JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"init_from_adapter": "source-run", "lora_rank": 8},
         }
@@ -939,7 +969,7 @@ def test_effective_snapshot_rejects_tampering(field, value):
     public = JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "environment": {"id": "owner/environment"},
             "train": {"init_from_adapter": "source-run", "lora_rank": 8, "lora_alpha": 16},
@@ -987,6 +1017,25 @@ def test_effective_snapshot_rejects_tampering(field, value):
         R.effective_spec_from_status(status)
 
 
+@pytest.mark.parametrize(
+    "retired_model",
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"],
+)
+def test_effective_spec_rejects_persisted_removed_model_before_activation(retired_model):
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+
+    current = JobSpec.from_dict(
+        {"run_id": "retired", "model": "Qwen/Qwen3.5-9B", "algorithm": "sft"}
+    )
+    stored = current.to_dict()
+    stored["model"] = retired_model
+    status = runner.RunStatus(run_id="retired", state="running", spec=stored)
+
+    with pytest.raises(ValueError, match="unsupported model"):
+        runner.effective_spec_from_status(status)
+
+
 def test_worker_metrics_sanitizer_redacts_nested_and_direct_private_refs():
     from flash.engine.result.accounting import RunMetrics, sanitize_worker_metrics
 
@@ -1023,7 +1072,7 @@ def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_
     spec = JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
         }
     )
@@ -1060,7 +1109,7 @@ def test_legacy_warmstart_status_fails_closed_without_private_snapshot():
     public = JobSpec.from_dict(
         {
             "run_id": "legacy-child",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {"init_from_adapter": "source-run"},
         }
@@ -1092,7 +1141,7 @@ def test_every_algorithm_pair_prepares_a_warm_start(
     source = JobSpec.from_dict(
         {
             "run_id": "source-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "model_revision": _REVISION,
             # runner-assigned, which is the pin shape a child must be able to inherit AND deploy.
             "model_revision_auto": True,
@@ -1257,7 +1306,7 @@ def test_inherited_sft_pin_survives_the_force_pin_when_the_hub_tip_moved(monkeyp
     inherited = JobSpec.from_dict(
         {
             "run_id": "child-run",
-            "model": "Qwen/Qwen3-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "model_revision": _REVISION,
             "model_revision_auto": True,
@@ -1293,7 +1342,7 @@ def test_force_pin_still_pins_a_fresh_sft_run_to_the_hub_tip(monkeypatch):
     fresh = JobSpec.from_dict(
         {
             "run_id": "fresh-run",
-            "model": "Qwen/Qwen3-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "train": {"hf_repo": "org/repo"},
             "environment": {"id": "org/env"},
@@ -1325,7 +1374,7 @@ def test_recovery_reproduces_a_digest_taken_before_lora_alpha_was_public(monkeyp
     public = JobSpec.from_dict(
         {
             "run_id": "pre-alpha-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "gpu": {"type": "RTX 4090"},
             "train": {"lora_rank": 32},
@@ -1412,7 +1461,7 @@ def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(mon
         JobSpec.from_dict(
             {
                 "run_id": "pre-alpha-persist",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "gpu": {"type": "RTX 4090"},
                 "train": {"lora_rank": 32},
@@ -1478,7 +1527,7 @@ def test_digest_matches_the_shape_the_deployed_release_writes(monkeypatch, tmp_p
         JobSpec.from_dict(
             {
                 "run_id": "canonical-digest-run",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "gpu": {"type": "RTX 4090"},
                 "train": {"lora_rank": 32},

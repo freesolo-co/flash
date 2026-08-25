@@ -25,7 +25,7 @@ class _Client:
             "error": None,
             "spec": {
                 "project": "11111111-1111-4111-8111-111111111111",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
             },
         }
@@ -52,7 +52,7 @@ def test_plain_path_stays_machine_readable(monkeypatch, fake_client, capsys) -> 
     assert cli.main(["models", "list"]) == 0
     out = capsys.readouterr().out
     # plain output is bare model ids, one per line, with no themed header or detail columns
-    assert "Qwen/Qwen3.5-0.8B" in out
+    assert "Qwen/Qwen3.5-9B" in out
     assert "supported base models" not in out
     assert "Qwen/Qwen3.5-9B" in out
     assert "\t" not in out
@@ -72,7 +72,7 @@ def test_styled_path_is_themed_but_lossless(monkeypatch, fake_client, capsys) ->
     assert cli.main(["models", "list"]) == 0
     out = capsys.readouterr().out
     assert "supported base models" in out  # themed header
-    assert "Qwen/Qwen3.5-0.8B" in out
+    assert "Qwen/Qwen3.5-9B" in out
     assert "PARAMS" not in out  # ids only — no reintroduced detail columns
 
     assert cli.main(["runs", "status", "flash-1"]) == 0
@@ -935,7 +935,7 @@ def test_progress_age_always_adds_to_heartbeat_age(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"},
     }
     heartbeat = {
         "stage": "rl_step",
@@ -1110,7 +1110,7 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"},
     }
 
     stale = dict(base, last_heartbeat={"stage": "rl_step", "step": 1, "ts": _time.time() - 1200})
@@ -1207,7 +1207,7 @@ def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
     }
 
     # model_prefetching is the stage that actually pulls base weights, so it is the one whose
@@ -1274,7 +1274,7 @@ def test_setup_hint_does_not_blame_a_download_on_a_stage_that_never_downloads(mo
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
     }
 
     frozen = dict(base, last_heartbeat={"stage": "sft_configuring", "ts": _time.time() - 1200})
@@ -1304,7 +1304,7 @@ def test_warmup_reassurance_yields_once_the_silence_is_unexplained(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "rl"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "rl"},
     }
 
     # inside the overlap: the specific hint wins, the reassurance stands down.
@@ -1337,7 +1337,7 @@ def test_opd_model_load_is_not_described_as_a_weight_download(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "opd"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "opd"},
     }
 
     opd = dict(base, last_heartbeat={"stage": "opd_model_load", "ts": _time.time() - 1200})
@@ -1377,7 +1377,7 @@ def test_stale_datacenter_is_labelled_as_the_previous_attempt(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
     }
 
     superseded = dict(
@@ -1471,7 +1471,7 @@ def test_finalizing_silence_is_not_called_unusual(stage, monkeypatch):
     obj = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
         "last_heartbeat": {"stage": stage, "ts": _time.time() - 1200},
     }
     out = render.run_status(obj)
@@ -1496,7 +1496,7 @@ def test_setup_hint_cites_the_datacenter_only_when_the_row_is_rendered(monkeypat
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
     }
 
     without_dc = dict(
@@ -1560,7 +1560,7 @@ def test_quiet_hint_does_not_send_users_to_an_hourly_log(monkeypatch):
     quiet = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"},
         "last_heartbeat": {"stage": "rl_train_start", "ts": _time.time() - 400},
     }
     out = render.run_status(quiet).split("details")[0]
@@ -1593,7 +1593,7 @@ def test_a_cleared_remote_does_not_present_a_dead_attempts_region_as_live(monkey
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
     }
     heartbeat = {
         "stage": "sft_model_load",
@@ -1630,7 +1630,7 @@ def test_a_superseded_ping_is_not_called_alive_by_the_quiet_hint(monkeypatch):
     base = {
         "run_id": "flash-1",
         "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"},
     }
     # rl_train_start is deliberate: it is in neither hint's stage set, so before this fix nothing
     # suppressed the quiet hint and the contradiction was reachable.

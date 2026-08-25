@@ -14,7 +14,7 @@ from flash.cli.commands.serve_undeploy import cmd_serve_undeploy
 from flash.cli.serve_parser import _add_serve_commands
 from flash.serve.control import DeploymentResult
 from flash.serve.resolve import ResolveError
-from tests.test_cli_serve_deploy import IMAGE, MODEL, _stub_resolution
+from tests.test_cli_serve_deploy import IMAGE, MODEL, _historical_identity, _stub_resolution
 
 
 def _parse(argv: list[str]) -> argparse.Namespace:
@@ -121,6 +121,29 @@ def _fail_hub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("flash.serve.resolve.resolve_base_revision", _base_failure)
     monkeypatch.setattr("flash.serve.resolve.resolve_adapter", _adapter_failure)
+
+
+@pytest.mark.parametrize(
+    "retired_model",
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
+)
+def test_undeploy_uses_immutable_identity_for_removed_model(
+    monkeypatch: pytest.MonkeyPatch, retired_model: str
+) -> None:
+    args = _args("modal")
+    args.deployment_identity = _historical_identity(monkeypatch, args, retired_model)
+    args.model = retired_model
+    _stub_credentials(monkeypatch)
+    seen = []
+
+    def _teardown(bundle, handle, credentials, *, deadline_at, **_kwargs):
+        seen.append(bundle.spec.adapters[0].base_model)
+        return _result(bundle, "absent")
+
+    monkeypatch.setattr("flash.serve.provisioning.modal.teardown_modal_deployment", _teardown)
+
+    assert cmd_serve_undeploy(args) == 0
+    assert seen == [retired_model]
 
 
 @pytest.mark.parametrize(

@@ -92,7 +92,7 @@ CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
 # is_torch_cuda_available(), so they answer False on any machine without a gpu regardless of the
 # installed version. An earlier revision of this comment claimed a 5.13 import-path move made them
 # answer False; that mechanism does not exist. See Dockerfile.worker's sanity block.
-TRANSFORMERS_REQUIREMENT = "transformers>=5.6,<5.13"
+TRANSFORMERS_REQUIREMENT = "transformers>=5.8,<5.13"
 # exact deployed install and override pin; the range above remains public package metadata.
 TRANSFORMERS_INSTALL_REQUIREMENT = "transformers==5.12.1"
 

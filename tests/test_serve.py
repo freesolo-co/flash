@@ -172,7 +172,7 @@ def test_deploy_dry_run():
 
     dep = deploy_adapter(
         run_id="r1",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/r1/seed0",
         dry_run=True,
@@ -197,7 +197,7 @@ def test_thinking_structured_dry_run_does_not_probe_capabilities(monkeypatch):
     )
     dep = d.deploy_adapter(
         run_id="r1",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/r1/seed0",
         dry_run=True,
@@ -222,31 +222,28 @@ def test_deploy_9b_dry_run_is_not_rejected():
     assert dep.to_dict()["state"] == "dry_run"
 
 
-def test_deploy_27b_dry_run_accepts_rank_at_serving_cap():
-    from flash.serve.deploy import deploy_adapter
+def test_deploy_27b_rejects_before_rank_resolution_or_dry_run_success(monkeypatch):
+    import flash.serve.deploy as deploy
 
-    dep = deploy_adapter(
-        run_id="q27",
-        model="Qwen/Qwen3.6-27B",
-        hf_repo="org/repo",
-        adapter_prefix="sft/q27/seed0",
-        dry_run=True,
-        lora_rank=64,
+    monkeypatch.setattr(
+        deploy,
+        "validate_serving_lora_rank",
+        lambda *_args, **_kwargs: pytest.fail("inactive model must reject before rank validation"),
     )
-    assert dep.to_dict()["state"] == "dry_run"
+    monkeypatch.setattr(
+        deploy,
+        "deployment_record",
+        lambda *_args, **_kwargs: pytest.fail("inactive model must reject before artifact shaping"),
+    )
 
-
-def test_deploy_27b_rejects_lora_rank_above_serving_cap():
-    from flash.serve.deploy import deploy_adapter
-
-    with pytest.raises(ValueError, match="max_lora_rank=64"):
-        deploy_adapter(
-            run_id="q27-r65",
-            model="Qwen/Qwen3.6-27B",
+    with pytest.raises(ValueError, match="not active in hosted serving"):
+        deploy.deploy_adapter(
+            run_id="q27",
+            model="Qwen/Qwen3.8-27B",
             hf_repo="org/repo",
-            adapter_prefix="sft/q27-r65/seed0",
+            adapter_prefix="sft/q27/seed0",
             dry_run=True,
-            lora_rank=65,
+            lora_rank=64,
         )
 
 
@@ -256,12 +253,12 @@ def test_deploy_rejects_lora_rank_above_serving_cap():
 
     # derive the over-cap rank from the catalog rather than hardcoding it: the 4B cap has moved
     # twice (32 -> 64 -> 128), and a literal here silently stops testing the boundary each time.
-    cap = serving_lora_rank_cap("Qwen/Qwen3.5-4B")
+    cap = serving_lora_rank_cap("Qwen/Qwen3.5-9B")
     assert cap is not None
     with pytest.raises(ValueError, match=f"max_lora_rank={cap}"):
         deploy_adapter(
             run_id="r-over-cap",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-over-cap/seed0",
             dry_run=True,
@@ -277,7 +274,7 @@ def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, 
     # the artifact's effective rank exceeds the cap even though the spec lora_rank (32) fits, so
     # deploy must catch the ARTIFACT rank. derived from the catalog: pinned to a literal, this stops
     # exercising the over-cap branch the moment the cap rises past it (as it just did, 64 -> 128).
-    cap = serving_lora_rank_cap("Qwen/Qwen3.5-4B")
+    cap = serving_lora_rank_cap("Qwen/Qwen3.5-9B")
     assert cap is not None
     over_cap = cap + 1
     seen = _stub_adapter_config(monkeypatch, tmp_path, rank=over_cap)
@@ -285,7 +282,7 @@ def test_deploy_rejects_recombined_artifact_rank_above_serving_cap(monkeypatch, 
     with pytest.raises(ValueError, match=f"adapter artifact has rank {over_cap}"):
         deploy_adapter(
             run_id="r-recombined",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="grpo/r-recombined/seed0",
             dry_run=False,
@@ -304,7 +301,7 @@ def test_deploy_rejects_adapter_config_without_rank_metadata(monkeypatch, tmp_pa
     with pytest.raises(ValueError, match="no LoRA rank metadata"):
         deploy_adapter(
             run_id="r-missing-rank",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-missing-rank/seed0",
             dry_run=False,
@@ -320,7 +317,7 @@ def test_deploy_rejects_falsey_invalid_rank_pattern(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="invalid rank_pattern"):
         deploy_adapter(
             run_id="r-bad-pattern",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-bad-pattern/seed0",
             dry_run=False,
@@ -344,7 +341,7 @@ def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
     ) as excinfo:
         d.deploy_adapter(
             run_id="r-hf-down",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-hf-down/seed0",
             dry_run=False,
@@ -375,7 +372,7 @@ def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
     ):
         d.deploy_adapter(
             run_id="r-missing",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-missing/seed0",
             dry_run=False,
@@ -391,7 +388,7 @@ def test_deploy_adapter_missing_tensor_file_is_adapter_tensor_missing(monkeypatc
     with pytest.raises(d.AdapterTensorMissing, match="no adapter_model tensor file"):
         d.deploy_adapter(
             run_id="r-missing-tensors",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-missing-tensors/seed0",
             dry_run=False,
@@ -407,7 +404,7 @@ def test_deploy_adapter_zero_byte_tensor_file_is_adapter_tensor_missing(monkeypa
     with pytest.raises(d.AdapterTensorMissing, match="zero-byte adapter tensor"):
         d.deploy_adapter(
             run_id="r-empty-tensors",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-empty-tensors/seed0",
             dry_run=False,
@@ -430,7 +427,7 @@ def test_deploy_adapter_rejects_zero_byte_sharded_tensor(monkeypatch, tmp_path):
     with pytest.raises(d.AdapterTensorMissing, match=r"adapter_model-00002-of-00002\.safetensors"):
         d.deploy_adapter(
             run_id="r-empty-shard",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/r-empty-shard/seed0",
             dry_run=False,
@@ -452,7 +449,7 @@ def test_deploy_adapter_options_are_keyword_only():
     from flash.serve.deploy import deploy_adapter
 
     with pytest.raises(TypeError):
-        deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0", True)
+        deploy_adapter("r1", "Qwen/Qwen3.5-9B", "org/repo", "sft/r1/seed0", True)
 
 
 def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serving_registry):
@@ -487,7 +484,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
 
     dep = d.deploy_adapter(
         run_id="flash-7-abcd",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
     )
@@ -496,7 +493,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
     assert seen["json"] == {
         "adapter_id": revision,
         "repo_id": "org/repo",
-        "base_model": "Qwen/Qwen3.5-0.8B",
+        "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "sft/flash-7-abcd/seed0/adapter",
         # flash always uploads adapters to HF *dataset* repos, so serving must be told to
         # pull from the dataset namespace (else snapshot_download 404s on the model namespace).
@@ -537,7 +534,7 @@ def test_deploy_registers_structured_outputs_default(monkeypatch, tmp_path, stub
         stub_serving_registry,
         events=events,
         run_id="flash-7-abcd",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
         structured_outputs=spec,
@@ -559,7 +556,7 @@ def test_deploy_omits_structured_outputs_when_unset(monkeypatch, tmp_path, stub_
         tmp_path,
         stub_serving_registry,
         run_id="flash-7-abcd",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
         structured_outputs="",
@@ -578,7 +575,7 @@ def test_deploy_registers_structured_outputs_for_thinking_after_capability_probe
         stub_serving_registry,
         events=events,
         run_id="flash-7-abcd",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
         thinking=True,
@@ -660,7 +657,7 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
     with pytest.raises(d.ServingError, match=match):
         d.deploy_adapter(
             run_id="flash-7-abcd",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/flash-7-abcd/seed0",
             thinking=True,
@@ -709,7 +706,7 @@ def test_missing_provenance_only_still_deploys(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="REACHED_POST"):
         d.deploy_adapter(
             run_id="flash-7-abcd",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/flash-7-abcd/seed0",
             thinking=True,
@@ -761,7 +758,7 @@ def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatc
 
     d.deploy_adapter(
         run_id="flash-7-no-provenance",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-no-provenance/seed0",
     )
@@ -771,7 +768,7 @@ def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatc
     captured.clear()
     d.deploy_adapter(
         run_id="flash-7-with-provenance",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-with-provenance/seed0",
     )
@@ -848,7 +845,7 @@ def test_revision_ready_budget_scales_with_base_model_size():
     import flash.serve.deploy as d
     from flash.core.catalog import MODELS
 
-    smallest = d.revision_ready_budget_seconds("Qwen/Qwen3.5-0.8B")
+    smallest = d.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
     largest = d.revision_ready_budget_seconds("Qwen/Qwen3.6-35B-A3B")
     assert smallest >= d.REVISION_READY_MIN_BUDGET_SECONDS
     assert largest > smallest
@@ -862,10 +859,17 @@ def test_revision_ready_budget_scales_with_base_model_size():
         assert d.REVISION_READY_MIN_BUDGET_SECONDS <= budget <= d.REVISION_READY_MAX_BUDGET_SECONDS
     ordered = [budget for _params, budget in sorted(budgets)]
     assert ordered == sorted(ordered)
-    # and the per-B term is genuinely live below the cap, not a constant the cap flattens: two
-    # distinct sub-cap sizes must get distinct budgets, or "scales with size" is untested.
-    sub_cap = sorted({b for b in ordered if b < d.REVISION_READY_MAX_BUDGET_SECONDS})
-    assert len(sub_cap) >= 2
+    # the surviving catalog has only one sub-cap row, so add a synthetic smaller row to prove the
+    # per-b term remains live without restoring a retired executable model id.
+    from dataclasses import replace
+
+    synthetic_id = "test/readiness-budget-smaller"
+    MODELS[synthetic_id] = replace(MODELS["Qwen/Qwen3.5-9B"], id=synthetic_id, params_b=1.0)
+    try:
+        synthetic = d.revision_ready_budget_seconds(synthetic_id)
+    finally:
+        del MODELS[synthetic_id]
+    assert d.REVISION_READY_MIN_BUDGET_SECONDS < synthetic < smallest
 
     # an MoE is sized by its TOTAL params: every expert is resident even though a token routes
     # through few, so active_params_b must not shrink the budget. asserted against the formula
@@ -1186,7 +1190,7 @@ def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp
     def registered(adapter_id, *, timeout_s=None):
         assert adapter_id == registration_body["adapter_id"]
         # the deploy funds this read from the model's own scaled budget, not the bare floor.
-        assert timeout_s == d.revision_ready_budget_seconds("Qwen/Qwen3.5-4B")
+        assert timeout_s == d.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
         clock[0] += timeout_s
         return (
             {
@@ -1209,7 +1213,7 @@ def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp
     with pytest.raises(d.ServingError, match="revision_ready_timeout"):
         d.deploy_adapter(
             run_id="run-expiry",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/run-expiry/seed0",
         )
@@ -1293,7 +1297,7 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_servin
 
     d.deploy_adapter(
         run_id="flash-7-abcd",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
         org_id="org-xyz",
@@ -1303,7 +1307,7 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_servin
     # No org -> the key is omitted entirely (registration shape unchanged for older callers).
     d.deploy_adapter(
         run_id="flash-7-abcd",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
     )
@@ -1340,7 +1344,7 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
 
     d.deploy_adapter(
         run_id="flash-7-abcd",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
         thinking=True,
@@ -1351,7 +1355,7 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
     # default (else Qwen3.5's template default thinking-ON emits a reasoning preamble).
     d.deploy_adapter(
         run_id="flash-7-abcd",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
         thinking=False,
@@ -1374,7 +1378,7 @@ def test_deploy_propagates_serving_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(d.httpx, "post", lambda *a, **k: _Resp())
     with pytest.raises(d.ServingError):
-        d.deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0")
+        d.deploy_adapter("r1", "Qwen/Qwen3.5-9B", "org/repo", "sft/r1/seed0")
 
 
 def test_undeploy_deletes_on_freesolo_serving(monkeypatch):

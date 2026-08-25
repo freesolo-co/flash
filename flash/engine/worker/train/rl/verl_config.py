@@ -16,6 +16,7 @@ import os
 from flash.adapters.targets import resolve_lora_targeting
 from flash.content.multimodal import messages_with_decoded_images
 from flash.content.structured_outputs import reasoning_parser_for
+from flash.content.thinking import messages_for_chat_template
 from flash.engine.worker.backend_common import (
     actor_fsdp_strategy_overrides,
     agent_loop_workers,
@@ -27,7 +28,11 @@ from flash.engine.worker.backend_common import (
     trainer_dtype_overrides,
 )
 from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.sft_train import _hydra_val, _verl_image_message_content
+from flash.engine.worker.sft_train import _hydra_val
+from flash.engine.worker.train.core.prompt_rows import (
+    canonical_prompt_messages,
+    prompt_message_features,
+)
 from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
@@ -76,18 +81,9 @@ def build_verl_dataset_rows(
     for position, (messages, idx, gt) in enumerate(
         zip(message_prompts, example_indices, ground_truths, strict=True)
     ):
-        prompt: list[dict] | list
-        if image_uris is None:
-            prompt = messages
-        else:
-            prompt = [
-                {
-                    "role": str(message.get("role") or ""),
-                    "content": _verl_image_message_content(message.get("content")),
-                }
-                for message in messages
-            ]
-            placeholders = sum(str(message["content"]).count("<image>") for message in prompt)
+        prompt = canonical_prompt_messages(messages, multimodal=image_uris is not None)
+        if image_uris is not None:
+            placeholders = sum(message["content"].count("<image>") for message in prompt)
             if placeholders != len(image_uris[position]):
                 raise ValueError(
                     f"multimodal prompt for example {int(idx)} has {placeholders} <image> "
@@ -133,7 +129,11 @@ def _processor_expanded_prompt(
     images = decode_image_descriptors(list(image_descriptors), package_root)
     prepared = messages_with_decoded_images(messages, images)
     rendered = processor.apply_chat_template(
-        prepared, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
+        messages_for_chat_template(prepared),
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+        preserve_thinking=False,
     )
     model_inputs = processor(
         text=[rendered], images=images or None, videos=None, return_tensors="pt"
@@ -146,32 +146,31 @@ def _processor_expanded_prompt(
     return [int(token_id) for token_id in input_ids], rendered
 
 
-def _verl_grpo_parquet_features():
-    """provide an explicit arrow schema for multimodal grpo rows.
-
-    mixed text/image jobs can infer an all-empty ``images`` column as null, which verl cannot read
-    as a struct. the pinned schema keeps every row compatible.
-    """
+def _verl_grpo_parquet_features(*, multimodal: bool, prompt: dict):
+    """provide one explicit arrow schema for the full grpo row set."""
     from datasets import Features, Value
 
-    return Features(
-        {
-            "data_source": Value("string"),
-            "prompt": [{"role": Value("string"), "content": Value("string")}],
-            "images": [{"image": Value("string")}],
-            "ability": Value("string"),
-            "reward_model": {"style": Value("string"), "ground_truth": Value("string")},
-            "extra_info": {"split": Value("string"), "index": Value("int64")},
-        }
-    )
+    features = {
+        "data_source": Value("string"),
+        "prompt": [prompt],
+        "ability": Value("string"),
+        "reward_model": {"style": Value("string"), "ground_truth": Value("string")},
+        "extra_info": {"split": Value("string"), "index": Value("int64")},
+    }
+    if multimodal:
+        # mixed jobs can otherwise infer an all-empty images column as null, which verl cannot read.
+        features["images"] = [{"image": Value("string")}]
+    return Features(features)
 
 
 def write_verl_grpo_parquet(rows: list[dict], path: str) -> None:
-    """write grpo rows to parquet, pinning the schema when the job is multimodal."""
+    """write grpo rows with one explicit schema derived from the full row set."""
     from datasets import Dataset
 
-    multimodal = any("images" in row for row in rows)
-    features = _verl_grpo_parquet_features() if multimodal else None
+    features = _verl_grpo_parquet_features(
+        multimodal=any("images" in row for row in rows),
+        prompt=prompt_message_features(rows),
+    )
     Dataset.from_list(rows, features=features).to_parquet(path)
 
 
@@ -213,6 +212,7 @@ def _data_overrides(cfg: dict) -> list[str]:
         # rollout prompt parity: verl renders raw messages with the tokenizer's chat template;
         # thread flash's thinking mode so the rollout sees the same prompt the retired trl path saw.
         f"+data.apply_chat_template_kwargs.enable_thinking={str(bool(cfg.get('thinking', False))).lower()}",
+        "+data.apply_chat_template_kwargs.preserve_thinking=false",
         f"data.seed={cfg['seed']}",
         "data.dataloader_num_workers=0",
         # set the rollout seed through engine_kwargs: verl 0.8.0 has no RolloutConfig.seed, and

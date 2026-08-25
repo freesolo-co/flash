@@ -47,7 +47,7 @@ def _spec(run_id="flash-1700000001-rt01", algorithm="sft", **gpu_kw) -> JobSpec:
     return attach_sft_profile(
         JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": algorithm,
                 "run_id": run_id,
                 "environment": {
@@ -76,6 +76,8 @@ def _public_spec(run_id="flash-1700000001-rt01", algorithm="sft") -> JobSpec:
     spec instead of a second hand-written copy that could drift from it.
     """
     public = _spec(run_id=run_id, algorithm=algorithm).to_dict()
+    # submission tests exercise environment and persistence boundaries, not an exact gpu pin.
+    public["gpu"]["type"] = ""
     return JobSpec.from_dict({**public, "run_id": run_id})
 
 
@@ -1495,9 +1497,9 @@ def test_select_candidate_escapes_a_failed_preferred_provider():
 def test_select_candidate_keeps_the_allocators_per_step_ranking():
     """The picker must take the allocator's order, not re-price the list by hourly rate.
 
-    ``allocate()`` ranks on the dollars one optimizer STEP costs, so a faster card can rank first
-    while costing more per hour -- the real Qwen3.5-0.8B OPD case ranks the $0.99/hr RTX 5090 ahead
-    of the $0.69/hr RTX 4090. Re-sorting here on total $/hr overrode that on the FIRST paid attempt,
+    ``allocate()`` ranks on the dollars one optimizer step costs, so a faster card can rank first
+    while costing more per hour. a measured opd case ranks the $0.99/hr rtx 5090 ahead of the
+    $0.69/hr rtx 4090. re-sorting here on total $/hr overrode that on the first paid attempt,
     running the slower card for more total money. Ordering is the allocator's job; this picker only
     demotes failed providers and tried shapes.
     """
@@ -1850,7 +1852,7 @@ def test_config_gpu_fields(monkeypatch):
     from flash.schema import spec_from_dict
 
     base = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "train": {"epochs": 1, "max_examples": 8},
         "environment": {"id": "github:owner/repo@main:env/environment.py"},

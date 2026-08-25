@@ -33,5 +33,5 @@ def test_sft_worker_requests_the_fused_loss_its_sizing_assumes():
     assert '"model.use_fused_kernels=true"' in source
     assert '"use_liger": False' in source
     # the discount is not universal, so the gate must still be a real allowlist, not a constant.
-    assert sft_chunked_nll_enabled("Qwen/Qwen3.5-4B")
+    assert sft_chunked_nll_enabled("Qwen/Qwen3.5-9B")
     assert not sft_chunked_nll_enabled("meta-llama/Llama-3.1-8B")

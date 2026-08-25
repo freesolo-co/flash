@@ -632,7 +632,7 @@ def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
     from flash.providers._lifecycle.worker import build_worker_env
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
