@@ -65,6 +65,9 @@ def _openai_stream_content(
         events = iter_openai_sse_events(f"{line}\n" for line in lines)
         for event in events:
             if isinstance(event, ErrorEvent):
+                if reasoning_open:
+                    reasoning_open = False
+                    yield _TAG_CLOSE
                 raise ClientError(event.message)
             if not isinstance(event, DeltaEvent):
                 continue
@@ -154,6 +157,9 @@ def _openai_stream_content(
                     continue
                 yield content
     except OpenAISSEError as exc:
+        if reasoning_open:
+            reasoning_open = False
+            yield _TAG_CLOSE
         raise ClientError(str(exc)) from exc
     if reasoning_open:
         # generation stopped inside the block (a length cap, usually). still close it: an

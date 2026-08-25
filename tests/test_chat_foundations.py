@@ -132,6 +132,41 @@ def test_decoded_sse_parser_rejects_present_non_object_delta(delta: object) -> N
         list(iter_openai_sse_events([f'data: {{"choices":[{{"delta":{json.dumps(delta)}}}]}}\n\n']))
 
 
+@pytest.mark.parametrize("field", ["content", "reasoning_content"])
+@pytest.mark.parametrize("value", [False, 0, [], {}])
+def test_decoded_sse_parser_rejects_present_non_string_text_fields(
+    field: str, value: object
+) -> None:
+    payload = {"choices": [{"delta": {field: value}}]}
+
+    with pytest.raises(OpenAISSEError, match=rf"{field} must be a string or null"):
+        list(iter_openai_sse_events([f"data: {json.dumps(payload)}\n\n"]))
+
+
+@pytest.mark.parametrize("field", ["content", "reasoning_content"])
+def test_decoded_sse_parser_accepts_absent_or_null_text_fields(field: str) -> None:
+    null_payload = {"choices": [{"delta": {field: None}}]}
+    absent_payload = {"choices": [{"delta": {}}]}
+
+    events = list(
+        iter_openai_sse_events(
+            [
+                f"data: {json.dumps(null_payload)}\n\n",
+                f"data: {json.dumps(absent_payload)}\n\n",
+                "data: [DONE]\n\n",
+            ]
+        )
+    )
+
+    assert events == [DoneEvent()]
+
+
+@pytest.mark.parametrize("error", [None, False, 0, "failure", []])
+def test_decoded_sse_parser_rejects_present_non_object_error(error: object) -> None:
+    with pytest.raises(OpenAISSEError, match="error must be an object"):
+        list(iter_openai_sse_events([f'data: {{"error":{json.dumps(error)}}}\n\n']))
+
+
 def test_decoded_sse_parser_joins_data_lines_only_after_frame_delimiter() -> None:
     chunks = iter(
         [

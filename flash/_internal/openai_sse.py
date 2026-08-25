@@ -100,8 +100,10 @@ def _events_from_frame(lines: list[str]) -> tuple[OpenAISSEEvent, ...]:
         raise OpenAISSEError("chat stream contained invalid openai sse json") from exc
     if not isinstance(payload, dict):
         raise OpenAISSEError("chat stream contained a non-object openai sse payload")
-    error = payload.get("error")
-    if isinstance(error, dict):
+    if "error" in payload:
+        error = payload["error"]
+        if not isinstance(error, dict):
+            raise OpenAISSEError("chat stream error must be an object")
         return (ErrorEvent(str(error.get("message") or "chat stream ended with an error")),)
     choices = payload.get("choices", [])
     if not isinstance(choices, list):
@@ -118,6 +120,10 @@ def _events_from_frame(lines: list[str]) -> tuple[OpenAISSEEvent, ...]:
             raise OpenAISSEError("chat stream delta must be an object")
         reasoning = delta.get("reasoning_content")
         content = delta.get("content")
+        if reasoning is not None and not isinstance(reasoning, str):
+            raise OpenAISSEError("chat stream reasoning_content must be a string or null")
+        if content is not None and not isinstance(content, str):
+            raise OpenAISSEError("chat stream content must be a string or null")
         normalized_reasoning = reasoning if isinstance(reasoning, str) else None
         normalized_content = content if isinstance(content, str) else None
         if normalized_reasoning is not None or normalized_content is not None:
