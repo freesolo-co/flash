@@ -513,6 +513,7 @@ def test_chat_stream_preserves_raw_openai_sse_and_provenance_headers(api, monkey
     assert response.headers["x-freesolo-adapter-revision"] == revision
     assert response.headers["x-freesolo-checkpoint"] == run_id
     assert response.headers["x-freesolo-hf-revision"] == "a" * 40
+    assert "x-freesolo-lora-request-adapter" not in response.headers
     assert body == b"".join(frames)
     assert closed == [True]
     assert seen["run_id"] == revision
@@ -538,6 +539,7 @@ def test_chat_stream_strips_hop_by_hop_and_connection_extension_headers(api, mon
             "trailer": "x-checksum",
             "transfer-encoding": "chunked",
             "upgrade": "websocket",
+            "x-freesolo-lora-request-adapter": revision,
             "x-remove-me": "connection extension",
             "x-preserved": "yes",
         },
@@ -561,9 +563,37 @@ def test_chat_stream_strips_hop_by_hop_and_connection_extension_headers(api, mon
         "trailer",
         "transfer-encoding",
         "upgrade",
+        "x-freesolo-lora-request-adapter",
         "x-remove-me",
     ):
         assert header not in response.headers
+
+
+@pytest.mark.parametrize("case", ["missing", "mismatch"])
+def test_chat_stream_rejects_missing_or_mismatched_adapter_attestation(api, monkeypatch, case):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    headers = _managed_stream_headers(revision)
+    if case == "missing":
+        del headers["x-freesolo-lora-request-adapter"]
+    else:
+        headers["x-freesolo-lora-request-adapter"] = f"{run_id}@final." + "b" * 40
+    upstream = _RawManagedChatResponse([b"data: [DONE]\n\n"], headers=headers)
+    monkeypatch.setattr(app_mod, "serve_chat_sse", lambda **_kwargs: upstream)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 502
+    expected = "omitted" if case == "missing" else "mismatched"
+    assert f"{expected} LoRA request adapter attestation" in response.json()["detail"]
+    assert upstream.closed
 
 
 @pytest.mark.parametrize("case", ["missing", "mismatch"])

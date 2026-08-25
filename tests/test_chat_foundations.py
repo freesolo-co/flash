@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
@@ -91,6 +92,25 @@ def test_decoded_sse_parser_yields_typed_events_and_requires_done() -> None:
 
     with pytest.raises(OpenAISSEError, match=r"terminal \[DONE\]"):
         list(iter_openai_sse_events(['data: {"choices":[{"delta":{"content":"partial"}}]}\n']))
+
+
+@pytest.mark.parametrize("payload", [{}, {"choices": []}])
+def test_decoded_sse_parser_accepts_absent_or_empty_choices(payload: dict) -> None:
+    events = list(iter_openai_sse_events([f"data: {json.dumps(payload)}\n", "data: [DONE]\n"]))
+
+    assert events == [DoneEvent()]
+
+
+@pytest.mark.parametrize("choices", [{}, "", 0, False, None])
+def test_decoded_sse_parser_rejects_present_non_array_choices(choices: object) -> None:
+    with pytest.raises(OpenAISSEError, match="choices must be an array"):
+        list(iter_openai_sse_events([f'data: {{"choices":{json.dumps(choices)}}}\n']))
+
+
+@pytest.mark.parametrize("choice", [None, "", 0, False, []])
+def test_decoded_sse_parser_rejects_non_object_choice_entries(choice: object) -> None:
+    with pytest.raises(OpenAISSEError, match="choice must be an object"):
+        list(iter_openai_sse_events([f'data: {{"choices":[{json.dumps(choice)}]}}\n']))
 
 
 class _Response:

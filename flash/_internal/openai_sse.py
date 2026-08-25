@@ -94,13 +94,13 @@ def _events_from_line(line: str) -> tuple[OpenAISSEEvent, ...]:
     error = payload.get("error")
     if isinstance(error, dict):
         return (ErrorEvent(str(error.get("message") or "chat stream ended with an error")),)
-    choices = payload.get("choices") or []
+    choices = payload.get("choices", [])
     if not isinstance(choices, list):
         raise OpenAISSEError("chat stream choices must be an array")
     events: list[DeltaEvent | ErrorEvent] = []
     for choice in choices:
         if not isinstance(choice, dict):
-            continue
+            raise OpenAISSEError("chat stream choice must be an object")
         if choice.get("finish_reason") == "error":
             events.append(ErrorEvent("chat stream ended with an engine error"))
             continue

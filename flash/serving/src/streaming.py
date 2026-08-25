@@ -299,6 +299,8 @@ async def prepare_stream(
             expected_checkpoint=expected_checkpoint,
         )
         first = await anext(events)
+        if target.is_revision:
+            require_attested_revision(first, target)
     except BaseException as exc:
         # cancellation while waiting for the first engine event must still enter the pool iterator's
         # finally block, which aborts the remote generation. ordinary dispatch failures need the same
@@ -312,11 +314,14 @@ async def prepare_stream(
     if first.get("type") == "ready":
         active_checkpoint = first.get("checkpoint")
         provenance = _revision_provenance(target, active_checkpoint)
+        headers = _provenance_headers(provenance, active_checkpoint)
+        if target.is_revision:
+            headers["X-Freesolo-LoRA-Request-Adapter"] = target.adapter_id
         # replay ready internally so its first-output usage remains available if the client
         # disconnects before a text delta, while keeping it out of the client-facing sse protocol.
         return (
             _replay_first_event(first, events),
-            _provenance_headers(provenance, active_checkpoint),
+            headers,
             bool(first.get("thinking")),
         )
 

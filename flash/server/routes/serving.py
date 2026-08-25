@@ -676,6 +676,7 @@ _UPSTREAM_RESPONSE_HEADER_EXCLUSIONS = frozenset(
         "x-freesolo-adapter-revision",
         "x-freesolo-checkpoint",
         "x-freesolo-hf-revision",
+        "x-freesolo-lora-request-adapter",
     }
 )
 
@@ -804,6 +805,16 @@ def chat(
                 if upstream.status_code < 400:
                     if "text/event-stream" not in content_type.lower():
                         raise ValueError("serving backend returned a non-sse streaming response")
+                    normalized_headers = {
+                        key.lower(): value for key, value in upstream.headers.items()
+                    }
+                    attested_adapter = normalized_headers.get("x-freesolo-lora-request-adapter")
+                    if not attested_adapter:
+                        raise ValueError("serving backend omitted LoRA request adapter attestation")
+                    if attested_adapter != provenance.adapter_revision:
+                        raise ValueError(
+                            "serving backend returned mismatched LoRA request adapter attestation"
+                        )
                     validate_header_provenance(upstream.headers, provenance)
                     headers.update(provenance.freesolo_headers())
                 return _UpstreamStreamingResponse(

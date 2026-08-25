@@ -187,7 +187,7 @@ class FakePool:
     ):
         record = self._resolved_record(record)
         checkpoint = self._check_expected(record, expected_checkpoint)
-        yield {"type": "ready", "checkpoint": checkpoint}
+        yield attest(record, {"type": "ready", "checkpoint": checkpoint})
         self.generated.append((base_model, payload.adapter_id))
         self.generated_records.append(record)
         self.messages.append(getattr(payload, "messages", None))
@@ -714,6 +714,7 @@ def test_openai_chat_completions_streams_sse_chunks(app_setup):
     ) as resp:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/event-stream")
+        assert resp.headers["x-freesolo-lora-request-adapter"] == _revision_id("mc")
         text = resp.read().decode("utf-8")
 
     assert '"delta":{"role":"assistant"}' in text
@@ -723,6 +724,53 @@ def test_openai_chat_completions_streams_sse_chunks(app_setup):
     assert '"finish_reason":"stop"' in text
     assert "data: [DONE]" in text
     assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
+
+
+@pytest.mark.parametrize("attestation", [None, "wrong@final." + "b" * 40])
+def test_openai_stream_rejects_unattested_revision_and_closes_engine(attestation):
+    revision = _rec("attested", QWEN)
+
+    class UnattestedPool(FakePool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = False
+
+        async def stream_generate(
+            self,
+            base_model: str,
+            payload,
+            record,
+            *,
+            expected_checkpoint: str | None = None,
+        ):
+            del base_model, payload, expected_checkpoint
+            event = {"type": "ready", "checkpoint": record.checkpoint}
+            if attestation is not None:
+                event["lora_request_adapter"] = attestation
+            try:
+                yield event
+                await asyncio.Event().wait()
+            finally:
+                self.closed = True
+
+    pool = UnattestedPool()
+    client = _serve(pool, AdapterRouter([revision, _alias(revision)]))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": revision.adapter_id,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 502
+    assert "attest" in response.json()["detail"]
+    assert "x-freesolo-adapter-revision" not in response.headers
+    assert "x-freesolo-checkpoint" not in response.headers
+    assert "x-freesolo-hf-revision" not in response.headers
+    assert pool.closed
 
 
 def test_openai_chat_completions_stream_can_include_usage(app_setup):
@@ -1590,7 +1638,7 @@ class _CachedMeteringPool(FakePool):
     ):
         record = self._resolved_record(record)
         checkpoint = self._check_expected(record, expected_checkpoint)
-        yield {"type": "ready", "checkpoint": checkpoint}
+        yield attest(record, {"type": "ready", "checkpoint": checkpoint})
         self.generated.append((base_model, payload.adapter_id))
         yield {"type": "delta", "text": "hi"}
         yield {

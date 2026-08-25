@@ -24,4 +24,5 @@ def managed_stream_headers(revision: str) -> dict[str, str]:
         "x-flash-adapter-revision": revision,
         "x-flash-checkpoint": checkpoint,
         "x-flash-source-revision": source_revision,
+        "x-freesolo-lora-request-adapter": revision,
     }

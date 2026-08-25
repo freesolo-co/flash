@@ -107,7 +107,14 @@ def validate_body_provenance(
 
 def validate_header_provenance(headers: Mapping[str, str], expected: ImmutableProvenance) -> None:
     normalized = {key.lower(): value for key, value in headers.items()}
-    has_freesolo = any(key.startswith("x-freesolo-") for key in normalized)
+    has_freesolo = any(
+        key in normalized
+        for key in (
+            "x-freesolo-adapter-revision",
+            "x-freesolo-checkpoint",
+            "x-freesolo-hf-revision",
+        )
+    )
     has_flash = any(key.startswith("x-flash-") for key in normalized)
     if not has_freesolo and not has_flash:
         raise ValueError("serving backend omitted adapter_revision provenance")

@@ -756,10 +756,9 @@ class _LoraEngineImpl:
 
         payload = GenerateRequest.model_validate(payload_dict)
         lora_request, record = await self._lora_request(payload.adapter_id, record_dict)
-        # streaming sends its headers before the first token, so there is no response field left to
-        # carry an attestation. the check still runs for its raise: a mismatched immutable adapter
-        # fails here, before any token is emitted, rather than streaming the wrong weights.
-        self._lora_request_attestation(record, lora_request)
+        # the ready event carries the resolved adapter identity to the router before response headers
+        # are sent, so a mismatched immutable adapter fails before any token is emitted.
+        lora_request_attestation = self._lora_request_attestation(record, lora_request)
         active_checkpoint = self._enforce_expected_checkpoint(record, expected_checkpoint)
         # resolve structured outputs and advance vllm before the ready event so validation failures
         # remain clean responses instead of surfacing after streaming has started.
@@ -818,6 +817,11 @@ class _LoraEngineImpl:
             yield {
                 "type": "ready",
                 "thinking": thinking_default,
+                **(
+                    {"lora_request_adapter": lora_request_attestation}
+                    if lora_request_attestation is not None
+                    else {}
+                ),
                 **_stream_usage_fields(first_output, first_completion_tokens, **usage_context),
             }
             final_output = None
