@@ -13,6 +13,23 @@ from flash.runner.lifecycle import status as status_ops
 from flash.runner.lifecycle.state import RunStatus
 
 MIN_PROVIDER_WALL_SECONDS = 60
+_ATTEMPT_GRANT_ALLOWANCE_S = 900.0
+_RESULT_VISIBILITY_ALLOWANCE_S = 120.0
+
+
+def _derive_attempt_deadlines(raw: dict, *, reserved_at: float) -> tuple[float, float, float, float]:
+    """Derive immutable grant, work, result, and outer deadlines for one reservation."""
+    _status, canonical = _canonical_run_deadline(raw)
+    if state._RUN_DEADLINE_AT_KEY not in raw:
+        raise RuntimeError("persisted run wall deadline is missing; no provisioning is allowed")
+    run_deadline = _checked_stored_run_deadline(raw[state._RUN_DEADLINE_AT_KEY], canonical)
+    reserved = _require_valid_deadline(reserved_at)
+    if reserved >= run_deadline:
+        raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
+    grant_deadline = min(run_deadline, reserved + _ATTEMPT_GRANT_ALLOWANCE_S)
+    work_deadline = run_deadline
+    result_deadline = run_deadline + _RESULT_VISIBILITY_ALLOWANCE_S
+    return grant_deadline, work_deadline, result_deadline, run_deadline
 
 
 def _require_valid_deadline(value: object) -> float:
