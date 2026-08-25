@@ -33,17 +33,17 @@ TARGETS: Final = (
     Target(
         "vllm/model_executor/layers/fused_moe/experts/lora_context.py",
         "050992817a1fe2a3e7604a94f34d35cc03b6b074dc54abc83e4a9e0ba9d1dbf8",
-        "f0f8e87b4c9d0a6857f7c28b6b8a6a9231182cb76c66443f0a51dec405323d6f",
+        "7a8911cfae2d7d59f38399fd402c41b341b78919e8772fae70329941c2007b20",
     ),
     Target(
         "vllm/model_executor/layers/fused_moe/experts/triton_moe.py",
         "b197ddb0606380873250d284fd56acd0c4ffad4fe4c9ffa3bb0ed4b8bf49f271",
-        "ec359c4c1d0bdecf56d16f0cac13aa27f359f7df8aa7ed2915a8ce184bc76190",
+        "c166d7eed1b1715fc717f4f040fd4c8623ed281ce5451d02efb6145fd9156b84",
     ),
     Target(
         "vllm/model_executor/layers/fused_moe/modular_kernel.py",
         "b1e73b77322363d686c524d01e482c7eabb50f46fa8d9796eebcb7976acb8aa1",
-        "ffee04fbb1ccd8f08d3e5f8414a9d9ac5de8c47ea062a557ca4dd5a66bd909f9",
+        "8a551510150c7be4dab6510f7404bf3f6b1c08e32796aa9461e55b3777245521",
     ),
 )
 
@@ -71,10 +71,9 @@ def _patch_lora_context(source: str) -> str:
     replacement = (
         anchor
         + """
-    # original unquantized hidden states are stashed by the modular kernel
-    # before the prepare step potentially quantizes them. apply_w13_lora uses
-    # them so the lora kernel receives correctly scaled activations instead of
-    # raw quantized values with no activation scale.
+    # unquantized hidden states are stashed by the modular kernel with the
+    # router-input weighting expected by the expert path. apply_w13_lora uses
+    # them only when no all-to-all dispatch changes the activation layout.
     original_hidden_states: torch.Tensor | None = None
 """
     )
@@ -167,6 +166,7 @@ def _patch_triton_moe(source: str) -> str:
             lora_x = lora_unquantized_hidden_states
         elif (
             lora_context is not None
+            and not self.moe_config.moe_parallel_config.use_all2all_kernels
             and lora_context.original_hidden_states is not None
             and lora_context.original_hidden_states.shape[0] == hidden_states.shape[0]
         ):
@@ -199,7 +199,20 @@ def _patch_modular_kernel(source: str) -> str:
 
         fused_out = self._fused_experts(
 """
-    prepare_replacement = """        a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
+    prepare_replacement = """        # preserve the exact local unquantized activation before _prepare can
+        # replace routing metadata with gathered all-to-all tensors. the local
+        # stash is used only on non-all-to-all paths; gathered paths use the
+        # activation returned by _prepare.
+        lora_ctx = getattr(self.fused_experts, "_lora_context", None)
+        lora_hidden_states = hidden_states
+        if lora_ctx is not None and apply_router_weight_on_input:
+            topk = topk_ids.size(1)
+            assert topk == 1, (
+                "apply_router_weight_on_input is only implemented for topk=1"
+            )
+            lora_hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
+
+        a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
             hidden_states,
             topk_weights,
             topk_ids,
@@ -208,11 +221,8 @@ def _patch_modular_kernel(source: str) -> str:
             apply_router_weight_on_input,
         )
 
-        # preserve original activations alongside _prepare quantization so the
-        # ordinary lora a receives unquantized values at the correct magnitude.
-        lora_ctx = getattr(self.fused_experts, "_lora_context", None)
         if lora_ctx is not None:
-            lora_ctx.original_hidden_states = hidden_states
+            lora_ctx.original_hidden_states = lora_hidden_states
 
         fused_out = self._fused_experts(
 """
@@ -401,6 +411,29 @@ def _verify_semantics(sources: dict[str, bytes]) -> None:
         "hidden_states",
     }:
         raise RepairError("semantic verification: lora_x unquantized sources are incomplete")
+    local_stash_guards = [
+        node
+        for node in ast.walk(apply)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(child, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "lora_x" for target in child.targets
+            )
+            and ast.unparse(child.value) == "lora_context.original_hidden_states"
+            for child in node.body
+        )
+    ]
+    if len(local_stash_guards) != 1 or not any(
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.Not)
+        and isinstance(node.operand, ast.Attribute)
+        and node.operand.attr == "use_all2all_kernels"
+        for node in ast.walk(local_stash_guards[0].test)
+    ):
+        raise RepairError(
+            "semantic verification: local activation stash must be disabled for all-to-all"
+        )
 
     modular_tree = trees[TARGETS[2].relative_path]
     modular = _class_node(modular_tree, "FusedMoEKernelModularImpl")
@@ -421,8 +454,76 @@ def _verify_semantics(sources: dict[str, bytes]) -> None:
         node.value.value if isinstance(node.value, ast.Constant) else object()
         for node in assignments
     ]
-    if assigned_names.count("hidden_states") != 1 or assigned_constants.count(None) != 1:
+    if assigned_names.count("lora_hidden_states") != 1 or assigned_constants.count(None) != 1:
         raise RepairError("semantic verification: modular activation stash or clear is missing")
+
+    local_activation_assignments = [
+        node
+        for node in ast.walk(modular_apply)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "lora_hidden_states"
+            for target in node.targets
+        )
+    ]
+    local_activation_sources = {ast.unparse(node.value) for node in local_activation_assignments}
+    if local_activation_sources != {
+        "hidden_states",
+        "hidden_states * topk_weights.to(hidden_states.dtype)",
+    }:
+        raise RepairError(
+            "semantic verification: router-weighted unquantized activation stash is missing"
+        )
+    router_weight_branches = [
+        node
+        for node in ast.walk(modular_apply)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(child, ast.Name) and child.id == "apply_router_weight_on_input"
+            for child in ast.walk(node.test)
+        )
+        and any(
+            isinstance(child, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "lora_hidden_states"
+                for target in child.targets
+            )
+            and ast.unparse(child.value) == "hidden_states * topk_weights.to(hidden_states.dtype)"
+            for child in node.body
+        )
+    ]
+    if len(router_weight_branches) != 1:
+        raise RepairError(
+            "semantic verification: router-weighted unquantized activation stash is missing"
+        )
+
+    prepare_assignments = [
+        node
+        for node in modular_apply.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "_prepare"
+    ]
+    stash_assignments = [
+        node
+        for node in modular_apply.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "lora_hidden_states"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "hidden_states"
+    ]
+    if len(prepare_assignments) != 1 or len(stash_assignments) != 1:
+        raise RepairError(
+            "semantic verification: exact prepare and local stash ordering is missing"
+        )
+    if modular_apply.body.index(stash_assignments[0]) >= modular_apply.body.index(
+        prepare_assignments[0]
+    ):
+        raise RepairError("semantic verification: local activation stash must precede prepare")
 
     protected_calls = []
     for node in ast.walk(modular_apply):

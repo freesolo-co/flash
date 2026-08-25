@@ -206,6 +206,56 @@ def test_semantic_verifier_rejects_raw_cast_sabotage(tmp_path: Path) -> None:
         repair._verify_semantics(transformed)
 
 
+def test_semantic_verifier_rejects_all_to_all_local_stash_fallback(tmp_path: Path) -> None:
+    root = _install_tree(tmp_path)
+    transformed = repair._transform_sources(_target_bytes(root))
+    path = repair.TARGETS[1].relative_path
+    source = transformed[path].decode()
+    guard = "            and not self.moe_config.moe_parallel_config.use_all2all_kernels\n"
+    assert source.count(guard) == 1
+    transformed[path] = source.replace(guard, "", 1).encode()
+    with pytest.raises(repair.RepairError, match="disabled for all-to-all"):
+        repair._verify_semantics(transformed)
+
+
+def test_semantic_verifier_rejects_unweighted_router_input_stash(tmp_path: Path) -> None:
+    root = _install_tree(tmp_path)
+    transformed = repair._transform_sources(_target_bytes(root))
+    path = repair.TARGETS[2].relative_path
+    source = transformed[path].decode()
+    old = """        if lora_ctx is not None and apply_router_weight_on_input:
+            topk = topk_ids.size(1)
+            assert topk == 1, (
+                \"apply_router_weight_on_input is only implemented for topk=1\"
+            )
+            lora_hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
+"""
+    replacement = ""
+    assert source.count(old) == 1
+    transformed[path] = source.replace(old, replacement, 1).encode()
+    with pytest.raises(repair.RepairError, match="router-weighted unquantized"):
+        repair._verify_semantics(transformed)
+
+
+def test_semantic_verifier_rejects_local_stash_after_prepare(tmp_path: Path) -> None:
+    root = _install_tree(tmp_path)
+    transformed = repair._transform_sources(_target_bytes(root))
+    path = repair.TARGETS[2].relative_path
+    source = transformed[path].decode()
+    initial = "        lora_hidden_states = hidden_states\n"
+    after_prepare = """            apply_router_weight_on_input,
+        )
+
+"""
+    assert source.count(initial) == 1
+    assert source.count(after_prepare) == 1
+    source = source.replace(initial, "        pass\n", 1)
+    source = source.replace(after_prepare, after_prepare + initial, 1)
+    transformed[path] = source.encode()
+    with pytest.raises(repair.RepairError, match="stash must precede prepare"):
+        repair._verify_semantics(transformed)
+
+
 def test_semantic_verifier_rejects_missing_requantization(tmp_path: Path) -> None:
     root = _install_tree(tmp_path)
     transformed = repair._transform_sources(_target_bytes(root))
