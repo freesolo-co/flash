@@ -1,11 +1,15 @@
-"""Modal app: multi-LoRA serving with one GPU container per base model. ``LoraEngine`` is a
-Modal class parametrized by ``base_model`` (one GPU per base model, sharing its adapters via
-``enable_lora``); ``router`` is the CPU front door that dispatches to the right engine. See
-README to deploy.
+"""Modal app: multi-LoRA serving with one immutable engine class per base model.
+
+Each exact-model engine owns one GPU container and shares that model's adapters via
+``enable_lora``. ``router`` is the CPU front door that dispatches to the matching engine.
 """
 
 import asyncio
+import hashlib
+import json
 import os
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -135,21 +139,9 @@ def scaledown_window_for(gpu: str) -> int:
     return SCALEDOWN_WINDOW_SECONDS_BY_GPU.get(gpu, DEFAULT_SCALEDOWN_WINDOW_SECONDS)
 
 
-# gpu model engines scale to zero. inference and adapter registration remote calls start the matching
-# parameter-bound engine on demand.
-MIN_CONTAINERS = 0
-# no autoscaling cap per base-model engine; modal adds capacity as concurrency demands.
-MAX_CONTAINERS = None
-# Concurrent requests packed onto one base-model GPU before Modal autoscales a new (costly) one.
-# A real-GPU sweep (scripts/gpu_canary.py::sweep_concurrency on A10G/Qwen2.5-1.5B) showed vLLM
-# throughput scaling near-linearly with no saturation through 128 concurrent, while TTFT stayed
-# <60 ms — so the old default of 32 left ~2x of each GPU idle. 64 packs ~2.3x the throughput per
-# GPU for ~+14% per-request latency (now blunted by the fp8 KV cache, which is on for every base —
-# see settings.KV_CACHE_DTYPE), roughly halving GPU count for the same load.
-# Per-engine concurrency is sized by _engine_concurrency from each model's max_num_seqs; these are
-# the router/global ceiling. TARGET_INPUTS auto-derives to 48 (= 64*3//4).
-MAX_INPUTS = 64
-TARGET_INPUTS = max(1, MAX_INPUTS * 3 // 4)
+# hosted traffic policy is derived per model from its real max_num_seqs. every advertised model keeps
+# one warm engine, scales to at most two, and exposes exactly two application-side queue positions.
+# the cpu router remains a singleton and is bounded to the aggregate model hard limits plus queues.
 
 # engines enable trust_remote_code, so their secret uses an allowlist: future credentials
 # default to staying router-only. engines hydrate adapter state per request from the router-forwarded
@@ -230,16 +222,15 @@ image = (
             "HF_HOME": HOSTING_CACHE_MOUNT,
             "HF_HUB_CACHE": f"{HOSTING_CACHE_MOUNT}/hub",
             "TRANSFORMERS_CACHE": f"{HOSTING_CACHE_MOUNT}/transformers",
-            # vLLM's own cache root, on the SAME persistent volume as the weight caches above.
-            # It defaults to ~/.cache/vllm (vllm/envs.py), which is ephemeral container storage, so
-            # every scale-from-zero re-compiled the model from scratch: vLLM writes its torch.compile
-            # artifacts to VLLM_CACHE_ROOT/torch_compile_cache/<hash>/ (vllm/compilation/backends.py),
-            # plus modelinfos/ and the GPU p2p cache. With MIN_CONTAINERS = 0 and a 30-minute
-            # scaledown window that cost is paid on every cold start — it is the torch.compile +
-            # graph-capture portion of the ~1010s 35B engine init measured for STARTUP_TIMEOUT_SECONDS.
-            # vLLM's own startup benchmark DEFINES a cold start this way (benchmarks/startup.py
-            # cold_startup() points VLLM_CACHE_ROOT at a fresh mkdtemp), so leaving it unset on
-            # ephemeral storage reproduces that worst case involuntarily.
+            # vllm's own cache root, on the same persistent volume as the weight caches above.
+            # normal deploys keep one warm container and may scale each model to two containers, so
+            # normal requests avoid container cold startup. persisting the cache also lets replacement
+            # and second containers reuse torch.compile artifacts, modelinfos, and the gpu p2p cache
+            # instead of recompiling and repeating graph capture during engine initialization.
+            # vllm writes compiled artifacts under vllm_cache_root/torch_compile_cache/<hash>/
+            # (vllm/compilation/backends.py). its startup benchmark defines a cold startup by pointing
+            # vllm_cache_root at a fresh mkdtemp (benchmarks/startup.py), so leaving the cache on
+            # ephemeral storage involuntarily repeats the worst-case initialization path.
             # Reuse is safe by construction: the cache directory name is a sha256 over
             # [env_hash, config_hash, code_hash, compiler_hash], so a different vLLM version, engine
             # config, or model code lands in a DIFFERENT directory rather than loading a stale graph.
@@ -283,56 +274,66 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 # so it registers nothing, and inside the ``flash`` package so the image's
 # ``add_local_python_source("flash")`` ships it to the remote container under the same import path
 # it has here), re-exported so ``_build_engine`` can subclass it.
-from flash.serving.src.lora_engine import _LoraEngineImpl  # noqa: E402
-
 # ---- One Modal LoraEngine class per GPU tier -----------------------------------------------------
 # model_config is a pure-stdlib module (no heavy deps), so importing it at module scope is safe for
 # `modal deploy` (which imports modal_app.py locally) — unlike the vllm/transformers imports, which
 # stay lazy inside the engine methods.
-from flash.serving.src.model_config import base_models, engine_overrides_for, gpu_for  # noqa: E402
+from flash.serving.src.capacity import (  # noqa: E402
+    CAPACITY_POLL_INTERVAL_SECONDS,
+    CAPACITY_REFRESH_TIMEOUT_SECONDS,
+    CAPACITY_SNAPSHOT_MAX_AGE_SECONDS,
+    CapacitySnapshot,
+    fixed_local_active_limit,
+)
+from flash.serving.src.lora_engine import _LoraEngineImpl  # noqa: E402
+from flash.serving.src.model_config import (  # noqa: E402
+    HostedTrafficPolicy,
+    base_models,
+    configured_router_async_capacity,
+    gpu_for,
+    hosted_traffic_policy_for,
+)
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
-    """(max_inputs, target_inputs) sized to the model's REAL vLLM concurrency (``max_num_seqs``).
-
-    Modal's ``max_inputs`` is how many requests it packs onto ONE container before it must add
-    another. If it far exceeds the engine's ``max_num_seqs`` (e.g. the global 64 on the 35B, which
-    decodes only 8 at a time), Modal piles requests 9..64 INSIDE the container instead of autoscaling
-    — high latency and no scale-out until ~target_inputs are packed. So cap ``max_inputs`` near the
-    engine's capacity with a small boot buffer (2x, so a cold-booting replacement doesn't reject
-    bursts), bounded by the global ``MAX_INPUTS``; scale out at 3/4 of that. Models that leave
-    ``max_num_seqs`` at the vLLM default keep the global sizing."""
-    seqs = int(engine_overrides_for(base_model).get("max_num_seqs", MAX_INPUTS))
-    max_inputs = max(8, min(MAX_INPUTS, seqs * 2))
-    target_inputs = max(1, max_inputs * 3 // 4)
-    return max_inputs, target_inputs
+    policy = hosted_traffic_policy_for(base_model)
+    return policy.max_inputs, policy.target_inputs
 
 
-def _engine_class_name(gpu: str, max_inputs: int) -> str:
-    """Deterministic, Modal-safe class name for a (GPU tier, concurrency) engine — e.g.
-    ('A100-80GB', 16) -> 'LoraEngine_A100_80GB_c16'. The concurrency is part of the identity because
-    ``modal.concurrent`` is fixed per class, so tiers sharing a GPU but needing different max_inputs
-    must be distinct classes."""
-    base = "LoraEngine_" + "".join(ch if ch.isalnum() else "_" for ch in gpu)
-    return f"{base}_c{max_inputs}"
+def _policy_contract(base_model: str) -> dict[str, Any]:
+    policy = hosted_traffic_policy_for(base_model)
+    return {
+        "base_model": base_model,
+        "gpu": gpu_for(base_model),
+        "scaledown_window": scaledown_window_for(gpu_for(base_model)),
+        "startup_timeout": STARTUP_TIMEOUT_SECONDS,
+        "timeout": TIMEOUT_SECONDS,
+        "min_containers": policy.min_containers,
+        "max_containers": policy.max_containers,
+        "buffer_containers": policy.buffer_containers,
+        "max_inputs": policy.max_inputs,
+        "target_inputs": policy.target_inputs,
+    }
 
 
-def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int) -> Any:
-    """Register one Modal ``@app.cls`` LoraEngine pinned to ``gpu``.
+def _engine_class_name(base_model: str) -> str:
+    """Deterministic identity for one exact model and every decorator-affecting policy value."""
+    contract = _policy_contract(base_model)
+    digest = hashlib.sha256(
+        json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
+    model_name = base_model.rsplit("/", 1)[-1]
+    safe_model = "".join(ch if ch.isalnum() else "_" for ch in model_name)[:32]
+    return f"LoraEngine_{safe_model}_{digest}"
 
-    Modal fixes a class's GPU at decoration time, so the A100-80GB 35B model and the L4 models need
-    distinct classes. The Modal entrypoints are defined fresh here (so each class owns its own method
-    objects) and forward to the shared ``_``-prefixed impl on ``_LoraEngineImpl``.
 
-    Class identity (name/qualname + module-global binding) is fixed BEFORE the class-level decorators
-    run. With the real Modal SDK ``@modal.concurrent`` returns a wrapper that holds the user class
-    separately, so renaming the bound name AFTER the decorator would rename the wrapper, not the class
-    Modal registers — every tier would then register under ``_Engine`` and the ``<locals>`` qualname
-    would fail Modal's global-scope validation. So we apply ``modal.concurrent``/``app.cls`` in call
-    form on an already-renamed, already-module-global class."""
+def _build_engine(base_model: str, class_name: str, policy: HostedTrafficPolicy) -> Any:
+    """Register one Modal class for one exact advertised model and traffic policy."""
+    gpu = gpu_for(base_model)
+    exact_base_model = base_model
 
     class _Engine(_LoraEngineImpl):
-        base_model: str = modal.parameter()
+        base_model: str = exact_base_model
 
         @modal.enter()
         async def load(self) -> None:
@@ -379,14 +380,7 @@ def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int
         def health(self) -> dict[str, Any]:
             return self._health()
 
-    # Record the GPU this class was actually pinned to (a plain class attribute, NOT a
-    # modal.parameter() field). _health() reports THIS rather than re-deriving the tier from the base
-    # model name, so a base model accidentally routed onto the wrong tier's class surfaces in health
-    # instead of being masked by the expected-tier lookup.
     _Engine.pinned_gpu = gpu
-    # Give the REAL class its distinct, module-level identity BEFORE decorating. A clean (no-``<locals>``)
-    # __qualname__ satisfies Modal's global-scope validation, and binding it as a module attribute under
-    # that name makes ``getattr(module, class_name)`` resolve the class Modal re-imports in the container.
     _Engine.__name__ = class_name
     _Engine.__qualname__ = class_name
     globals()[class_name] = _Engine
@@ -397,43 +391,134 @@ def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int
         scaledown_window=scaledown_window_for(gpu),
         startup_timeout=STARTUP_TIMEOUT_SECONDS,
         timeout=TIMEOUT_SECONDS,
-        min_containers=MIN_CONTAINERS,
-        max_containers=MAX_CONTAINERS,
-    )(modal.concurrent(max_inputs=max_inputs, target_inputs=target_inputs)(_Engine))
-    # Rebind the module name to the decorated handle, matching the normal ``@app.cls class X`` pattern
-    # where the module attribute ends up referring to the decorated class.
+        min_containers=policy.min_containers,
+        max_containers=policy.max_containers,
+        buffer_containers=policy.buffer_containers,
+    )(
+        modal.concurrent(
+            max_inputs=policy.max_inputs,
+            target_inputs=policy.target_inputs,
+        )(_Engine)
+    )
     globals()[class_name] = engine
     return engine
 
 
-def _engine_key(base_model: str) -> tuple[str, int]:
-    """(gpu, max_inputs) — the identity of the engine CLASS a base model runs on."""
-    return gpu_for(base_model), _engine_concurrency(base_model)[0]
-
-
-def _distinct_engine_keys() -> list[tuple[str, int]]:
-    """Distinct (gpu, max_inputs) engine classes needed across the catalog, order-stable."""
-    keys: dict[tuple[str, int], None] = {}
-    for bm in base_models():
-        keys.setdefault(_engine_key(bm), None)
-    return list(keys)
-
-
-# One engine class per distinct (GPU tier, concurrency) — see _engine_concurrency for why max_inputs
-# is part of the class identity (Modal fixes concurrency per class).
-ENGINE_BY_KEY: dict[tuple[str, int], Any] = {
-    (gpu, mi): _build_engine(gpu, _engine_class_name(gpu, mi), mi, max(1, mi * 3 // 4))
-    for (gpu, mi) in _distinct_engine_keys()
+ENGINE_BY_MODEL: dict[str, Any] = {
+    model: _build_engine(model, _engine_class_name(model), hosted_traffic_policy_for(model))
+    for model in base_models()
 }
 
 
 def _engine_cls_for(base_model: str) -> Any:
-    """The Modal LoraEngine class to run ``base_model`` on (its (GPU, concurrency) class)."""
-    return ENGINE_BY_KEY[_engine_key(base_model)]
+    hosted_traffic_policy_for(base_model)
+    return ENGINE_BY_MODEL[base_model]
+
+
+def _capacity_deployment_identity(base_model: str) -> str:
+    return f"modal-app-class:{APP_NAME}/{_engine_class_name(base_model)}"
 
 
 class _ModalEnginePool:
-    """Dispatches router calls to each base model's per-gpu-tier ``LoraEngine`` container."""
+    """Dispatch and live capacity for each model's dedicated Modal engine class."""
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._capacity: dict[str, CapacitySnapshot] = {}
+        self._capacity_locks: dict[str, asyncio.Lock] = {}
+        self._capacity_changed: Callable[[str], None] | None = None
+
+    def bind_capacity_changed(self, callback: Callable[[str], None]) -> None:
+        self._capacity_changed = callback
+
+    async def capacity_snapshot(self, model: str, observed_local_active: int) -> CapacitySnapshot:
+        now = self._clock()
+        current = self._capacity.get(model)
+        if current is not None and current.is_fresh(
+            now, max_age_seconds=CAPACITY_POLL_INTERVAL_SECONDS
+        ):
+            return current
+        lock = self._capacity_locks.setdefault(model, asyncio.Lock())
+        async with lock:
+            now = self._clock()
+            current = self._capacity.get(model)
+            if current is not None and current.is_fresh(
+                now, max_age_seconds=CAPACITY_POLL_INTERVAL_SECONDS
+            ):
+                return current
+            snapshot = await self._fetch_capacity_snapshot(model, observed_local_active)
+            self._capacity[model] = snapshot
+            if self._capacity_changed is not None:
+                self._capacity_changed(model)
+            return snapshot
+
+    async def _fetch_capacity_snapshot(
+        self, model: str, observed_local_active: int
+    ) -> CapacitySnapshot:
+        observed_at = self._clock()
+        deployment_identity = _capacity_deployment_identity(model)
+        policy = hosted_traffic_policy_for(model)
+        hard_limit = policy.max_inputs * policy.max_containers
+        try:
+            engine = _engine_cls_for(model)()
+            stats = await asyncio.wait_for(
+                engine.generate.get_current_stats.aio(),
+                timeout=CAPACITY_REFRESH_TIMEOUT_SECONDS,
+            )
+            counts = {
+                "total_runners": stats.num_total_runners,
+                "running_inputs": stats.num_running_inputs,
+                "input_headroom": stats.input_headroom,
+                "backlog": stats.backlog,
+            }
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in counts.values()
+            ):
+                raise ValueError("invalid Modal function stats")
+            if counts["total_runners"] <= 0:
+                return CapacitySnapshot.unavailable_snapshot(
+                    model,
+                    deployment_identity,
+                    observed_at,
+                    "no_warm_runners",
+                    observed_local_active=observed_local_active,
+                    **counts,
+                )
+            return CapacitySnapshot(
+                model=model,
+                deployment_identity=deployment_identity,
+                observed_at=observed_at,
+                observed_local_active=observed_local_active,
+                local_active_limit=fixed_local_active_limit(
+                    observed_local_active,
+                    counts["running_inputs"],
+                    counts["input_headroom"],
+                    hard_limit,
+                ),
+                **counts,
+            )
+        except Exception:
+            return CapacitySnapshot.unavailable_snapshot(
+                model,
+                deployment_identity,
+                observed_at,
+                "stats_unavailable",
+                observed_local_active=observed_local_active,
+            )
+
+    def current_dispatch_capacity(self, model: str) -> int:
+        snapshot = self._capacity.get(model)
+        now = self._clock()
+        deployment_identity = _capacity_deployment_identity(model)
+        if snapshot is None or not snapshot.is_dispatchable(
+            now,
+            model=model,
+            deployment_identity=deployment_identity,
+            max_age_seconds=CAPACITY_SNAPSHOT_MAX_AGE_SECONDS,
+        ):
+            return 0
+        return snapshot.local_active_limit
 
     @staticmethod
     def _record_payload(record: Any) -> dict[str, Any]:
@@ -451,7 +536,7 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
-        engine = _engine_cls_for(base_model)(base_model=base_model)
+        engine = _engine_cls_for(base_model)()
         return await engine.generate.remote.aio(
             payload.model_dump(by_alias=True),
             self._record_payload(record),
@@ -466,7 +551,7 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ):
-        engine = _engine_cls_for(base_model)(base_model=base_model)
+        engine = _engine_cls_for(base_model)()
         remote_stream = engine.stream_generate.remote_gen.aio(
             payload.model_dump(by_alias=True),
             self._record_payload(record),
@@ -481,7 +566,7 @@ class _ModalEnginePool:
                 await close()
 
     async def register(self, base_model: str, record: Any) -> None:
-        engine = _engine_cls_for(base_model)(base_model=base_model)
+        engine = _engine_cls_for(base_model)()
         await engine.register.remote.aio(
             self._record_payload(record),
             getattr(record, "deployment_generation", None),
@@ -493,7 +578,7 @@ class _ModalEnginePool:
         adapter_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        engine = _engine_cls_for(base_model)(base_model=base_model)
+        engine = _engine_cls_for(base_model)()
         await engine.unregister.remote.aio(adapter_id, expected_generation)
 
 
@@ -703,12 +788,20 @@ def _build_chat_authorizer(settings: Any) -> Any:
     return authorize
 
 
+ROUTER_ASYNC_CAPACITY = configured_router_async_capacity()
+
+
 @app.function(
     secrets=runtime_secrets,
-    min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
-    timeout=ROUTER_TIMEOUT_SECONDS,  # must cover engine cold start (see ROUTER_TIMEOUT_SECONDS)
+    min_containers=1,
+    max_containers=1,
+    buffer_containers=0,
+    timeout=ROUTER_TIMEOUT_SECONDS,
 )
-@modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=TARGET_INPUTS)
+@modal.concurrent(
+    max_inputs=ROUTER_ASYNC_CAPACITY,
+    target_inputs=ROUTER_ASYNC_CAPACITY,
+)
 @modal.asgi_app(
     label=APP_NAME,
     # Claim the branded domain only when one is configured for this workspace; empty => omit it so the
@@ -749,6 +842,7 @@ def router():
         # the adapter (the backend authorizes), or the shared internal key to bypass. The authorizer
         # must be wired (backend URL + internal key) or non-internal chat fails closed.
         chat_authorizer=_build_chat_authorizer(settings),
+        capacity_provider=pool,
     )
 
 
@@ -756,21 +850,19 @@ def router():
 def start_all(base_model: str | None = None) -> None:
     """Explicitly boot deployed gpu engines and wait for them to report healthy.
 
-    Normal deploys leave gpu engines at zero until inference or adapter registration reaches the
-    matching base model. This manual diagnostic can boot one model with ``--base-model`` or every
-    catalog model without changing the scale-to-zero deployment.
+    Normal deploys keep one warm container for every advertised model and may scale each model to
+    two containers. This manual diagnostic verifies one model with ``--base-model`` or every catalog
+    model without changing that one-warm/two-max policy.
     """
-    from flash.serving.src.model_config import base_models, gpu_for
+    from flash.serving.src.model_config import base_models
 
     started = {}
     failures: list[str] = []
     models = [base_model] if base_model else list(base_models())
     for bm in models:
         # Each base model's engine lives on its (GPU tier, concurrency) class.
-        engine = modal.Cls.from_name(
-            APP_NAME, _engine_class_name(gpu_for(bm), _engine_concurrency(bm)[0])
-        )
-        instance = engine(base_model=bm)
+        engine = modal.Cls.from_name(APP_NAME, _engine_class_name(bm))
+        instance = engine()
         started[bm] = instance.health.spawn()
     for bm, handle in started.items():
         try:

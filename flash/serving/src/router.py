@@ -15,11 +15,14 @@ import contextlib
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from flash.serve.contract import MAX_CHAT_REQUEST_BYTES
 from flash.serving.src.adapter_routes import adapter_router
+from flash.serving.src.admission import ServingCapacityUnavailable, ServingOverloaded
 from flash.serving.src.body_limit import RequestBodyLimitMiddleware
+from flash.serving.src.capacity import CapacityProvider, ConfiguredCapacityProvider
 from flash.serving.src.context import APP_STATE_ATTR, ServingContext
 from flash.serving.src.inference_routes import inference_router
 from flash.serving.src.lookup import AdapterLookup
@@ -50,6 +53,7 @@ def build_serving_app(
     reload_interval_seconds: float = 30.0,
     usage_reporter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     chat_authorizer: Callable[[str, str], Awaitable["str | None"]] | None = None,
+    capacity_provider: CapacityProvider | None = None,
 ):
     """Front-door FastAPI app. ``reload_records`` re-reads persisted ready adapters so a router
     that missed a (un)registration on another container still resolves it: reload once on a miss
@@ -71,6 +75,7 @@ def build_serving_app(
     Trusted server-to-server callers presenting the shared internal key bypass it. If no
     ``chat_authorizer`` is wired, a non-internal request fails closed (503) — prod always wires it.
     """
+    capacity = capacity_provider or ConfiguredCapacityProvider()
     context = ServingContext(
         pool,
         router,
@@ -85,6 +90,7 @@ def build_serving_app(
             deployment_id=deployment_id,
             drain_timeout_seconds=_USAGE_REPORT_DRAIN_TIMEOUT_SECONDS,
         ),
+        capacity,
         internal_key=internal_key,
         reload_records=reload_records,
         lookup_record=lookup_record,
@@ -97,6 +103,37 @@ def build_serving_app(
         lifespan=_lifespan_for(context, usage_reporter, chat_authorizer),
     )
     setattr(api.state, APP_STATE_ATTR, context)
+
+    @api.exception_handler(ServingOverloaded)
+    async def _serving_overloaded(_request: Request, exc: ServingOverloaded) -> JSONResponse:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": {
+                    "message": "The serving model is at capacity. Retry shortly.",
+                    "type": "server_error",
+                    "code": exc.code,
+                }
+            },
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
+
+    @api.exception_handler(ServingCapacityUnavailable)
+    async def _serving_capacity_unavailable(
+        _request: Request, exc: ServingCapacityUnavailable
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": "The serving model has no fresh warm capacity.",
+                    "type": "server_error",
+                    "code": exc.code,
+                }
+            },
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
+
     # fastapi resolves body parameters before handlers run, so cap the raw receive channel first.
     api.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_CHAT_REQUEST_BYTES)
 
@@ -123,13 +160,16 @@ def _lifespan_for(
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: "FastAPI"):
-        refresh_task = asyncio.create_task(context.lookup.refresh_periodically())
+        refresh_tasks = (
+            asyncio.create_task(context.lookup.refresh_periodically()),
+            asyncio.create_task(context.refresh_capacity_periodically()),
+        )
         try:
             yield
         finally:
-            refresh_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await refresh_task
+            for task in refresh_tasks:
+                task.cancel()
+            await asyncio.gather(*refresh_tasks, return_exceptions=True)
         # drain detached usage reports before closing their shared client.
         await context.usage.drain()
 

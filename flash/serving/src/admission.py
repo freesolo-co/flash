@@ -14,7 +14,7 @@ from flash.serving.src.model_config import HostedTrafficPolicy
 
 
 class DispatchLimit(Protocol):
-    """Return the currently dispatchable request count for one model."""
+    """Return the safe absolute local active limit for one model."""
 
     def __call__(self, model: str) -> int: ...
 
@@ -39,6 +39,17 @@ class ServingOverloaded(RuntimeError):
         self.model = model
         self.retry_after_seconds = retry_after_seconds
         super().__init__(f"serving overloaded for model {model!r}")
+
+
+class ServingCapacityUnavailable(RuntimeError):
+    """The model has no fresh positive dispatch capacity."""
+
+    code = "serving_capacity_unavailable"
+
+    def __init__(self, model: str, retry_after_seconds: int) -> None:
+        self.model = model
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(f"serving capacity unavailable for model {model!r}")
 
 
 @dataclass(slots=True)
@@ -111,7 +122,10 @@ class AdmissionController:
     async def acquire(self, model: str) -> AdmissionLease:
         state = self._state_for(model)
         self._promote(model, state)
-        if not state.waiters and state.active < self._dispatch_limit(model, state.policy):
+        dispatch_limit = self._dispatch_limit(model, state.policy)
+        if dispatch_limit <= 0:
+            raise ServingCapacityUnavailable(model, state.policy.retry_after_seconds)
+        if not state.waiters and state.active < dispatch_limit:
             state.active += 1
             return AdmissionLease(self, model, queue_duration_seconds=0.0)
         if len(state.waiters) >= state.policy.queue_capacity:
@@ -139,6 +153,10 @@ class AdmissionController:
         state = self._states.get(model)
         if state is not None:
             self._promote(model, state)
+
+    def active_count(self, model: str) -> int:
+        state = self._states.get(model)
+        return 0 if state is None else state.active
 
     def snapshot(self, model: str) -> AdmissionSnapshot:
         state = self._state_for(model)

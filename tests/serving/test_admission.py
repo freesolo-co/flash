@@ -6,7 +6,11 @@ import asyncio
 
 import pytest
 
-from flash.serving.src.admission import AdmissionController, ServingOverloaded
+from flash.serving.src.admission import (
+    AdmissionController,
+    ServingCapacityUnavailable,
+    ServingOverloaded,
+)
 from flash.serving.src.model_config import HostedTrafficPolicy
 
 _MODEL_A = "model-a"
@@ -47,6 +51,7 @@ def test_immediate_acquire_has_zero_queue_and_hard_limit() -> None:
 
         lease.release()
         assert controller.snapshot(_MODEL_A).active == 0
+        assert controller.active_count(_MODEL_A) == 0
 
     asyncio.run(run())
 
@@ -164,21 +169,19 @@ def test_cancellation_after_promotion_returns_reserved_active_slot() -> None:
     asyncio.run(run())
 
 
-def test_capacity_changed_promotes_waiter_when_dispatch_limit_increases() -> None:
+def test_capacity_changed_allows_future_acquire_when_dispatch_limit_increases() -> None:
     async def run() -> None:
-        clock = _Clock()
         limits = _Limits(**{_MODEL_A: 0})
-        controller = AdmissionController(_policy, limits, clock=clock)
-        waiting = asyncio.create_task(controller.acquire(_MODEL_A))
-        await asyncio.sleep(0)
-        assert controller.snapshot(_MODEL_A).queued == 1
+        controller = AdmissionController(_policy, limits)
 
-        clock.now = 12.5
+        with pytest.raises(ServingCapacityUnavailable):
+            await controller.acquire(_MODEL_A)
+
         limits.values[_MODEL_A] = 1
         controller.capacity_changed(_MODEL_A)
-        lease = await waiting
+        lease = await controller.acquire(_MODEL_A)
 
-        assert lease.queue_duration_seconds == 2.5
+        assert lease.queue_duration_seconds == 0.0
         assert controller.snapshot(_MODEL_A).active == 1
         assert controller.snapshot(_MODEL_A).queued == 0
         lease.release()
@@ -186,29 +189,20 @@ def test_capacity_changed_promotes_waiter_when_dispatch_limit_increases() -> Non
     asyncio.run(run())
 
 
-def test_zero_capacity_fails_closed_and_uses_bounded_queue() -> None:
+def test_zero_capacity_fails_closed_immediately_without_queueing() -> None:
     async def run() -> None:
         controller = AdmissionController(_policy, _Limits(**{_MODEL_A: 0}))
-        first = asyncio.create_task(controller.acquire(_MODEL_A))
-        second = asyncio.create_task(controller.acquire(_MODEL_A))
-        await asyncio.sleep(0)
+
+        with pytest.raises(ServingCapacityUnavailable) as exc_info:
+            await controller.acquire(_MODEL_A)
+        assert exc_info.value.code == "serving_capacity_unavailable"
+        assert exc_info.value.retry_after_seconds == 1
+        assert exc_info.value.model == _MODEL_A
 
         snapshot = controller.snapshot(_MODEL_A)
         assert snapshot.active == 0
-        assert snapshot.queued == 2
+        assert snapshot.queued == 0
         assert snapshot.current_dispatch_limit == 0
-
-        with pytest.raises(ServingOverloaded) as exc_info:
-            await controller.acquire(_MODEL_A)
-        assert exc_info.value.code == "serving_overloaded"
-        assert exc_info.value.retry_after_seconds == 1
-
-        first.cancel()
-        second.cancel()
-        results = await asyncio.gather(first, second, return_exceptions=True)
-        assert all(isinstance(result, asyncio.CancelledError) for result in results)
-        assert controller.snapshot(_MODEL_A).active == 0
-        assert controller.snapshot(_MODEL_A).queued == 0
 
     asyncio.run(run())
 

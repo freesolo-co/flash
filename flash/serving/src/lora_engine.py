@@ -69,13 +69,12 @@ def _stream_usage_fields(
 class _LoraEngineImpl:
     """Implementation of one vLLM multi-LoRA engine for a base model.
 
-    Plain base class: the GPU is chosen per base model (see ``model_config.gpu_for``), and Modal
-    fixes a class's GPU at decoration time, so ``_build_engine`` wraps this in one ``@app.cls`` per
-    distinct GPU tier and the router dispatches each base model to its tier's class. The Modal
-    entrypoints (load/register/generate/stream_generate/unregister/health) live on the thin per-tier
-    subclass and forward to the ``_``-prefixed methods here."""
+    Plain base class: each generated Modal subclass bakes one exact base-model identity and its GPU
+    policy at decoration time. The router dispatches each model to that immutable class variant. The
+    Modal entrypoints (load/register/generate/stream_generate/unregister/health) live on the thin
+    per-model subclass and forward to the ``_``-prefixed methods here."""
 
-    base_model: str  # set by the per-GPU Modal subclass via modal.parameter()
+    base_model: str  # immutable class identity set by the per-model Modal subclass
 
     def _replica_identifier(self) -> str:
         replica_id = getattr(self, "_replica_id", None)

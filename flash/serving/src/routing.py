@@ -117,6 +117,8 @@ class AdapterRouter:
     def resolve(self, adapter_id: str) -> tuple[AdapterRecord, AdapterRecord] | None:
         requested = self._registry.get(adapter_id)
         if requested is not None and requested.status == "ready" and requested.serve_base_model:
+            if not self._require_base_qualification:
+                return requested, requested
             qualified = self._qualified_base(adapter_id)
             return (qualified, qualified) if qualified is not None else None
         resolved = self._resolve_adapter(adapter_id)
@@ -165,8 +167,8 @@ def health_body(
     supported_models = [m for m in models if is_supported_base_model(m)]
     unsupported_models = [m for m in models if not is_supported_base_model(m)]
     # report configured per-model gpu tiers rather than live container counts, which modal does
-    # not expose here. ``gpus`` is the supported base-model engine count and remains stable when
-    # demand-driven containers scale to zero.
+    # not expose here. ``gpus`` is the supported base-model engine count under the fixed
+    # one-warm/two-max policy.
     gpu_by_model = {m: gpu_for(m) for m in supported_models}
     body = {
         "ok": True,

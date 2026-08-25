@@ -6,9 +6,15 @@ from typing import Any
 
 import pytest
 from fastapi import Request
+from starlette.requests import ClientDisconnect
 
 from flash.serving.src import inference_routes
-from flash.serving.src.inference_routes import _discard_prepared_stream, _stream_chat_completion
+from flash.serving.src.admission import AdmissionLease
+from flash.serving.src.inference_routes import (
+    _discard_prepared_stream,
+    _LeasedAsyncIterator,
+    _stream_chat_completion,
+)
 from flash.serving.src.routing import AdapterRouter
 from flash.serving.src.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.serving_io import _sse
@@ -39,17 +45,37 @@ def _record() -> AdapterRecord:
     )
 
 
+def _scope(spec_version: str = "2.3") -> dict[str, Any]:
+    return {
+        "type": "http",
+        "asgi": {"spec_version": spec_version},
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [],
+    }
+
+
 def _request(receive) -> Request:
-    return Request(
-        {
-            "type": "http",
-            "asgi": {"spec_version": "2.3"},
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "headers": [],
-        },
-        receive,
-    )
+    return Request(_scope(), receive)
+
+
+def _lease() -> AdmissionLease:
+    class Controller:
+        def __init__(self) -> None:
+            self.releases = 0
+
+        def _release(self, _model: str) -> None:
+            self.releases += 1
+
+    return AdmissionLease(Controller(), QWEN, queue_duration_seconds=0.0)
+
+
+def _admission_headers() -> dict[str, str]:
+    return {
+        "X-Freesolo-Queue-Duration-Seconds": "0.000000",
+        "X-Freesolo-Application-Active": "1",
+        "X-Freesolo-Application-Pending": "0",
+    }
 
 
 @pytest.mark.parametrize("route", ["generate", "generate_for_adapter", "chat_completions"])
@@ -69,6 +95,14 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
 
             async def authorize_inference(self, *_args):
                 return "org-1"
+
+            async def acquire_admission(self, _model: str) -> AdmissionLease:
+                return _lease()
+
+            def admission_headers(
+                self, _model: str, _admission_lease: AdmissionLease
+            ) -> dict[str, str]:
+                return _admission_headers()
 
             async def generate(self, *_args, **_kwargs):
                 entered.set()
@@ -192,6 +226,8 @@ def test_disconnect_before_first_event_closes_engine_without_starting_response_b
                 created=123,
                 include_usage=True,
                 caller_org="org-1",
+                lease=_lease(),
+                admission_headers=_admission_headers(),
             )
         )
         await entered.wait()
@@ -289,10 +325,235 @@ def test_first_event_failure_closes_engine_iterator() -> None:
                 created=123,
                 include_usage=True,
                 caller_org="org-1",
+                lease=_lease(),
+                admission_headers=_admission_headers(),
             )
         return closed.is_set()
 
     assert asyncio.run(scenario()), "a failed first advance leaked the engine iterator"
+
+
+def test_leased_iterator_explicit_close_before_first_advance_closes_and_releases_once() -> None:
+    async def scenario() -> tuple[int, bool]:
+        closed = False
+
+        class Events:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise AssertionError("unstarted close must not advance the iterator")
+
+            async def aclose(self) -> None:
+                nonlocal closed
+                closed = True
+
+        lease = _lease()
+        owned = _LeasedAsyncIterator(Events(), lease)
+        await owned.aclose()
+        await owned.aclose()
+        return lease._controller.releases, closed
+
+    releases, closed = asyncio.run(scenario())
+    assert closed
+    assert releases == 1
+
+
+def test_leased_iterator_explicit_close_after_first_event_closes_and_releases_once() -> None:
+    async def scenario() -> tuple[bytes, int, bool]:
+        closed = False
+
+        class Events:
+            def __init__(self) -> None:
+                self.sent = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.sent:
+                    await asyncio.Event().wait()
+                self.sent = True
+                return b"event"
+
+            async def aclose(self) -> None:
+                nonlocal closed
+                closed = True
+
+        lease = _lease()
+        owned = _LeasedAsyncIterator(Events(), lease)
+        first = await anext(owned)
+        await owned.aclose()
+        await owned.aclose()
+        return first, lease._controller.releases, closed
+
+    first, releases, closed = asyncio.run(scenario())
+    assert first == b"event"
+    assert closed
+    assert releases == 1
+
+
+def test_leased_iterator_normal_completion_releases_once() -> None:
+    async def scenario() -> tuple[list[bytes], int]:
+        async def events():
+            yield b"one"
+            yield b"two"
+
+        lease = _lease()
+        owned = _LeasedAsyncIterator(events(), lease)
+        chunks = [chunk async for chunk in owned]
+        await owned.aclose()
+        return chunks, lease._controller.releases
+
+    chunks, releases = asyncio.run(scenario())
+    assert chunks == [b"one", b"two"]
+    assert releases == 1
+
+
+def test_leased_iterator_midstream_error_closes_and_releases_once() -> None:
+    async def scenario() -> tuple[int, bool]:
+        closed = False
+
+        class Events:
+            def __init__(self) -> None:
+                self.sent = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.sent:
+                    self.sent = True
+                    return b"partial"
+                raise RuntimeError("engine stream failed")
+
+            async def aclose(self) -> None:
+                nonlocal closed
+                closed = True
+
+        lease = _lease()
+        owned = _LeasedAsyncIterator(Events(), lease)
+        assert await anext(owned) == b"partial"
+        with pytest.raises(RuntimeError, match="engine stream failed"):
+            await anext(owned)
+        return lease._controller.releases, closed
+
+    releases, closed = asyncio.run(scenario())
+    assert closed
+    assert releases == 1
+
+
+def test_leased_iterator_cancellation_closes_and_releases_once() -> None:
+    async def scenario() -> tuple[int, bool]:
+        entered = asyncio.Event()
+        closed = False
+
+        class Events:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                entered.set()
+                await asyncio.Event().wait()
+                raise StopAsyncIteration
+
+            async def aclose(self) -> None:
+                nonlocal closed
+                closed = True
+
+        lease = _lease()
+        owned = _LeasedAsyncIterator(Events(), lease)
+        task = asyncio.create_task(anext(owned))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return lease._controller.releases, closed
+
+    releases, closed = asyncio.run(scenario())
+    assert closed
+    assert releases == 1
+
+
+def test_asgi_24_send_failure_closes_stream_and_releases_lease_once() -> None:
+    async def scenario() -> tuple[int, int]:
+        closes = 0
+
+        class Events:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return b"event"
+
+            async def aclose(self) -> None:
+                nonlocal closes
+                closes += 1
+
+        lease = _lease()
+        body = inference_routes._LeasedAsyncIterator(Events(), lease)
+        response = inference_routes._ClosingStreamingResponse(body)
+
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def send(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.body" and message.get("body"):
+                raise OSError("client disconnected")
+
+        with pytest.raises(ClientDisconnect):
+            await response(_scope("2.4"), receive, send)
+        await body.aclose()
+        await body.aclose()
+        return closes, lease._controller.releases
+
+    closes, releases = asyncio.run(scenario())
+    assert closes == 1
+    assert releases == 1
+
+
+def test_asgi_23_disconnect_closes_stream_and_releases_lease_once() -> None:
+    async def scenario() -> tuple[int, int]:
+        sent = asyncio.Event()
+        closes = 0
+
+        class Events:
+            def __init__(self) -> None:
+                self.first = True
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.first:
+                    self.first = False
+                    return b"event"
+                await asyncio.Event().wait()
+                raise StopAsyncIteration
+
+            async def aclose(self) -> None:
+                nonlocal closes
+                closes += 1
+
+        lease = _lease()
+        body = inference_routes._LeasedAsyncIterator(Events(), lease)
+        response = inference_routes._ClosingStreamingResponse(body)
+
+        async def receive():
+            await sent.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.body" and message.get("body"):
+                sent.set()
+
+        await response(_scope("2.3"), receive, send)
+        await body.aclose()
+        return closes, lease._controller.releases
+
+    closes, releases = asyncio.run(scenario())
+    assert closes == 1
+    assert releases == 1
 
 
 def test_connected_preparation_preserves_headers_events_and_usage() -> None:
@@ -345,6 +606,8 @@ def test_connected_preparation_preserves_headers_events_and_usage() -> None:
             created=123,
             include_usage=True,
             caller_org="org-1",
+            lease=_lease(),
+            admission_headers=_admission_headers(),
         )
         chunks = [chunk async for chunk in response.body_iterator]
         return response, chunks, context, closed.is_set()
@@ -354,6 +617,9 @@ def test_connected_preparation_preserves_headers_events_and_usage() -> None:
     assert response.headers["x-freesolo-adapter-revision"] == _record().adapter_id
     assert response.headers["x-freesolo-checkpoint"] == "run-a"
     assert response.headers["x-freesolo-hf-revision"] == revision
+    assert response.headers["x-freesolo-queue-duration-seconds"] == "0.000000"
+    assert response.headers["x-freesolo-application-active"] == "1"
+    assert response.headers["x-freesolo-application-pending"] == "0"
     assert chunks == [
         _sse(
             {

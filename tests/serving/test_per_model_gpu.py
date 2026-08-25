@@ -21,7 +21,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from flash.serving.src.model_config import base_models, gpu_for
+from flash.serving.src.admission import AdmissionController, ServingOverloaded
+from flash.serving.src.model_config import base_models, gpu_for, hosted_traffic_policy_for
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -135,7 +136,9 @@ print(json.dumps({
     "mode": modal_app.SERVING_DEPLOYMENT_MODE,
     "custom_domain": modal_app.SERVING_CUSTOM_DOMAIN,
     "asgi_custom_domains": modal_stub.asgi_app.call_args.kwargs["custom_domains"],
-    "min_containers": modal_app.MIN_CONTAINERS,
+    "engine_min_containers": sorted({
+        call.kwargs["min_containers"] for call in modal_app.app.cls.call_args_list
+    }),
 }))
 """
 
@@ -164,13 +167,13 @@ def _successful_import_payload(
     return json.loads(result.stdout)
 
 
-def test_deployment_mode_unset_defaults_to_production_with_zero_floor() -> None:
+def test_deployment_mode_unset_defaults_to_production_with_warm_floor() -> None:
     payload = _successful_import_payload(_probe_modal_app_import())
     assert payload == {
         "mode": "production",
         "custom_domain": "",
         "asgi_custom_domains": None,
-        "min_containers": 0,
+        "engine_min_containers": [1],
     }
 
 
@@ -185,11 +188,11 @@ def test_explicit_production_mode_accepts_production_custom_domain() -> None:
         "mode": "production",
         "custom_domain": "serve.freesolo.co",
         "asgi_custom_domains": ["serve.freesolo.co"],
-        "min_containers": 0,
+        "engine_min_containers": [1],
     }
 
 
-def test_development_mode_accepts_exact_custom_domain_with_zero_floor() -> None:
+def test_development_mode_accepts_exact_custom_domain_with_warm_floor() -> None:
     payload = _successful_import_payload(
         _probe_modal_app_import(
             SERVING_DEPLOYMENT_MODE="development",
@@ -201,7 +204,7 @@ def test_development_mode_accepts_exact_custom_domain_with_zero_floor() -> None:
         "mode": "development",
         "custom_domain": _DEVELOPMENT_CUSTOM_DOMAIN,
         "asgi_custom_domains": [_DEVELOPMENT_CUSTOM_DOMAIN],
-        "min_containers": 0,
+        "engine_min_containers": [1],
     }
 
 
@@ -418,81 +421,32 @@ assert "flash.serving.src.multimodal" not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
-def test_one_engine_class_per_distinct_engine_key(modal_app_module):
-    """A LoraEngine @app.cls is built for each distinct (GPU tier, max_inputs) key. The small models
-    share (L4, 64); 4B uses (L4, 16), 9B uses (L40S, 16), 27B uses (H100, 16), and 35B uses (H200, 16)."""
-    assert set(modal_app_module.ENGINE_BY_KEY) == {
-        ("L4", 64),
-        ("L4", 16),
-        ("L40S", 16),
-        ("H100", 16),
-        ("H200", 16),
-    }
+def test_one_engine_class_per_supported_model(modal_app_module):
+    assert set(modal_app_module.ENGINE_BY_MODEL) == set(base_models())
+    assert len(modal_app_module.ENGINE_BY_MODEL) == 6
+    assert len({id(engine) for engine in modal_app_module.ENGINE_BY_MODEL.values()}) == 6
 
 
-def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, monkeypatch):
-    mod = modal_app_module
-
-    monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {"max_num_seqs": 8})
-    assert mod._engine_concurrency("valid") == (16, 12)
-
-    monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {})
-    assert mod._engine_concurrency("defaulted") == (64, 48)
-
-    monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {"max_num_seqs": "invalid"})
-    monkeypatch.setattr(mod, "base_models", lambda: ["malformed"])
-    monkeypatch.setattr(mod, "gpu_for", lambda _bm: "L4")
-    with pytest.raises(ValueError, match="invalid literal"):
-        mod._distinct_engine_keys()
+def test_engine_concurrency_comes_from_validated_model_policy(modal_app_module):
+    assert modal_app_module._engine_concurrency("Qwen/Qwen3.5-0.8B") == (64, 48)
+    assert modal_app_module._engine_concurrency("Qwen/Qwen3.5-4B") == (8, 6)
+    with pytest.raises(ValueError, match="Unsupported base model"):
+        modal_app_module._engine_concurrency("unsupported/model")
 
 
-def test_class_names_are_distinct_and_modal_safe(modal_app_module):
-    """Each tier registers under an app-unique, alnum/underscore-only class name that encodes both
-    the GPU and its concurrency (max_inputs is part of the class identity)."""
-    assert modal_app_module._engine_class_name("L4", 64) == "LoraEngine_L4_c64"
-    assert modal_app_module._engine_class_name("L4", 16) == "LoraEngine_L4_c16"
-    assert modal_app_module._engine_class_name("A100-80GB", 16) == "LoraEngine_A100_80GB_c16"
+def test_class_names_are_deterministic_distinct_and_modal_safe(modal_app_module):
+    names = [modal_app_module._engine_class_name(model) for model in base_models()]
+    assert len(set(names)) == 6
+    assert names == [modal_app_module._engine_class_name(model) for model in base_models()]
+    assert all(name.startswith("LoraEngine_") for name in names)
+    assert all(name.replace("_", "").isalnum() for name in names)
 
 
-def test_small_models_route_to_l4(modal_app_module):
-    """Small dense models (owned pre-quant checkpoints) keep the cheap FP8-capable L4 tier."""
-    by_key = modal_app_module.ENGINE_BY_KEY
-    for bm in (
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
-    ):
-        assert modal_app_module._engine_cls_for(bm) is by_key[("L4", 64)]
-        assert gpu_for(bm) == "L4"
-
-
-def test_4b_routes_to_l4(modal_app_module):
-    """Rank-128 LoRA serving for 4B uses the L4 tier (8-seq -> (L4, 16))."""
-    by_key = modal_app_module.ENGINE_BY_KEY
-    assert gpu_for("Qwen/Qwen3.5-4B") == "L4"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-4B") is by_key[("L4", 16)]
-
-
-def test_9b_routes_to_l40s(modal_app_module):
-    """Rank-128 LoRA serving for 9B uses the L40S tier (8-seq -> (L40S, 16))."""
-    by_key = modal_app_module.ENGINE_BY_KEY
-    assert gpu_for("Qwen/Qwen3.5-9B") == "L40S"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-9B") is by_key[("L40S", 16)]
-    assert by_key[("L40S", 16)].__name__ == "LoraEngine_L40S_c16"
-
-
-def test_27b_routes_to_h100(modal_app_module):
-    """rank-64 LoRA serving for 27B uses the H100 tier (8-seq -> (H100, 16))."""
-    by_key = modal_app_module.ENGINE_BY_KEY
-    assert gpu_for("Qwen/Qwen3.6-27B") == "H100"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-27B") is by_key[("H100", 16)]
-
-
-def test_35b_moe_routes_to_h200(modal_app_module):
-    """The 35B-A3B MoE runs bf16 on the H200 tier ((H200, 16))."""
-    by_key = modal_app_module.ENGINE_BY_KEY
-    assert gpu_for("Qwen/Qwen3.6-35B-A3B") == "H200"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("H200", 16)]
-    assert by_key[("H200", 16)].pinned_gpu == "H200"
+@pytest.mark.parametrize("base_model", base_models())
+def test_each_model_routes_to_its_exact_identity(modal_app_module, base_model: str):
+    engine = modal_app_module.ENGINE_BY_MODEL[base_model]
+    assert modal_app_module._engine_cls_for(base_model) is engine
+    assert engine.pinned_gpu == gpu_for(base_model)
 
 
 def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module):
@@ -501,41 +455,325 @@ def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module)
         modal_app_module._engine_cls_for("Qwen/Qwen3.5-99B")
 
 
-def test_tier_classes_inherit_the_shared_impl(modal_app_module):
-    """Each tier class subclasses _LoraEngineImpl (so _load/_generate/etc resolve) and defines the
-    public Modal entrypoints itself (so Modal collects them per class)."""
-    l4 = modal_app_module.ENGINE_BY_KEY[("L4", 64)]
-    assert issubclass(l4, modal_app_module._LoraEngineImpl)
-    for impl in ("_load", "_register", "_generate", "_stream_generate", "_unregister", "_health"):
-        assert hasattr(l4, impl)
-    for entry in ("load", "register", "generate", "stream_generate", "unregister", "health"):
-        assert entry in l4.__dict__
+def test_modal_capacity_snapshot_parses_exact_stats_and_identity(modal_app_module, monkeypatch):
+    model = "Qwen/Qwen3.5-0.8B"
+    stats = types.SimpleNamespace(
+        num_total_runners=1,
+        num_running_inputs=10,
+        input_headroom=54,
+        backlog=3,
+    )
+
+    class GetCurrentStats:
+        @staticmethod
+        async def aio():
+            return stats
+
+    class StatsMethod:
+        get_current_stats = GetCurrentStats
+
+    class Engine:
+        generate = StatsMethod()
+
+    monkeypatch.setattr(
+        modal_app_module, "_engine_cls_for", lambda _model: lambda **_kwargs: Engine()
+    )
+    pool = modal_app_module._ModalEnginePool(clock=lambda: 10.0)
+
+    snapshot = asyncio.run(pool.capacity_snapshot(model, observed_local_active=10))
+
+    assert snapshot.model == model
+    assert snapshot.deployment_identity == modal_app_module._capacity_deployment_identity(model)
+    assert snapshot.total_runners == 1
+    assert snapshot.running_inputs == 10
+    assert snapshot.input_headroom == 54
+    assert snapshot.backlog == 3
+    assert snapshot.observed_local_active == 10
+    assert snapshot.local_active_limit == 64
+    assert pool.current_dispatch_capacity(model) == 64
 
 
-def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
-    """Each per-tier class records the GPU it was actually pinned to in _build_engine, so health/ops
-    can detect a base model misrouted onto the wrong tier instead of trusting the derived lookup."""
-    by_key = modal_app_module.ENGINE_BY_KEY
-    # Every class records the GPU half of its (gpu, max_inputs) key.
-    for (gpu, _max_inputs), cls in by_key.items():
-        assert cls.pinned_gpu == gpu
-    assert by_key[("L4", 64)].pinned_gpu == "L4"
-    assert by_key[("L4", 16)].pinned_gpu == "L4"
-    assert by_key[("L40S", 16)].pinned_gpu == "L40S"
-    assert by_key[("H100", 16)].pinned_gpu == "H100"
-    assert by_key[("H200", 16)].pinned_gpu == "H200"
+def test_fixed_stats_snapshot_never_self_inflates_admission_limit(
+    modal_app_module, monkeypatch
+) -> None:
+    model = "Qwen/Qwen3.5-0.8B"
+    stats = types.SimpleNamespace(
+        num_total_runners=1,
+        num_running_inputs=60,
+        input_headroom=4,
+        backlog=0,
+    )
+
+    class GetCurrentStats:
+        @staticmethod
+        async def aio():
+            return stats
+
+    class Engine:
+        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
+
+    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
+    pool = modal_app_module._ModalEnginePool(clock=lambda: 10.0)
+    admission = AdmissionController(hosted_traffic_policy_for, pool.current_dispatch_capacity)
+
+    async def scenario() -> tuple[list[object], bool, list[int]]:
+        snapshot = await pool.capacity_snapshot(model, admission.active_count(model))
+        leases = [await admission.acquire(model) for _ in range(4)]
+        waiters = [asyncio.create_task(admission.acquire(model)) for _ in range(2)]
+        await asyncio.sleep(0)
+        with pytest.raises(ServingOverloaded):
+            await admission.acquire(model)
+        limits = [snapshot.local_active_limit, admission.snapshot(model).current_dispatch_limit]
+        leases[0].release()
+        await asyncio.sleep(0)
+        first_fifo = waiters[0].done() and not waiters[1].done()
+        first = await waiters[0]
+        first.release()
+        await asyncio.sleep(0)
+        second = await waiters[1]
+        for lease in (*leases[1:], second):
+            lease.release()
+        limits.append(admission.snapshot(model).current_dispatch_limit)
+        return waiters, first_fifo, limits
+
+    waiters, first_fifo, limits = asyncio.run(scenario())
+    assert all(waiter.done() for waiter in waiters)
+    assert first_fifo
+    assert limits == [4, 4, 4]
 
 
-def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
-    """Each tier class carries its distinct, module-level identity: a clean ``__name__``/``__qualname__``
-    (no ``<locals>``) plus a module attribute under that name. The rename + global binding happen on the
-    REAL class BEFORE ``@modal.concurrent`` wraps it — otherwise (renaming after the decorator) every tier
-    would register under ``_Engine`` and the ``<locals>`` qualname would fail Modal's global-scope check."""
-    for (gpu, max_inputs), cls in modal_app_module.ENGINE_BY_KEY.items():
-        class_name = modal_app_module._engine_class_name(gpu, max_inputs)
-        assert cls.__name__ == class_name
-        assert cls.__qualname__ == class_name  # clean — no `_build_engine.<locals>.` prefix
-        assert getattr(modal_app_module, class_name) is cls  # reachable as a module global by name
+def test_modal_capacity_snapshot_fails_closed_on_invalid_or_mismatched_identity(
+    modal_app_module,
+) -> None:
+    model = "Qwen/Qwen3.5-0.8B"
+    identity = modal_app_module._capacity_deployment_identity(model)
+    snapshot = modal_app_module.CapacitySnapshot(
+        model=model,
+        deployment_identity=identity,
+        observed_at=10.0,
+        total_runners=1,
+        running_inputs=60,
+        input_headroom=4,
+        backlog=100,
+        observed_local_active=0,
+        local_active_limit=4,
+    )
+    clock = {"now": 10.0}
+    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
+    pool._capacity[model] = snapshot
+
+    assert pool.current_dispatch_capacity(model) == 4
+    clock["now"] = 13.0
+    assert pool.current_dispatch_capacity(model) == 0
+    clock["now"] = 10.0
+
+    pool._capacity[model] = modal_app_module.CapacitySnapshot(
+        model="Qwen/Qwen3.5-2B",
+        deployment_identity=identity,
+        observed_at=10.0,
+        total_runners=1,
+        running_inputs=0,
+        input_headroom=64,
+        backlog=0,
+        observed_local_active=0,
+        local_active_limit=64,
+    )
+    assert pool.current_dispatch_capacity(model) == 0
+
+    pool._capacity[model] = modal_app_module.CapacitySnapshot(
+        model=model,
+        deployment_identity=f"{identity}-other",
+        observed_at=10.0,
+        total_runners=1,
+        running_inputs=0,
+        input_headroom=64,
+        backlog=0,
+        observed_local_active=0,
+        local_active_limit=64,
+    )
+    assert pool.current_dispatch_capacity(model) == 0
+
+
+def test_modal_capacity_is_isolated_per_model(modal_app_module) -> None:
+    first, second = base_models()[:2]
+    pool = modal_app_module._ModalEnginePool(clock=lambda: 10.0)
+    pool._capacity[first] = modal_app_module.CapacitySnapshot(
+        model=first,
+        deployment_identity=modal_app_module._capacity_deployment_identity(first),
+        observed_at=10.0,
+        total_runners=1,
+        running_inputs=0,
+        input_headroom=5,
+        backlog=0,
+        observed_local_active=0,
+        local_active_limit=5,
+    )
+    pool._capacity[second] = modal_app_module.CapacitySnapshot(
+        model=second,
+        deployment_identity=modal_app_module._capacity_deployment_identity(second),
+        observed_at=10.0,
+        total_runners=1,
+        running_inputs=0,
+        input_headroom=7,
+        backlog=0,
+        observed_local_active=0,
+        local_active_limit=7,
+    )
+
+    assert pool.current_dispatch_capacity(first) == 5
+    assert pool.current_dispatch_capacity(second) == 7
+
+
+def test_new_function_stats_replace_fixed_limit_for_scale_up_and_down(
+    modal_app_module, monkeypatch
+) -> None:
+    model = "Qwen/Qwen3.5-0.8B"
+    clock = {"now": 10.0}
+    stats = {
+        "value": types.SimpleNamespace(
+            num_total_runners=1,
+            num_running_inputs=60,
+            input_headroom=4,
+            backlog=0,
+        )
+    }
+
+    class GetCurrentStats:
+        @staticmethod
+        async def aio():
+            return stats["value"]
+
+    class Engine:
+        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
+
+    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
+    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
+
+    first = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
+    assert first.local_active_limit == 4
+
+    clock["now"] += modal_app_module.CAPACITY_POLL_INTERVAL_SECONDS + 0.01
+    stats["value"] = types.SimpleNamespace(
+        num_total_runners=2,
+        num_running_inputs=56,
+        input_headroom=8,
+        backlog=0,
+    )
+    scaled_up = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
+    assert scaled_up.local_active_limit == 8
+
+    clock["now"] += modal_app_module.CAPACITY_POLL_INTERVAL_SECONDS + 0.01
+    stats["value"] = types.SimpleNamespace(
+        num_total_runners=1,
+        num_running_inputs=62,
+        input_headroom=2,
+        backlog=0,
+    )
+    scaled_down = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
+    assert scaled_down.local_active_limit == 2
+    assert pool.current_dispatch_capacity(model) == 2
+
+
+def test_model_classes_inherit_the_shared_impl(modal_app_module):
+    for engine in modal_app_module.ENGINE_BY_MODEL.values():
+        assert issubclass(engine, modal_app_module._LoraEngineImpl)
+        for impl in (
+            "_load",
+            "_register",
+            "_generate",
+            "_stream_generate",
+            "_unregister",
+            "_health",
+        ):
+            assert hasattr(engine, impl)
+        for entry in ("load", "register", "generate", "stream_generate", "unregister", "health"):
+            assert entry in engine.__dict__
+
+
+def test_model_class_identity_is_fixed_before_decoration(modal_app_module):
+    for model, engine in modal_app_module.ENGINE_BY_MODEL.items():
+        class_name = modal_app_module._engine_class_name(model)
+        assert engine.__name__ == class_name
+        assert engine.__qualname__ == class_name
+        assert getattr(modal_app_module, class_name) is engine
+
+
+def test_installed_modal_registers_six_unparameterized_exact_warm_classes() -> None:
+    code = """
+import inspect
+import json
+
+import flash.serving.modal_app as modal_app
+
+app_inner = next(
+    value for name, value in vars(modal_app.app).items() if name.startswith("_sync_original")
+)
+registered = app_inner._local_state_attr.functions
+observed = {}
+for model, engine_class in modal_app.ENGINE_BY_MODEL.items():
+    instance = engine_class()
+    service = registered[f"{engine_class.__name__}.*"]
+    registration = inspect.getclosurevars(service._load).nonlocals
+    user_class = registration["info"].user_cls
+    observed[model] = {
+        "class_name": engine_class.__name__,
+        "parameters": instance._get_parameter_values(),
+        "instance_model": instance.base_model,
+        "class_model": user_class.base_model,
+        "min_containers": registration["min_containers"],
+        "max_containers": registration["max_containers"],
+    }
+print(json.dumps(observed, sort_keys=True))
+"""
+    env = os.environ.copy()
+    env["SERVING_DEPLOYMENT_MODE"] = "production"
+    env.pop("SERVING_CUSTOM_DOMAIN", None)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert set(observed) == set(base_models())
+    assert len({entry["class_name"] for entry in observed.values()}) == 6
+    for model, entry in observed.items():
+        assert entry["parameters"] == {}
+        assert entry["instance_model"] == model
+        assert entry["class_model"] == model
+        assert entry["min_containers"] == 1
+        assert entry["max_containers"] == 2
+
+
+def test_changed_hosted_sources_describe_warm_policy() -> None:
+    root = Path(__file__).resolve().parents[2]
+    sources = (
+        root / "flash/serving/modal_app.py",
+        root / "flash/serving/src/context.py",
+        root / "flash/serving/src/lora_engine.py",
+        root / "flash/serving/src/routing.py",
+    )
+    forbidden = (
+        "scale" + "-to-zero",
+        "scale" + "-from-zero",
+        "scaled" + "-to-zero",
+        "zero" + "-floor",
+        "leave gpu engines at " + "zero",
+        "demand" + "-only",
+        "min_containers" + " = 0",
+    )
+
+    hits = {
+        str(path.relative_to(root)): phrase
+        for path in sources
+        for phrase in forbidden
+        if phrase in path.read_text().lower()
+    }
+    assert hits == {}
 
 
 def test_health_reports_pinned_gpu_over_derived_tier(modal_app_module):
@@ -590,7 +828,7 @@ def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
     mod = modal_app_module
     monkeypatch.setattr(model_config, "base_models", lambda: ["ok", "boom"])
     monkeypatch.setattr(model_config, "gpu_for", lambda _bm: "L4")
-    monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {})
+    monkeypatch.setattr(mod, "_engine_class_name", lambda model: f"LoraEngine_{model}")
     spawned: list[str] = []
 
     class _Handle:
@@ -602,13 +840,15 @@ def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
                 raise RuntimeError("cold start failed")
             return "ok"
 
-    def _from_name(_app_name: str, _cls_name: str):
-        def _factory(base_model: str):
+    def _from_name(_app_name: str, cls_name: str):
+        model = cls_name.removeprefix("LoraEngine_")
+
+        def _factory():
             class _Health:
                 @staticmethod
                 def spawn():
-                    spawned.append(base_model)
-                    return _Handle(base_model)
+                    spawned.append(model)
+                    return _Handle(model)
 
             return type("Instance", (), {"health": _Health()})()
 
@@ -622,8 +862,8 @@ def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
     assert sorted(spawned) == ["boom", "ok"]
 
 
-def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_module, monkeypatch):
-    """The pool never updates autoscaling and still dispatches demand-driven remote calls."""
+def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monkeypatch):
+    """The one-warm/two-max pool dispatches through the exact per-model class."""
     mod = modal_app_module
     bound_models: list[str] = []
     generate_calls: list[tuple[dict, dict, str | None]] = []
@@ -665,15 +905,18 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
 
         @property
         def update_autoscaler(self):
-            raise AssertionError("zero-floor engines must not update the autoscaler")
+            raise AssertionError("fixed one-warm/two-max engines must not update autoscaling")
 
     engine = _FakeEngine()
 
-    def _bind(*, base_model: str):
-        bound_models.append(base_model)
-        return engine
+    def _engine_for(base_model: str):
+        def _bind():
+            bound_models.append(base_model)
+            return engine
 
-    monkeypatch.setattr(mod, "_engine_cls_for", lambda _base_model: _bind)
+        return _bind
+
+    monkeypatch.setattr(mod, "_engine_cls_for", _engine_for)
     pool = mod._ModalEnginePool()
     payload = _Dump({"messages": [{"role": "user", "content": "hello"}]})
     record = _Dump(

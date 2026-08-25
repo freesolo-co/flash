@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from starlette.responses import StreamingResponse
 
 from flash.serving.src.adapter_routes import remove_adapter
+from flash.serving.src.capacity import CapacitySnapshot
 from flash.serving.src.router import AdapterRouter, build_serving_app
 from flash.serving.src.schemas import AdapterRecord
 from flash.serving.src.serving_io import _sse
@@ -335,6 +336,177 @@ def test_generate_routes_to_the_adapters_base_model(app_setup):
     assert client.post("/generate", json={"adapter_id": "mc", "prompt": "hi"}).status_code == 200
     # qa -> 0.8B engine, mc -> 2B engine.
     assert pool.generated == [(QWEN, _revision_id("qa")), (QWEN_2B, _revision_id("mc"))]
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/generate", {"adapter_id": "qa", "prompt": "hi"}),
+        ("/adapters/qa/generate", {"prompt": "hi"}),
+        (
+            "/v1/chat/completions",
+            {"model": "qa", "messages": [{"role": "user", "content": "hi"}]},
+        ),
+    ],
+)
+def test_successful_nonstream_admission_headers(
+    app_setup, path: str, payload: dict[str, object]
+) -> None:
+    client, _, _ = app_setup
+
+    response = client.post(path, json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["X-Freesolo-Queue-Duration-Seconds"] == "0.000000"
+    assert response.headers["X-Freesolo-Application-Active"] == "1"
+    assert response.headers["X-Freesolo-Application-Pending"] == "0"
+
+
+def test_successful_stream_admission_headers(app_setup) -> None:
+    client, _, _ = app_setup
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "qa",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["X-Freesolo-Queue-Duration-Seconds"] == "0.000000"
+        assert response.headers["X-Freesolo-Application-Active"] == "1"
+        assert response.headers["X-Freesolo-Application-Pending"] == "0"
+        response.read()
+
+
+def test_zero_live_capacity_returns_retryable_503_body() -> None:
+    class UnavailableCapacity:
+        async def capacity_snapshot(
+            self, model: str, observed_local_active: int
+        ) -> CapacitySnapshot:
+            return CapacitySnapshot.unavailable_snapshot(
+                model,
+                "test:unavailable",
+                time.monotonic(),
+                "no_warm_runners",
+                observed_local_active=observed_local_active,
+            )
+
+        def current_dispatch_capacity(self, _model: str) -> int:
+            return 0
+
+    client = _serve(
+        FakePool(),
+        _router_for("qa", QWEN),
+        capacity_provider=UnavailableCapacity(),
+    )
+
+    response = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    assert response.json() == {
+        "error": {
+            "message": "The serving model has no fresh warm capacity.",
+            "type": "server_error",
+            "code": "serving_capacity_unavailable",
+        }
+    }
+
+
+def test_full_admission_queue_returns_retryable_429_body() -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    class OneSlotCapacity:
+        async def capacity_snapshot(
+            self, model: str, observed_local_active: int
+        ) -> CapacitySnapshot:
+            return CapacitySnapshot(
+                model=model,
+                deployment_identity="test:one-slot",
+                observed_at=time.monotonic(),
+                total_runners=1,
+                running_inputs=0,
+                input_headroom=1,
+                backlog=0,
+                observed_local_active=observed_local_active,
+                local_active_limit=1,
+            )
+
+        def current_dispatch_capacity(self, _model: str) -> int:
+            return 1
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingPool(FakePool):
+        async def generate(self, base_model, payload, record, *, expected_checkpoint=None):
+            entered.set()
+            await release.wait()
+            return await super().generate(
+                base_model,
+                payload,
+                record,
+                expected_checkpoint=expected_checkpoint,
+            )
+
+    app = build_serving_app(
+        BlockingPool(),
+        _router_for("qa", QWEN),
+        capacity_provider=OneSlotCapacity(),
+        chat_authorizer=_allow,
+    )
+
+    async def scenario():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+
+            async def send():
+                return await client.post(
+                    "/generate",
+                    json={"adapter_id": "qa", "prompt": "hi"},
+                    headers={"Authorization": "Bearer t"},
+                )
+
+            active = asyncio.create_task(send())
+            entered_wait = asyncio.create_task(entered.wait())
+            done, _ = await asyncio.wait(
+                {active, entered_wait},
+                timeout=5,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert entered_wait in done, "the active route exited before entering generation"
+            await entered_wait
+            assert not active.done(), "the active route exited while generation was blocked"
+
+            waiters = (asyncio.create_task(send()), asyncio.create_task(send()))
+            deadline = asyncio.get_running_loop().time() + 5
+            while app.state.serving_context.admission.snapshot(QWEN).queued < 2:
+                completed = [task for task in waiters if task.done()]
+                assert not completed, "an admission waiter exited before the queue filled"
+                assert asyncio.get_running_loop().time() < deadline, (
+                    "the admission queue did not fill"
+                )
+                await asyncio.sleep(0.01)
+
+            overloaded = await send()
+            release.set()
+            responses = await asyncio.wait_for(asyncio.gather(active, *waiters), timeout=5)
+            return overloaded, responses
+
+    overloaded, responses = asyncio.run(scenario())
+
+    assert overloaded.status_code == 429
+    assert overloaded.headers["Retry-After"] == "1"
+    assert overloaded.json() == {
+        "error": {
+            "message": "The serving model is at capacity. Retry shortly.",
+            "type": "server_error",
+            "code": "serving_overloaded",
+        }
+    }
+    assert all(response.status_code == 200 for response in responses)
 
 
 def test_chat_template_kwargs_forwarded_on_generate(app_setup):

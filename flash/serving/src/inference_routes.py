@@ -11,13 +11,14 @@ import asyncio
 import re
 import time
 import uuid
-from collections.abc import Awaitable
+from collections.abc import AsyncIterator, Awaitable
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from flash.serve.app.openai import OpenAIRequestError, parse_stream_options
+from flash.serving.src.admission import AdmissionLease
 from flash.serving.src.context import ServingContext
 from flash.serving.src.responses import openai_chat_completion, openai_generate_fields
 from flash.serving.src.schemas import GenerateRequest
@@ -45,17 +46,22 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     caller_org = await context.authorize_inference(request, payload.adapter_id)
     requested, target = await context.lookup.resolve(payload.adapter_id)
     await _prepare_generate_request(payload, target)
-    result = await _await_until_disconnect(
-        request,
-        context.generate(
-            payload,
-            requested,
-            target,
-            expected_checkpoint=_expected_checkpoint(request),
-            caller_org=caller_org,
-        ),
-    )
-    return _inference_json_response(result, target)
+    lease = await context.acquire_admission(target.base_model)
+    admission_headers = context.admission_headers(target.base_model, lease)
+    try:
+        result = await _await_until_disconnect(
+            request,
+            context.generate(
+                payload,
+                requested,
+                target,
+                expected_checkpoint=_expected_checkpoint(request),
+                caller_org=caller_org,
+            ),
+        )
+    finally:
+        lease.release()
+    return _inference_json_response(result, target, headers=admission_headers)
 
 
 @inference_router.post("/adapters/{adapter_id}/generate", tags=["inference"])
@@ -68,17 +74,22 @@ async def generate_for_adapter(
     req = _parse_generate({**payload, "adapter_id": adapter_id})
     requested, target = await context.lookup.resolve(req.adapter_id)
     await _prepare_generate_request(req, target)
-    result = await _await_until_disconnect(
-        request,
-        context.generate(
-            req,
-            requested,
-            target,
-            expected_checkpoint=_expected_checkpoint(request),
-            caller_org=caller_org,
-        ),
-    )
-    return _inference_json_response(result, target)
+    lease = await context.acquire_admission(target.base_model)
+    admission_headers = context.admission_headers(target.base_model, lease)
+    try:
+        result = await _await_until_disconnect(
+            request,
+            context.generate(
+                req,
+                requested,
+                target,
+                expected_checkpoint=_expected_checkpoint(request),
+                caller_org=caller_org,
+            ),
+        )
+    finally:
+        lease.release()
+    return _inference_json_response(result, target, headers=admission_headers)
 
 
 def _path_adapter_id(adapter_id: str) -> str:
@@ -130,6 +141,8 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     req = _parse_generate(fields)
     await _prepare_generate_request(req, target)
+    lease = await context.acquire_admission(target.base_model)
+    admission_headers = context.admission_headers(target.base_model, lease)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     if stream:
@@ -144,18 +157,23 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
             created=created,
             include_usage=include_usage,
             caller_org=caller_org,
+            lease=lease,
+            admission_headers=admission_headers,
         )
 
-    generation = await _await_until_disconnect(
-        request,
-        context.generate(
-            req,
-            requested,
-            target,
-            expected_checkpoint=_expected_checkpoint(request),
-            caller_org=caller_org,
-        ),
-    )
+    try:
+        generation = await _await_until_disconnect(
+            request,
+            context.generate(
+                req,
+                requested,
+                target,
+                expected_checkpoint=_expected_checkpoint(request),
+                caller_org=caller_org,
+            ),
+        )
+    finally:
+        lease.release()
     # already attested in `generate_once`, before usage was metered; this only strips the field
     # off the body so it does not leak into the OpenAI-shaped response.
     lora_request_adapter = generation.pop("lora_request_adapter", None)
@@ -169,6 +187,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         provenance=provenance,
     )
     response_headers = _provenance_headers(provenance, active_checkpoint)
+    response_headers.update(admission_headers)
     if target.is_revision:
         response_headers["X-Freesolo-LoRA-Request-Adapter"] = lora_request_adapter
     return JSONResponse(response, headers=response_headers)
@@ -199,6 +218,51 @@ async def _wait_for_disconnect(request: Request) -> None:
         message = await request.receive()
         if message["type"] == "http.disconnect":
             return
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """Close the response body iterator when the ASGI send loop exits for any reason."""
+
+    async def stream_response(self, send: Any) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await _close_async_iterator(self.body_iterator)
+
+
+class _LeasedAsyncIterator:
+    """Own one stream iterator and its admission lease through explicit or natural close."""
+
+    __slots__ = ("_closed", "_events", "_lease")
+
+    def __init__(self, events: AsyncIterator[bytes], lease: AdmissionLease) -> None:
+        self._events = events
+        self._lease = lease
+        self._closed = False
+
+    def __aiter__(self) -> "_LeasedAsyncIterator":
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return await anext(self._events)
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await _close_async_iterator(self._events)
+        finally:
+            self._lease.release()
 
 
 async def _discard_prepared_stream(
@@ -232,6 +296,8 @@ async def _stream_chat_completion(
     created: int,
     include_usage: bool,
     caller_org: str | None,
+    lease: AdmissionLease,
+    admission_headers: dict[str, str],
 ) -> StreamingResponse:
     preparation = asyncio.create_task(
         context.prepare_stream(
@@ -251,16 +317,19 @@ async def _stream_chat_completion(
             raise asyncio.CancelledError
         prepared = preparation.result()
         events, checkpoint_headers, thinking = prepared
-        response = StreamingResponse(
-            context.chat_stream(
-                record=requested,
-                events=events,
-                adapter_id=adapter_id,
-                completion_id=completion_id,
-                created=created,
-                include_usage=include_usage,
-                caller_org=caller_org,
-                thinking=thinking,
+        response = _ClosingStreamingResponse(
+            _LeasedAsyncIterator(
+                context.chat_stream(
+                    record=requested,
+                    events=events,
+                    adapter_id=adapter_id,
+                    completion_id=completion_id,
+                    created=created,
+                    include_usage=include_usage,
+                    caller_org=caller_org,
+                    thinking=thinking,
+                ),
+                lease,
             ),
             media_type="text/event-stream",
             # Disable proxy and CDN buffering so each SSE chunk reaches the client immediately.
@@ -270,6 +339,7 @@ async def _stream_chat_completion(
                 "X-Accel-Buffering": "no",
                 "Cache-Control": "no-cache",
                 **checkpoint_headers,
+                **admission_headers,
             },
         )
         transferred = True
@@ -285,3 +355,5 @@ async def _stream_chat_completion(
             prepared = preparation_result
         if prepared is not None and not transferred:
             await _discard_prepared_stream(context, requested, caller_org, prepared[0])
+        if not transferred:
+            lease.release()

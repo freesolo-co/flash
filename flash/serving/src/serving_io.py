@@ -109,7 +109,12 @@ def _provenance_headers(
     }
 
 
-def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> JSONResponse:
+def _inference_json_response(
+    result: dict[str, Any],
+    target: AdapterRecord,
+    *,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     # attach revision provenance while keeping engine-process attribution internal to metering.
     active_checkpoint = result.get("checkpoint")
     provenance = _revision_provenance(target, active_checkpoint)
@@ -120,7 +125,10 @@ def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> J
     }
     public_result = {key: value for key, value in result.items() if key not in internal_fields}
     body = {**public_result, "freesolo": provenance} if provenance is not None else public_result
-    return JSONResponse(body, headers=_provenance_headers(provenance, active_checkpoint))
+    response_headers = _provenance_headers(provenance, active_checkpoint)
+    if headers is not None:
+        response_headers.update(headers)
+    return JSONResponse(body, headers=response_headers)
 
 
 def _expected_checkpoint(request: Request) -> str | None:

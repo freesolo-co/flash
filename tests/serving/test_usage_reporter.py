@@ -90,25 +90,28 @@ def test_stream_text_delta_keeps_native_delta_chunks(modal_app_module):
     assert previous == "Hello hello"
 
 
-def test_lora_engine_scales_to_zero_by_default(modal_app_module):
-    # every gpu engine class scales to zero, while the cpu router stays available to trigger them.
-    assert modal_app_module.MIN_CONTAINERS == 0
-
+def test_lora_engines_keep_one_warm_container_per_model(modal_app_module):
     cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
-    assert len(cls_calls) == len(modal_app_module.ENGINE_BY_KEY)
-    # asserted on the kwargs modal is actually CALLED with, not on the constant: the floor is only
-    # real if it reaches `app.cls`. `AutoscalerSettings.min_containers` is an `optional` proto field
-    # (has_presence), so omitting it and sending 0 are distinguishable on the wire -- an omitted
-    # field leaves the floor to whatever the server defaults to, which is not ours to assume.
-    assert all(kwargs["min_containers"] == modal_app_module.MIN_CONTAINERS for kwargs in cls_calls)
-    # Each engine class is pinned to ITS gpu tier's window, not one flat value.
-    assert {kwargs["gpu"]: kwargs["scaledown_window"] for kwargs in cls_calls} == {
-        gpu: modal_app_module.scaledown_window_for(gpu)
-        for gpu, _mi in modal_app_module.ENGINE_BY_KEY
-    }
+    assert len(cls_calls) == len(modal_app_module.ENGINE_BY_MODEL) == 6
+    assert all(kwargs["min_containers"] == 1 for kwargs in cls_calls)
+    assert all(kwargs["max_containers"] == 2 for kwargs in cls_calls)
+    assert all(kwargs["buffer_containers"] == 0 for kwargs in cls_calls)
+    assert sorted(kwargs["gpu"] for kwargs in cls_calls) == sorted(
+        modal_app_module.gpu_for(model) for model in modal_app_module.ENGINE_BY_MODEL
+    )
+    assert all(
+        kwargs["scaledown_window"] == modal_app_module.scaledown_window_for(kwargs["gpu"])
+        for kwargs in cls_calls
+    )
 
     assert modal_app_module.app.function.call_count == 1
-    assert modal_app_module.app.function.call_args.kwargs["min_containers"] == 1
+    assert modal_app_module.app.function.call_args.kwargs == {
+        "secrets": modal_app_module.runtime_secrets,
+        "min_containers": 1,
+        "max_containers": 1,
+        "buffer_containers": 0,
+        "timeout": modal_app_module.ROUTER_TIMEOUT_SECONDS,
+    }
 
 
 def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app_module):
@@ -128,20 +131,22 @@ def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app
     assert window_for("B200") == default
 
 
-def test_modal_concurrency_is_per_engine_key(modal_app_module):
-    # Each engine class caps max_inputs near its engine's real max_num_seqs (see _engine_concurrency)
-    # so Modal autoscales instead of over-packing one container; target_inputs = 3/4 of that. The
-    # router keeps the global 64/48. MAX_INPUTS 64 came from a real-GPU sweep (near-linear to 128).
-    assert modal_app_module.MAX_INPUTS == 64
-    assert modal_app_module.TARGET_INPUTS == 48
-    # One @modal.concurrent per distinct engine key plus one on the router.
+def test_modal_concurrency_matches_each_model_policy_and_router_bound(modal_app_module):
     calls = [call.kwargs for call in modal_app_module.modal.concurrent.call_args_list]
-    assert len(calls) == len(modal_app_module.ENGINE_BY_KEY) + 1
-    seen = {(c["max_inputs"], c["target_inputs"]) for c in calls}
-    # Router carries the global sizing; each engine key carries max_inputs with target = 3/4 of it.
-    expected = {(mi, max(1, mi * 3 // 4)) for (_gpu, mi) in modal_app_module.ENGINE_BY_KEY}
-    expected.add((modal_app_module.MAX_INPUTS, modal_app_module.TARGET_INPUTS))
-    assert seen == expected
+    assert len(calls) == len(modal_app_module.ENGINE_BY_MODEL) + 1
+    engine_calls = calls[:-1]
+    expected = [
+        {
+            "max_inputs": modal_app_module.hosted_traffic_policy_for(model).max_inputs,
+            "target_inputs": modal_app_module.hosted_traffic_policy_for(model).target_inputs,
+        }
+        for model in modal_app_module.ENGINE_BY_MODEL
+    ]
+    assert engine_calls == expected
+    assert calls[-1] == {
+        "max_inputs": modal_app_module.ROUTER_ASYNC_CAPACITY,
+        "target_inputs": modal_app_module.ROUTER_ASYNC_CAPACITY,
+    }
 
 
 def test_lora_engine_replica_identifier_is_stable_per_instance(modal_app_module):

@@ -13,6 +13,7 @@ from flash.serving.src import settings as cfg
 from flash.serving.src.model_config import (
     engine_overrides_for,
     gpu_for,
+    hosted_traffic_policy_for,
     image_limit_for,
     is_supported_base_model,
 )
@@ -57,12 +58,23 @@ def evidence_sha256(evidence: dict[str, Any] | BaseModel) -> str:
 def engine_contract(model_id: str) -> dict[str, Any]:
     if not is_supported_base_model(model_id):
         raise ValueError(f"unsupported readiness model: {model_id}")
+    policy = hosted_traffic_policy_for(model_id)
     return {
-        "version": 1,
+        "version": 2,
         "model_id": model_id,
         "gpu": gpu_for(model_id),
         "image_input_limit": image_limit_for(model_id),
         "engine_overrides": engine_overrides_for(model_id),
+        "hosted_traffic_policy": {
+            "min_containers": policy.min_containers,
+            "max_containers": policy.max_containers,
+            "buffer_containers": policy.buffer_containers,
+            "queue_capacity": policy.queue_capacity,
+            "retry_after_seconds": policy.retry_after_seconds,
+            "max_num_seqs": policy.max_num_seqs,
+            "max_inputs": policy.max_inputs,
+            "target_inputs": policy.target_inputs,
+        },
         "runtime": {
             "trust_remote_code": cfg.TRUST_REMOTE_CODE,
             "dtype": cfg.DTYPE,

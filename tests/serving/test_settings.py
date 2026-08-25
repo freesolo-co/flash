@@ -12,6 +12,7 @@ def test_settings_holds_only_runtime_wiring() -> None:
         "internal_key",
         "deployment_sha",
         "deployment_id",
+        "deployment_mode",
         "backend_url",
         "supabase_url",
         "supabase_service_role_key",

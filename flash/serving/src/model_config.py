@@ -297,6 +297,17 @@ def configured_hard_gpu_ceiling() -> int:
     return sum(hosted_traffic_policy_for(model).max_containers for model in base_models())
 
 
+def configured_router_async_capacity() -> int:
+    """Finite router concurrency for every model's hard slots plus bounded waiters."""
+    capacity = sum(
+        policy.max_inputs * policy.max_containers + policy.queue_capacity
+        for policy in _HOSTED_TRAFFIC_POLICY_BY_MODEL.values()
+    )
+    if capacity <= 0:
+        raise ValueError("hosted router async capacity must be positive")
+    return capacity
+
+
 def _config_for(base_model: str) -> dict[str, Any]:
     cfg = _BY_MODEL.get(base_model)
     if cfg is None:
