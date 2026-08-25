@@ -52,7 +52,7 @@ def _engine(**overrides: object) -> EngineIdentity:
         "tokenizer_revision": TOKENIZER_REVISION,
         "image_digest": IMAGE_DIGEST,
         "modality": "text",
-        "runtime_family": "vllm-0.23.0",
+        "runtime_family": "vllm-0.23.0-pr42120",
         "dtype": "bfloat16",
         "quantization": None,
         "kv_cache_dtype": None,

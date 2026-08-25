@@ -13,6 +13,7 @@ import time
 import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.verl.checkpoints as verl_checkpoints
+from flash._internal.fileio import reject_duplicate_keys
 from flash.adapters.artifacts import MAX_ATTEMPT_ID, has_loadable_adapter_weights
 from flash.engine.support.verl_checkpoint import FsdpCheckpointInspection
 from flash.engine.support.verl_policy import FsdpGeneration
@@ -69,6 +70,15 @@ def _strict_attempt(value, *, field: str) -> int:
     return value
 
 
+class _DuplicateJsonKeyError(ValueError):
+    pass
+
+
+_REJECT_DUPLICATE_MANIFEST_KEYS = reject_duplicate_keys(
+    lambda key: _DuplicateJsonKeyError(f"duplicate key {key!r}")
+)
+
+
 def _read_resume_manifest(
     checkpoint_dir: str,
     *,
@@ -83,8 +93,8 @@ def _read_resume_manifest(
         )
     try:
         with open(path, encoding="utf-8") as handle:
-            manifest = json.load(handle)
-    except (OSError, json.JSONDecodeError) as error:
+            manifest = json.load(handle, object_pairs_hook=_REJECT_DUPLICATE_MANIFEST_KEYS)
+    except (OSError, UnicodeError, json.JSONDecodeError, _DuplicateJsonKeyError) as error:
         raise RuntimeError(
             f"GRPO resume checkpoint {checkpoint_step} has an unreadable {_RESUME_MANIFEST}"
         ) from error
@@ -510,43 +520,44 @@ def _restore_verl_resume(
     required_steps: tuple[int, ...] = (),
 ) -> int:
     """stage this run's current-contract native checkpoint and its internal adapter store."""
-    inspections: dict[str, FsdpCheckpointInspection] = {}
+    accepted: dict[str, tuple[tuple[int, int], ...]] = {}
+    rejected: dict[str, RuntimeError] = {}
 
-    def prefer(path: str) -> bool:
-        inspection = inspections.get(path)
-        if inspection is None:
-            inspection = verl_checkpoints.inspect_resume_checkpoint(
-                path,
-                world_size=world_size,
-                expected_fsdp_generation=expected_fsdp_generation,
-            )
-            inspections[path] = inspection
-        if not inspection.loadable:
+    def accept(path: str, _inspection: FsdpCheckpointInspection) -> bool:
+        if path in accepted:
+            return True
+        if path in rejected:
             return False
-        step_text = os.path.basename(path).removeprefix("checkpoint-")
-        if not step_text.isdigit() or int(step_text) <= 0:
+        name = os.path.basename(path)
+        if not name.startswith("checkpoint-") or not name[len("checkpoint-") :].isdigit():
+            rejected[path] = RuntimeError(f"invalid GRPO resume checkpoint path {path!r}")
+            return False
+        step = int(name[len("checkpoint-") :])
+        if step <= 0:
+            rejected[path] = RuntimeError(f"invalid GRPO resume checkpoint path {path!r}")
             return False
         try:
             referenced, _positive = _read_resume_manifest(
                 path,
-                checkpoint_step=int(step_text),
+                checkpoint_step=step,
                 required_steps=required_steps,
             )
             _internal_adapter_sources(path, referenced)
-        except RuntimeError:
+        except RuntimeError as error:
+            rejected[path] = error
             return False
+        accepted[path] = referenced
         return True
 
-    resume = _worker_hf.hf_resume_checkpoint(prefer=prefer)
+    resume, inspection = verl_checkpoints.select_verl_resume_checkpoint(
+        world_size=world_size,
+        expected_fsdp_generation=expected_fsdp_generation,
+        accept=accept,
+    )
     if not resume:
         return 0
-    inspection = inspections.get(resume)
     if inspection is None:
-        inspection = verl_checkpoints.inspect_resume_checkpoint(
-            resume,
-            world_size=world_size,
-            expected_fsdp_generation=expected_fsdp_generation,
-        )
+        raise RuntimeError("selected GRPO resume checkpoint is missing its inspection")
     if not inspection.loadable:
         return verl_checkpoints.stage_verl_resume(
             resume,
@@ -556,15 +567,12 @@ def _restore_verl_resume(
             expected_fsdp_generation=expected_fsdp_generation,
             inspection=inspection,
         )
-    name = os.path.basename(resume)
-    if not name.startswith("checkpoint-") or not name[len("checkpoint-") :].isdigit():
+    referenced = accepted.get(resume)
+    if referenced is None:
+        error = rejected.get(resume)
+        if error is not None:
+            raise error
         raise RuntimeError(f"invalid GRPO resume checkpoint path {resume!r}")
-    step = int(name[len("checkpoint-") :])
-    referenced, _positive = _read_resume_manifest(
-        resume,
-        checkpoint_step=step,
-        required_steps=required_steps,
-    )
     _stage_internal_adapters(resume, local_dir, referenced)
     return verl_checkpoints.stage_verl_resume(
         resume,

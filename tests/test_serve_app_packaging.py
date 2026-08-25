@@ -192,7 +192,13 @@ def test_dockerfile_serve_uses_existing_cuda_family_and_frozen_lock() -> None:
     assert "PIP_BREAK_SYSTEM_PACKAGES=1" in worker
     assert "PIP_BREAK_SYSTEM_PACKAGES=1" in source
     assert "python -c 'import sys; assert sys.version_info[:2] == (3, 12)'" in source
-    assert "uv sync --frozen --no-dev --extra serve-runtime" in source
+    sync = "RUN uv sync --frozen --no-dev --extra serve-runtime"
+    repair = "RUN /opt/flash-venv/bin/python /app/docker/patch_vllm_moe_lora.py"
+    verify = "/opt/flash-venv/bin/python /app/docker/patch_vllm_moe_lora.py --verify"
+    cleanup = "rm /app/docker/patch_vllm_moe_lora.py"
+    assert sync in source
+    assert "COPY docker/patch_vllm_moe_lora.py ./docker/patch_vllm_moe_lora.py" in source
+    assert source.index(sync) < source.index(repair) < source.index(verify) < source.index(cleanup)
     assert "COPY serve_launch.py ./serve_launch.py" in source
     assert 'CMD ["python", "/app/serve_launch.py"]' in source
     assert "python -m flash" not in source

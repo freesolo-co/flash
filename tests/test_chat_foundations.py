@@ -41,7 +41,7 @@ def test_canonical_request_parser_owns_defaults_and_strict_schema() -> None:
     )
 
     assert request.max_tokens == DEFAULT_MAX_TOKENS == 1024
-    assert request.chat_template_kwargs == {"custom": 1}
+    assert request.chat_template_kwargs == {"custom": 1, "enable_thinking": True}
 
     for strict in (False, "true", 1):
         with pytest.raises(OpenAIRequestError, match="strict"):

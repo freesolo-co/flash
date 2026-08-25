@@ -14,6 +14,8 @@ from typing import Any
 
 from fastapi.responses import JSONResponse
 
+from flash.serve.app.openai import split_reasoning
+from flash.serve.request.openai import NormalizedChatRequest
 from flash.serving.src.io.provenance import _provenance_headers, _revision_provenance
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.structured_outputs import StructuredOutputsError
@@ -203,22 +205,39 @@ def openai_chat_completion(
     provenance: dict[str, str] | None,
 ) -> dict[str, Any]:
     """Assemble the non-streaming OpenAI chat-completion body from an engine result."""
-    reasoning, content = _split_reasoning(str(generation["text"]), bool(generation.get("thinking")))
-    message: dict[str, Any] = {"role": "assistant", "content": content}
-    if reasoning is not None:
-        message["reasoning_content"] = reasoning
+    raw_choices = generation.get("choices")
+    if not isinstance(raw_choices, list):
+        raw_choices = [
+            {
+                "index": 0,
+                "text": generation["text"],
+                "finish_reason": generation.get("finish_reason"),
+                "logprobs": None,
+            }
+        ]
+    choices = []
+    for choice in raw_choices:
+        reasoning, content = split_reasoning(
+            str(choice["text"]), thinking=bool(generation.get("thinking"))
+        )
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if reasoning is not None:
+            message["reasoning_content"] = reasoning
+        choice_logprobs = choice.get("logprobs")
+        choices.append(
+            {
+                "index": choice["index"],
+                "message": message,
+                "finish_reason": choice.get("finish_reason"),
+                "logprobs": {"content": choice_logprobs} if choice_logprobs is not None else None,
+            }
+        )
     response = {
         "id": completion_id,
         "object": "chat.completion",
         "created": created,
         "model": adapter_id,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": generation.get("finish_reason"),
-            }
-        ],
+        "choices": choices,
     }
     if provenance is not None:
         response["freesolo"] = provenance
@@ -231,28 +250,22 @@ def openai_chat_completion(
     return response
 
 
-def openai_generate_fields(payload: dict[str, Any], adapter_id: str) -> dict[str, Any]:
-    """Translate an OpenAI chat-completions body into GenerateRequest fields.
+def openai_generate_fields(request: NormalizedChatRequest, adapter_id: str) -> dict[str, Any]:
+    """bind one canonical OpenAI request to the hosted internal envelope."""
 
-    Raises ``StructuredOutputsError`` for a malformed ``response_format``; the caller maps it to
-    a 422 rather than letting it surface as a 500.
-    """
     return {
         "adapter_id": adapter_id,
-        "messages": payload.get("messages"),
-        "max_tokens": payload.get("max_tokens", 1024),
-        "temperature": payload.get("temperature", 0.0),
-        "top_p": payload.get("top_p", 0.95),
-        # Forward sanitized chat-template kwargs for OpenAI-style callers (backend
-        # /api/sample proxy, evals). The engine overwrites enable_thinking from the
-        # adapter's trained default, so callers cannot change thinking mode for adapters
-        # that have a persisted trained value.
-        "chat_template_kwargs": payload.get("chat_template_kwargs"),
-        # forwarded raw so GenerateRequest's validator normalizes and rejects it consistently with
-        # the /generate route (one 422 shape for both entry points).
-        "stop": payload.get("stop"),
-        # Structured outputs: our structured_outputs extension, or the OpenAI-standard
-        # response_format (translated to canonical at this endpoint only). Forwarded raw so
-        # GenerateRequest's validator normalizes it (consistent 422s).
-        "structured_outputs": _openai_structured_outputs(payload),
+        "messages": request.messages,
+        "max_tokens": request.max_tokens,
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "n": request.n,
+        "seed": request.seed,
+        "frequency_penalty": request.frequency_penalty,
+        "presence_penalty": request.presence_penalty,
+        "logprobs": request.logprobs,
+        "top_logprobs": request.top_logprobs,
+        "chat_template_kwargs": request.chat_template_kwargs,
+        "stop": list(request.stop) or None,
+        "structured_outputs": request.structured_outputs,
     }

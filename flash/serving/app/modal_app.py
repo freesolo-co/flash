@@ -220,14 +220,25 @@ image = (
         str(REPO_DIR / "pyproject.toml"),
         optional_dependencies=["serve-runtime", "serving"],
     )
-    # No in-engine kernel-patching hook is installed in this image (see the note at the engine call
-    # site): under vLLM V1 the model runs in a separate EngineCore process, so patches applied in THIS
-    # process never reach the model, and a prior attempt's extra CUDA context + GPU self-tests stole
-    # the post-init slack the engine needs for FlashInfer's lazily-allocated decode workspace
-    # (2026-07-05 35B outage: first real request OOM-killed the engine).
-    # No quantization package needed: FP8 (weights + KV) is built into vLLM and quantizes the bf16
-    # checkpoint online at load (see settings.QUANTIZATION). The old bitsandbytes QLoRA-serving path
-    # is gone — bitsandbytes was the slowest inference quant and nothing references it anymore.
+    # copy the fail-closed repair into the image before running it. this is a build-time source
+    # backport, not a runtime hook: it verifies exact vllm 0.23.0 pre/post hashes without importing
+    # vllm or torch. a separate pass rejects a successful no-op, then the script is removed.
+    .add_local_file(
+        str(REPO_DIR / "docker" / "patch_vllm_moe_lora.py"),
+        remote_path="/root/patch_vllm_moe_lora.py",
+        copy=True,
+    )
+    .run_commands(
+        "python /root/patch_vllm_moe_lora.py && "
+        "python /root/patch_vllm_moe_lora.py --verify && "
+        "rm /root/patch_vllm_moe_lora.py"
+    )
+    # no in-engine kernel-patching hook is installed. under vllm v1 the model runs in a separate
+    # enginecore process, so patches applied in this process never reach the model. a prior attempt's
+    # extra cuda context and gpu self-tests also stole the post-init slack flashinfer needs for its
+    # lazily allocated decode workspace. the build-time repair above runs before either process.
+    # no quantization package is needed: fp8 weights and kv are built into vllm. the old bitsandbytes
+    # qlora serving path is gone because nothing references it.
     .env(
         {
             "HF_HOME": HOSTING_CACHE_MOUNT,

@@ -34,10 +34,10 @@ from flash.serve.control import (
 )
 from flash.serve.provisioning import ServingImage
 
-# the serving image installs `vllm==0.23.0` (pyproject `serve-runtime`). runtime_family is part of
-# the engine identity so a vllm upgrade forces a new engine rather than silently reusing an id
-# validated against a different engine build.
-SERVE_RUNTIME_FAMILY = "vllm-0.23.0"
+# the serving image installs `vllm==0.23.0` plus the exact pr42120 moe lora backport. runtime_family
+# is part of the engine identity so a runtime repair or upgrade cannot reuse an engine id validated
+# against different execution bytes.
+SERVE_RUNTIME_FAMILY = "vllm-0.23.0-pr42120"
 
 
 class ProfileError(ValueError):

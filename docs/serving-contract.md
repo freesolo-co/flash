@@ -139,15 +139,39 @@ unactivated aliases return `404` or `503`.
 The registered grammar is the default for every call to that revision. A request may override it
 per call with `structured_outputs`, or with the OpenAI-standard `response_format` accepted at this
 endpoint only; `{}` (equivalently `response_format: {"type": "text"}`) means explicitly
-unconstrained for that call and does not change what is registered. Requests may also include
-`stop` and `chat_template_kwargs.enable_thinking`.
+unconstrained for that call and does not change what is registered. Requests may also include `stop` and `chat_template_kwargs.enable_thinking`.
+
+The packaged, hosted, and managed OpenAI entry points share one strict sampling grammar:
+
+- `n` is an exact integer from 1 through 4. `n > 1` requires `temperature > 0`; the server never
+  rewrites temperature or duplicates a greedy output.
+- `seed` is null or a signed 64-bit integer. Explicit `-1` is rejected because vLLM treats it as an
+  unset seed.
+- `frequency_penalty` and `presence_penalty` are finite numbers from -2 through 2.
+- `logprobs` is a strict boolean and `top_logprobs` is an exact integer from 0 through 20. A positive
+  `top_logprobs` requires `logprobs: true`.
+- Thinking-enabled adapters reject logprobs after the requested adapter or run has been authorized
+  and resolved. Tools, tool selection, and unrelated vLLM extensions remain unsupported.
+
+A buffered response contains one indexed `choices` entry per generated choice. Each choice keeps its
+own finish reason and, when requested, OpenAI token logprobs. Prompt and cached tokens count once per
+request; completion tokens are summed across all choices. Streaming may interleave choice indexes.
+Each choice has independent reasoning state and exactly one terminal entry, followed by one aggregate
+usage block when requested and one final `data: [DONE]`. Hosted serving durably settles the single
+request lifecycle before emitting successful terminals. Managed serving forwards the backend's raw
+SSE frames without flattening choices or rewriting provenance.
+
+The decoded convenience `chat_stream` iterator remains text-only and single-choice. It rejects
+`n != 1` and any logprob request before opening transport; use buffered JSON or raw SSE for those
+features.
+
 Every successful response reports the exact revision, checkpoint, and Hugging Face commit in:
 
 - body object `freesolo` with `adapter_revision`, `checkpoint`, and `hf_revision`;
 - headers `X-Freesolo-Adapter-Revision`, `X-Freesolo-Checkpoint`, and
   `X-Freesolo-HF-Revision`.
-  Streaming uses `text/event-stream` with `data:` JSON frames containing
-  `choices[0].delta.content`, followed by `data: [DONE]`. Preserve stop handling and provenance headers.
+  Streaming uses `text/event-stream` with indexed `data:` JSON choice frames followed by
+  `data: [DONE]`. Preserve stop handling and provenance headers.
   A cold adapter may return `503` with a top-level retryable `adapter_unavailable` /
   `adapter_loading` error envelope and a `Retry-After` header.
   The shared runtime supports bounded multimodal preparation. An image-capable profile declares

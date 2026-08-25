@@ -380,6 +380,8 @@ def internal_adapter_payload(record: AdapterRecord) -> dict[str, Any]:
 
 
 class GenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     adapter_id: str
     # the cpu front door overwrites this before every production dispatch. direct offline engine
     # tests may omit it, in which case the engine supplies a test-only id before calling vllm.
@@ -400,9 +402,7 @@ class GenerateRequest(BaseModel):
     # default), {} = explicitly unconstrained (overrides the adapter default), non-empty dict =
     # the constraint to apply.
     structured_outputs: dict[str, Any] | None = Field(default=None)
-    # stop sequences for THIS call, forwarded to the engine. the serving contract documents `stop`
-    # as an accepted field, and pydantic drops undeclared keys silently, so an undeclared `stop`
-    # would be accepted and then ignored -- billing the caller for tokens it asked to stop before.
+    # stop sequences for this call, forwarded to the engine as part of the strict raw contract.
     stop: str | list[str] | None = Field(default=None)
 
     @field_validator("max_tokens", mode="before")
