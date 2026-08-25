@@ -290,7 +290,7 @@ def cmd_serve_deploy(args) -> int:
     deadline_at = time.monotonic() + float(args.timeout)
     try:
         if provider == "modal":
-            from flash.serve.provisioning.modal.execution.lifecycle_entry import (
+            from flash.serve.provisioning.modal.execution.operations import (
                 provision_modal_deployment,
             )
 
@@ -298,7 +298,7 @@ def cmd_serve_deploy(args) -> int:
                 bundle, credentials, runtime_secrets, deadline_at=deadline_at
             )
         else:
-            from flash.serve.provisioning.runpod.lifecycle_entry import (
+            from flash.serve.provisioning.runpod.operations import (
                 RunPodDataCenterUnsupported,
                 provision_runpod_deployment,
             )

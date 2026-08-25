@@ -8,7 +8,7 @@ logging off, which is only discoverable after the GPU spend, when the curve is g
 
 from __future__ import annotations
 
-from flash.cli.commands import _warn_if_wandb_requested_without_key
+from flash.cli.commands.ops.train import _warn_if_wandb_requested_without_key
 from flash.core.spec import JobSpec, WandbSpec
 
 
@@ -97,11 +97,11 @@ def test_every_shipped_worker_actually_reaches_wandb():
     import inspect
     from pathlib import Path
 
+    import flash.engine.worker.entry.worker as worker_entry
     from flash.core.catalog import ALGORITHMS
-    from flash.engine import worker as worker_pkg
 
     # the trainer entry modules live in worker/train/entry/ since the layout regrouping.
-    worker_dir = Path(inspect.getfile(worker_pkg)).parent / "train" / "entry"
+    worker_dir = Path(inspect.getfile(worker_entry)).parents[1] / "train" / "entry"
     without_wandb = set()
     for algorithm in ALGORITHMS:
         # JobSpec.phase is the algorithm -> worker-module mapping (grpo runs the rl worker); the

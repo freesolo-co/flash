@@ -16,7 +16,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from flash.serve.contract.contract import MAX_CHAT_REQUEST_BYTES
+from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
 from flash.serving.src.http.adapter_routes import adapter_router
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
 from flash.serving.src.http.context import APP_STATE_ATTR, ServingContext

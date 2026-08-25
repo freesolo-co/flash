@@ -14,23 +14,9 @@ import sys
 import threading
 import time
 
+from flash._internal.channel import CLI_NAME
 from flash.cli.ui import render
-from flash.client import ApiError, ClientError
-
-
-def _commands():
-    """The parent package, imported lazily because it re-exports this module.
-
-    `client_from_config` and `CLI_NAME` are patched as attributes of `flash.cli.commands` by the
-    cli tests -- the first to install a fake client, the second to prove the dev channel's
-    `flash-dev` name reaches the hints these handlers print. Importing either by value here would
-    bind the original before the patch lands, so the patch would rebind a name this module never
-    reads.
-    """
-    from flash.cli import commands
-
-    return commands
-
+from flash.client import ApiError, ClientError, client_from_config
 
 # the states a deployment sits in before the requested revision is actually servable, mirroring
 # the set the control plane transitions through. anything else ends the wait: ready, failed, or a
@@ -149,7 +135,7 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
                     return other
                 print(
                     f"warning: {run_id} is no longer an active deployment; "
-                    f"run `{_commands().CLI_NAME} models deployments` to check what happened",
+                    f"run `{CLI_NAME} models deployments` to check what happened",
                     file=sys.stderr,
                 )
                 return latest
@@ -158,7 +144,7 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
                 return current
     print(
         f"warning: still {str(latest.get('state') or 'unknown')!r} after {timeout:g}s; "
-        f"run `{_commands().CLI_NAME} models deployments` to keep checking {run_id}",
+        f"run `{CLI_NAME} models deployments` to keep checking {run_id}",
         file=sys.stderr,
     )
     return latest
@@ -294,7 +280,7 @@ def _alias_move_warning(client, base_run_id: str, requested_step: int | None) ->
     if str(current.get("state") or "") not in _DEPLOYMENT_READY_STATES and not ambiguous:
         # nothing is being served off the alias yet, so nothing is lost by moving it.
         return None
-    cli = _commands().CLI_NAME
+    cli = CLI_NAME
     # `step-N` is not universally available: `ApiClient.chat` gates a step target behind
     # `_require_chat_step_selector`, which refuses outright on a plane that does not advertise
     # `chat_step_selector_v1`. the capability cannot be read here without spending a /v1/health on
@@ -433,7 +419,7 @@ def cmd_deploy(args) -> int:
         )
         return 1
     base_run_id, step = parsed
-    client = _commands().client_from_config()
+    client = client_from_config()
     # before the POST: after it the alias has already moved, and a warning about a checkpoint that
     # is no longer served reads as history rather than a decision the reader still has. a dry run
     # registers nothing, so it displaces nothing and gets no warning.
@@ -467,7 +453,7 @@ def cmd_deploy(args) -> int:
     if dep.get("state") != "dry_run":
         openai_base = str(dep.get("openai_base_url") or "")
         note = (
-            f"serving is billed per token only; use `{_commands().CLI_NAME} models undeploy {base_run_id}` "
+            f"serving is billed per token only; use `{CLI_NAME} models undeploy {base_run_id}` "
             "to deregister the adapter."
         )
         print(render.arrow(note) if render.styled() else f"note: {note}", file=sys.stderr)
@@ -483,8 +469,8 @@ def cmd_deploy(args) -> int:
         if state == "failed":
             detail = str(dep.get("error") or dep.get("detail") or "unknown error")
             status_note = (
-                f"deployment failed: {detail}; run `{_commands().CLI_NAME} models deployments` for details "
-                f"and retry `{_commands().CLI_NAME} models deploy {args.run_id}` after fixing the error."
+                f"deployment failed: {detail}; run `{CLI_NAME} models deployments` for details "
+                f"and retry `{CLI_NAME} models deploy {args.run_id}` after fixing the error."
             )
         elif waited_but_unservable and dep.get("last_deploy_error"):
             # state reads `ready`, but it is the PREVIOUS revision: say so, or the reader trusts
@@ -493,7 +479,7 @@ def cmd_deploy(args) -> int:
             status_note = (
                 f"the requested revision did not become servable ({detail}); the previously "
                 f"deployed revision is still serving. retry "
-                f"`{_commands().CLI_NAME} models deploy {args.run_id}` after fixing the error."
+                f"`{CLI_NAME} models deploy {args.run_id}` after fixing the error."
             )
         elif waited_but_unservable:
             # the wait ended without the plane calling this revision servable, and there is no
@@ -501,12 +487,12 @@ def cmd_deploy(args) -> int:
             # generic "use chat once it is ready" below would read as success next to the exit 1.
             status_note = (
                 f"deployment state is {state!r} after waiting; the requested revision is not "
-                f"servable yet. run `{_commands().CLI_NAME} models deployments` to keep checking it."
+                f"servable yet. run `{CLI_NAME} models deployments` to keep checking it."
             )
         else:
             status_note = (
-                f"deployment state is {state!r}; run `{_commands().CLI_NAME} models deployments` to check "
-                f"progress and use `{_commands().CLI_NAME} models chat` once it is ready."
+                f"deployment state is {state!r}; run `{CLI_NAME} models deployments` to check "
+                f"progress and use `{CLI_NAME} models chat` once it is ready."
             )
         print(
             render.arrow(status_note) if render.styled() else f"note: {status_note}",
@@ -789,7 +775,7 @@ def cmd_export(args) -> int:
             file=sys.stderr,
         )
     _hf_identity_and_write_access(args.repository, hf_token)
-    client = _commands().client_from_config()
+    client = client_from_config()
     progress = (
         f"exporting adapter {args.adapter_id} to {args.repository}; "
         "downloading then re-uploading; this can take a minute..."
@@ -816,9 +802,102 @@ def cmd_export(args) -> int:
 
 
 def cmd_undeploy(args) -> int:
-    result = _commands().client_from_config().undeploy(args.run_id)
+    result = client_from_config().undeploy(args.run_id)
     if render.styled():
         print(render.undeployed(result))
     else:
         print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_deployments(args) -> int:
+    rows = client_from_config().deployments()
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        if render.styled():
+            print(render.empty("deployments", "0 active", "no active deployments"))
+        else:
+            print("no active deployments")
+        return 0
+    if render.styled():
+        print(render.deployments_table(rows))
+        return 0
+    print(
+        f"{'RUN ID':<30}  {'STEP':<6}  {'REVISION':<40}  {'STATE':<14}  "
+        f"{'VERIFIED AT':<20}  {'OPENAI MODEL':<30}  {'OPENAI BASE URL':<48}  DETAIL"
+    )
+    for row in rows:
+        deployment = row.get("deployment") or {}
+        run_id = str(deployment.get("run_id") or row.get("run_id") or "")
+        step = deployment.get("checkpoint_step")
+        step_text = "final" if step is None else str(step)
+        verified_at = deployment.get("verified_at")
+        verified_text = (
+            "-" if verified_at is None else (render._humanize_ts(verified_at) or str(verified_at))
+        )
+        revision = str(deployment.get("adapter_revision") or "-")
+        state = str(deployment.get("state") or "-")
+        openai_model = str(deployment.get("openai_model") or run_id)
+        openai_base_url = str(deployment.get("openai_base_url") or "-")
+        detail = str(deployment.get("error") or deployment.get("detail") or "")[:160]
+        print(
+            f"{run_id:<30}  {step_text:<6}  {revision:<40}  {state:<14}  "
+            f"{verified_text:<20}  {openai_model:<30}  {openai_base_url:<48}  {detail}"
+        )
+    return 0
+
+
+def cmd_chat(args) -> int:
+    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
+
+    revision = parse_adapter_revision(args.run_id)
+    parsed = parse_checkpoint_ref(args.run_id) if revision is None else None
+    if revision is None and parsed is None:
+        print(
+            f"invalid chat target {args.run_id!r} "
+            "(expected a bare <run_id>, <run_id>/step-N, or full immutable adapter revision)",
+            file=sys.stderr,
+        )
+        return 1
+    chat_target = args.run_id
+    client = client_from_config()
+    messages = [{"role": "user", "content": args.message}]
+    system = getattr(args, "system", None)
+    if system:
+        messages.insert(0, {"role": "system", "content": system})
+    wrote = False
+    pending: list[str] = []
+    for chunk in client.chat_stream(
+        chat_target,
+        messages=messages,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+    ):
+        # delay the label and blank chunks until real text arrives. otherwise an empty response has
+        # non-empty stdout and cannot serve as a health check. release buffered blanks verbatim;
+        # flash/cli/commands/env/testing/eval.py grades emptiness the same way.
+        if not wrote:
+            pending.append(chunk)
+            if not chunk.strip():
+                continue
+            if render.styled():
+                print(render.chat_label())
+            chunk = "".join(pending)
+            wrote = True
+        print(chunk, end="", flush=True)
+    if not wrote:
+        # the request succeeded at the transport level but carried no assistant text, which is what
+        # a serving path that stopped applying the run's chat template looks like from here. exiting
+        # 0 with an empty stdout makes that indistinguishable from a model that answered nothing, so
+        # this surface cannot be used as a health check -- say what happened and fail.
+        print(
+            f"no response text from {chat_target}: the request succeeded but the model returned "
+            "nothing. the deployment may be unhealthy or still starting; check "
+            f"`{CLI_NAME} models deployments` and retry.",
+            file=sys.stderr,
+        )
+        return 1
+    print()
     return 0

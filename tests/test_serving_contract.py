@@ -6,31 +6,29 @@ import types
 
 import pytest
 
-from flash.serve.contract.contract import (
+import flash.serve.contract.errors as serving_errors
+import flash.serve.contract.urls as serving_urls
+import flash.serve.deployment.adapter_check as adapter_check
+import flash.serve.request.transport as serving_transport
+from flash.serve.contract.protocol import (
     ADAPTER_REVISION_PATTERN,
     PREFERRED_SERVING_CAPABILITIES,
     REQUIRED_SERVING_CAPABILITIES,
     ServingHealthError,
     parse_serving_health,
 )
-from flash.serve.deployment.deploy import (
-    Deployment,
-    deploy_adapter,
-    serving_base_url,
-    undeploy_adapter,
-)
+from flash.serve.contract.urls import serving_base_url
+from flash.serve.deployment.deploy import Deployment, deploy_adapter, undeploy_adapter
 
 
 @pytest.fixture(autouse=True)
 def _stub_shared_http_client(monkeypatch):
-    import flash.serve.deployment.deploy as deploy
-
     class _Client:
         def request(self, method, url, **kwargs):
-            return getattr(deploy.httpx, method.lower())(url, **kwargs)
+            return getattr(serving_transport.httpx, method.lower())(url, **kwargs)
 
     client = _Client()
-    monkeypatch.setattr(deploy, "_http_client", lambda: client)
+    monkeypatch.setattr(serving_transport, "_http_client", lambda: client)
 
 
 def test_dependency_light_health_parser_normalizes_the_serving_contract():
@@ -73,10 +71,8 @@ def test_schema_and_generated_backends_share_the_adapter_revision_pattern():
 
 
 def test_serving_base_url_default_and_override(monkeypatch):
-    from flash.serve.deployment.deploy import DEFAULT_FREESOLO_SERVING_URL
-
     monkeypatch.delenv("FREESOLO_SERVING_URL", raising=False)
-    assert serving_base_url() == DEFAULT_FREESOLO_SERVING_URL
+    assert serving_base_url() == serving_urls.default_serving_url()
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/")
     assert serving_base_url() == "https://serve.example"
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
@@ -123,7 +119,7 @@ def test_adapter_artifact_metadata_reads_the_exported_modality_marker(
 def _stub_deploy_preconditions(monkeypatch, deploy_mod) -> None:
     monkeypatch.setattr(deploy_mod, "resolve_hf_revision", lambda repo: "a" * 40)
     monkeypatch.setattr(
-        deploy_mod,
+        adapter_check,
         "adapter_artifact_metadata",
         lambda *a, **k: types.SimpleNamespace(lora_rank=32, targets_images=False),
     )
@@ -142,13 +138,13 @@ def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
     import httpx
 
     import flash.serve.deployment.deploy as deploy_mod
-    from flash.serve.deployment.deploy import ServingError
+    from flash.serve.contract.errors import ServingError
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     req = httpx.Request("POST", "https://serve.example/adapters")
     resp = httpx.Response(500, text="no base-model engines loaded", request=req)
     _stub_deploy_preconditions(monkeypatch, deploy_mod)
-    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+    monkeypatch.setattr(serving_transport.httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
         deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
@@ -162,13 +158,13 @@ def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     import httpx
 
     import flash.serve.deployment.deploy as deploy_mod
-    from flash.serve.deployment.deploy import ServingError
+    from flash.serve.contract.errors import ServingError
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     req = httpx.Request("POST", "https://serve.example/adapters")
     resp = httpx.Response(401, text="invalid internal key", request=req)
     _stub_deploy_preconditions(monkeypatch, deploy_mod)
-    monkeypatch.setattr(deploy_mod.httpx, "post", lambda *a, **k: resp)
+    monkeypatch.setattr(serving_transport.httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
         deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
@@ -187,7 +183,7 @@ def _stub_healthz(monkeypatch, deploy_mod, capabilities: list[str]) -> None:
         def json(self):
             return {"capabilities": list(capabilities)}
 
-    monkeypatch.setattr(deploy_mod, "_serving_request", lambda method, url, **k: _Resp())
+    monkeypatch.setattr(serving_transport, "serving_request", lambda method, url, **k: _Resp())
 
 
 def test_require_capabilities_provenance_is_preferred_not_required(monkeypatch):
@@ -212,7 +208,7 @@ def test_require_capabilities_provenance_is_preferred_not_required(monkeypatch):
 
 def test_require_capabilities_still_fails_on_missing_safety_critical(monkeypatch):
     import flash.serve.deployment.deploy as deploy_mod
-    from flash.serve.deployment.deploy import ServingError
+    from flash.serve.contract.errors import ServingError
 
     # Missing the atomic alias CAS (safety-critical) -> deploy MUST still be blocked.
     _stub_healthz(monkeypatch, deploy_mod, ["immutable_adapter_revisions", "revision_provenance"])
@@ -224,7 +220,7 @@ def test_require_capabilities_still_fails_on_missing_safety_critical(monkeypatch
 
 def test_require_capabilities_thinking_structured_outputs_required_when_used(monkeypatch):
     import flash.serve.deployment.deploy as deploy_mod
-    from flash.serve.deployment.deploy import ServingError
+    from flash.serve.contract.errors import ServingError
 
     # Backend lacks the deferred thinking/structured-outputs cap -> a thinking+SO deploy is blocked.
     _stub_healthz(
@@ -239,7 +235,7 @@ def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch
     import httpx
 
     import flash.serve.deployment.deploy as deploy_mod
-    from flash.serve.deployment.deploy import ServingError
+    from flash.serve.contract.errors import ServingError
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
 
@@ -247,7 +243,7 @@ def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch
         raise httpx.ConnectError("connection refused", request=httpx.Request("POST", url))
 
     _stub_deploy_preconditions(monkeypatch, deploy_mod)
-    monkeypatch.setattr(deploy_mod.httpx, "post", fake_post)
+    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
     with pytest.raises(ServingError) as ei:
         deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
     assert ei.value.status_code is None
@@ -255,7 +251,6 @@ def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch
 
 
 def test_undeploy_calls_freesolo_delete(monkeypatch):
-    import flash.serve.deployment.deploy as deploy_mod
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     deleted_urls = []
@@ -277,7 +272,7 @@ def test_undeploy_calls_freesolo_delete(monkeypatch):
         deleted_urls.append(url)
         return _Resp()
 
-    monkeypatch.setattr(deploy_mod.httpx, "delete", fake_delete)
+    monkeypatch.setattr(serving_transport.httpx, "delete", fake_delete)
     out = undeploy_adapter("flash-1-abc")
     assert out["run_id"] == "flash-1-abc"
     assert out["disabled_aliases"] == ["flash-1-abc"]
@@ -286,7 +281,6 @@ def test_undeploy_calls_freesolo_delete(monkeypatch):
 
 
 def test_undeploy_404_is_clean(monkeypatch):
-    import flash.serve.deployment.deploy as deploy_mod
 
     class _Resp:
         status_code = 404
@@ -294,7 +288,7 @@ def test_undeploy_404_is_clean(monkeypatch):
         def raise_for_status(self):  # pragma: no cover
             raise AssertionError("404 must not raise")
 
-    monkeypatch.setattr(deploy_mod.httpx, "delete", lambda *a, **k: _Resp())
+    monkeypatch.setattr(serving_transport.httpx, "delete", lambda *a, **k: _Resp())
     assert undeploy_adapter("flash-1-gone") == {
         "run_id": "flash-1-gone",
         "disabled_aliases": [],
@@ -378,7 +372,7 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
         events.append("verify")
         return types.SimpleNamespace(lora_rank=32, targets_images=True)
 
-    monkeypatch.setattr(deploy, "adapter_artifact_metadata", artifact_metadata)
+    monkeypatch.setattr(adapter_check, "adapter_artifact_metadata", artifact_metadata)
 
     def _caps(**_kwargs):
         events.append("capabilities")
@@ -406,7 +400,7 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
         events.append("register")
         return Resp()
 
-    monkeypatch.setattr(deploy, "_serving_request", request)
+    monkeypatch.setattr(serving_transport, "serving_request", request)
 
     def wait_ready(
         adapter_revision,
@@ -470,10 +464,10 @@ def test_registration_conflict_is_not_masked_by_existing_revision(monkeypatch):
 
     _stub_deploy_preconditions(monkeypatch, deploy)
     monkeypatch.setattr(
-        deploy,
-        "_serving_request",
+        serving_transport,
+        "serving_request",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            deploy.ServingError("revision conflict", status_code=409)
+            serving_errors.ServingError("revision conflict", status_code=409)
         ),
     )
     monkeypatch.setattr(
@@ -484,7 +478,7 @@ def test_registration_conflict_is_not_masked_by_existing_revision(monkeypatch):
         ),
     )
 
-    with pytest.raises(deploy.ServingError, match="revision conflict"):
+    with pytest.raises(serving_errors.ServingError, match="revision conflict"):
         deploy.deploy_adapter(
             "flash-1",
             "Qwen/Qwen3.5-0.8B",
@@ -498,9 +492,9 @@ def test_ambiguous_registration_requires_matching_immutable_identity(monkeypatch
 
     _stub_deploy_preconditions(monkeypatch, deploy)
     monkeypatch.setattr(
-        deploy,
-        "_serving_request",
-        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("timeout")),
+        serving_transport,
+        "serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(serving_errors.ServingError("timeout")),
     )
     monkeypatch.setattr(
         deploy,
@@ -522,7 +516,7 @@ def test_ambiguous_registration_requires_matching_immutable_identity(monkeypatch
         },
     )
 
-    with pytest.raises(deploy.ServingError, match="timeout"):
+    with pytest.raises(serving_errors.ServingError, match="timeout"):
         deploy.deploy_adapter(
             "flash-1",
             "Qwen/Qwen3.5-0.8B",
@@ -557,7 +551,7 @@ def test_revision_poll_rejects_mismatched_immutable_identity(monkeypatch):
         lambda adapter_id, **_kwargs: (mismatched, types.SimpleNamespace(headers={})),
     )
 
-    with pytest.raises(deploy.ServingError, match="different immutable identity"):
+    with pytest.raises(serving_errors.ServingError, match="different immutable identity"):
         deploy._wait_revision_ready(
             revision,
             expected["subfolder"],
@@ -608,7 +602,7 @@ def test_revision_poll_tolerates_absent_provenance_when_not_advertised(monkeypat
     )
 
     readback["record"] = {**record, "repo_id": "other/repo"}
-    with pytest.raises(deploy.ServingError, match="different immutable identity"):
+    with pytest.raises(serving_errors.ServingError, match="different immutable identity"):
         deploy._wait_revision_ready(
             revision,
             expected["subfolder"],
@@ -623,9 +617,9 @@ def test_activation_transport_ambiguity_reconciles_authoritative_alias(monkeypat
 
     revision = "flash-1@final." + "a" * 40
     monkeypatch.setattr(
-        deploy,
-        "_serving_request",
-        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("timeout")),
+        serving_transport,
+        "serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(serving_errors.ServingError("timeout")),
     )
     monkeypatch.setattr(
         deploy,
@@ -647,9 +641,9 @@ def test_activation_readback_rejects_disabled_alias_with_stale_target(monkeypatc
     revision = "flash-1@final." + "a" * 40
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
     monkeypatch.setattr(
-        deploy,
-        "_serving_request",
-        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("timeout")),
+        serving_transport,
+        "serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(serving_errors.ServingError("timeout")),
     )
     monkeypatch.setattr(
         deploy,
@@ -661,7 +655,7 @@ def test_activation_readback_rejects_disabled_alias_with_stale_target(monkeypatc
         },
     )
 
-    with pytest.raises(deploy.ActivationOutcomeUnknown, match="alias_activation_unknown"):
+    with pytest.raises(serving_errors.ActivationOutcomeUnknown, match="alias_activation_unknown"):
         deploy._activate_revision("flash-1", revision, "flash-1", expected_adapter_revision=None)
 
 
@@ -672,13 +666,13 @@ def test_activation_commit_survives_lost_response_and_transient_readback_failure
     revision = "flash-1@final." + "a" * 40
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
     monkeypatch.setattr(
-        deploy,
-        "_serving_request",
-        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("response lost")),
+        serving_transport,
+        "serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(serving_errors.ServingError("response lost")),
     )
     readbacks = iter(
         [
-            deploy.ServingError("readback unavailable"),
+            serving_errors.ServingError("readback unavailable"),
             {
                 "adapter_id": "flash-1",
                 "metadata": {"record_type": "alias", "alias_of": previous},
@@ -713,17 +707,19 @@ def test_activation_lost_response_and_readback_remains_explicitly_unknown(monkey
     revision = "flash-1@final." + "a" * 40
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
     monkeypatch.setattr(
-        deploy,
-        "_serving_request",
-        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("response lost")),
+        serving_transport,
+        "serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(serving_errors.ServingError("response lost")),
     )
     monkeypatch.setattr(
         deploy,
         "_registered_adapter",
-        lambda adapter_id: (_ for _ in ()).throw(deploy.ServingError("readback unavailable")),
+        lambda adapter_id: (_ for _ in ()).throw(
+            serving_errors.ServingError("readback unavailable")
+        ),
     )
 
-    with pytest.raises(deploy.ActivationOutcomeUnknown, match="alias_activation_unknown"):
+    with pytest.raises(serving_errors.ActivationOutcomeUnknown, match="alias_activation_unknown"):
         deploy._activate_revision("flash-1", revision, "flash-1", expected_adapter_revision=None)
 
 
@@ -732,9 +728,9 @@ def test_activation_reconciliation_accepts_alias_without_updated_at(monkeypatch)
 
     revision = "flash-1@final." + "a" * 40
     monkeypatch.setattr(
-        deploy,
-        "_serving_request",
-        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("timeout")),
+        serving_transport,
+        "serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(serving_errors.ServingError("timeout")),
     )
     monkeypatch.setattr(
         deploy,
@@ -757,9 +753,9 @@ def test_first_activation_missing_alias_target_remains_ambiguous(monkeypatch):
     revision = "flash-1@final." + "a" * 40
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0)
     monkeypatch.setattr(
-        deploy,
-        "_serving_request",
-        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("timeout")),
+        serving_transport,
+        "serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(serving_errors.ServingError("timeout")),
     )
     monkeypatch.setattr(
         deploy,
@@ -767,7 +763,7 @@ def test_first_activation_missing_alias_target_remains_ambiguous(monkeypatch):
         lambda adapter_id: {"adapter_id": adapter_id, "metadata": {"record_type": "alias"}},
     )
 
-    with pytest.raises(deploy.ServingError, match="outcome is ambiguous"):
+    with pytest.raises(serving_errors.ServingError, match="outcome is ambiguous"):
         deploy._activate_revision("flash-1", revision, "flash-1", expected_adapter_revision=None)
 
 
@@ -778,9 +774,9 @@ def test_activation_divergence_requires_reconciliation(monkeypatch):
     revision = "flash-1@step-20." + "a" * 40
     divergent = "flash-1@step-30." + "c" * 40
     monkeypatch.setattr(
-        deploy,
-        "_serving_request",
-        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("response lost")),
+        serving_transport,
+        "serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(serving_errors.ServingError("response lost")),
     )
     monkeypatch.setattr(
         deploy,
@@ -791,7 +787,7 @@ def test_activation_divergence_requires_reconciliation(monkeypatch):
         },
     )
 
-    with pytest.raises(deploy.ActivationOutcomeUnknown, match="activation diverged"):
+    with pytest.raises(serving_errors.ActivationOutcomeUnknown, match="activation diverged"):
         deploy._activate_revision(
             "flash-1", revision, "flash-1/step-20", expected_adapter_revision=previous
         )
@@ -813,7 +809,7 @@ def test_activation_response_mismatch_reconciles_authoritative_previous_alias(mo
                 "checkpoint": "flash-1/step-20",
             }
 
-    monkeypatch.setattr(deploy, "_serving_request", lambda *args, **kwargs: Resp())
+    monkeypatch.setattr(serving_transport, "serving_request", lambda *args, **kwargs: Resp())
     monkeypatch.setattr(
         deploy,
         "_registered_adapter",
@@ -823,7 +819,7 @@ def test_activation_response_mismatch_reconciles_authoritative_previous_alias(mo
             "metadata": {"record_type": "alias", "alias_of": previous},
         },
     )
-    with pytest.raises(deploy.ServingError, match="was not committed"):
+    with pytest.raises(serving_errors.ServingError, match="was not committed"):
         deploy._activate_revision(
             "flash-1", revision, "flash-1/step-20", expected_adapter_revision=previous
         )
@@ -839,7 +835,7 @@ def test_malformed_activation_response_reconciles_committed_alias(monkeypatch):
         def json(self):
             return {"adapter_id": "flash-1", "target_adapter_revision": "wrong"}
 
-    monkeypatch.setattr(deploy, "_serving_request", lambda *args, **kwargs: Resp())
+    monkeypatch.setattr(serving_transport, "serving_request", lambda *args, **kwargs: Resp())
     monkeypatch.setattr(
         deploy,
         "_registered_adapter",
@@ -875,7 +871,7 @@ def test_undeploy_returns_disabled_aliases_and_revisions(monkeypatch):
                 "disabled_revisions": ["flash-1@final." + "a" * 40],
             }
 
-    monkeypatch.setattr(deploy, "_serving_request", lambda *args, **kwargs: Resp())
+    monkeypatch.setattr(serving_transport, "serving_request", lambda *args, **kwargs: Resp())
     out = deploy.undeploy_adapter("flash-1")
     assert out["serving_deregistered"] is True
     assert out["disabled_aliases"] == ["flash-1"]
@@ -895,8 +891,8 @@ def test_undeploy_rejects_malformed_disabled_id_lists(monkeypatch):
                 "disabled_revisions": [],
             }
 
-    monkeypatch.setattr(deploy, "_serving_request", lambda *args, **kwargs: Resp())
-    with pytest.raises(deploy.ServingError, match="invalid disabled_aliases"):
+    monkeypatch.setattr(serving_transport, "serving_request", lambda *args, **kwargs: Resp())
+    with pytest.raises(serving_errors.ServingError, match="invalid disabled_aliases"):
         deploy.undeploy_adapter("flash-1")
 
 
@@ -907,8 +903,8 @@ def test_serving_capabilities_are_required(monkeypatch):
         def json(self):
             return {"capabilities": ["immutable_adapter_revisions"]}
 
-    monkeypatch.setattr(deploy, "_serving_request", lambda *args, **kwargs: Resp())
-    with pytest.raises(deploy.ServingError, match="alias_compare_and_swap"):
+    monkeypatch.setattr(serving_transport, "serving_request", lambda *args, **kwargs: Resp())
+    with pytest.raises(serving_errors.ServingError, match="alias_compare_and_swap"):
         deploy._require_serving_capabilities()
 
 
@@ -933,10 +929,10 @@ def test_capability_preflight_reads_healthz(monkeypatch):
         seen["url"] = url
         return Resp()
 
-    monkeypatch.setattr(deploy, "_serving_request", request)
+    monkeypatch.setattr(serving_transport, "serving_request", request)
     deploy._require_serving_capabilities()
     assert seen["method"] == "GET"
-    assert seen["url"] == f"{deploy.serving_base_url()}/healthz"
+    assert seen["url"] == f"{serving_urls.serving_base_url()}/healthz"
 
 
 def test_activation_conflict_preserves_expected_alias(monkeypatch):
@@ -945,16 +941,16 @@ def test_activation_conflict_preserves_expected_alias(monkeypatch):
     previous = "flash-1@step-10." + "b" * 40
     revision = "flash-1@step-20." + "a" * 40
     monkeypatch.setattr(
-        deploy,
-        "_serving_request",
-        lambda *args, **kwargs: (_ for _ in ()).throw(deploy.ServingError("conflict")),
+        serving_transport,
+        "serving_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(serving_errors.ServingError("conflict")),
     )
     monkeypatch.setattr(
         deploy,
         "_registered_adapter",
         lambda adapter_id: {"metadata": {"alias_of": previous}},
     )
-    with pytest.raises(deploy.ServingError, match="was not committed"):
+    with pytest.raises(serving_errors.ServingError, match="was not committed"):
         deploy._activate_revision(
             "flash-1", revision, "flash-1/step-20", expected_adapter_revision=previous
         )

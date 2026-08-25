@@ -10,6 +10,12 @@ import tempfile
 
 import pytest
 
+import flash.runner.lifecycle.attempts as runner_attempts
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as runner_submit
+import flash.runner.supervise.lifecycle as runner_lifecycle
+from flash.providers._lifecycle.net import worker as provider_worker
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 SOURCE_SNAPSHOT = valid_source_snapshot()
@@ -17,17 +23,15 @@ SOURCE_SNAPSHOT = valid_source_snapshot()
 
 def test_run_job_persists_flash_metrics(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.providers.runpod.serverless as flash_train
-        import flash.runner as runner
+        import flash.providers._lifecycle.net.worker as flash_train
 
         importlib.reload(flash_train)
-        importlib.reload(runner)
         # Storage roots are fixed constants now; redirect via monkeypatch (auto-restored).
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
-        monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", os.path.join(tmp, "results"))
         publication_events = []
         monkeypatch.setattr(
-            runner,
+            provider_worker,
             "publish_source_snapshot",
             lambda _repo: publication_events.append("published") or SOURCE_SNAPSHOT,
         )
@@ -36,14 +40,14 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         captured = {}
 
         def fake_submit(spec, seed, log=None, **kwargs):
-            from flash.snapshot.source_snapshot import TERMINAL_ATTESTATION_KEY, source_attestation
+            from flash.snapshot.archive import TERMINAL_ATTESTATION_KEY, source_attestation
 
             captured["gpu"] = spec.gpu.type
             captured["seed"] = seed
             captured["source_snapshot"] = kwargs["source_snapshot"]
-            persisted = runner.get_status(spec.run_id)
+            persisted = runner_status.get_status(spec.run_id)
             assert persisted.source_snapshot == SOURCE_SNAPSHOT
-            attempt = runner._reserve_attempt(spec.run_id)
+            attempt = runner_attempts._reserve_attempt(spec.run_id)
             return {
                 "arm": "runpod",
                 "phase": spec.phase,
@@ -64,7 +68,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         # Stub the submit/poll path (the seam that used to be the in-process
         # offline shortcut) so the run completes without provisioning a GPU.
         # _run_training resolves it via `from flash.runner import _submit_seed_supervised`.
-        monkeypatch.setattr(runner, "_submit_seed_supervised", fake_submit)
+        monkeypatch.setattr(runner_lifecycle, "_submit_seed_supervised", fake_submit)
 
         spec = JobSpec(
             run_id="flash-run",
@@ -74,13 +78,13 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             gpu=GpuSpec(type=""),
             seed=123,
         )
-        status = runner.submit_job(spec, dry_run=False, background=False)
+        status = runner_submit.submit_job(spec, dry_run=False, background=False)
 
         assert status.state == "done", status.error
         from flash.providers.runpod.client.pricing import hourly_rate
 
-        # We charge the QUOTE (flash.cost estimate); the measured 1h-on-a-4090 cost lands in metrics.json.
-        assert status.cost_usd == runner.charge_usd_for_spec(spec), status.cost_usd
+        # the full run charges the persisted accepted quote; measured cost lands in metrics.json.
+        assert status.cost_usd == status.estimated_cost_usd, status.cost_usd
         assert publication_events == ["published"]
         assert captured["gpu"] == ""
         assert captured["seed"] == 123
@@ -98,7 +102,6 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
 
 def test_source_publication_failure_is_generic_at_submission_and_api_boundary(monkeypatch, caplog):
-    import flash.runner as runner
     from flash.core.spec import JobSpec, TrainSpec
     from flash.server.routes.runs import _submit_failure_http_error
 
@@ -108,11 +111,11 @@ def test_source_publication_failure_is_generic_at_submission_and_api_boundary(mo
         algorithm="sft",
         train=TrainSpec(hf_repo="private-org/private-run-repo"),
     )
-    prepared = runner.PreparedJob(public_spec=spec, worker_spec=spec, estimated_cost_usd=1.0)
+    prepared = runner_submit.PreparedJob(public_spec=spec, worker_spec=spec, estimated_cost_usd=1.0)
     secret = "hf_private_token_123456"
     monkeypatch.setenv("HF_TOKEN", secret)
     monkeypatch.setattr(
-        runner,
+        provider_worker,
         "publish_source_snapshot",
         lambda _repo: (_ for _ in ()).throw(
             RuntimeError(
@@ -124,9 +127,9 @@ def test_source_publication_failure_is_generic_at_submission_and_api_boundary(mo
 
     with (
         caplog.at_level(logging.WARNING),
-        pytest.raises(runner.SourceSnapshotPublicationError) as raised,
+        pytest.raises(runner_submit.SourceSnapshotPublicationError) as raised,
     ):
-        runner.submit_job(spec, prepared_job=prepared)
+        runner_submit.submit_job(spec, prepared_job=prepared)
 
     public_error = _submit_failure_http_error(raised.value)
     assert public_error.status_code == 503
@@ -191,11 +194,9 @@ def test_publish_source_snapshot_forces_private_and_captures_commit(monkeypatch,
         return str(archive_file)
 
     _install_snapshot_hub(monkeypatch, _Api, download)
+    monkeypatch.setattr("flash.snapshot.archive.build_source_archive", lambda **_kwargs: archive)
     monkeypatch.setattr(
-        "flash.snapshot.source_snapshot.build_source_archive", lambda **_kwargs: archive
-    )
-    monkeypatch.setattr(
-        "flash.snapshot.source_snapshot.read_verified_archive", lambda data, _desc: {"ok": data}
+        "flash.snapshot.archive.read_verified_archive", lambda data, _desc: {"ok": data}
     )
 
     descriptor = worker.publish_source_snapshot("owner/run-artifacts")
@@ -250,10 +251,8 @@ def test_publish_source_snapshot_creates_missing_repo(monkeypatch, tmp_path):
         return str(archive_file)
 
     _install_snapshot_hub(monkeypatch, _Api, download)
-    monkeypatch.setattr(
-        "flash.snapshot.source_snapshot.build_source_archive", lambda **_kwargs: archive
-    )
-    monkeypatch.setattr("flash.snapshot.source_snapshot.read_verified_archive", lambda *_args: {})
+    monkeypatch.setattr("flash.snapshot.archive.build_source_archive", lambda **_kwargs: archive)
+    monkeypatch.setattr("flash.snapshot.archive.read_verified_archive", lambda *_args: {})
 
     worker.publish_source_snapshot("owner/new-env-artifacts")
 
@@ -264,7 +263,7 @@ def test_publish_source_snapshot_creates_missing_repo(monkeypatch, tmp_path):
 
 
 def test_hf_call_honors_retry_after(monkeypatch):
-    import flash.providers.runpod.serverless as flash_train
+    import flash.providers._lifecycle.net.worker as flash_train
 
     sleeps: list[float] = []
     logs: list[tuple[str, tuple]] = []
@@ -295,7 +294,7 @@ def test_hf_call_honors_retry_after(monkeypatch):
 
 
 def test_hf_call_caps_http_date_retry_after(monkeypatch):
-    import flash.providers.runpod.serverless as flash_train
+    import flash.providers._lifecycle.net.worker as flash_train
 
     sleeps: list[float] = []
 
@@ -352,10 +351,8 @@ def test_publish_source_snapshot_reuses_verified_archive_at_exact_head(monkeypat
         return str(archive_file)
 
     _install_snapshot_hub(monkeypatch, _Api, download)
-    monkeypatch.setattr(
-        "flash.snapshot.source_snapshot.build_source_archive", lambda **_kwargs: archive
-    )
-    monkeypatch.setattr("flash.snapshot.source_snapshot.read_verified_archive", lambda *_args: {})
+    monkeypatch.setattr("flash.snapshot.archive.build_source_archive", lambda **_kwargs: archive)
+    monkeypatch.setattr("flash.snapshot.archive.read_verified_archive", lambda *_args: {})
 
     descriptor = worker.publish_source_snapshot("owner/run-artifacts")
 
@@ -397,10 +394,8 @@ def test_publish_source_snapshot_rereads_concurrent_winner(monkeypatch, tmp_path
         return str(archive_file)
 
     _install_snapshot_hub(monkeypatch, _Api, download)
-    monkeypatch.setattr(
-        "flash.snapshot.source_snapshot.build_source_archive", lambda **_kwargs: archive
-    )
-    monkeypatch.setattr("flash.snapshot.source_snapshot.read_verified_archive", lambda *_args: {})
+    monkeypatch.setattr("flash.snapshot.archive.build_source_archive", lambda **_kwargs: archive)
+    monkeypatch.setattr("flash.snapshot.archive.read_verified_archive", lambda *_args: {})
 
     descriptor = worker.publish_source_snapshot("owner/run-artifacts")
     assert descriptor["revision"] == "e" * 40
@@ -411,7 +406,6 @@ def test_run_job_background_swallows_exception(monkeypatch):
     an alarming 'Exception in thread' traceback for every failed run); the synchronous _run_job
     keeps raising for its callers. Terminal state is already persisted before the raise, so the
     wrapper just logs and returns."""
-    import flash.runner as runner
 
     calls = {"n": 0}
 
@@ -420,10 +414,10 @@ def test_run_job_background_swallows_exception(monkeypatch):
         raise RuntimeError("seed 0 failed after retries: job_failed")
 
     # The wrapper dispatches through the package-level _run_job that tests patch.
-    monkeypatch.setattr(runner, "_run_job", boom)
+    monkeypatch.setattr(runner_lifecycle, "_run_job", boom)
     spec = type("S", (), {"run_id": "bg-run"})()
     # Must not raise — the wrapper swallows it (state already persisted by _run_job_inner).
-    runner._run_job_background(spec)
+    runner_lifecycle._run_job_background(spec)
     assert calls["n"] == 1
 
 
@@ -434,26 +428,25 @@ def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch, c
     import os
     import tempfile
 
-    import flash.runner as runner
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
-        monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
-        os.makedirs(runner.RUNS_DIR, exist_ok=True)
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", os.path.join(tmp, "results"))
+        os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
         # a non-terminal (queued) run, as submit_job persists before dispatching the daemon thread
-        runner._save_status(RunStatus(run_id="bg-fail", state="queued", spec={}))
+        runner_state._save_status(RunStatus(run_id="bg-fail", state="queued", spec={}))
         raw_message = "crashed before persisting terminal state"
 
         def boom(spec):
             raise RuntimeError(raw_message)
 
-        monkeypatch.setattr(runner, "_run_job", boom)
-        caplog.set_level(logging.WARNING, logger=runner.__name__)
+        monkeypatch.setattr(runner_lifecycle, "_run_job", boom)
+        caplog.set_level(logging.WARNING, logger=runner_lifecycle.__name__)
         spec = type("S", (), {"run_id": "bg-fail"})()
-        runner._run_job_background(spec)  # must not raise
+        runner_lifecycle._run_job_background(spec)  # must not raise
 
-        status = runner.get_status("bg-fail")
+        status = runner_status.get_status("bg-fail")
         assert status.state == "failed"
         safe_detail = "RuntimeError: background run failed"
         assert status.error == safe_detail
@@ -468,25 +461,24 @@ def test_run_job_background_does_not_clobber_persisted_failure(monkeypatch):
     import os
     import tempfile
 
-    import flash.runner as runner
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
-        monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(tmp, "results"))
-        os.makedirs(runner.RUNS_DIR, exist_ok=True)
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", os.path.join(tmp, "results"))
+        os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
         # already terminal, carrying the REAL failure detail _run_job_inner persisted
-        runner._save_status(
+        runner_state._save_status(
             RunStatus(run_id="bg-done", state="failed", spec={}, error="real seed failure detail")
         )
 
         def boom(spec):
             raise RuntimeError("generic wrapper-level error")
 
-        monkeypatch.setattr(runner, "_run_job", boom)
+        monkeypatch.setattr(runner_lifecycle, "_run_job", boom)
         spec = type("S", (), {"run_id": "bg-done"})()
-        runner._run_job_background(spec)  # must not raise
+        runner_lifecycle._run_job_background(spec)  # must not raise
 
-        status = runner.get_status("bg-done")
+        status = runner_status.get_status("bg-done")
         assert status.state == "failed"
         assert status.error == "real seed failure detail"  # NOT clobbered by the wrapper

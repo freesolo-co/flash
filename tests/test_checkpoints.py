@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.io.hf as worker_hf
 from flash.core.spec import JobSpec
 from flash.runner.results.checkpoints import (
     CheckpointListingError,
@@ -54,20 +55,20 @@ class _RecordingHfApi:
 
 
 def _prime_worker(monkeypatch, recorder, *, repo="org/test-runs", phase="rl", run="flash-ckpt-1"):
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
-    monkeypatch.setattr(worker, "HF_REPO", repo)
-    monkeypatch.setattr(worker, "PHASE", phase)
-    monkeypatch.setattr(worker, "RUN_ID", run)
-    monkeypatch.setattr(worker, "SEED", 0)
-    monkeypatch.setattr(worker, "hf_api", lambda: recorder)
-    # heartbeat would otherwise commit to HF; silence it for the unit test.
-    monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(worker._worker_state, "HF_REPO", repo)
+    monkeypatch.setattr(worker._worker_state, "PHASE", phase)
+    monkeypatch.setattr(worker._worker_state, "RUN_ID", run)
+    monkeypatch.setattr(worker._worker_state, "SEED", 0)
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: recorder)
+    # heartbeat would otherwise commit to hf; silence it for the unit test.
+    monkeypatch.setattr(worker._worker_heartbeat, "heartbeat", lambda *a, **k: None)
     return worker
 
 
 def test_publish_deployable_checkpoint_uploads_adapter_only(tmp_path, monkeypatch):
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
@@ -96,14 +97,14 @@ def test_publish_deployable_checkpoint_writes_base_model_provenance(tmp_path, mo
     # base-model provenance sidecar, sourced from the job spec's pinned base model, before uploading.
     import json
 
-    import flash.engine.worker as worker
     import flash.engine.worker.io.hf as hf
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
     commit = "e" * 40
     monkeypatch.setattr(
-        worker, "JOB_SPEC", SimpleNamespace(model="org/base", model_revision="main")
+        worker._worker_state, "JOB_SPEC", SimpleNamespace(model="org/base", model_revision="main")
     )
     monkeypatch.setattr(hf, "resolve_cached_model_commit", lambda model_id, revision: commit)
     ckpt = tmp_path / "checkpoint-80"
@@ -127,11 +128,11 @@ def test_publish_deployable_checkpoint_writes_base_model_provenance(tmp_path, mo
 def test_publish_deployable_checkpoint_without_job_spec_writes_no_provenance(tmp_path, monkeypatch):
     # back-compat: with no JOB_SPEC (e.g. local recipe runs) publish writes no base_model_provenance.json
     # rather than a misleading empty record, and still publishes the deployable (provenance is additive).
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
-    monkeypatch.setattr(worker, "JOB_SPEC", None, raising=False)
+    monkeypatch.setattr(worker._worker_state, "JOB_SPEC", None, raising=False)
     ckpt = tmp_path / "checkpoint-80"
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
@@ -147,12 +148,15 @@ def test_publish_deployable_checkpoint_with_empty_model_writes_no_provenance(tmp
     # #542 finding: the guard mirrors the final-save path (write only for a non-empty base model), so a
     # JOB_SPEC with no model stamps no sidecar rather than a misleading empty-model_id record, and still
     # publishes the deployable.
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
     monkeypatch.setattr(
-        worker, "JOB_SPEC", SimpleNamespace(model="", model_revision=""), raising=False
+        worker._worker_state,
+        "JOB_SPEC",
+        SimpleNamespace(model="", model_revision=""),
+        raising=False,
     )
     ckpt = tmp_path / "checkpoint-80"
     ckpt.mkdir()
@@ -166,7 +170,7 @@ def test_publish_deployable_checkpoint_with_empty_model_writes_no_provenance(tmp
 
 
 def test_publish_deployable_checkpoint_rejects_bin_weights(tmp_path, monkeypatch):
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
@@ -181,7 +185,7 @@ def test_publish_deployable_checkpoint_rejects_bin_weights(tmp_path, monkeypatch
 
 def test_publish_deployable_checkpoint_skips_without_adapter(tmp_path, monkeypatch):
     """A checkpoint that carries no PEFT adapter is never advertised as deployable."""
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
@@ -195,7 +199,7 @@ def test_publish_deployable_checkpoint_skips_without_adapter(tmp_path, monkeypat
 
 def test_publish_deployable_checkpoint_skips_config_without_weights(tmp_path, monkeypatch):
     """A checkpoint with adapter_config.json but no weights file isn't loadable -> not published."""
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
@@ -208,7 +212,7 @@ def test_publish_deployable_checkpoint_skips_config_without_weights(tmp_path, mo
 
 
 def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec, repo="")  # local run, no HF repo
@@ -221,11 +225,11 @@ def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
 
 
 def test_publish_deployable_checkpoint_starts_no_upload_at_deadline(tmp_path, monkeypatch):
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
-    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: 0.0)
+    monkeypatch.setattr(worker._worker_state, "_remaining_worker_wall_seconds", lambda: 0.0)
     ckpt = tmp_path / "checkpoint-5"
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
@@ -511,7 +515,7 @@ def test_register_run_checkpoints_requires_org():
 def test_register_run_checkpoints_falls_back_to_platform_context(monkeypatch):
     # Internal/operator runs carry org only in platform_context (billing_context is None):
     # registration must still scope rows to that org. _run_org_id falls back to billing-then-platform
-    # (same order as routes/serving.py::_run_org; NOT run_registry, which is platform-first).
+    # (same order as routes/serving.py::_run_org; NOT runs, which is platform-first).
     import flash.server.domain.registry.checkpoints as ck
 
     captured = {}
@@ -623,8 +627,8 @@ def test_run_rl_publishes_final_step_as_deployable_checkpoint():
     # the original catalog base and deploys as-is: the final adapter is uploaded as the default and
     # published as the deployable checkpoint directly — no recombine step.
     assert "save_pretrained(adapter_dir)" in src
-    assert '_w.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
-    assert "_w.publish_deployable_checkpoint(adapter_dir, steps_run)" in src
+    assert '_worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
+    assert "_worker_hf.publish_deployable_checkpoint(adapter_dir, steps_run)" in src
 
 
 def test_run_sft_publishes_final_step_as_deployable_checkpoint():
@@ -633,8 +637,8 @@ def test_run_sft_publishes_final_step_as_deployable_checkpoint():
     # follows the wiring to where the adapter is actually exported and published.
     src = _finalize_src("flash.engine.worker.train.entry.sft_train", "run_sft_train")
     assert "_export_checkpoint_adapter(" in src
-    assert '_w.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
-    assert "_w.publish_deployable_checkpoint(adapter_dir, final_step)" in src
+    assert '_worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
+    assert "_worker_hf.publish_deployable_checkpoint(adapter_dir, final_step)" in src
 
 
 def test_worker_io_modules_only_reference_attributes_their_siblings_define():

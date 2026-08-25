@@ -6,7 +6,7 @@ Parsing that back into a clean payload is pure string work with no serving depen
 it lives here rather than in `flash.serve.deploy`.
 
 Split out to keep that module under the file-size limit. The tag constants are defined here
-and re-exported by `deploy`, which has no other use for them.
+and consumed directly by the request paths.
 """
 
 from __future__ import annotations
@@ -177,13 +177,7 @@ def _strip_retained_close(text: str, reasoning: str, start: int = 0) -> tuple[st
     Return ``None`` while a split delimiter may still be arriving. Resume from ``start`` to avoid
     rescanning the growing buffer; end-of-stream distinguishes a delayed answer from the tag itself.
     """
-    # resolved through `flash.serve.deploy` rather than called directly: the streaming tests
-    # measure buffer rescans by patching `deploy._find_delimiter`, and this is the call site
-    # that walks the closing buffer. A direct call would bypass the instrumentation and report
-    # zero scans, which no growth assertion can distinguish from a linear scan.
-    from flash.serve.deployment import deploy as _deploy
-
-    close = _deploy._find_delimiter(text, start)
+    close = _find_delimiter(text, start)
     if close >= 0:
         end = _retained_delimiter_end(text, close, reasoning)
         if end is not None:

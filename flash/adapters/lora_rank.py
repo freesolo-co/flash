@@ -52,7 +52,7 @@ def resolve_adapter_ref(adapter_ref: str) -> tuple[str, str] | None:
 
     Users write the short ``<run_id>[/step-N]`` form (see ``flash.schema.parse_checkpoint_ref``);
     the control plane resolves it against the source run's metadata into the storage reference
-    the worker receives (``flash.runner._prepare_init_from_adapter``). Per-step deployable
+    the worker receives (``flash.runner.lifecycle.preparation._prepare_init_from_adapter``). per-step deployable
     adapters live at the identical ``<prefix>/adapter`` layout in the artifact repo (see
     ``publish_deployable_checkpoint``), so the same download path serves both.
     """

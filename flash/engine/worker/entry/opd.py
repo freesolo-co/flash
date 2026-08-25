@@ -9,9 +9,9 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass
 
+import flash.engine.worker.runtime.state as _worker_state
 from flash.engine.plan.recipe import RECIPE, resolve_teacher
 from flash.engine.plan.vram import opd_completion_len
-from flash.engine.worker.runtime.pkg_proxy import W as _w
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ class OpdKnobs:
 def _resolve_opd_knobs() -> OpdKnobs:
     """Resolve every opd knob from the JobSpec's [train] table, falling back to RECIPE.opd."""
     d = RECIPE.opd
-    t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
+    t = _worker_state.JOB_SPEC.train if _worker_state.JOB_SPEC else None
 
     def opt(name, default):
         v = getattr(t, name, None) if t else None
@@ -82,7 +82,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
             else d.sampling_temperature
         ),
         top_p=d.sampling_top_p,
-        max_completion=opd_completion_len(opt("max_completion_tokens", 0), _w.THINKING),
+        max_completion=opd_completion_len(opt("max_completion_tokens", 0), _worker_state.THINKING),
         # reads prompts_per_step, NOT batch_size: opd rejects batch_size at parse time, so an opd
         # spec carries the optimizer batch only under this key. reading the old name found None on
         # every run and trained the recipe default no matter what the user authored.
@@ -103,7 +103,7 @@ def _thinking_prefill_text(tok) -> str:
     ``<think>\\n``), i.e. the delta between the enable_thinking=True and =False renders. Returns "" when
     thinking is off or the template ignores enable_thinking (the two renders match), so callers can
     unconditionally append it to the teacher prompt for student/teacher conditioning parity."""
-    if not _w.THINKING:
+    if not _worker_state.THINKING:
         return ""
     probe = [{"role": "user", "content": ""}]
     with contextlib.suppress(Exception):

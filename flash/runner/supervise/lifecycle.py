@@ -1,8 +1,4 @@
-"""Run-execution machinery: the submit -> supervised training job -> GC flow.
-
-Sibling helpers are imported function-locally to avoid the flash.runner.__init__ import cycle
-and to keep monkeypatches reachable (``monkeypatch.setattr(runner, ...)`` vs a static copy).
-"""
+"""run-execution machinery for submission, supervision, and cleanup."""
 
 from __future__ import annotations
 
@@ -21,42 +17,22 @@ RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
 
 
-class _SelectedQuoteUnaffordable(RuntimeError):
-    """The selected live candidate costs more than the owning organization can afford."""
+def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
+    """run a supervised job without leaking a daemon-thread traceback."""
+    import logging
 
+    from flash.runner.lifecycle.state import TERMINAL_STATES
+    from flash.runner.lifecycle.status import _update, get_status
 
-def _recheck_selected_quote_affordability(status, selected_quote: float, log) -> None:
-    """Recheck only a live quote that increases the amount accepted before allocation."""
-    accepted_quote = float(getattr(status, "estimated_cost_usd", 0.0) or 0.0)
-    if selected_quote <= accepted_quote:
-        return
-    context = getattr(status, "billing_context", None)
-    if not isinstance(context, dict):
-        return
-    org_id = str(context.get("org_id") or "").strip()
-    if not org_id:
-        return
-
-    from flash.server.platform.internal_client import internal_key
-
-    key = internal_key()
-    if not key:
-        return
     try:
-        from flash.server.billing.charges import precheck_training_run
-
-        precheck_training_run(internal_key=key, org_id=org_id, estimate_usd=selected_quote)
+        _run_job(spec, runtime_secrets=runtime_secrets) if runtime_secrets else _run_job(spec)
     except Exception as exc:
-        from flash.server.billing.charges import BillingError
-
-        if isinstance(exc, BillingError) and exc.status_code == 402:
-            raise _SelectedQuoteUnaffordable(
-                "selected live GPU quote exceeds the organization's available training balance"
-            ) from exc
-        print(
-            f"budget recheck skipped for selected quote (billing service error: {type(exc).__name__})",
-            file=log,
-            flush=True,
+        detail = f"{type(exc).__name__}: background run failed"
+        with contextlib.suppress(Exception):
+            if get_status(spec.run_id).state not in TERMINAL_STATES:
+                _update(spec.run_id, "failed", error=detail)
+        logging.getLogger(__name__).warning(
+            "background run %s ended in error: %s", spec.run_id, detail
         )
 
 
@@ -100,14 +76,10 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
 
     preflight_validate_image_opd(spec)
 
-    from flash.runner import (
-        RUNS_DIR,
-        TERMINAL_STATES,
-        _gc_run_endpoints,
-        _run_job_inner,
-        _update,
-        get_status,
-    )
+    from flash.runner.lifecycle.state import RUNS_DIR, TERMINAL_STATES
+    from flash.runner.lifecycle.status import _update, get_status
+    from flash.runner.supervise.lifecycle import _run_job_inner
+    from flash.runner.supervise.recovery import _gc_run_endpoints
 
     # Cancel can land before this thread starts; don't overwrite a terminal state with provisioning.
     if get_status(spec.run_id).state in TERMINAL_STATES:
@@ -121,7 +93,7 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
                 break
             except Exception as exc:
                 from flash.envs.loading.staged import StagedEnvironmentTransientError
-                from flash.runner import _load_run_deadline_at
+                from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
                 if not isinstance(exc, StagedEnvironmentTransientError):
                     raise
@@ -181,7 +153,7 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
     Only drops the platform-managed shared cache (WEIGHT_CACHE_VOLUME_NAME); a custom per-org
     network_volume is the user's own choice and is preserved across retries.
     """
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
         return spec
@@ -238,14 +210,11 @@ def _run_job_inner(
     log_path: str,
     runtime_secrets: dict[str, str] | None = None,
 ) -> None:
-    from flash.runner import (
-        _load_run_deadline_at,
-        _run_training,
-        _RunCancelled,
-        _update,
-        get_status,
-        stage_environment_package,
-    )
+    from flash.runner.accounting.artifacts import stage_environment_package
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.lifecycle.status import _update, get_status
+    from flash.runner.supervise.errors import _RunCancelled
+    from flash.runner.supervise.lifecycle import _run_training
 
     try:
         # dev replaced the explicit code upload with managed source snapshots, so staging only has
@@ -289,18 +258,17 @@ def _run_training(
     checkpoint on a fresh allocation). ``prior_cost`` carries spend already booked before a
     recovery so the total isn't under-reported. ``attempt_start`` preserves globally monotonic
     worker identities while each invocation keeps its own bounded retry budget."""
-    from flash.runner import (
-        TERMINAL_STATES,
+    from flash.runner.accounting.costs import _status_estimated_charge
+    from flash.runner.lifecycle.state import TERMINAL_STATES, artifacts_dir
+    from flash.runner.lifecycle.status import (
         _persist_metrics,
-        _RunCancelled,
-        _status_estimated_charge,
-        _submit_seed_supervised,
         _update,
-        artifacts_dir,
         get_status,
         source_snapshot_from_status,
         validate_terminal_source_metrics,
     )
+    from flash.runner.supervise.errors import _RunCancelled
+    from flash.runner.supervise.lifecycle import _submit_seed_supervised
 
     if spec.algorithm == "opd":
         from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
@@ -337,8 +305,9 @@ def _run_training(
     metrics, verified_attempt = validate_terminal_source_metrics(get_status(spec.run_id), metrics)
     # measured wall x $/hr is recorded in metrics.json for analytics, but is not what we charge.
     measured_cost = prior_cost + _persist_metrics(spec, metrics)
-    # The customer is charged the submit-time QUOTE, not measured wall. Legacy runs without a
-    # persisted quote are re-priced from the spec, falling back only for old/unpriceable records.
+    # full planned work is charged at the submit-time quote, never measured wall. a worker that
+    # finishes fewer optimizer steps pays the matching estimated-work fraction; legacy records
+    # without a completed-step metric preserve the quote exactly.
     charge_usd = _status_estimated_charge(get_status(spec.run_id), spec, fallback=measured_cost)
     # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
     # Re-read before the terminal "done" so a late worker success doesn't resurrect a cancelled run.

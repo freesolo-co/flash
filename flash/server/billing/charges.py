@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from decimal import ROUND_HALF_UP, Decimal
 
 from flash.core.spec import attributed_gpu_type
+from flash.cost.currency import usd_cents as _cents
 from flash.server.platform.internal_client import (
     DEFAULT_TIMEOUT_S,
     build_internal_request,
@@ -25,12 +25,6 @@ class BillingError(Exception):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
-
-
-def _cents(usd: float) -> int:
-    """Whole cents, ROUND_HALF_UP (not banker's rounding), never negative."""
-    cents = Decimal(str(usd)).scaleb(2).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    return max(0, int(cents))
 
 
 def _http_reason(exc: urllib.error.HTTPError) -> str:

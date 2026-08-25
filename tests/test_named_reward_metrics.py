@@ -1,12 +1,12 @@
 import inspect
 
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
-from flash.engine.worker.train.entry.rl_train import (
+from flash.engine.worker.train.entry.rl_train import run_rl_train
+from flash.engine.worker.train.entry.rl_train_runner import (
     _ingest_step_metrics,
     _start_reward_runtime,
-    run_rl_train,
-    score_single_turn,
 )
+from flash.engine.worker.train.rl.rollout.single_turn import score_single_turn
 
 
 def _published_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict[str, float]:

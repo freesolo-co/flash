@@ -9,7 +9,7 @@ Like ``flash.server.billing.charges``, the POST is authenticated with the operat
 control plane never persists a user's freesolo key) and carries the org id persisted WITH the
 run — ``billing_context`` for user runs, THEN ``platform_context`` for internal/operator runs
 (the submit-path order). That billing-then-platform precedence is the canonical
-``_internal_client.run_org_id`` (NOT ``run_registry._context_from_status``, which prefers
+``_internal_client.run_org_id`` (NOT ``runs._context_from_status``, which prefers
 ``platform_context`` first). Unlike billing, checkpoint persistence is
 STRICTLY best-effort: a failure here must never disturb a run or a deploy, so the public entry
 point swallows everything. Internal/operator runs with no org attribution at all are skipped
@@ -88,7 +88,7 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
     try:
         # run_id + hf_repo are platform-managed and stripped from the public spec; read the
         # authoritative values from the internal worker-spec carrier (see _internal_spec_from_status).
-        from flash.runner import _internal_spec_from_status
+        from flash.runner.lifecycle.state import _internal_spec_from_status
 
         spec = _internal_spec_from_status(status)
     except Exception as exc:

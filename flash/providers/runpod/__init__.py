@@ -20,7 +20,7 @@ from flash.providers.core.base import (
 def terminate_persisted_endpoints(spec: Any, run_id: str) -> None:
     """Best-effort teardown for every GPU class named by a raw persisted spec."""
     from flash.core.spec import persisted_gpu_types
-    from flash.providers.runpod.serverless import terminate_endpoint
+    from flash.providers.runpod.serverless.endpoints import terminate_endpoint
 
     for gpu_type in persisted_gpu_types(spec):
         with contextlib.suppress(Exception):
@@ -85,7 +85,7 @@ class RunpodProvider:
         _deadline_at: float | None = None,
     ) -> PollResult:
         from flash.core.spec import require_matching_seed
-        from flash.providers.runpod.execution.jobs import submit_run
+        from flash.providers.runpod.execution.job_execution import submit_run
 
         seed = require_matching_seed(spec, seed)
         kwargs = {
@@ -110,13 +110,13 @@ class RunpodProvider:
         _deadline_at: float | None = None,
     ) -> PollResult:
         from flash.core.spec import gpu_count_of, require_matching_seed
-        from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
-        from flash.providers.runpod.execution.jobs import (
+        from flash.providers.artifacts.hf import (
             make_hf_failure_detail_reader,
             make_hf_heartbeat_reader,
-            poll_job,
-            stall_kwargs,
         )
+        from flash.providers.runpod.execution.job_execution import poll_job
+        from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
+        from flash.providers.runpod.execution.jobs import stall_kwargs
 
         seed = require_matching_seed(spec, seed)
         hf_repo = spec.train.hf_repo
@@ -202,7 +202,7 @@ class RunpodProvider:
             )
 
     def gc(self, spec) -> None:
-        from flash.providers.runpod.serverless import terminate_endpoint
+        from flash.providers.runpod.serverless.endpoints import terminate_endpoint
 
         # every acceptable class, not just the head: allocation ranks a multi-class pin on cost and
         # may rent a fallback, whose endpoint name is derived from that class. matching is by name,

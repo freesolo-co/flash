@@ -1204,13 +1204,15 @@ def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch
     from flash.providers.core.allocator import required_vram_gb
     from flash.providers.core.base import (
         GPU_INFO,
-        MAX_COMBINATION_CARDS,
         UnsupportedGpuError,
-        combined_vram_gb,
         get_gpu_info,
         providers_for,
         provisional_gpu,
         provisional_gpu_count,
+    )
+    from flash.providers.core.sharding import (
+        MAX_COMBINATION_CARDS,
+        combined_vram_gb,
     )
     from flash.schema import ConfigError, spec_from_dict
 
@@ -1364,7 +1366,12 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
     from flash.core.catalog import ALGORITHMS, MODELS
     from flash.cost import RunConfig, estimate_cost
     from flash.providers.core import allocator
-    from flash.providers.core.base import GPU_INFO, combined_vram_gb, get_gpu_info, provisional_gpu
+    from flash.providers.core.base import (
+        GPU_INFO,
+        get_gpu_info,
+        provisional_gpu,
+    )
+    from flash.providers.core.sharding import combined_vram_gb
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
     expected = {
@@ -2278,7 +2285,11 @@ def test_width_search_finds_a_shape_the_executed_width_reaches_non_monotonically
     caller turns into a terminal rejection of a job the allocator would have launched.
     """
     from flash.engine.plan.steps import sft_data_parallel_cards
-    from flash.providers.core.base import GPU_INFO, combined_vram_gb, smallest_fitting_gpu_count
+    from flash.providers.core.base import (
+        GPU_INFO,
+        smallest_fitting_gpu_count,
+    )
+    from flash.providers.core.sharding import combined_vram_gb
 
     width = lambda count: sft_data_parallel_cards(count, 3, 3)  # noqa: E731
     assert (width(2), width(4)) == (1, 3), "premise: the executed width dips, then climbs"

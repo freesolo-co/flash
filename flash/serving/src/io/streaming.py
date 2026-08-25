@@ -10,17 +10,23 @@ import contextlib
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+import orjson
+
 from flash.serving.src.engine.errors import raise_if_engine_error, terminating_on_engine_error
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
-from flash.serving.src.io.responses import _ReasoningStreamSplitter, _usage_block
-from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.io.serving_io import (
+from flash.serving.src.io.provenance import (
     _active_checkpoint_ref,
     _provenance_headers,
     _revision_provenance,
-    _sse,
     require_attested_revision,
 )
+from flash.serving.src.io.responses import _ReasoningStreamSplitter, _usage_block
+from flash.serving.src.io.schemas import AdapterRecord
+
+
+def _sse(data: dict[str, Any] | str) -> bytes:
+    encoded = data.encode("utf-8") if isinstance(data, str) else orjson.dumps(data)
+    return b"data: " + encoded + b"\n\n"
 
 
 async def _next_event_or_disconnect(

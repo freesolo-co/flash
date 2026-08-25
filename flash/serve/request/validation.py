@@ -10,7 +10,7 @@ import re
 import warnings
 from typing import Any
 
-from flash.serve.contract.contract import reject_non_finite_json_constant
+from flash.serve.contract.protocol import reject_non_finite_json_constant
 
 MAX_IMAGES = 4
 MAX_COMPRESSED_BYTES = 8 * 1024 * 1024

@@ -11,9 +11,12 @@ from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 
-import flash.runner as runner
 from flash.core.spec import JobSpec
 from flash.envs.meta.identity import GitHubEnvironmentRef
+
+_DEFAULT_ARTIFACT_NAMESPACE = "Freesolo-Co"
+_ARTIFACT_REPO_PREFIX = "flashrun-"
+_ARTIFACT_REPO_NAME_MAX = 96
 
 
 def artifact_namespace() -> str:
@@ -25,9 +28,7 @@ def artifact_namespace() -> str:
     self-hoster's token cannot create ``Freesolo-Co/flashrun-*``, so the run failed at upload before
     any training started.
     """
-    return (
-        os.environ.get("FLASH_HF_NAMESPACE") or ""
-    ).strip() or runner._DEFAULT_ARTIFACT_NAMESPACE
+    return (os.environ.get("FLASH_HF_NAMESPACE") or "").strip() or _DEFAULT_ARTIFACT_NAMESPACE
 
 
 def _environment_artifact_repo_name(env_id: str) -> str:
@@ -35,14 +36,14 @@ def _environment_artifact_repo_name(env_id: str) -> str:
     raw = (env_id or "default-environment").strip() or "default-environment"
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
     slug = re.sub(r"[^A-Za-z0-9]+", "-", raw.lower()).strip("-") or "environment"
-    budget = runner._ARTIFACT_REPO_NAME_MAX - len(runner._ARTIFACT_REPO_PREFIX) - len(digest) - 1
+    budget = _ARTIFACT_REPO_NAME_MAX - len(_ARTIFACT_REPO_PREFIX) - len(digest) - 1
     slug = slug[:budget].rstrip("-") or "environment"
-    return f"{runner._ARTIFACT_REPO_PREFIX}{slug}-{digest}"
+    return f"{_ARTIFACT_REPO_PREFIX}{slug}-{digest}"
 
 
 def managed_hf_repo_for_environment(env_id: str) -> str:
     """Private HF dataset repo shared by runs that use the same environment id."""
-    return f"{runner.artifact_namespace()}/{runner._environment_artifact_repo_name(env_id)}"
+    return f"{artifact_namespace()}/{_environment_artifact_repo_name(env_id)}"
 
 
 def _file_digest(path: str, digest) -> None:
@@ -55,10 +56,10 @@ def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     """Assign the environment-scoped HF artifact repo (platform-managed, never user-set)."""
     if not spec.run_id or spec.run_id == "local":
         raise ValueError("run_id must be finalized before assigning the artifact repo")
-    repo = runner.managed_hf_repo_for_environment(spec.environment.id)
+    repo = managed_hf_repo_for_environment(spec.environment.id)
     d = spec.to_internal_dict()
     d["train"] = {**d["train"], "hf_repo": repo}
-    return runner.JobSpec.from_dict(d)
+    return JobSpec.from_dict(d)
 
 
 def stage_environment_package(
@@ -199,7 +200,7 @@ def _resolve_environment_sha_once(
         return spec, None
     d = spec.to_internal_dict()
     d["environment"] = {**d["environment"], "resolved_sha": sha}
-    return runner.JobSpec.from_dict(d), None
+    return JobSpec.from_dict(d), None
 
 
 def _pin_env_sha_with_reason(spec: JobSpec) -> tuple[JobSpec, str]:
@@ -212,7 +213,7 @@ def _pin_env_sha_with_reason(spec: JobSpec) -> tuple[JobSpec, str]:
     pinned, error = _resolve_environment_sha_once(spec, parsed, timeout=10.0)
     if error is None:
         return pinned, ""
-    logging.getLogger(runner.__name__).warning(
+    logging.getLogger(__name__).warning(
         "resolve-once: could not pin env ref->sha for %r (%s); controller staging will retry",
         spec.environment.id,
         error,
@@ -244,7 +245,9 @@ def preflight_validate_environment_ref(spec: JobSpec) -> tuple[JobSpec, bool]:
     pinned, error = _resolve_environment_sha_once(spec, parsed, timeout=4.0)
     if isinstance(error, GitHubPermanentError):
         env_id = spec.environment.id
-        raise runner.EnvironmentRefNotFound(
+        from flash.runner.lifecycle.preparation import EnvironmentRefNotFound
+
+        raise EnvironmentRefNotFound(
             f"environment {env_id!r} could not be resolved on GitHub: {error}. Verify the repository "
             "and ref exist and that the plane's GitHub token can read them"
         ) from error

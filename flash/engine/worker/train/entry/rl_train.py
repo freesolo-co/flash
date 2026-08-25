@@ -10,166 +10,51 @@ from __future__ import annotations
 
 import contextlib
 import os
-import subprocess
 
-# several imports below are marked unused-ok on purpose: their call sites moved to
-# `.train.rl.inputs`, but tests still read or patch them as attributes of THIS module and the
-# resolver reads them back through it. an autofix that drops them breaks those tests.
-from flash.engine.plan.steps import (
-    final_save_due,
-    on_policy_steps,  # noqa: F401
-    resolve_update_horizon,  # noqa: F401
-)
+import flash.engine.worker.io.heartbeat as _worker_heartbeat
+import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.runtime.state as _worker_state
+import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
+from flash.engine.plan.steps import final_save_due
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
-
-# no call site in this module since the uploader moved to `.train.rl.checkpoints`, but it is kept
-# imported here on purpose: the resume tests patch `rl_train._deployable_adapter_on_hf`, and the
-# uploader reads it back through this module. removing it as unused would silently break them.
-from flash.engine.worker.io.hf import _deployable_adapter_on_hf  # noqa: F401
 from flash.engine.worker.model.packing import model_is_gdn_hybrid
 from flash.engine.worker.perf import gpu_diagnostics
-from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.runtime.rng import seed_training_rngs  # noqa: F401
-from flash.engine.worker.train.entry.backend_common import (  # noqa: F401
-    _ORPHANED_PIPE_GRACE_S,
-    _TEARDOWN_GRACE_S,
+from flash.engine.worker.train.entry.backend_common import (
     VERL_REQUIREMENT,
-    ChildOutputTail,
-    VerlChildSilenceWatchdog,
-    _ChildExitWatchdog,
-    clamp_engine_len,
-    export_peft_adapter,
     fused_ce_backend,
     gdn_probe_module,
-    kill_process_group,
-    model_max_position_embeddings,
     probe_verl_capabilities,
-    raise_for_classified_verl_exit,
     reap_stragglers,
     require_gdn_boundary_resets,
     resolve_blackwell_attention_backends,
     resolve_rollout_enforce_eager,
-    resolve_verl_loggers,
     resolve_verl_python,
     rollout_fp8_kv,
-    stamp_adapter_dir_provenance,
     verl_declares_rollout_field,
     verl_device_capability,
 )
-from flash.engine.worker.train.entry.sft_train import (  # noqa: F401
-    _build_verl_child_env,
-    _cached_model_path,
-    _NvidiaSmiPeakSampler,
+from flash.engine.worker.train.entry.rl_train_runner import (
+    _announce_training,
+    _build_rl_child_env,
+    _execute_rl_child,
+    _export_final_adapter,
+    _initialize_teardown_state,
+    _prepare_final_adapter,
+    _prepare_rl_inputs,
+    _prepare_rl_runtime,
+    _resolve_training_settings,
+    _start_resume_uploader,
+    _step_timing_fields,
+    _StepMetricState,
+    _validate_rl_child,
+    _write_rl_plugin_config,
 )
-
-# kept here purely as the patch surface the resolver tests replace: `_resolve_grpo_inputs` moved
-# to `train/rl/inputs.py` and calls it back through this module, so the name must resolve here.
-from flash.engine.worker.train.opd.orchestration.gkd import (  # noqa: F401
-    generation_eos_from_cached_config,
+from flash.engine.worker.train.entry.sft_train import _cached_model_path
+from flash.engine.worker.train.rl.launch.verl_config import (
+    _build_verl_train_notes,
+    _build_verl_training_cfg,
+    build_verl_overrides,
 )
-from flash.engine.worker.train.rl.rollout.reward_module import render_reward_module  # noqa: F401
-
-DATA_SOURCE = "flash_env"
-
-
-# --------------------------------------------------------------------------------------------
-# pure helpers (no verl, no gpu, no network) -- unit tested directly.
-# --------------------------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------------------------
-# orchestration.
-# --------------------------------------------------------------------------------------------
-
-
-class _GrpoSubprocessStream:
-    """one grpo child stream and the evidence latched from that same stream."""
-
-    def __init__(self, proc, *, tail=None, silence_watchdog=None) -> None:
-        self._proc = proc
-        # the caller uses start_new_session, so the leader pid remains the group's stable identity.
-        self._process_group_id = proc.pid
-        self._tail = tail if tail is not None else ChildOutputTail()
-        self._silence_watchdog = silence_watchdog
-        self._terminated = False
-        self._orphaned_pipe = False
-
-    def __iter__(self):
-        assert self._proc.stdout is not None
-        # the child's exit is watched independently of pipe EOF: verl's vllm EngineCore grandchild
-        # inherits this same pipe, so a trainer that dies while it lives leaves a pipe nobody will
-        # close and this loop would run forever on a paid gpu. the watchdog tears the group down,
-        # which frees the cuda context AND closes the pipe, ending this loop.
-        if self._silence_watchdog is not None:
-            self._silence_watchdog.bind(
-                child_alive=lambda: self._proc.poll() is None,
-                teardown=self.terminate,
-            )
-            self._silence_watchdog.start()
-        try:
-            with _ChildExitWatchdog(
-                self._proc, process_group_id=self._process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
-            ) as watchdog:
-                for line in self._proc.stdout:
-                    # held across the yield. this is a generator, so the consumer's work for a line
-                    # runs while suspended here; counting only arrival makes a long callback look idle.
-                    with watchdog.handling_line():
-                        self._tail.record(line)
-                        if self._silence_watchdog is not None:
-                            self._silence_watchdog.observe_line(line)
-                        yield line
-        finally:
-            if self._silence_watchdog is not None:
-                self._silence_watchdog.stop()
-        if watchdog.tore_down:
-            self._orphaned_pipe = True
-            # the group is already gone, so teardown must not be attempted a second time.
-            self._terminated = True
-
-    def terminate(self) -> None:
-        if self._terminated:
-            return
-        kill_process_group(self._proc, process_group_id=self._process_group_id)
-        self._terminated = True
-
-    def wait_and_classify(self) -> int:
-        # BOUNDED. the iterator above ends on stdout EOF, which is not the direct child's exit: verl
-        # spawns vllm's EngineCore as a grandchild holding this same merged pipe, so a trainer that
-        # dies while the EngineCore lives keeps the pipe open and an unbounded wait parks the
-        # attempt on a paid gpu. a child that has not exited within the grace after its own stdout
-        # closed is not going to, so tear the group down; `terminate` waits on it.
-        try:
-            return_code = int(self._proc.wait(timeout=_TEARDOWN_GRACE_S))
-        except subprocess.TimeoutExpired:
-            self.terminate()
-            # `terminate` waits, so the child is normally collected by now. it is still not
-            # guaranteed -- a member wedged in uninterruptible io outlives even the SIGKILL -- and a
-            # survivor is a failure however the exit reads, so an uncollected child is reported as
-            # one rather than defaulted to zero.
-            collected = self._proc.returncode
-            return_code = int(collected) if collected is not None else 1
-        try:
-            raise_for_classified_verl_exit(return_code, self._tail)
-            if self._silence_watchdog is not None:
-                self._silence_watchdog.raise_if_failed()
-        except BaseException:
-            self.terminate()
-            raise
-        if return_code != 0:
-            # an unclassified nonzero exit RETURNS from the classifier rather than raising, so this
-            # is the failing path that reached no teardown. the direct child is gone but its group
-            # need not be, and a surviving EngineCore strands the gpu for the next attempt.
-            self.terminate()
-        if self._orphaned_pipe and return_code == 0:
-            # the trainer exited 0 but a descendant held the pipe open past the grace, so the group
-            # was killed to release it. the trainer's status says nothing about that descendant, and
-            # returning 0 here would publish a partial run as a completed one.
-            raise RuntimeError(
-                f"verl subprocess {self._proc.pid} exited 0 but a descendant held its output pipe "
-                f"open for {_ORPHANED_PIPE_GRACE_S:.0f}s; the process group was torn down to "
-                "release the gpu"
-            )
-        return return_code
 
 
 def _write_terminal_metadata(
@@ -192,14 +77,14 @@ def _write_terminal_metadata(
     gdn_hybrid,
 ):
     metrics_last = state.metrics_last
-    _w.heartbeat(
+    _worker_heartbeat.heartbeat(
         "rl_trained",
         train_wall=train_wall,
         step=steps_run,
         gpu=gpu_diagnostics(),
         metrics_last=list(metrics_last),
     )
-    _w.write_train_meta(
+    _worker_finalize.write_train_meta(
         phase="rl",
         adapter_dir=adapter_dir,
         model_id=inp["model_id"],
@@ -296,7 +181,7 @@ def _configure_rl_child(
         train_files=files["train_pq"],
         val_files=files["val_pq"],
         model_path=model_path_for_verl,
-        thinking=bool(_w.THINKING),
+        thinking=bool(_worker_state.THINKING),
         loggers=loggers,
         fp8_kv=fp8_kv,
         enforce_eager=enforce_eager,
@@ -306,10 +191,10 @@ def _configure_rl_child(
         local_dir=files["local_dir"],
         project_name=project_name,
         experiment_name=experiment_name,
-        gpu_type=(_w.JOB_SPEC.gpu.type if _w.JOB_SPEC else ""),
+        gpu_type=(_worker_state.JOB_SPEC.gpu.type if _worker_state.JOB_SPEC else ""),
         # the authored knobs the allocator sized this run's shape from, so the zero-2 gate the
         # worker applies is the same one the allocator admitted the shape under.
-        train_spec=(_w.JOB_SPEC.train if _w.JOB_SPEC else None),
+        train_spec=(_worker_state.JOB_SPEC.train if _worker_state.JOB_SPEC else None),
         # the ranks verl will actually run, not the cards rented: with ulysses pinned off every rank
         # is a dp rank, and verl chunks the step's sequences across them with an exact-divisibility
         # assert. a wider launch than the sequences divide aborts at step 0 on a paid box. resolved
@@ -397,7 +282,7 @@ def run_rl_train():
             caps=caps,
         )
         expected_steps, loggers = configured["expected_steps"], configured["loggers"]
-        _w.heartbeat("rl_step", step=0, initial=True)
+        _worker_heartbeat.heartbeat("rl_step", step=0, initial=True)
         state = _StepMetricState()
         # equal within-group rewards produce zero advantages and gradients. collect per-step spread;
         # reward mean and pg_loss cannot prove a signal. declare this before the uploader because its
@@ -470,11 +355,11 @@ def run_rl_train():
     ):
         _export_final_adapter(actor_dir, adapter_dir, inp, python_bin)
         preprocessor.save_pretrained(adapter_dir)
-        _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+        _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)
         # preserve the final checkpoint only when exact save steps are not configured: with
         # save_at_steps set the customer asked for those steps and nothing else.
         if final_save_due(steps_run, inp["save_at_steps"]):
-            _w.publish_deployable_checkpoint(adapter_dir, steps_run)
+            _worker_hf.publish_deployable_checkpoint(adapter_dir, steps_run)
     _write_terminal_metadata(
         inp=inp,
         prompts=prompts,
@@ -493,74 +378,3 @@ def run_rl_train():
         reward_runtime=reward_runtime,
         gdn_hybrid=gdn_hybrid,
     )
-
-
-# single-turn scoring, implemented in `.train.rl.single_turn`.
-# verl config rendering, implemented in `.train.rl.verl_config`.
-# the parent side of the multi-turn rollout loop, implemented in `.train.rl.multi_turn`.
-# checkpoint upload and the zero-gradient publish guard, implemented in `.train.rl.checkpoints`.
-# imported at the BOTTOM because that module reaches back here for the export helpers the upload
-# tests patch on this module, so a top-level import would be circular.
-from flash.engine.worker.train.entry.rl_train_runner import (  # noqa: E402,F401
-    _announce_training,
-    _build_rl_child_env,
-    _execute_rl_child,
-    _export_final_adapter,
-    _ingest_step_metrics,
-    _initialize_teardown_state,
-    _prepare_final_adapter,
-    _prepare_rl_files,
-    _prepare_rl_inputs,
-    _prepare_rl_runtime,
-    _resolve_training_settings,
-    _RewardRuntime,
-    _start_resume_uploader,
-    _start_reward_runtime,
-    _step_timing_fields,
-    _StepMetricState,
-    _validate_rl_child,
-    _write_rl_plugin_config,
-    _write_rl_shim,
-)
-from flash.engine.worker.train.rl.launch.checkpoints import (  # noqa: E402,F401
-    _check_grpo_had_a_gradient,
-    _restore_verl_resume,
-    _VerlResumeUploader,
-)
-
-# re-exported so `rl_train._resolve_grpo_inputs` keeps working: the resolver is called and
-# source-inspected through this module by a large number of tests.
-from flash.engine.worker.train.rl.launch.inputs import _resolve_grpo_inputs  # noqa: E402,F401
-from flash.engine.worker.train.rl.launch.verl_config import (  # noqa: E402,F401
-    _DEFAULT_GPU_MEM_UTIL,
-    _build_verl_train_notes,
-    _build_verl_training_cfg,
-    _processor_expanded_prompt,
-    _verl_epochs_for_horizon,
-    _verl_grpo_parquet_features,
-    build_verl_dataset_rows,
-    build_verl_overrides,
-    resolve_gpu_mem_util,
-    write_verl_grpo_parquet,
-)
-from flash.engine.worker.train.rl.rollout.multi_turn import (  # noqa: E402,F401
-    _MULTI_TURN_SCORE_BATCH_SIZE,
-    _MULTI_TURN_SCORE_FLUSH_WAIT_S,
-    _MULTI_TURN_SCORE_SHUTDOWN_WAIT_S,
-    _MULTI_TURN_SESSION_LEASE_S,
-    _REWARD_BRIDGE_MIN_REQUEST_BACKLOG,
-    _SINGLE_TURN_SCORE_BATCH_SIZE,
-    _SINGLE_TURN_SCORE_FLUSH_WAIT_S,
-    _SINGLE_TURN_SCORE_SHUTDOWN_WAIT_S,
-    GRPO_CHILD_MODULES,
-    MultiTurnBridge,
-    copy_grpo_child_modules,
-    multi_turn_child_env,
-    start_reward_server,
-)
-from flash.engine.worker.train.rl.rollout.single_turn import (  # noqa: E402,F401
-    _finalize_single_turn_reward,
-    _single_turn_scoring_state,
-    score_single_turn,
-    score_single_turn_batch,
-)

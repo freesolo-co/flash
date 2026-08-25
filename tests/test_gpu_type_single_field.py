@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import tempfile
 
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as runner_submit
 from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
 
-def _persist_effective(runner, public: JobSpec, effective_type: str, effective_count: int = 0):
-    runner._save_status(
-        runner.RunStatus(
+def _persist_effective(public: JobSpec, effective_type: str, effective_count: int = 0):
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id=public.run_id,
             state="provisioning",
             spec=public.to_dict(),
@@ -32,15 +35,15 @@ def _persist_effective(runner, public: JobSpec, effective_type: str, effective_c
     if effective_count:
         selected_dict["gpu"]["count"] = effective_count
     selected = JobSpec.from_dict(selected_dict)
-    assert runner._persist_effective_worker_spec(selected)
-    return runner.get_status(public.run_id)
+    assert runner_submit._persist_effective_worker_spec(selected)
+    return runner_status.get_status(public.run_id)
 
 
 def test_reallocation_spec_restores_public_gpu_type_for_auto(monkeypatch):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-auto",
             model="Qwen/Qwen3.5-0.8B",
@@ -48,20 +51,20 @@ def test_reallocation_spec_restores_public_gpu_type_for_auto(monkeypatch):
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
         )
-        stored = _persist_effective(runner, public, effective_type="H100")
+        stored = _persist_effective(public, effective_type="H100")
 
         # polling/cleanup keep the concrete allocated class...
-        assert runner.effective_spec_from_status(stored).gpu.type == "H100"
+        assert runner_status.effective_spec_from_status(stored).gpu.type == "H100"
         # ...but re-allocation restores the empty public value so recovery does not
         # hard-pin an originally-auto run to the prior attempt's class.
-        assert runner.reallocation_spec_from_status(stored).gpu.type == ""
+        assert runner_status.reallocation_spec_from_status(stored).gpu.type == ""
 
 
 def test_reallocation_spec_keeps_pin_for_pinned(monkeypatch):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-pinned",
             model="Qwen/Qwen3.5-0.8B",
@@ -69,11 +72,11 @@ def test_reallocation_spec_keeps_pin_for_pinned(monkeypatch):
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="H100", max_retries=2),
         )
-        stored = _persist_effective(runner, public, effective_type="H100")
+        stored = _persist_effective(public, effective_type="H100")
 
         # a pinned run's public and effective type match, so re-allocation keeps the pin.
-        assert runner.reallocation_spec_from_status(stored).gpu.type == "H100"
-        assert runner.effective_spec_from_status(stored).gpu.type == "H100"
+        assert runner_status.reallocation_spec_from_status(stored).gpu.type == "H100"
+        assert runner_status.effective_spec_from_status(stored).gpu.type == "H100"
 
 
 def test_reallocation_spec_restores_the_authored_card_ceiling_for_an_auto_run(monkeypatch):
@@ -87,7 +90,7 @@ def test_reallocation_spec_restores_the_authored_card_ceiling_for_an_auto_run(mo
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-auto-count",
             model="Qwen/Qwen3.5-0.8B",
@@ -95,14 +98,14 @@ def test_reallocation_spec_restores_the_authored_card_ceiling_for_an_auto_run(mo
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", count=4, max_retries=2),
         )
-        stored = _persist_effective(runner, public, effective_type="H100", effective_count=1)
+        stored = _persist_effective(public, effective_type="H100", effective_count=1)
 
         # polling and cleanup keep the concrete allocation: one H100.
-        live = runner.effective_spec_from_status(stored)
+        live = runner_status.effective_spec_from_status(stored)
         assert live.gpu.type == "H100"
         assert live.gpu.count == 1
 
-        recovered = runner.reallocation_spec_from_status(stored)
+        recovered = runner_status.reallocation_spec_from_status(stored)
         assert recovered.gpu.type == ""
         assert recovered.gpu.count == 4, (
             "recovery re-entered allocation with the narrowed count as its ceiling, so a run "
@@ -119,7 +122,7 @@ def test_reallocation_spec_restores_the_authored_card_ceiling_for_a_pinned_run(m
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-pinned-count",
             model="Qwen/Qwen3.5-0.8B",
@@ -127,11 +130,11 @@ def test_reallocation_spec_restores_the_authored_card_ceiling_for_a_pinned_run(m
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="H100", count=4, max_retries=2),
         )
-        stored = _persist_effective(runner, public, effective_type="H100", effective_count=2)
+        stored = _persist_effective(public, effective_type="H100", effective_count=2)
 
-        assert runner.effective_spec_from_status(stored).gpu.count == 2
+        assert runner_status.effective_spec_from_status(stored).gpu.count == 2
 
-        recovered = runner.reallocation_spec_from_status(stored)
+        recovered = runner_status.reallocation_spec_from_status(stored)
         assert recovered.gpu.type == "H100"
         assert recovered.gpu.count == 4, (
             "the pinned early return handed back the snapshot with its narrowed count, so a "
@@ -152,7 +155,7 @@ def test_reallocation_preserves_auto_count_provenance(monkeypatch):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-auto-marker",
             model="Qwen/Qwen3.5-0.8B",
@@ -163,9 +166,9 @@ def test_reallocation_preserves_auto_count_provenance(monkeypatch):
         )
         assert public.to_dict()["gpu"]["count"] == 1
         assert "gpu_count_auto" not in public.to_dict()
-        stored = _persist_effective(runner, public, effective_type="H200", effective_count=2)
+        stored = _persist_effective(public, effective_type="H200", effective_count=2)
 
-        recovered = runner.reallocation_spec_from_status(stored)
+        recovered = runner_status.reallocation_spec_from_status(stored)
         assert recovered.gpu_count_auto is True, (
             "the auto marker was dropped on restore, so recovery hard-pins an auto-sized run to "
             "the placeholder count of 1 and can never re-offer it a multi-card shape"
@@ -180,7 +183,7 @@ def test_reallocation_keeps_an_authored_single_card_pin_hard(monkeypatch):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         public = JobSpec(
             run_id="realloc-authored-one",
             model="Qwen/Qwen3.5-0.8B",
@@ -188,8 +191,8 @@ def test_reallocation_keeps_an_authored_single_card_pin_hard(monkeypatch):
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", count=1),
         )
-        stored = _persist_effective(runner, public, effective_type="H100")
+        stored = _persist_effective(public, effective_type="H100")
 
-        recovered = runner.reallocation_spec_from_status(stored)
+        recovered = runner_status.reallocation_spec_from_status(stored)
         assert recovered.gpu_count_auto is False
         assert recovered.gpu.count == 1

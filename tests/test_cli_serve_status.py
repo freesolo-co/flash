@@ -200,7 +200,7 @@ def test_status_uses_deploy_time_identity_after_the_model_tip_advances(
 
     _stub_environment(monkeypatch)
     monkeypatch.setattr(
-        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
         _reconcile,
     )
 
@@ -226,11 +226,11 @@ def test_status_without_inference_key_reports_provider_observable_states(
     modal_args = _args_with_identity(monkeypatch, "modal")
     runpod_args = _args_with_identity(monkeypatch, "runpod")
     monkeypatch.setattr(
-        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
         _modal,
     )
     monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.lifecycle_entry.reconcile_runpod_deployment", _runpod
+        "flash.serve.provisioning.runpod.operations.reconcile_runpod_deployment", _runpod
     )
 
     assert cmd_serve_status(modal_args) == 0
@@ -253,11 +253,11 @@ def test_status_routes_to_the_named_read_only_provider(monkeypatch: pytest.Monke
     modal_args = _args_with_identity(monkeypatch, "modal")
     runpod_args = _args_with_identity(monkeypatch, "runpod")
     monkeypatch.setattr(
-        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
         _modal,
     )
     monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.lifecycle_entry.reconcile_runpod_deployment", _runpod
+        "flash.serve.provisioning.runpod.operations.reconcile_runpod_deployment", _runpod
     )
 
     assert cmd_serve_status(modal_args) == 0
@@ -289,7 +289,7 @@ def test_status_surfaces_every_outcome_distinctly(
     _stub_environment(monkeypatch)
     args = _args_with_identity(monkeypatch)
     monkeypatch.setattr(
-        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
         _reconcile,
     )
 
@@ -312,7 +312,7 @@ def test_non_ready_status_never_prints_ready(
     _stub_environment(monkeypatch)
     args = _args_with_identity(monkeypatch)
     monkeypatch.setattr(
-        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
         _reconcile,
     )
 
@@ -342,7 +342,7 @@ def test_status_credentials_never_enter_argv_output_or_artifacts(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["flash", "serve", "status"])
     monkeypatch.setattr(
-        "flash.serve.provisioning.modal.execution.lifecycle_entry.reconcile_modal_deployment",
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
         _capture,
     )
 

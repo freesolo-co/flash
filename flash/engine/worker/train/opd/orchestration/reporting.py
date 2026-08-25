@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from flash.engine.worker.runtime.pkg_proxy import W as _w
+import flash.engine.worker.runtime.state as _worker_state
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 if TYPE_CHECKING:
-    from flash.engine.worker.train.entry.opd_train_runner import (
+    from flash.engine.worker.train.opd.orchestration.state import (
         _ChildResult,
         _OpdRequest,
         _PromptState,
@@ -40,7 +40,7 @@ def _build_train_note_sections(
         "init_from_adapter": request.spec.train.init_from_adapter or None,
         "teacher_model": knobs.teacher_model,
         "download_seconds": download_seconds,
-        "thinking": _w.THINKING,
+        "thinking": _worker_state.THINKING,
         "loss_curve": final_accounting["loss_curve"],
         "mean_coverage": (
             float(final_accounting["coverage_sum"]) / int(final_accounting["aligned_sequences"])

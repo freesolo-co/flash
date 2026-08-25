@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.cli.commands.ops.train as cli_train
 from flash.core.spec import JobSpec
 from flash.engine.plan.prompt_budget import rl_prompt_budget
 from flash.engine.plan.recipe import RECIPE
@@ -74,11 +75,10 @@ def _train_args(config, *, dry_run: bool = False):
 
 
 def test_reporter_matches_grpo_worker_for_authored_and_default_lengths(monkeypatch) -> None:
-    import flash.engine.worker.train.entry.rl_train as rl_train
     from flash.engine.worker.train.rl.launch import inputs
 
-    monkeypatch.setattr(inputs._w, "THINKING", False)
-    monkeypatch.setattr(rl_train, "model_max_position_embeddings", lambda *_args: 32768)
+    monkeypatch.setattr(inputs._worker_state, "THINKING", False)
+    monkeypatch.setattr(inputs, "model_max_position_embeddings", lambda *_args: 32768)
 
     for context in (0, 8192):
         train = {"max_completion_tokens": 512}
@@ -102,11 +102,10 @@ def test_reporter_matches_grpo_worker_for_authored_and_default_lengths(monkeypat
 
 
 def test_grpo_worker_keeps_clamp_and_value_error_contract(monkeypatch, capsys) -> None:
-    import flash.engine.worker.train.entry.rl_train as rl_train
     from flash.engine.worker.train.rl.launch import inputs
 
-    monkeypatch.setattr(inputs._w, "THINKING", False)
-    monkeypatch.setattr(rl_train, "model_max_position_embeddings", lambda *_args: 1024)
+    monkeypatch.setattr(inputs._worker_state, "THINKING", False)
+    monkeypatch.setattr(inputs, "model_max_position_embeddings", lambda *_args: 1024)
     spec = _budget_spec("grpo", {"max_context_tokens": 2048, "max_completion_tokens": 512})
     lengths = inputs._resolve_sequence_lengths(
         spec.model,
@@ -134,7 +133,8 @@ def test_grpo_worker_keeps_clamp_and_value_error_contract(monkeypatch, capsys) -
 
 def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int = 32768):
     import flash.engine.worker.teacher.client as teacher_client
-    import flash.engine.worker.train.entry.opd_train as opd_train
+    import flash.engine.worker.train.entry.opd_train_runner as opd_train_runner
+    from flash.engine.worker.entry import opd as opd_entry
     from flash.engine.worker.entry.opd import OpdKnobs
     from flash.engine.worker.train.entry.opd_train_runner import _prepare_prompts
     from flash.engine.worker.train.opd.orchestration.state import _OpdRequest
@@ -146,13 +146,22 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
         def apply_chat_template(self, *_args, **_kwargs):
             return list(range(100))
 
-    monkeypatch.setattr(opd_train._w, "THINKING", False)
-    monkeypatch.setattr(opd_train._w, "load_tokenizer", lambda *_args, **_kwargs: Tokenizer())
-    monkeypatch.setattr(opd_train, "_thinking_prefill_text", lambda _tokenizer: "")
+    import flash.engine.worker.io.hf as worker_hf
+    import flash.engine.worker.runtime.state as worker_state
+
+    monkeypatch.setattr(worker_state, "THINKING", False)
+    monkeypatch.setattr(worker_hf, "load_tokenizer", lambda *_args, **_kwargs: Tokenizer())
+    monkeypatch.setattr(opd_entry, "_thinking_prefill_text", lambda _tokenizer: "")
     monkeypatch.setattr(
-        opd_train, "model_max_position_embeddings", lambda *_args: architecture_limit
+        opd_train_runner._backend,
+        "model_max_position_embeddings",
+        lambda *_args: architecture_limit,
     )
-    monkeypatch.setattr(opd_train, "liveness_heartbeat", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        opd_train_runner._worker_heartbeat,
+        "liveness_heartbeat",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
     monkeypatch.setattr(teacher_client, "TeacherClient", lambda *_args, **_kwargs: object())
     request = _OpdRequest(
         spec=None,
@@ -262,7 +271,6 @@ def test_sft_has_no_drop_semantics_prompt_budget() -> None:
 def test_paid_submit_owner_warning_precedes_create_and_names_source(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    from flash.cli import commands
     from flash.cli.commands.ops import prompt_budget as cli_prompt_budget
 
     events = []
@@ -281,9 +289,9 @@ def test_paid_submit_owner_warning_precedes_create_and_names_source(
                 "prompt_budget": _serialized_budget(warm_start_context=8192),
             }
 
-    monkeypatch.setattr(commands, "client_from_config", lambda: Client())
+    monkeypatch.setattr(cli_train, "client_from_config", lambda: Client())
     monkeypatch.setattr(cli_prompt_budget.render, "styled", lambda: False)
-    result = commands.cmd_train(
+    result = cli_train.cmd_train(
         _train_args(_train_config(tmp_path, init_from_adapter="source-run"))
     )
     captured = capsys.readouterr()
@@ -301,7 +309,6 @@ def test_paid_submit_owner_warning_precedes_create_and_names_source(
 def test_paid_submit_org_peer_prints_only_supplement_after_create(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    from flash.cli import commands
     from flash.cli.commands.ops import prompt_budget as cli_prompt_budget
 
     events = []
@@ -320,9 +327,9 @@ def test_paid_submit_org_peer_prints_only_supplement_after_create(
                 "prompt_budget": _serialized_budget(warm_start_context=8192),
             }
 
-    monkeypatch.setattr(commands, "client_from_config", lambda: Client())
+    monkeypatch.setattr(cli_train, "client_from_config", lambda: Client())
     monkeypatch.setattr(cli_prompt_budget.render, "styled", lambda: False)
-    result = commands.cmd_train(
+    result = cli_train.cmd_train(
         _train_args(_train_config(tmp_path, init_from_adapter="org-peer-run"))
     )
     captured = capsys.readouterr()
@@ -353,7 +360,6 @@ def test_source_lookup_failure_is_non_fatal() -> None:
 
 
 def test_dry_run_keeps_budget_in_machine_readable_stdout(monkeypatch, tmp_path, capsys) -> None:
-    from flash.cli import commands
     from flash.cli.commands.ops import prompt_budget as cli_prompt_budget
 
     class Client:
@@ -366,9 +372,9 @@ def test_dry_run_keeps_budget_in_machine_readable_stdout(monkeypatch, tmp_path, 
                 "affordability_verified": True,
             }
 
-    monkeypatch.setattr(commands, "client_from_config", lambda: Client())
+    monkeypatch.setattr(cli_train, "client_from_config", lambda: Client())
     monkeypatch.setattr(cli_prompt_budget.render, "styled", lambda: False)
-    result = commands.cmd_train(_train_args(_train_config(tmp_path), dry_run=True))
+    result = cli_train.cmd_train(_train_args(_train_config(tmp_path), dry_run=True))
     captured = capsys.readouterr()
 
     assert result == 0
@@ -379,7 +385,7 @@ def test_dry_run_keeps_budget_in_machine_readable_stdout(monkeypatch, tmp_path, 
 
 
 def test_status_serialization_keeps_prompt_budget_payload_identical() -> None:
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
     budget = rl_prompt_budget(_budget_spec("grpo"))
     assert budget is not None

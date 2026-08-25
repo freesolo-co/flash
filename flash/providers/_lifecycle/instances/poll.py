@@ -331,7 +331,7 @@ def _record_heartbeat(hb: dict) -> None:
     if not run_id:
         return
     try:
-        from flash.runner import record_heartbeat
+        from flash.runner.lifecycle.status import record_heartbeat
 
         record_heartbeat(run_id, hb)
     except Exception:

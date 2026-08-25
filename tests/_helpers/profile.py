@@ -147,12 +147,13 @@ def attach_sft_profile(spec: Any) -> Any:
     )
 
 
-def record_sft_profile(runner, spec: Any, monkeypatch=None) -> str:
+def record_sft_profile(spec: Any, monkeypatch=None) -> str:
     """stub control-plane packaged-dataset profiling for tests about another boundary."""
     import flash.engine.profiling.dataset_profile as dataset_profile
+    import flash.runner.lifecycle.preparation as runner_preparation
     from flash.engine.profiling.workload_profile import sft_profile_input_digest
 
-    producer_version = runner._profile_producer_version()
+    producer_version = runner_preparation._profile_producer_version()
     digest = sft_profile_input_digest(
         spec,
         tokenizer_revision=spec.model_revision,
@@ -170,7 +171,7 @@ def record_sft_profile(runner, spec: Any, monkeypatch=None) -> str:
     return digest
 
 
-def satisfy_sft_profile(runner, monkeypatch, spec: Any):
+def satisfy_sft_profile(monkeypatch, spec: Any):
     """Pin the immutable revisions ``spec`` needs and record its completed profile.
 
     Returns the pinned spec (the shape ``prepare_job`` will re-derive), so a caller can assert
@@ -183,7 +184,13 @@ def satisfy_sft_profile(runner, monkeypatch, spec: Any):
 
     # Hub/model round-trips are replaced in place. Each has dedicated coverage; reaching the network
     # here would make every sft submit test an integration test.
-    monkeypatch.setattr(runner, "_resolve_model_revision", lambda s, **_kw: _pin_model_revision(s))
+    import flash.runner.lifecycle.preparation as runner_preparation
+
+    monkeypatch.setattr(
+        runner_preparation,
+        "_resolve_model_revision",
+        lambda s, **_kw: _pin_model_revision(s),
+    )
     # both pinning policies now share the loader resolver, so one stub covers every caller without
     # teaching this helper which wrapper each submission path uses.
     import flash.envs.loading.loader as env_loader
@@ -192,5 +199,5 @@ def satisfy_sft_profile(runner, monkeypatch, spec: Any):
     stub_revision_geometry(monkeypatch)
 
     pinned = _pin_env_revision(_pin_model_revision(spec))
-    record_sft_profile(runner, pinned, monkeypatch)
+    record_sft_profile(pinned, monkeypatch)
     return pinned

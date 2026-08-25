@@ -8,8 +8,8 @@ from huggingface_hub.errors import HfHubHTTPError
 from requests.exceptions import Timeout
 from safetensors.numpy import save
 
-import flash.engine.worker as worker
 import flash.engine.worker.model.adapter as adapter
+import flash.engine.worker.runtime.state as worker_state
 from flash.engine.worker.io.hf import RetriableInfraError
 
 _ADAPTER_REF = "Freesolo-Co/flashrun-source:sft/source-run"
@@ -30,7 +30,7 @@ def _hf_error(status_code: int) -> HfHubHTTPError:
 def _prepare_download(monkeypatch):
     deadline_checks = []
     monkeypatch.setattr(
-        worker,
+        worker_state,
         "JOB_SPEC",
         SimpleNamespace(train=SimpleNamespace(init_from_adapter_revision=_REVISION)),
         raising=False,
@@ -288,13 +288,12 @@ def _warmstart_guard_call(monkeypatch, tmp_path, *, rank, alpha, expected_rank, 
         f'{{"peft_type":"LORA","r":{rank},"lora_alpha":{alpha}}}', encoding="utf-8"
     )
     monkeypatch.setattr(
-        sft_train._w,
+        worker_state,
         "JOB_SPEC",
         SimpleNamespace(train=SimpleNamespace(init_from_adapter=_ADAPTER_REF)),
-        raising=False,
     )
-    monkeypatch.setattr(sft_train._w, "_download_adapter", lambda _ref: str(adapter_dir))
-    monkeypatch.setattr(sft_train._w, "validate_warmstart_adapter", lambda *_a, **_k: None)
+    monkeypatch.setattr(adapter, "_download_adapter", lambda _ref: str(adapter_dir))
+    monkeypatch.setattr(adapter, "validate_warmstart_adapter", lambda *_a, **_k: None)
     return sft_train._warmstart_adapter_path("m", "", expected_rank, expected_alpha)
 
 

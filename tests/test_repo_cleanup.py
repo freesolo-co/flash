@@ -14,7 +14,9 @@ from datetime import UTC, datetime
 
 import pytest
 
-from flash.runner import _DEFAULT_ARTIFACT_NAMESPACE
+from flash.runner.accounting.artifacts import _DEFAULT_ARTIFACT_NAMESPACE
+from flash.serve.contract import urls as serving_urls
+from flash.serve.request import transport as serving_transport
 from flash.server.domain.ops import repo_cleanup as rc
 
 # Real implementations captured before the offline conftest stub swaps in a no-op sweep.
@@ -224,11 +226,9 @@ def test_private_opd_retry_markers_are_never_cleanup_targets(monkeypatch):
 
 def _serving(monkeypatch, records):
     """Point deployed_prefixes' serving call at a canned ``GET /adapters`` payload."""
-    from flash.serve.deployment import deploy as sd
-
-    monkeypatch.setattr(sd, "serving_base_url", lambda: "https://serving.test")
+    monkeypatch.setattr(serving_urls, "serving_base_url", lambda: "https://serving.test")
     resp = types.SimpleNamespace(json=lambda: {"adapters": records})
-    monkeypatch.setattr(sd, "_serving_request", lambda method, url: resp)
+    monkeypatch.setattr(serving_transport, "serving_request", lambda method, url: resp)
 
 
 def test_deployed_prefixes_from_serving_registry(monkeypatch):

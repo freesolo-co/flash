@@ -14,9 +14,9 @@ import shutil
 import threading
 import time
 
+import flash.engine.worker.io.hf as _worker_hf
 from flash.engine.worker.io.heartbeat import join_while_draining
-from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.train.core.lifecycle.checkpoint_lifecycle import CheckpointLedger
+from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 from flash.engine.worker.train.entry.backend_common import (
     completed_checkpoint_step,
     export_peft_adapter,
@@ -91,7 +91,7 @@ def _export_checkpoint_adapter(
     stamp_adapter_dir_provenance(
         adapter_dir, model_id, model_revision, exclude_modules=exclude_modules
     )
-    _w.write_base_model_provenance(adapter_dir, model_id, model_revision)
+    _worker_hf.write_base_model_provenance(adapter_dir, model_id, model_revision)
 
 
 class _VerlCheckpointWatcher:
@@ -243,7 +243,7 @@ class _VerlCheckpointWatcher:
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
 
         def publish_adapter() -> None:
-            published = _w.publish_deployable_checkpoint(
+            published = _worker_hf.publish_deployable_checkpoint(
                 adapter_dir,
                 step,
                 required=step in self.required_steps,
@@ -280,7 +280,7 @@ class _VerlCheckpointWatcher:
                 preprocessor=self.preprocessor,
             )
             self.lifecycle.mark_staged(step)
-            uploaded = _w.upload_resume_checkpoint(
+            uploaded = _worker_hf.upload_resume_checkpoint(
                 step,
                 checkpoint_dir,
                 before_upload=publish_adapter,

@@ -2,7 +2,8 @@
 
 Split out of router.py's ``add_adapter``. Reserves the run-alias namespace and persists the
 revision; the caller owns routing upserts and the deferred gpu registration. Persistence is
-reached through serving_io, and the adapter router is passed in rather than captured.
+reached through the canonical store access layer, and the adapter router is passed in rather than
+captured.
 """
 
 from typing import Any
@@ -11,14 +12,44 @@ from fastapi import HTTPException, status
 
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
-from flash.serving.src.io.serving_io import (
-    _get_stored,
-    _insert_or_read,
-    _replace_stored_cas,
-    _validate_alias,
-    _validate_alias_target,
-)
+from flash.serving.src.store.access import _get_stored, _insert_or_read, _replace_stored_cas
 from flash.serving.src.store.persistence import PersistenceRecordError
+
+
+def _validate_alias(alias: AdapterRecord, revision: AdapterRecord) -> None:
+    if alias.org_id != revision.org_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown adapter id")
+    if (
+        not alias.is_alias
+        or alias.adapter_id != revision.run_id
+        or alias.run_id != revision.run_id
+        or alias.base_model != revision.base_model
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, "run alias namespace is occupied")
+
+
+async def _validate_alias_target(
+    alias: AdapterRecord, *, allow_missing: str | None = None
+) -> AdapterRecord | None:
+    alias_of = alias.alias_of
+    if alias_of is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid")
+    try:
+        target = await _get_stored(alias_of)
+    except PersistenceRecordError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid") from exc
+    if target is None:
+        if alias.status == "disabled" and alias_of == allow_missing:
+            return None
+        raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid")
+    if (
+        not target.is_revision
+        or target.org_id != alias.org_id
+        or target.base_model != alias.base_model
+        or target.run_id != alias.run_id
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, "run alias target is invalid")
+    return target
 
 
 def _assert_matches_existing(existing: AdapterRecord, revision: AdapterRecord) -> None:

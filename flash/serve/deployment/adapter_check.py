@@ -19,11 +19,6 @@ from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.adapters.targets import config_targets_images
 from flash.serve.contract.errors import AdapterConfigMissing, AdapterTensorMissing, ServingError
 
-# the accepted weight-file shapes live beside the filenames themselves so serving validation and
-# `flash.serve.deployment.export` cannot drift apart. the alias name is load-bearing:
-# `flash.serve.deployment.deploy` re-exports it and the serving tests resolve it there.
-_is_adapter_tensor_filename = is_adapter_weight_filename
-
 
 @dataclass(frozen=True)
 class AdapterArtifactMetadata:
@@ -101,7 +96,7 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str, *, hf_revisio
         # every listed name, because whether the shards form a loadable set is decided by the index
         # beside them -- and the index is not itself a weight file.
         listed_paths.append(path)
-        if not _is_adapter_tensor_filename(path):
+        if not is_adapter_weight_filename(path):
             continue
         tensor_paths.append(path)
         size = getattr(entry, "size", None)

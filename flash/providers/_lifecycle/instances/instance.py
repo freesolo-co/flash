@@ -203,7 +203,7 @@ def build_payload(
         build_worker_env,
         strip_runpod_volume_env,
     )
-    from flash.snapshot.source_snapshot import parse_descriptor
+    from flash.snapshot.archive import parse_descriptor
 
     canonical_seed = require_matching_seed(spec, seed)
     # strip the runpod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.

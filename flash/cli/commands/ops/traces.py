@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 
 from flash._internal.channel import CLI_NAME
-from flash.cli.commands import render
+from flash.cli.ui import render
 from flash.client import ClientError, export_trace_records, list_trace_projects
 from flash.client.config import load_credentials
 from flash.client.http import has_freesolo_backend
@@ -143,7 +143,7 @@ def _empty_export_error(project_id: str, export_format: str) -> ClientError:
 
 
 def cmd_traces_export(args) -> int:
-    from flash.cli.commands import unavailable_without_a_freesolo_backend
+    from flash.cli.commands.ops.account import unavailable_without_a_freesolo_backend
 
     # one snapshot for both: the url decides whether to refuse, and the key from that same read is
     # what gets sent, so a concurrent `flash login` cannot pair this url with a later credential.

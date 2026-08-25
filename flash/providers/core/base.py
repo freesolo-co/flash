@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from flash.providers.core.sharding import MAX_COMBINATION_CARDS, combined_vram_gb
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
@@ -443,21 +445,6 @@ def _run_cost_key(
         )
     except Exception:  # unpriceable run -- rank on $/hr, never fail selection
         return None
-
-
-# the fsdp sharding model lives in a sibling module (this file is at its size limit) and is
-# re-exported here so every existing `from flash.providers.core.base import ...` keeps resolving to the
-# one definition. see `flash/providers/core/sharding.py` for the measured constants.
-from flash.providers.core.sharding import (  # noqa: E402,F401
-    MAX_COMBINATION_CARDS,
-    REPLICATED_PER_CARD_GB,
-    SHARD_VRAM_EFFICIENCY,
-    ZERO2_CHARGED_RESIDENCY,
-    ZERO2_WEIGHT_RESIDENCY,
-    combined_vram_gb,
-    zero2_enabled,
-    zero2_replicated_floor_gb,
-)
 
 
 def authored_gpu_ceiling(gpu_type: str, gpu_count: int | None) -> int | None:

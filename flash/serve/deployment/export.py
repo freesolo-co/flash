@@ -31,7 +31,7 @@ from flash.adapters.lora_rank import (
     lora_tensor_rank_disagrees,
     strict_declared_lora_ranks,
 )
-from flash.serve.deployment.deploy import ServingError
+from flash.serve.contract.errors import ServingError
 
 logger = get_logger(__name__)
 

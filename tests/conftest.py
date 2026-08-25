@@ -276,17 +276,17 @@ def pytest_runtest_makereport(item, call):
 @pytest.fixture(scope="session", autouse=True)
 def _close_status_reporter_after_suite():
     yield
-    import flash.runner as runner
+    from flash.runner.lifecycle import reporting
 
-    runner._shutdown_status_reporter(close=True)
+    reporting._shutdown_status_reporter(close=True)
 
 
 @pytest.fixture(autouse=True)
 def _reset_status_reporter_before_test():
-    import flash.runner as runner
+    from flash.runner.lifecycle import reporting
 
-    runner._shutdown_status_reporter(close=True)
-    runner._open_status_reporter()
+    reporting._shutdown_status_reporter(close=True)
+    reporting._open_status_reporter()
 
 
 @pytest.fixture(autouse=True)
@@ -483,7 +483,7 @@ def stub_serving_registry(monkeypatch):
     """Patch GET /adapters to return the given records (deploy read-back verification)."""
 
     def _stub(*records: dict):
-        import flash.serve.deployment.deploy as _deploy
+        import flash.serve.request.transport as serving_transport
 
         class _RegistryResp:
             status_code = 200
@@ -494,6 +494,6 @@ def stub_serving_registry(monkeypatch):
             def json(self) -> dict:
                 return {"ok": True, "adapters": list(records)}
 
-        monkeypatch.setattr(_deploy.httpx, "get", lambda *a, **k: _RegistryResp())
+        monkeypatch.setattr(serving_transport.httpx, "get", lambda *a, **k: _RegistryResp())
 
     return _stub

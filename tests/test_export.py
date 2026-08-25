@@ -1391,7 +1391,7 @@ def test_export_checks_ranks_across_every_shard_not_just_the_first(tmp_path):
 
 
 def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
-    from flash.serve.deployment.deploy import ServingError
+    from flash.serve.contract.errors import ServingError
 
     def fake_snapshot_download(**kw):
         raise RuntimeError("401 Unauthorized")
@@ -1415,7 +1415,7 @@ def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
 
 
 def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch):
-    from flash.serve.deployment.deploy import ServingError
+    from flash.serve.contract.errors import ServingError
 
     message = "You don't have the rights to download this repository"
 
@@ -1443,7 +1443,7 @@ def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch)
 
 
 def test_export_adapter_propagates_local_download_oserror(monkeypatch):
-    from flash.serve.deployment.deploy import ServingError
+    from flash.serve.contract.errors import ServingError
 
     def fake_snapshot_download(**kw):
         raise PermissionError("local export directory is not writable")
@@ -1469,7 +1469,7 @@ def test_export_adapter_propagates_local_download_oserror(monkeypatch):
 
 
 def test_export_adapter_wraps_hub_create_repo_oserror_in_serving_error(monkeypatch):
-    from flash.serve.deployment.deploy import ServingError
+    from flash.serve.contract.errors import ServingError
 
     message = "You don't have the rights to create a model under the namespace me"
 
@@ -1538,8 +1538,8 @@ def test_hf_api_missing_extra_raises_runtime_error_not_serving_error(monkeypatch
     # route lets it surface as a 500 rather than a misleading 502.
     import builtins
 
+    from flash.serve.contract.errors import ServingError
     from flash.serve.deployment import export
-    from flash.serve.deployment.deploy import ServingError
 
     real_import = builtins.__import__
 
@@ -1561,8 +1561,8 @@ def test_export_missing_operator_token_raises_runtime_error_not_serving_error(mo
     # misconfiguration (-> 500), NOT an upstream auth failure (ServingError -> 502). export_adapter
     # must raise a plain RuntimeError BEFORE snapshot_download, rather than passing token=None and
     # wrapping the resulting auth error as ServingError.
+    from flash.serve.contract.errors import ServingError
     from flash.serve.deployment import export
-    from flash.serve.deployment.deploy import ServingError
 
     monkeypatch.delenv("HF_TOKEN", raising=False)
 

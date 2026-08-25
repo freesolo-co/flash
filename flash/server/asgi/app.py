@@ -14,7 +14,8 @@ import threading
 import time
 
 from flash import __version__
-from flash.runner import get_status, prepare_job, submit_job
+from flash.runner.lifecycle.status import get_status
+from flash.runner.lifecycle.submit import prepare_job, submit_job
 from flash.runner.results.checkpoints import list_checkpoints
 from flash.serve.deployment.deploy import (
     adapter_alias_target,
@@ -23,8 +24,8 @@ from flash.serve.deployment.deploy import (
     undeploy_adapter,
 )
 from flash.serve.deployment.deploy import chat as serve_chat
-from flash.serve.deployment.deploy import chat_stream as serve_chat_stream
 from flash.serve.deployment.export import export_adapter
+from flash.serve.request.streaming import chat_stream as serve_chat_stream
 from flash.server.platform import db
 from flash.server.platform.locks import _DEPLOY_LOCKS, _deploy_lock
 from flash.server.platform.runtime import (
@@ -91,9 +92,9 @@ def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
     """
     from flash.core.spec import persisted_gpu_types
     from flash.providers.core.base import canonical_gpu
-    from flash.providers.runpod.execution.jobs import canonical_endpoint_name
-    from flash.providers.runpod.serverless import _run_suffix, endpoint_name
-    from flash.runner import TERMINAL_STATES
+    from flash.providers.runpod.execution.resources import canonical_endpoint_name
+    from flash.providers.runpod.serverless.endpoints import _run_suffix, endpoint_name
+    from flash.runner.lifecycle.state import TERMINAL_STATES
 
     names: set[str] = set()
 
@@ -184,7 +185,7 @@ def start_deployment_job(target, *args, **kwargs) -> bool:
 
 def _reap_idle_endpoints_once(min_idle_s: float) -> int:
     """One run-aware sweep of idle, orphaned RunPod training endpoints. Returns count deleted."""
-    from flash.providers.runpod.execution.jobs import _sweep_idle_flash_endpoints
+    from flash.providers.runpod.execution.resources import _sweep_idle_flash_endpoints
 
     return _sweep_idle_flash_endpoints(
         _protected_train_endpoint_names(),
@@ -322,7 +323,7 @@ def create_app():
     @asynccontextmanager
     async def lifespan(app):
         from flash.providers.core.preflight import check_run_preflight
-        from flash.runner import _open_status_reporter
+        from flash.runner.lifecycle.reporting import _open_status_reporter
         from flash.server.billing.retry import charge_retry_enabled
         from flash.server.domain.ops.reconcile import reconcile_enabled
 
@@ -398,7 +399,7 @@ def create_app():
                 if not await asyncio.to_thread(_wait_for_deployment_jobs, 10.0):
                     _log.warning("deployment jobs still running at shutdown deadline")
             with contextlib.suppress(Exception):
-                from flash.runner import _shutdown_status_reporter
+                from flash.runner.lifecycle.reporting import _shutdown_status_reporter
 
                 remaining = max(0.0, shutdown_deadline - time.monotonic())
                 await asyncio.to_thread(_shutdown_status_reporter, remaining, close=True)

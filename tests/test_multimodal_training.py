@@ -4,11 +4,19 @@ import base64
 import dataclasses
 import io
 import json
+import threading
 import urllib.parse
 from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
+import flash.engine.worker.train.rl.launch.inputs as rl_inputs
+import flash.runner.lifecycle.preparation as runner_preparation
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as runner_submit
+import flash.runner.supervise.lifecycle as runner_lifecycle
 from flash.content import image_descriptors as _image_descriptors
 from flash.content import multimodal as mm
 from tests._helpers.profile import attach_sft_profile
@@ -970,14 +978,12 @@ def test_native_single_turn_image_grpo_suppresses_image_pad_generation():
     own subprocess, so the ban is injected as a rollout shim rather than a generate kwarg."""
     import inspect
 
-    from flash.engine.worker.train.entry import rl_train
-
     # the shim's own rendering is covered in test_rl_train.py; what belongs here is the multimodal
     # wiring -- the pad id comes from the PROCESSOR (a text run resolves none) and reaches the shim.
-    resolver = inspect.getsource(rl_train._resolve_grpo_inputs)
+    resolver = inspect.getsource(rl_inputs._resolve_grpo_inputs)
     assert "image_pad_token_id = resolve_image_pad_token_id(processor, tok)" in resolver
 
-    entry = inspect.getsource(rl_train._write_rl_plugin_config)
+    entry = inspect.getsource(rl_train_runner._write_rl_plugin_config)
     assert '"image_pad_token_id": inp["image_pad_token_id"]' in entry
 
 
@@ -1102,19 +1108,18 @@ def test_image_opd_preflight_limits_scan_to_max_examples(tmp_path, record_source
 def test_image_opd_submit_preflight_rejects_text_teacher_before_state_mutation(
     monkeypatch, tmp_path, background
 ):
-    from flash import runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
 
     def fail(*args, **kwargs):
         raise AssertionError("rejected submit must not mutate warm-start state or reach providers")
 
-    monkeypatch.setattr(runner, "_mark_warmstart_source", fail)
-    monkeypatch.setattr(runner, "_run_job", fail)
-    monkeypatch.setattr(runner, "_run_job_background", fail)
-    monkeypatch.setattr(runner.threading, "Thread", fail)
+    monkeypatch.setattr(runner_preparation, "_mark_warmstart_source", fail)
+    monkeypatch.setattr(runner_lifecycle, "_run_job", fail)
+    monkeypatch.setattr(runner_lifecycle, "_run_job_background", fail)
+    monkeypatch.setattr(threading, "Thread", fail)
 
     spec = JobSpec.from_dict(
         {
@@ -1132,9 +1137,9 @@ def test_image_opd_submit_preflight_rejects_text_teacher_before_state_mutation(
     )
 
     with pytest.raises(ValueError, match="selected teacher 'kimi-k3' cannot see images"):
-        runner.submit_job(spec, background=background)
+        runner_submit.submit_job(spec, background=background)
     with pytest.raises(FileNotFoundError):
-        runner.get_status(spec.run_id)
+        runner_status.get_status(spec.run_id)
 
 
 def test_grpo_prices_the_full_context_budget_for_image_and_mixed_rows():

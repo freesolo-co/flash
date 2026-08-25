@@ -8,7 +8,7 @@ from typing import ClassVar
 
 import pytest
 
-import flash.cli as cli
+import flash.cli.parsing.main as cli
 from flash.cli.commands.env.testing.test import cmd_env_test
 from flash.envs.loading.adapter import FreesoloEnvironment
 from flash.envs.loading.base import RolloutReward

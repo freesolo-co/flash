@@ -19,16 +19,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from flash.serve.app.openai import OpenAIRequestError, parse_stream_options
 from flash.serving.src.http.context import ServingContext
-from flash.serving.src.io.responses import openai_chat_completion, openai_generate_fields
-from flash.serving.src.io.schemas import GenerateRequest
-from flash.serving.src.io.serving_io import (
-    _expected_checkpoint,
+from flash.serving.src.io.multimodal import _prepare_generate_request
+from flash.serving.src.io.provenance import _provenance_headers, _revision_provenance
+from flash.serving.src.io.requests import _expected_checkpoint, _parse_generate
+from flash.serving.src.io.responses import (
     _inference_json_response,
-    _parse_generate,
-    _prepare_generate_request,
-    _provenance_headers,
-    _revision_provenance,
+    openai_chat_completion,
+    openai_generate_fields,
 )
+from flash.serving.src.io.schemas import GenerateRequest
 from flash.serving.src.io.streaming import _close_async_iterator
 from flash.serving.src.io.structured_outputs import StructuredOutputsError
 

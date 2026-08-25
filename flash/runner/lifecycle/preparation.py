@@ -18,21 +18,42 @@ import re
 from collections.abc import Mapping
 from dataclasses import replace
 
-from flash.core.spec import JobSpec
+from flash.core.spec import MANAGED_GPU_KEYS, JobSpec
 from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
+from flash.runner.lifecycle import status as status_ops
 
 
-def _runner():
-    """The runner package, imported lazily because it re-exports this module.
+class WarmStartPreparationError(ValueError):
+    """a submit failed while preparing the source adapter."""
 
-    Five of these helpers are patched as attributes of `flash.runner` by the warm-start and
-    workload-profile tests, and they call each other, so every cross-helper call and every shared
-    constant is resolved through the package rather than bound here. Binding by value would make a
-    patch on `flash.runner` rebind a name this module never reads.
-    """
-    import flash.runner as runner
 
-    return runner
+class WorkloadProfileUnavailable(ValueError):
+    """the sft packaged-dataset estimate failed or cannot be trusted."""
+
+
+class EnvironmentRefNotFound(ValueError):
+    """the environment ref cannot be resolved by the control plane."""
+
+
+def _context_org_id(context: dict | None) -> str:
+    if not isinstance(context, dict):
+        return ""
+    return str(context.get("org_id") or "").strip()
+
+
+def _status_org_id(status) -> str:
+    return _context_org_id(status.billing_context) or _context_org_id(status.platform_context)
+
+
+def _source_owned_by_key(src_run_id: str, owner_key_id: int | None) -> bool:
+    if owner_key_id is None:
+        return False
+    try:
+        from flash.server.platform import db
+
+        return db.run_owner(src_run_id) == owner_key_id
+    except Exception:
+        return False
 
 
 def _adopted_warmstart_revision(spec: JobSpec, src_spec: JobSpec) -> JobSpec:
@@ -64,10 +85,10 @@ def _warmstart_source_is_authorized(
     owner_org_id = owner_org_id.strip()
     if not owner_org_id:
         return True
-    src_org_id = _runner()._status_org_id(src_status)
+    src_org_id = _status_org_id(src_status)
     if src_org_id:
         return src_org_id == owner_org_id
-    return _runner()._source_owned_by_key(src_run_id, owner_key_id)
+    return _source_owned_by_key(src_run_id, owner_key_id)
 
 
 def _inherit_warmstart_revision(
@@ -118,17 +139,17 @@ def _inherit_warmstart_revision(
     if parsed is None:
         return spec
     try:
-        src_status = _runner().get_status(parsed[0])
-        if not _runner()._warmstart_source_is_authorized(
+        src_status = status_ops.get_status(parsed[0])
+        if not _warmstart_source_is_authorized(
             src_status, parsed[0], owner_org_id=owner_org_id, owner_key_id=owner_key_id
         ):
             return spec  # _prepare_init_from_adapter raises the same-org error
-        src_spec = _runner().effective_spec_from_status(src_status)
+        src_spec = status_ops.effective_spec_from_status(src_status)
     except Exception:
         return spec
     if src_spec.model != spec.model:
         return spec  # _prepare_init_from_adapter raises on this with the specific message
-    return _runner()._adopted_warmstart_revision(spec, src_spec)
+    return _adopted_warmstart_revision(spec, src_spec)
 
 
 def _prepare_init_from_adapter(
@@ -141,19 +162,19 @@ def _prepare_init_from_adapter(
     """prepare public and worker specs with source-authoritative adapter metadata.
 
     Failures here are genuinely about the warm-start source, so they are tagged
-    ``_runner().WarmStartPreparationError`` for the submit route. Everything else in ``prepare_job`` (gpu
+    ``WarmStartPreparationError`` for the submit route. Everything else in ``prepare_job`` (gpu
     sizing, budget, environment resolution) must keep its own message rather than be reported as a
     bad adapter, since those run for non-warm-start runs too and have nothing to do with the
     adapter.
     """
     try:
-        return _runner()._prepare_init_from_adapter_inner(
+        return _prepare_init_from_adapter_inner(
             spec, owner_org_id=owner_org_id, owner_key_id=owner_key_id, token=token
         )
-    except _runner().WarmStartPreparationError:
+    except WarmStartPreparationError:
         raise
     except Exception as exc:
-        raise _runner().WarmStartPreparationError(str(exc)) from exc
+        raise WarmStartPreparationError(str(exc)) from exc
 
 
 def _prepare_init_from_adapter_inner(
@@ -185,11 +206,11 @@ def _prepare_init_from_adapter_inner(
         )
     src_run_id, step = parsed
     try:
-        src_status = _runner().get_status(src_run_id)
+        src_status = status_ops.get_status(src_run_id)
     except FileNotFoundError:
         raise ValueError(f"train.init_from_adapter references unknown run {src_run_id!r}") from None
     owner_org_id = owner_org_id.strip()
-    if not _runner()._warmstart_source_is_authorized(
+    if not _warmstart_source_is_authorized(
         src_status, src_run_id, owner_org_id=owner_org_id, owner_key_id=owner_key_id
     ):
         raise ValueError("train.init_from_adapter source run must belong to the same Freesolo org")
@@ -203,7 +224,7 @@ def _prepare_init_from_adapter_inner(
     # it, so the mismatch check below compares two equal values and passes -- the adoption
     # silences the guard instead of tripping it. `effective_spec_from_status` verifies public/
     # worker equality and the preparation digest first.
-    src_spec = _runner().effective_spec_from_status(src_status)
+    src_spec = status_ops.effective_spec_from_status(src_status)
     if src_spec.model != spec.model:
         raise ValueError(
             f"train.init_from_adapter source model {src_spec.model!r} does not match target model "
@@ -452,17 +473,17 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     # platform maximum. this branch is still bounded: MAX_COMBINATION_CARDS is the same cap
     # allocation itself honours, and the count that lands here was produced by a VRAM fit check and
     # the attention-head geometry cap, so a marker cannot buy a shape those would refuse.
-    from flash.providers.core.base import MAX_COMBINATION_CARDS
+    from flash.providers.core.sharding import MAX_COMBINATION_CARDS
 
     ceiling = public_count if worker_spec.authored_gpu_count is not None else MAX_COMBINATION_CARDS
     if 1 <= effective_count <= ceiling:
         effective_gpu["count"] = public_gpu.get("count")
     # disk sizing, the weight-cache volume, and retry/wall-clock lifecycle policy are platform-managed
-    # (_runner().MANAGED_GPU_KEYS) and stripped from the public spec, so the reconstructed public spec carries
+    # (MANAGED_GPU_KEYS) and stripped from the public spec, so the reconstructed public spec carries
     # only defaults for them. exclude them from the structural comparison; their integrity is covered
     # by the sha256 preparation digest, and the committed weight-cache volume is guarded against
     # illegitimate removal at the persist boundary (see _reject_managed_volume_removal).
-    for managed_gpu in _runner().MANAGED_GPU_KEYS:
+    for managed_gpu in MANAGED_GPU_KEYS:
         effective_gpu[managed_gpu] = public_gpu.get(managed_gpu)
     effective["gpu"] = effective_gpu
     if effective != public:
@@ -540,18 +561,18 @@ def _profile_producer_version() -> str:
 
 
 def _require_pinned_profile_environment(spec: JobSpec) -> JobSpec:
-    pinned, reason = _runner()._pin_env_sha_with_reason(spec)
+    from flash.runner.accounting.artifacts import _pin_env_sha_with_reason
+
+    pinned, reason = _pin_env_sha_with_reason(spec)
     if not pinned.environment.id:
-        raise _runner().WorkloadProfileUnavailable(
-            "sft workload profiling requires an environment id"
-        )
+        raise WorkloadProfileUnavailable("sft workload profiling requires an environment id")
     if not pinned.environment.resolved_sha:
         # the pin is best-effort, so reaching here says only that it did not happen -- and the four
         # causes (a ref that does not exist, a rate limit, an outage, a private repo the token
         # cannot read) need four different fixes. GitHub already answered with which one; name it
         # instead of describing the missing pin it produced.
         detail = f": {reason}" if reason else ""
-        raise _runner().WorkloadProfileUnavailable(
+        raise WorkloadProfileUnavailable(
             f"sft workload profiling requires a pinned environment package revision, but "
             f"{spec.environment.id!r} could not be resolved{detail}"
         )
@@ -566,7 +587,7 @@ def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
         sft_profile_input_digest,
     )
 
-    producer_version = _runner()._profile_producer_version()
+    producer_version = _profile_producer_version()
     tokenizer_revision = spec.model_revision
     input_digest = sft_profile_input_digest(
         spec,
@@ -590,8 +611,8 @@ def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
             producer_version=producer_version,
             tokenizer_revision=tokenizer_revision,
         )
-    except _runner().WorkloadProfileUnavailable:
+    except WorkloadProfileUnavailable:
         raise
     except dataset_profile.PackagedDatasetUnavailable as exc:
-        raise _runner().WorkloadProfileUnavailable(str(exc)) from exc
+        raise WorkloadProfileUnavailable(str(exc)) from exc
     return replace(profiled_spec, workload_profile=profile.to_dict())

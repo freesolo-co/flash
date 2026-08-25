@@ -6,6 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.io.heartbeat as worker_heartbeat
+import flash.engine.worker.io.hf as worker_hf
+import flash.engine.worker.runtime.state as worker_state
 from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.plan.steps import (
@@ -183,8 +186,6 @@ def test_positive_save_every_is_preserved():
 
 
 def test_resume_first_companion_retries_without_reuploading_full_state(monkeypatch, tmp_path):
-    import flash.engine.worker as worker
-    from flash.engine.worker.io import hf as worker_hf
 
     calls = {"resume": 0, "deployable": 0}
 
@@ -201,9 +202,9 @@ def test_resume_first_companion_retries_without_reuploading_full_state(monkeypat
         if calls["deployable"] == 1:
             raise ConnectionError("hf deployable upload unavailable")
 
-    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker, "hf_api", lambda: Api())
-    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
     assert worker_hf.upload_resume_checkpoint(
@@ -213,8 +214,6 @@ def test_resume_first_companion_retries_without_reuploading_full_state(monkeypat
 
 
 def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatch, tmp_path):
-    import flash.engine.worker as worker
-    from flash.engine.worker.io import hf as worker_hf
 
     secret = "hf_checkpoint_upload_secret"
     calls = 0
@@ -227,10 +226,10 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
             raise PermissionError(f"hf quota refused credential {secret} " + "x" * 400)
 
     monkeypatch.setenv("HF_TOKEN", secret)
-    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
     monkeypatch.setattr(
-        worker, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+        worker_heartbeat, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
     )
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
@@ -251,8 +250,6 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
 
 @pytest.mark.parametrize("failure_stage", ["before", "after"])
 def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path, failure_stage):
-    import flash.engine.worker as worker
-    from flash.engine.worker.io import hf as worker_hf
 
     calls = {"resume": 0, "companion": 0}
     heartbeats: list[tuple[str, dict]] = []
@@ -269,10 +266,10 @@ def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path,
         raise RuntimeError(f"{failure_stage} companion failed")
 
     callbacks = {f"{failure_stage}_upload": fail_companion}
-    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
     monkeypatch.setattr(
-        worker, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+        worker_heartbeat, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
     )
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
@@ -437,7 +434,7 @@ def test_seed_host_rngs_reaches_the_dataset_generators_without_importing_torch(m
 
 
 def test_worker_seed_prefers_jobspec_when_present():
-    from flash.engine.worker import _resolve_worker_seed
+    from flash.engine.worker.runtime.state import _resolve_worker_seed
 
     assert _resolve_worker_seed(SimpleNamespace(seed=123), "999") == 123
     assert _resolve_worker_seed(None, "999") == 999

@@ -22,6 +22,8 @@ from typing import ClassVar
 
 import pytest
 
+import flash.runner.lifecycle.reporting as runner_reporting
+import flash.runner.supervise.transitions as runner_transitions
 from flash.server.domain.registry import envs
 
 pytest.importorskip("fastapi")
@@ -32,7 +34,8 @@ import flash.server.routes.serving_completion as serving_completion
 import flash.server.routes.serving_smoke as serving_smoke
 from flash.content import multimodal
 from flash.engine.plan.recipe import RECIPE
-from flash.serve.deployment.deploy import AliasThinkingSilent, ServingError
+from flash.serve.contract.errors import AliasThinkingSilent, ServingError
+from flash.serve.request import transport as serving_transport
 
 
 def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
@@ -552,9 +555,6 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
         return statuses[run_id]
 
     monkeypatch.setattr(serving._app, "get_status", fake_get_status)
-
-    import flash.runner as runner
-
     marked: list[tuple[str, dict]] = []
     reported = []
 
@@ -563,8 +563,8 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
         return types.SimpleNamespace(run_id=run_id, state="done", deployment=failed)
 
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
-    monkeypatch.setattr(runner, "_report_status", reported.append)
+    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner_reporting, "_report_status", reported.append)
 
     from flash.server.platform.locks import _RunLock
 
@@ -574,7 +574,7 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
         # r-stale and r-fresh both recover: the lock is the ownership proof, so a busy record whose
         # lock this pass can take has no live lifecycle whatever its timestamp says. r-held is the
         # one that must survive -- its lock is genuinely held, so a live owner still has it.
-        assert serving.recover_deployments() == 2
+        assert serving_completion.recover_deployments() == 2
     finally:
         held_lock.release()
     assert sorted(run_id for run_id, _failed in marked) == ["r-fresh", "r-stale"]
@@ -596,12 +596,12 @@ def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
     monkeypatch.setattr(serving._app, "get_status", lambda _run_id: statuses.pop(0))
     monkeypatch.setattr(
-        serving,
+        runner_transitions,
         "mark_deployment_failed",
         lambda *_args: pytest.fail("a deployment that settled under the lock must not be failed"),
     )
 
-    assert serving.recover_deployments() == 0
+    assert serving_completion.recover_deployments() == 0
     assert statuses == []
 
 
@@ -642,9 +642,6 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
         ),
     }
     monkeypatch.setattr(serving._app, "get_status", lambda run_id: statuses[run_id])
-
-    import flash.runner as runner
-
     marked: list[tuple[str, dict]] = []
 
     def mark_failed(run_id, failed):
@@ -652,10 +649,10 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
         return types.SimpleNamespace(run_id=run_id, state="done", deployment=failed)
 
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
-    monkeypatch.setattr(runner, "_report_status", lambda status: None)
+    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda status: None)
 
-    assert serving.recover_deployments() == 1
+    assert serving_completion.recover_deployments() == 1
     assert [run_id for run_id, _failed in marked] == ["r-retired"]
     for _run_id, failed in marked:
         assert failed["state"] == "failed"
@@ -664,8 +661,6 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
 
 
 def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):
-    import flash.runner as runner
-
     previous = {
         "state": "ready",
         "endpoint_name": "https://serve.example",
@@ -694,10 +689,10 @@ def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):
     reported = []
 
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    monkeypatch.setattr(serving, "mark_deployment_failed", mark_failed)
-    monkeypatch.setattr(runner, "_report_status", reported.append)
+    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner_reporting, "_report_status", reported.append)
 
-    assert serving.recover_deployments() == 1
+    assert serving_completion.recover_deployments() == 1
     assert len(reported) == 1
     assert reported[0].deployment["state"] == "ready"
     assert "control-plane restart" in reported[0].deployment["last_deploy_error"]
@@ -1353,9 +1348,11 @@ def test_chat_body_carries_stop_sequences(monkeypatch):
             sent.update(json or {})
             return _Resp()
 
-    monkeypatch.setattr(_deploy, "serving_openai_base_url", lambda: "https://serving.example/v1")
-    monkeypatch.setattr(_deploy, "_internal_key_header", dict)
-    monkeypatch.setattr(_deploy, "_chat_http_client", _Client)
+    monkeypatch.setattr(
+        serving_transport, "serving_openai_base_url", lambda: "https://serving.example/v1"
+    )
+    monkeypatch.setattr(serving_transport, "_internal_key_header", dict)
+    monkeypatch.setattr(serving_transport, "_chat_http_client", _Client)
 
     _deploy.chat("run-1", [{"role": "user", "content": "hi"}], stop=["</answer>"])
     assert sent["stop"] == ["</answer>"]
@@ -1394,9 +1391,11 @@ def test_chat_captures_lora_request_adapter_attestation_for_smoke(monkeypatch):
         def post(self, url, json=None, headers=None, timeout=None):
             return _Resp()
 
-    monkeypatch.setattr(_deploy, "serving_openai_base_url", lambda: "https://serving.example/v1")
-    monkeypatch.setattr(_deploy, "_internal_key_header", dict)
-    monkeypatch.setattr(_deploy, "_chat_http_client", _Client)
+    monkeypatch.setattr(
+        serving_transport, "serving_openai_base_url", lambda: "https://serving.example/v1"
+    )
+    monkeypatch.setattr(serving_transport, "_internal_key_header", dict)
+    monkeypatch.setattr(serving_transport, "_chat_http_client", _Client)
 
     out = _deploy.chat(
         _SMOKE_REVISION,

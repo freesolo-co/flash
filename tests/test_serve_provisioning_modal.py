@@ -33,7 +33,7 @@ from flash.serve.provisioning import (
     serving_resource_names,
 )
 from flash.serve.provisioning.modal.execution.deployment import _work_deadline
-from flash.serve.provisioning.modal.execution.lifecycle_entry import (
+from flash.serve.provisioning.modal.execution.operations import (
     _abort_created_resources,
     _CreatedResources,
     provision_modal_deployment,
@@ -2217,7 +2217,7 @@ from flash.serve.app.manifest import ServingManifest
 from flash.serve.app.materialize import hydrate_manifest
 from flash.serve.provisioning import ServingImage
 from flash.serve.provisioning.modal.planning.plan import build_modal_create_plan
-from flash.serve.provisioning.modal.execution.lifecycle_entry import provision_modal_deployment
+from flash.serve.provisioning.modal.execution.operations import provision_modal_deployment
 
 assert ServingManifest
 assert hydrate_manifest

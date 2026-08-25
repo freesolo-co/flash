@@ -5,7 +5,7 @@ shaping and spec-to-knob translation the flash side still performs before handin
 
 from __future__ import annotations
 
-from flash.engine.worker.runtime.pkg_proxy import W as _w
+import flash.engine.worker.runtime.state as _worker_state
 
 
 def resolve_grpo_prompts_per_step(requested: int, available_prompts: int) -> int:
@@ -37,9 +37,9 @@ def build_grpo_prompt_dataset(prompts: list[dict]) -> tuple[list[dict], list]:
 
 def grpo_overrides() -> dict:
     """GRPO knobs from job spec's [train] table; omits unset fields so recipe defaults apply."""
-    if not _w.JOB_SPEC:
+    if not _worker_state.JOB_SPEC:
         return {}
-    train = _w.JOB_SPEC.train
+    train = _worker_state.JOB_SPEC.train
     cfg = {
         "group_size": train.group_size,
         "temperature": train.temperature,

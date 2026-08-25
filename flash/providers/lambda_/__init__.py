@@ -14,9 +14,9 @@ from flash.providers.core.base import (
     PollResult,
     Provider,
     UnsupportedGpuError,
-    combined_vram_gb,
     rentable_gpu_counts,
 )
+from flash.providers.core.sharding import combined_vram_gb
 
 
 class LambdaProvider(InstanceProvider):

@@ -20,6 +20,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.submit as runner_submit
 from tests._helpers.profile import satisfy_sft_profile
 from tests._helpers.source_snapshot import valid_source_snapshot
 from tests._helpers.teacher import configure_managed_teacher
@@ -134,14 +136,13 @@ def test_submit_accepts_multi_gpu_on_every_provider(
 
     dry_run stops before provisioning, so this asserts only that nothing rejects the shape up front.
     """
-    from flash import runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm, count=4, provider=provider)
-        satisfy_sft_profile(runner, monkeypatch, spec)
+        satisfy_sft_profile(monkeypatch, spec)
         configure_managed_teacher(monkeypatch, spec)
-        status = runner.submit_job(spec, dry_run=True)
+        status = runner_submit.submit_job(spec, dry_run=True)
         assert status is not None
 
 
@@ -753,16 +754,15 @@ def _submittable(
 
 @pytest.mark.parametrize("algorithm", ["grpo", "sft", "opd"])
 def test_submit_records_the_resolved_backend(monkeypatch, algorithm):
-    from flash import runner
 
     # the run records which trainer actually ran, so it stays auditable from the run itself.
     expected = "verl"
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm)
-        satisfy_sft_profile(runner, monkeypatch, spec)
+        satisfy_sft_profile(monkeypatch, spec)
         configure_managed_teacher(monkeypatch, spec)
-        status = runner.submit_job(spec, dry_run=True)
+        status = runner_submit.submit_job(spec, dry_run=True)
         assert (status.effective_preparation or {}).get("backend") == expected
 
 
@@ -777,7 +777,11 @@ def test_gpu_count_is_honoured_by_parse_time_sizing():
     Pinned to a need no single validated class holds (180 GB max) but four cards do, so the
     assertion cannot pass by accident on a run that fits one card anyway.
     """
-    from flash.providers.core.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
+    from flash.providers.core.base import (
+        UnsupportedGpuError,
+        cheapest_gpu,
+    )
+    from flash.providers.core.sharding import combined_vram_gb
 
     need = 234
     assert all(info.vram_gb < need for info in _validated_infos()), (
@@ -803,7 +807,11 @@ def test_public_max_gpu_count_is_rentable_not_silently_clamped():
     ``gpu.count = 8``; clamping it to 4 makes that provider capacity unreachable and contradicts the
     authored ceiling without an error.
     """
-    from flash.providers.core.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
+    from flash.providers.core.base import (
+        UnsupportedGpuError,
+        cheapest_gpu,
+    )
+    from flash.providers.core.sharding import combined_vram_gb
 
     # above the widest 4-card shape but below 8x B200, so restoring the old cap to 4 kills this test.
     need = 700
@@ -1377,7 +1385,7 @@ def test_effective_spec_validation_accepts_an_allocator_narrowed_count():
     integrity failure.
     """
     from flash.core.spec import JobSpec, gpu_count_of
-    from flash.runner import _validate_effective_spec
+    from flash.runner.lifecycle.preparation import _validate_effective_spec
     from flash.runner.supervise.lifecycle import _spec_with_gpu
 
     public = JobSpec.from_dict(

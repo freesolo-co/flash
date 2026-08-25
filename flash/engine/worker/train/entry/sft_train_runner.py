@@ -14,6 +14,14 @@ from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
+import flash.engine.worker.io.heartbeat as _worker_heartbeat
+import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.io.wandb_log as _worker_wandb
+import flash.engine.worker.model.adapter as _worker_adapter
+import flash.engine.worker.perf as _worker_perf
+import flash.engine.worker.runtime.rng as _worker_rng
+import flash.engine.worker.runtime.state as _worker_state
+from flash.adapters.fused_experts import lora_target_parameters
 from flash.adapters.targets import resolve_lora_targeting
 from flash.core.catalog import get_model
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
@@ -23,7 +31,6 @@ from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 from flash.providers.core.base import rentable_gpu_counts
 
 RECIPE = _sft_train.RECIPE
-_w = _sft_train._w
 _MAX_ZERO_GRAD_STEPS = _sft_train._MAX_ZERO_GRAD_STEPS
 _SFT_LORAPLUS_RATIO = _sft_train._SFT_LORAPLUS_RATIO
 _LORAPLUS_READY_MARKER = _sft_train._LORAPLUS_READY_MARKER
@@ -164,14 +171,14 @@ class _SftOutputs:
 
 
 def _resolve_sft_options(spec) -> _SftOptions:
-    spec = spec or _w.JOB_SPEC
-    env = _w.require_active_env()
+    spec = spec or _worker_state.JOB_SPEC
+    env = _worker_state.require_active_env()
     # the child trainer is seeded through its shim, but the environment's dataset/completion calls
     # run HERE in the parent. without this the documented top-level seed no longer reproduces sft
     # targets for any env whose row construction uses python/numpy randomness.
-    _sft_train.seed_training_rngs(_w.SEED)
+    _sft_train.seed_training_rngs(_worker_state.SEED)
     started_at = time.time()
-    _w.heartbeat("sft_start", gpu=_w.gpu_diagnostics(include_torch=False))
+    _worker_heartbeat.heartbeat("sft_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False))
     gpu_probe = _sft_train._probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
@@ -184,7 +191,9 @@ def _resolve_sft_options(spec) -> _SftOptions:
         value = getattr(train_spec, name, None) if train_spec else None
         return value if value is not None else default
 
-    workdir = os.path.join("/tmp", "flash-sft-verl", _w.RUN_ID, f"seed-{_w.SEED}")
+    workdir = os.path.join(
+        "/tmp", "flash-sft-verl", _worker_state.RUN_ID, f"seed-{_worker_state.SEED}"
+    )
     shutil.rmtree(workdir, ignore_errors=True)
     os.makedirs(workdir, exist_ok=True)
     paths = _SftPaths(
@@ -224,7 +233,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
     prepared_workload = _sft_train.prepare_sft_workload(
         options.spec,
         options.env,
-        tokenizer_loader=lambda candidate, revision: _w.load_tokenizer(
+        tokenizer_loader=lambda candidate, revision: _worker_hf.load_tokenizer(
             candidate,
             revision=revision,
         ),
@@ -297,7 +306,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
             "from raw output; reasoning blocks or multi-turn structure may have been lost. encode "
             "full target trajectories as message lists in output"
         )
-    if _w.THINKING and not any("<think>" in text for text in sampled_texts[:256]):
+    if _worker_state.THINKING and not any("<think>" in text for text in sampled_texts[:256]):
         print(
             "WARN: thinking mode is ON but no sampled SFT target contains a <think> trace; "
             "training on non-reasoning targets teaches the model to skip thinking"
@@ -331,12 +340,12 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     from flash.core.catalog import MODELS
     from flash.engine.plan.vram import sft_chunked_nll_enabled
 
-    download_seconds = _w.prefetch_model(options.model_id, revision=options.model_revision)
+    download_seconds = _worker_hf.prefetch_model(options.model_id, revision=options.model_revision)
     setup_seconds = time.time() - options.started_at
-    _w.heartbeat(
+    _worker_heartbeat.heartbeat(
         "sft_model_load",
         setup_seconds=setup_seconds,
-        gpu=_w.gpu_diagnostics(include_torch=False),
+        gpu=_worker_perf.gpu_diagnostics(include_torch=False),
     )
     # everything below reads adapter/tokenizer/architecture config from the hub or cache, which is
     # minutes on a cold mount and emits nothing of its own. without this the run's last ping is the
@@ -344,7 +353,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     # cold cache is indistinguishable from a dead worker -- the exact ambiguity the stage was added
     # to resolve. same stage name, so the provider's setup-grace classification is unchanged.
     with liveness_heartbeat("sft_model_load"):
-        lora_config = _w.make_lora(options.model_id)
+        lora_config = _worker_adapter.make_lora(options.model_id)
         targeting = resolve_lora_targeting(
             options.model_id, algorithm="sft", multimodal=data.multimodal
         )
@@ -543,7 +552,7 @@ def _resolve_sft_run_identity(
     project_name = (
         options.spec.wandb.project if options.spec and options.spec.wandb else None
     ) or "flash"
-    return loggers, project_name, _w.wandb_run_name()
+    return loggers, project_name, _worker_wandb.wandb_run_name()
 
 
 def _write_sft_child_shims(
@@ -634,7 +643,7 @@ def _prepare_sft_child(
         "lora_alpha": model.lora_alpha,
         "target_modules": model.target_modules,
         "exclude_modules": None,
-        "target_parameters": _w.lora_target_parameters(options.model_id),
+        "target_parameters": lora_target_parameters(options.model_id),
         "lora_adapter_path": model.warmstart_adapter,
         "ulysses_sp_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
         "lr": options.learning_rate,
@@ -645,7 +654,7 @@ def _prepare_sft_child(
         "local_dir": options.paths.local_dir,
         "save_freq": model.save_freq,
         "n_gpus_per_node": world_size,
-        "seed": _w.backend_seed(_w.SEED),
+        "seed": _worker_rng.backend_seed(_worker_state.SEED),
         "project_name": project_name,
         "experiment_name": experiment_name,
         "loop_epochs": model.loop_epochs,
@@ -790,12 +799,14 @@ class _SftProgressCallbacks:
             "grad_norm": self.progress.values["grad_norm"],
             "learning_rate": self.progress.values["lr"],
         }
-        _w.heartbeat(
+        _worker_heartbeat.heartbeat(
             "sft_step", **{key: value for key, value in payload.items() if value is not None}
         )
 
     def child_heartbeat(self) -> None:
-        _w.heartbeat("sft_step", liveness=True, step=int(self.progress.values["step"] or 0))
+        _worker_heartbeat.heartbeat(
+            "sft_step", liveness=True, step=int(self.progress.values["step"] or 0)
+        )
 
 
 def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_line) -> int:

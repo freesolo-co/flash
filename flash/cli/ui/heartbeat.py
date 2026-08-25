@@ -16,8 +16,6 @@ from __future__ import annotations
 import math
 import time
 
-from flash.cli.ui.render import _dim
-
 
 def _heartbeat_age_seconds(value: object) -> float | None:
     """Return heartbeat age in seconds, or None for an unusable timestamp."""
@@ -492,6 +490,8 @@ def _heartbeat_pairs(obj: dict) -> list[tuple[str, str]]:
         # the progress row already explains this silence, and does it more precisely. show one or
         # the other, never both, or the panel gives two readings of the same quiet.
         if running and not explained and heartbeat_age_seconds > _HB_QUIET_HINT_AFTER_S:
+            from flash.cli.ui.render import _dim
+
             age += _dim(f"  ({_QUIET_HEARTBEAT_HINT})")
         pairs.append(("heartbeat", age))
     if explained:

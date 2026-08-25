@@ -204,7 +204,7 @@ def test_the_worker_still_reschedules_on_either_transient_cause():
     The worker classifies on the shared base, so an outage that used to arrive as the rate-limit
     type keeps rescheduling the run rather than failing it permanently.
     """
-    from flash.engine.worker import _worker_failure_flags
+    from flash.engine.worker.entry.worker import _worker_failure_flags
 
     for exc in (
         loader.GitHubRateLimitError("quota"),

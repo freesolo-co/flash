@@ -12,7 +12,7 @@ import tarfile
 
 import pytest
 
-import flash.cli as cli
+import flash.cli.parsing.main as cli
 from flash.cli.commands.env.ops.push import _human_bytes, _UploadProgress
 from flash.envs.package.direct_tokens import (
     _CHUNK_SIZE,

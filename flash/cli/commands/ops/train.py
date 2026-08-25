@@ -1,48 +1,47 @@
 """cost quotes and config compatibility notes printed before `flash train` launches.
 
-rl methods use the offline analytical calculation. sft asks the authenticated control-plane preview
-for the quote and renders its packaged-dataset aggregates, including the raw-record estimate caveat.
+every method asks the authenticated control-plane preview for the quote submission would freeze.
+sft also renders packaged-dataset aggregates, including the raw-record estimate caveat.
 
 split out of `flash.cli.commands` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 
 from flash import __version__
+from flash._internal.channel import CLI_NAME
+from flash._internal.logging import get_logger
+from flash.cli.commands.ops.prompt_budget import (
+    print_status_prompt_budget_warning,
+    print_warmstart_context_supplement,
+    prompt_budget_validation_suffix,
+    warn_before_paid_submit,
+)
 from flash.cli.ui import render
-from flash.client import ClientError
+from flash.client import ClientError, client_from_config
+from flash.client.config import shadowed_login_warning
 from flash.client.runtime_secrets import runtime_secrets_from_local_env
 from flash.client.specs import spec_payload
-from flash.cost.spec import runconfig_from_spec
+from flash.cost.currency import format_usd
 from flash.engine.profiling.workload_profile import (
     rendered_reasoning_loss_warning,
     unpacked_batch_warning,
 )
 from flash.schema import spec_and_train_keys_from_file, train_schema_metadata
 
-
-def _commands():
-    """The parent package, imported lazily because it re-exports this module.
-
-    `client_from_config`, `shadowed_login_warning` and `CLI_NAME` are patched as attributes of
-    `flash.cli.commands` by the cli estimate tests -- the first two to prove the offline quote
-    never builds a client and still surfaces the shadowed-key warning, the third to prove the dev
-    channel's `flash-dev` name reaches the hints printed here. Binding any of them by value would
-    capture the original before the patch lands.
-    """
-    from flash.cli import commands
-
-    return commands
+logger = get_logger("flash.cli")
 
 
 def _cmd_train_cost(args) -> int:
     """`flash train --cost`: print the pre-flight USD cost for the config and exit (no submit).
 
-    grpo and opd quote offline from the catalog. sft asks the server to read the pinned packaged
-    dataset and statically readable training contract without executing environment code. tokens,
-    retention, truncation, and steps are estimates that can miss other environment transformations.
+    every method asks the server to run the same read-only preparation that freezes a real submit's
+    quote. sft also reads the pinned packaged dataset and statically readable training contract
+    without executing environment code. tokens, retention, truncation, and steps are estimates that
+    can miss other environment transformations.
     """
     from flash.adapters.lora_rank import preflight_train_context_within_serving
 
@@ -56,61 +55,39 @@ def _cmd_train_cost(args) -> int:
     preflight_train_context_within_serving(spec)
     if spec.algorithm == "sft":
         return _cmd_train_cost_sft(args, spec, authored_train_keys)
-    return _cmd_train_cost_offline(spec)
+    return _cmd_train_cost_rl(args, spec, authored_train_keys)
 
 
-def _cmd_train_cost_offline(spec) -> int:
-    """Catalog-only quote for the algorithms that do not need workload evidence yet (grpo, opd)."""
-    from dataclasses import replace
-
-    from flash.cost import estimate_cost
-    from flash.schema import MIN_LORA_RANK
-
-    config = runconfig_from_spec(spec)
-    if spec.train.init_from_adapter:
-        # --cost is offline/catalog-only and cannot read the source adapter's rank, and the parser
-        # rejects an authored `lora_rank` alongside `init_from_adapter`, so there is never an
-        # authored rank to quote at. stderr keeps stdout clean for machine-readable callers.
-        #
-        # quote at rank 1 rather than at the serialization placeholder. the placeholder is not a
-        # measurement of anything, and `estimate_cost` reads the rank for both the exact-card fit and
-        # cost-ranked hardware selection. rank 1 is a vram lower bound, but not a dollar lower bound:
-        # a higher source rank can move the run onto a cheaper multi-card shape.
-        config = replace(config, lora_rank=MIN_LORA_RANK)
-        print(
-            "warning: warm-start (train.init_from_adapter) cost is a provisional rank-1 estimate. "
-            "The authoritative source adapter rank is resolved server-side and can change the "
-            "selected hardware and cost in either direction. Run "
-            f"`{_commands().CLI_NAME} train --dry-run` for a quote using the resolved source rank.",
-            file=sys.stderr,
-        )
-    estimate = estimate_cost(config)
-    if render.styled():
-        print(render.cost_panel(estimate))
-    else:
-        print(estimate.breakdown())
-    from flash.cli.commands.ops.prompt_budget import warn_cost_prompt_budget
-
-    warn_cost_prompt_budget(spec)
-    return 0
-
-
-def _cmd_train_cost_sft(args, spec, authored_train_keys: frozenset[str]) -> int:
-    """SFT estimate served by the same authenticated path that freezes a real submit's quote."""
-    # cli._warn_if_login_shadowed() suppresses this warning for `--cost` because the catalog path
-    # never reaches an organization. the sft path does: it authenticates, resolves the project, and
-    # requests the server-side packaged-dataset estimate, so the warning has to fire here after all.
-    message = _commands().shadowed_login_warning()
+def _request_server_quote(args, spec, authored_train_keys: frozenset[str]) -> dict:
+    """Run authenticated submit preparation without allocating a training gpu."""
+    # the generic cli hook suppresses this warning for `--cost` because the algorithm is not known
+    # until this file parses the config. every quote now reaches an organization, so restore it here.
+    message = shadowed_login_warning()
     if message:
         print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
-    client = _commands().client_from_config()
-    status = client.create_run(
+    client = client_from_config()
+    return client.create_run(
         spec_payload(spec, authored_train_keys=authored_train_keys),
         runtime_secrets=runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets)
         or None,
         dry_run=True,
         client_train_schema=_client_train_schema(authored_train_keys),
     )
+
+
+def _cmd_train_cost_rl(args, spec, authored_train_keys: frozenset[str]) -> int:
+    """Authoritative grpo/opd quote from the same preparation used by submission."""
+    from flash.cli.commands.ops.prompt_budget import print_status_prompt_budget_warning
+
+    status = _request_server_quote(args, spec, authored_train_keys)
+    _print_server_cost(status, spec)
+    print_status_prompt_budget_warning(status)
+    return 0
+
+
+def _cmd_train_cost_sft(args, spec, authored_train_keys: frozenset[str]) -> int:
+    """SFT estimate served by the same authenticated path that freezes a real submit's quote."""
+    status = _request_server_quote(args, spec, authored_train_keys)
     _print_sft_cost(status, spec)
     return 0
 
@@ -307,7 +284,7 @@ def _republish_advice(environment_id: str) -> str | None:
         return None
     if managed_slug is not None:
         return (
-            f"{prefix}run `{_commands().CLI_NAME} env push --name NAME "
+            f"{prefix}run `{CLI_NAME} env push --name NAME "
             "--project PROJECT_UUID [path]` again for this managed environment."
         )
     if not is_github_environment_ref(environment_id):
@@ -323,13 +300,31 @@ def _republish_advice(environment_id: str) -> str | None:
     )
 
 
-def _print_sft_cost(status: dict, spec) -> None:
+def _server_quote_total(status: object, algorithm: str) -> float:
     total = status.get("estimated_cost_usd") if isinstance(status, dict) else None
     if not isinstance(total, (int, float)) or isinstance(total, bool):
-        raise ClientError(
-            "the server accepted this SFT config but returned no cost estimate; "
-            f"run `{_commands().CLI_NAME} train --dry-run` to see the full server response"
+        message = (
+            f"the server accepted this {algorithm.upper()} config but returned no cost estimate"
         )
+        if algorithm == "sft":
+            message += f"; run `{CLI_NAME} train --dry-run` to see the full server response"
+        raise ClientError(message)
+    return float(total)
+
+
+def _print_server_cost(status: dict, spec) -> None:
+    """Render a server-prepared quote without inventing an offline hardware breakdown."""
+    total = _server_quote_total(status, spec.algorithm)
+    rows = [("run", f"{spec.model}  [{spec.algorithm.upper()}]")]
+    if render.styled():
+        print(render.server_cost_panel(rows, total, "authoritative server quote"))
+    else:
+        print(f"{'run'.ljust(8)}: {rows[0][1]}")
+        print(f"{'TOTAL'.ljust(8)}: {format_usd(total)}")
+
+
+def _print_sft_cost(status: dict, spec) -> None:
+    total = _server_quote_total(status, "sft")
     profile = status.get("workload_profile")
     rows = _sft_cost_rows(spec, profile if isinstance(profile, dict) else {})
     if render.styled():
@@ -338,7 +333,7 @@ def _print_sft_cost(status: dict, spec) -> None:
         for key, value in rows:
             if value is not None:
                 print(f"{key.ljust(8)}: {value}")
-        print(f"{'TOTAL'.ljust(8)}: ${float(total):.2f}")
+        print(f"{'TOTAL'.ljust(8)}: {format_usd(total)}")
     _print_published_sft_environment_note(status, spec)
     print(
         "tokens, retained rows, truncation, and optimizer steps are estimated from packaged "
@@ -408,3 +403,111 @@ def _warn_if_wandb_requested_without_key(
         "DISABLED. Export WANDB_API_KEY or put it in a .env next to the config."
     )
     print(render.warn(message) if render.styled() else f"warning: {message}", file=sys.stderr)
+
+
+def cmd_train(args) -> int:
+    if getattr(args, "cost", False):
+        return _cmd_train_cost(args)
+    spec, authored_train_keys = spec_and_train_keys_from_file(
+        args.config,
+        run_id=None,
+        overrides=args.overrides,
+        extra_configs=args.extra_configs,
+        project_required=True,
+    )
+    payload = spec_payload(spec, authored_train_keys=authored_train_keys)
+    client = client_from_config()
+    client_train_schema = _client_train_schema(authored_train_keys)
+    runtime_secrets = (
+        runtime_secrets_from_local_env(args.config, keys=spec.environment.secrets) or None
+    )
+    _warn_if_wandb_requested_without_key(spec, runtime_secrets, dry_run=bool(args.dry_run))
+    if args.dry_run:
+        # dry-run runs submit-time server preflights without allocating a training gpu or charging
+        # for training. a rejection surfaces as the server's error with exit status 1. for sft the
+        # server reads the packaged dataset file and builds the quote without executing environment.py.
+        status = client.create_run(
+            payload,
+            runtime_secrets=runtime_secrets,
+            dry_run=True,
+            client_train_schema=client_train_schema,
+        )
+        compatibility = status.pop("train_schema_compatibility", None)
+        _print_train_schema_compatibility(compatibility)
+        # the server fails open on a billing-infra problem, so "cost" is only in the validated list
+        # when it was actually checked. absent key = a server that predates the signal, which is
+        # equally not a verification -- so treat anything but an explicit True as unverified.
+        affordability_verified = status.pop("affordability_verified", None) is True
+        cost = "and cost" if affordability_verified else "but NOT cost"
+        budget_validated = prompt_budget_validation_suffix(status)
+        environment = (
+            "it did NOT import or run your environment.py. packaged input/output fields and the "
+            "statically readable training contract were tokenized together; tokens, retention, "
+            "truncation, and steps can still miss other environment transformations. environment "
+            "execution, model load, and gpu/training are first exercised on the worker after cold-start."
+            if spec.algorithm == "sft"
+            else "it did NOT import or run your environment.py; dataset loading, "
+            "start_episode/episode shapes, reward/scorer, worker imports, model load, and "
+            "gpu/training are first exercised on the worker after cold-start."
+        )
+        print(
+            "dry-run validated: config/schema, model+algorithm compatibility, lora rank, "
+            f"runtime-secret presence, warm-start source, serving context cap{budget_validated}, "
+            f"{cost}. {environment}",
+            file=sys.stderr,
+        )
+        if not affordability_verified:
+            print(
+                "affordability was NOT verified (billing check unavailable); this run can still be "
+                "rejected for insufficient balance when you submit it for real.",
+                file=sys.stderr,
+            )
+        if render.styled():
+            print(
+                render.object_panel(
+                    "train", status, "dry run — validated by the server, not submitted"
+                )
+            )
+        else:
+            print(json.dumps(status, indent=2))
+        if spec.algorithm == "sft":
+            _print_published_sft_environment_note(status, spec)
+        _print_unpacked_batch_warning(status, spec)  # after the payload, so stdout stays parseable
+        print_status_prompt_budget_warning(status)
+        _print_reasoning_loss_warning(status)
+        return 0
+    local_budget = warn_before_paid_submit(client, spec)
+    status = client.create_run(
+        payload,
+        runtime_secrets=runtime_secrets,
+        client_train_schema=client_train_schema,
+    )
+    run_id = status["run_id"]
+    _print_unpacked_batch_warning(status, spec)  # a real submit overrides batch_size the same way
+    _print_reasoning_loss_warning(status)  # and trains on whatever reasoning the template kept
+    print_warmstart_context_supplement(local_budget, status)
+    logger.info(
+        "submitted run %s: model=%s algorithm=%s gpu=%s",
+        run_id,
+        spec.model,
+        spec.algorithm,
+        spec.gpu.type or "auto",
+    )
+    if args.background:
+        if render.styled():
+            print(render.object_panel("train", status, "submitted (running in background)"))
+        else:
+            print(json.dumps(status, indent=2))
+        return 0
+    if render.styled():
+        print(render.submitted(run_id), file=sys.stderr)
+    else:
+        print(
+            f"run {run_id} submitted; following logs (Ctrl-C detaches and the run keeps "
+            f"billing, `{CLI_NAME} runs log {run_id} --follow` resumes, "
+            f"`{CLI_NAME} runs cancel {run_id}` stops it)",
+            file=sys.stderr,
+        )
+    from flash.cli.commands.ops.runs import _follow_run
+
+    return _follow_run(client, run_id)

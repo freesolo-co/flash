@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from flash.engine.worker.train.opd.orchestration.gkd import _teacher_prompt_text
 
 if TYPE_CHECKING:  # annotation-only: the prompt record lives in the orchestrator
-    from flash.engine.worker.train.entry.opd_train import _BridgePrompt
+    from flash.engine.worker.train.opd.orchestration.state import _BridgePrompt
 
 
 def build_multimodal_score_items(

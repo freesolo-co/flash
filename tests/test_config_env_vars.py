@@ -22,7 +22,11 @@ from flash._internal.paths import DATA_DIR_ENV, data_dir
 
 # Modules that read the data dir at import time. Resolution is centralized, but these bind the
 # result to a module constant, so the subprocess probes below re-import rather than reload.
-_STATE_MODULES = ("flash.client.config", "flash.runner", "flash.server.platform.db")
+_STATE_MODULES = (
+    "flash.client.config",
+    "flash.runner.lifecycle.state",
+    "flash.server.platform.db",
+)
 
 
 def _resolve_paths_in(env_overrides: dict[str, str]) -> dict[str, str]:
@@ -34,7 +38,8 @@ def _resolve_paths_in(env_overrides: dict[str, str]) -> dict[str, str]:
     """
     code = (
         "import json\n"
-        "import flash.client.config as c, flash.runner as r, flash.server.platform.db as d\n"
+        "import flash.client.config as c, flash.runner.lifecycle.state as r, "
+        "flash.server.platform.db as d\n"
         "from flash._internal.paths import data_dir\n"
         "print(json.dumps({\n"
         "  'config': str(c.CONFIG_PATH),\n"

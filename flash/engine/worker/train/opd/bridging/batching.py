@@ -21,23 +21,12 @@ from flash.engine.worker.teacher.client import (
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
 from flash.engine.worker.train.entry.backend_common import BoundedThreadingHTTPServer
 from flash.engine.worker.train.entry.score_batcher import ScoreBatcher
+from flash.engine.worker.train.opd.orchestration import protocol
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
-# how many teacher POSTs may sit in the bridge server's accept backlog. defined here rather than
-# in `opd_train` (which re-exports it) so this module imports without its parent.
+# how many teacher POSTs may sit in the bridge server's accept backlog. this leaf module owns the
+# value so it never imports the entry orchestrator.
 _TEXT_TEACHER_REQUEST_BACKLOG = 64
-
-
-def _opd_train():
-    """The orchestrator module, imported lazily because it imports this one.
-
-    The two flush/shutdown budgets below are patched on `opd_train` by the batcher tests to keep
-    their waits short; a `from ... import` here would bind the production values before the patch
-    lands, so the tests would wait the real duration against an object they never rebound.
-    """
-    from flash.engine.worker.train.entry import opd_train
-
-    return opd_train
 
 
 def _align_granularity(groups, student_tokens) -> float:
@@ -163,7 +152,7 @@ class _TextTeacherBatcher(ScoreBatcher):
             self._score_items,
             max_batch_size=max_batch_size,
             flush_wait_s=(
-                _opd_train()._TEXT_TEACHER_FLUSH_WAIT_S if flush_wait_s is None else flush_wait_s
+                protocol.TEXT_TEACHER_FLUSH_WAIT_S if flush_wait_s is None else flush_wait_s
             ),
             label="text teacher batcher",
             thread_name="flash-opd-text-teacher-batcher",
@@ -212,5 +201,5 @@ class _TextTeacherBatcher(ScoreBatcher):
         # resolved here rather than as a default: the shutdown budget is patched on `opd_train`
         # by the batcher tests, and a default argument would freeze it at import time.
         if timeout_s is None:
-            timeout_s = _opd_train()._TEXT_TEACHER_SHUTDOWN_WAIT_S
+            timeout_s = protocol.TEXT_TEACHER_SHUTDOWN_WAIT_S
         super().close(timeout_s)

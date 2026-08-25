@@ -18,7 +18,7 @@ import pytest
 from flash.core.catalog import MODELS
 from flash.engine.worker.train.opd.orchestration.overrides import build_opd_overrides
 from flash.engine.worker.verl.parallelism import resolve_reshard_after_forward
-from flash.providers.core.base import (
+from flash.providers.core.sharding import (
     REPLICATED_PER_CARD_GB,
     SHARD_VRAM_EFFICIENCY,
     ZERO2_CHARGED_RESIDENCY,

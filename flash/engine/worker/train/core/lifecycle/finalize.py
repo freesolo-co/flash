@@ -6,8 +6,10 @@ import json
 import os
 
 from flash.engine.result.accounting import RunMetrics, sanitize_worker_metrics
+from flash.engine.worker.io import heartbeat as heartbeat_io
+from flash.engine.worker.io import hf as hf_io
 from flash.engine.worker.perf import gpu_diagnostics
-from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.runtime import state as worker_state
 
 
 def _train_meta_job_spec():
@@ -19,7 +21,7 @@ def _train_meta_job_spec():
     train.init_from_adapter_revision, internal storage locators, into an artifact users download.
     so add back the one field, and only when it is set.
     """
-    spec = _w.JOB_SPEC
+    spec = worker_state.JOB_SPEC
     if not spec:
         return None
     data = spec.to_dict()
@@ -41,7 +43,7 @@ def write_train_meta(
     step=None,
     heartbeat_fields=None,
 ):
-    env = _w.require_active_env()
+    env = worker_state.require_active_env()
     meta = sanitize_worker_metrics(
         {
             "phase": phase,
@@ -56,13 +58,13 @@ def write_train_meta(
     )
     with open("/tmp/train_meta.json", "w") as f:
         json.dump(meta, f)
-    _w.hf_upload_file("/tmp/train_meta.json", "train_meta.json")
+    hf_io.hf_upload_file("/tmp/train_meta.json", "train_meta.json")
     # Carry the completed optimizer ``step`` (when the caller supplies it) so this final pre-DONE
     # heartbeat doesn't clobber the last stepped training ping with a stepless one -- a cancel
     # between here and DONE would otherwise re-price a fully-trained run to 0 steps.
     _step_field = {"step": int(step)} if isinstance(step, (int, float)) and step > 0 else {}
     _heartbeat_fields = heartbeat_fields or {}
-    _w.heartbeat(
+    heartbeat_io.heartbeat(
         f"{phase}_train_done",
         **_step_field,
         **{k: meta[k] for k in ("train_wall", "train_tokens", "generated_tokens")},
@@ -75,7 +77,7 @@ def write_train_meta(
         # Completed optimizer updates (opd passes step=opt_steps; sft/rl omit it -> None). _finalize
         # reads metrics.step to carry the true step onto the terminal `done` heartbeat.
         step=step,
-        seed=_w.SEED,
+        seed=worker_state.SEED,
         model_id=model_id,
         wall_seconds=train_wall,
         setup_seconds=setup_seconds,
@@ -87,11 +89,25 @@ def write_train_meta(
         notes={
             **(notes or {}),
             "renderer": "flash_env",
-            "thinking": _w.THINKING,
+            "thinking": worker_state.THINKING,
             "train_wall": train_wall,
             "model_id": model_id,
             "environment": env.id,
             "job_spec": _train_meta_job_spec(),
         },
     )
-    _w._finalize(m, heartbeat_fields=_heartbeat_fields)
+    _finalize(m, heartbeat_fields=_heartbeat_fields)
+
+
+def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
+    import time
+
+    metrics.save("/tmp/metrics.json")
+    hf_io.hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
+    with open("/tmp/DONE", "w") as handle:
+        handle.write(str(time.time()))
+    hf_io.hf_upload_file("/tmp/DONE", "DONE", required=True)
+    step = metrics.step
+    step_field = {"step": int(step)} if isinstance(step, (int, float)) and step > 0 else {}
+    heartbeat_io.heartbeat("done", **step_field, **(heartbeat_fields or {}), gpu=gpu_diagnostics())
+    print("NODE DONE:", metrics.to_json())

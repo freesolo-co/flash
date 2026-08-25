@@ -13,13 +13,14 @@ from typing import Any, TypeGuard
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
 from flash.serving.src.http.context import ServingContext
+from flash.serving.src.io.requests import _assert_supported_base_model
 from flash.serving.src.io.schemas import (
     AdapterActivationRequest,
     AdapterRecord,
     ImmutableAdapterRegistration,
     internal_adapter_payload,
 )
-from flash.serving.src.io.serving_io import _assert_supported_base_model, _replace_stored_cas
+from flash.serving.src.store.access import _replace_stored_cas
 from flash.serving.src.store.registration import activate_revision, persist_revision
 from flash.serving.src.store.undeploy import (
     apply_teardown,

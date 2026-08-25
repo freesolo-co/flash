@@ -100,7 +100,7 @@ def test_unexpected_error_suggestion_does_not_replay_a_credential():
     Both argv spellings matter: argparse accepts `--api-key secret` as two entries and
     `--api-key=secret` as one, and only the first is caught by looking at the following element.
     """
-    from flash.cli import _redacted_args
+    from flash.cli.parsing.main import _redacted_args
 
     separate = _redacted_args(
         ["models", "export", "--repository", "alice/model", "--api-key", "hf_SUPERSECRET"]
@@ -136,7 +136,7 @@ def test_unexpected_error_suggestion_redacts_abbreviated_credential_flags():
     parser is asserted here alongside the redaction: the point is that these spellings are real,
     not hypothetical.
     """
-    from flash.cli import _build_parser, _redacted_args
+    from flash.cli.parsing.main import _build_parser, _redacted_args
 
     parser = _build_parser()
     for argv in (["login", "--api-k", "fs_SUPERSECRET"], ["login", "--api-ke=fs_SUPERSECRET"]):
@@ -203,7 +203,7 @@ def test_dry_run_without_login_fails_fast():
     assert "Traceback (most recent call last)" not in proc.stderr
 
 
-def test_cost_needs_no_live_pricing():
+def test_cost_requires_login_for_server_dry_run_preparation():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
@@ -213,9 +213,10 @@ def test_cost_needs_no_live_pricing():
                 "[train]\nepochs = 1\nmax_examples = 1\n"
             )
         proc = _run(["train", cfg, "--cost"], env=_logged_out_env(tmp))
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "TOTAL" in proc.stdout
-    assert "live GPU pricing unavailable" not in proc.stderr
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "not logged in" in proc.stderr
+    assert f"{INVOKED_CLI_NAME} login" in proc.stderr
+    assert "Traceback (most recent call last)" not in proc.stderr
 
 
 @contextlib.contextmanager

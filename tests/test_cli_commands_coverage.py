@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import flash.cli.commands as commands
 import flash.cli.commands.env.ops.list as env_list_commands
+from flash.cli.commands.ops import deploy as deploy_commands
+from flash.cli.commands.ops import runs as commands
 
 
 class _Client:
@@ -117,6 +118,8 @@ def test_checkpoints_empty_and_styled_paths(monkeypatch, capsys) -> None:
     """Checkpoint listing must render both empty and populated styled states without plain leakage."""
     client = _Client()
     monkeypatch.setattr(commands, "client_from_config", lambda: client)
+    monkeypatch.setattr(deploy_commands, "client_from_config", lambda: client)
+    monkeypatch.setattr(deploy_commands, "client_from_config", lambda: client)
     monkeypatch.setattr(commands.render, "styled", lambda: True)
     monkeypatch.setattr(commands.render, "empty", lambda *args: "empty-checkpoints")
     assert commands.cmd_checkpoints(SimpleNamespace(run_id="flash-1")) == 0
@@ -134,6 +137,8 @@ def test_checkpoints_plain_path_prints_canonical_refs(monkeypatch, capsys) -> No
     """Plain checkpoint output must stay grep-friendly and include the deployment hint on stderr."""
     client = _Client(checkpoints=[{"step": 12}, {"step": 24}])
     monkeypatch.setattr(commands, "client_from_config", lambda: client)
+    monkeypatch.setattr(deploy_commands, "client_from_config", lambda: client)
+    monkeypatch.setattr(deploy_commands, "client_from_config", lambda: client)
     monkeypatch.setattr(commands.render, "styled", lambda: False)
 
     assert commands.cmd_checkpoints(SimpleNamespace(run_id="flash-1")) == 0
@@ -150,14 +155,16 @@ def test_deployments_empty_and_styled_paths(monkeypatch, capsys) -> None:
     """Deployment listing must distinguish empty and populated styled states."""
     client = _Client()
     monkeypatch.setattr(commands, "client_from_config", lambda: client)
+    monkeypatch.setattr(deploy_commands, "client_from_config", lambda: client)
+    monkeypatch.setattr(deploy_commands, "client_from_config", lambda: client)
     monkeypatch.setattr(commands.render, "styled", lambda: True)
     monkeypatch.setattr(commands.render, "empty", lambda *args: "empty-deployments")
-    assert commands.cmd_deployments(SimpleNamespace(json=False)) == 0
+    assert deploy_commands.cmd_deployments(SimpleNamespace(json=False)) == 0
     assert capsys.readouterr().out == "empty-deployments\n"
 
     client._deployments = [{"run_id": "flash-1", "deployment": {"state": "ready"}}]
     monkeypatch.setattr(commands.render, "deployments_table", lambda rows: "deployment-table")
-    assert commands.cmd_deployments(SimpleNamespace(json=False)) == 0
+    assert deploy_commands.cmd_deployments(SimpleNamespace(json=False)) == 0
     assert capsys.readouterr().out == "deployment-table\n"
 
 
@@ -178,9 +185,10 @@ def test_deployments_plain_path_handles_final_and_detailed_rows(monkeypatch, cap
         }
     ]
     monkeypatch.setattr(commands, "client_from_config", lambda: _Client(deployments=rows))
+    monkeypatch.setattr(deploy_commands, "client_from_config", lambda: _Client(deployments=rows))
     monkeypatch.setattr(commands.render, "styled", lambda: False)
 
-    assert commands.cmd_deployments(SimpleNamespace(json=False)) == 0
+    assert deploy_commands.cmd_deployments(SimpleNamespace(json=False)) == 0
 
     output = capsys.readouterr().out
     assert "flash-1" in output
@@ -200,7 +208,9 @@ def test_chat_rejects_invalid_target_without_constructing_a_client(monkeypatch, 
         lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
     )
 
-    result = commands.cmd_chat(SimpleNamespace(run_id="bad target", message="hello", system=None))
+    result = deploy_commands.cmd_chat(
+        SimpleNamespace(run_id="bad target", message="hello", system=None)
+    )
 
     assert result == 1
     assert "invalid chat target" in capsys.readouterr().err
@@ -216,10 +226,11 @@ def test_chat_prints_styled_label_before_streaming(monkeypatch, capsys) -> None:
             yield "hi"
 
     monkeypatch.setattr(commands, "client_from_config", ChatClient)
+    monkeypatch.setattr(deploy_commands, "client_from_config", ChatClient)
     monkeypatch.setattr(commands.render, "styled", lambda: True)
     monkeypatch.setattr(commands.render, "chat_label", lambda: "assistant-label")
 
-    result = commands.cmd_chat(
+    result = deploy_commands.cmd_chat(
         SimpleNamespace(
             run_id="flash-1",
             message="hello",
@@ -246,9 +257,10 @@ def test_chat_fails_when_the_stream_carries_no_text(monkeypatch, capsys) -> None
             return iter(())
 
     monkeypatch.setattr(commands, "client_from_config", EmptyChatClient)
+    monkeypatch.setattr(deploy_commands, "client_from_config", EmptyChatClient)
     monkeypatch.setattr(commands.render, "styled", lambda: False)
 
-    result = commands.cmd_chat(
+    result = deploy_commands.cmd_chat(
         SimpleNamespace(
             run_id="flash-1",
             message="hello",
@@ -265,7 +277,7 @@ def test_chat_fails_when_the_stream_carries_no_text(monkeypatch, capsys) -> None
 
     # `models list` enumerates supported base models and carries no deployment state, so it cannot
     # investigate either condition this message names. `models deployments` is the one that can.
-    assert f"{commands.CLI_NAME} models deployments" in captured.err
+    assert f"{deploy_commands.CLI_NAME} models deployments" in captured.err
     assert "models list" not in captured.err
 
 
@@ -285,10 +297,11 @@ def test_chat_treats_a_whitespace_only_stream_as_no_response(monkeypatch, capsys
             yield "\t"
 
     monkeypatch.setattr(commands, "client_from_config", BlankChatClient)
+    monkeypatch.setattr(deploy_commands, "client_from_config", BlankChatClient)
     monkeypatch.setattr(commands.render, "styled", lambda: True)
     monkeypatch.setattr(commands.render, "chat_label", lambda: "assistant-label")
 
-    result = commands.cmd_chat(
+    result = deploy_commands.cmd_chat(
         SimpleNamespace(
             run_id="flash-1",
             message="hello",
@@ -317,9 +330,10 @@ def test_chat_preserves_leading_whitespace_once_the_stream_has_text(monkeypatch,
             yield "hi"
 
     monkeypatch.setattr(commands, "client_from_config", LeadingBlankChatClient)
+    monkeypatch.setattr(deploy_commands, "client_from_config", LeadingBlankChatClient)
     monkeypatch.setattr(commands.render, "styled", lambda: False)
 
-    result = commands.cmd_chat(
+    result = deploy_commands.cmd_chat(
         SimpleNamespace(
             run_id="flash-1",
             message="hello",
@@ -348,10 +362,11 @@ def test_chat_keeps_stdout_empty_when_a_styled_stream_carries_no_text(monkeypatc
             return iter(())
 
     monkeypatch.setattr(commands, "client_from_config", EmptyChatClient)
+    monkeypatch.setattr(deploy_commands, "client_from_config", EmptyChatClient)
     monkeypatch.setattr(commands.render, "styled", lambda: True)
     monkeypatch.setattr(commands.render, "chat_label", lambda: "assistant-label")
 
-    result = commands.cmd_chat(
+    result = deploy_commands.cmd_chat(
         SimpleNamespace(
             run_id="flash-1",
             message="hello",

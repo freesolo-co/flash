@@ -5,9 +5,16 @@ Split out of ``flash.providers.runpod.execution.jobs`` to keep that module under
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import math
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import flash.providers.runpod.serverless.endpoints as runpod_endpoints
+from flash._internal.logging import get_logger
+from flash.core.spec import gpu_count_of
 from flash.providers._lifecycle.instances.poll import (
     PollErrorTracker,
     _attempt_int,
@@ -16,6 +23,7 @@ from flash.providers._lifecycle.instances.poll import (
     make_say,
     surface_heartbeat,
 )
+from flash.providers._lifecycle.net import worker as runpod_worker
 from flash.providers._lifecycle.net.deadline import (
     CREATE_ALLOWANCE_S,
     deadline_kwargs,
@@ -23,12 +31,34 @@ from flash.providers._lifecycle.net.deadline import (
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers.core.base import PollResult
-from flash.providers.runpod.execution import jobs as _jobs
+from flash.providers.artifacts.hf import (
+    make_hf_failure_detail_reader,
+    make_hf_heartbeat_reader,
+)
+from flash.providers.core.base import PollResult, UnreconciledCreateError, canonical_gpu
+from flash.providers.runpod.client import api as runpod_api
+from flash.providers.runpod.client.gpus import flash_gpu
+from flash.providers.runpod.execution import resources as runpod_resources
+from flash.providers.runpod.execution.jobs import (
+    PLATFORM_TERMINATIONS,
+    TERMINAL_FAIL,
+    TERMINAL_OK,
+    WORKER_COMING_UP_TTL_S,
+    GraceTimer,
+    JobHandle,
+    _append_failure_artifacts,
+    _safe_failure_text,
+    capacity_escalation_note,
+    decode_output,
+    stall_kwargs,
+    surfaced_worker_flags,
+)
 from flash.providers.runpod.execution.resources import WEIGHT_CACHE_GROW_BUDGET_S
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+logger = get_logger(__name__)
 
 # Job statuses that PROVE RunPod took the job out of the queue and therefore granted it a worker.
 # Kept as an allowlist because the complement (`!= "IN_QUEUE"`) also matches None and any status
@@ -36,6 +66,156 @@ if TYPE_CHECKING:
 _GRANT_PROVING_STATUSES = frozenset(
     {"IN_PROGRESS", "COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}
 )
+
+
+def _is_workers_quota_error(exc: Exception) -> bool:
+    """Return whether RunPod reports exhausted account worker quota."""
+    return "max workers across all endpoints" in str(exc).lower()
+
+
+def _is_balance_error(exc: Exception) -> bool:
+    """Return whether RunPod refuses endpoint creation for account balance."""
+    return "account balance" in str(exc).lower()
+
+
+def submit_run(
+    spec,
+    seed: int,
+    log=None,
+    on_handle=None,
+    attempt: int = 0,
+    runtime_secrets: dict[str, str] | None = None,
+    on_last_gpu: bool = False,
+    *,
+    source_snapshot: dict,
+    deadline_at: float | None = None,
+) -> PollResult:
+    """Deploy, submit, persist handle via ``on_handle``, and poll to completion."""
+    from flash.envs.loading.base import worker_pip_with_extras
+    from flash.snapshot.archive import parse_descriptor
+
+    deadline_at = require_deadline_at(deadline_at)
+    attempt_id = _attempt_int(attempt)
+    if attempt_id is None:
+        raise ValueError("RunPod attempt identity is invalid")
+    source_descriptor = parse_descriptor(source_snapshot)
+    timeout_s = int(require_create_allowance(deadline_at))
+    # Per-attempt suffix so a retry lands on a fresh endpoint, not the same throttled/sick host.
+    suffix = runpod_endpoints._run_suffix(spec.run_id)
+    if attempt_id:
+        suffix = f"{suffix}r{attempt_id}"
+    # the author's [environment] pip is appended to the worker requirement, never substituted for it.
+    extra_pip = worker_pip_with_extras(spec.environment.id, spec.environment.pip)
+    worker_env = runpod_worker.build_worker_env(
+        spec,
+        seed,
+        runtime_secrets=runtime_secrets,
+    )
+    worker_env["ATTEMPT"] = str(attempt_id)
+    endpoint_id, name, key_fingerprint = deploy_train_endpoint(
+        spec.gpu.type,
+        execution_timeout_ms=timeout_s * 1000,
+        name_suffix=suffix,
+        disk_gb=spec.gpu.disk_gb,
+        spec=spec,
+        **deadline_kwargs(deploy_train_endpoint, deadline_at),
+    )
+    payload = {
+        "hf_repo": spec.train.hf_repo,
+        "job_spec_json": spec.to_json(),
+        "phase": spec.phase,
+        "run_id": spec.run_id,
+        "attempt": attempt_id,
+        "seed": spec.seed,
+        "env": worker_env,
+        "extra_pip": extra_pip,
+        "source_snapshot": source_descriptor.to_dict(),
+        "deadline_at": deadline_at,
+    }
+    try:
+        require_create_allowance(deadline_at)
+        submitted_ts = time.time()
+        job_id = runpod_api.submit_job(
+            endpoint_id,
+            payload,
+            key_fingerprint=key_fingerprint,
+            **deadline_kwargs(runpod_api.submit_job, deadline_at),
+        )
+    except Exception as exc:
+        # the queue post is non-idempotent: only a positively confirmed endpoint deletion makes
+        # the original failure safe to retry. otherwise persist exact cleanup identity and stop.
+        deletion_confirmed = False
+        with contextlib.suppress(Exception):
+            deletion_confirmed = (
+                runpod_api.delete_endpoint_for_fingerprint(endpoint_id, key_fingerprint) is True
+            )
+        if deletion_confirmed:
+            raise
+        if on_handle is not None:
+            on_handle(
+                JobHandle(
+                    endpoint_id,
+                    name,
+                    key_fingerprint,
+                    None,
+                    attempt_id,
+                    time.time(),
+                ).to_dict()
+            )
+        raise UnreconciledCreateError(
+            "RunPod queue submission could not be reconciled and endpoint deletion was unconfirmed"
+        ) from exc
+    handle = JobHandle(
+        endpoint_id,
+        name,
+        key_fingerprint,
+        job_id,
+        attempt_id,
+        submitted_ts,
+    )
+    if log is not None:
+        print(
+            f"submitted job: endpoint={name} ({endpoint_id}) job={job_id} "
+            f"attempt={attempt} gpu={spec.gpu.type} phase={spec.phase} seed={seed}",
+            file=log,
+            flush=True,
+        )
+    if on_handle is not None:
+        on_handle(handle.to_dict())
+    hf_repo = spec.train.hf_repo
+    prefix = f"{spec.phase}/{spec.run_id}"
+    reader = (
+        make_hf_heartbeat_reader(
+            hf_repo,
+            prefix,
+            **deadline_kwargs(make_hf_heartbeat_reader, deadline_at),
+        )
+        if hf_repo
+        else None
+    )
+    failure_reader = (
+        make_hf_failure_detail_reader(
+            hf_repo,
+            prefix,
+            spec.phase,
+            attempt=attempt_id,
+            **deadline_kwargs(make_hf_failure_detail_reader, deadline_at),
+        )
+        if hf_repo
+        else None
+    )
+    return poll_job(
+        handle,
+        log=log,
+        heartbeat_reader=reader,
+        failure_detail_reader=failure_reader,
+        current_attempt=attempt_id,
+        **deadline_kwargs(poll_job, deadline_at),
+        on_last_gpu=on_last_gpu,
+        # the count actually rented for this attempt, which allocation may have resolved to fewer
+        # cards than the spec's ceiling named -- so read the effective spec, not the run's request.
+        **stall_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
+    )
 
 
 @dataclass
@@ -56,7 +236,7 @@ class _DeployContext:
         """
         if self.cache_volumes is not None:
             return bool(self.cache_volumes)
-        from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+        from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
         base = getattr(self.spec.gpu, "network_volume", None) if self.spec is not None else None
         return str(base or "") == WEIGHT_CACHE_VOLUME_NAME
@@ -110,16 +290,16 @@ def _prepare_quota_retry(
     # from this sweep and backoff.
     context.require_launchable(key_count, active_key)
     quota_deadline = context.create_deadline(key_count)
-    swept = _jobs._sweep_idle_flash_endpoints(
-        protected={_jobs.canonical_endpoint_name(name)},
+    swept = runpod_resources._sweep_idle_flash_endpoints(
+        protected={runpod_resources.canonical_endpoint_name(name)},
         min_idle_s=0.0,
         reap_warm=False,
-        **deadline_kwargs(_jobs._sweep_idle_flash_endpoints, quota_deadline),
+        **deadline_kwargs(runpod_resources._sweep_idle_flash_endpoints, quota_deadline),
     )
     wait_s = 30 * quota_attempt
     if context.deadline_at is not None:
         wait_s = min(wait_s, remaining_seconds(quota_deadline))
-    _jobs.logger.warning(
+    logger.warning(
         "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
         "retrying in %ds",
         quota_attempt + 1,
@@ -128,7 +308,7 @@ def _prepare_quota_retry(
         wait_s,
     )
     if wait_s > 0:
-        _jobs.time.sleep(wait_s)
+        time.sleep(wait_s)
 
 
 def _deploy_with_failover(
@@ -159,25 +339,25 @@ def _deploy_with_failover(
                 resource, owning_fingerprint = deploy_once()
                 break  # success
             except Exception as exc:
-                if _jobs._is_balance_error(exc):
+                if _is_balance_error(exc):
                     # a broke account can't be helped by sweeping idle endpoints: fail over now
                     deploy_failover_exc = exc
                     break
-                if not _jobs._is_workers_quota_error(exc):
+                if not _is_workers_quota_error(exc):
                     raise
                 deploy_failover_exc = exc
         if resource is not None:
             break
         if failovers_left > 0:
-            with _jobs.FLASH_SDK_LOCK:
+            with runpod_endpoints.FLASH_SDK_LOCK:
                 rp_keys.advance_key()
             failovers_left -= 1
             reason = (
                 "has insufficient balance"
-                if deploy_failover_exc is not None and _jobs._is_balance_error(deploy_failover_exc)
+                if deploy_failover_exc is not None and _is_balance_error(deploy_failover_exc)
                 else "worker quota exhausted after sweeping"
             )
-            _jobs.logger.warning(
+            logger.warning(
                 "RunPod account %s; failing over to the next RUNPOD_API_KEY account (%d configured)",
                 reason,
                 rp_keys.key_count(),
@@ -187,6 +367,17 @@ def _deploy_with_failover(
             "deploy_train_endpoint: deploy failover exhausted"
         )
     return resource, owning_fingerprint
+
+
+def apply_disk_gb(config, disk_gb: int | None) -> None:
+    """Raise the worker container disk while preserving the SDK default floor."""
+    if not disk_gb:
+        return
+    template = getattr(config, "template", None)
+    if template is None:
+        logger.warning("disk_gb=%s requested but endpoint config has no template", disk_gb)
+        return
+    template.containerDiskInGb = max(int(disk_gb), int(template.containerDiskInGb or 0))
 
 
 def deploy_train_endpoint(
@@ -211,30 +402,31 @@ def deploy_train_endpoint(
     from flash.providers.runpod.client import auth as rp_keys
     from flash.providers.runpod.client.auth import ensure_auth
 
-    _jobs._patch_runpod_backoff()
-    friendly = _jobs.canonical_gpu(friendly_gpu)
-    name = _jobs.endpoint_name(friendly, name_suffix)
-    image = _jobs.worker_image_for_gpu(friendly)
+    runpod_endpoints._patch_runpod_backoff()
+    friendly = canonical_gpu(friendly_gpu)
+    name = runpod_endpoints.endpoint_name(friendly, name_suffix)
+    image = runpod_worker.worker_image_for_gpu(friendly)
     context = _DeployContext(deadline_at, spec, cache_volumes, set())
 
     def _deploy_once() -> tuple[object, str]:
         """Create under one serialized account selection and return its owning fingerprint."""
         context.require_launchable(rp_keys.key_count(), rp_keys.active_key())
-        with _jobs.FLASH_SDK_LOCK:
+        with runpod_endpoints.FLASH_SDK_LOCK:
             owning_key = ensure_auth()
             # re-check the selected key under the lock: another deploy may advance the global key
             # after admission. an unreconciled real account must retain its grow slice or fail
             # closed.
             context.require_launchable(rp_keys.key_count(), owning_key)
-            owning_fingerprint = _jobs.runpod_api.key_fingerprint(owning_key)
-            _jobs.isolate_flash_state(name_suffix)
+            owning_fingerprint = runpod_api.key_fingerprint(owning_key)
+            runpod_endpoints.isolate_flash_state(name_suffix)
             kwargs = {
                 "name": name,
-                "gpu": _jobs.flash_gpu(friendly),
+                "gpu": flash_gpu(friendly),
                 # one worker occupies gpu.count cards of this class; count == 1 is the historical path.
                 "gpu_count": gpu_count_of(spec),
-                "min_cuda_version": _jobs.min_cuda_for(friendly),
-                "execution_timeout_ms": execution_timeout_ms or _jobs.DEFAULT_EXECUTION_TIMEOUT_MS,
+                "min_cuda_version": runpod_endpoints.min_cuda_for(friendly),
+                "execution_timeout_ms": execution_timeout_ms
+                or runpod_worker.DEFAULT_EXECUTION_TIMEOUT_MS,
                 "workers": (0, 1),
             }
             kwargs["image"] = image
@@ -245,18 +437,22 @@ def deploy_train_endpoint(
                 # spends against the raw deadline: this account's slice of the reserve is released
                 # by the line above, so the grow draws its own budget and still yields the create
                 # allowance. the slices of the accounts not yet reconciled stay held back.
-                _jobs.grow_weight_cache_volumes(spec, owning_key, deadline_at, wanted=cache_volumes)
+                runpod_resources.grow_weight_cache_volumes(
+                    spec, owning_key, deadline_at, wanted=cache_volumes
+                )
             # re-invoke factory per account (avoids reusing a volume id stamped for the prior account).
             override = endpoint_kwargs() if callable(endpoint_kwargs) else endpoint_kwargs
             kwargs.update(
-                override if override is not None else _jobs.weight_cache_endpoint_kwargs(spec)
+                override
+                if override is not None
+                else runpod_resources.weight_cache_endpoint_kwargs(spec)
             )
             ep = Endpoint(**kwargs)
             config = ep._build_resource_config()
-            _jobs.apply_disk_gb(config, disk_gb)
+            apply_disk_gb(config, disk_gb)
             rm = ResourceManager()
             if deadline_at is None:
-                resource = _jobs.asyncio.run(rm.get_or_deploy_resource(config))
+                resource = asyncio.run(rm.get_or_deploy_resource(config))
             else:
                 # this attempt's own grow has run by now (the reconciled check above), so the
                 # re-check is judged without its slice: charging it again would re-deduct a cost
@@ -266,8 +462,8 @@ def deploy_train_endpoint(
                 # create may spend only down to the failover grow reserve. yield the proven create
                 # allowance so a large reserve cannot produce a zero timeout.
                 remaining = max(CREATE_ALLOWANCE_S, remaining_seconds(create_deadline))
-                resource = _jobs.asyncio.run(
-                    _jobs.asyncio.wait_for(
+                resource = asyncio.run(
+                    asyncio.wait_for(
                         rm.get_or_deploy_resource(config),
                         timeout=remaining,
                     )
@@ -326,7 +522,7 @@ class _PollState:
 
 
 def _wall_deadline_result(context: _PollContext) -> PollResult | None:
-    if context.absolute_deadline is not None and _jobs.time.time() >= context.absolute_deadline:
+    if context.absolute_deadline is not None and time.time() >= context.absolute_deadline:
         return PollResult(False, failure="stalled", detail="run wall deadline exceeded")
     return None
 
@@ -334,14 +530,14 @@ def _wall_deadline_result(context: _PollContext) -> PollResult | None:
 def _read_job_status(context: _PollContext) -> tuple[dict | None, PollResult | None]:
     """Read one provider status; neither value means a transient error should be retried."""
     try:
-        status = _jobs.runpod_api.job_status(
+        status = runpod_api.job_status(
             context.handle.endpoint_id,
             context.handle.job_id,
             key_fingerprint=context.handle.key_fingerprint,
-            **deadline_kwargs(_jobs.runpod_api.job_status, context.absolute_deadline),
+            **deadline_kwargs(runpod_api.job_status, context.absolute_deadline),
         )
         context.poll_errors.reset()
-    except _jobs.runpod_api.RunpodApiError as exc:
+    except runpod_api.RunpodApiError as exc:
         if context.poll_errors.record(exc, deadline_at=context.absolute_deadline):
             return None, PollResult(False, failure="poll_error", detail=str(exc))
         return None, None
@@ -355,7 +551,7 @@ def _classify_terminal_status(
     status: Any,
 ) -> PollResult | None:
     """Return a terminal result, or None when polling must continue."""
-    if status in _jobs.TERMINAL_OK:
+    if status in TERMINAL_OK:
         # read heartbeats already committed at the wall deadline (deadline_at=None) so a job that
         # completes right at the boundary still surfaces its final per-step metrics for `flash runs log -f`
         forced_reader = (
@@ -365,18 +561,18 @@ def _classify_terminal_status(
         )
         state.last_hb_key, _ = surface_heartbeat(forced_reader, state.last_hb_key, context.say)
         try:
-            return PollResult(True, metrics=_jobs.decode_output(provider_status.get("output")))
+            return PollResult(True, metrics=decode_output(provider_status.get("output")))
         except RuntimeError as exc:
             output = provider_status.get("output")
             output_retriable = isinstance(output, dict) and output.get("_flash_retriable") is True
-            state.last_hb_key, retriable, oom = _jobs.surfaced_worker_flags(
+            state.last_hb_key, retriable, oom = surfaced_worker_flags(
                 context.heartbeat_reader,
                 state.last_hb_key,
                 context.say,
                 context.current_attempt,
                 launch_ts=context.launch_ts,
             )
-            detail = _jobs._append_failure_artifacts(str(exc), context.failure_detail_reader)
+            detail = _append_failure_artifacts(str(exc), context.failure_detail_reader)
             return PollResult(
                 False,
                 failure=(
@@ -386,28 +582,28 @@ def _classify_terminal_status(
                 ),
                 detail=detail,
             )
-    if status not in _jobs.TERMINAL_FAIL:
+    if status not in TERMINAL_FAIL:
         return None
     # this detail reaches the user-readable run log, so every part of it is sanitized before its
     # tail is selected: a control-plane secret echoed by the worker would otherwise be printed
     # verbatim, and slicing first could cut a credential at the boundary so its surviving part no
     # longer value-matches (the instance providers sanitize each part of theirs the same way).
-    detail = _jobs._safe_failure_text(provider_status.get("error") or "", 1500)
+    detail = _safe_failure_text(provider_status.get("error") or "", 1500)
     output = provider_status.get("output")
     if isinstance(output, dict) and output.get("stdout"):
-        detail += "\n--- worker stdout tail ---\n" + _jobs._safe_failure_text(output["stdout"])
+        detail += "\n--- worker stdout tail ---\n" + _safe_failure_text(output["stdout"])
     elif not detail:
-        detail = _jobs._safe_failure_text(output, 1500)
-    if status in _jobs.PLATFORM_TERMINATIONS:
+        detail = _safe_failure_text(output, 1500)
+    if status in PLATFORM_TERMINATIONS:
         return PollResult(False, failure="job_preempted", detail=f"[{status}] {detail}")
-    state.last_hb_key, retriable, oom = _jobs.surfaced_worker_flags(
+    state.last_hb_key, retriable, oom = surfaced_worker_flags(
         context.heartbeat_reader,
         state.last_hb_key,
         context.say,
         context.current_attempt,
         launch_ts=context.launch_ts,
     )
-    detail = _jobs._append_failure_artifacts(detail, context.failure_detail_reader)
+    detail = _append_failure_artifacts(detail, context.failure_detail_reader)
     return PollResult(
         False,
         failure="oom" if oom else ("job_preempted" if retriable else "job_failed"),
@@ -417,7 +613,7 @@ def _classify_terminal_status(
 
 def _worker_is_coming_up(at: float | None, now: float) -> bool:
     """Whether a worker sighting at ``at`` is recent enough to suppress the capacity timer."""
-    return at is not None and (now - at) <= _jobs.WORKER_COMING_UP_TTL_S
+    return at is not None and (now - at) <= WORKER_COMING_UP_TTL_S
 
 
 def _probe_worker_coming_up_at(context: _PollContext, now: float) -> float | None:
@@ -427,11 +623,11 @@ def _probe_worker_coming_up_at(context: _PollContext, now: float) -> float | Non
     leaves existing evidence unchanged.
     """
     try:
-        health = _jobs.runpod_api.endpoint_health_for_fingerprint(
+        health = runpod_api.endpoint_health_for_fingerprint(
             context.handle.endpoint_id,
             context.handle.key_fingerprint,
             **deadline_kwargs(
-                _jobs.runpod_api.endpoint_health_for_fingerprint,
+                runpod_api.endpoint_health_for_fingerprint,
                 context.absolute_deadline,
             ),
         )
@@ -485,11 +681,11 @@ def _classify_queue_state(
         return None
     state.last_health_probe = now
     try:
-        health = _jobs.runpod_api.endpoint_health_for_fingerprint(
+        health = runpod_api.endpoint_health_for_fingerprint(
             context.handle.endpoint_id,
             context.handle.key_fingerprint,
             **deadline_kwargs(
-                _jobs.runpod_api.endpoint_health_for_fingerprint,
+                runpod_api.endpoint_health_for_fingerprint,
                 context.absolute_deadline,
             ),
         )
@@ -520,7 +716,7 @@ def _classify_queue_state(
                 elapsed_s = max(0, int(now - state.queued_timer.since))
                 budget = (
                     f"{context.queue_grace_s:g}s"
-                    if _jobs.math.isfinite(context.queue_grace_s)
+                    if math.isfinite(context.queue_grace_s)
                     else "unbounded"
                 )
                 message += f"; waited {elapsed_s}s of {budget} capacity grace"
@@ -603,7 +799,7 @@ def _update_heartbeat(context: _PollContext, state: _PollState) -> None:
     # raw `hb_ts` above, which stays the uploaded-ts bookkeeping the advance checks below compare.
     # A heartbeat with no usable ts still clamps to now, preserving the existing behaviour that an
     # untimestamped heartbeat counts as progress. It is computed only where it is used: this loop's
-    # clock is observable through `_jobs.time.time`, so an unused read would be a visible side effect.
+    # clock is observable through `time.time`, so an unused read would be a visible side effect.
     #
     # heartbeat ordering is independent of other progress sources. a queue exemption or status
     # transition may already have advanced `last_progress` beyond this heartbeat's timestamp, so
@@ -636,7 +832,7 @@ def _classify_stall(context: _PollContext, state: _PollState, status: Any) -> Po
     #
     # Only for the no-worker case: once health shows one coming up, the queue timer is suppressed
     # and the setup grace legitimately governs the cold start, unscaled, as it always did.
-    now = _jobs.time.time()
+    now = time.time()
     if (
         status == "IN_QUEUE"
         and not state.ever_saw_worker
@@ -679,7 +875,7 @@ def _sleep_until_next_poll(context: _PollContext) -> None:
             return
         delay = min(delay, remaining)
     if delay > 0:
-        _jobs.time.sleep(delay)
+        time.sleep(delay)
 
 
 def poll_job(
@@ -706,7 +902,7 @@ def poll_job(
         raise ValueError("endpoint-only RunPod handles cannot be polled")
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     launch_ts = handle.started_ts
-    if not _jobs.math.isfinite(launch_ts) or launch_ts <= 0:
+    if not math.isfinite(launch_ts) or launch_ts <= 0:
         raise ValueError("persisted RunPod launch timestamp is invalid")
     attempt_id = handle.attempt if current_attempt is None else _attempt_int(current_attempt)
     if attempt_id is None or attempt_id != handle.attempt:
@@ -726,7 +922,7 @@ def poll_job(
         absolute_deadline=absolute_deadline,
         current_attempt=attempt_id,
         launch_ts=launch_ts,
-        next_gpu_note=_jobs.capacity_escalation_note(on_last_gpu),
+        next_gpu_note=capacity_escalation_note(on_last_gpu),
         poll_errors=PollErrorTracker(say, interval_s),
     )
     state = _PollState(
@@ -744,9 +940,9 @@ def poll_job(
         last_progress=launch_ts,
         seen_training_hb=False,
         last_health_probe=0.0,
-        unhealthy_timer=_jobs.GraceTimer(),
-        throttled_timer=_jobs.GraceTimer(),
-        queued_timer=_jobs.GraceTimer(),
+        unhealthy_timer=GraceTimer(),
+        throttled_timer=GraceTimer(),
+        queued_timer=GraceTimer(),
         # a runpod job stays IN_QUEUE for the whole worker cold start, image pull included, so the
         # queue timer alone cannot tell "runpod never gave us the gpu" from "the gpu arrived and we
         # are still pulling a multi-GB image". the unhealthy/throttled timers already refuse to fire
@@ -785,12 +981,12 @@ def poll_job(
             # launch anchor on poll one, which is exactly how a delayed reattach used to win back a
             # whole setup window before any evidence of progress had been seen.
             if state.last_status is not None:
-                state.last_progress = _jobs.time.time()
+                state.last_progress = time.time()
             state.last_status = status
         terminal = _classify_terminal_status(context, state, provider_status, status)
         if terminal is not None:
             return terminal
-        now = _jobs.time.time()
+        now = time.time()
         terminal = _classify_queue_state(context, state, status, now)
         if terminal is not None:
             return terminal

@@ -16,12 +16,14 @@ import threading
 import time
 from collections.abc import Callable
 
+import flash.engine.worker.io.hf as _worker_hf
 from flash.engine.worker.io.heartbeat import join_while_draining
-from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.train.core.lifecycle.checkpoint_lifecycle import CheckpointLedger
+from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 from flash.engine.worker.train.entry.backend_common import (
     completed_checkpoint_step,
+    export_peft_adapter,
     stage_verl_resume,
+    stamp_adapter_dir_provenance,
     undiscovered_checkpoint_dirs,
 )
 from flash.engine.worker.verl.checkpoints import (
@@ -29,19 +31,6 @@ from flash.engine.worker.verl.checkpoints import (
     MergeDiskHeadroomError,
     resume_checkpoint_is_loadable,
 )
-
-
-def _rl_train():
-    """The orchestrator module, imported lazily because it imports this one.
-
-    `export_peft_adapter`, `stamp_adapter_dir_provenance`, and `_deployable_adapter_on_hf` are
-    defined elsewhere but patched on `rl_train` by the upload tests. Binding them here would
-    capture the originals, so the patches would rebind an object this module never reads and the
-    uploader would perform real exports and Hub reads under test.
-    """
-    from flash.engine.worker.train.entry import rl_train
-
-    return rl_train
 
 
 class _VerlResumeUploader:
@@ -102,7 +91,7 @@ class _VerlResumeUploader:
         required step without publishing its deployable artifact.
         """
         for step in sorted(self.required_steps):
-            if step <= int(resume_step) and _rl_train()._deployable_adapter_on_hf(step):
+            if step <= int(resume_step) and _worker_hf._deployable_adapter_on_hf(step):
                 self.lifecycle.mark_deployable_published(step)
 
     def start(self) -> None:
@@ -161,24 +150,26 @@ class _VerlResumeUploader:
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
         shutil.rmtree(adapter_dir, ignore_errors=True)
         os.makedirs(adapter_dir, exist_ok=True)
-        _rl_train().export_peft_adapter(
+        export_peft_adapter(
             actor_dir, adapter_dir, base_model_id=self.model_id, python_bin=self.python_bin
         )
         # the served adapter needs its preprocessor alongside it, exactly as the final publish does:
         # the processor on a multimodal job (tokenizer + image preprocessor), else the tokenizer.
         self.preprocessor.save_pretrained(adapter_dir)
-        _rl_train().stamp_adapter_dir_provenance(
+        stamp_adapter_dir_provenance(
             adapter_dir,
             self.model_id,
             self.model_revision,
             exclude_modules=self.exclude_modules,
         )
-        _w.write_base_model_provenance(adapter_dir, self.model_id, self.model_revision)
+        _worker_hf.write_base_model_provenance(adapter_dir, self.model_id, self.model_revision)
         return adapter_dir
 
     def _publish_staged(self, step: int, adapter_dir: str) -> None:
         """make an already-staged adapter durable and servable."""
-        _w.publish_deployable_checkpoint(adapter_dir, step, required=True, _provenance_ready=True)
+        _worker_hf.publish_deployable_checkpoint(
+            adapter_dir, step, required=True, _provenance_ready=True
+        )
         self.lifecycle.mark_deployable_published(step)
 
     def _publish_ready(self) -> None:
@@ -230,7 +221,7 @@ class _VerlResumeUploader:
                     if step not in self._resume_attempted:
                         self._resume_attempted.add(step)
                         try:
-                            _w.upload_resume_checkpoint(
+                            _worker_hf.upload_resume_checkpoint(
                                 step,
                                 path,
                                 after_upload=lambda step=step: self.lifecycle.mark_resume_uploaded(
@@ -267,7 +258,7 @@ def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
     incompatible one also streamed -- without it, a repeated discard would starve the compatible one
     every retry (the remote max-step pick never advances past the checkpoint this attempt rejects).
     """
-    resume = _w.hf_resume_checkpoint(
+    resume = _worker_hf.hf_resume_checkpoint(
         prefer=lambda path: resume_checkpoint_is_loadable(path, world_size=world_size)
     )
     if not resume:

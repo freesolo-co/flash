@@ -335,7 +335,9 @@ _reject_duplicate_keys = reject_duplicate_keys(
 
 
 def _require_current_attempt(capability: dict[str, Any]) -> None:
-    from flash.runner import _internal_spec_from_status, _latest_reserved_attempt, get_status
+    from flash.runner.lifecycle.attempts import _latest_reserved_attempt
+    from flash.runner.lifecycle.state import _internal_spec_from_status
+    from flash.runner.lifecycle.status import get_status
 
     try:
         status = get_status(capability["run_id"])

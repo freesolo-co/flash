@@ -35,7 +35,7 @@ def test_checkpoint_export_saves_complete_processor_sidecars(monkeypatch, tmp_pa
 
     monkeypatch.setattr(checkpoints, "export_peft_adapter", export)
     monkeypatch.setattr(checkpoints, "stamp_adapter_dir_provenance", lambda *args, **kwargs: None)
-    monkeypatch.setattr(checkpoints._w, "write_base_model_provenance", lambda *args: None)
+    monkeypatch.setattr(checkpoints._worker_hf, "write_base_model_provenance", lambda *args: None)
 
     checkpoints._export_checkpoint_adapter(
         str(actor_dir),
@@ -74,7 +74,7 @@ def test_multimodal_checkpoint_export_passes_explicit_modality_marker(monkeypatc
 
     monkeypatch.setattr(checkpoints, "export_peft_adapter", export)
     monkeypatch.setattr(checkpoints, "stamp_adapter_dir_provenance", stamp)
-    monkeypatch.setattr(checkpoints._w, "write_base_model_provenance", lambda *args: None)
+    monkeypatch.setattr(checkpoints._worker_hf, "write_base_model_provenance", lambda *args: None)
 
     checkpoints._export_checkpoint_adapter(
         str(actor_dir),
@@ -102,7 +102,7 @@ def test_text_checkpoint_export_does_not_invent_processor_sidecars(monkeypatch, 
 
     monkeypatch.setattr(checkpoints, "export_peft_adapter", export)
     monkeypatch.setattr(checkpoints, "stamp_adapter_dir_provenance", lambda *args, **kwargs: None)
-    monkeypatch.setattr(checkpoints._w, "write_base_model_provenance", lambda *args: None)
+    monkeypatch.setattr(checkpoints._worker_hf, "write_base_model_provenance", lambda *args: None)
 
     checkpoints._export_checkpoint_adapter(
         str(actor_dir),

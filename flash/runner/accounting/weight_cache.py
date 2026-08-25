@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-import flash.runner as runner
 from flash.core.catalog import ModelInfo
 from flash.core.spec import JobSpec
+
+WEIGHT_CACHE_VOLUME_NAME = "flash-weights"
+WEIGHT_CACHE_VOLUME_GB = 250
+_WEIGHT_CACHE_PEAK_FACTOR = 2.0
 
 
 def _download_gb(info: ModelInfo) -> float:
@@ -19,7 +22,7 @@ def _download_gb(info: ModelInfo) -> float:
 
 def _peak_gb(info: ModelInfo) -> float:
     """GB the volume must have free for this model to finish downloading."""
-    return runner._WEIGHT_CACHE_PEAK_FACTOR * runner._download_gb(info)
+    return _WEIGHT_CACHE_PEAK_FACTOR * _download_gb(info)
 
 
 def _fits_weight_cache(info: ModelInfo) -> bool:
@@ -30,7 +33,7 @@ def _fits_weight_cache(info: ModelInfo) -> bool:
     """
     if not info.params_b:
         return True
-    return runner._peak_gb(info) <= runner.WEIGHT_CACHE_VOLUME_GB
+    return _peak_gb(info) <= WEIGHT_CACHE_VOLUME_GB
 
 
 def weight_cache_catalog_peak_gb() -> float:
@@ -43,12 +46,12 @@ def weight_cache_catalog_peak_gb() -> float:
     """
     from flash.core.catalog import MODELS
 
-    cached = [info for info in MODELS.values() if runner._fits_weight_cache(info)]
+    cached = [info for info in MODELS.values() if _fits_weight_cache(info)]
     if not cached:
         return 0.0
-    largest = max(cached, key=runner._download_gb)
-    resident_others = sum(runner._download_gb(info) for info in cached if info is not largest)
-    return resident_others + runner._peak_gb(largest)
+    largest = max(cached, key=_download_gb)
+    resident_others = sum(_download_gb(info) for info in cached if info is not largest)
+    return resident_others + _peak_gb(largest)
 
 
 def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) -> JobSpec:
@@ -59,23 +62,23 @@ def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) ->
     oversized model still fails ``_fits_weight_cache``.
     """
     existing = getattr(spec.gpu, "network_volume", None)
-    if existing and existing != runner.WEIGHT_CACHE_VOLUME_NAME:
+    if existing and existing != WEIGHT_CACHE_VOLUME_NAME:
         return spec
-    attach = info is None or runner._fits_weight_cache(info)
-    pinned = existing == runner.WEIGHT_CACHE_VOLUME_NAME
+    attach = info is None or _fits_weight_cache(info)
+    pinned = existing == WEIGHT_CACHE_VOLUME_NAME
     # an already-pinned spec is only correct if it also carries the current managed size. a stale or
     # internally-round-tripped spec can hold the shared name at a previous, smaller size. taking the
     # no-op return there would deploy an undersized volume for models this size now admits.
-    sized = getattr(spec.gpu, "network_volume_gb", None) == runner.WEIGHT_CACHE_VOLUME_GB
+    sized = getattr(spec.gpu, "network_volume_gb", None) == WEIGHT_CACHE_VOLUME_GB
     if attach == pinned and (sized or not attach):
         return spec
     d = spec.to_internal_dict()
     if attach:
         d["gpu"] = {
             **d["gpu"],
-            "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
-            "network_volume_gb": runner.WEIGHT_CACHE_VOLUME_GB,
+            "network_volume": WEIGHT_CACHE_VOLUME_NAME,
+            "network_volume_gb": WEIGHT_CACHE_VOLUME_GB,
         }
     else:
         d["gpu"] = {**d["gpu"], "network_volume": None}
-    return runner.JobSpec.from_dict(d)
+    return JobSpec.from_dict(d)

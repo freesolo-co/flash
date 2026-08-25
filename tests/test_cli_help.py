@@ -11,7 +11,7 @@ import argparse
 
 import pytest
 
-import flash.cli as cli
+import flash.cli.parsing.main as cli
 
 
 def _registered_subcommands() -> set[str]:

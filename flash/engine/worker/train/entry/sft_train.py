@@ -14,10 +14,15 @@ import sys
 import threading
 import time
 
+import flash.engine.worker.io.heartbeat as _worker_heartbeat
+import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.model.adapter as _worker_adapter
+import flash.engine.worker.perf as _worker_perf
+import flash.engine.worker.runtime.state as _worker_state
+import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.adapters.lora_rank import alpha_from_adapter_config, rank_from_adapter_config
 from flash.engine.worker.runtime.kernel_warmup import KERNEL_CACHE_ENV_SUBDIRS
-from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
@@ -67,11 +72,11 @@ def _warmstart_adapter_path(
     run of any algorithm, so nothing here may describe either end as SFT: warm start continues one
     LoRA in place across every algorithm pair.
     """
-    spec = _w.JOB_SPEC
+    spec = _worker_state.JOB_SPEC
     source = spec.train.init_from_adapter if spec else ""
     if not source:
         return None
-    adapter_dir = _w._download_adapter(source)
+    adapter_dir = _worker_adapter._download_adapter(source)
     if not adapter_dir:
         raise RuntimeError("the prepared warm-start adapter could not be downloaded")
     config_path = os.path.join(adapter_dir, "adapter_config.json")
@@ -94,9 +99,9 @@ def _warmstart_adapter_path(
             f"{expected_alpha}; alpha changes are not supported"
         )
     if targeting is None:
-        _w.validate_warmstart_adapter(config, model_id, adapter_dir)
+        _worker_adapter.validate_warmstart_adapter(config, model_id, adapter_dir)
     else:
-        _w.validate_warmstart_adapter(config, model_id, adapter_dir, targeting)
+        _worker_adapter.validate_warmstart_adapter(config, model_id, adapter_dir, targeting)
     base = str(config.get("base_model_name_or_path") or "").strip()
     if base and base != model_id:
         raise ValueError("warm-start adapter base model does not match the target model")
@@ -134,7 +139,7 @@ def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
     prefers a lower loadable checkpoint over a higher incompatible one, so a repeated discard cannot
     starve a compatible checkpoint uploaded after the one this attempt already rejected.
     """
-    resume = _w.hf_resume_checkpoint(
+    resume = _worker_hf.hf_resume_checkpoint(
         prefer=lambda path: resume_checkpoint_is_loadable(path, world_size=world_size)
     )
     if not resume:
@@ -146,19 +151,19 @@ def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: i
     candidates = [step for step in required_steps if step <= resume_step]
     if not candidates:
         return set()
-    if not _w.HF_REPO:
+    if not _worker_state.HF_REPO:
         raise RuntimeError("required SFT saves have no artifact repository")
     durable: set[int] = set()
     for step in candidates:
-        marker = f"{_w.hf_prefix()}/checkpoints/step-{step}/adapter/adapter_config.json"
+        marker = f"{_worker_hf.hf_prefix()}/checkpoints/step-{step}/adapter/adapter_config.json"
         try:
-            exists = _w.hf_api().file_exists(
-                repo_id=_w.HF_REPO,
+            exists = _worker_hf.hf_api().file_exists(
+                repo_id=_worker_state.HF_REPO,
                 filename=marker,
                 repo_type="dataset",
             )
         except Exception as error:
-            raise _w.RetriableInfraError(
+            raise _worker_perf.RetriableInfraError(
                 f"could not verify required SFT save step {step} on hf"
             ) from error
         if exists:
@@ -292,16 +297,20 @@ print("FLASH_GPU_PROBE=" + json.dumps({
             timeout=150,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise _w.RetriableInfraError("gpu readiness probe failed in its subprocess") from error
+        raise _worker_perf.RetriableInfraError(
+            "gpu readiness probe failed in its subprocess"
+        ) from error
     output = "\n".join(part for part in (result.stdout, result.stderr) if part)
     if output:
         print(output, end="" if output.endswith("\n") else "\n", flush=True)
     if result.returncode != 0:
-        raise _w.RetriableInfraError(f"gpu readiness probe exited with status {result.returncode}")
+        raise _worker_perf.RetriableInfraError(
+            f"gpu readiness probe exited with status {result.returncode}"
+        )
     for line in result.stdout.splitlines():
         if line.startswith("FLASH_GPU_PROBE="):
             return json.loads(line.split("=", 1)[1])
-    raise _w.RetriableInfraError("gpu readiness probe returned no device metadata")
+    raise _worker_perf.RetriableInfraError("gpu readiness probe returned no device metadata")
 
 
 class _NvidiaSmiPeakSampler:
@@ -358,11 +367,11 @@ def _resolve_sft_grad_accum(effective_batch: int, **kwargs):
 
 
 def _resolve_sft_gradient_checkpointing(model_id: str, max_length: int, **kwargs) -> bool:
-    return _w.grad_checkpointing_on(model_id, max_length, **kwargs)
+    return _worker_perf.grad_checkpointing_on(model_id, max_length, **kwargs)
 
 
 def _resolve_sft_reentrant_gradient_checkpointing(model_id: str) -> bool:
-    return _w.grpo_use_reentrant(model_id)
+    return _worker_perf.grpo_use_reentrant(model_id)
 
 
 def _resolve_sft_fused_ce_backend(caps):
@@ -453,13 +462,13 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
     adapter_dir = outputs.adapter_dir
     train_wall = outputs.train_wall
     device_peak_gpu_gb = outputs.device_peak_gpu_gb
-    _w.heartbeat(
+    _worker_heartbeat.heartbeat(
         "sft_trained",
         train_wall=train_wall,
         step=verified.final_step,
-        gpu=_w.gpu_diagnostics(include_torch=False),
+        gpu=_worker_perf.gpu_diagnostics(include_torch=False),
     )
-    _w.write_train_meta(
+    _worker_finalize.write_train_meta(
         phase="sft",
         adapter_dir=adapter_dir,
         model_id=options.model_id,
@@ -474,7 +483,7 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "warm_started": bool(model.warmstart_adapter),
             "download_seconds": model.download_seconds,
             "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
-            "thinking": _w.THINKING,
+            "thinking": _worker_state.THINKING,
             "multimodal": data.multimodal,
             "gradient_checkpointing": model.gradient_checkpointing,
             "gradient_checkpointing_reentrant": model.reentrant_gradient_checkpointing,
@@ -665,7 +674,7 @@ def run_sft_train(spec=None) -> None:
             python_bin=child.python_bin,
             preprocessor=data.processor,
         )
-        _w.hf_upload_folder(adapter_dir, "adapter", required=True)
+        _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)
         # only a durably published adapter may suppress the final publish. the seeded resume step no
         # longer needs excluding by hand: it is credited as deployable_published only when its
         # adapter was actually found on hf, so a resume that carried resumable state without a
@@ -674,6 +683,6 @@ def run_sft_train(spec=None) -> None:
             final_save_due(final_step, options.save_at_steps)
             and final_step not in child.watcher.lifecycle.deployable_published_steps
         ):
-            _w.publish_deployable_checkpoint(adapter_dir, final_step)
+            _worker_hf.publish_deployable_checkpoint(adapter_dir, final_step)
         outputs = _SftOutputs(adapter_dir, train_wall, device_peak_gpu_gb)
     _write_sft_result(options, data, model, child, child_progress, verified, outputs)

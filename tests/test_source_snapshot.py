@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-import flash.snapshot.source_snapshot as source_snapshot
-from flash.snapshot.source_snapshot import (
+import flash.snapshot.archive as source_snapshot
+from flash.snapshot.archive import (
     SourceSnapshotDescriptor,
     SourceSnapshotError,
     attempt_materialization_path,
@@ -62,7 +62,7 @@ def test_default_archive_root_is_the_flash_package() -> None:
     assert "flash/__init__.py" in payload
     assert "flash/cli/__init__.py" in payload
     assert "flash/providers/__init__.py" in payload
-    assert "flash/snapshot/source_snapshot.py" in payload
+    assert "flash/snapshot/archive.py" in payload
     assert len(payload) > 100
 
 

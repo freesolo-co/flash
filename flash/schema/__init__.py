@@ -49,7 +49,7 @@ from flash.schema.fields import (
     _train_teacher,
     _wandb_spec,
 )
-from flash.serve.contract.contract import ADAPTER_REVISION_PATTERN
+from flash.serve.contract.protocol import ADAPTER_REVISION_PATTERN
 
 # the smallest rank the parser accepts, and so the smallest a source adapter can turn out to have.
 # unresolved warm starts use it instead of the serialization default for permissive client-side
@@ -464,8 +464,9 @@ def _parse_time_wider_shape_remedy(
     """
     try:
         from flash.providers.core.allocator import _executed_width, geometry_safe_gpu_cap
-        from flash.providers.core.base import MAX_COMBINATION_CARDS, wider_shape_remedy
+        from flash.providers.core.base import wider_shape_remedy
         from flash.providers.core.fit_errors import widenable_gpu_names
+        from flash.providers.core.sharding import MAX_COMBINATION_CARDS
 
         if not widenable_gpu_names((candidate,), (provider,) if provider else None):
             return ""

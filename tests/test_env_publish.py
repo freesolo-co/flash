@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
 from flash.server.domain.registry import envs
 from tests._helpers.source_snapshot import valid_source_snapshot
 
@@ -1105,8 +1107,8 @@ def test_record_environment_use_posts_to_backend(monkeypatch):
 
 
 def test_record_training_run_posts_to_backend(monkeypatch):
-    from flash.runner import RunStatus
-    from flash.server.domain.registry import run_registry
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.server.domain.registry import runs
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -1127,9 +1129,9 @@ def test_record_training_run_posts_to_backend(monkeypatch):
         seen["body"] = req.data
         return _Resp()
 
-    monkeypatch.setattr(run_registry.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(runs.urllib.request, "urlopen", fake_urlopen)
 
-    ok = run_registry.record_training_run(
+    ok = runs.record_training_run(
         status=RunStatus(
             run_id="flash-1",
             state="running",
@@ -1177,8 +1179,8 @@ def test_record_training_run_posts_to_backend(monkeypatch):
 
 
 def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
-    from flash.runner import RunStatus
-    from flash.server.domain.registry import run_registry
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.server.domain.registry import runs
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -1197,7 +1199,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
         seen["body"] = req.data
         return _Resp()
 
-    monkeypatch.setattr(run_registry.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(runs.urllib.request, "urlopen", fake_urlopen)
 
     spec = {
         "model": "Qwen/Qwen3.5-4B",
@@ -1209,7 +1211,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
     context = {"org_id": "org-1", "user_id": "user-1", "api_key_id": "key-1"}
 
     # terminal persistence clears the remote, so the effective worker spec retains the selected class.
-    run_registry.record_training_run(
+    runs.record_training_run(
         status=RunStatus(
             run_id="flash-1",
             state="cancelled",
@@ -1221,7 +1223,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
     assert json.loads(seen["body"])["gpuType"] == "A100 SXM"
 
     # before allocation, the authored head remains the best available attribution.
-    run_registry.record_training_run(
+    runs.record_training_run(
         status=RunStatus(
             run_id="flash-1",
             state="queued",
@@ -1233,14 +1235,13 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
 
 
 def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
-    from flash import runner
     from flash.core.spec import JobSpec
-    from flash.runner import RunStatus
-    from flash.server.domain.registry import run_registry
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.server.domain.registry import runs
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     seen: dict[str, object] = {}
 
     class _Resp:
@@ -1258,7 +1259,7 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
         seen["body"] = req.data
         return _Resp()
 
-    monkeypatch.setattr(run_registry.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(runs.urllib.request, "urlopen", fake_urlopen)
     spec = JobSpec.from_dict(
         {
             "run_id": "flash-1",
@@ -1270,7 +1271,7 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
     )
     persisted_spec = spec.to_dict()
     persisted_spec["project"] = " AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA "
-    runner._save_status(
+    runner_state._save_status(
         RunStatus(
             run_id="flash-1",
             state="running",
@@ -1280,7 +1281,7 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
         )
     )
 
-    ok = run_registry.record_training_checkpoint(
+    ok = runs.record_training_checkpoint(
         spec=spec,
         metrics={"cost_usd": 0.25},
         artifact_path="/tmp/artifacts",
@@ -1307,10 +1308,9 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
 def test_record_training_checkpoint_rejects_invalid_persisted_project(
     monkeypatch, persisted_project
 ):
-    from flash import runner
     from flash.core.spec import JobSpec
-    from flash.runner import RunStatus
-    from flash.server.domain.registry import run_registry
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.server.domain.registry import runs
 
     spec = JobSpec.from_dict(
         {
@@ -1332,15 +1332,15 @@ def test_record_training_checkpoint_rejects_invalid_persisted_project(
         spec=persisted_spec,
         platform_context={"org_id": "org-1"},
     )
-    monkeypatch.setattr(runner, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(runner_status, "get_status", lambda _run_id: status)
     monkeypatch.setattr(
-        run_registry,
+        runs,
         "_post",
         lambda *_args, **_kwargs: pytest.fail("invalid project must not be reported"),
     )
 
     assert (
-        run_registry.record_training_checkpoint(
+        runs.record_training_checkpoint(
             spec=spec,
             metrics={"cost_usd": 0.25},
             artifact_path="/tmp/artifacts",

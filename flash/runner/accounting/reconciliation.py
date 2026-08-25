@@ -5,9 +5,11 @@ from __future__ import annotations
 import contextlib
 import time
 
-import flash.runner as runner
 from flash.core.spec import JobSpec
-from flash.runner import RunStatus
+from flash.runner.accounting import costs
+from flash.runner.lifecycle import attempts, reporting, state
+from flash.runner.lifecycle import status as status_ops
+from flash.runner.lifecycle.state import RunStatus
 
 # the provider-allocated identifier that names the billable resource itself, per provider handle
 # above: runpod carries `endpoint_id`, lambda and vast carry `instance_id`. a record holding one of
@@ -64,30 +66,27 @@ def _remote_resource_identity(remote: object) -> tuple | None:
 def _expected_remote_matches(current: object, expected: dict | None) -> bool:
     if expected is None:
         return current is None
-    expected_identity = runner._remote_resource_identity(expected)
-    return (
-        expected_identity is not None
-        and runner._remote_resource_identity(current) == expected_identity
-    )
+    expected_identity = _remote_resource_identity(expected)
+    return expected_identity is not None and _remote_resource_identity(current) == expected_identity
 
 
 def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
     """Clear only the nonterminal remote that still names the destroyed resource."""
-    if runner._remote_resource_identity(expected_remote) is None:
+    if _remote_resource_identity(expected_remote) is None:
         return False
     report_status: RunStatus | None = None
-    with runner._status_guard(run_id):
-        status = runner.get_status(run_id)
-        if status.state in runner.TERMINAL_STATES:
+    with state._status_guard(run_id):
+        status = status_ops.get_status(run_id)
+        if status.state in state.TERMINAL_STATES:
             return False
-        if not runner._expected_remote_matches(status.remote, expected_remote):
+        if not _expected_remote_matches(status.remote, expected_remote):
             return False
         status.remote = None
         status.updated_at = time.time()
-        runner._save_status_unlocked(status)
+        state._save_status_unlocked(status)
         report_status = status
     if report_status is not None:
-        runner._report_status(report_status)
+        reporting._report_status(report_status)
     return True
 
 
@@ -99,20 +98,20 @@ def _compare_and_prepare_resubmit(
 ) -> bool:
     """Claim a nonterminal recovery launch only while its expected remote still owns the run."""
     report_status: RunStatus | None = None
-    with runner._status_guard(run_id):
-        status = runner.get_status(run_id)
-        if status.state in runner.TERMINAL_STATES:
+    with state._status_guard(run_id):
+        status = status_ops.get_status(run_id)
+        if status.state in state.TERMINAL_STATES:
             return False
         if expected_state is not None and status.state != expected_state:
             return False
-        if not runner._expected_remote_matches(status.remote, expected_remote):
+        if not _expected_remote_matches(status.remote, expected_remote):
             return False
         status.state = "provisioning"
         status.updated_at = time.time()
-        runner._save_status_unlocked(status)
+        state._save_status_unlocked(status)
         report_status = status
     if report_status is not None:
-        runner._report_status(report_status)
+        reporting._report_status(report_status)
     return True
 
 
@@ -123,29 +122,29 @@ def _compare_and_fail_remote(
 ) -> bool:
     """CAS a nonterminal expected remote to failed and confirm the durable write."""
     report_status: RunStatus | None = None
-    with runner._status_guard(run_id):
-        status = runner.get_status(run_id)
-        if status.state in runner.TERMINAL_STATES:
+    with state._status_guard(run_id):
+        status = status_ops.get_status(run_id)
+        if status.state in state.TERMINAL_STATES:
             return False
-        if not runner._expected_remote_matches(status.remote, expected_remote):
+        if not _expected_remote_matches(status.remote, expected_remote):
             return False
         status.state = "failed"
         status.error = error
         status.updated_at = time.time()
         if status.finished_at is None:
             status.finished_at = status.updated_at
-        runner._save_status_unlocked(status)
+        state._save_status_unlocked(status)
         report_status = status
-    confirmed = runner.get_status(run_id)
+    confirmed = status_ops.get_status(run_id)
     expected_after = expected_remote
     if (
         confirmed.state != "failed"
-        or not runner._expected_remote_matches(confirmed.remote, expected_after)
+        or not _expected_remote_matches(confirmed.remote, expected_after)
         or confirmed.error != error
     ):
         raise RuntimeError("terminal recovery failure was not durably confirmed")
     if report_status is not None:
-        runner._report_status(report_status)
+        reporting._report_status(report_status)
     return True
 
 
@@ -157,55 +156,53 @@ def _compare_and_complete_remote(
 ) -> bool:
     """Adopt strict completed artifacts only while the captured remote still owns the run."""
     report_status: RunStatus | None = None
-    with runner._status_guard(run_id):
-        status = runner.get_status(run_id)
-        if status.state in runner.TERMINAL_STATES:
+    with state._status_guard(run_id):
+        status = status_ops.get_status(run_id)
+        if status.state in state.TERMINAL_STATES:
             return False
-        if not runner._expected_remote_matches(status.remote, expected_remote):
+        if not _expected_remote_matches(status.remote, expected_remote):
             return False
     expected_attempt = (
         expected_remote.get("attempt")
         if isinstance(expected_remote, dict)
-        else runner._latest_reserved_attempt(run_id)
+        else attempts._latest_reserved_attempt(run_id)
     )
-    metrics, verified_attempt = runner.validate_terminal_source_metrics(
+    metrics, verified_attempt = status_ops.validate_terminal_source_metrics(
         status,
         metrics,
         expected_attempt=expected_attempt,
     )
-    if expected_remote is not None and not runner._record_cleanup_remote(run_id, expected_remote):
+    if expected_remote is not None and not _record_cleanup_remote(run_id, expected_remote):
         return False
-    recovered_cost = runner._persist_metrics(spec, metrics)
-    with runner._status_guard(run_id):
-        status = runner.get_status(run_id)
-        if status.state in runner.TERMINAL_STATES:
+    recovered_cost = status_ops._persist_metrics(spec, metrics)
+    with state._status_guard(run_id):
+        status = status_ops.get_status(run_id)
+        if status.state in state.TERMINAL_STATES:
             return False
-        if not runner._expected_remote_matches(status.remote, expected_remote):
+        if not _expected_remote_matches(status.remote, expected_remote):
             return False
         measured = float(status.cost_usd or 0.0) + recovered_cost
-        charge_usd = runner._status_estimated_charge(status, spec, fallback=measured)
+        charge_usd = costs._status_estimated_charge(status, spec, fallback=measured)
         status.state = "done"
         status.cost_usd = charge_usd
-        status.artifacts_dir = runner.artifacts_dir(spec)
+        status.artifacts_dir = state.artifacts_dir(spec)
         status.source_verified_attempt = verified_attempt
         status.updated_at = time.time()
         if status.finished_at is None:
             status.finished_at = status.updated_at
-        runner._save_status_unlocked(status)
+        state._save_status_unlocked(status)
         report_status = status
-    confirmed = runner.get_status(run_id)
-    if confirmed.state != "done" or not runner._expected_remote_matches(
-        confirmed.remote, expected_remote
-    ):
+    confirmed = status_ops.get_status(run_id)
+    if confirmed.state != "done" or not _expected_remote_matches(confirmed.remote, expected_remote):
         raise RuntimeError("terminal recovery completion was not durably confirmed")
     if report_status is not None:
-        runner._report_status(report_status)
+        reporting._report_status(report_status)
     return True
 
 
 def _canonical_cleanup_remote(remote: object) -> dict | None:
     """Return the complete strict teardown handle for one exact resource."""
-    if not isinstance(remote, dict) or runner._remote_resource_identity(remote) is None:
+    if not isinstance(remote, dict) or _remote_resource_identity(remote) is None:
         return None
     provider = remote.get("provider")
     try:
@@ -227,21 +224,21 @@ def _canonical_cleanup_remote(remote: object) -> dict | None:
 
 
 def _cleanup_remote_key(remote: object) -> tuple | None:
-    record = runner._canonical_cleanup_remote(remote)
+    record = _canonical_cleanup_remote(remote)
     if record is None:
         return None
-    return runner._remote_resource_identity(record), record["attempt"]
+    return _remote_resource_identity(record), record["attempt"]
 
 
 def _cleanup_remotes_from_raw(raw: dict) -> list[dict]:
-    value = raw.get(runner._CLEANUP_REMOTES_KEY, [])
+    value = raw.get(state._CLEANUP_REMOTES_KEY, [])
     if not isinstance(value, list):
         raise RuntimeError("stored cleanup remotes are invalid")
     records = []
     seen = set()
     for item in value:
-        record = runner._canonical_cleanup_remote(item)
-        key = runner._cleanup_remote_key(record)
+        record = _canonical_cleanup_remote(item)
+        key = _cleanup_remote_key(record)
         if record is None or key is None:
             raise RuntimeError("stored cleanup remote is invalid")
         if key not in seen:
@@ -251,18 +248,18 @@ def _cleanup_remotes_from_raw(raw: dict) -> list[dict]:
 
 
 def _snapshot_cleanup_remotes(run_id: str) -> list[dict]:
-    with runner._status_guard(run_id):
-        return runner._cleanup_remotes_from_raw(runner._load_status_json(run_id))
+    with state._status_guard(run_id):
+        return _cleanup_remotes_from_raw(status_ops._load_status_json(run_id))
 
 
 def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bool:
     expected_key = _teardown_removal_key(expected_remote)
     if expected_key is None:
         return False
-    with runner._status_guard(run_id):
-        raw = runner._load_status_json(run_id)
+    with state._status_guard(run_id):
+        raw = status_ops._load_status_json(run_id)
         try:
-            records = runner._cleanup_remotes_from_raw(raw)
+            records = _cleanup_remotes_from_raw(raw)
         except Exception:
             # the strict reader raises on the FIRST record it cannot canonicalize, and the drain
             # suppresses that -- so one bad sibling made every CONFIRMED-DELETED record undeletable,
@@ -270,22 +267,22 @@ def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bo
             # does not require understanding the others: keep the ones that cannot be parsed exactly
             # as they are on disk, drop only the record whose teardown was confirmed. nothing is
             # silently discarded, and the strict reader still guards every other write path.
-            value = raw.get(runner._CLEANUP_REMOTES_KEY, [])
+            value = raw.get(state._CLEANUP_REMOTES_KEY, [])
             if not isinstance(value, list):
                 return False
             remaining = [item for item in value if _teardown_removal_key(item) != expected_key]
             if len(remaining) == len(value):
                 return False
-            runner._save_status_unlocked(
-                runner._runstatus_from_json(raw),
+            state._save_status_unlocked(
+                status_ops._runstatus_from_json(raw),
                 _cleanup_remotes=remaining or None,
             )
             return True
         remaining = [record for record in records if _teardown_removal_key(record) != expected_key]
         if len(remaining) == len(records):
             return False
-        runner._save_status_unlocked(
-            runner._runstatus_from_json(raw),
+        state._save_status_unlocked(
+            status_ops._runstatus_from_json(raw),
             _cleanup_remotes=remaining or None,
         )
     return True
@@ -328,7 +325,7 @@ def _teardown_removal_key(record: object) -> tuple | None:
     `(identity, attempt)` and the lenient one is a 3-tuple, so they never compare equal and a record
     that canonicalizes is matched by its strict key on both sides.
     """
-    return runner._cleanup_remote_key(record) or _uncanonical_cleanup_remote_key(record)
+    return _cleanup_remote_key(record) or _uncanonical_cleanup_remote_key(record)
 
 
 def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
@@ -345,18 +342,18 @@ def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
     validates only `provider`. Dropping these records here is what strands them -- a live RunPod
     endpoint then bills forever with nothing left to tear it down.
     """
-    with runner._status_guard(run_id):
+    with state._status_guard(run_id):
         try:
-            raw = runner._load_status_json(run_id)
+            raw = status_ops._load_status_json(run_id)
         except FileNotFoundError:
             return []
-    value = raw.get(runner._CLEANUP_REMOTES_KEY, [])
+    value = raw.get(state._CLEANUP_REMOTES_KEY, [])
     if not isinstance(value, list):
         return []
     records: list[dict] = []
     seen = set()
     for item in value:
-        record = runner._canonical_cleanup_remote(item)
+        record = _canonical_cleanup_remote(item)
         if record is None:
             record = _uncanonical_teardown_record(item)
         key = _teardown_removal_key(record)
@@ -374,7 +371,7 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     # here. the strict reader stays in place for the write paths, where a malformed record must
     # not be silently dropped from the file.
     try:
-        records = runner._snapshot_cleanup_remotes(run_id)
+        records = _snapshot_cleanup_remotes(run_id)
     except Exception:
         records = _drainable_cleanup_remotes(run_id)
     attempted = set()
@@ -387,9 +384,7 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
         # a record that fails strict canonicalization still names a billable resource; the base
         # JobHandle validates only `provider`, and the runpod teardown resolves the deployed
         # 16-char fingerprint itself. skipping it here would leave that resource billing forever.
-        identity = runner._remote_resource_identity(record) or _uncanonical_cleanup_remote_key(
-            record
-        )
+        identity = _remote_resource_identity(record) or _uncanonical_cleanup_remote_key(record)
         if identity is None:
             continue
         attempted.add(identity)
@@ -399,51 +394,51 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
             continue
         if resource_deleted:
             with contextlib.suppress(Exception):
-                runner._compare_and_remove_cleanup_remote(run_id, record)
+                _compare_and_remove_cleanup_remote(run_id, record)
     return attempted
 
 
 def _record_cleanup_remote(run_id: str, remote: dict) -> bool:
     """Persist one exact cleanup identity without changing the active remote."""
-    record = runner._canonical_cleanup_remote(remote)
-    key = runner._cleanup_remote_key(record)
+    record = _canonical_cleanup_remote(remote)
+    key = _cleanup_remote_key(record)
     if record is None or key is None:
         return False
     report_status: RunStatus | None = None
-    with runner._status_guard(run_id):
-        raw = runner._load_status_json(run_id)
-        status = runner._runstatus_from_json(raw)
-        records = runner._cleanup_remotes_from_raw(raw)
-        if all(runner._cleanup_remote_key(existing) != key for existing in records):
+    with state._status_guard(run_id):
+        raw = status_ops._load_status_json(run_id)
+        status = status_ops._runstatus_from_json(raw)
+        records = _cleanup_remotes_from_raw(raw)
+        if all(_cleanup_remote_key(existing) != key for existing in records):
             records.append(record)
         status.updated_at = time.time()
-        runner._save_status_unlocked(status, _cleanup_remotes=records)
+        state._save_status_unlocked(status, _cleanup_remotes=records)
         report_status = status
     if report_status is not None:
-        runner._report_status(report_status)
+        reporting._report_status(report_status)
     return True
 
 
 def _preserve_cleanup_remote(run_id: str, remote: dict) -> bool:
     """Persist cleanup identity without changing a terminal lifecycle state."""
-    record = runner._canonical_cleanup_remote(remote)
-    key = runner._cleanup_remote_key(record)
+    record = _canonical_cleanup_remote(remote)
+    key = _cleanup_remote_key(record)
     if record is None or key is None:
         return False
     report_status: RunStatus | None = None
-    with runner._status_guard(run_id):
-        raw = runner._load_status_json(run_id)
-        status = runner._runstatus_from_json(raw)
-        records = runner._cleanup_remotes_from_raw(raw)
-        if all(runner._cleanup_remote_key(existing) != key for existing in records):
+    with state._status_guard(run_id):
+        raw = status_ops._load_status_json(run_id)
+        status = status_ops._runstatus_from_json(raw)
+        records = _cleanup_remotes_from_raw(raw)
+        if all(_cleanup_remote_key(existing) != key for existing in records):
             records.append(record)
-        current_identity = runner._remote_resource_identity(status.remote)
-        identity = runner._remote_resource_identity(record)
+        current_identity = _remote_resource_identity(status.remote)
+        identity = _remote_resource_identity(record)
         if current_identity is None or current_identity == identity:
             status.remote = dict(remote)
         status.updated_at = time.time()
-        runner._save_status_unlocked(status, _cleanup_remotes=records)
+        state._save_status_unlocked(status, _cleanup_remotes=records)
         report_status = status
     if report_status is not None:
-        runner._report_status(report_status)
+        reporting._report_status(report_status)
     return True

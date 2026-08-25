@@ -1,8 +1,5 @@
 """The FSDP sharding strategy a multi-card run trains under, and what it costs per card.
 
-Split out of ``flash.providers.base`` (which is at its file-size limit) and re-exported from there,
-so every existing import keeps working and there is still exactly one definition of each rule.
-
 ZeRO-3 (verl's default, ``reshard_after_forward=true``) re-gathers each parameter shard for the
 backward and frees it again, so a card only ever holds its own slice. ZeRO-2 keeps the gathered copy
 resident instead: one fewer all-gather per step, paid for in per-card memory.

@@ -32,7 +32,7 @@ BIG_GRPO = (
 
 def _overrides(*argv: str) -> list[str]:
     """the override list the real parser produces for `flash train run.toml <argv>`."""
-    from flash.cli import _build_parser
+    from flash.cli.parsing.main import _build_parser
 
     return _build_parser().parse_args(["train", "run.toml", *argv]).overrides
 
@@ -138,7 +138,7 @@ def test_gpus_is_validated_by_the_same_bound_as_the_config_key(tmp_path, bad):
 def test_a_non_integer_gpus_is_refused_at_parse_time(bad, capsys):
     # `--gpus 2.5` must not reach the config as the literal string "gpu.count=2.5" and get
     # diagnosed as a TOML problem. argparse rejects it where the user typed it.
-    from flash.cli import _build_parser
+    from flash.cli.parsing.main import _build_parser
 
     with pytest.raises(SystemExit):
         _build_parser().parse_args(["train", "run.toml", "--gpus", bad])
@@ -163,7 +163,7 @@ def test_gpus_is_accepted_on_every_provider(tmp_path, provider):
 
 def test_the_help_explains_auto_sizing_and_authored_ceilings():
     """The flag must distinguish an omitted auto-size from an authored hard ceiling."""
-    from flash.cli import _build_parser
+    from flash.cli.parsing.main import _build_parser
 
     # render the train subparser's help, which is the text `flash train --help` prints.
     sub = _build_parser()._subparsers._group_actions[0].choices["train"]  # type: ignore[union-attr]
@@ -290,7 +290,7 @@ def test_the_public_run_record_never_reports_the_allocated_count():
     IS recorded, but only in effective_preparation, which to_dict() pops as server-internal -- so
     if a future change starts publishing it there, this fails and the doc gets rewritten with it.
     """
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
     submitted_ceiling = 4
     status = RunStatus(

@@ -15,8 +15,6 @@ from flash.providers import (
 )
 from flash.providers.core.base import (
     GPU_INFO,
-    MAX_COMBINATION_CARDS,
-    SHARD_VRAM_EFFICIENCY,
     Allocation,
     AllocationConstraints,
     Candidate,
@@ -26,7 +24,6 @@ from flash.providers.core.base import (
     _run_cost_key,
     authored_gpu_ceiling,
     canonical_gpu,
-    combined_vram_gb,
     largest_rentable_count,
     providers_for,
     rentable_gpu_counts,
@@ -41,6 +38,11 @@ from flash.providers.core.fit_errors import (
     rents_arbitrary_card_counts,
     vram_fit_error_message,
     widenable_gpu_names,
+)
+from flash.providers.core.sharding import (
+    MAX_COMBINATION_CARDS,
+    SHARD_VRAM_EFFICIENCY,
+    combined_vram_gb,
 )
 
 logger = get_logger(__name__)

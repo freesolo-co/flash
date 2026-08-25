@@ -61,7 +61,7 @@ def _artifact_namespace_problem(value: str) -> str:
         )
     from huggingface_hub.utils import validate_repo_id
 
-    from flash.runner import _environment_artifact_repo_name
+    from flash.runner.accounting.artifacts import _environment_artifact_repo_name
 
     # validate the id that WILL be created, not the segment in isolation: the repo half is
     # generated and already known-good, so anything rejected here is the operator's namespace.

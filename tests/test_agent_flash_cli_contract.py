@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+import flash.runner.lifecycle.state as runner_state
+
 # --- cross-folder sys.path shim: make ../agent/src importable -----------------
 _AGENT_SRC = Path(__file__).resolve().parents[2] / "agent" / "src"
 if _AGENT_SRC.is_dir() and str(_AGENT_SRC) not in sys.path:
@@ -38,15 +40,10 @@ def _import_agent(modpath: str):
 
 
 # --- flash side (always importable in the flash venv) ---------------------
-from flash.cli import main
+from flash.cli.parsing.main import main
 from flash.core.spec import JobSpec
-from flash.runner import (
-    TERMINAL_STATES,
-    RunStatus,
-    get_status,
-    new_run_id,
-    require_safe_run_id,
-)
+from flash.runner.lifecycle.state import TERMINAL_STATES, RunStatus, new_run_id, require_safe_run_id
+from flash.runner.lifecycle.status import get_status
 
 
 @pytest.mark.parametrize(
@@ -128,7 +125,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatc
             seen["client_train_schema"] = client_train_schema
             return {"run_id": new_run_id(), "state": "dry_run", "spec": spec}
 
-    monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: _FakeClient())
+    monkeypatch.setattr("flash.cli.commands.ops.train.client_from_config", lambda: _FakeClient())
 
     rc = main(["train", str(config), "--dry-run"])
     assert rc == 0
@@ -148,7 +145,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatc
 
 
 def test_new_run_id_format_is_filesystem_safe_and_stable() -> None:
-    """flash.runner.new_run_id() must stay within the safe run-id alphabet (it flows
+    """flash.runner_state.new_run_id() must stay within the safe run-id alphabet (it flows
     into filesystem paths AND into the agent's tracker as best_run_id/run_id). The
     agent resolves the flash run id from the tracker (workflows.common
     .training_run_id_from_tracker) and threads it back into its output schema, so the
@@ -190,14 +187,14 @@ def test_agent_tracker_run_id_round_trips_through_resolver(tmp_path: Path) -> No
 
 def test_agent_terminal_states_subset_of_flash_terminal_states() -> None:
     """The agent waits for a run to reach a terminal state before reading final
-    metrics. flash.runner.TERMINAL_STATES is the source of truth; the CLI's
+    metrics. flash.runner_state.TERMINAL_STATES is the source of truth; the CLI's
     _CLI_DONE_STATES (what `flash`/the agent polls until) must be a superset and must
     include every flash terminal state, or the agent could poll forever on a state
     the CLI never treats as done.
     """
-    import flash.cli as cli_main
+    import flash.cli.commands.ops.runs as cli_runs
 
-    assert TERMINAL_STATES <= cli_main._CLI_DONE_STATES
+    assert TERMINAL_STATES <= cli_runs._CLI_DONE_STATES
     # "done" is the success terminal the agent's verifier gates run_completed on.
     assert "done" in TERMINAL_STATES
     assert {"done", "failed", "cancelled"} <= TERMINAL_STATES
@@ -209,16 +206,15 @@ def test_get_status_returns_fields_the_agent_reads(tmp_path, monkeypatch) -> Non
     persisted RunStatus exposes those keys so a field rename in RunStatus can't
     silently strip what the agent/CLI consume.
     """
-    from flash import runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     rid = new_run_id()
     status = RunStatus(
         run_id=rid,
         state="done",
         spec={"model": "m", "project": "11111111-1111-4111-8111-111111111111"},
     )
-    runner._save_status(status)
+    runner_state._save_status(status)
 
     loaded = get_status(rid).to_dict()
     for key in ("run_id", "state", "spec", "cost_usd", "updated_at", "created_at", "adapter_ref"):
@@ -228,9 +224,8 @@ def test_get_status_returns_fields_the_agent_reads(tmp_path, monkeypatch) -> Non
 
 
 def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
-    from flash import runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     rid = "flash-status-adapter-ref"
     spec = JobSpec.from_dict(
         {
@@ -249,7 +244,7 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
     # from the internal worker spec persisted in effective_preparation (present for every
     # provisioned run), exactly as submit_job records it.
     worker_prep = {"worker_spec": spec.to_internal_dict()}
-    runner._save_status(
+    runner_state._save_status(
         RunStatus(
             run_id=rid, state="running", spec=spec.to_dict(), effective_preparation=worker_prep
         )
@@ -257,7 +252,7 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
     # a non-terminal run does not expose the adapter ref even once its worker spec is prepared
     assert get_status(rid).to_dict()["adapter_ref"] is None
 
-    runner._save_status(
+    runner_state._save_status(
         RunStatus(run_id=rid, state="done", spec=spec.to_dict(), effective_preparation=worker_prep)
     )
     # the public short ref: exactly what train.init_from_adapter accepts
@@ -270,9 +265,8 @@ def test_done_status_with_removed_spec_key_serializes_without_adapter_ref(
     # a record written by an OLDER plane can carry a since-removed spec key (gpu.exact_type,
     # pre-#670); strict JobSpec parsing raises on it. the record must still serialize (one bad
     # record must not 500 the whole runs list) -- it just resolves no adapter ref.
-    from flash import runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     rid = "flash-status-legacy-spec-key"
     legacy_spec = {
         "run_id": rid,
@@ -283,14 +277,14 @@ def test_done_status_with_removed_spec_key_serializes_without_adapter_ref(
     }
     # written directly: these records were created by the older plane and sit on disk as-is
     # (the current plane's _save_status could never produce one).
-    os.makedirs(runner.RUNS_DIR, exist_ok=True)
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
     record = RunStatus(
         run_id=rid,
         state="done",
         spec=legacy_spec,
         effective_preparation={"worker_spec": dict(legacy_spec)},
     )
-    with open(os.path.join(runner.RUNS_DIR, f"{rid}.json"), "w") as f:
+    with open(os.path.join(runner_state.RUNS_DIR, f"{rid}.json"), "w") as f:
         json.dump(dataclasses.asdict(record), f)
     loaded = get_status(rid).to_dict()
     assert loaded["state"] == "done"

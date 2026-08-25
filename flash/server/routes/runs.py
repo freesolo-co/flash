@@ -10,14 +10,15 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
-import flash.runner as _runner
 from flash.engine.profiling.image_tokens import ImageGeometryUnavailable
-from flash.runner import (
+from flash.runner.lifecycle import status as runner_status
+from flash.runner.lifecycle.preparation import WarmStartPreparationError
+from flash.runner.lifecycle.state import new_run_id, runs_file_path
+from flash.runner.lifecycle.submit import SourceSnapshotPublicationError
+from flash.runner.supervise.deploy import (
     DeploymentRevocationError,
     DeploymentStatePersistenceError,
     cancel_run,
-    new_run_id,
-    runs_file_path,
 )
 from flash.schema import train_schema_metadata
 from flash.serve.deployment.preflight import ServingPreflightError
@@ -246,7 +247,7 @@ def _submit_failure_http_error(exc: Exception) -> HTTPException:
     Everything reaching here is a bad request by default. Submit-time errors may opt into 503 with
     a truthy ``plane_fault`` attribute when the submitter cannot fix the failure by changing the spec.
     """
-    if isinstance(exc, _runner.SourceSnapshotPublicationError):
+    if isinstance(exc, SourceSnapshotPublicationError):
         return HTTPException(status_code=503, detail=str(exc))
     if (
         isinstance(exc, (ImageGeometryUnavailable, TeacherBrokerConfigurationError))
@@ -290,7 +291,7 @@ def _dispose_failed_submission(
         # record that already reached a terminal state is left untouched.
         terminalized = False
         try:
-            _runner._update(
+            runner_status._update(
                 run_id,
                 "failed",
                 error=(
@@ -375,7 +376,7 @@ def create_run(
         # resolve the class off the module rather than binding it at import: flash.runner is
         # reloaded (tests, and any reimport), which rebinds the class to a new object, and a
         # bound name would silently stop matching the error the runner actually raises.
-        except _runner.WarmStartPreparationError as exc:
+        except WarmStartPreparationError as exc:
             # only failures raised while resolving the warm-start source reach here, so the adapter
             # really is the cause. the reason itself stays out of the response on purpose: it can
             # name internal storage paths and source-run internals. it is logged instead.
@@ -499,7 +500,7 @@ def run_worker_output(
     status = readable_run(run_id, key, x_freesolo_org_id)
     # hf_repo + run_id (adapter prefix) are platform-managed and stripped from the public spec;
     # the worker artifact repo lives under the internal carrier (see _internal_spec_from_status).
-    from flash.runner import _internal_spec_from_status
+    from flash.runner.lifecycle.state import _internal_spec_from_status
 
     return {
         "run_id": run_id,
@@ -541,7 +542,7 @@ def run_checkpoints(run_id: str, key: Annotated[dict, Depends(require_key)]):
     status = owned_run(run_id, key)
     # checkpoint listing keys off hf_repo + run_id, both platform-managed and stripped from the
     # public spec; resolve them from the internal carrier (see _internal_spec_from_status).
-    from flash.runner import _internal_spec_from_status
+    from flash.runner.lifecycle.state import _internal_spec_from_status
 
     spec = _internal_spec_from_status(status)
     checkpoints = _app.list_checkpoints(spec)

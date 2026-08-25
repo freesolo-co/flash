@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import atexit
 import contextlib
 import math
 import os
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -14,25 +12,19 @@ from urllib.parse import quote
 
 import httpx
 
+import flash.serve.contract.errors as serving_errors
+import flash.serve.contract.urls as serving_urls
 from flash._internal.logging import get_logger
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.envs.loading.loader import is_commit_sha
 from flash.schema import format_adapter_revision
-from flash.serve.contract.contract import (
+from flash.serve.contract.protocol import (
     PREFERRED_SERVING_CAPABILITIES,
     REQUIRED_SERVING_CAPABILITIES,
     REVISION_PROVENANCE_CAPABILITY,
     THINKING_STRUCTURED_OUTPUTS_CAPABILITY,
     ServingHealthError,
     parse_serving_health,
-)
-from flash.serve.contract.errors import (  # noqa: F401 -- re-exported: callers import these from here
-    ActivationOutcomeUnknown,
-    AdapterConfigMissing,
-    AdapterTensorMissing,
-    AliasThinkingSilent,
-    RetryableServingUnavailable,
-    ServingError,
 )
 from flash.serve.contract.responses import (
     active_alias_target as _active_alias_target,
@@ -41,193 +33,23 @@ from flash.serve.contract.responses import (
     matches_revision_identity as _matches_revision_identity,
 )
 from flash.serve.contract.responses import (
-    serving_status_error as _serving_status_error,
-)
-from flash.serve.contract.responses import (
     validate_activation_response as _validate_activation_response,
 )
-from flash.serve.contract.urls import (  # noqa: F401 -- re-exported: callers import these from here
-    DEV_FREESOLO_SERVING_URL,
-    PROD_FREESOLO_SERVING_URL,
-    default_serving_url,
-    is_freesolo_hosted_url,
-    openai_base_url,
-    serving_base_url,
-    serving_control_url,
-)
-from flash.serve.contract.urls import internal_key_header as _internal_key_header
+from flash.serve.deployment import adapter_check
+from flash.serve.request import thinking as thinking_support
+from flash.serve.request import transport
 
 logger = get_logger(__name__)
 
-DEFAULT_FREESOLO_SERVING_URL = default_serving_url()
 READBACK_DELAY_SECONDS = 0.5
 READBACK_MAX_DELAY_SECONDS = 2.0
-# how long to wait for serving to report a newly registered revision ready. the wait covers a COLD
-# engine: serving pulls the base model, starts the engine, then loads the adapter, and none of that
-# is proportional to the adapter, which is megabytes. so the budget scales with the BASE model.
-#
-# the floor is NOT the old 5 minutes: a 4B deploy was observed timing out on a cold engine and then
-# succeeding in ~4.6 minutes against the now-warm one, so 5 minutes did not even cover the warm case
-# with margin. the floor is doubled to 10 and the per-B term covers a bigger base on top.
-#
-# the cap is the real constraint, and readiness is only one leg of the attempt. the same deploy also
-# spends time before this wait (resolving the hub revision, downloading the adapter config to read
-# its rank, the capability check, registration) and after it (600s of immutable smoke, activation,
-# then 600s of alias smoke). the whole attempt must finish inside both
-# `_DEPLOYMENT_STALE_SECONDS` (2400s, when the plane declares an in-flight attempt abandoned) and
-# the CLI's 2400s default `--wait`, or a deploy that is still progressing is reaped or reported as
-# failed.
-#
-# so the cap leaves real slack rather than just clearing smoke: 900 + 600 + 600 = 2100, keeping 300s
-# for the surrounding hub reads, registration, activation, and poll latency, none of which share a
-# wall-clock bound with this one.
-#
-# a longer budget costs little: an adapter serving REJECTS raises as soon as the revision reports
-# `failed`, so only a revision that is genuinely still loading waits out the clock.
 REVISION_READY_MIN_BUDGET_SECONDS = 10 * 60.0
 REVISION_READY_MAX_BUDGET_SECONDS = 15 * 60.0
 REVISION_READY_SECONDS_PER_PARAM_B = 20.0
 ACTIVATION_READBACK_ATTEMPTS = 3
 ACTIVATION_READBACK_DELAY_SECONDS = 2.0
-# smoke-retry fallback when a 503 carries no usable Retry-After: keep the prior 2s default rather
-# than the 0.5s readiness backoff base, so cold-start smoke retries don't hammer serving.
 SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
-_INTERNAL_KEY_HEADER = "X-Freesolo-Internal-Key"
-# modal 303-redirects a slow request to an async-result poll url on the same origin, once per poll
-# cycle until the result is ready, so the cap must cover a full 30-minute chat window of polls
-# (~150s apart). it guards against redirect loops, not credential leakage: the request hook strips
-# the internal key on every off-origin hop regardless of chain length.
-_MAX_REDIRECTS = 100
-_HTTP_CLIENT: httpx.Client | None = None
-_CHAT_HTTP_CLIENT: httpx.Client | None = None
-_STREAM_HTTP_CLIENT: httpx.Client | None = None
-_HTTP_CLIENT_LOCK = threading.Lock()
-
-
-def _url_origin(url: httpx.URL) -> tuple[str, str, int | None]:
-    # scheme + host + port identify an origin; httpx normalizes default ports to None.
-    return (url.scheme.lower(), (url.host or "").rstrip(".").lower(), url.port)
-
-
-def _configured_serving_origin() -> tuple[str, str, int | None] | None:
-    """Origin of the configured serving backend, or None when it cannot be parsed.
-
-    Mirrors ``serving_base_url()``'s url resolution without its standalone guard: this runs
-    inside an httpx event hook, so it must never raise, and any request carrying the key was
-    already built from a ``serving_base_url()`` that vetted the configuration.
-    """
-    configured = (os.environ.get("FREESOLO_SERVING_URL") or "").strip()
-    base = serving_control_url(configured or DEFAULT_FREESOLO_SERVING_URL)
-    try:
-        url = httpx.URL(base)
-    except Exception:
-        return None
-    if not url.host:
-        return None
-    return _url_origin(url)
-
-
-def _strip_internal_key_off_origin(request: httpx.Request) -> None:
-    """Drop the plane credential from any request that leaves the serving origin.
-
-    httpx strips only ``Authorization`` and ``Cookie`` when a redirect changes origin; the
-    internal key rides a custom header, so without this hook a single 302 from the serving host
-    would forward the credential that controls this plane to an arbitrary origin. The hook runs
-    once per redirect hop, so same-origin redirects (modal's async-result polls) keep the key.
-    """
-    if _INTERNAL_KEY_HEADER not in request.headers:
-        return
-    origin = _configured_serving_origin()
-    if origin is None or _url_origin(request.url) != origin:
-        del request.headers[_INTERNAL_KEY_HEADER]
-
-
-def _new_serving_client(**kwargs) -> httpx.Client:
-    """An httpx client for the serving backend: bounded redirects, credential-scoping hook."""
-    return httpx.Client(
-        follow_redirects=True,
-        max_redirects=_MAX_REDIRECTS,
-        event_hooks={"request": [_strip_internal_key_off_origin]},
-        **kwargs,
-    )
-
-
-def _http_client() -> httpx.Client:
-    global _HTTP_CLIENT
-    if _HTTP_CLIENT is None:
-        with _HTTP_CLIENT_LOCK:
-            if _HTTP_CLIENT is None:
-                _HTTP_CLIENT = _new_serving_client()
-    return _HTTP_CLIENT
-
-
-def _chat_http_client() -> httpx.Client:
-    global _CHAT_HTTP_CLIENT
-    if _CHAT_HTTP_CLIENT is None:
-        with _HTTP_CLIENT_LOCK:
-            if _CHAT_HTTP_CLIENT is None:
-                _CHAT_HTTP_CLIENT = _new_serving_client(
-                    limits=httpx.Limits(max_connections=None, max_keepalive_connections=100),
-                )
-    return _CHAT_HTTP_CLIENT
-
-
-def _stream_http_client() -> httpx.Client:
-    global _STREAM_HTTP_CLIENT
-    if _STREAM_HTTP_CLIENT is None:
-        with _HTTP_CLIENT_LOCK:
-            if _STREAM_HTTP_CLIENT is None:
-                _STREAM_HTTP_CLIENT = _new_serving_client(
-                    limits=httpx.Limits(max_connections=None, max_keepalive_connections=100),
-                )
-    return _STREAM_HTTP_CLIENT
-
-
-def _close_http_client() -> None:
-    global _CHAT_HTTP_CLIENT, _HTTP_CLIENT, _STREAM_HTTP_CLIENT
-    with _HTTP_CLIENT_LOCK:
-        clients = (_HTTP_CLIENT, _CHAT_HTTP_CLIENT, _STREAM_HTTP_CLIENT)
-        _HTTP_CLIENT = None
-        _CHAT_HTTP_CLIENT = None
-        _STREAM_HTTP_CLIENT = None
-    for client in clients:
-        if client is not None:
-            client.close()
-
-
-atexit.register(_close_http_client)
-
-
-def _serving_request(
-    method: str,
-    url: str,
-    *,
-    json: dict | None = None,
-    ok_statuses: tuple[int, ...] = (),
-    timeout_s: float | None = None,
-) -> httpx.Response:
-    """Issue a request to the serving backend; translates failures into ServingError."""
-    # follow_redirects: modal 303-redirects slow requests to an async-result poll url.
-    timeout = 60.0 if timeout_s is None else min(60.0, max(0.0, float(timeout_s)))
-    kwargs: dict = {"headers": _internal_key_header(), "timeout": timeout, "follow_redirects": True}
-    if json is not None:
-        kwargs["json"] = json
-    try:
-        resp = _http_client().request(method, url, **kwargs)
-        if resp.status_code in ok_statuses:
-            return resp
-        resp.raise_for_status()
-        return resp
-    except httpx.HTTPStatusError as exc:
-        raise _serving_status_error(url, exc) from exc
-    except httpx.RequestError as exc:
-        raise ServingError(f"could not reach the serving backend at {url}: {exc}") from exc
-
-
-def serving_openai_base_url() -> str:
-    """OpenAI-compatible base URL for the configured serving backend."""
-    return openai_base_url(serving_base_url())
 
 
 @dataclass
@@ -252,7 +74,7 @@ def resolve_hf_revision(hf_repo: str) -> str:
     try:
         from huggingface_hub import HfApi
     except ImportError as exc:  # pragma: no cover
-        raise ServingError(
+        raise serving_errors.ServingError(
             "could not resolve adapter revision: huggingface_hub is not installed"
         ) from exc
     try:
@@ -267,9 +89,11 @@ def resolve_hf_revision(hf_repo: str) -> str:
             or ""
         ).strip()
     except Exception as exc:
-        raise ServingError(f"could not resolve adapter revision for {hf_repo}: {exc}") from exc
+        raise serving_errors.ServingError(
+            f"could not resolve adapter revision for {hf_repo}: {exc}"
+        ) from exc
     if not is_commit_sha(revision):
-        raise ServingError(f"could not resolve full Hub commit SHA for {hf_repo}")
+        raise serving_errors.ServingError(f"could not resolve full Hub commit SHA for {hf_repo}")
     return revision.lower()
 
 
@@ -283,8 +107,8 @@ def deployment_record(
     adapter_revision: str | None = None,
 ) -> Deployment:
     subfolder = f"{adapter_prefix}/adapter"
-    base = serving_base_url()
-    openai_url = serving_openai_base_url()
+    base = serving_urls.serving_base_url()
+    openai_url = transport.serving_openai_base_url()
     return Deployment(
         run_id=run_id,
         model=model,
@@ -345,7 +169,9 @@ def deploy_adapter(
     Thinking adapters with structured outputs require serving to advertise deferred constraint
     support before the immutable revision is registered.
     """
-    validate_serving_lora_rank(model, lora_rank, rank_source="configured train.lora_rank")
+    adapter_check.validate_serving_lora_rank(
+        model, lora_rank, rank_source="configured train.lora_rank"
+    )
     subfolder = f"{adapter_prefix}/adapter"
     dep = deployment_record(
         run_id,
@@ -358,8 +184,10 @@ def deploy_adapter(
         return dep
 
     hf_revision = resolve_hf_revision(hf_repo)
-    artifact_metadata = adapter_artifact_metadata(hf_repo, subfolder, hf_revision=hf_revision)
-    validate_serving_lora_rank(
+    artifact_metadata = adapter_check.adapter_artifact_metadata(
+        hf_repo, subfolder, hf_revision=hf_revision
+    )
+    adapter_check.validate_serving_lora_rank(
         model,
         artifact_metadata.lora_rank,
         rank_source="adapter artifact",
@@ -398,17 +226,19 @@ def deploy_adapter(
         body["org_id"] = normalized_org_id
 
     try:
-        registration = _serving_request("POST", f"{serving_base_url()}/adapters", json=body)
+        registration = transport.serving_request(
+            "POST", f"{serving_urls.serving_base_url()}/adapters", json=body
+        )
         if registration.status_code not in {200, 202}:
-            raise ServingError(
+            raise serving_errors.ServingError(
                 f"serving returned unexpected adapter registration status {registration.status_code}"
             )
-    except ServingError as exc:
+    except serving_errors.ServingError as exc:
         if exc.status_code is not None and exc.status_code < 500:
             raise
         try:
             record = _registered_adapter(revision)
-        except ServingError as read_exc:
+        except serving_errors.ServingError as read_exc:
             raise exc from read_exc
         if record is None or not _matches_revision_identity(
             record, body, require_provenance=require_provenance
@@ -447,14 +277,14 @@ def deploy_adapter(
 
 
 def _adapter_url(adapter_id: str) -> str:
-    return f"{serving_base_url()}/adapters/{quote(adapter_id, safe='')}"
+    return f"{serving_urls.serving_base_url()}/adapters/{quote(adapter_id, safe='')}"
 
 
 def _registered_adapter_response(
     adapter_id: str, *, timeout_s: float | None = None
 ) -> tuple[dict | None, httpx.Response]:
     """Read one authoritative adapter record and retain its polling headers."""
-    resp = _serving_request(
+    resp = transport.serving_request(
         "GET",
         _adapter_url(adapter_id),
         ok_statuses=(404,),
@@ -465,14 +295,16 @@ def _registered_adapter_response(
     try:
         payload = resp.json()
     except ValueError as exc:
-        raise ServingError(
+        raise serving_errors.ServingError(
             f"serving returned invalid status JSON for adapter {adapter_id}"
         ) from exc
     if not isinstance(payload, dict):
-        raise ServingError(f"serving returned invalid status data for adapter {adapter_id}")
+        raise serving_errors.ServingError(
+            f"serving returned invalid status data for adapter {adapter_id}"
+        )
     record = payload.get("adapter") if isinstance(payload.get("adapter"), dict) else payload
     if not isinstance(record, dict):
-        raise ServingError(f"serving returned no adapter record for {adapter_id}")
+        raise serving_errors.ServingError(f"serving returned no adapter record for {adapter_id}")
     return record, resp
 
 
@@ -497,12 +329,12 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
         # Genuinely required for this run: thinking + structured outputs needs the serving backend's
         # deferred-constraint support (grammar applied after </think>) or served output is invalid.
         required.add(THINKING_STRUCTURED_OUTPUTS_CAPABILITY)
-    url = f"{serving_base_url()}/healthz"
-    response = _serving_request("GET", url)
+    url = f"{serving_urls.serving_base_url()}/healthz"
+    response = transport.serving_request("GET", url)
     try:
         payload = response.json()
     except ValueError as exc:
-        raise ServingError(
+        raise serving_errors.ServingError(
             f"serving_contract_unsupported: serving health check at {url} did not return valid JSON"
         ) from exc
     try:
@@ -514,13 +346,13 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
             detail = "must return a list field named capabilities"
         else:
             detail = "capabilities must be strings"
-        raise ServingError(
+        raise serving_errors.ServingError(
             f"serving_contract_unsupported: serving health check at {url} {detail}"
         ) from exc
     advertised = set(health.capabilities)
     missing = sorted(required - advertised)
     if missing:
-        raise ServingError(
+        raise serving_errors.ServingError(
             "serving_contract_unsupported: serving is missing required capabilities "
             + ", ".join(missing)
         )
@@ -579,7 +411,7 @@ def _wait_revision_ready(
     budget = max(0.0, float(budget_s))
     deadline = time.monotonic() + budget
     last_state = "registered"
-    last_read_error: ServingError | None = None
+    last_read_error: serving_errors.ServingError | None = None
     # the loader's own complaint, kept even when serving reports it WITHOUT moving the revision to
     # `failed`. without this a stuck load times out reporting only the state, and the one piece of
     # evidence that says which subsystem is at fault is dropped on the floor.
@@ -601,7 +433,7 @@ def _wait_revision_ready(
         first_read = False
         try:
             record, response = _registered_adapter_response(revision, timeout_s=remaining)
-        except ServingError as exc:
+        except serving_errors.ServingError as exc:
             if exc.status_code is not None and exc.status_code < 500:
                 raise
             last_read_error = exc
@@ -621,7 +453,7 @@ def _wait_revision_ready(
         if expected_identity is not None and not _matches_revision_identity(
             record, expected_identity, require_provenance=require_provenance
         ):
-            raise ServingError(
+            raise serving_errors.ServingError(
                 f"adapter revision {revision} resolved to a different immutable identity"
             )
         observed_record = True
@@ -635,7 +467,7 @@ def _wait_revision_ready(
         failure = metadata.get("failure")
         last_failure = str(failure) if failure else None
         if last_state == "failed" or record.get("status") == "disabled":
-            raise ServingError(
+            raise serving_errors.ServingError(
                 f"serving failed to load adapter revision {revision}: {failure or 'unknown error'}"
             )
         if last_state == "ready":
@@ -657,7 +489,7 @@ def _wait_revision_ready(
                 f". before those errors the loader reported: {last_failure} -- that is not "
                 "transient and survives a warm engine, so fix it before retrying"
             )
-        raise ServingError(message) from last_read_error
+        raise serving_errors.ServingError(message) from last_read_error
     # a TIMEOUT, not a rejection. the two are distinguishable in code (a rejected adapter raises
     # "serving failed to load adapter revision" above) but the old message said only that the
     # revision "remained 'registered'", which reads as a serving fault and sent readers to the wrong
@@ -697,7 +529,7 @@ def _wait_revision_ready(
             "engine loading a large base model can exceed the budget, and the retry usually "
             "succeeds against the now-warm engine."
         )
-    raise ServingError(
+    raise serving_errors.ServingError(
         f"revision_ready_timeout: adapter revision {revision} did not become ready in time "
         f"({'; '.join(details)}). the previous alias remains available and {remedy} this is NOT "
         "the same as serving rejecting the adapter, which fails the deployment with 'serving "
@@ -712,7 +544,7 @@ def adapter_alias_target(run_id: str) -> str | None:
         return None
     target = _active_alias_target(record)
     if target is None:
-        raise ServingError(
+        raise serving_errors.ServingError(
             f"serving alias {run_id} is not an immutable alias record; legacy aliases are unsupported"
         )
     return target
@@ -727,7 +559,7 @@ def _activate_revision(
 ) -> dict:
     body = {"expected_adapter_revision": expected_adapter_revision}
     try:
-        response = _serving_request(
+        response = transport.serving_request(
             "POST",
             f"{_adapter_url(revision)}/activate",
             json=body,
@@ -739,9 +571,9 @@ def _activate_revision(
             checkpoint=checkpoint,
             expected_adapter_revision=expected_adapter_revision,
         )
-    except (ServingError, ValueError) as exc:
+    except (serving_errors.ServingError, ValueError) as exc:
         alias = None
-        read_error: ServingError | None = None
+        read_error: serving_errors.ServingError | None = None
         target = None
         for attempt in range(ACTIVATION_READBACK_ATTEMPTS):
             if attempt:
@@ -749,7 +581,7 @@ def _activate_revision(
             try:
                 alias = _registered_adapter(run_id)
                 read_error = None
-            except ServingError as read_exc:
+            except serving_errors.ServingError as read_exc:
                 read_error = read_exc
                 continue
             target = _active_alias_target(alias)
@@ -764,13 +596,13 @@ def _activate_revision(
             if target not in (None, expected_adapter_revision):
                 break
         if read_error is not None:
-            raise ActivationOutcomeUnknown(run_id, revision) from read_error
+            raise serving_errors.ActivationOutcomeUnknown(run_id, revision) from read_error
         if expected_adapter_revision is not None and target == expected_adapter_revision:
-            raise ServingError(
+            raise serving_errors.ServingError(
                 f"alias activation was not committed; {run_id} still targets {target!r}"
             ) from exc
         if target is None:
-            raise ActivationOutcomeUnknown(
+            raise serving_errors.ActivationOutcomeUnknown(
                 run_id,
                 revision,
                 detail=(
@@ -778,7 +610,7 @@ def _activate_revision(
                     "no target"
                 ),
             ) from exc
-        raise ActivationOutcomeUnknown(
+        raise serving_errors.ActivationOutcomeUnknown(
             run_id,
             revision,
             detail=f"alias activation diverged because authoritative readback targets {target!r}",
@@ -787,7 +619,7 @@ def _activate_revision(
 
 def undeploy_adapter(run_id: str) -> dict:
     """Disable the run alias and all immutable revisions without engine eviction."""
-    response = _serving_request(
+    response = transport.serving_request(
         "DELETE",
         _adapter_url(run_id),
         ok_statuses=(404,),
@@ -802,13 +634,15 @@ def undeploy_adapter(run_id: str) -> dict:
     try:
         payload = response.json()
     except ValueError as exc:
-        raise ServingError("serving returned an invalid undeploy response") from exc
+        raise serving_errors.ServingError("serving returned an invalid undeploy response") from exc
     if not isinstance(payload, dict) or payload.get("run_id") != run_id:
-        raise ServingError("serving returned a mismatched undeploy response")
+        raise serving_errors.ServingError("serving returned a mismatched undeploy response")
     for field in ("disabled_aliases", "disabled_revisions"):
         value = payload.setdefault(field, [])
         if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-            raise ServingError(f"serving returned invalid {field} in undeploy response")
+            raise serving_errors.ServingError(
+                f"serving returned invalid {field} in undeploy response"
+            )
     payload["serving_deregistered"] = bool(
         payload["disabled_aliases"] or payload["disabled_revisions"]
     )
@@ -820,7 +654,7 @@ def _retryable_smoke_unavailable(
     *,
     requested_model: str,
     expected_adapter_revision: str,
-) -> RetryableServingUnavailable | None:
+) -> serving_errors.RetryableServingUnavailable | None:
     if response.status_code != 503:
         return None
     try:
@@ -846,7 +680,7 @@ def _retryable_smoke_unavailable(
         retry_after_seconds = SMOKE_RETRY_FALLBACK_DELAY_SECONDS
     if not math.isfinite(retry_after_seconds) or retry_after_seconds <= 0:
         retry_after_seconds = SMOKE_RETRY_FALLBACK_DELAY_SECONDS
-    return RetryableServingUnavailable(str(code), retry_after_seconds)
+    return serving_errors.RetryableServingUnavailable(str(code), retry_after_seconds)
 
 
 def chat(
@@ -869,7 +703,7 @@ def chat(
     ``stop`` carries the run's own stop sequences so a model trained to terminate on a delimiter
     rather than EOS finishes on ``stop`` instead of running to ``max_tokens``.
     """
-    base = serving_openai_base_url()
+    base = transport.serving_openai_base_url()
     body = {
         "model": run_id,
         "messages": messages,
@@ -882,13 +716,15 @@ def chat(
     if structured_outputs is not None:
         body["structured_outputs"] = structured_outputs
     # follow_redirects: modal 303-redirects slow cold-start requests across many poll cycles
-    # before the result is ready (bounded by _MAX_REDIRECTS, all on the serving origin).
-    headers = _internal_key_header()
+    # before the result is ready, bounded by the transport redirect limit on the serving origin.
+    headers = transport._internal_key_header()
     if expected_checkpoint:
         headers["X-Freesolo-Expected-Checkpoint"] = expected_checkpoint
     timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))
     client_context = (
-        _new_serving_client() if retry_unavailable else contextlib.nullcontext(_chat_http_client())
+        transport._new_serving_client()
+        if retry_unavailable
+        else contextlib.nullcontext(transport._chat_http_client())
     )
     with client_context as client:
         resp = client.post(f"{base}/chat/completions", json=body, headers=headers, timeout=timeout)
@@ -902,7 +738,7 @@ def chat(
                 raise retryable_error
         resp.raise_for_status()
         payload = resp.json()
-        _balance_thinking_payload(payload, thinking=thinking)
+        thinking_support._balance_thinking_payload(payload, thinking=thinking)
         if expected_checkpoint and isinstance(payload, dict):
             payload["_freesolo_headers"] = {
                 "adapter_revision": resp.headers.get("X-Freesolo-Adapter-Revision"),
@@ -913,41 +749,3 @@ def chat(
                 "X-Freesolo-LoRA-Request-Adapter"
             )
         return payload
-
-
-# Adapter artifact validation lives in `flash.serve.adapter_check`, which imports the exception
-# types above. Re-exported so `deploy_adapter` and the serving tests keep resolving them here.
-from flash.serve.deployment.adapter_check import (  # noqa: E402,F401
-    _is_adapter_tensor_filename,
-    _is_hf_not_found_error,
-    _verify_adapter_artifact_tensors,
-    adapter_artifact_metadata,
-    validate_serving_lora_rank,
-)
-
-# `chat_stream` and its sse decoder live in `flash.serve.streaming`, which imports the client
-# helpers above. re-exported so `from flash.serve.deployment.deploy import chat_stream`
-# (flash.server.app, and the cli through the client) keeps resolving.
-from flash.serve.request.streaming import (  # noqa: E402,F401
-    _openai_stream_content,
-    chat_stream,
-)
-
-# The reasoning-delimiter parsing lives in `flash.serve.thinking`, which imports the tag
-# constants above. Re-exported so the existing `deploy._balanced_thinking_content` call sites
-# and tests keep resolving.
-from flash.serve.request.thinking import (  # noqa: E402,F401
-    _TAG_CLOSE,
-    _TAG_OPEN,
-    _balance_thinking_payload,
-    _balanced_thinking_content,
-    _delimiter_may_complete,
-    _duplicates_reasoning,
-    _find_delimiter,
-    _inline_reasoning_block,
-    _is_only_retained_delimiter,
-    _is_sampled_delimiter,
-    _is_terminal_reasoning_repeat,
-    _retained_delimiter_end,
-    _strip_retained_close,
-)

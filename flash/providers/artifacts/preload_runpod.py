@@ -16,10 +16,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flash.providers.runpod.client import api as runpod_api
-from flash.providers.runpod.execution.jobs import (
-    GraceTimer,
-    weight_cache_volume_name,
-)
+from flash.providers.runpod.execution.jobs import GraceTimer
+from flash.providers.runpod.execution.resources import weight_cache_volume_name
 
 
 def _preload():
@@ -150,7 +148,7 @@ def catalog_model_ids() -> list[str]:
     mistaken for a capacity fix.
     """
     from flash.core.catalog import MODELS
-    from flash.runner import _fits_weight_cache
+    from flash.runner.accounting.weight_cache import _fits_weight_cache
 
     fitting = [(mid, info) for mid, info in MODELS.items() if _fits_weight_cache(info)]
     fitting.sort(key=lambda pair: (-(pair[1].params_b or 0.0), pair[0]))
@@ -169,7 +167,10 @@ def _preload_one_dc(
     from runpod_flash import NetworkVolume
     from runpod_flash.core.resources.datacenter import DataCenter
 
-    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import (
+        WEIGHT_CACHE_VOLUME_GB,
+        WEIGHT_CACHE_VOLUME_NAME,
+    )
 
     dc = DataCenter.from_string(dc_id)
     vol_name = weight_cache_volume_name(WEIGHT_CACHE_VOLUME_NAME, dc)
@@ -191,7 +192,7 @@ def _preload_one_dc(
         # allowance all by itself, the grow yields to that allowance, and reconciliation
         # is skipped entirely -- reintroducing the under-sized mount this whole path
         # exists to prevent.
-        from flash.providers.runpod.execution.jobs import weight_cache_grow_headroom_s
+        from flash.providers.runpod.execution.resources import weight_cache_grow_headroom_s
 
         deadline_at = _preload().time.time() + timeout_s + weight_cache_grow_headroom_s()
         # The warm attaches its own volume (spec=None), so the deploy cannot derive what to
@@ -429,7 +430,7 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
     """
 
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     # Explicit [] is a no-op — never widen zero DCs to the whole fleet.
     if datacenters is not None and not datacenters:
@@ -508,7 +509,7 @@ def teardown_weight_cache(datacenters: list[str] | None = None) -> list[str]:
 def teardown_lambda_filesystems(name: str | None = None) -> list[str]:
     """Delete Lambda weight-cache filesystems across all regions. Best-effort and idempotent."""
     from flash.providers.lambda_.client import api as lambda_api
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     target = name or WEIGHT_CACHE_VOLUME_NAME
     deleted: list[str] = []

@@ -10,6 +10,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import flash.serve.contract.urls as serving_urls
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -33,9 +35,7 @@ def test_checked_in_source_is_prod_channel():
     # The functional defaults everything reads from.
     assert config.DEFAULT_API_URL == "https://flash.freesolo.co"
 
-    from flash.serve.deployment import deploy
-
-    assert deploy.DEFAULT_FREESOLO_SERVING_URL == "https://serve.freesolo.co"
+    assert serving_urls.default_serving_url() == "https://serve.freesolo.co"
 
 
 def test_default_api_url_follows_channel():
@@ -53,7 +53,7 @@ def test_default_serving_url_follows_channel():
     posts a dev `org_id` into the prod database and takes a 23503 foreign-key violation -- which
     reads as a serving outage but is a routing defect, and which no retry can clear.
     """
-    from flash.serve.deployment.deploy import (
+    from flash.serve.contract.urls import (
         DEV_FREESOLO_SERVING_URL,
         PROD_FREESOLO_SERVING_URL,
         default_serving_url,
@@ -91,12 +91,12 @@ def test_every_hosted_default_flips_with_the_channel():
     assert dev_channel == "dev"
 
     from flash.client.config import default_api_url
-    from flash.serve.deployment.deploy import default_serving_url
+    from flash.serve.contract.urls import default_serving_url
 
     # Every channel-derived default, evaluated as the built dev package would.
     dev_defaults = {
         "control plane (flash.client.config.default_api_url)": default_api_url(dev_channel),
-        "serving plane (flash.serve.deployment.deploy.default_serving_url)": default_serving_url(
+        "serving plane (flash.serve.deployment.serving_urls.default_serving_url)": default_serving_url(
             dev_channel
         ),
     }
@@ -153,7 +153,7 @@ def test_flash_cli_alias_reaches_the_same_entry_point():
     nothing else claims, so it is what SELF_HOSTING.md points operators at.
     """
     scripts = _real_console_scripts()
-    assert scripts.get("flash") == "flash.cli:main"
+    assert scripts.get("flash") == "flash.cli.parsing.main:main"
     assert scripts.get("flash-cli") == scripts["flash"], (
         "flash-cli must stay an alias of flash. SELF_HOSTING.md tells self-hosters to use it "
         "when runpod-flash's console script shadows `flash`."

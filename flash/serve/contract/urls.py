@@ -130,16 +130,6 @@ def serving_base_url() -> str:
     return serving_control_url(configured or default_serving_url())
 
 
-def internal_key_header() -> dict[str, str]:
-    """The header every serving request carries, or nothing when no key is configured."""
-    import os
-
-    # strip exactly as authenticate does: newlines are invalid headers and spaces change the key.
-    # blank values omit the header.
-    key = (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
-    return {"X-Freesolo-Internal-Key": key} if key else {}
-
-
 def public_deployment(deployment: dict) -> dict:
     """Return a public copy without private rollback state."""
     out = dict(deployment)

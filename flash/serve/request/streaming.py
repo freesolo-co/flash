@@ -10,46 +10,9 @@ import json
 import sys
 from collections.abc import Iterator
 
+import flash.serve.request.thinking as thinking_support
+import flash.serve.request.transport as transport
 from flash.client.http import ClientError
-from flash.serve.request.thinking import (
-    _TAG_CLOSE,
-    _TAG_OPEN,
-    _balanced_thinking_content,
-    _inline_reasoning_block,
-    _is_only_retained_delimiter,
-    _is_terminal_reasoning_repeat,
-    _strip_retained_close,
-)
-
-
-def _deploy():
-    """The deploy module, imported lazily because it re-exports this one.
-
-    Everything reached through it is a seam the serving tests replace with
-    `monkeypatch.setattr(deploy, ...)` -- the key header, both http clients, the base url, and
-    `_find_delimiter` (patched to count buffer scans) -- so a `from ... import` would capture the
-    original before the patch is applied. The import is deferred to call time rather than done at
-    module level so that importing this module on its own does not re-enter `deploy` mid-body.
-    """
-    from flash.serve.deployment import deploy
-
-    return deploy
-
-
-def _internal_key_header():
-    return _deploy()._internal_key_header()
-
-
-def _stream_http_client():
-    return _deploy()._stream_http_client()
-
-
-def serving_openai_base_url():
-    return _deploy().serving_openai_base_url()
-
-
-def _find_delimiter(*args, **kwargs):
-    return _deploy()._find_delimiter(*args, **kwargs)
 
 
 def _raise_for_stream_error(chunk: dict) -> None:
@@ -65,7 +28,7 @@ def _raise_for_stream_error(chunk: dict) -> None:
 
 
 def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[str]:
-    # reasoning arrives on its own delta field (see _balanced_thinking_content). re-open the block
+    # reasoning arrives on its own delta field (see thinking_support._balanced_thinking_content). re-open the block
     # around it and close it at the answer boundary, so the streamed text matches the balanced
     # string the non-streaming path returns.
     reasoning_open = False
@@ -103,7 +66,7 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
         for choice in chunk.get("choices") or []:
             delta = (choice.get("delta") or {}) if isinstance(choice, dict) else {}
             raw_reasoning = delta.get("reasoning_content")
-            # `thinking` gates this as it gates `_balanced_thinking_content`, and for the same
+            # `thinking` gates this as it gates `thinking_support._balanced_thinking_content`, and for the same
             # reason: this path also backs the public chat route. tested by type, not falsiness --
             # a model that closed its reasoning immediately streams `reasoning_content: ""`, which
             # still needs a pair.
@@ -121,7 +84,9 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                         # a new block opens here, so no further content can join the buffer and it
                         # is decidable now, exactly as at end of stream.
                         settled = (
-                            "" if _is_only_retained_delimiter(closing, reasoning_text) else closing
+                            ""
+                            if thinking_support._is_only_retained_delimiter(closing, reasoning_text)
+                            else closing
                         )
                         closing = None
                         if settled:
@@ -132,7 +97,7 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                     # block's retained close against both blocks' text, so they stopped recognising
                     # it and streamed the delimiter a second time.
                     reasoning_text = ""
-                    yield _TAG_OPEN
+                    yield thinking_support._TAG_OPEN
                 if raw_reasoning:
                     reasoning_text += raw_reasoning
                     yield raw_reasoning
@@ -143,12 +108,12 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                     reasoning_open = False
                     reasoning_done = True
                     held = None
-                    yield _TAG_CLOSE
+                    yield thinking_support._TAG_CLOSE
                     closing = ""
                     closing_scanned = 0
                 if closing is not None:
                     closing += content
-                    answer, closing_scanned = _strip_retained_close(
+                    answer, closing_scanned = thinking_support._strip_retained_close(
                         closing, reasoning_text, closing_scanned
                     )
                     if answer is None:
@@ -164,14 +129,16 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                     # resume where the last scan stopped: rescanning the whole buffer per delta is
                     # quadratic in the completion length, and token-sized deltas make that the
                     # common case. only the last few characters can still be a partial tag.
-                    close = _find_delimiter(held_text, held_scanned)
+                    close = thinking_support._find_delimiter(held_text, held_scanned)
                     if close < 0:
-                        held_scanned = max(0, len(held_text) - (len(_TAG_CLOSE) - 1))
+                        held_scanned = max(
+                            0, len(held_text) - (len(thinking_support._TAG_CLOSE) - 1)
+                        )
                         continue
                     joined = held_text
                     held = None
                     held_text = ""
-                    inline = _inline_reasoning_block(joined)
+                    inline = thinking_support._inline_reasoning_block(joined)
                     if inline is not None and inline[1] == close:
                         # already balanced: the legacy stream carried its own opener, so re-opening
                         # would nest one block inside another. the pair must be the one that
@@ -180,19 +147,19 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
                         yield joined
                         continue
                     yield (
-                        f"{_TAG_OPEN}{joined[:close]}{_TAG_CLOSE}"
-                        f"{joined[close + len(_TAG_CLOSE) :]}"
+                        f"{thinking_support._TAG_OPEN}{joined[:close]}{thinking_support._TAG_CLOSE}"
+                        f"{joined[close + len(thinking_support._TAG_CLOSE) :]}"
                     )
                     continue
                 yield content
     if reasoning_open:
         # generation stopped inside the block (a length cap, usually). still close it: an
         # unbalanced opener is the same defect as the unbalanced closer, mirrored.
-        yield _TAG_CLOSE
+        yield thinking_support._TAG_CLOSE
     # the buffer holds the block's own retained close and nothing else, in either the bare or the
     # opener-carrying form. only decidable at end of stream, since nothing more can arrive. any
     # other buffer was answer text after all, covering the answer that IS the delimiter.
-    if closing and not _is_terminal_reasoning_repeat(closing, reasoning_text):
+    if closing and not thinking_support._is_terminal_reasoning_repeat(closing, reasoning_text):
         yield closing
     if held:
         # no delimiter ever arrived, so nothing marked a reasoning phase: a plain answer. release
@@ -218,7 +185,7 @@ def chat_stream(
     200 and headers had been flushed, so an upstream 4xx/5xx could only surface as a
     truncated success.
     """
-    base = serving_openai_base_url()
+    base = transport.serving_openai_base_url()
     body = {
         "model": run_id,
         "messages": messages,
@@ -229,11 +196,11 @@ def chat_stream(
     }
     if stop:
         body["stop"] = [str(value) for value in stop]
-    ctx = _stream_http_client().stream(
+    ctx = transport._stream_http_client().stream(
         "POST",
         f"{base}/chat/completions",
         json=body,
-        headers=_internal_key_header(),
+        headers=transport._internal_key_header(),
         timeout=30 * 60.0,
     )
     resp = ctx.__enter__()
@@ -263,7 +230,7 @@ def _streamed_body(ctx, resp, *, thinking: bool) -> Iterator[str]:
             # client.stream() leaves body unread; must call resp.read() before .json().
             resp.read()
             payload = resp.json()
-            content = _balanced_thinking_content(
+            content = thinking_support._balanced_thinking_content(
                 (payload.get("choices") or [{}])[0].get("message") or {}, thinking=thinking
             )
             if content:

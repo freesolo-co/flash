@@ -21,8 +21,8 @@ from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.schema import format_adapter_revision
 from flash.serve.app import AdapterExecutionInput, ArtifactFile, ExecutionInputs
 from flash.serve.app.materialize import MaterializationError, validate_adapter_weight_structure
-from flash.serve.contract.contract import reject_non_finite_json_constant
 from flash.serve.contract.profiles import ServingProfile
+from flash.serve.contract.protocol import reject_non_finite_json_constant
 from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
 from flash.serve.provisioning import ServingImage
 

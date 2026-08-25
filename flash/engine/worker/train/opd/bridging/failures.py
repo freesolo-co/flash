@@ -12,10 +12,10 @@ retry is meaningful, anything else is permanent and terminal for the run.
 from __future__ import annotations
 
 
-def _opd_train():
-    from flash.engine.worker.train.entry import opd_train
-
-    return opd_train
+class _RecordedMutationCallbackFailure(RuntimeError):
+    def __init__(self, classification: str, message: str) -> None:
+        super().__init__(message)
+        self.classification = classification
 
 
 class TeacherFailureRecording:
@@ -92,7 +92,7 @@ class TeacherFailureRecording:
     @staticmethod
     def _raise_recorded_mutation_failure(failure: tuple[str, str]) -> None:
         classification, message = failure
-        raise _opd_train()._RecordedMutationCallbackFailure(classification, message)
+        raise _RecordedMutationCallbackFailure(classification, message)
 
     @property
     def mutation_failure(self) -> tuple[str, str] | None:

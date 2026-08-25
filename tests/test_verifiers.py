@@ -19,6 +19,8 @@ from typing import ClassVar
 
 import pytest
 
+import flash.engine.worker.runtime.state as worker_state
+
 
 @dataclass
 class _TaskExample:
@@ -2256,7 +2258,6 @@ def test_non_thinking_run_scores_the_completion_unchanged(monkeypatch):
 
 def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
     """The worker is what knows whether the run samples <think>; it must tell the env."""
-    import flash.engine.worker as worker
     from flash.core.spec import JobSpec
 
     class _Env:
@@ -2270,10 +2271,12 @@ def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
             "environment": {"id": "org/env"},
         }
     )
-    monkeypatch.setattr(worker, "JOB_SPEC", spec)
-    monkeypatch.setattr(worker, "load_staged_freesolo_environment", lambda *a, **k: (_Env(), None))
+    monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
+    monkeypatch.setattr(
+        worker_state, "load_staged_freesolo_environment", lambda *a, **k: (_Env(), None)
+    )
 
-    assert worker._load_active_env().thinking is True
+    assert worker_state._load_active_env().thinking is True
 
 
 def _thinking_env(monkeypatch, sdk_env, *, prompt_opens_thinking: bool):
@@ -2289,7 +2292,6 @@ def _thinking_env(monkeypatch, sdk_env, *, prompt_opens_thinking: bool):
 
 def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monkeypatch):
     from flash.engine.worker.model.decoding import prompt_opens_thinking
-    from flash.engine.worker.train.entry import opd_train as opd_mod
     from flash.engine.worker.train.entry import opd_train_runner
     from flash.engine.worker.train.opd.orchestration.state import _OpdRequest
 
@@ -2317,21 +2319,25 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     tokenizer = _Tokenizer()
+    import flash.engine.worker.io.hf as worker_hf
+
+    monkeypatch.setattr(worker_state, "THINKING", True)
+    monkeypatch.setattr(worker_hf, "load_tokenizer", lambda model_id, revision: tokenizer)
+    monkeypatch.setattr(opd_train_runner, "prompt_opens_thinking", prompt_opens_thinking)
     monkeypatch.setattr(
-        opd_mod,
-        "_w",
-        types.SimpleNamespace(
-            THINKING=True,
-            load_tokenizer=lambda model_id, revision: tokenizer,
-            prompt_opens_thinking=prompt_opens_thinking,
-        ),
+        opd_train_runner._opd_entry, "_thinking_prefill_text", lambda _tokenizer: "<think>\n"
     )
-    monkeypatch.setattr(opd_mod, "_thinking_prefill_text", lambda _tokenizer: "<think>\n")
-    monkeypatch.setattr(opd_mod, "clamp_engine_len", lambda requested, _limit: requested)
-    monkeypatch.setattr(opd_mod, "model_max_position_embeddings", lambda *_args: None)
-    monkeypatch.setattr(opd_mod, "validate_glue_template", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        opd_mod,
+        opd_train_runner._backend, "clamp_engine_len", lambda requested, _limit: requested
+    )
+    monkeypatch.setattr(
+        opd_train_runner._backend, "model_max_position_embeddings", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        opd_train_runner._glue, "validate_glue_template", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        opd_train_runner._worker_heartbeat,
         "liveness_heartbeat",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
@@ -2634,7 +2640,7 @@ def test_rl_hands_the_derived_opener_flag_to_the_env():
     """
     import inspect
 
-    from flash.engine.worker.train.entry.rl_train import _resolve_grpo_inputs
+    from flash.engine.worker.train.rl.launch.inputs import _resolve_grpo_inputs
 
     src = inspect.getsource(_resolve_grpo_inputs)
     assert 'hasattr(env, "prompt_opens_thinking")' in src

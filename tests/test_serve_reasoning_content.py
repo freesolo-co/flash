@@ -13,6 +13,9 @@ from typing import ClassVar
 import pytest
 
 import flash.serve.deployment.deploy as deploy
+import flash.serve.request.streaming as serving_streaming
+import flash.serve.request.thinking as serving_thinking
+import flash.serve.request.transport as serving_transport
 from flash.client.http import ClientError
 
 
@@ -23,11 +26,11 @@ def _sse(*deltas: dict) -> list[str]:
 
 
 def _folded(message: dict, *, thinking: bool = True) -> str:
-    return deploy._balanced_thinking_content(message, thinking=thinking)
+    return serving_thinking._balanced_thinking_content(message, thinking=thinking)
 
 
 def _streamed(*deltas: dict, thinking: bool = True) -> str:
-    return "".join(deploy._openai_stream_content(iter(_sse(*deltas)), thinking=thinking))
+    return "".join(serving_streaming._openai_stream_content(iter(_sse(*deltas)), thinking=thinking))
 
 
 def _split(message: dict) -> tuple[dict, ...]:
@@ -424,7 +427,7 @@ def test_a_non_thinking_stream_yields_each_delta_as_it_arrives():
     # no block can exist outside thinking mode, so nothing is ever held back: the deltas a caller
     # prints must arrive one at a time, not batched at the end.
     lines = _sse({"content": "a"}, {"content": "b"})
-    assert list(deploy._openai_stream_content(iter(lines), thinking=False)) == ["a", "b"]
+    assert list(serving_streaming._openai_stream_content(iter(lines), thinking=False)) == ["a", "b"]
 
 
 def test_an_engine_error_raises_after_yielding_partial_content():
@@ -433,7 +436,7 @@ def test_an_engine_error_raises_after_yielding_partial_content():
         f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'error'}], 'error': {'message': 'engine stream failed', 'type': 'engine_error', 'code': 500}})}",
         "data: [DONE]",
     ]
-    stream = deploy._openai_stream_content(iter(lines), thinking=False)
+    stream = serving_streaming._openai_stream_content(iter(lines), thinking=False)
 
     assert next(stream) == "partial"
     with pytest.raises(ClientError, match="engine stream failed"):
@@ -444,7 +447,7 @@ def test_a_split_stream_releases_the_answer_incrementally():
     # once a reasoning delta proves the backend splits, the legacy hold is dropped and the answer
     # streams delta by delta rather than accumulating to the end.
     lines = _sse({"reasoning_content": "r"}, {"content": "an"}, {"content": "swer"})
-    assert list(deploy._openai_stream_content(iter(lines), thinking=True)) == [
+    assert list(serving_streaming._openai_stream_content(iter(lines), thinking=True)) == [
         "<think>",
         "r",
         "</think>",
@@ -464,7 +467,7 @@ def test_the_held_stream_does_not_rescan_its_whole_buffer_per_delta():
     per delta too. What changed is how much each call reads, so that is what is measured.
     """
     scanned = 0
-    real_find_delimiter = deploy._find_delimiter
+    real_find_delimiter = serving_thinking._find_delimiter
 
     def _counting_find(buffer: str, start: int) -> int:
         # measured through the source's own named seam, because instrumenting the buffer is not
@@ -479,8 +482,8 @@ def test_the_held_stream_does_not_rescan_its_whole_buffer_per_delta():
         scanned = 0
         lines = _sse(*({"content": "tok "} for _ in range(deltas)))
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(deploy, "_find_delimiter", _counting_find)
-            out = "".join(deploy._openai_stream_content(iter(lines), thinking=True))
+            patch.setattr(serving_thinking, "_find_delimiter", _counting_find)
+            out = "".join(serving_streaming._openai_stream_content(iter(lines), thinking=True))
         assert out == "tok " * deltas
         return scanned
 
@@ -500,7 +503,7 @@ def test_the_closing_buffer_does_not_rescan_itself_per_delta():
     reason.
     """
     scanned = 0
-    real_find_delimiter = deploy._find_delimiter
+    real_find_delimiter = serving_thinking._find_delimiter
 
     def _counting_find(buffer: str, start: int) -> int:
         nonlocal scanned
@@ -515,8 +518,10 @@ def test_the_closing_buffer_does_not_rescan_itself_per_delta():
         stream += [{"content": "tok "} for _ in range(deltas)]
         stream += [{"content": "</think>"}, {"content": "answer"}]
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(deploy, "_find_delimiter", _counting_find)
-            out = "".join(deploy._openai_stream_content(iter(_sse(*stream)), thinking=True))
+            patch.setattr(serving_thinking, "_find_delimiter", _counting_find)
+            out = "".join(
+                serving_streaming._openai_stream_content(iter(_sse(*stream)), thinking=True)
+            )
         assert out == f"<think>{reasoning}</think>answer"
         return scanned
 
@@ -539,7 +544,7 @@ def test_payload_balancing_rewrites_every_choice_in_place():
             {"message": {"content": "b", "reasoning_content": "r2"}},
         ]
     }
-    deploy._balance_thinking_payload(payload, thinking=True)
+    serving_thinking._balance_thinking_payload(payload, thinking=True)
     assert payload["choices"][0]["message"]["content"] == "<think>r1</think>a"
     assert payload["choices"][1]["message"]["content"] == "<think>r2</think>b"
     # the split fields survive for callers that want them.
@@ -548,13 +553,13 @@ def test_payload_balancing_rewrites_every_choice_in_place():
 
 def test_payload_balancing_is_a_no_op_outside_thinking_mode():
     payload = {"choices": [{"message": {"content": "a</think>b", "reasoning_content": "r"}}]}
-    deploy._balance_thinking_payload(payload, thinking=False)
+    serving_thinking._balance_thinking_payload(payload, thinking=False)
     assert payload["choices"][0]["message"]["content"] == "a</think>b"
 
 
 def test_payload_balancing_tolerates_shapes_it_cannot_rewrite():
     for payload in (None, [], "text", {}, {"choices": None}, {"choices": [{}, {"message": None}]}):
-        deploy._balance_thinking_payload(payload, thinking=True)  # must not raise
+        serving_thinking._balance_thinking_payload(payload, thinking=True)  # must not raise
 
 
 def _stub_serving(monkeypatch, message: dict) -> None:
@@ -571,9 +576,11 @@ def _stub_serving(monkeypatch, message: dict) -> None:
         def post(self, url, **kwargs):
             return _Resp()
 
-    monkeypatch.setattr(deploy, "serving_openai_base_url", lambda: "https://serve.example/v1")
-    monkeypatch.setattr(deploy, "_internal_key_header", dict)
-    monkeypatch.setattr(deploy, "_chat_http_client", lambda: _Client())
+    monkeypatch.setattr(
+        serving_transport, "serving_openai_base_url", lambda: "https://serve.example/v1"
+    )
+    monkeypatch.setattr(serving_transport, "_internal_key_header", dict)
+    monkeypatch.setattr(serving_transport, "_chat_http_client", lambda: _Client())
 
 
 def test_non_streaming_chat_balances_before_returning(monkeypatch):

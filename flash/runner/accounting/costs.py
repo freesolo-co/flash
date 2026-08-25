@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import math
+import os
 import time
 from dataclasses import replace
 
-import flash.runner as runner
-from flash.runner import RunStatus
+from flash.runner.lifecycle import reporting, state
+from flash.runner.lifecycle.state import RunStatus
+
+_BILLING_FIELDS = frozenset({"billing_state", "billing_error", "billing_charge"})
+
+
+def _get_status(run_id: str):
+    from flash.runner.lifecycle.status import get_status
+
+    return get_status(run_id)
 
 
 def _gpu_rate(gpu_type: str, provider: str = "") -> float:
@@ -208,14 +218,11 @@ def cancelled_charge_usd(
 ) -> float:
     """Price a mid-training cancellation from the accepted quote, scaled by the completed work.
 
-    the persisted quote (``estimated_cost_usd``) carries the exact live rate the user accepted: the
-    lifecycle refreshes it from the selected candidate before provisioning. a spec reprice through
-    ``estimate_cost`` takes the offline static-rate path, and on live-market providers (vast,
-    lambda) those rates differ materially from the accepted one, so pricing a near-complete cancel
-    that way can bill above what the run would have been charged on success. instead the quote is
-    scaled by the completed share of the estimated billed work: partial and full spec estimates use
-    the same offline rates, so the rate cancels out of their ratio and only the work fraction
-    remains. the fraction, not a bare ``steps / planned`` ratio, is what keeps the charge honest:
+    the persisted quote (``estimated_cost_usd``) is the whole-cent submit-time amount shown by
+    ``flash train --cost``. provider selection and allocation never refresh it. instead the quote is
+    scaled by the completed share of estimated billed work: partial and full spec estimates use the
+    rented topology when available, so their ratio isolates the work fraction without replacing the
+    accepted quote. the fraction, not a bare ``steps / planned`` ratio, keeps the charge honest:
     the one-time compile and each reached save land whole in the partial estimate, unreached saves
     stay out of it, and a wall-capped plan caps both sides so the fraction is measured against the
     capped horizon the quote actually paid for rather than the uncapped step count. the fraction is
@@ -243,7 +250,7 @@ def cancelled_charge_usd(
     )
     quote = getattr(status, "estimated_cost_usd", None)
     if quote is None:
-        return runner.charge_usd_for_spec(
+        return charge_usd_for_spec(
             spec,
             steps=n,
             fallback=fallback,
@@ -251,18 +258,19 @@ def cancelled_charge_usd(
             gpu_type=gpu_type,
             gpu_count=gpu_count,
         )
-    try:
-        quote = float(quote)
-    except (TypeError, ValueError):
+    if isinstance(quote, bool) or not isinstance(quote, (int, float)):
         # a malformed persisted quote is a pricing failure, not a license to reprice: the accepted
         # rate is unknowable, so the caller's fallback must propagate and settle the run.
         return float(fallback)
-    if quote <= 0:
-        # a non-positive quote is malformed the same way: prorating it would persist a charge the
-        # billing retry predicate (cost_usd > 0) can never settle, silently stranding the run
-        # unbilled, so the fallback propagates and the caller records the pricing failure.
+    quote = float(quote)
+    if not math.isfinite(quote) or quote < 0:
+        # negative and non-finite quotes cannot represent an accepted whole-cent amount, so the
+        # fallback propagates and the caller records the pricing failure.
         return float(fallback)
-    partial = runner.charge_usd_for_spec(
+    if quote == 0:
+        # a valid quote may round to zero cents and remains authoritative for any completed work.
+        return 0.0
+    partial = charge_usd_for_spec(
         spec,
         steps=n,
         fallback=float("nan"),
@@ -270,7 +278,7 @@ def cancelled_charge_usd(
         gpu_type=gpu_type,
         gpu_count=gpu_count,
     )
-    full = runner.charge_usd_for_spec(
+    full = charge_usd_for_spec(
         spec,
         fallback=float("nan"),
         provider=provider,
@@ -281,7 +289,7 @@ def cancelled_charge_usd(
         return quote * min(1.0, partial / full)
     # the work fraction is unpriceable: reprice the spec but never bill a cancel above the quote.
     # a non-finite reprice is a pricing failure and must propagate so the caller records it.
-    repriced = runner.charge_usd_for_spec(
+    repriced = charge_usd_for_spec(
         spec, steps=n, fallback=fallback, provider=provider, gpu_type=gpu_type, gpu_count=gpu_count
     )
     if not math.isfinite(repriced):
@@ -289,11 +297,59 @@ def cancelled_charge_usd(
     return min(repriced, quote)
 
 
+def _persisted_completed_work(spec) -> tuple[int | None, dict | None]:
+    """Authoritative completed steps and rented basis from terminal metrics."""
+    try:
+        with open(os.path.join(state.artifacts_dir(spec), "metrics.json")) as handle:
+            metrics = json.load(handle)
+    except (OSError, TypeError, ValueError):
+        return None, None
+    if not isinstance(metrics, dict):
+        return None, None
+    step = metrics.get("step")
+    valid_step = (
+        isinstance(step, (int, float))
+        and not isinstance(step, bool)
+        and (not isinstance(step, float) or (math.isfinite(step) and step.is_integer()))
+        and step >= 0
+    )
+    completed_steps = int(step) if valid_step else None
+    provider = metrics.get("allocated_provider")
+    gpu = metrics.get("allocated_gpu")
+    gpu_count = metrics.get("allocated_gpu_count")
+    rented_remote = {
+        "provider": provider,
+        "allocated_gpu": gpu,
+        "allocated_gpu_count": gpu_count,
+    }
+    if not any(value is not None for value in rented_remote.values()):
+        rented_remote = None
+    return completed_steps, rented_remote
+
+
 def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
+    """Charge the quote exactly for full work, or its estimated share for an early finish."""
+    completed_steps, persisted_basis = _persisted_completed_work(spec)
+    if completed_steps is not None:
+        # reuse cancellation's estimated-work fraction: one-time compile and reached saves stay
+        # whole, unreached saves stay out, and a wall-capped plan reaches 100% at its priced cap.
+        # a complete horizon produces a fraction of exactly 1 and therefore the accepted quote.
+        status_remote = status.remote if isinstance(status.remote, dict) else {}
+        rented_remote = {
+            key: value for key, value in (persisted_basis or {}).items() if value is not None
+        }
+        rented_remote.update(status_remote)
+        return cancelled_charge_usd(
+            status,
+            spec,
+            steps=completed_steps,
+            fallback=fallback,
+            rented_remote=rented_remote or None,
+        )
     quote = getattr(status, "estimated_cost_usd", None)
     if quote is not None:
         return float(quote)
-    return runner.charge_usd_for_spec(spec, fallback=fallback)
+    return charge_usd_for_spec(spec, fallback=fallback)
 
 
 def actual_steps_run(status: RunStatus) -> int:
@@ -308,33 +364,33 @@ def actual_steps_run(status: RunStatus) -> int:
     if isinstance(step, (int, float)) and step > 0:
         return int(step)
     # training started (rl_step/sft_step/opd_step) but no completed step yet means mid-first-step.
-    if hb.get("stage") in runner._TRAINING_STAGES:
+    if hb.get("stage") in state._TRAINING_STAGES:
         return 1
     return 0
 
 
 def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at: float) -> None:
     """Persist reconciliation COGS without touching run state. No-ops if run vanished."""
-    with runner._status_guard(run_id):
+    with state._status_guard(run_id):
         try:
-            status = runner.get_status(run_id)
+            status = _get_status(run_id)
         except FileNotFoundError:
             return
         status.realized_cost_usd = realized_cost_usd
         status.reconciled_at = reconciled_at
         status.updated_at = time.time()
-        runner._save_status_unlocked(status)
-    runner._report_status(status)
+        state._save_status_unlocked(status)
+    reporting._report_status(status)
 
 
 def record_billing_state(run_id: str, **fields) -> None:
     """Persist billing fields without touching run state. Never downgrades a charged run."""
-    bad = set(fields) - runner._BILLING_FIELDS
+    bad = set(fields) - _BILLING_FIELDS
     if bad:
         raise ValueError(f"record_billing_state only writes billing fields, got: {sorted(bad)}")
-    with runner._status_guard(run_id):
+    with state._status_guard(run_id):
         try:
-            status = runner.get_status(run_id)
+            status = _get_status(run_id)
         except FileNotFoundError:
             return
         new_billing_state = fields.get("billing_state")
@@ -347,5 +403,5 @@ def record_billing_state(run_id: str, **fields) -> None:
         for key, value in fields.items():
             setattr(status, key, value)
         status.updated_at = time.time()
-        runner._save_status_unlocked(status)
-    runner._report_status(status)
+        state._save_status_unlocked(status)
+    reporting._report_status(status)

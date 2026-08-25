@@ -53,11 +53,9 @@ class _SubmitContext:
     drop_weight_cache: bool = False
 
     def on_handle(self, handle: dict) -> None:
-        from flash.runner import (
-            _preserve_cleanup_remote,
-            _TerminalHandleRace,
-            _update,
-        )
+        from flash.runner.accounting.reconciliation import _preserve_cleanup_remote
+        from flash.runner.lifecycle.status import _update
+        from flash.runner.supervise.errors import _TerminalHandleRace
 
         try:
             selected_provider = self.current_gpu.get("provider")
@@ -118,7 +116,7 @@ class _SubmitContext:
 
     def cancel(self):
         """Reap this seed's tracked endpoints before unwinding on cancel."""
-        from flash.runner import _RunCancelled
+        from flash.runner.supervise.errors import _RunCancelled
 
         # a handle whose `running` write loses the terminal-stickiness race never lands in
         # status.remote, so only seen_endpoints (rN walk endpoints _gc_run_endpoints can't name)
@@ -127,7 +125,7 @@ class _SubmitContext:
         return _RunCancelled(f"run {self.spec.run_id} was cancelled")
 
     def raise_if_cancelled(self) -> None:
-        from flash.runner import get_status
+        from flash.runner.lifecycle.status import get_status
 
         try:
             if get_status(self.spec.run_id).state == "cancelled":
@@ -185,7 +183,6 @@ class _AttemptOutcome:
     chosen: object | None = None
     candidates: tuple = ()
     run_spec: JobSpec | None = None
-    quote_refresh_failed: bool = False
     stop: bool = False
 
 
@@ -203,8 +200,9 @@ def _build_context(
     source_snapshot: dict | None,
     attempt_start: int,
 ) -> _SubmitContext:
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME, get_status, source_snapshot_from_status
-    from flash.snapshot.source_snapshot import parse_descriptor
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
+    from flash.snapshot.archive import parse_descriptor
 
     source_snapshot = parse_descriptor(
         source_snapshot or source_snapshot_from_status(get_status(spec.run_id), required=True)
@@ -237,7 +235,7 @@ def _build_context(
 def _require_opd_configuration(ctx: _SubmitContext) -> None:
     if ctx.spec.algorithm != "opd":
         return
-    from flash.runner import _load_run_deadline_at
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.server.domain.teacher.broker import require_teacher_broker_configuration
 
     # configuration and absolute policy fail before allocation can create a paid worker.
@@ -253,11 +251,11 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         return None
     from flash.providers import get_provider
     from flash.providers.core.base import JobHandle
-    from flash.runner import (
+    from flash.runner.accounting.reconciliation import (
         _compare_and_clear_remote,
-        _load_run_deadline_at,
         _record_cleanup_remote,
     )
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
     completed_metrics = _lifecycle._await_runpod_completed_metrics(
         ctx.last_handle,
@@ -353,11 +351,8 @@ def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
 
 
 def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOutcome:
-    from flash.runner import (
-        _reserve_attempt,
-        _spec_with_remaining_wall,
-        _verified_opd_retry_state,
-    )
+    from flash.runner.lifecycle.attempts import _reserve_attempt, _verified_opd_retry_state
+    from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
 
     attempt = ctx.attempt_start + local_attempt
     ctx.raise_if_cancelled()
@@ -402,7 +397,8 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
 def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
     from flash.providers.core.allocator import allocate
     from flash.providers.core.base import CapacityUnavailableError, PollResult, UnsupportedGpuError
-    from flash.runner import _load_run_deadline_at, get_status
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.lifecycle.status import get_status
 
     # a cancel can land after _run_training's pre-submit check but while
     # allocation/pricing runs, when no handle exists yet for cancel_run() to
@@ -517,7 +513,8 @@ def _build_candidate_plan(
 ) -> _CandidatePlan | None:
     from flash.providers import get_provider
     from flash.providers.core.allocator import allocation_summary
-    from flash.runner import _spec_with_gpu, _spec_with_remaining_wall
+    from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
+    from flash.runner.supervise.lifecycle import _spec_with_gpu
 
     candidates = tuple(_lifecycle._oom_escalated(allocation.candidates, ctx.oom_vram_floor))
     if not candidates:
@@ -595,29 +592,8 @@ def _build_candidate_plan(
     return _CandidatePlan(allocation, candidates, chosen, on_last_gpu, effective_spec, run_spec)
 
 
-def _estimate_selected_quote(ctx: _SubmitContext, plan: _CandidatePlan, latest) -> float:
-    from flash.cost.spec import estimate_for_spec
-    from flash.providers.core.base import Allocation as QuoteAllocation
-
-    # preparation stays offline so a market outage cannot consume the lifecycle's first
-    # retry before the run exists. now that allocation selected an exact live shape,
-    # replace the provisional quote atomically with the effective worker spec, before
-    # provisioning starts and before any billable work can occur.
-    quote_allocation = QuoteAllocation(
-        provider=plan.chosen.provider,
-        gpu=plan.chosen.gpu,
-        hourly_usd=plan.chosen.hourly_usd,
-        min_vram_gb=plan.allocation.min_vram_gb,
-        candidates=(plan.chosen,),
-        gpu_count=getattr(plan.chosen, "gpu_count", 1),
-    )
-    selected_quote = estimate_for_spec(plan.effective_spec, allocation=quote_allocation).total_usd
-    _lifecycle._recheck_selected_quote_affordability(latest, selected_quote, ctx.log)
-    return selected_quote
-
-
 def _retry_delay(ctx: _SubmitContext, local_attempt: int) -> float:
-    from flash.runner import _load_run_deadline_at
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
     if local_attempt >= ctx.infra_budget:
         return 0
@@ -636,11 +612,8 @@ def _submit_provider(
         RunExhaustedProviderPoolError,
         UnreconciledCreateError,
     )
-    from flash.runner import (
-        _load_run_deadline_at,
-        _TerminalHandleRace,
-        _worker_deadline_at,
-    )
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at, _worker_deadline_at
+    from flash.runner.supervise.errors import _TerminalHandleRace
     from flash.server.domain.teacher.broker import teacher_attempt_transport
 
     provider = get_provider(plan.chosen.provider)
@@ -710,20 +683,14 @@ def _submit_candidate(
     prepared: _PreparedAttempt,
     plan: _CandidatePlan,
 ):
-    from flash.cost.spec import UnknownPromptPoolSize
-    from flash.engine.profiling.workload_profile import WorkloadProfileMismatch
-    from flash.providers.core.base import PollResult
-    from flash.runner import (
-        TERMINAL_STATES,
-        _persist_effective_worker_spec,
-        _RunCancelled,
-        get_status,
-    )
+    from flash.runner.lifecycle.state import TERMINAL_STATES
+    from flash.runner.lifecycle.status import get_status
+    from flash.runner.lifecycle.submit import _persist_effective_worker_spec
+    from flash.runner.supervise.errors import _RunCancelled
     from flash.server.platform.locks import _deploy_lock
 
     retry_delay = 0.0
-    quote_refresh_failed = False
-    result = None
+    candidate_not_started = False
     ctx.submission_lock = _deploy_lock(ctx.spec.run_id)
     ctx.submission_lock.acquire()
     try:
@@ -734,41 +701,16 @@ def _submit_candidate(
             raise _RunCancelled(
                 f"run {ctx.spec.run_id} already has a durable provider handle; not resubmitting"
             )
-        try:
-            selected_quote = _estimate_selected_quote(ctx, plan, latest)
-        except _lifecycle._SelectedQuoteUnaffordable:
-            raise
-        except (WorkloadProfileMismatch, UnknownPromptPoolSize):
-            # both are defects in the run's own inputs rather than a market or metadata blip, so
-            # retrying re-derives the same answer and fails the same way, spending the run's
-            # remaining deadline in backoff sleeps to get there.
-            #
-            # the profile mismatch is an identity derived from this spec. the missing pool size is
-            # the same shape: grpo/opd price their horizon from a stated prompt-pool size, and a
-            # spec that states none states none on every attempt. this refresh asks for a
-            # PREDICTED horizon (no steps to prorate from), which is exactly the question the
-            # refusal exists to answer -- so it must fail closed once, not once per attempt.
-            raise
-        except Exception as exc:
-            # revision-aware quote inputs can depend on remote metadata. a transient refresh
-            # failure after allocation is infrastructure-shaped, not a terminal run defect.
-            quote_refresh_failed = True
-            result = PollResult(
-                False,
-                failure="poll_error",
-                detail=f"selected quote refresh failed ({type(exc).__name__})",
-            )
+        # the accepted customer quote was frozen during preparation and is exactly the amount shown
+        # by `flash train --cost`. allocation persists only the effective worker spec; live provider
+        # rates and topology must never rewrite estimated_cost_usd after submission.
+        if not _persist_effective_worker_spec(plan.effective_spec):
+            raise ctx.cancel()
+        if get_status(ctx.spec.run_id).state in TERMINAL_STATES:
+            raise ctx.cancel()
+        result, candidate_not_started = _submit_provider(ctx, prepared, plan)
+        if candidate_not_started:
             retry_delay = _retry_delay(ctx, prepared.local_attempt)
-        else:
-            if not _persist_effective_worker_spec(
-                plan.effective_spec, estimated_cost_usd=selected_quote
-            ):
-                raise ctx.cancel()
-            if get_status(ctx.spec.run_id).state in TERMINAL_STATES:
-                raise ctx.cancel()
-            result, submit_refresh_failed = _submit_provider(ctx, prepared, plan)
-            if submit_refresh_failed:
-                retry_delay = _retry_delay(ctx, prepared.local_attempt)
     finally:
         lock = ctx.submission_lock
         ctx.submission_lock = None
@@ -776,7 +718,7 @@ def _submit_candidate(
             lock.release()
     if retry_delay:
         _lifecycle.time.sleep(retry_delay)  # let the transient clear
-    return result, quote_refresh_failed
+    return result
 
 
 def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOutcome:
@@ -787,13 +729,12 @@ def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOut
     plan = _build_candidate_plan(ctx, prepared, allocation)
     if plan is None:
         return _AttemptOutcome(stop=True)
-    result, quote_refresh_failed = _submit_candidate(ctx, prepared, plan)
+    result = _submit_candidate(ctx, prepared, plan)
     return _AttemptOutcome(
         result=result,
         chosen=plan.chosen,
         candidates=plan.candidates,
         run_spec=plan.run_spec,
-        quote_refresh_failed=quote_refresh_failed,
     )
 
 
@@ -821,7 +762,8 @@ def _handle_failure(
     outcome: _AttemptOutcome,
 ) -> _FailureDecision:
     from flash.providers import get_provider
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME, _load_run_deadline_at
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
     # cancel wins over any retry-shaped failure.
     ctx.raise_if_cancelled()
@@ -852,8 +794,7 @@ def _handle_failure(
         and getattr(outcome.run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
     )
     first_cache_drop = (
-        not outcome.quote_refresh_failed
-        and run_had_cache
+        run_had_cache
         and not ctx.drop_weight_cache
         and result.failure in ("no_capacity", "poll_error")
     )
@@ -911,7 +852,7 @@ def _handle_failure(
         ctx.retry_budget.record_retry(result.failure, cache_drop=True)
     else:
         ctx.retry_budget.record_retry(result.failure, cache_drop=False)
-        if outcome.chosen is not None and not outcome.quote_refresh_failed:
+        if outcome.chosen is not None:
             if not oom_shaped:
                 ctx.failed_providers.add(outcome.chosen.provider)
             ctx.tried_classes.add(_lifecycle._shape_key(outcome.chosen))

@@ -13,6 +13,11 @@ import types
 
 import pytest
 
+import flash.serve.contract.errors as serving_errors
+import flash.serve.deployment.deploy as d
+import flash.serve.request.streaming as serving_streaming
+import flash.serve.request.transport as serving_transport
+
 _IMMUTABLE_SERVING_CAPABILITIES = {
     "immutable_adapter_revisions",
     "alias_compare_and_swap",
@@ -22,15 +27,15 @@ _IMMUTABLE_SERVING_CAPABILITIES = {
 
 @pytest.fixture(autouse=True)
 def _stub_shared_http_client(monkeypatch):
-    import flash.serve.deployment.deploy as deploy
+    import flash.serve.request.transport as transport
 
     class _Client:
         def request(self, method, url, **kwargs):
-            return getattr(deploy.httpx, method.lower())(url, **kwargs)
+            return getattr(transport.httpx, method.lower())(url, **kwargs)
 
         def post(self, url, **kwargs):
             timeout = kwargs.pop("timeout", None)
-            client = deploy.httpx.Client(
+            client = transport.httpx.Client(
                 follow_redirects=True,
                 max_redirects=100,
                 timeout=timeout,
@@ -39,7 +44,7 @@ def _stub_shared_http_client(monkeypatch):
 
         def stream(self, method, url, **kwargs):
             timeout = kwargs.pop("timeout", None)
-            client = deploy.httpx.Client(
+            client = transport.httpx.Client(
                 follow_redirects=True,
                 max_redirects=100,
                 timeout=timeout,
@@ -47,9 +52,9 @@ def _stub_shared_http_client(monkeypatch):
             return client.stream(method, url, **kwargs)
 
     client = _Client()
-    monkeypatch.setattr(deploy, "_http_client", lambda: client)
-    monkeypatch.setattr(deploy, "_chat_http_client", lambda: client)
-    monkeypatch.setattr(deploy, "_stream_http_client", lambda: client)
+    monkeypatch.setattr(transport, "_http_client", lambda: client)
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
+    monkeypatch.setattr(transport, "_stream_http_client", lambda: client)
 
 
 def _stub_adapter_config(
@@ -121,8 +126,6 @@ def _capture_registration_body(
     **deploy_kwargs,
 ):
     """Run a non-dry-run deploy_adapter and return the posted adapter body."""
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
     _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
@@ -141,12 +144,12 @@ def _capture_registration_body(
         seen["json"] = json
         return _Resp()
 
-    monkeypatch.setattr(d.httpx, "post", fake_post)
+    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
     run_id = deploy_kwargs.get("run_id", "flash-7-abcd")
     stub_serving_registry(
         {"adapter_id": run_id, "subfolder": f"{deploy_kwargs['adapter_prefix']}/adapter"}
     )
-    registry_get = d.httpx.get
+    registry_get = serving_transport.httpx.get
 
     class _HealthResp(_Resp):
         def json(self):
@@ -162,7 +165,7 @@ def _capture_registration_body(
             return _HealthResp()
         return registry_get(url, **kwargs)
 
-    monkeypatch.setattr(d.httpx, "get", fake_get)
+    monkeypatch.setattr(serving_transport.httpx, "get", fake_get)
     d.deploy_adapter(**deploy_kwargs)
     return seen["json"]
 
@@ -340,7 +343,7 @@ def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
     monkeypatch.setattr(d, "resolve_hf_revision", lambda repo: "a" * 40)
 
     with pytest.raises(
-        d.ServingError, match="failed to read org/repo:sft/r-hf-down/seed0/adapter"
+        serving_errors.ServingError, match="failed to read org/repo:sft/r-hf-down/seed0/adapter"
     ) as excinfo:
         d.deploy_adapter(
             run_id="r-hf-down",
@@ -350,7 +353,7 @@ def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
             dry_run=False,
             lora_rank=32,
         )
-    assert not isinstance(excinfo.value, d.AdapterConfigMissing)
+    assert not isinstance(excinfo.value, serving_errors.AdapterConfigMissing)
 
 
 def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
@@ -371,7 +374,8 @@ def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
     monkeypatch.setattr(d, "resolve_hf_revision", lambda repo: "a" * 40)
 
     with pytest.raises(
-        d.AdapterConfigMissing, match="failed to read org/repo:sft/r-missing/seed0/adapter"
+        serving_errors.AdapterConfigMissing,
+        match="failed to read org/repo:sft/r-missing/seed0/adapter",
     ):
         d.deploy_adapter(
             run_id="r-missing",
@@ -388,7 +392,7 @@ def test_deploy_adapter_missing_tensor_file_is_adapter_tensor_missing(monkeypatc
 
     _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"README.md": 123})
 
-    with pytest.raises(d.AdapterTensorMissing, match="no adapter_model tensor file"):
+    with pytest.raises(serving_errors.AdapterTensorMissing, match="no adapter_model tensor file"):
         d.deploy_adapter(
             run_id="r-missing-tensors",
             model="Qwen/Qwen3.5-4B",
@@ -404,7 +408,7 @@ def test_deploy_adapter_zero_byte_tensor_file_is_adapter_tensor_missing(monkeypa
 
     _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"adapter_model.safetensors": 0})
 
-    with pytest.raises(d.AdapterTensorMissing, match="zero-byte adapter tensor"):
+    with pytest.raises(serving_errors.AdapterTensorMissing, match="zero-byte adapter tensor"):
         d.deploy_adapter(
             run_id="r-empty-tensors",
             model="Qwen/Qwen3.5-4B",
@@ -427,7 +431,9 @@ def test_deploy_adapter_rejects_zero_byte_sharded_tensor(monkeypatch, tmp_path):
         },
     )
 
-    with pytest.raises(d.AdapterTensorMissing, match=r"adapter_model-00002-of-00002\.safetensors"):
+    with pytest.raises(
+        serving_errors.AdapterTensorMissing, match=r"adapter_model-00002-of-00002\.safetensors"
+    ):
         d.deploy_adapter(
             run_id="r-empty-shard",
             model="Qwen/Qwen3.5-4B",
@@ -439,7 +445,8 @@ def test_deploy_adapter_rejects_zero_byte_sharded_tensor(monkeypatch, tmp_path):
 
 
 def test_deploy_rejects_bin_adapter_tensor(monkeypatch, tmp_path):
-    from flash.serve.deployment.deploy import AdapterTensorMissing, adapter_artifact_metadata
+    from flash.serve.contract.errors import AdapterTensorMissing
+    from flash.serve.deployment.adapter_check import adapter_artifact_metadata
 
     seen = _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"adapter_model.bin": None})
 
@@ -458,8 +465,6 @@ def test_deploy_adapter_options_are_keyword_only():
 def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serving_registry):
     """A non-dry-run deploy POSTs the adapter to {FREESOLO_SERVING_URL}/adapters with the
     right body and the internal-key auth header."""
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
@@ -479,7 +484,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
         seen["follow_redirects"] = follow_redirects
         return _Resp()
 
-    monkeypatch.setattr(d.httpx, "post", fake_post)
+    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
         {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
@@ -611,8 +616,6 @@ def test_deploy_registers_structured_outputs_for_thinking_after_capability_probe
 def test_thinking_structured_capability_failure_never_posts_adapter(
     monkeypatch, tmp_path, health_case, match
 ):
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
     posts: list[str] = []
@@ -623,9 +626,13 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
 
         def raise_for_status(self):
             if health_case == "http_error":
-                request = d.httpx.Request("GET", "https://serve.example/healthz")
-                response = d.httpx.Response(503, request=request, text="unavailable")
-                raise d.httpx.HTTPStatusError("unavailable", request=request, response=response)
+                request = serving_transport.httpx.Request("GET", "https://serve.example/healthz")
+                response = serving_transport.httpx.Response(
+                    503, request=request, text="unavailable"
+                )
+                raise serving_transport.httpx.HTTPStatusError(
+                    "unavailable", request=request, response=response
+                )
 
         def json(self):
             if health_case == "invalid_json":
@@ -646,18 +653,18 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
     def fake_get(url, **_kwargs):
         assert url == "https://serve.example/healthz"
         if health_case == "unreachable":
-            request = d.httpx.Request("GET", url)
-            raise d.httpx.ConnectError("connection refused", request=request)
+            request = serving_transport.httpx.Request("GET", url)
+            raise serving_transport.httpx.ConnectError("connection refused", request=request)
         return _HealthResp()
 
     def fake_post(url, **_kwargs):
         posts.append(url)
         pytest.fail("adapter registration must not be attempted")
 
-    monkeypatch.setattr(d.httpx, "get", fake_get)
-    monkeypatch.setattr(d.httpx, "post", fake_post)
+    monkeypatch.setattr(serving_transport.httpx, "get", fake_get)
+    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
 
-    with pytest.raises(d.ServingError, match=match):
+    with pytest.raises(serving_errors.ServingError, match=match):
         d.deploy_adapter(
             run_id="flash-7-abcd",
             model="Qwen/Qwen3.5-0.8B",
@@ -674,8 +681,6 @@ def test_missing_provenance_only_still_deploys(monkeypatch, tmp_path):
     thinking/structured-outputs cap, but NOT revision_provenance. That must NOT block the deploy
     (regression guard for the org-wide `serving_contract_unsupported: ... revision_provenance`
     outage): the capability check passes and registration is attempted."""
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
     posts: list[str] = []
@@ -703,8 +708,8 @@ def test_missing_provenance_only_still_deploys(monkeypatch, tmp_path):
         posts.append(url)
         raise RuntimeError("REACHED_POST")  # stop after proving the capability gate let us through
 
-    monkeypatch.setattr(d.httpx, "get", fake_get)
-    monkeypatch.setattr(d.httpx, "post", fake_post)
+    monkeypatch.setattr(serving_transport.httpx, "get", fake_get)
+    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
 
     with pytest.raises(RuntimeError, match="REACHED_POST"):
         d.deploy_adapter(
@@ -719,8 +724,6 @@ def test_missing_provenance_only_still_deploys(monkeypatch, tmp_path):
 
 
 def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatch, tmp_path):
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
     advertised = sorted(
@@ -755,8 +758,8 @@ def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatc
         captured["budget_s"] = budget_s
         return {}
 
-    monkeypatch.setattr(d.httpx, "get", fake_get)
-    monkeypatch.setattr(d.httpx, "post", lambda *args, **kwargs: _Resp())
+    monkeypatch.setattr(serving_transport.httpx, "get", fake_get)
+    monkeypatch.setattr(serving_transport.httpx, "post", lambda *args, **kwargs: _Resp())
     monkeypatch.setattr(d, "_wait_revision_ready", wait_ready)
 
     d.deploy_adapter(
@@ -788,8 +791,8 @@ def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
         "metadata": {"lifecycle_state": "ready"},
     }
     outcomes = [
-        d.ServingError("temporary 503", status_code=503),
-        d.ServingError("connection reset"),
+        serving_errors.ServingError("temporary 503", status_code=503),
+        serving_errors.ServingError("connection reset"),
         ready,
     ]
 
@@ -821,7 +824,7 @@ def test_wait_revision_ready_caps_reads_by_remaining_wall_time(monkeypatch):
         assert adapter_id == revision
         request_timeouts.append(timeout_s)
         clock[0] += 3.0 if len(request_timeouts) == 1 else float(timeout_s)
-        raise d.ServingError("slow transient read", status_code=503)
+        raise serving_errors.ServingError("slow transient read", status_code=503)
 
     def fake_sleep(delay):
         clock[0] += delay
@@ -831,7 +834,7 @@ def test_wait_revision_ready_caps_reads_by_remaining_wall_time(monkeypatch):
     monkeypatch.setattr(d.time, "sleep", fake_sleep)
     monkeypatch.setattr(d, "_registered_adapter_response", fake_registered_adapter)
 
-    with pytest.raises(d.ServingError, match="readiness could not be confirmed"):
+    with pytest.raises(serving_errors.ServingError, match="readiness could not be confirmed"):
         d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     assert request_timeouts == [5.0, 1.0]
@@ -907,7 +910,7 @@ def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
 
     # take the CLI default from the parser rather than restating it, so the two cannot drift apart
     # silently: shrinking bare `--wait` must fail here, not in a deploy.
-    from flash.cli import _build_parser
+    from flash.cli.parsing.main import _build_parser
     from flash.server.routes.serving import _DEPLOYMENT_STALE_SECONDS
     from flash.server.routes.serving_smoke import _SMOKE_BUDGET_SECONDS
 
@@ -935,7 +938,9 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
     class Response:
         status_code = 200
 
-    monkeypatch.setattr(d, "_serving_request", lambda method, url, **kwargs: Response())
+    monkeypatch.setattr(
+        serving_transport, "serving_request", lambda method, url, **kwargs: Response()
+    )
     budgets = []
 
     def wait_ready(revision, subfolder, **kwargs):
@@ -978,7 +983,7 @@ def test_revision_ready_timeout_message_is_self_diagnosing(monkeypatch):
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
-    with pytest.raises(d.ServingError) as excinfo:
+    with pytest.raises(serving_errors.ServingError) as excinfo:
         d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=7.0)
 
     message = str(excinfo.value)
@@ -1016,7 +1021,7 @@ def test_revision_ready_timeout_reports_the_loader_failure(monkeypatch):
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
-    with pytest.raises(d.ServingError) as excinfo:
+    with pytest.raises(serving_errors.ServingError) as excinfo:
         d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     message = str(excinfo.value)
@@ -1044,7 +1049,7 @@ def test_revision_ready_timeout_distinguishes_a_never_visible_record(monkeypatch
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
-    with pytest.raises(d.ServingError) as excinfo:
+    with pytest.raises(serving_errors.ServingError) as excinfo:
         d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     message = str(excinfo.value)
@@ -1083,7 +1088,7 @@ def test_a_cleared_loader_failure_is_not_reported_after_the_timeout(monkeypatch)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
-    with pytest.raises(d.ServingError) as excinfo:
+    with pytest.raises(serving_errors.ServingError) as excinfo:
         d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     message = str(excinfo.value)
@@ -1121,13 +1126,13 @@ def test_a_loader_failure_survives_later_transient_read_errors(monkeypatch):
                 },
                 types.SimpleNamespace(headers={}),
             )
-        raise d.ServingError("serving backend error (HTTP 503)", status_code=503)
+        raise serving_errors.ServingError("serving backend error (HTTP 503)", status_code=503)
 
     monkeypatch.setattr(d, "_registered_adapter_response", registered)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
-    with pytest.raises(d.ServingError) as excinfo:
+    with pytest.raises(serving_errors.ServingError) as excinfo:
         d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     message = str(excinfo.value)
@@ -1155,7 +1160,7 @@ def test_rejected_adapter_still_fails_distinctly_from_a_timeout(monkeypatch):
         ),
     )
 
-    with pytest.raises(d.ServingError) as excinfo:
+    with pytest.raises(serving_errors.ServingError) as excinfo:
         d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     message = str(excinfo.value)
@@ -1197,7 +1202,7 @@ def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp
         )
 
     activations = []
-    monkeypatch.setattr(d, "_serving_request", request)
+    monkeypatch.setattr(serving_transport, "serving_request", request)
     monkeypatch.setattr(d, "_registered_adapter_response", registered)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(
@@ -1206,7 +1211,7 @@ def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp
         lambda *args, **kwargs: activations.append((args, kwargs)),
     )
 
-    with pytest.raises(d.ServingError, match="revision_ready_timeout"):
+    with pytest.raises(serving_errors.ServingError, match="revision_ready_timeout"):
         d.deploy_adapter(
             run_id="run-expiry",
             model="Qwen/Qwen3.5-4B",
@@ -1231,7 +1236,7 @@ def test_registered_adapter_caps_request_timeout(monkeypatch):
         return Response()
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    monkeypatch.setattr(d.httpx, "get", fake_get)
+    monkeypatch.setattr(serving_transport.httpx, "get", fake_get)
 
     assert d._registered_adapter("run-1", timeout_s=0.75) is None
     assert seen["timeout"] == 0.75
@@ -1260,15 +1265,13 @@ def test_adapter_alias_target_rejects_legacy_record(monkeypatch):
     assert d.adapter_alias_target("run-1") is None
 
     monkeypatch.setattr(d, "_registered_adapter", lambda run_id: {"adapter_id": run_id})
-    with pytest.raises(d.ServingError, match="legacy aliases are unsupported"):
+    with pytest.raises(serving_errors.ServingError, match="legacy aliases are unsupported"):
         d.adapter_alias_target("run-1")
 
 
 def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_serving_registry):
     """When the deploying org is known, registration carries `org_id` so serving can persist
     hosted_lora_adapters.org_id and later authorize external chat by org. Omitted when unknown."""
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
@@ -1285,7 +1288,7 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_servin
         seen["json"] = json
         return _Resp()
 
-    monkeypatch.setattr(d.httpx, "post", fake_post)
+    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
         {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
@@ -1314,8 +1317,6 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
     """Registration carries the run's training `thinking` flag so serving can default
     enable_thinking to it for raw chat callers (those that omit chat_template_kwargs). A
     thinking=true run registers thinking=true; a thinking=false run registers thinking=false."""
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
@@ -1332,7 +1333,7 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
         seen["json"] = json
         return _Resp()
 
-    monkeypatch.setattr(d.httpx, "post", fake_post)
+    monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
         {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
@@ -1370,17 +1371,15 @@ def test_deploy_propagates_serving_error(monkeypatch, tmp_path):
         status_code = 500
 
         def raise_for_status(self):
-            raise d.httpx.HTTPStatusError("boom", request=None, response=None)
+            raise serving_transport.httpx.HTTPStatusError("boom", request=None, response=None)
 
-    monkeypatch.setattr(d.httpx, "post", lambda *a, **k: _Resp())
-    with pytest.raises(d.ServingError):
+    monkeypatch.setattr(serving_transport.httpx, "post", lambda *a, **k: _Resp())
+    with pytest.raises(serving_errors.ServingError):
         d.deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "org/repo", "sft/r1/seed0")
 
 
 def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
     """A terminal /v1 override keeps undeploy calls on the serving control root."""
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
 
@@ -1406,11 +1405,13 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
         seen["follow_redirects"] = follow_redirects
         return _Resp(200)
 
-    monkeypatch.setattr(d.httpx, "delete", fake_delete)
+    monkeypatch.setattr(serving_transport.httpx, "delete", fake_delete)
     # no registry-readback get: the structured undeploy response (disabled_aliases /
     # disabled_revisions / serving_deregistered) is authoritative.
     monkeypatch.setattr(
-        d.httpx, "get", lambda *a, **k: pytest.fail("undeploy must not read the registry back")
+        serving_transport.httpx,
+        "get",
+        lambda *a, **k: pytest.fail("undeploy must not read the registry back"),
     )
     out = d.undeploy_adapter("flash-7-abcd")
     assert out["disabled_aliases"] == ["flash-7-abcd"]
@@ -1421,7 +1422,7 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
     assert seen["follow_redirects"] is True
 
     # A 404 (already gone) returns an empty list, not an error.
-    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
+    monkeypatch.setattr(serving_transport.httpx, "delete", lambda *a, **k: _Resp(404))
     assert d.undeploy_adapter("flash-7-abcd")["serving_deregistered"] is False
 
 
@@ -1437,11 +1438,11 @@ def test_undeploy_propagates_serving_error(monkeypatch):
             self.text = "kaboom"
 
         def raise_for_status(self):
-            raise d.httpx.HTTPStatusError("boom", request=None, response=self)
+            raise serving_transport.httpx.HTTPStatusError("boom", request=None, response=self)
 
     # Non-404 (500) → ServingError carrying the upstream status, not a raw httpx error.
-    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(500))
-    with pytest.raises(d.ServingError) as ei:
+    monkeypatch.setattr(serving_transport.httpx, "delete", lambda *a, **k: _Resp(500))
+    with pytest.raises(serving_errors.ServingError) as ei:
         d.undeploy_adapter("flash-7-abcd")
     assert ei.value.status_code == 500
 
@@ -1450,17 +1451,19 @@ def test_undeploy_propagates_serving_error(monkeypatch):
     # message can raise TypeError before undeploy_adapter() can translate it, so mirror the real
     # undeploy call (DELETE {serving}/adapters/{run_id}).
     def _boom_delete(*a, **k):
-        raise d.httpx.RequestError(
+        raise serving_transport.httpx.RequestError(
             "no route to host",
-            request=d.httpx.Request("DELETE", "https://serve.example/adapters/flash-7-abcd"),
+            request=serving_transport.httpx.Request(
+                "DELETE", "https://serve.example/adapters/flash-7-abcd"
+            ),
         )
 
-    monkeypatch.setattr(d.httpx, "delete", _boom_delete)
-    with pytest.raises(d.ServingError):
+    monkeypatch.setattr(serving_transport.httpx, "delete", _boom_delete)
+    with pytest.raises(serving_errors.ServingError):
         d.undeploy_adapter("flash-7-abcd")
 
     # A 404 short-circuits before raise_for_status(), so it stays a no-op success (not a ServingError).
-    monkeypatch.setattr(d.httpx, "delete", lambda *a, **k: _Resp(404))
+    monkeypatch.setattr(serving_transport.httpx, "delete", lambda *a, **k: _Resp(404))
     assert d.undeploy_adapter("flash-7-abcd")["serving_deregistered"] is False
 
 
@@ -1502,9 +1505,9 @@ def test_chat_classifies_retryable_alias_smoke_503_for_the_expected_revision(mon
         def post(self, *args, **kwargs):
             return Response()
 
-    monkeypatch.setattr(d.httpx, "Client", Client)
+    monkeypatch.setattr(serving_transport.httpx, "Client", Client)
 
-    with pytest.raises(d.RetryableServingUnavailable) as exc_info:
+    with pytest.raises(serving_errors.RetryableServingUnavailable) as exc_info:
         d.chat(
             run_id,
             [{"role": "user", "content": "hello"}],
@@ -1542,7 +1545,9 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
 
         def __init__(self):
             self.headers = {"Retry-After": "1"}
-            self.request = d.httpx.Request("POST", "https://serve.example/v1/chat/completions")
+            self.request = serving_transport.httpx.Request(
+                "POST", "https://serve.example/v1/chat/completions"
+            )
 
         def json(self):
             return {
@@ -1554,7 +1559,9 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
             }
 
         def raise_for_status(self):
-            raise d.httpx.HTTPStatusError("unavailable", request=self.request, response=self)
+            raise serving_transport.httpx.HTTPStatusError(
+                "unavailable", request=self.request, response=self
+            )
 
     class Client:
         def __init__(self, *args, **kwargs):
@@ -1569,9 +1576,9 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
         def post(self, *args, **kwargs):
             return Response()
 
-    monkeypatch.setattr(d.httpx, "Client", Client)
+    monkeypatch.setattr(serving_transport.httpx, "Client", Client)
 
-    with pytest.raises(d.httpx.HTTPStatusError):
+    with pytest.raises(serving_transport.httpx.HTTPStatusError):
         d.chat(
             revision,
             [{"role": "user", "content": "hello"}],
@@ -1582,8 +1589,6 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
 
 def test_chat_posts_to_freesolo_serving(monkeypatch):
     """A terminal /v1 override produces one OpenAI path for direct chat."""
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
 
@@ -1621,7 +1626,7 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
             seen["headers"] = headers or {}
             return _Resp()
 
-    monkeypatch.setattr(d.httpx, "Client", _FakeClient)
+    monkeypatch.setattr(serving_transport.httpx, "Client", _FakeClient)
     out = d.chat(
         run_id="flash-7-abcd",
         messages=[{"role": "user", "content": "2+2?"}],
@@ -1647,8 +1652,6 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
 
 
 def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkeypatch):
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
     requests = []
@@ -1665,7 +1668,7 @@ def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkey
             requests.append((url, kwargs))
             return Response()
 
-    monkeypatch.setattr(d, "_chat_http_client", Client)
+    monkeypatch.setattr(serving_transport, "_chat_http_client", Client)
 
     messages = [{"role": "user", "content": "hello"}]
     d.chat("run-1", messages, structured_outputs={})
@@ -1682,8 +1685,6 @@ def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkey
 
 def test_chat_stream_yields_openai_sse_content(monkeypatch):
     """A terminal /v1 override produces one OpenAI path for streaming chat."""
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
     seen = {}
@@ -1729,10 +1730,10 @@ def test_chat_stream_yields_openai_sse_content(monkeypatch):
             seen["headers"] = headers or {}
             return _StreamResp()
 
-    monkeypatch.setattr(d.httpx, "Client", _FakeClient)
+    monkeypatch.setattr(serving_transport.httpx, "Client", _FakeClient)
 
     chunks = list(
-        d.chat_stream(
+        serving_streaming.chat_stream(
             run_id="flash-7-abcd",
             messages=[{"role": "user", "content": "2+2?"}],
             temperature=0.0,
@@ -1760,8 +1761,6 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
     """
     import httpx
 
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
 
     def handler(request):
@@ -1776,23 +1775,24 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
         kwargs["transport"] = transport
         return real_client(*args, **kwargs)
 
-    monkeypatch.setattr(d.httpx, "Client", _client)
+    monkeypatch.setattr(serving_transport.httpx, "Client", _client)
 
-    assert list(d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])) == [
-        "full reply"
-    ]
+    assert list(
+        serving_streaming.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
+    ) == ["full reply"]
 
 
 def _erroring_stream_seams(monkeypatch, resp):
     """Point the chat_stream seams at a fake client whose stream() yields ``resp``."""
-    import flash.serve.deployment.deploy as d
 
     class _FakeClient:
         def stream(self, method, url, **kwargs):
             return resp
 
-    monkeypatch.setattr(d, "_stream_http_client", lambda: _FakeClient())
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(serving_transport, "_stream_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(
+        serving_transport, "serving_openai_base_url", lambda: "https://serve.example/v1"
+    )
 
 
 def test_chat_stream_upstream_error_raises_before_first_chunk(monkeypatch):
@@ -1804,8 +1804,6 @@ def test_chat_stream_upstream_error_raises_before_first_chunk(monkeypatch):
     must be closed on the way out.
     """
     import httpx
-
-    import flash.serve.deployment.deploy as d
 
     exits = []
 
@@ -1828,7 +1826,7 @@ def test_chat_stream_upstream_error_raises_before_first_chunk(monkeypatch):
     _erroring_stream_seams(monkeypatch, _ErrorResp())
 
     with pytest.raises(httpx.HTTPStatusError):
-        d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
+        serving_streaming.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
     assert len(exits) == 1
 
 
@@ -1857,12 +1855,11 @@ def test_chat_stream_midstream_failure_raises_and_closes_upstream(monkeypatch):
 
     The propagating exception is what makes the serving route abort the chunked body, so the
     client sees a truncated transfer rather than a clean eof."""
-    import flash.serve.deployment.deploy as d
 
     resp = _MidstreamFailureResp()
     _erroring_stream_seams(monkeypatch, resp)
 
-    stream = d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
+    stream = serving_streaming.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
     assert next(stream) == "hi"
     with pytest.raises(RuntimeError, match="upstream connection lost"):
         next(stream)
@@ -1875,12 +1872,11 @@ def test_chat_stream_close_without_iterating_closes_upstream(monkeypatch):
     chat_stream opens the upstream connection eagerly, so the returned generator must already
     be running: close() on a never-started generator skips the finally that exits the httpx
     stream context."""
-    import flash.serve.deployment.deploy as d
 
     resp = _MidstreamFailureResp()
     _erroring_stream_seams(monkeypatch, resp)
 
-    stream = d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
+    stream = serving_streaming.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])
     stream.close()
     assert len(resp.exits) == 1
 
@@ -1894,8 +1890,6 @@ def test_internal_key_is_stripped_on_cross_origin_redirect(monkeypatch):
     """
     import httpx
 
-    import flash.serve.deployment.deploy as d
-
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
 
@@ -1907,8 +1901,10 @@ def test_internal_key_is_stripped_on_cross_origin_redirect(monkeypatch):
             return httpx.Response(302, headers={"Location": "https://attacker.example/capture"})
         return httpx.Response(200, json={})
 
-    with d._new_serving_client(transport=httpx.MockTransport(handler)) as client:
-        resp = client.get("https://serve.example/v1/adapters", headers=d._internal_key_header())
+    with serving_transport._new_serving_client(transport=httpx.MockTransport(handler)) as client:
+        resp = client.get(
+            "https://serve.example/v1/adapters", headers=serving_transport._internal_key_header()
+        )
 
     assert resp.status_code == 200
     # first hop (serving origin) carries the key; the redirected hop must not.
@@ -1918,8 +1914,6 @@ def test_internal_key_is_stripped_on_cross_origin_redirect(monkeypatch):
 def test_internal_key_survives_same_origin_redirect_polls(monkeypatch):
     """Modal's async-result poll flow (same-origin 303s) must keep working with the key."""
     import httpx
-
-    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -1932,8 +1926,10 @@ def test_internal_key_survives_same_origin_redirect_polls(monkeypatch):
             return httpx.Response(303, headers={"Location": "https://serve.example/v1/poll"})
         return httpx.Response(200, json={})
 
-    with d._new_serving_client(transport=httpx.MockTransport(handler)) as client:
-        resp = client.get("https://serve.example/v1/slow", headers=d._internal_key_header())
+    with serving_transport._new_serving_client(transport=httpx.MockTransport(handler)) as client:
+        resp = client.get(
+            "https://serve.example/v1/slow", headers=serving_transport._internal_key_header()
+        )
 
     assert resp.status_code == 200
     assert seen == [("/v1/slow", "secret-internal"), ("/v1/poll", "secret-internal")]
@@ -1949,17 +1945,15 @@ def test_serving_clients_bound_redirect_chains(monkeypatch):
     """
     import httpx
 
-    import flash.serve.deployment.deploy as d
-
     # sized for the 30-minute chat timeout at one poll hop per ~150s, with margin.
-    assert d._MAX_REDIRECTS * 150 >= 30 * 60
+    assert serving_transport._MAX_REDIRECTS * 150 >= 30 * 60
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
 
     def handler(request):
         return httpx.Response(302, headers={"Location": "https://serve.example/v1/again"})
 
-    with d._new_serving_client(transport=httpx.MockTransport(handler)) as client:
-        assert client.max_redirects == d._MAX_REDIRECTS
+    with serving_transport._new_serving_client(transport=httpx.MockTransport(handler)) as client:
+        assert client.max_redirects == serving_transport._MAX_REDIRECTS
         with pytest.raises(httpx.TooManyRedirects):
             client.get("https://serve.example/v1/loop")

@@ -6,10 +6,13 @@ import math
 import time
 from dataclasses import replace
 
-import flash.runner as runner
 from flash.core.spec import JobSpec
 from flash.providers._lifecycle.net.deadline import require_finite_positive
-from flash.runner import RunStatus
+from flash.runner.lifecycle import state
+from flash.runner.lifecycle import status as status_ops
+from flash.runner.lifecycle.state import RunStatus
+
+MIN_PROVIDER_WALL_SECONDS = 60
 
 
 def _require_valid_deadline(value: object) -> float:
@@ -24,17 +27,17 @@ def _require_valid_deadline(value: object) -> float:
 
 
 def _canonical_run_deadline(raw: dict) -> tuple[RunStatus, float]:
-    status = runner._runstatus_from_json(raw)
+    status = status_ops._runstatus_from_json(raw)
     # max_wall_seconds is platform-managed and stripped from the public status.spec, so source the
     # run-global wall budget from the internal worker spec (the same value submit recorded).
-    spec = runner._internal_spec_from_status(status)
-    created_at = runner._require_valid_deadline(status.created_at)
-    max_wall_seconds = runner._require_valid_deadline(spec.gpu.max_wall_seconds)
-    return status, runner._require_valid_deadline(created_at + max_wall_seconds)
+    spec = state._internal_spec_from_status(status)
+    created_at = _require_valid_deadline(status.created_at)
+    max_wall_seconds = _require_valid_deadline(spec.gpu.max_wall_seconds)
+    return status, _require_valid_deadline(created_at + max_wall_seconds)
 
 
 def _checked_stored_run_deadline(stored: object, canonical: float) -> float:
-    deadline = runner._require_valid_deadline(stored)
+    deadline = _require_valid_deadline(stored)
     if not math.isclose(deadline, canonical, rel_tol=0.0, abs_tol=1e-6):
         raise RuntimeError(
             "persisted run wall deadline does not match canonical submission deadline; "
@@ -45,13 +48,13 @@ def _checked_stored_run_deadline(stored: object, canonical: float) -> float:
 
 def _load_run_deadline_at(run_id: str) -> float:
     """Return the persisted canonical submission-to-terminal deadline."""
-    raw = runner._load_status_json(run_id)
-    _status, canonical = runner._canonical_run_deadline(raw)
-    if runner._RUN_DEADLINE_AT_KEY not in raw:
+    raw = status_ops._load_status_json(run_id)
+    _status, canonical = _canonical_run_deadline(raw)
+    if state._RUN_DEADLINE_AT_KEY not in raw:
         raise RuntimeError(
             "persisted run wall deadline is missing; no further provisioning is allowed"
         )
-    return runner._checked_stored_run_deadline(raw[runner._RUN_DEADLINE_AT_KEY], canonical)
+    return _checked_stored_run_deadline(raw[state._RUN_DEADLINE_AT_KEY], canonical)
 
 
 def _remaining_run_wall_seconds(run_id: str, *, now: float | None = None) -> float:
@@ -64,7 +67,7 @@ def _remaining_run_wall_seconds(run_id: str, *, now: float | None = None) -> flo
         or current <= 0
     ):
         raise ValueError("current clock is invalid")
-    return max(0.0, runner._load_run_deadline_at(run_id) - float(current))
+    return max(0.0, _load_run_deadline_at(run_id) - float(current))
 
 
 def _worker_deadline_at(run_id: str, spec: JobSpec, *, now: float | None = None) -> float:
@@ -75,7 +78,7 @@ def _worker_deadline_at(run_id: str, spec: JobSpec, *, now: float | None = None)
     fetch all come out of the work budget, and a slow-to-boot box self-terminates before it can emit
     the first heartbeat that would have armed the plane's own clock.
     """
-    return runner._load_run_deadline_at(run_id)
+    return _load_run_deadline_at(run_id)
 
 
 def _spec_with_remaining_wall(
@@ -85,10 +88,10 @@ def _spec_with_remaining_wall(
     now: float | None = None,
 ) -> JobSpec:
     """Copy a spec with only the run-global wall allowance still available."""
-    remaining = runner._remaining_run_wall_seconds(spec.run_id, now=now)
+    remaining = _remaining_run_wall_seconds(spec.run_id, now=now)
     if remaining <= 0:
         raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
-    if require_provider_minimum and remaining < runner.MIN_PROVIDER_WALL_SECONDS:
+    if require_provider_minimum and remaining < MIN_PROVIDER_WALL_SECONDS:
         raise RuntimeError(
             "run wall deadline has less than the 60-second minimum provider allowance remaining; "
             "no further provisioning is allowed"

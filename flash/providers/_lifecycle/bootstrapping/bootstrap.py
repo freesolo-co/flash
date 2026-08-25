@@ -27,13 +27,13 @@ if __package__:
         _read_console_tail,
         _safe_detail,
     )
-    from flash.snapshot import source_snapshot as _source_snapshot
+    from flash.snapshot import archive as _source_snapshot
 else:
     # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
     # same directory, and the script directory leads sys.path.
+    import archive as _source_snapshot  # type: ignore[no-redef]
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
-    import source_snapshot as _source_snapshot  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
         _read_console_tail,

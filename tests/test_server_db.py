@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import flash.runner.lifecycle.state as runner_state
 from flash.server.platform import db
 
 
@@ -408,15 +409,12 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     import flash.providers.runpod.client.auth as runpod_keys
 
     runpod_keys.reset()
-
-    import flash.runner as runner
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
 
-    importlib.reload(runner)
     importlib.reload(auth_mod)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
 
     token = "fslo_abc123_secret"

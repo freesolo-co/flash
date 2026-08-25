@@ -55,7 +55,8 @@ def resolve_reshard_after_forward(
         return True
     try:
         from flash.engine.plan.vram import model_required_vram_gb, resolve_params_b
-        from flash.providers.core.base import get_gpu_info, zero2_enabled
+        from flash.providers.core.base import get_gpu_info
+        from flash.providers.core.sharding import zero2_enabled
 
         # the PINNED revision's real weight count, not the catalog default: the retained copy is
         # priced off the weights the worker actually loads.

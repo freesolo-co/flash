@@ -37,6 +37,24 @@ def test_breakdown_lists_every_term(est):
     assert "Notes" in b
 
 
+def test_plain_analytical_total_uses_billing_round_half_up(est):
+    quote = dataclasses.replace(est, total_usd=1.005)
+
+    assert f"{quote.total_usd:.2f}" == "1.00", "the fixture must expose half-even formatting"
+    assert "TOTAL      : $1.01" in quote.breakdown()
+
+
+def test_styled_analytical_total_uses_billing_round_half_up(est, monkeypatch):
+    from flash.cli.ui import render
+
+    monkeypatch.setenv("FLASH_STYLE", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    quote = dataclasses.replace(est, total_usd=1.005)
+
+    assert f"{quote.total_usd:.2f}" == "1.00", "the fixture must expose half-even formatting"
+    assert "$1.01" in render.cost_panel(quote)
+
+
 def test_capped_estimate_flags_in_breakdown():
     capped = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 100_000))
     assert capped.wall_capped

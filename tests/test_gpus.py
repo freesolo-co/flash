@@ -405,7 +405,7 @@ def test_config_defaults_gpu_to_auto():
 
 def test_build_worker_env():
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(
         run_id="r1",

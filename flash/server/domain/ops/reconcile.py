@@ -11,8 +11,10 @@ import json
 import time
 import urllib.request
 
-from flash import runner
+import flash.runner.accounting.costs as runner_costs
+import flash.runner.lifecycle.status as runner_status
 from flash.providers.core.realized import realized_cost_for_remote
+from flash.runner.lifecycle.state import TERMINAL_STATES, RunStatus
 from flash.server.platform.auth import freesolo_base_url
 from flash.server.platform.internal_client import internal_key
 
@@ -25,8 +27,8 @@ _WINDOW_SECONDS = 7 * 86400.0  # only reconcile runs that finished within the la
 # States that incur no GPU cost -> never reconciled.
 _FREE_TERMINAL_STATES = frozenset({"dry_run"})
 # reconcile terminal billable states plus `deployed`, whose training invoice is final even though
-# it is intentionally absent from `runner.TERMINAL_STATES`. exclude free states such as `dry_run`.
-_RECONCILABLE_STATES = (runner.TERMINAL_STATES | {"deployed"}) - _FREE_TERMINAL_STATES
+# it is intentionally absent from `TERMINAL_STATES`. exclude free states such as `dry_run`.
+_RECONCILABLE_STATES = (TERMINAL_STATES | {"deployed"}) - _FREE_TERMINAL_STATES
 
 
 def reconcile_enabled() -> bool:
@@ -59,14 +61,14 @@ def _report(body: dict) -> bool:
         return False
 
 
-def _terminal_ts(status: runner.RunStatus) -> float:
+def _terminal_ts(status: RunStatus) -> float:
     """Return the immutable training-teardown time used for billing and eligibility."""
     if status.finished_at is None:
         raise ValueError(f"run {status.run_id} is missing finished_at")
     return float(status.finished_at)
 
 
-def _due(status: runner.RunStatus, now: float) -> bool:
+def _due(status: RunStatus, now: float) -> bool:
     """Whether a run should be reconciled this pass: a billable run whose training is finished
     (a terminal billable state, or `deployed` -- see _RECONCILABLE_STATES), not yet reconciled,
     past the settle delay, still within the window, and carrying a provider handle."""
@@ -82,7 +84,7 @@ def _due(status: runner.RunStatus, now: float) -> bool:
     return bool(status.remote)
 
 
-def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool:
+def reconcile_run(status: RunStatus, *, now: float | None = None) -> bool:
     """Pull + report realized cost for one run; mark it reconciled on success. Returns True when
     a positive realized cost was reported. A zero/None result leaves the run unreconciled so a
     later cycle (within the window) retries once the provider invoice settles."""
@@ -121,7 +123,7 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     # persist realized-cost fields only. `status` is stale, and writing its state could revert a run
     # that advanced to nonterminal `deployed`, which terminal-sticky CAS would not protect.
     with contextlib.suppress(Exception):
-        runner.record_realized_cost(
+        runner_costs.record_realized_cost(
             status.run_id,
             realized_cost_usd=realized.realized_usd,
             reconciled_at=now,
@@ -135,7 +137,7 @@ def reconcile_once(*, now: float | None = None) -> int:
         return 0
     now = time.time() if now is None else now
     reported = 0
-    for status in runner.list_runs():
+    for status in runner_status.list_runs():
         if not _due(status, now):
             continue
         with contextlib.suppress(Exception):

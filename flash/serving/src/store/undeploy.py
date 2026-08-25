@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.io.serving_io import _get_stored, _list_run_stored, _replace_stored_cas
+from flash.serving.src.store.access import _get_stored, _list_run_stored, _replace_stored_cas
 from flash.serving.src.store.persistence import PersistenceRecordError
 
 # Rows that lose the compare-and-swap are re-read and retried. Bounded so a row losing every race

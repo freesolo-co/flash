@@ -20,8 +20,7 @@ from starlette.responses import StreamingResponse
 from flash.serving.src.http.adapter_routes import remove_adapter
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.io.serving_io import _sse
-from flash.serving.src.io.streaming import _produce_openai_chat_stream, openai_chat_stream
+from flash.serving.src.io.streaming import _produce_openai_chat_stream, _sse, openai_chat_stream
 from tests.serving.conftest import attest
 
 

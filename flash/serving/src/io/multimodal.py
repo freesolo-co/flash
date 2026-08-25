@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
+from fastapi import HTTPException, status
+
 from flash.serve.request import validation as _shared
+from flash.serving.src.engine.model_config import image_limit_for, supports_image_input
+from flash.serving.src.io.schemas import AdapterRecord
 
 _MAX_IMAGES = _shared.MAX_IMAGES
 _MAX_COMPRESSED_BYTES = _shared.MAX_COMPRESSED_BYTES
@@ -43,6 +48,31 @@ def normalize_chat_messages(
         raise MultimodalRequestError("the resolved base model does not support image input")
     _shared.close_images(_decode_images(sources, image_limit=image_limit))
     return None
+
+
+async def _prepare_generate_request(payload: Any, target: AdapterRecord) -> None:
+    messages = getattr(payload, "messages", None)
+    if not isinstance(messages, list):
+        return
+    # validate every message list, not only ones carrying list-form content. `generaterequest`
+    # only checks that this is a list of dicts, and the engine hands it straight to the chat
+    # template, so a string-content request skipping this bypassed both halves of the shared
+    # contract: a malformed `{"role": "user"}` rendered as an empty prompt and billed the
+    # completion, and `developer` was never rewritten to `system` before gpu dispatch.
+    try:
+        normalized = await asyncio.to_thread(
+            normalize_chat_messages,
+            messages,
+            supports_images=supports_image_input(target.base_model),
+            image_limit=image_limit_for(target.base_model),
+        )
+    except MultimodalRequestError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    # write back only for text-only lists, where the normalized form is self-contained and the
+    # role rewrite would otherwise be lost. image lists return none: their normalized form has
+    # the sources stripped out, so the engine must re-normalize the original.
+    if normalized is not None:
+        payload.messages = normalized
 
 
 def prepare_multimodal_request(

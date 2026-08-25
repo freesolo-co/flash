@@ -17,7 +17,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from flash._internal.logging import get_logger
-from flash.runner import artifact_namespace
+from flash.runner.accounting.artifacts import artifact_namespace
+from flash.serve.contract import urls as serving_urls
+from flash.serve.request import transport as serving_transport
 
 logger = get_logger(__name__)
 
@@ -112,9 +114,7 @@ def deployed_prefixes() -> tuple[set[tuple[str, str]], set[str], bool]:
     The tuple contains exact prefixes, whole repos with unmappable live records, and a completeness
     flag; callers fail closed when any live adapter cannot be identified.
     """
-    from flash.serve.deployment import deploy as _sd
-
-    resp = _sd._serving_request("GET", f"{_sd.serving_base_url()}/adapters")
+    resp = serving_transport.serving_request("GET", f"{serving_urls.serving_base_url()}/adapters")
     records = resp.json().get("adapters") or []
     prefixes: set[tuple[str, str]] = set()
     whole: set[str] = set()

@@ -12,8 +12,8 @@ import pytest
 
 import flash.cli.commands.env.ops.list as env_list_commands
 from flash._internal.channel import CLI_NAME
-from flash.cli import _build_parser
 from flash.cli.commands.env.ops.list import cmd_env_list
+from flash.cli.parsing.main import _build_parser
 
 
 def _no_published(monkeypatch):

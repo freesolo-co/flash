@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flash.engine.worker.train.core.lifecycle.checkpoint_lifecycle import CheckpointLedger
+from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 
 
 def test_resume_and_deployable_are_recorded_independently_in_either_order():

@@ -167,7 +167,7 @@ def decode_terminal_marker(
     error = marker["error"]
     now = time.time()
     if "source_attestation" in marker:
-        from flash.snapshot.source_snapshot import parse_attestation
+        from flash.snapshot.archive import parse_attestation
 
         attestation = parse_attestation(marker["source_attestation"])
         if attestation["run_id"] != run_id or attestation["attempt"] != attempt:
@@ -262,7 +262,7 @@ def resolve_terminal_artifacts(
             metrics_unparseable=raw_metrics is not None,
         )
     if "source_attestation" in marker:
-        from flash.snapshot.source_snapshot import TERMINAL_ATTESTATION_KEY
+        from flash.snapshot.archive import TERMINAL_ATTESTATION_KEY
 
         metrics = {**metrics, TERMINAL_ATTESTATION_KEY: marker["source_attestation"]}
     return TerminalResolution(TerminalKind.SUCCESS, metrics=metrics, marker=marker)

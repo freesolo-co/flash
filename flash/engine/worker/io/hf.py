@@ -1,8 +1,4 @@
-"""HF artifact channel: code-delivery + adapter/metrics/checkpoint upload (works without inbound net).
-
-State and callables (hf_api, heartbeat, hf_upload_file) are read through _w at call time so
-monkeypatch.setattr(worker, ...) takes effect in tests.
-"""
+"""hf artifact channel for code delivery, adapters, metrics, and checkpoints."""
 
 from __future__ import annotations
 
@@ -13,6 +9,8 @@ import threading
 import time
 from collections.abc import Callable
 
+import flash.engine.worker.io.heartbeat as _worker_heartbeat
+import flash.engine.worker.runtime.state as _worker_state
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.artifacts import attempt_scoped_artifact_name, has_loadable_adapter_weights
 from flash.engine.profiling.tokenizer import (  # noqa: F401
@@ -27,7 +25,6 @@ from flash.engine.worker.perf import (  # noqa: F401
     RetriableInfraError,
     gpu_diagnostics,
 )
-from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.teacher.retry_contract import (
     canonical_opd_optimizer_start_json,
     opd_optimizer_start_marker_path,
@@ -88,19 +85,19 @@ def hf_api():
 
 
 def hf_prefix() -> str:
-    return f"{_w.PHASE}/{_w.RUN_ID}"
+    return f"{_worker_state.PHASE}/{_worker_state.RUN_ID}"
 
 
 def publish_opd_optimizer_start_marker() -> None:
     """Synchronously publish the first-update mutation marker before optimizer.step()."""
-    if not isinstance(_w.HF_REPO, str) or not _w.HF_REPO.strip():
+    if not isinstance(_worker_state.HF_REPO, str) or not _worker_state.HF_REPO.strip():
         raise RuntimeError("opd optimizer-start marker requires a private HF repository")
-    marker_path = opd_optimizer_start_marker_path(_w.RUN_ID, _w.ATTEMPT)
-    local_path = f"/tmp/opd-optimizer-start-attempt-{_w.ATTEMPT}.json"
+    marker_path = opd_optimizer_start_marker_path(_worker_state.RUN_ID, _worker_state.ATTEMPT)
+    local_path = f"/tmp/opd-optimizer-start-attempt-{_worker_state.ATTEMPT}.json"
     payload = canonical_opd_optimizer_start_json(
-        run_id=_w.RUN_ID,
-        attempt=_w.ATTEMPT,
-        seed=_w.SEED,
+        run_id=_worker_state.RUN_ID,
+        attempt=_worker_state.ATTEMPT,
+        seed=_worker_state.SEED,
     )
     with open(local_path, "wb") as file:
         file.write(payload)
@@ -108,10 +105,10 @@ def publish_opd_optimizer_start_marker() -> None:
         os.fsync(file.fileno())
     try:
         _require_hf_deadline_allowance()
-        _w.hf_api().upload_file(
+        hf_api().upload_file(
             path_or_fileobj=local_path,
             path_in_repo=marker_path,
-            repo_id=_w.HF_REPO,
+            repo_id=_worker_state.HF_REPO,
             repo_type="dataset",
         )
     except Exception as error:
@@ -122,7 +119,7 @@ def publish_opd_optimizer_start_marker() -> None:
 
 
 def _require_hf_deadline_allowance() -> float | None:
-    remaining = _w._remaining_worker_wall_seconds()
+    remaining = _worker_state._remaining_worker_wall_seconds()
     if remaining is not None and remaining <= 0:
         raise TimeoutError("run wall deadline exceeded")
     return remaining
@@ -133,7 +130,7 @@ def _sleep_with_hf_deadline(delay: float) -> bool:
     sleep_for = delay if remaining is None else min(delay, remaining)
     if sleep_for > 0:
         time.sleep(sleep_for)
-    remaining = _w._remaining_worker_wall_seconds()
+    remaining = _worker_state._remaining_worker_wall_seconds()
     return remaining is None or remaining > 0
 
 
@@ -142,7 +139,7 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> bool
 
     Returns True when a commit landed (or HF_REPO is unset), False on best-effort failure.
     """
-    if not _w.HF_REPO:
+    if not _worker_state.HF_REPO:
         return True
     attempts = 3 if required else 1
     last_err: Exception | None = None
@@ -177,10 +174,10 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> bool
 def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False) -> bool:
     """Upload one file to the run's HF prefix. Returns True on success (see ``_hf_upload``)."""
     return _hf_upload(
-        lambda: _w.hf_api().upload_file(
+        lambda: hf_api().upload_file(
             path_or_fileobj=local_path,
             path_in_repo=f"{hf_prefix()}/{repo_subpath}",
-            repo_id=_w.HF_REPO,
+            repo_id=_worker_state.HF_REPO,
             repo_type="dataset",
         ),
         repo_subpath,
@@ -208,10 +205,10 @@ def _resume_checkpoint_upload_slot(timeout_s: float | None = None):
 def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) -> bool:
     """Upload a folder to the run's HF prefix. Returns True on success (see ``_hf_upload``)."""
     return _hf_upload(
-        lambda: _w.hf_api().upload_folder(
+        lambda: hf_api().upload_folder(
             folder_path=local_dir,
             path_in_repo=f"{hf_prefix()}/{repo_subpath}",
-            repo_id=_w.HF_REPO,
+            repo_id=_worker_state.HF_REPO,
             repo_type="dataset",
         ),
         repo_subpath,
@@ -251,7 +248,7 @@ def hf_resume_checkpoint(
     """
     required = bool(revision)
     strict = bool(fail_closed or required)
-    if not _w.HF_REPO:
+    if not _worker_state.HF_REPO:
         if required:
             raise RetriableInfraError("required resume checkpoint has no artifact repository")
         return None
@@ -267,7 +264,7 @@ def hf_resume_checkpoint(
         with liveness_heartbeat("checkpoint_prefetching"):
             _require_hf_deadline_allowance()
             snapshot_download(
-                repo_id=_w.HF_REPO,
+                repo_id=_worker_state.HF_REPO,
                 repo_type="dataset",
                 allow_patterns=[f"{hf_prefix()}/checkpoint/**"],
                 local_dir="/tmp/resume",
@@ -341,7 +338,7 @@ def _has_deployable_adapter(ckpt_dir: str) -> bool:
 
 
 def _write_deployable_provenance(ckpt_dir: str) -> None:
-    spec = getattr(_w, "JOB_SPEC", None)
+    spec = _worker_state.JOB_SPEC
     if spec is not None and spec.model:
         write_base_model_provenance(ckpt_dir, spec.model, getattr(spec, "model_revision", "") or "")
 
@@ -361,7 +358,7 @@ def publish_deployable_checkpoint(
     Periodic saves remain best-effort. ``required=True`` fails loudly when an exact required save
     cannot be published.
     """
-    if not _w.HF_REPO:
+    if not _worker_state.HF_REPO:
         if required:
             raise RequiredSaveError(f"required save step {step} has no artifact repository")
         return None
@@ -380,15 +377,15 @@ def publish_deployable_checkpoint(
     for attempt in range(attempts):
         try:
             _require_hf_deadline_allowance()
-            _w.hf_api().upload_folder(
+            hf_api().upload_folder(
                 folder_path=ckpt_dir,
                 path_in_repo=subfolder,
-                repo_id=_w.HF_REPO,
+                repo_id=_worker_state.HF_REPO,
                 repo_type="dataset",
                 ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
             )
             if _emit_heartbeat:
-                _w.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
+                _worker_heartbeat.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
             return subfolder
         except Exception as e:
             last_error = e
@@ -425,12 +422,14 @@ def _deployable_adapter_on_hf(step: int) -> bool:
     resume, not be misread as a permanently-missing required save. file_exists returns False cleanly
     for a genuinely absent file (that stays uncredited and fails the final completeness check).
     """
-    if not _w.HF_REPO:
+    if not _worker_state.HF_REPO:
         return False
     marker = f"{hf_prefix()}/checkpoints/step-{step}/adapter/adapter_config.json"
     try:
         return bool(
-            _w.hf_api().file_exists(repo_id=_w.HF_REPO, filename=marker, repo_type="dataset")
+            hf_api().file_exists(
+                repo_id=_worker_state.HF_REPO, filename=marker, repo_type="dataset"
+            )
         )
     except Exception as e:
         raise RetriableInfraError(f"could not verify required save step {step} on hf") from e
@@ -445,13 +444,13 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
     newer checkpoint. A later upload removes any lower directory left by that race. The deployable tree
     (``{prefix}/checkpoints/...``, plural) has a different prefix and is untouched.
     """
-    if not _w.HF_REPO:
+    if not _worker_state.HF_REPO:
         return
-    api = _w.hf_api()
+    api = hf_api()
     base = f"{hf_prefix()}/checkpoint/"
     try:
         _require_hf_deadline_allowance()
-        files = api.list_repo_files(repo_id=_w.HF_REPO, repo_type="dataset")
+        files = api.list_repo_files(repo_id=_worker_state.HF_REPO, repo_type="dataset")
     except Exception as e:
         print("ckpt prune warn (list):", e)
         return
@@ -466,7 +465,9 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
     for folder in sorted(stale):
         try:
             _require_hf_deadline_allowance()
-            api.delete_folder(path_in_repo=folder, repo_id=_w.HF_REPO, repo_type="dataset")
+            api.delete_folder(
+                path_in_repo=folder, repo_id=_worker_state.HF_REPO, repo_type="dataset"
+            )
         except Exception as e:
             print(f"ckpt prune warn ({folder}):", e)
             break
@@ -483,7 +484,7 @@ def upload_resume_checkpoint(
     lock_timeout_s: float | None = None,
 ) -> bool:
     """synchronously stream one full-state resume checkpoint and ordered companion artifacts."""
-    if not _w.HF_REPO:
+    if not _worker_state.HF_REPO:
         return True
 
     from flash.engine.worker.io.heartbeat import liveness_heartbeat
@@ -515,10 +516,10 @@ def upload_resume_checkpoint(
                     if not resume_completed:
                         failure_stage = "resume"
                         _require_hf_deadline_allowance()
-                        _w.hf_api().upload_folder(
+                        hf_api().upload_folder(
                             folder_path=ckpt_dir,
                             path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
-                            repo_id=_w.HF_REPO,
+                            repo_id=_worker_state.HF_REPO,
                             repo_type="dataset",
                         )
                         # prune only after the atomic folder commit lands, so the prior complete save
@@ -531,7 +532,7 @@ def upload_resume_checkpoint(
                         after_completed = True
                     if emit_heartbeat:
                         failure_stage = "heartbeat"
-                        _w.heartbeat("checkpoint_uploaded", step=step)
+                        _worker_heartbeat.heartbeat("checkpoint_uploaded", step=step)
                     return True
                 except RequiredSaveError:
                     raise
@@ -555,7 +556,7 @@ def upload_resume_checkpoint(
                             with contextlib.suppress(Exception):
                                 # worker stdout is not part of control-plane run logs, so the stage
                                 # name alone would otherwise be the entire failure report.
-                                _w.heartbeat(
+                                _worker_heartbeat.heartbeat(
                                     "checkpoint_upload_failed",
                                     step=step,
                                     checkpoint_failure={

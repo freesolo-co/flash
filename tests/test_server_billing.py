@@ -11,6 +11,12 @@ import urllib.request
 
 import pytest
 
+import flash.providers._lifecycle.net.worker as provider_worker
+import flash.runner.lifecycle.preparation as runner_preparation
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.supervise.lifecycle as runner_lifecycle
+
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
@@ -82,7 +88,7 @@ def test_cents_rounds_half_up_not_bankers():
 
 
 def _completed_status(monkeypatch, *, cost_usd: float = 12.345, org_id: str = "org-A"):
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
     spec = _spec(monkeypatch)
     return RunStatus(
@@ -145,7 +151,7 @@ def test_charge_posts_completed_run_cost_and_parses_response(monkeypatch):
 def test_charge_bills_cost_usd_for_a_cancelled_run(monkeypatch):
     """A cancelled run is charged its cost_usd exactly like a completed one -- the cancel path already
     set cost_usd to the estimate at the steps actually run, so charge_completed_run just bills it."""
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
     from flash.server.billing import charges as billing
 
     captured = {}
@@ -266,17 +272,15 @@ def api(tmp_path, monkeypatch):
     import flash.providers.runpod.client.auth as runpod_keys
 
     runpod_keys.reset()
-    import flash.runner as runner
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
 
-    importlib.reload(runner)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo: _SOURCE_SNAPSHOT)
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(provider_worker, "publish_source_snapshot", lambda _repo: _SOURCE_SNAPSHOT)
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
     # Keep submit offline: validate + record, but the GPU job body is a no-op.
-    monkeypatch.setattr(runner, "_run_job", lambda *a, **k: None)
+    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda *a, **k: None)
 
     import flash.server.asgi.app as app_mod
 
@@ -285,7 +289,7 @@ def api(tmp_path, monkeypatch):
     # these billing tests assert only on the API response and must remain network-free.
     import flash.providers as providers_mod
     import flash.server.domain.registry.projects as projects_mod
-    import flash.server.domain.registry.run_registry as run_registry
+    import flash.server.domain.registry.runs as runs
 
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(
@@ -304,7 +308,7 @@ def api(tmp_path, monkeypatch):
         lambda **_kwargs: None,
         raising=False,
     )
-    monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
+    monkeypatch.setattr(runs, "_post", lambda *a, **k: False, raising=False)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
@@ -777,15 +781,14 @@ _SFT_SPEC = {**SPEC, "algorithm": "sft", "train": {"epochs": 1, "max_examples": 
 
 
 def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
-    import flash.runner as runner
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
     from flash.runner.supervise import lifecycle
 
     spec = _spec(monkeypatch)
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-    runner._save_status(
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    runner_state._save_status(
         RunStatus(
             run_id=spec.run_id,
             state="done",
@@ -808,7 +811,7 @@ def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
     lifecycle._charge_completed_run_by_id(spec.run_id, log)
 
     assert calls == [("fslo-internal", "run-1", 1.23)]
-    status = runner.get_status("run-1")
+    status = runner_status.get_status("run-1")
     assert status.billing_state == "charged"
     assert status.billing_error is None
     assert status.billing_charge == {"amountCents": 123, "balanceCents": 877, "replay": False}
@@ -816,14 +819,13 @@ def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
 
 
 def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
-    import flash.runner as runner
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
     from flash.runner.supervise import lifecycle
 
     spec = _spec(monkeypatch)
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    runner._save_status(
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    runner_state._save_status(
         RunStatus(
             run_id=spec.run_id,
             state="done",
@@ -840,7 +842,7 @@ def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
 
     lifecycle._charge_completed_run_by_id(spec.run_id, io.StringIO())
 
-    status = runner.get_status("run-1")
+    status = runner_status.get_status("run-1")
     assert status.billing_state == "failed"
     assert "FREESOLO_INTERNAL_KEY" in (status.billing_error or "")
 
@@ -850,13 +852,13 @@ def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
 
 def test_route_blames_the_adapter_only_for_tagged_failures(api, monkeypatch):
     # a genuine adapter-resolution failure keeps the actionable 400 that names the source.
-    import flash.runner as runner_mod
+
     import flash.server.asgi.app as app_mod
 
     # raise the class off the reloaded module: the api fixture reloads flash.runner, so a symbol
     # imported at module scope here would be a different object than the route's.
     def _prepare(*args, **kwargs):
-        raise runner_mod.WarmStartPreparationError("private-owner/private-repo:sft/step-20")
+        raise runner_preparation.WarmStartPreparationError("private-owner/private-repo:sft/step-20")
 
     monkeypatch.setattr(app_mod, "prepare_job", _prepare)
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))

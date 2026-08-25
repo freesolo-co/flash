@@ -12,9 +12,27 @@ those into unresolvable strings -> silent 422.
 
 from typing import Any
 
+from fastapi.responses import JSONResponse
+
+from flash.serving.src.io.provenance import _provenance_headers, _revision_provenance
+from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.structured_outputs import StructuredOutputsError
 
 _THINK_CLOSE = "</think>"
+
+
+def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> JSONResponse:
+    # attach revision provenance while keeping engine-process attribution internal to metering.
+    active_checkpoint = result.get("checkpoint")
+    provenance = _revision_provenance(target, active_checkpoint)
+    internal_fields = {
+        "cached_tokens_reported",
+        "engine_replica_id",
+        "lora_request_adapter",
+    }
+    public_result = {key: value for key, value in result.items() if key not in internal_fields}
+    body = {**public_result, "freesolo": provenance} if provenance is not None else public_result
+    return JSONResponse(body, headers=_provenance_headers(provenance, active_checkpoint))
 
 
 def _split_reasoning(text: str, thinking: bool) -> tuple[str | None, str]:

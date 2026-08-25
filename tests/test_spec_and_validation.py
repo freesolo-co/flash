@@ -11,6 +11,11 @@ from dataclasses import fields, replace
 
 import pytest
 
+import flash.runner.lifecycle.preparation as runner_preparation
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as runner_submit
+import flash.runner.supervise.deploy as runner_deploy
 from flash.core.spec import (
     GpuSpec,
     JobSpec,
@@ -2029,36 +2034,36 @@ def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fresh_orchestrator(tmp_path, monkeypatch):
+def _fresh_orchestrator(tmp_path, monkeypatch) -> None:
     from tests._helpers.runner import fresh_runner
 
-    return fresh_runner(tmp_path, monkeypatch)
+    fresh_runner(tmp_path, monkeypatch)
 
 
 def test_runs_file_path_rejects_traversal(tmp_path, monkeypatch) -> None:
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     for bad in ("../escape", "a/b", "", "x" * 200, ".hidden"):
         with pytest.raises(ValueError, match="invalid run_id"):
-            orch.runs_file_path(bad, ".json")
-    good = orch.runs_file_path("flash-123-abc", ".log")
+            runner_state.runs_file_path(bad, ".json")
+    good = runner_state.runs_file_path("flash-123-abc", ".log")
     assert good.endswith("flash-123-abc.log")
 
 
 def test_dry_run_submit_get_list_logs_cancel(tmp_path, monkeypatch) -> None:
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     spec = spec_from_dict(_raw())
 
-    status = orch.submit_job(spec, dry_run=True)
+    status = runner_submit.submit_job(spec, dry_run=True)
     assert status.state == "dry_run"
-    assert orch.get_status(status.run_id).state == "dry_run"
-    assert status.run_id in [r.run_id for r in orch.list_runs()]
-    assert orch.get_logs(status.run_id) == ""  # no log yet, no crash
+    assert runner_status.get_status(status.run_id).state == "dry_run"
+    assert status.run_id in [r.run_id for r in runner_status.list_runs()]
+    assert runner_status.get_logs(status.run_id) == ""  # no log yet, no crash
 
     # terminal runs cancel as a no-op (state preserved)
-    assert orch.cancel_run(status.run_id).state == "dry_run"
+    assert runner_deploy.cancel_run(status.run_id).state == "dry_run"
 
     with pytest.raises(FileNotFoundError, match="unknown run_id"):
-        orch.get_status("flash-000-nope")
+        runner_status.get_status("flash-000-nope")
 
 
 def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
@@ -2069,9 +2074,9 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
     # to an assumed row count -- including on the dry-run preview, which previews a real submit.
     from flash.core.spec import JobSpec
 
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        orch,
+        runner_preparation,
         "_resolve_model_revision",
         lambda s, **_kw: replace(s, model_revision="a" * 40, model_revision_auto=True),
     )
@@ -2081,10 +2086,12 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
         algorithm="sft",
         project="11111111-1111-4111-8111-111111111111",
     )
-    with pytest.raises(orch.WorkloadProfileUnavailable, match="requires an environment id"):
-        orch.submit_job(spec, dry_run=True)
+    with pytest.raises(
+        runner_preparation.WorkloadProfileUnavailable, match="requires an environment id"
+    ):
+        runner_submit.submit_job(spec, dry_run=True)
     with pytest.raises(FileNotFoundError):
-        orch.get_status(spec.run_id)
+        runner_status.get_status(spec.run_id)
 
 
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
@@ -2099,7 +2106,7 @@ def test_adapter_continuation_preparation_is_target_algorithm_agnostic(
     """
     from flash.core.spec import JobSpec, TrainSpec
 
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     spec = JobSpec(
         run_id=f"{algorithm}-warmstart",
         model="Qwen/Qwen3.5-0.8B",
@@ -2109,22 +2116,24 @@ def test_adapter_continuation_preparation_is_target_algorithm_agnostic(
     )
 
     with pytest.raises(ValueError, match="references unknown run 'source-run'"):
-        orch._prepare_init_from_adapter(spec)
+        runner_preparation._prepare_init_from_adapter(spec)
 
 
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:
-    orch = _fresh_orchestrator(tmp_path, monkeypatch)
+    _fresh_orchestrator(tmp_path, monkeypatch)
     spec = spec_from_dict(_raw(), run_id="flash-1-x")
-    assert orch.artifacts_dir(spec).endswith(os.path.join("results", "runpod", "rl", "flash-1-x"))
-    assert orch.adapter_prefix(spec) == "rl/flash-1-x"
-    assert orch.adapter_ref(spec) is None
+    assert runner_state.artifacts_dir(spec).endswith(
+        os.path.join("results", "runpod", "rl", "flash-1-x")
+    )
+    assert runner_state.adapter_prefix(spec) == "rl/flash-1-x"
+    assert runner_state.adapter_ref(spec) is None
 
     # hf_repo and run_id are platform-managed: they survive the INTERNAL round trip
     # (to_internal_dict -> from_dict), which is what the worker/control plane use, not to_dict().
     d = spec.to_internal_dict()
     d["train"] = {**d["train"], "hf_repo": "Freesolo-Co/flashrun-flash-1-x"}
     spec_with_repo = _job_from_dict(d)
-    assert orch.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
+    assert runner_state.adapter_ref(spec_with_repo) == "Freesolo-Co/flashrun-flash-1-x:rl/flash-1-x"
 
 
 # ---------------------------------------------------------------------------

@@ -1,8 +1,8 @@
 """Exception types raised by the serving path.
 
-These live in a leaf module with no `flash.serve` imports of their own so that the modules split
-out of `flash.serve.deploy` can raise them without importing `deploy` back. `deploy` re-exports
-every name here, so `from flash.serve.deployment.deploy import ServingError` keeps resolving.
+These live in a leaf module with no `flash.serve` imports of their own so deployment and request
+modules can raise them without importing the deployment orchestrator back. Every caller imports
+these errors from this canonical owner.
 """
 
 from __future__ import annotations

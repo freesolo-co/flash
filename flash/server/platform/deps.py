@@ -46,7 +46,7 @@ def owned_run(run_id: str, key: dict):
 def _internal_org_run(run_id: str, key: dict, org_id: str | None = None):
     org = (org_id or "").strip()
     if key.get("auth_kind") == "internal" and org:
-        from flash.runner import _status_org_id
+        from flash.runner.lifecycle.preparation import _status_org_id
 
         status = _load_status(run_id)
         if _status_org_id(status) == org:

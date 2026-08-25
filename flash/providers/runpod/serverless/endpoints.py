@@ -63,9 +63,9 @@ def _train_body(input_data: dict) -> dict:
     from huggingface_hub import snapshot_download
 
     try:
-        import source_snapshot as _source_snapshot
+        import archive as _source_snapshot
     except ModuleNotFoundError:
-        from flash.snapshot import source_snapshot as _source_snapshot
+        from flash.snapshot import archive as _source_snapshot
 
     class _TransientSourceFetchError(RuntimeError):
         flash_retriable = True

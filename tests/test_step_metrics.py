@@ -1,3 +1,5 @@
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
+
 """verl GRPO per-step metrics reconstructed from the trainer's stdout.
 
 an in-process trainer would feed `flash runs log -f` from a TrainerCallback. verl's trainer runs
@@ -12,7 +14,6 @@ import ast
 import inspect
 import textwrap
 
-from flash.engine.worker.train.entry import rl_train_runner
 from flash.engine.worker.train.entry.backend_common import (
     append_step_metrics,
     parse_verl_metric,
@@ -203,7 +204,7 @@ def test_exact_advantage_bounds_are_retained_in_the_forced_step_heartbeat(monkey
         calls.append((stage, fields))
         return next(outcomes)
 
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", heartbeat)
+    monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     for step, minimum, maximum in ((1, -0.25, 0.75), (2, -0.5, 1.5)):
@@ -247,7 +248,7 @@ def _verl_rl_tree() -> ast.Module:
         inspect.getsource(fn)
         for fn in (
             rl_train.run_rl_train,
-            rl_train._ingest_step_metrics,
+            rl_train_runner._ingest_step_metrics,
             rl_train._write_terminal_metadata,
         )
     )
@@ -376,7 +377,7 @@ def test_first_backlog_is_forced_past_the_rl_step_throttle():
 def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():
     # the payload schema belongs to the cli, not verl: a key the renderer does not know is dead
     # weight, so keep the mapping's flash-side names inside the rendered set.
-    from flash.cli.commands import _FOLLOW_METRIC_FIELDS
+    from flash.cli.commands.ops.log_follow import _FOLLOW_METRIC_FIELDS
     from flash.engine.worker.train.entry.backend_common import _VERL_METRIC_FIELDS
 
     rendered = {name for name, *_ in _FOLLOW_METRIC_FIELDS}

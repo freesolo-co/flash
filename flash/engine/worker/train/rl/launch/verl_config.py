@@ -13,10 +13,10 @@ import copy
 import math
 import os
 
+import flash.engine.worker.runtime.state as _worker_state
 from flash.adapters.targets import resolve_lora_targeting
 from flash.content.multimodal import messages_with_decoded_images
 from flash.content.structured_outputs import reasoning_parser_for
-from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.train.entry.backend_common import (
     actor_fsdp_strategy_overrides,
     agent_loop_workers,
@@ -751,7 +751,7 @@ def _build_verl_train_notes(
         # padded upper bound. the flag is published so a consumer comparing against historical runs
         # (which counted the padded bound) does not read the two as equivalent.
         "gen_tokens_is_upper_bound": False,
-        "thinking": _w.THINKING,
+        "thinking": _worker_state.THINKING,
         # the console is uploaded only on failure, so a SUCCESSFUL run has no other record that fp8 kv
         # engaged. this is resolved per-card (cc>=8.9, and never for gdn hybrids), so it is a property
         # of the run rather than of the config.

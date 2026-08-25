@@ -3,6 +3,8 @@ import math
 
 import pytest
 
+import flash.engine.worker.io.heartbeat as worker_heartbeat
+import flash.engine.worker.io.hf as worker_hf
 from flash.cli.ui.heartbeat import _heartbeat_pairs, _step_timing_pairs
 from flash.engine.worker.train.core.lifecycle.step_timing import StepTiming
 from flash.engine.worker.train.entry import rl_train_runner
@@ -46,8 +48,10 @@ def test_overflowing_diagnostic_is_omitted_through_step_ingestion(monkeypatch) -
         calls.append((stage, fields))
         return True
 
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", heartbeat)
-    monkeypatch.setattr(rl_train_runner._w, "_remaining_worker_wall_seconds", lambda: 20000.0)
+    monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
+    monkeypatch.setattr(
+        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
+    )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     inp = {"max_completion": 512, "steps": 190}
@@ -151,8 +155,10 @@ def test_first_usable_pace_is_forced_after_first_metrics_commit(monkeypatch) -> 
         calls.append((stage, fields))
         return True
 
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", heartbeat)
-    monkeypatch.setattr(rl_train_runner._w, "_remaining_worker_wall_seconds", lambda: 20000.0)
+    monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
+    monkeypatch.setattr(
+        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
+    )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     inp = {"max_completion": 512, "steps": 190}
@@ -183,8 +189,6 @@ def test_first_usable_pace_is_forced_after_first_metrics_commit(monkeypatch) -> 
 def test_first_timing_bypasses_force_floor_and_retries_with_real_wrapper(monkeypatch) -> None:
     import importlib
 
-    import flash.engine.worker as worker
-
     heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
 
     now = {"value": 1000.0}
@@ -197,16 +201,18 @@ def test_first_timing_bypasses_force_floor_and_retries_with_real_wrapper(monkeyp
         return next(outcomes)
 
     monkeypatch.setattr(heartbeat_module.time, "time", lambda: now["value"])
-    monkeypatch.setattr(worker, "hf_upload_file", upload)
-    monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(worker, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
-    monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 999.0)
-    monkeypatch.setattr(worker, "_HB_LAST_FORCED_UPLOAD", 0.0)
-    monkeypatch.setattr(worker, "_HB_LAST_COMMITTED_STEP", 0)
-    monkeypatch.setattr(worker, "_HB_PROGRESS_SEQ", 0)
-    monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", worker.heartbeat)
-    monkeypatch.setattr(rl_train_runner._w, "_remaining_worker_wall_seconds", lambda: 20000.0)
+    monkeypatch.setattr(worker_hf, "hf_upload_file", upload)
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 999.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_FORCED_UPLOAD", 0.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_COMMITTED_STEP", 0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_SEQ", 0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+    monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", worker_heartbeat.heartbeat)
+    monkeypatch.setattr(
+        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
+    )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     inp = {"max_completion": 512, "steps": 190}
@@ -217,14 +223,14 @@ def test_first_timing_bypasses_force_floor_and_retries_with_real_wrapper(monkeyp
     state.progress["step"] = 1
     _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
     assert state.sent_first_metrics is True
-    assert worker._HB_LAST_FORCED_UPLOAD == 1000.0
+    assert worker_heartbeat._HB_LAST_FORCED_UPLOAD == 1000.0
 
     now["value"] = 1001.0
     state.progress["step"] = 2
     _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
     assert state.sent_first_timing is False
-    assert worker._HB_LAST_COMMITTED_STEP == 1
-    assert worker._HB_LAST_FORCED_UPLOAD == 1000.0
+    assert worker_heartbeat._HB_LAST_COMMITTED_STEP == 1
+    assert worker_heartbeat._HB_LAST_FORCED_UPLOAD == 1000.0
 
     now["value"] = 1002.0
     state.progress["step"] = 3
@@ -234,7 +240,7 @@ def test_first_timing_bypasses_force_floor_and_retries_with_real_wrapper(monkeyp
     now["value"] = 1003.0
     state.progress["step"] = 4
     _ingest_step_metrics(_line(4, 94.0), inp, state, observability)
-    assert worker.heartbeat("rl_step", step=4, force=True) is False
+    assert worker_heartbeat.heartbeat("rl_step", step=4, force=True) is False
 
     assert [payload["step"] for payload in uploads] == [1, 2, 3]
     assert "step_duration_s" not in uploads[0]
@@ -250,8 +256,10 @@ def test_failed_first_timing_commit_retries_on_next_step(monkeypatch) -> None:
         calls.append((stage, fields))
         return next(outcomes)
 
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", heartbeat)
-    monkeypatch.setattr(rl_train_runner._w, "_remaining_worker_wall_seconds", lambda: 20000.0)
+    monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
+    monkeypatch.setattr(
+        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
+    )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     inp = {"max_completion": 512, "steps": 190}
@@ -293,8 +301,10 @@ def test_forced_first_metrics_retry_carries_pace_once_available(monkeypatch) -> 
         calls.append((stage, fields))
         return len(calls) > 1
 
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", heartbeat)
-    monkeypatch.setattr(rl_train_runner._w, "_remaining_worker_wall_seconds", lambda: 20000.0)
+    monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
+    monkeypatch.setattr(
+        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
+    )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     inp = {"max_completion": 512, "steps": 190}

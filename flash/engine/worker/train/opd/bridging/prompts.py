@@ -18,7 +18,7 @@ from flash.content.multimodal import messages_with_decoded_images
 from flash.engine.worker.train.opd.orchestration.gkd import _trim_trailing_stop
 
 if TYPE_CHECKING:  # the prompt record, for annotations only -- it lives in the orchestrator
-    from flash.engine.worker.train.entry.opd_train import _BridgePrompt
+    from flash.engine.worker.train.opd.orchestration.state import _BridgePrompt
 
 
 def _prompt_pool_fingerprint(prompts: list[_BridgePrompt]) -> str:

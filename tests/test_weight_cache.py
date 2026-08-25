@@ -6,6 +6,7 @@ are offline and pin the fixed cache contract plus the SDK datacenter-superset ru
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import tempfile
@@ -14,6 +15,14 @@ import types
 
 import pytest
 
+import flash.providers._lifecycle.net.worker as provider_worker
+import flash.providers.runpod.execution.job_execution as job_execution
+import flash.providers.runpod.execution.resources as runpod_resources
+import flash.providers.runpod.serverless.endpoints as runpod_endpoints
+import flash.runner.accounting.weight_cache as runner_weight_cache
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as runner_submit
 from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 from tests._helpers.profile import satisfy_sft_profile
 from tests._helpers.source_snapshot import valid_source_snapshot
@@ -28,7 +37,6 @@ def _oversized_model_info():
     Sized off WEIGHT_CACHE_VOLUME_GB so it stays oversized if the volume grows again — the real
     catalog now fits entirely, so the size gate needs a stand-in to stay covered.
     """
-    from flash import runner
     from flash.core.catalog import ModelInfo
 
     return ModelInfo(
@@ -37,7 +45,9 @@ def _oversized_model_info():
         params="huge",
         algos=("sft",),
         min_vram_gb=80,
-        params_b=float(runner.WEIGHT_CACHE_VOLUME_GB),  # peak = 4x params_b GB >> the volume
+        params_b=float(
+            runner_weight_cache.WEIGHT_CACHE_VOLUME_GB
+        ),  # peak = 4x params_b GB >> the volume
     )
 
 
@@ -53,7 +63,7 @@ def _ndc() -> int:
     """Size of the ALLOWED datacenter set (DataCenter.all()) — what the endpoint's `datacenter` list
     spans. Derived from the same source the code uses, so it tracks the SDK's storage-DC set.
     """
-    from flash.providers.runpod.execution.jobs import weight_cache_datacenters
+    from flash.providers.runpod.execution.resources import weight_cache_datacenters
 
     n = len(weight_cache_datacenters())
     assert n > 1
@@ -143,30 +153,27 @@ def test_weight_cache_datacenters_excludes_volume_incapable():
     # creating a volume there 500s the whole deploy, so the fleet must exclude them.
     from runpod_flash.core.resources.datacenter import DataCenter
 
-    from flash.providers.runpod.execution import jobs
-
-    dcs = jobs.weight_cache_datacenters()
+    dcs = runpod_resources.weight_cache_datacenters()
     vals = {d.value for d in dcs}
     assert len(set(dcs)) == len(dcs)  # all distinct
-    assert vals == {d.value for d in DataCenter.all()} - jobs._VOLUME_INCAPABLE_DATACENTERS
+    assert (
+        vals == {d.value for d in DataCenter.all()} - runpod_resources._VOLUME_INCAPABLE_DATACENTERS
+    )
     assert "US-MO-1" not in vals  # the known volume-incapable DC is dropped
-    assert not (vals & jobs._VOLUME_INCAPABLE_DATACENTERS)
+    assert not (vals & runpod_resources._VOLUME_INCAPABLE_DATACENTERS)
 
 
 def test_weight_cache_datacenters_ignores_removed_env_knob(monkeypatch):
     # Regression: the FLASH_WEIGHT_CACHE_DATACENTERS knob is GONE — the fleet is fixed/managed.
-    from flash.providers.runpod.execution import jobs
 
-    baseline = len(jobs.weight_cache_datacenters())
+    baseline = len(runpod_resources.weight_cache_datacenters())
     monkeypatch.setenv("FLASH_WEIGHT_CACHE_DATACENTERS", "US-CA-2")
-    assert len(jobs.weight_cache_datacenters()) == baseline  # env ignored
+    assert len(runpod_resources.weight_cache_datacenters()) == baseline  # env ignored
 
 
 def test_weight_cache_volumes_distinct_name_per_dc():
-    from flash import runner
-    from flash.providers.runpod.execution import jobs
 
-    vols = jobs.weight_cache_volumes(_vol_spec(gb=100))
+    vols = runpod_resources.weight_cache_volumes(_vol_spec(gb=100))
     # EAGER: one volume in EVERY storage DC (no lazy used-set gating).
     assert len(vols) == _ndc()
     # DISTINCT physical name per DC (the SDK keys resource tracking on name only, so same-named
@@ -176,11 +183,11 @@ def test_weight_cache_volumes_distinct_name_per_dc():
     # the name encodes the DC, lowercased
     assert {v.name for v in vols} == {f"flash-weights-{v.dataCenterId.value.lower()}" for v in vols}
     # exactly the full storage-DC set
-    assert {v.dataCenterId for v in vols} == set(jobs.weight_cache_datacenters())
+    assert {v.dataCenterId for v in vols} == set(runpod_resources.weight_cache_datacenters())
     # the SHARED cache is platform-managed, so a stale spec size never wins: a spec still carrying
     # the pre-bump 100 must still build 250-GB volumes, or the bump is a no-op for anything that
     # round-tripped a spec.
-    assert {v.size for v in vols} == {runner.WEIGHT_CACHE_VOLUME_GB}
+    assert {v.size for v in vols} == {runner_weight_cache.WEIGHT_CACHE_VOLUME_GB}
 
 
 def test_weight_cache_volumes_size_tolerant_of_bad_values():
@@ -188,15 +195,15 @@ def test_weight_cache_volumes_size_tolerant_of_bad_values():
     # can carry a raw value that bypassed JobSpec.from_dict's parse). A non-numeric/"0"/negative size
     # must never raise (best-effort would silently drop the cache) or create a 0-GB volume; on the
     # shared cache it lands on the managed size.
-    from flash import runner
-    from flash.providers.runpod.execution import jobs
 
     for raw in ("0", 0, -5, "abc", None, True):
-        vols = jobs.weight_cache_volumes(_vol_spec(gb=raw))
-        assert {v.size for v in vols} == {runner.WEIGHT_CACHE_VOLUME_GB}, f"{raw!r} rejected"
+        vols = runpod_resources.weight_cache_volumes(_vol_spec(gb=raw))
+        assert {v.size for v in vols} == {runner_weight_cache.WEIGHT_CACHE_VOLUME_GB}, (
+            f"{raw!r} rejected"
+        )
     # an oversized request on the shared cache still passes through: the floor only raises.
-    big = runner.WEIGHT_CACHE_VOLUME_GB + 50
-    assert {v.size for v in jobs.weight_cache_volumes(_vol_spec(gb=big))} == {big}
+    big = runner_weight_cache.WEIGHT_CACHE_VOLUME_GB + 50
+    assert {v.size for v in runpod_resources.weight_cache_volumes(_vol_spec(gb=big))} == {big}
 
 
 def test_custom_volume_keeps_its_spec_size_while_shared_cache_is_managed():
@@ -205,33 +212,28 @@ def test_custom_volume_keeps_its_spec_size_while_shared_cache_is_managed():
     Flooring every volume at the cache size would silently over-provision (and over-bill) a custom
     volume that was deliberately asked for small.
     """
-    from flash.providers.runpod.execution import jobs
 
-    vols = jobs.weight_cache_volumes(_vol_spec(name="my-own-volume", gb=20))
+    vols = runpod_resources.weight_cache_volumes(_vol_spec(name="my-own-volume", gb=20))
     assert {v.size for v in vols} == {20}
 
 
 def test_weight_cache_volume_name_includes_datacenter():
     from runpod_flash.core.resources.datacenter import DataCenter
 
-    from flash.providers.runpod.execution import jobs
-
     assert (
-        jobs.weight_cache_volume_name("flash-weights", DataCenter.US_CA_2)
+        runpod_resources.weight_cache_volume_name("flash-weights", DataCenter.US_CA_2)
         == "flash-weights-us-ca-2"
     )
 
 
 def test_weight_cache_volumes_empty_without_volume_name():
-    from flash.providers.runpod.execution import jobs
 
-    assert jobs.weight_cache_volumes(JobSpec(model="m")) == []
+    assert runpod_resources.weight_cache_volumes(JobSpec(model="m")) == []
 
 
 def test_weight_cache_endpoint_kwargs_volume_in_every_dc():
-    from flash.providers.runpod.execution import jobs
 
-    kw = jobs.weight_cache_endpoint_kwargs(_vol_spec())
+    kw = runpod_resources.weight_cache_endpoint_kwargs(_vol_spec())
     assert sorted(kw) == ["datacenter", "volume"]
     # EAGER: a volume in EVERY storage DC, and the endpoint allowed across exactly that same set, so
     # whichever DC it lands in is warm. The two lists span the identical storage-DC set.
@@ -241,19 +243,19 @@ def test_weight_cache_endpoint_kwargs_volume_in_every_dc():
 
 
 def test_weight_cache_endpoint_kwargs_empty_without_volume():
-    from flash.providers.runpod.execution import jobs
 
-    assert jobs.weight_cache_endpoint_kwargs(JobSpec(model="m")) == {}
+    assert runpod_resources.weight_cache_endpoint_kwargs(JobSpec(model="m")) == {}
 
 
 def test_weight_cache_endpoint_kwargs_swallows_errors(monkeypatch):
-    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(
-        jobs, "weight_cache_volumes", lambda spec: (_ for _ in ()).throw(RuntimeError("sdk boom"))
+        runpod_resources,
+        "weight_cache_volumes",
+        lambda spec: (_ for _ in ()).throw(RuntimeError("sdk boom")),
     )
     # best-effort: ANY failure building the cache -> {} (deploy with no volume), never propagate.
-    assert jobs.weight_cache_endpoint_kwargs(_vol_spec()) == {}
+    assert runpod_resources.weight_cache_endpoint_kwargs(_vol_spec()) == {}
 
 
 def test_weight_cache_satisfies_real_sdk_superset_validation(monkeypatch):
@@ -264,9 +266,7 @@ def test_weight_cache_satisfies_real_sdk_superset_validation(monkeypatch):
     from runpod_flash import Endpoint
     from runpod_flash.core.resources.gpu import GpuGroup
 
-    from flash.providers.runpod.execution import jobs
-
-    kw = jobs.weight_cache_endpoint_kwargs(_vol_spec())
+    kw = runpod_resources.weight_cache_endpoint_kwargs(_vol_spec())
     ep = Endpoint(name="wc-test", gpu=GpuGroup.AMPERE_48, gpu_count=1, **kw)
     cfg = ep._build_resource_config()  # raises if the superset rule is violated
     vol_dcs = {v.dataCenterId for v in cfg.networkVolumes}
@@ -280,7 +280,7 @@ def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
     import runpod_flash.core.resources.resource_manager as rm_mod
 
     from flash.providers.runpod.client import auth
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     auth.reset()
@@ -300,16 +300,16 @@ def test_deploy_train_endpoint_attaches_volume_kwargs(monkeypatch):
     monkeypatch.setattr(runpod_flash, "Endpoint", RecEndpoint)
     monkeypatch.setattr(rm_mod, "ResourceManager", FakeRM)
     monkeypatch.setattr(auth, "ensure_auth", lambda: "test-key")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
 
-    eid, _name, fingerprint = jobs.deploy_train_endpoint(
+    eid, _name, fingerprint = job_execution.deploy_train_endpoint(
         "RTX 4090",
         spec=_vol_spec(),
         disk_gb=None,
     )
     assert eid == "ep-abc"
-    assert fingerprint == jobs.runpod_api.key_fingerprint("test-key")
+    assert fingerprint == job_execution.runpod_api.key_fingerprint("test-key")
     assert len(captured["volume"]) == _ndc()  # EAGER: a volume in every storage DC
     assert len(captured["datacenter"]) == _ndc()  # allowed across all storage DCs
     assert len({v.name for v in captured["volume"]}) == _ndc()  # distinct per-DC names
@@ -321,7 +321,7 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
     import runpod_flash.core.resources.resource_manager as rm_mod
 
     from flash.providers.runpod.client import auth
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     monkeypatch.setenv("RUNPOD_API_KEY", "test-key")
     auth.reset()
@@ -341,10 +341,10 @@ def test_deploy_train_endpoint_no_volume_when_spec_has_none(monkeypatch):
     monkeypatch.setattr(runpod_flash, "Endpoint", RecEndpoint)
     monkeypatch.setattr(rm_mod, "ResourceManager", FakeRM)
     monkeypatch.setattr(auth, "ensure_auth", lambda: "test-key")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
 
-    jobs.deploy_train_endpoint("RTX 4090", spec=JobSpec(model="m"), disk_gb=None)
+    job_execution.deploy_train_endpoint("RTX 4090", spec=JobSpec(model="m"), disk_gb=None)
     assert "volume" not in captured
     assert "datacenter" not in captured
 
@@ -405,7 +405,9 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
     import huggingface_hub
     import huggingface_hub.constants
 
-    import flash.engine.worker.io.hf as hf
+    import flash.engine.worker.io.heartbeat as worker_heartbeat
+    import flash.engine.worker.io.prefetch as worker_prefetch
+    import flash.engine.worker.perf as worker_perf
 
     calls = []
 
@@ -427,9 +429,12 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot)
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(ephemeral_hub))
-    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(hf._w, "heartbeat", lambda *a, **k: None)
-    return hf, calls
+    monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(
+        worker_heartbeat, "liveness_heartbeat", lambda *_args, **_kwargs: contextlib.nullcontext()
+    )
+    return worker_prefetch, calls
 
 
 def test_prefetch_model_downloads_to_shared_mount_and_links(tmp_path, monkeypatch):
@@ -494,7 +499,9 @@ def test_prefetch_model_falls_back_to_ephemeral_when_mount_absent(tmp_path, monk
 def test_prefetch_model_starts_no_download_at_deadline(tmp_path, monkeypatch):
     monkeypatch.delenv("FLASH_WEIGHT_CACHE_DIR", raising=False)
     hf, calls = _patch_prefetch_io(monkeypatch, tmp_path / "ephemeral" / "hub")
-    monkeypatch.setattr(hf._w, "_remaining_worker_wall_seconds", lambda: 0.0)
+    import flash.engine.worker.runtime.state as worker_state
+
+    monkeypatch.setattr(worker_state, "_remaining_worker_wall_seconds", lambda: 0.0)
 
     hf.prefetch_model("Qwen/Qwen3.5-0.8B")
 
@@ -504,19 +511,19 @@ def test_prefetch_model_starts_no_download_at_deadline(tmp_path, monkeypatch):
 def test_shared_weight_cache_dir_resolves_mount_for_both_substrates(tmp_path, monkeypatch):
     """_shared_weight_cache_dir derives the mount as two levels up from the cache dir (works for the
     RunPod /runpod-volume and instance /weight-cache mounts alike) and requires it to exist."""
-    import flash.engine.worker.io.hf as hf
+    import flash.engine.worker.io.prefetch as worker_prefetch
 
     monkeypatch.delenv("FLASH_WEIGHT_CACHE_DIR", raising=False)
-    assert hf._shared_weight_cache_dir() is None  # unset
+    assert worker_prefetch._shared_weight_cache_dir() is None  # unset
 
     mount = tmp_path / "weight-cache"
     mount.mkdir()
     hub = str(mount / "hf-cache" / "hub")
     monkeypatch.setenv("FLASH_WEIGHT_CACHE_DIR", hub)
-    assert hf._shared_weight_cache_dir() == hub  # mount present
+    assert worker_prefetch._shared_weight_cache_dir() == hub  # mount present
 
     monkeypatch.setenv("FLASH_WEIGHT_CACHE_DIR", str(tmp_path / "absent" / "hf-cache" / "hub"))
-    assert hf._shared_weight_cache_dir() is None  # mount absent -> ephemeral fallback
+    assert worker_prefetch._shared_weight_cache_dir() is None  # mount absent -> ephemeral fallback
 
 
 # ---------------------------------------------------------------------------
@@ -564,21 +571,19 @@ def test_instance_payload_strips_runpod_volume_redirect():
 
 
 # ---------------------------------------------------------------------------
-# runner._assign_weight_cache_volume — fully managed, no knobs. Only curated models are trainable
+# runner_weight_cache._assign_weight_cache_volume — fully managed, no knobs. Only curated models are trainable
 # and their weights are public, so the shared cross-tenant cache holds nothing private; size
 # (_fits_weight_cache) is what gates attachment.
 # ---------------------------------------------------------------------------
 def test_assign_weight_cache_attaches_to_a_run():
-    from flash import runner
 
-    out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
-    assert out.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME == "flash-weights"
-    assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB
+    out = runner_weight_cache._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
+    assert out.gpu.network_volume == runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME == "flash-weights"
+    assert out.gpu.network_volume_gb == runner_weight_cache.WEIGHT_CACHE_VOLUME_GB
 
 
 def test_assign_weight_cache_keeps_a_custom_volume():
     # A NON-shared (per-org / custom) volume is the intended escape hatch — left intact.
-    from flash import runner
 
     spec = JobSpec.from_dict(
         {
@@ -591,26 +596,24 @@ def test_assign_weight_cache_keeps_a_custom_volume():
             },
         }
     )
-    out = runner._assign_weight_cache_volume(spec)
+    out = runner_weight_cache._assign_weight_cache_volume(spec)
     assert out.gpu.network_volume == "org-123-private-cache"  # not the shared cache -> kept
 
 
 def test_assign_weight_cache_ignores_removed_kill_switch(monkeypatch):
     # Regression: the FLASH_WEIGHT_CACHE=0 kill switch is GONE — fully managed, always on.
-    from flash import runner
 
     monkeypatch.setenv("FLASH_WEIGHT_CACHE", "0")
-    out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
+    out = runner_weight_cache._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
     assert out.gpu.network_volume == "flash-weights"  # env ignored
 
 
 def test_assign_weight_cache_does_not_override_existing():
-    from flash import runner
 
     spec = _vol_spec(name="explicit-vol")
     # network_volume is managed -> carried by the internal dict; an already-pinned volume is honored.
     spec = JobSpec.from_dict({**spec.to_internal_dict(), "run_id": "r"})
-    out = runner._assign_weight_cache_volume(spec)
+    out = runner_weight_cache._assign_weight_cache_volume(spec)
     assert out.gpu.network_volume == "explicit-vol"  # an explicit/test value is never clobbered
 
 
@@ -620,10 +623,9 @@ def test_assign_weight_cache_skips_oversized_catalog_model():
     # mid-download. It is left cache-less and downloads to the container disk instead. Every model
     # in the current catalog fits (see test_every_catalog_model_fits_the_weight_cache), so the gate
     # is exercised with a synthetic oversized entry rather than a real one.
-    from flash import runner
 
     info = _oversized_model_info()
-    out = runner._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
+    out = runner_weight_cache._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
     assert out.gpu.network_volume is None  # too big for the shared cache -> cache-less
 
 
@@ -632,7 +634,6 @@ def test_assign_weight_cache_strips_preset_shared_cache_on_oversized_catalog_mod
     # already pinned ``flash-weights`` for an oversized model must NOT bypass the gate via the
     # "honor an existing volume" no-op and redirect the download onto the undersized mount. It is
     # stripped cache-less.
-    from flash import runner
 
     info = _oversized_model_info()
     spec = JobSpec.from_dict(
@@ -641,19 +642,18 @@ def test_assign_weight_cache_strips_preset_shared_cache_on_oversized_catalog_mod
             "run_id": "r",
             "gpu": {
                 "type": "B200",
-                "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
+                "network_volume": runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME,
                 "network_volume_gb": 100,
             },
         }
     )
-    out = runner._assign_weight_cache_volume(spec, info)
+    out = runner_weight_cache._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume is None  # oversized -> the pre-set shared cache was stripped
 
 
 def test_assign_weight_cache_keeps_preset_shared_cache_on_fitting_catalog_model():
     # The re-gate only strips when OVERSIZED: a fitting model that already carries the shared cache
     # keeps it (the pin is correct), exercising the honor-existing path for a shared-name spec.
-    from flash import runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
@@ -663,19 +663,18 @@ def test_assign_weight_cache_keeps_preset_shared_cache_on_fitting_catalog_model(
             "run_id": "r",
             "gpu": {
                 "type": "H100",
-                "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
+                "network_volume": runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME,
                 "network_volume_gb": 100,
             },
         }
     )
-    out = runner._assign_weight_cache_volume(spec, info)
+    out = runner_weight_cache._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume == "flash-weights"  # fits -> kept
 
 
 def test_assign_weight_cache_keeps_preset_custom_volume_on_oversized_catalog_model():
     # The re-gate is scoped to the SHARED name only: a custom/per-org volume on an oversized model is
     # left intact (the caller owns its sizing — it may be a 200 GB org cache that DOES fit).
-    from flash import runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.6-35B-A3B"]
@@ -690,38 +689,35 @@ def test_assign_weight_cache_keeps_preset_custom_volume_on_oversized_catalog_mod
             },
         }
     )
-    out = runner._assign_weight_cache_volume(spec, info)
+    out = runner_weight_cache._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume == "org-123-big-cache"  # custom volume honored despite size
 
 
 def test_assign_weight_cache_attaches_fitting_catalog_model():
     # A model whose download fits the cache (with temp headroom) is still attached when info is passed.
-    from flash import runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]  # ~19.4 GB download, peak ~39 GB < 100 GB
-    out = runner._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
+    out = runner_weight_cache._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
     assert out.gpu.network_volume == "flash-weights"
 
 
 def test_fits_weight_cache_is_size_based():
-    from flash import runner
 
     # Oversized models are still excluded: the gate is a size check, not "always true".
-    assert not runner._fits_weight_cache(_oversized_model_info())
+    assert not runner_weight_cache._fits_weight_cache(_oversized_model_info())
 
 
 def test_every_catalog_model_fits_the_weight_cache():
     # The largest models have the slowest cold downloads, so they are exactly the ones the cache
     # must cover. WEIGHT_CACHE_VOLUME_GB must stay >= the peak footprint of the biggest catalog
     # entry; if a larger model is added, grow the volume rather than silently skipping its cache.
-    from flash import runner
     from flash.core.catalog import MODELS
 
     for mid, info in MODELS.items():
-        assert runner._fits_weight_cache(info), (
+        assert runner_weight_cache._fits_weight_cache(info), (
             f"{mid} ({info.params_b}B) no longer fits the "
-            f"{runner.WEIGHT_CACHE_VOLUME_GB} GB weight cache"
+            f"{runner_weight_cache.WEIGHT_CACHE_VOLUME_GB} GB weight cache"
         )
 
 
@@ -729,10 +725,9 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
     # Integration: the assignment is wired into submit_job and visible on the effective worker spec.
     # network_volume is platform-managed -> stripped from the public status.spec, so observe the
     # managed assignment on the effective-preparation worker spec the worker actually runs.
-    from flash import runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = JobSpec.from_dict(
             {
                 "model": "Qwen/Qwen3.5-0.8B",
@@ -744,11 +739,11 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
         )
         # sft submission is profile-gated; the cache attachment under test is not, so seed the
         # profile rather than exercising the hub round-trips a real submit performs.
-        satisfy_sft_profile(runner, monkeypatch, spec)
-        status = runner.submit_job(spec, dry_run=True)
+        satisfy_sft_profile(monkeypatch, spec)
+        status = runner_submit.submit_job(spec, dry_run=True)
     gpu = status.effective_preparation["worker_spec"]["gpu"]
     assert gpu["network_volume"] == "flash-weights"
-    assert gpu["network_volume_gb"] == runner.WEIGHT_CACHE_VOLUME_GB
+    assert gpu["network_volume_gb"] == runner_weight_cache.WEIGHT_CACHE_VOLUME_GB
     # and it must NOT leak into the public spec
     assert "network_volume" not in status.spec["gpu"]
 
@@ -773,7 +768,7 @@ def test_drop_weight_cache_preserves_non_shared_escape_hatch_volume():
     # Review (Copilot): the no-capacity cache-drop must NOT strip a non-shared per-org/custom volume —
     # that is the deliberate escape-hatch isolation the run opted into. Only the SHARED
     # platform cache (WEIGHT_CACHE_VOLUME_NAME) is dropped.
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.supervise.lifecycle import _drop_weight_cache
 
     custom = _vol_spec(name="org-1234-private")
@@ -792,16 +787,16 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         public = JobSpec.from_dict(
             {**_vol_spec().to_internal_dict(), "run_id": "managed-cache-fallback"}
         )
-        assert public.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME
+        assert public.gpu.network_volume == runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME
         selected_dict = public.to_internal_dict()
         selected_dict["gpu"]["network_volume"] = None
         selected = JobSpec.from_dict(selected_dict)
-        runner._save_status(
-            runner.RunStatus(
+        runner_state._save_status(
+            runner_state.RunStatus(
                 run_id=public.run_id,
                 state="provisioning",
                 spec=public.to_dict(),
@@ -814,12 +809,12 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
             )
         )
 
-        assert runner._persist_effective_worker_spec(selected)
+        assert runner_submit._persist_effective_worker_spec(selected)
 
-        stored = runner.get_status(public.run_id)
+        stored = runner_status.get_status(public.run_id)
         assert stored.effective_preparation["worker_spec"]["gpu"]["network_volume"] is None
         assert stored.effective_preparation["adapter_identity"] is None
-        assert runner.effective_spec_from_status(stored).gpu.network_volume is None
+        assert runner_status.effective_spec_from_status(stored).gpu.network_volume is None
 
 
 def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
@@ -831,16 +826,16 @@ def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         committed = JobSpec.from_dict(
             {
                 **_vol_spec(name="org-1234-private").to_internal_dict(),
                 "run_id": "custom-cache-fallback",
             }
         )
-        assert committed.gpu.network_volume != runner.WEIGHT_CACHE_VOLUME_NAME
-        runner._save_status(
-            runner.RunStatus(
+        assert committed.gpu.network_volume != runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME
+        runner_state._save_status(
+            runner_state.RunStatus(
                 run_id=committed.run_id,
                 state="provisioning",
                 spec=committed.to_dict(),
@@ -857,7 +852,7 @@ def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
         selected = JobSpec.from_dict(selected_dict)
 
         with pytest.raises(ValueError, match="effective preparation"):
-            runner._persist_effective_worker_spec(selected)
+            runner_submit._persist_effective_worker_spec(selected)
 
 
 def _supervised_walk(monkeypatch, failures):
@@ -868,9 +863,9 @@ def _supervised_walk(monkeypatch, failures):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        orch = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         import flash.providers.runpod.execution.jobs as jobs
-        import flash.providers.runpod.serverless as flash_train
+        import flash.providers.runpod.serverless.endpoints as flash_train
 
         seen: list = []
 
@@ -881,10 +876,12 @@ def _supervised_walk(monkeypatch, failures):
                 return jobs.PollResult(False, failure=fail, detail="x")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
-        monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(orch, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
+        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
         monkeypatch.setattr(
-            orch,
+            provider_worker, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT
+        )
+        monkeypatch.setattr(
+            runner_status,
             "validate_terminal_source_metrics",
             lambda _status, metrics, expected_attempt=None: (metrics, expected_attempt),
         )
@@ -897,8 +894,8 @@ def _supervised_walk(monkeypatch, failures):
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
         )
-        orch.submit_job(spec, dry_run=False, background=False)
-        assert orch.get_status("wc-walk").state == "done"
+        runner_submit.submit_job(spec, dry_run=False, background=False)
+        assert runner_status.get_status("wc-walk").state == "done"
         return seen
 
 
@@ -950,7 +947,7 @@ def test_non_capacity_failure_keeps_weight_cache(monkeypatch):
 def test_catalog_model_ids_are_the_cache_fitting_catalog():
     from flash.core.catalog import MODELS
     from flash.providers.artifacts import weight_cache as preload
-    from flash.runner import _fits_weight_cache
+    from flash.runner.accounting.weight_cache import _fits_weight_cache
 
     ids = set(preload.catalog_model_ids())
     # The default preload set is the catalog RESTRICTED to models that fit the weight cache (warming a
@@ -971,7 +968,7 @@ def test_preload_branch_passes_explicit_cache_dir(monkeypatch):
 
     import huggingface_hub
 
-    from flash.providers.runpod.serverless import endpoints
+    import flash.providers.runpod.serverless.endpoints as endpoints
 
     monkeypatch.setattr(_os, "environ", dict(_os.environ))  # isolate the branch's os.environ.update
     monkeypatch.setattr(_os.path, "isdir", lambda p: True)  # pretend the volume IS mounted
@@ -1018,7 +1015,7 @@ def test_preload_rejects_non_volume_hf_home(monkeypatch):
 
     import huggingface_hub
 
-    from flash.providers.runpod.serverless import endpoints
+    import flash.providers.runpod.serverless.endpoints as endpoints
 
     monkeypatch.setattr(_os, "environ", dict(_os.environ))
     monkeypatch.setattr(_os.path, "isdir", lambda p: True)  # even with the mount present...
@@ -1567,7 +1564,7 @@ def test_preload_branch_errors_when_volume_not_mounted(monkeypatch):
     # ephemeral disk — it returns an explicit error and downloads nothing.
     import os as _os
 
-    from flash.providers.runpod.serverless import endpoints
+    import flash.providers.runpod.serverless.endpoints as endpoints
 
     monkeypatch.setattr(_os, "environ", dict(_os.environ))
     monkeypatch.setattr(_os.path, "isdir", lambda p: False)  # /runpod-volume not mounted
@@ -3470,7 +3467,10 @@ def test_volume_holds_whole_catalog_with_largest_model_in_transit():
     Persistent volumes evict nothing, so download order cannot prevent the observed 200 GB
     "Disk quota exceeded" failure.
     """
-    from flash.runner import WEIGHT_CACHE_VOLUME_GB, weight_cache_catalog_peak_gb
+    from flash.runner.accounting.weight_cache import (
+        WEIGHT_CACHE_VOLUME_GB,
+        weight_cache_catalog_peak_gb,
+    )
 
     needed = weight_cache_catalog_peak_gb()
     assert needed <= WEIGHT_CACHE_VOLUME_GB, (
@@ -3487,7 +3487,7 @@ def test_preload_timeout_covers_a_fully_cold_whole_catalog_warm():
     """
     from flash.core.catalog import MODELS
     from flash.providers.artifacts.weight_cache import _PRELOAD_TIMEOUT_S
-    from flash.runner import _download_gb, _fits_weight_cache
+    from flash.runner.accounting.weight_cache import _download_gb, _fits_weight_cache
 
     measured_gb, measured_s = 70.0, 870.0  # observed cold 35B pull
     rate_gb_s = measured_gb / measured_s
@@ -3539,7 +3539,10 @@ def test_catalog_peak_counts_others_resident_not_just_the_largest():
     the largest model's own peak and the plain resident total.
     """
     from flash.core.catalog import MODELS
-    from flash.runner import _fits_weight_cache, weight_cache_catalog_peak_gb
+    from flash.runner.accounting.weight_cache import (
+        _fits_weight_cache,
+        weight_cache_catalog_peak_gb,
+    )
 
     sizes = sorted(
         ((info.params_b or 0.0) * 2.0 for info in MODELS.values() if _fits_weight_cache(info)),
@@ -3738,24 +3741,26 @@ def test_warm_grows_the_volume_before_attaching_it(monkeypatch):
     """
     import inspect
 
-    from flash import runner
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     # the grow must sit ahead of the create inside the same serialized attempt
-    src = inspect.getsource(jobs.deploy_train_endpoint)
+    src = inspect.getsource(job_execution.deploy_train_endpoint)
     assert src.index("grow_weight_cache_volumes(") < src.index("ep = Endpoint(**kwargs)")
 
     # and it asks for the MANAGED size on this DC's real (per-DC) volume name
     asked = {}
     monkeypatch.setattr(
-        jobs.runpod_api,
+        runpod_resources.runpod_api,
         "grow_network_volumes_for_key",
         lambda key, wanted, **kw: asked.update(wanted) or {},
     )
-    jobs.grow_weight_cache_volumes(
-        None, "k1", None, wanted={"flash-weights-us-ca-2": runner.WEIGHT_CACHE_VOLUME_GB}
+    runpod_resources.grow_weight_cache_volumes(
+        None,
+        "k1",
+        None,
+        wanted={"flash-weights-us-ca-2": runner_weight_cache.WEIGHT_CACHE_VOLUME_GB},
     )
-    assert asked == {"flash-weights-us-ca-2": runner.WEIGHT_CACHE_VOLUME_GB}
+    assert asked == {"flash-weights-us-ca-2": runner_weight_cache.WEIGHT_CACHE_VOLUME_GB}
 
 
 def test_a_bad_account_key_never_blocks_a_warm(monkeypatch):
@@ -3765,15 +3770,16 @@ def test_a_bad_account_key_never_blocks_a_warm(monkeypatch):
     but a warm aborted over an expired key warms nothing.
     """
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(
-        jobs.runpod_api,
+        runpod_resources.runpod_api,
         "grow_network_volumes_for_key",
         lambda key, wanted, **kw: (_ for _ in ()).throw(RuntimeError("401 unauthorized")),
     )
     # the grow raising must not propagate out of the helper the deploy calls
-    jobs.grow_weight_cache_volumes(None, "bad", None, wanted={"flash-weights-us-ca-2": 250})
+    runpod_resources.grow_weight_cache_volumes(
+        None, "bad", None, wanted={"flash-weights-us-ca-2": 250}
+    )
 
     monkeypatch.setattr(preload, "deploy_train_endpoint", lambda *a, **k: ("ep", "name", "fp"))
     monkeypatch.setattr(preload.runpod_api, "submit_job", lambda *a, **k: "job-1")
@@ -3790,7 +3796,6 @@ def test_assign_refreshes_a_stale_shared_cache_size():
 
     A correct volume name can still carry the stale 100 GB size and admit models that need 250 GB.
     """
-    from flash import runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
@@ -3800,14 +3805,14 @@ def test_assign_refreshes_a_stale_shared_cache_size():
             "run_id": "r",
             "gpu": {
                 "type": "H100",
-                "network_volume": runner.WEIGHT_CACHE_VOLUME_NAME,
+                "network_volume": runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME,
                 "network_volume_gb": 100,
             },
         }
     )
-    out = runner._assign_weight_cache_volume(spec, info)
-    assert out.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME
-    assert out.gpu.network_volume_gb == runner.WEIGHT_CACHE_VOLUME_GB
+    out = runner_weight_cache._assign_weight_cache_volume(spec, info)
+    assert out.gpu.network_volume == runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME
+    assert out.gpu.network_volume_gb == runner_weight_cache.WEIGHT_CACHE_VOLUME_GB
 
 
 def test_assign_leaves_a_custom_volume_size_alone():
@@ -3816,7 +3821,6 @@ def test_assign_leaves_a_custom_volume_size_alone():
     A per-org volume is the caller's to size, and rewriting it to the managed number would silently
     change what they are billed for.
     """
-    from flash import runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
@@ -3827,7 +3831,7 @@ def test_assign_leaves_a_custom_volume_size_alone():
             "gpu": {"type": "H100", "network_volume": "my-org-cache", "network_volume_gb": 100},
         }
     )
-    out = runner._assign_weight_cache_volume(spec, info)
+    out = runner_weight_cache._assign_weight_cache_volume(spec, info)
     assert out.gpu.network_volume == "my-org-cache"
     assert out.gpu.network_volume_gb == 100
 
@@ -4045,18 +4049,16 @@ def test_an_ordinary_deploy_grows_the_stale_volume_before_attaching(monkeypatch)
     Ordinary training must grow existing volumes before attach or newly admitted models mount the
     stale size and fail with "Disk quota exceeded".
     """
-    from flash import runner
-    from flash.providers.runpod.execution import jobs
 
     calls = []
     monkeypatch.setattr(
-        jobs.runpod_api,
+        runpod_resources.runpod_api,
         "grow_network_volumes_for_key",
         lambda key, wanted, **kw: calls.append((key, dict(wanted))) or {},
     )
 
-    spec = _vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME)
-    jobs.grow_weight_cache_volumes(spec, "owning-key")
+    spec = _vol_spec(runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME)
+    runpod_resources.grow_weight_cache_volumes(spec, "owning-key")
 
     assert len(calls) == 1
     key, wanted = calls[0]
@@ -4064,39 +4066,40 @@ def test_an_ordinary_deploy_grows_the_stale_volume_before_attaching(monkeypatch)
     assert key == "owning-key"
     # every storage DC's real per-DC volume name, at the managed size
     assert wanted
-    assert set(wanted.values()) == {runner.WEIGHT_CACHE_VOLUME_GB}
-    assert all(name.startswith(f"{runner.WEIGHT_CACHE_VOLUME_NAME}-") for name in wanted)
+    assert set(wanted.values()) == {runner_weight_cache.WEIGHT_CACHE_VOLUME_GB}
+    assert all(
+        name.startswith(f"{runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME}-") for name in wanted
+    )
 
 
 def test_an_ordinary_deploy_leaves_a_custom_volume_alone(monkeypatch):
     """Only the platform-managed cache is reconciled; a custom volume is the caller's to size."""
-    from flash.providers.runpod.execution import jobs
 
     calls = []
     monkeypatch.setattr(
-        jobs.runpod_api,
+        runpod_resources.runpod_api,
         "grow_network_volumes_for_key",
         lambda key, wanted, **kw: calls.append((key, dict(wanted))) or {},
     )
 
-    jobs.grow_weight_cache_volumes(_vol_spec("my-own-volume"), "k")
-    jobs.grow_weight_cache_volumes(_vol_spec(None), "k")
+    runpod_resources.grow_weight_cache_volumes(_vol_spec("my-own-volume"), "k")
+    runpod_resources.grow_weight_cache_volumes(_vol_spec(None), "k")
 
     assert calls == []
 
 
 def test_a_failed_grow_never_blocks_an_ordinary_deploy(monkeypatch):
     """Reconciliation is best-effort: attaching the old size beats failing the deploy outright."""
-    from flash import runner
-    from flash.providers.runpod.execution import jobs
 
     def _boom(*_a, **_k):
         raise RuntimeError("runpod unreachable")
 
-    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _boom)
+    monkeypatch.setattr(runpod_resources.runpod_api, "grow_network_volumes_for_key", _boom)
 
     # must not raise
-    jobs.grow_weight_cache_volumes(_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME), "k")
+    runpod_resources.grow_weight_cache_volumes(
+        _vol_spec(runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME), "k"
+    )
 
 
 def test_deploy_side_grow_takes_a_bounded_budget_not_the_run_deadline(monkeypatch):
@@ -4104,20 +4107,20 @@ def test_deploy_side_grow_takes_a_bounded_budget_not_the_run_deadline(monkeypatc
 
     Bound its retrying listing separately so a healthy account retains the 60-second create minimum.
     """
-    from flash import runner
-    from flash.providers.runpod.execution import jobs
 
     seen = {}
     monkeypatch.setattr(
-        jobs.runpod_api,
+        runpod_resources.runpod_api,
         "grow_network_volumes_for_key",
         lambda key, wanted, **kw: seen.update(kw) or {},
     )
 
     before = time.time()
-    jobs.grow_weight_cache_volumes(_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME), "k")
+    runpod_resources.grow_weight_cache_volumes(
+        _vol_spec(runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME), "k"
+    )
 
-    assert seen["deadline_at"] - before <= jobs.WEIGHT_CACHE_GROW_BUDGET_S + 1.0
+    assert seen["deadline_at"] - before <= runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S + 1.0
 
 
 def test_the_warm_names_the_volume_the_deploy_must_reconcile(monkeypatch):
@@ -4148,7 +4151,7 @@ def test_a_short_timeout_still_reconciles(monkeypatch):
     """
     from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
     from flash.providers.artifacts import weight_cache as preload
-    from flash.providers.runpod.execution.jobs import (
+    from flash.providers.runpod.execution.resources import (
         WEIGHT_CACHE_GROW_BUDGET_S,
         weight_cache_grow_headroom_s,
     )
@@ -4178,29 +4181,27 @@ def test_deploy_side_grow_yields_the_create_allowance_it_sits_in_front_of(monkey
 
     Growth must yield the create allowance before `_deploy_once` rechecks it.
     """
-    from flash import runner
     from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
-    from flash.providers.runpod.execution import jobs
 
     calls = []
     monkeypatch.setattr(
-        jobs.runpod_api,
+        runpod_resources.runpod_api,
         "grow_network_volumes_for_key",
         lambda key, wanted, **kw: calls.append(kw) or {},
     )
-    spec = _vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME)
+    spec = _vol_spec(runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME)
 
     # only 10s of slack above the allowance: the full budget would overrun it
     tight = time.time() + CREATE_ALLOWANCE_S + 10.0
     before = time.time()
-    jobs.grow_weight_cache_volumes(spec, "k", tight)
+    runpod_resources.grow_weight_cache_volumes(spec, "k", tight)
     assert calls, "a deploy with room to spare should still reconcile"
     assert calls[0]["deadline_at"] <= tight - CREATE_ALLOWANCE_S + 1.0
-    assert calls[0]["deadline_at"] - before <= jobs.WEIGHT_CACHE_GROW_BUDGET_S + 1.0
+    assert calls[0]["deadline_at"] - before <= runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S + 1.0
 
     # no slack at all: skip entirely rather than eat into the allowance
     calls.clear()
-    jobs.grow_weight_cache_volumes(spec, "k", time.time() + CREATE_ALLOWANCE_S)
+    runpod_resources.grow_weight_cache_volumes(spec, "k", time.time() + CREATE_ALLOWANCE_S)
     assert calls == []
 
 
@@ -4208,10 +4209,14 @@ def test_deploy_side_grow_is_wired_to_the_run_deadline(monkeypatch):
     """The deadline must actually reach the helper, not just be honoured once it does."""
     import inspect
 
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
-    src = inspect.getsource(jobs.deploy_train_endpoint)
-    assert "grow_weight_cache_volumes(spec, owning_key, deadline_at, wanted=cache_volumes)" in src
+    src = inspect.getsource(job_execution.deploy_train_endpoint)
+    compact = "".join(src.split())
+    assert (
+        "runpod_resources.grow_weight_cache_volumes("
+        "spec,owning_key,deadline_at,wanted=cache_volumes)"
+    ) in compact
 
 
 def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
@@ -4225,10 +4230,10 @@ def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
     from flash.providers._lifecycle.net import deadline as _deadline
     from flash.providers.runpod.client import auth as rp_auth
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     clock = {"t": 10_000.0}
-    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(job_execution.time, "time", lambda: clock["t"])
     monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
 
     account = {"key": "acct-1"}
@@ -4236,20 +4241,20 @@ def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
     monkeypatch.setattr(rp_auth, "ensure_auth", lambda: account["key"])
     monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
     monkeypatch.setattr(rp_keys, "advance_key", lambda: account.update(key="acct-2"))
-    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
-    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
-    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: True)
+    monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(job_execution, "_is_balance_error", lambda exc: True)
 
     events = []
 
     def _grow(key, wanted, **kw):
         events.append(("grow", key))
-        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S  # a real grow burns its budget
+        clock["t"] += runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S  # a real grow burns its budget
         return {}
 
-    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _grow)
+    monkeypatch.setattr(runpod_resources.runpod_api, "grow_network_volumes_for_key", _grow)
 
     def _endpoint(**kwargs):
         events.append(("attach", account["key"]))
@@ -4257,9 +4262,9 @@ def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
 
     monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
 
-    deadline = clock["t"] + 60 + jobs.weight_cache_grow_headroom_s()
+    deadline = clock["t"] + 60 + runpod_resources.weight_cache_grow_headroom_s()
     with pytest.raises(RuntimeError, match="insufficient balance"):
-        jobs.deploy_train_endpoint(
+        job_execution.deploy_train_endpoint(
             "RTX 4090",
             spec=None,
             endpoint_kwargs=dict,
@@ -4286,36 +4291,41 @@ def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch)
     from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
     from flash.providers.runpod.client import auth as rp_auth
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     clock = {"t": 10_000.0}
-    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(job_execution.time, "time", lambda: clock["t"])
     monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
 
     account = {"key": "acct-1"}
     monkeypatch.setattr(rp_auth, "ensure_auth", lambda: account["key"])
     monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
     monkeypatch.setattr(rp_keys, "advance_key", lambda: account.update(key="acct-2"))
-    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
-    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
-    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: "balance" in str(exc))
+    monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(job_execution, "_is_balance_error", lambda exc: "balance" in str(exc))
 
     events = []
 
     def _grow(key, wanted, **kw):
         events.append(("grow", key))
-        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S
+        clock["t"] += runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S
         return {}
 
-    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _grow)
+    monkeypatch.setattr(runpod_resources.runpod_api, "grow_network_volumes_for_key", _grow)
 
     # Sized so the failover attempt starts with exactly the create allowance left: enough for
     # require_create_allowance to pass, but `min(budget, remaining - allowance)` is then 0, so the
     # unreserved code proceeded to attach with no reconciliation at all.
     deadline = clock["t"] + 900.0
-    burn = {"s": deadline - clock["t"] - jobs.WEIGHT_CACHE_GROW_BUDGET_S - CREATE_ALLOWANCE_S}
+    burn = {
+        "s": deadline
+        - clock["t"]
+        - runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S
+        - CREATE_ALLOWANCE_S
+    }
 
     def _endpoint(**kwargs):
         events.append(("attach", account["key"]))
@@ -4326,7 +4336,7 @@ def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch)
     monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
 
     with pytest.raises(RuntimeError, match=r"balance|deadline"):
-        jobs.deploy_train_endpoint(
+        job_execution.deploy_train_endpoint(
             "RTX 4090",
             spec=None,
             endpoint_kwargs=dict,
@@ -4355,22 +4365,22 @@ def test_a_volume_free_run_reserves_no_grow_time(monkeypatch):
     from flash.providers._lifecycle.net import deadline as _deadline
     from flash.providers.runpod.client import auth as rp_auth
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     clock = {"t": 10_000.0}
-    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(job_execution.time, "time", lambda: clock["t"])
     monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
 
     monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "acct-1")
     monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
-    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
 
     def _grow(key, wanted, **kw):  # pragma: no cover - must never run for a volume-free deploy
         raise AssertionError("a volume-free run must not reconcile anything")
 
-    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _grow)
+    monkeypatch.setattr(runpod_resources.runpod_api, "grow_network_volumes_for_key", _grow)
 
     reached = []
 
@@ -4382,7 +4392,7 @@ def test_a_volume_free_run_reserves_no_grow_time(monkeypatch):
 
     # exactly Codex's scenario: 2 accounts, 90s left, no managed cache attached
     with pytest.raises(RuntimeError, match=r"reached the provider"):
-        jobs.deploy_train_endpoint(
+        job_execution.deploy_train_endpoint(
             "RTX 4090",
             spec=None,
             endpoint_kwargs=dict,
@@ -4402,21 +4412,21 @@ def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
 
     from flash.providers.runpod.client import auth as rp_auth
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "only-account")
     monkeypatch.setattr(rp_keys, "key_count", lambda: 1)
-    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
-    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
-    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: False)
-    monkeypatch.setattr(jobs, "_is_workers_quota_error", lambda exc: True)
-    monkeypatch.setattr(jobs.time, "sleep", lambda *_a: None)
+    monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(job_execution, "_is_balance_error", lambda exc: False)
+    monkeypatch.setattr(job_execution, "_is_workers_quota_error", lambda exc: True)
+    monkeypatch.setattr(job_execution.time, "sleep", lambda *_a: None)
 
     grows = []
     monkeypatch.setattr(
-        jobs.runpod_api,
+        runpod_resources.runpod_api,
         "grow_network_volumes_for_key",
         lambda key, wanted, **kw: grows.append(key) or {},
     )
@@ -4427,7 +4437,7 @@ def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
     monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
 
     with pytest.raises(RuntimeError, match="no workers available"):
-        jobs.deploy_train_endpoint(
+        job_execution.deploy_train_endpoint(
             "RTX 4090",
             spec=None,
             endpoint_kwargs=dict,
@@ -4446,23 +4456,22 @@ def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
     """
     import runpod_flash
 
-    from flash import runner
     from flash.providers._lifecycle.net import deadline as _deadline
     from flash.providers.runpod.client import auth as rp_auth
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     clock = {"t": 10_000.0}
-    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(job_execution.time, "time", lambda: clock["t"])
     monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
 
     monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "acct-1")
     monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
-    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
     monkeypatch.setattr(
-        jobs.runpod_api, "grow_network_volumes_for_key", lambda key, wanted, **kw: {}
+        runpod_resources.runpod_api, "grow_network_volumes_for_key", lambda key, wanted, **kw: {}
     )
 
     reached = []
@@ -4475,9 +4484,9 @@ def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
 
     # exactly what submit_run passes: the managed cache attached, deadline handed over unpadded
     with pytest.raises(RuntimeError, match=r"reached the provider"):
-        jobs.deploy_train_endpoint(
+        job_execution.deploy_train_endpoint(
             "RTX 4090",
-            spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
+            spec=_vol_spec(runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME),
             endpoint_kwargs=dict,
             deadline_at=clock["t"] + 90.0,
         )
@@ -4492,23 +4501,22 @@ def test_the_grow_reserve_still_caps_what_a_create_may_spend(monkeypatch):
     """
     import runpod_flash
 
-    from flash import runner
     from flash.providers._lifecycle.net import deadline as _deadline
     from flash.providers.runpod.client import auth as rp_auth
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     clock = {"t": 10_000.0}
-    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(job_execution.time, "time", lambda: clock["t"])
     monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
 
     monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "acct-1")
     monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
-    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
     monkeypatch.setattr(
-        jobs.runpod_api, "grow_network_volumes_for_key", lambda key, wanted, **kw: {}
+        runpod_resources.runpod_api, "grow_network_volumes_for_key", lambda key, wanted, **kw: {}
     )
 
     timeouts = []
@@ -4518,7 +4526,7 @@ def test_the_grow_reserve_still_caps_what_a_create_may_spend(monkeypatch):
         coro.close()
         raise RuntimeError("reached the provider")
 
-    monkeypatch.setattr(jobs.asyncio, "wait_for", _wait_for)
+    monkeypatch.setattr(job_execution.asyncio, "wait_for", _wait_for)
     monkeypatch.setattr(
         runpod_flash,
         "Endpoint",
@@ -4526,15 +4534,15 @@ def test_the_grow_reserve_still_caps_what_a_create_may_spend(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match=r"reached the provider"):
-        jobs.deploy_train_endpoint(
+        job_execution.deploy_train_endpoint(
             "RTX 4090",
-            spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
+            spec=_vol_spec(runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME),
             endpoint_kwargs=dict,
             deadline_at=clock["t"] + 900.0,
         )
 
     # one account still unreconciled at create time, so its slice stays held back
-    assert timeouts == [900.0 - jobs.WEIGHT_CACHE_GROW_BUDGET_S]
+    assert timeouts == [900.0 - runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S]
 
 
 def test_the_post_grow_recheck_does_not_recharge_a_paid_slice(monkeypatch):
@@ -4544,28 +4552,27 @@ def test_the_post_grow_recheck_does_not_recharge_a_paid_slice(monkeypatch):
     """
     import runpod_flash
 
-    from flash import runner
     from flash.providers._lifecycle.net import deadline as _deadline
     from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
     from flash.providers.runpod.client import auth as rp_auth
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     clock = {"t": 10_000.0}
-    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(job_execution.time, "time", lambda: clock["t"])
     monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
 
     monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "acct-1")
     monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
-    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
 
     def _grow(key, wanted, **kw):
-        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S  # a real grow burns its budget
+        clock["t"] += runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S  # a real grow burns its budget
         return {}
 
-    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _grow)
+    monkeypatch.setattr(runpod_resources.runpod_api, "grow_network_volumes_for_key", _grow)
 
     reached = []
 
@@ -4574,7 +4581,7 @@ def test_the_post_grow_recheck_does_not_recharge_a_paid_slice(monkeypatch):
         coro.close()
         raise RuntimeError("reached the provider")
 
-    monkeypatch.setattr(jobs.asyncio, "wait_for", _wait_for)
+    monkeypatch.setattr(job_execution.asyncio, "wait_for", _wait_for)
     monkeypatch.setattr(
         runpod_flash,
         "Endpoint",
@@ -4583,11 +4590,11 @@ def test_the_post_grow_recheck_does_not_recharge_a_paid_slice(monkeypatch):
 
     # After the grow burns its slice, exactly the allowance plus half a slice remains: admission
     # passed, the grow ran, and only the stale re-deduction could reject the create from here.
-    deadline = clock["t"] + jobs.WEIGHT_CACHE_GROW_BUDGET_S * 1.5 + CREATE_ALLOWANCE_S
+    deadline = clock["t"] + runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S * 1.5 + CREATE_ALLOWANCE_S
     with pytest.raises(RuntimeError, match=r"reached the provider"):
-        jobs.deploy_train_endpoint(
+        job_execution.deploy_train_endpoint(
             "RTX 4090",
-            spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
+            spec=_vol_spec(runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME),
             endpoint_kwargs=dict,
             deadline_at=deadline,
         )
@@ -4603,16 +4610,15 @@ def test_admission_is_rejudged_with_the_key_the_attempt_lands_on(monkeypatch):
     """
     import runpod_flash
 
-    from flash import runner
     from flash.providers._lifecycle.net import deadline as _deadline
     from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
     from flash.providers.runpod.client import auth as rp_auth
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     clock = {"t": 10_000.0}
-    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
-    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    monkeypatch.setattr(job_execution.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(job_execution.time, "sleep", lambda s: None)
     monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
 
     monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
@@ -4627,19 +4633,19 @@ def test_admission_is_rejudged_with_the_key_the_attempt_lands_on(monkeypatch):
         return "acct-1" if attempts["n"] == 1 else "acct-2"
 
     monkeypatch.setattr(rp_auth, "ensure_auth", _ensure_auth)
-    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
-    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", lambda **kw: 0)
 
     grown = []
 
     def _grow(key, wanted, **kw):
         grown.append(key)
-        clock["t"] += jobs.WEIGHT_CACHE_GROW_BUDGET_S
+        clock["t"] += runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S
         return {}
 
-    monkeypatch.setattr(jobs.runpod_api, "grow_network_volumes_for_key", _grow)
+    monkeypatch.setattr(runpod_resources.runpod_api, "grow_network_volumes_for_key", _grow)
 
     reached = []
 
@@ -4656,11 +4662,11 @@ def test_admission_is_rejudged_with_the_key_the_attempt_lands_on(monkeypatch):
     # One slice plus the allowance: attempt 1's grow burns its slice, leaving exactly the
     # allowance. The retry's pre-lock check reads acct-1 (reconciled, slice released) and passes
     # -- only the under-lock re-check against acct-2 stands between it and a zero-budget grow.
-    deadline = clock["t"] + jobs.WEIGHT_CACHE_GROW_BUDGET_S + CREATE_ALLOWANCE_S
+    deadline = clock["t"] + runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S + CREATE_ALLOWANCE_S
     with pytest.raises(RuntimeError, match=r"deadline"):
-        jobs.deploy_train_endpoint(
+        job_execution.deploy_train_endpoint(
             "RTX 4090",
-            spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
+            spec=_vol_spec(runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME),
             endpoint_kwargs=dict,
             deadline_at=deadline,
         )
@@ -4677,25 +4683,24 @@ def test_a_large_key_pool_does_not_zero_the_create_timeout(monkeypatch):
     """
     import runpod_flash
 
-    from flash import runner
     from flash.providers._lifecycle.net import deadline as _deadline
     from flash.providers._lifecycle.net.deadline import CREATE_ALLOWANCE_S
     from flash.providers.runpod.client import auth as rp_auth
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     clock = {"t": 10_000.0}
-    monkeypatch.setattr(jobs.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(job_execution.time, "time", lambda: clock["t"])
     monkeypatch.setattr(_deadline.time, "time", lambda: clock["t"])
 
     monkeypatch.setattr(rp_auth, "ensure_auth", lambda: "acct-1")
     # 8 accounts * 20s reserve = 160s, more than the 90s left
     monkeypatch.setattr(rp_keys, "key_count", lambda: 8)
-    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
     monkeypatch.setattr(
-        jobs.runpod_api, "grow_network_volumes_for_key", lambda key, wanted, **kw: {}
+        runpod_resources.runpod_api, "grow_network_volumes_for_key", lambda key, wanted, **kw: {}
     )
 
     timeouts = []
@@ -4705,7 +4710,7 @@ def test_a_large_key_pool_does_not_zero_the_create_timeout(monkeypatch):
         coro.close()
         raise RuntimeError("reached the provider")
 
-    monkeypatch.setattr(jobs.asyncio, "wait_for", _wait_for)
+    monkeypatch.setattr(job_execution.asyncio, "wait_for", _wait_for)
     monkeypatch.setattr(
         runpod_flash,
         "Endpoint",
@@ -4713,9 +4718,9 @@ def test_a_large_key_pool_does_not_zero_the_create_timeout(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match=r"reached the provider"):
-        jobs.deploy_train_endpoint(
+        job_execution.deploy_train_endpoint(
             "RTX 4090",
-            spec=_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME),
+            spec=_vol_spec(runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME),
             endpoint_kwargs=dict,
             deadline_at=clock["t"] + 90.0,
         )
@@ -4726,14 +4731,19 @@ def test_a_large_key_pool_does_not_zero_the_create_timeout(monkeypatch):
 def test_grow_headroom_covers_every_account_in_the_pool(monkeypatch):
     """The caller cannot fund a whole deploy from a single grow budget: failover reconciles again."""
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.providers.runpod.execution import jobs
 
     monkeypatch.setattr(rp_keys, "key_count", lambda: 3)
-    assert jobs.weight_cache_grow_headroom_s() == jobs.WEIGHT_CACHE_GROW_BUDGET_S * 3
+    assert (
+        runpod_resources.weight_cache_grow_headroom_s()
+        == runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S * 3
+    )
 
     # an unconfigured pool still funds the one attempt that runs
     monkeypatch.setattr(rp_keys, "key_count", lambda: 0)
-    assert jobs.weight_cache_grow_headroom_s() == jobs.WEIGHT_CACHE_GROW_BUDGET_S
+    assert (
+        runpod_resources.weight_cache_grow_headroom_s()
+        == runpod_resources.WEIGHT_CACHE_GROW_BUDGET_S
+    )
 
 
 def test_one_bad_volume_never_blocks_the_others(monkeypatch):
@@ -4819,22 +4829,22 @@ def test_failover_reconciles_the_account_it_lands_on(monkeypatch):
     """
     from flash.providers.runpod.client import auth as rp_auth
     from flash.providers.runpod.client import auth as rp_keys
-    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution import job_execution
 
     account = {"key": "first-account"}
     # deploy_train_endpoint imports ensure_auth function-locally, so patch it at the source
     monkeypatch.setattr(rp_auth, "ensure_auth", lambda: account["key"])
     monkeypatch.setattr(rp_keys, "key_count", lambda: 2)
     monkeypatch.setattr(rp_keys, "advance_key", lambda: account.update(key="second-account"))
-    monkeypatch.setattr(jobs.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
-    monkeypatch.setattr(jobs, "isolate_flash_state", lambda *a, **k: None)
-    monkeypatch.setattr(jobs, "_patch_runpod_backoff", lambda: None)
-    monkeypatch.setattr(jobs, "_sweep_idle_flash_endpoints", lambda **kw: 0)
-    monkeypatch.setattr(jobs, "_is_balance_error", lambda exc: True)
+    monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
+    monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
+    monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
+    monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(job_execution, "_is_balance_error", lambda exc: True)
 
     grown = []
     monkeypatch.setattr(
-        jobs.runpod_api,
+        runpod_resources.runpod_api,
         "grow_network_volumes_for_key",
         lambda key, wanted, **kw: grown.append(key) or {},
     )
@@ -4848,7 +4858,7 @@ def test_failover_reconciles_the_account_it_lands_on(monkeypatch):
     monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
 
     with pytest.raises(RuntimeError, match="insufficient balance"):
-        jobs.deploy_train_endpoint(
+        job_execution.deploy_train_endpoint(
             "RTX 4090",
             spec=None,
             endpoint_kwargs=dict,
@@ -4865,30 +4875,29 @@ def test_datacenter_discovery_failure_never_fails_the_deploy(monkeypatch):
     Datacenter discovery failures must be swallowed like growth failures; the helper promises it
     cannot fail a deploy.
     """
-    from flash import runner
-    from flash.providers.runpod.execution import jobs
 
     def _boom():
         raise RuntimeError("incompatible SDK: DataCenter.all() is gone")
 
-    monkeypatch.setattr(jobs, "weight_cache_datacenters", _boom)
+    monkeypatch.setattr(runpod_resources, "weight_cache_datacenters", _boom)
 
     # must return, not raise
-    jobs.grow_weight_cache_volumes(_vol_spec(runner.WEIGHT_CACHE_VOLUME_NAME), "k")
+    runpod_resources.grow_weight_cache_volumes(
+        _vol_spec(runner_weight_cache.WEIGHT_CACHE_VOLUME_NAME), "k"
+    )
 
 
 def test_spec_none_without_named_volumes_stays_a_no_op(monkeypatch):
     """Callers that neither carry a spec nor name volumes have nothing to reconcile."""
-    from flash.providers.runpod.execution import jobs
 
     grown = []
     monkeypatch.setattr(
-        jobs.runpod_api,
+        runpod_resources.runpod_api,
         "grow_network_volumes_for_key",
         lambda key, wanted, **kw: grown.append(key) or {},
     )
 
-    jobs.grow_weight_cache_volumes(None, "k", None)
+    runpod_resources.grow_weight_cache_volumes(None, "k", None)
 
     assert grown == []
 
@@ -4908,4 +4917,5 @@ def test_the_owning_key_is_read_inside_the_serialized_section():
     # a key another thread advances after admission cannot grow one account while Endpoint attaches
     # a different one.
     assert "owning_key = ensure_auth()" in src
-    assert "grow_weight_cache_volumes(spec, owning_key" in src
+    compact = "".join(src.split())
+    assert "runpod_resources.grow_weight_cache_volumes(spec,owning_key" in compact

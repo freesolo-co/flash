@@ -16,6 +16,12 @@ import random
 from functools import reduce
 from math import gcd
 
+import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.model.adapter as _worker_adapter
+import flash.engine.worker.model.decoding as _worker_decoding
+import flash.engine.worker.perf as _worker_perf
+import flash.engine.worker.runtime.state as _worker_state
+import flash.engine.worker.train.rl.launch.config as _worker_config
 from flash.adapters.targets import LoraTargeting, resolve_lora_targeting
 from flash.content.structured_outputs import (
     describe_structured_outputs,
@@ -30,28 +36,17 @@ from flash.engine.plan.steps import (
     validate_save_steps,
 )
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
-from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.runtime.rng import backend_seed
+from flash.engine.worker.runtime.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.train.core.child.glue import validate_glue_template
-from flash.engine.worker.train.entry.backend_common import clamp_engine_len
+from flash.engine.worker.train.entry.backend_common import (
+    clamp_engine_len,
+    model_max_position_embeddings,
+)
+from flash.engine.worker.train.opd.orchestration.gkd import generation_eos_from_cached_config
 from flash.engine.worker.train.rl.launch.verl_config import (
     _processor_expanded_prompt,
     _verl_epochs_for_horizon,
 )
-
-
-def _rl_train():
-    """The orchestrator module, imported lazily because it imports this one.
-
-    `seed_training_rngs`, `model_max_position_embeddings` and `generation_eos_from_cached_config`
-    are patched on `rl_train` by the resolver tests (the last two keep the context-limit probe and
-    the halting-set read off the hub, which a clean runner has no cache for). Binding them here
-    with a `from ... import` would capture the originals at import time, so the patch would rebind
-    an object this module never reads and the resolver would run the real ones.
-    """
-    from flash.engine.worker.train.entry import rl_train
-
-    return rl_train
 
 
 def _validate_grpo_environment(env):
@@ -127,7 +122,7 @@ def _resolve_grpo_options(train_spec, rl, multi_turn):
             f"RECIPE.lora.dropout={RECIPE.lora.dropout} is not wired on the verl backend; "
             "add actor_rollout_ref.model.lora_dropout support before setting it non-zero."
         )
-    gcfg = _w.grpo_overrides()
+    gcfg = _worker_config.grpo_overrides()
     prompts_per_step = int(
         train_spec.prompts_per_step
         if train_spec and train_spec.prompts_per_step is not None
@@ -181,7 +176,7 @@ def _resolve_warmstart_config(
 ):
     with open(os.path.join(adapter_path, "adapter_config.json")) as f:
         source_config = json.load(f)
-    _w.validate_warmstart_adapter(source_config, model_id, adapter_path, targeting)
+    _worker_adapter.validate_warmstart_adapter(source_config, model_id, adapter_path, targeting)
     # a patterned adapter trains some modules at higher rank than the base `r`; verl allocates
     # one uniform rank, so it must cover the MAXIMUM prepared rank or the load truncates.
     ranks = [int(source_config.get("r", lora_rank))]
@@ -203,7 +198,7 @@ def _load_training_records(env, train_spec):
     max_examples = getattr(train_spec, "max_examples", None) if train_spec else None
     if max_examples:
         train = train[: int(max_examples)]
-    rng = random.Random(_w.SEED)
+    rng = random.Random(_worker_state.SEED)
     rng.shuffle(train)
     return train, [env.prompt_messages(ex) for ex in train]
 
@@ -219,7 +214,7 @@ def _grpo_is_multimodal(env, train, message_prompts):
 def _resolve_sequence_lengths(model_id, model_revision, train_spec, rl, gcfg, tok, multi_turn):
     from flash.engine.plan.vram import grpo_completion_len, grpo_rollout_seq_len
 
-    thinking = bool(_w.THINKING)
+    thinking = bool(_worker_state.THINKING)
     max_tokens = gcfg.get("max_tokens")
     max_completion = grpo_completion_len(max_tokens, thinking)
     train_ctx = (
@@ -230,7 +225,7 @@ def _resolve_sequence_lengths(model_id, model_revision, train_spec, rl, gcfg, to
     # clamping only the engine would admit prompts up to the unclamped budget and then fail them at
     # rollout, and would let the token budget pack more than the one-sequence memory floor intends.
     vllm_max_len = clamp_engine_len(
-        requested_len, _rl_train().model_max_position_embeddings(model_id, model_revision)
+        requested_len, model_max_position_embeddings(model_id, model_revision)
     )
     if vllm_max_len < requested_len:
         print(
@@ -247,7 +242,7 @@ def _resolve_sequence_lengths(model_id, model_revision, train_spec, rl, gcfg, to
         # the child derives inter-turn glue by probing this template. a template that cannot
         # round-trip assistant content would fail on the first environment reply, after the rollout
         # has already burned gpu time -- fail here instead, before anything is launched.
-        validate_glue_template(tok, thinking=bool(_w.THINKING))
+        validate_glue_template(tok, thinking=bool(_worker_state.THINKING))
     return {
         "max_completion": max_completion,
         "vllm_max_len": vllm_max_len,
@@ -272,7 +267,7 @@ def _build_grpo_prompts(
                 normalized.messages,
                 tuple(normalized.descriptors),
                 package_root,
-                enable_thinking=bool(_w.THINKING),
+                enable_thinking=bool(_worker_state.THINKING),
             )
             if 0 < len(expanded) <= prompt_budget:
                 prompts.append(
@@ -291,7 +286,10 @@ def _build_grpo_prompts(
     else:
         for ex, messages in zip(train, message_prompts, strict=True):
             rendered = tok.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, enable_thinking=_w.THINKING
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=_worker_state.THINKING,
             )
             prompt_ids = list(tok(rendered, add_special_tokens=False).input_ids)
             prompt_len = len(prompt_ids)
@@ -332,7 +330,7 @@ def _resolve_grpo_schedule(train_spec, rl, prompts, prompts_per_step, lengths, m
         if multi_turn
         else max_completion
     )
-    prompts_per_step = _w.resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
+    prompts_per_step = _worker_config.resolve_grpo_prompts_per_step(prompts_per_step, len(prompts))
     # optimizer-update horizon, honoring [train].max_steps exactly.
     epochs = (
         int(train_spec.epochs)
@@ -409,7 +407,7 @@ def _assemble_grpo_inputs(
         # the union of the tokenizer's eos and the model's generation_config eos, because a model can
         # stop on a secondary id its tokenizer never exposes.
         "eos_token_ids": (
-            _rl_train().generation_eos_from_cached_config(model_id, model_revision, tok)
+            generation_eos_from_cached_config(model_id, model_revision, tok)
             if multi_turn
             else frozenset()
         ),
@@ -427,7 +425,7 @@ def _assemble_grpo_inputs(
         # a checkpoint written at the executed width read as the wrong topology and every retry
         # restarted from step 0. opd binds one value for both phases; this is grpo's.
         "dp_cards": rl_data_parallel_cards(
-            gpu_count_of(_w.JOB_SPEC),
+            gpu_count_of(_worker_state.JOB_SPEC),
             int(schedule["prompts_per_step"]) * int(options["group_size"]),
         ),
         "mask_truncated_completions": options["mask_truncated_completions"],
@@ -461,19 +459,21 @@ def _assemble_grpo_inputs(
         # verl's default preserves the update horizon and on-policy baseline; with no generation reuse, each
         # update gets a fresh rollout batch.
         "ppo_epochs": 1,
-        "seed": int(backend_seed(_w.SEED)),
+        "seed": int(backend_seed(_worker_state.SEED)),
     }
 
 
 def _resolve_grpo_inputs():
     """reproduce run_rl's front-half config + dataset prep for text, multimodal, and multi-turn."""
-    env = _w.require_active_env()
+    env = _worker_state.require_active_env()
     multi_turn = _validate_grpo_environment(env)
-    _rl_train().seed_training_rngs(_w.SEED)
-    model_id = _w.JOB_SPEC.model if _w.JOB_SPEC else RECIPE.hf_model_id
-    model_revision = getattr(_w.JOB_SPEC, "model_revision", "") if _w.JOB_SPEC else ""
+    seed_training_rngs(_worker_state.SEED)
+    model_id = _worker_state.JOB_SPEC.model if _worker_state.JOB_SPEC else RECIPE.hf_model_id
+    model_revision = (
+        getattr(_worker_state.JOB_SPEC, "model_revision", "") if _worker_state.JOB_SPEC else ""
+    )
     rl = RECIPE.rl
-    _t = _w.JOB_SPEC.train if _w.JOB_SPEC else None
+    _t = _worker_state.JOB_SPEC.train if _worker_state.JOB_SPEC else None
     options = _resolve_grpo_options(_t, rl, multi_turn)
 
     # entropy_quantile keeps the loss to the top-entropy tokens of each completion. verl has no
@@ -486,7 +486,7 @@ def _resolve_grpo_inputs():
         else None
     )
 
-    mask_truncated_completions = _w.grpo_mask_truncated_completions(_t)
+    mask_truncated_completions = _worker_config.grpo_mask_truncated_completions(_t)
     options["mask_truncated_completions"] = mask_truncated_completions
     warmstart_adapter = ""
     if _t and getattr(_t, "init_from_adapter", ""):
@@ -534,12 +534,12 @@ def _resolve_grpo_inputs():
         from transformers import AutoProcessor
 
         processor = AutoProcessor.from_pretrained(
-            model_id, trust_remote_code=True, **_w.model_revision_kwargs(model_revision)
+            model_id, trust_remote_code=True, **_worker_hf.model_revision_kwargs(model_revision)
         )
         tok = processor.tokenizer
         image_pad_token_id = resolve_image_pad_token_id(processor, tok)
     else:
-        tok = _w.load_tokenizer(model_id, revision=model_revision)
+        tok = _worker_hf.load_tokenizer(model_id, revision=model_revision)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -555,7 +555,9 @@ def _resolve_grpo_inputs():
         package_root,
         lengths["prompt_budget"],
     )
-    prompt_opened_thinking = bool(_w.THINKING) and _w.prompt_opens_thinking(prompts[0]["rendered"])
+    prompt_opened_thinking = bool(
+        _worker_state.THINKING
+    ) and _worker_decoding.prompt_opens_thinking(prompts[0]["rendered"])
     # hand the same derived flag to the multi-turn grading path. the env cannot derive it itself --
     # it has no tokenizer and never sees a rendered prompt -- and the template opens the block in
     # EVERY assistant generation prompt (the glue tokenizer renders the next turn's header the same
@@ -572,7 +574,7 @@ def _resolve_grpo_inputs():
         # verl always checkpoints (enable_gradient_checkpointing=True) and always asks for
         # non-reentrant recompute, which the MoE router and GDN chunk-scan die on. resolved here so
         # the child shim can put the flag back to what the model needs.
-        "reentrant_checkpointing": bool(_w.grpo_use_reentrant(model_id)),
+        "reentrant_checkpointing": bool(_worker_perf.grpo_use_reentrant(model_id)),
         "per_turn_credit": per_turn_credit,
     }
     return _assemble_grpo_inputs(

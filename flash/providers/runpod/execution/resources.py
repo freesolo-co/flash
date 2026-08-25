@@ -13,6 +13,7 @@ from __future__ import annotations
 import threading
 import time
 
+from flash._internal.logging import get_logger
 from flash.providers._lifecycle.net.deadline import (
     CREATE_ALLOWANCE_S,
     deadline_kwargs,
@@ -39,18 +40,7 @@ def weight_cache_grow_headroom_s() -> float:
     return WEIGHT_CACHE_GROW_BUDGET_S * max(1, rp_keys.key_count())
 
 
-def _jobs():
-    """The jobs module, imported lazily because it imports this one.
-
-    Two things are read back through it. `weight_cache_volumes` is patched as a `jobs` attribute by
-    the volume tests and its only caller is here, so a direct call would run the real one under the
-    patch. `logger` is the parent's logger OBJECT, which a reaper test patches `.warning` on -- a
-    second `get_logger(__name__)` here would be a different object and the patch would miss it.
-    """
-    from flash.providers.runpod.execution import jobs
-
-    return jobs
-
+logger = get_logger(__name__)
 
 # DCs that do NOT support network volumes — creating one there 500s the whole deploy.
 # SDK exposes no capability flag; stale list degrades gracefully (falls back to cold cross-region run).
@@ -84,7 +74,10 @@ def weight_cache_volumes(spec) -> list:
     from runpod_flash import NetworkVolume
 
     from flash.core.spec_persistence import volume_gb
-    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import (
+        WEIGHT_CACHE_VOLUME_GB,
+        WEIGHT_CACHE_VOLUME_NAME,
+    )
 
     # The shared cache is platform-managed, so its size comes from the managed constant rather than
     # whatever the spec happens to carry: a stale/round-tripped spec can still hold a pre-bump size,
@@ -107,7 +100,10 @@ def grow_weight_cache_volumes(
     Existing volumes require REST growth because RunPod sizes only on create. Scope to `key` and
     optional `wanted`; remain best-effort and yield the create allowance under a deadline.
     """
-    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import (
+        WEIGHT_CACHE_VOLUME_GB,
+        WEIGHT_CACHE_VOLUME_NAME,
+    )
 
     try:
         if wanted is None:
@@ -124,33 +120,27 @@ def grow_weight_cache_volumes(
         if deadline_at is not None:
             budget = min(budget, remaining_seconds(deadline_at) - CREATE_ALLOWANCE_S)
         if budget <= 0:
-            _jobs().logger.warning(
-                "weight cache: no room to grow volume(s) before launch; attaching as-is"
-            )
+            logger.warning("weight cache: no room to grow volume(s) before launch; attaching as-is")
             return
         grown = runpod_api.grow_network_volumes_for_key(
             key, wanted, deadline_at=time.time() + budget
         )
     except Exception as exc:
-        _jobs().logger.warning("weight cache: could not grow volume(s) (%s); attaching as-is", exc)
+        logger.warning("weight cache: could not grow volume(s) (%s); attaching as-is", exc)
         return
     for name, size in sorted(grown.items()):
-        _jobs().logger.info(
-            "weight cache: grew %s to %d GB (was under the managed size)", name, size
-        )
+        logger.info("weight cache: grew %s to %d GB (was under the managed size)", name, size)
 
 
 def weight_cache_endpoint_kwargs(spec) -> dict:
     """Endpoint kwargs that attach the weight-cache fleet, or ``{}`` (best-effort; cache off = no volumes)."""
     try:
-        vols = _jobs().weight_cache_volumes(spec)
+        vols = weight_cache_volumes(spec)
         if not vols:
             return {}
         return {"volume": vols, "datacenter": weight_cache_datacenters()}
     except Exception as exc:
-        _jobs().logger.warning(
-            "weight cache disabled for this run (%s); deploying with no volume", exc
-        )
+        logger.warning("weight cache disabled for this run (%s); deploying with no volume", exc)
         return {}
 
 
@@ -188,12 +178,12 @@ def _sweep_idle_flash_endpoints(
             **deadline_kwargs(runpod_api.list_endpoints_by_key, deadline_at)
         )
     except Exception:
-        _jobs().logger.warning(
+        logger.warning(
             "idle-sweep: could not list any RunPod pool account; skipping sweep", exc_info=True
         )
         return 0
     if failed_fps:
-        _jobs().logger.warning(
+        logger.warning(
             "idle-sweep: %d of %d RunPod pool account(s) failed to list this cycle; reaping the %d "
             "that responded and retrying the rest next sweep",
             len(failed_fps),
@@ -250,11 +240,9 @@ def _sweep_idle_flash_endpoints(
                     if runpod_api.delete_endpoint_for_fingerprint(eid, fp):
                         deleted += 1
                         _idle_since.pop(eid, None)
-                        _jobs().logger.info(
-                            "idle-sweep: deleted idle endpoint %s (%s)", ep_name, eid
-                        )
+                        logger.info("idle-sweep: deleted idle endpoint %s (%s)", ep_name, eid)
                 except Exception:
-                    _jobs().logger.debug(
+                    logger.debug(
                         "idle-sweep: error processing endpoint %s (%s)", ep_name, eid, exc_info=True
                     )
                     continue

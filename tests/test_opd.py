@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.runtime.state as worker_state
 from flash.engine.worker.teacher.client import TeacherClient
 from flash.engine.worker.teacher.tokenizer_align import (
     StudentToken,
@@ -599,11 +600,8 @@ def test_opd_rejects_tool_environments(monkeypatch):
     from flash.engine.worker.entry import opd as opd_mod
 
     env = SimpleNamespace(is_tool_env=True)
-    monkeypatch.setattr(
-        opd_mod,
-        "_w",
-        SimpleNamespace(SEED=0, require_active_env=lambda e=env: e),
-    )
+    monkeypatch.setattr(worker_state, "SEED", 0)
+    monkeypatch.setattr(worker_state, "require_active_env", lambda e=env: e)
     with pytest.raises(RuntimeError, match="tool-calling"):
         opd_mod.run_opd()
 
@@ -729,12 +727,9 @@ def test_liveness_heartbeat_merges_fields_into_every_emission(monkeypatch):
     hb = importlib.import_module("flash.engine.worker.io.heartbeat")
 
     emitted: list[tuple[str, dict]] = []
-    fake_w = SimpleNamespace(
-        heartbeat=lambda stage, **kw: emitted.append((stage, kw)),
-        _HB_LAST_PROGRESS_TS=0.0,
-    )
-    monkeypatch.setattr(hb, "_w", fake_w)
-    monkeypatch.setattr(hb, "gpu_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(hb, "heartbeat", lambda stage, **kw: emitted.append((stage, kw)))
+    monkeypatch.setattr(hb, "_HB_LAST_PROGRESS_TS", 0.0)
+    monkeypatch.setattr(hb.worker_perf, "gpu_diagnostics", lambda *a, **k: {})
     monkeypatch.setattr(hb, "_LIVENESS_TICK_S", 0.001)
 
     with hb.liveness_heartbeat("opd_step", progress=lambda: 1, fields=lambda: {"step": 7}):
@@ -794,9 +789,9 @@ def test_thinking_prefill_text_is_template_delta(monkeypatch):
         ):
             return "<|im_start|>assistant\n" + ("<think>\n" if enable_thinking else "")
 
-    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=False))
+    monkeypatch.setattr(worker_state, "THINKING", False)
     assert opd_mod._thinking_prefill_text(_Tok()) == ""  # thinking off -> no prefill
-    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
+    monkeypatch.setattr(worker_state, "THINKING", True)
     assert opd_mod._thinking_prefill_text(_Tok()) == "<think>\n"  # exact opened delta
 
     class _NoThinkTok:  # template that ignores enable_thinking -> renders identically -> empty delta
@@ -821,7 +816,7 @@ def test_thinking_prefill_derives_opener_from_hybrid_template(monkeypatch):
         def apply_chat_template(self, messages, *, enable_thinking, **kw):
             return "A:\n<think>\nEND" if enable_thinking else "A:\nEND"
 
-    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
+    monkeypatch.setattr(worker_state, "THINKING", True)
     assert opd_mod._thinking_prefill_text(_HybridTok()) == "<think>\n"
 
 
@@ -838,7 +833,7 @@ def test_thinking_prefill_recovers_opener_from_closed_block_hybrid(monkeypatch):
             # both open <think>; non-thinking force-closes it with </think>.
             return "A:\n<think>\n" if enable_thinking else "A:\n<think></think>\n"
 
-    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
+    monkeypatch.setattr(worker_state, "THINKING", True)
     assert opd_mod._thinking_prefill_text(_ClosedBlockTok()) == "<think>\n"
 
 
@@ -856,7 +851,7 @@ def test_thinking_prefill_recovers_opener_from_whitespace_empty_block_hybrid(mon
             # both open <think>\n; non-thinking force-closes with a whitespace-only empty block.
             return "A:\n<think>\n" if enable_thinking else "A:\n<think>\n\n</think>\n"
 
-    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
+    monkeypatch.setattr(worker_state, "THINKING", True)
     assert opd_mod._thinking_prefill_text(_WhitespaceEmptyBlockTok()) == "<think>\n"
 
 
@@ -876,7 +871,7 @@ def test_thinking_prefill_recovers_opener_when_closed_block_leaves_whitespace_re
             # thinking opens "<think>\n"; non-thinking force-closes right after the opener.
             return "A:\n<think>\n" if enable_thinking else "A:\n<think></think>"
 
-    monkeypatch.setattr(opd_mod, "_w", SimpleNamespace(THINKING=True))
+    monkeypatch.setattr(worker_state, "THINKING", True)
     assert opd_mod._thinking_prefill_text(_ClosedImmediatelyTok()) == "<think>\n"
 
 
@@ -933,7 +928,10 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     misconfigured dataset pays for a full download + model load before failing. Trip if _student_model
     is reached, and assert prefetch_model was never called."""
     pytest.importorskip("torch")
-    from flash.engine.worker.entry import opd as opd_mod
+    import flash.engine.worker.io.hf as worker_hf
+    import flash.engine.worker.train.entry.opd_train_runner as opd_train_runner
+    from flash.engine.worker.entry import opd as opd_entry
+    from flash.engine.worker.train.entry import opd_train as opd_mod
 
     class _Tok:
         pad_token = "<pad>"
@@ -951,24 +949,29 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
         prompt_messages=lambda ex: [{"role": "user", "content": ex["q"]}],
     )
     prefetched: list = []
-    fake_w = SimpleNamespace(
-        require_active_env=lambda: env,
-        JOB_SPEC=SimpleNamespace(
+    monkeypatch.setattr(worker_state, "require_active_env", lambda: env)
+    monkeypatch.setattr(
+        worker_state,
+        "JOB_SPEC",
+        SimpleNamespace(
             train=SimpleNamespace(init_from_adapter=""),
             model="fake/model",
+            model_revision="",
             gpu=SimpleNamespace(type=None),
         ),
-        THINKING=False,
-        SEED=0,
-        OPD_RESUME_REVISION="",
-        heartbeat=lambda stage, **kw: None,
-        prefetch_model=lambda mid: (prefetched.append(mid), 0.0)[1],
     )
-    monkeypatch.setattr(opd_mod, "_w", fake_w)
+    monkeypatch.setattr(worker_state, "THINKING", False)
+    monkeypatch.setattr(worker_state, "SEED", 0)
+    monkeypatch.setattr(worker_state, "OPD_RESUME_REVISION", "")
     monkeypatch.setattr(
-        opd_mod,
+        worker_hf,
+        "prefetch_model",
+        lambda mid, revision="": (prefetched.append((mid, revision)), 0.0)[1],
+    )
+    monkeypatch.setattr(
+        opd_entry,
         "_resolve_opd_knobs",
-        lambda: opd_mod.OpdKnobs(
+        lambda: opd_entry.OpdKnobs(
             teacher_model="glm-5.2",
             epochs=1,
             learning_rate=1e-4,
@@ -985,12 +988,13 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     )
 
     def _boom(*a, **k):
-        raise AssertionError("_student_model was loaded before the all-over-budget guard fired")
+        raise AssertionError("model loading was reached before the all-over-budget guard fired")
 
-    monkeypatch.setattr(opd_mod, "_student_model", _boom)
-    monkeypatch.setattr(opd_mod, "wait_for_gpu", lambda *a, **k: None)
-    monkeypatch.setattr(opd_mod, "setup_perf_backends", lambda *a, **k: None)
-    monkeypatch.setattr(opd_mod, "gpu_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(opd_mod, "_load_opd_model", _boom)
+    monkeypatch.setattr(opd_mod, "_probe_gpu_in_subprocess", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod._worker_perf, "gpu_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(opd_mod._worker_heartbeat, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(opd_train_runner._worker_heartbeat, "heartbeat", lambda *a, **k: None)
 
     import transformers
 
@@ -1001,10 +1005,9 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "unit-test-teacher-capability")
 
-    # The all-over-budget guard (RuntimeError) must fire; _student_model's AssertionError would
-    # escape pytest.raises(RuntimeError) and fail the test (its "before the fix" behavior).
+    # the all-over-budget guard must fire before the model-load assertion can run.
     with pytest.raises(RuntimeError, match="every prompt exceeds"):
-        opd_mod.run_opd()
+        opd_mod.run_opd_train()
     # ...and the base-weight prefetch must have been deferred: an all-over-budget dataset fails
     # without paying for the tens-of-GB snapshot download.
     assert prefetched == [], "prefetch_model must not run when every prompt is over budget"
@@ -1305,12 +1308,14 @@ def test_opd_worker_fp8_kv_flag_matches_the_sizing_assumption():
 
     src = inspect.getsource(opd_train.run_opd_train)
     assert "model_is_gdn_hybrid(model_id, revision=model_revision)" in src
-    assert "fp8_kv = rollout_fp8_kv(_cc_ok, gdn_hybrid, model_id)" in src
-    assert "get_device_capability() >= (8, 9)" in src
+    assert "fp8_kv = rollout_fp8_kv(_cuda_supports_fp8_kv(), gdn_hybrid, model_id)" in src
+    assert "get_device_capability() >= (8, 9)" in inspect.getsource(opd_train._cuda_supports_fp8_kv)
 
     # and the override is emitted only when the resolved flag is true, so a bf16 worker never sends
     # fp8 (an absent key means bf16, which is the conservative direction).
-    assert 'if config.get("fp8_kv")' in inspect.getsource(opd_train.build_opd_overrides)
+    from flash.engine.worker.train.opd.orchestration import overrides
+
+    assert 'if config.get("fp8_kv")' in inspect.getsource(overrides.build_opd_overrides)
 
 
 def test_rollout_fp8_kv_admits_a_gdn_hybrid_only_when_its_engine_stays_resident():
@@ -1548,22 +1553,15 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
             return None
 
     monkeypatch.setattr(
-        opd_mod,
-        "_w",
-        SimpleNamespace(
-            JOB_SPEC=SimpleNamespace(train=_Train(kl_penalty_coef=0.0)), THINKING=False
-        ),
+        worker_state, "JOB_SPEC", SimpleNamespace(train=_Train(kl_penalty_coef=0.0))
     )
+    monkeypatch.setattr(worker_state, "THINKING", False)
     with pytest.raises(RuntimeError, match="kl_penalty_coef must be > 0"):
         opd_mod._resolve_opd_knobs()
 
     # unset (None) -> positive recipe default, no raise.
     monkeypatch.setattr(
-        opd_mod,
-        "_w",
-        SimpleNamespace(
-            JOB_SPEC=SimpleNamespace(train=_Train(kl_penalty_coef=None)), THINKING=False
-        ),
+        worker_state, "JOB_SPEC", SimpleNamespace(train=_Train(kl_penalty_coef=None))
     )
     assert opd_mod._resolve_opd_knobs().kl_coef > 0.0
 
@@ -1594,9 +1592,8 @@ def test_resolve_opd_knobs_trains_the_authored_prompts_per_step(monkeypatch):
             },
             run_id="pps",
         )
-        monkeypatch.setattr(
-            opd_mod, "_w", SimpleNamespace(JOB_SPEC=spec, THINKING=False), raising=False
-        )
+        monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
+        monkeypatch.setattr(worker_state, "THINKING", False)
         return opd_mod._resolve_opd_knobs()
 
     assert _knobs(prompts_per_step=32).prompts_per_step == 32
@@ -1617,12 +1614,9 @@ def test_resolve_opd_knobs_maps_alias_to_parasail_model(monkeypatch):
 
     def _knobs(teacher):
         monkeypatch.setattr(
-            opd_mod,
-            "_w",
-            SimpleNamespace(
-                JOB_SPEC=SimpleNamespace(train=_Train(teacher_model=teacher)), THINKING=False
-            ),
+            worker_state, "JOB_SPEC", SimpleNamespace(train=_Train(teacher_model=teacher))
         )
+        monkeypatch.setattr(worker_state, "THINKING", False)
         return opd_mod._resolve_opd_knobs()
 
     assert _knobs("kimi-k3").teacher_model == "parasail-kimi-k3-fast"
@@ -1687,9 +1681,9 @@ def test_opd_spec_json_round_trip():
 
 def test_opd_worker_resolves_the_authored_prompt_batch(monkeypatch):
     """The paid worker must train on the authored batch, not silently on the recipe default."""
+    import flash.engine.worker.runtime.state as worker_state
     from flash.engine.plan.recipe import RECIPE
     from flash.engine.worker.entry import opd as opd_entry
-    from flash.engine.worker.runtime.pkg_proxy import W
     from flash.schema import spec_from_dict
 
     authored = int(RECIPE.opd.prompts_per_step) * 4
@@ -1703,8 +1697,8 @@ def test_opd_worker_resolves_the_authored_prompt_batch(monkeypatch):
         },
         run_id="x",
     )
-    monkeypatch.setattr(W, "JOB_SPEC", spec, raising=False)
-    monkeypatch.setattr(W, "THINKING", False, raising=False)
+    monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
+    monkeypatch.setattr(worker_state, "THINKING", False)
     assert opd_entry._resolve_opd_knobs().prompts_per_step == authored
 
 
@@ -1779,6 +1773,7 @@ def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
     fake_torch.manual_seed = lambda _seed: None
     fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    import flash.engine.worker.io.heartbeat as worker_heartbeat
     import flash.engine.worker.teacher.client as teacher_mod
     from flash.engine.worker.train.entry import opd_train as opd_mod
 
@@ -1798,22 +1793,20 @@ def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
         stop_sequences=(),
         structured_outputs="",
     )
+    monkeypatch.setattr(worker_state, "SEED", 0)
+    monkeypatch.setattr(worker_state, "THINKING", False)
+    monkeypatch.setattr(worker_state, "require_active_env", lambda: env)
     monkeypatch.setattr(
-        opd_mod,
-        "_w",
+        worker_state,
+        "JOB_SPEC",
         SimpleNamespace(
-            SEED=0,
-            THINKING=False,
-            require_active_env=lambda: env,
-            JOB_SPEC=SimpleNamespace(
-                train=train,
-                model="Qwen/Qwen3.5-4B",
-                model_revision="",
-                gpu=SimpleNamespace(type=None),
-            ),
-            heartbeat=lambda *args, **kwargs: None,
+            train=train,
+            model="Qwen/Qwen3.5-4B",
+            model_revision="",
+            gpu=SimpleNamespace(type=None),
         ),
     )
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         teacher_mod,
         "TeacherClient",

@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 from safetensors.numpy import save
 
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
 from flash.engine.worker.perf.lifecycle import RetriableInfraError
 from flash.engine.worker.train.core.child import runtime as child_runtime
 from flash.engine.worker.train.entry import backend_common as vc
@@ -469,7 +470,7 @@ def test_an_exhausted_wheel_install_hands_the_arm_back_instead_of_burning_it(mon
 
     Assert the heartbeat flag, not only the exception type, because the poller routes on that flag.
     """
-    from flash.engine.worker import _worker_failure_flags
+    from flash.engine.worker.entry.worker import _worker_failure_flags
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
 
     calls, sleeps = [], []
@@ -1819,7 +1820,7 @@ def test_run_verl_training_classifies_a_child_cuda_oom_rather_than_returning_it(
 def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     monkeypatch, oom_first
 ):
-    from flash.engine.worker import _worker_failure_flags
+    from flash.engine.worker.entry.worker import _worker_failure_flags
     from flash.engine.worker.perf import lifecycle
 
     monkeypatch.setattr(lifecycle, "cuda_oom_count", lambda: 0)
@@ -3069,7 +3070,7 @@ def test_grpo_teardown_uses_the_shared_escalating_kill():
     # the grpo path used to hand-roll killpg(pid, 15) and swallow the wait timeout, so a vllm
     # EngineCore that ignored the term kept its cuda context and stranded the gpu for later jobs.
     # pin the call site: a bare killpg here would reintroduce exactly that.
-    source = inspect.getsource(rl_train)
+    source = inspect.getsource(rl_train_runner)
     assert "kill_process_group(self._proc, process_group_id=self._process_group_id)" in source
     assert "os.killpg" not in source, "grpo teardown must not hand-roll a non-escalating killpg"
 
@@ -3245,7 +3246,7 @@ def test_the_claim_is_made_before_each_verl_process_is_spawned():
     Claiming after the child exists leaves any grandchild it has already orphaned parented
     elsewhere, so the fix would work only for the second job onward on a reused worker.
     """
-    for fn in (vc._run_streaming_verl_subprocess, rl_train._execute_rl_child):
+    for fn in (vc._run_streaming_verl_subprocess, rl_train_runner._execute_rl_child):
         src = " ".join(inspect.getsource(fn).split())
         assert "adopt_orphaned_descendants()" in src, f"{fn.__name__} never claims its orphans"
         assert src.index("adopt_orphaned_descendants()") < src.index("subprocess.Popen("), (
@@ -3866,16 +3867,17 @@ def test_both_verl_bridges_use_the_bounded_server():
     each bridge is defined in its own module, so a fix applied to one leaves the other able to
     exhaust the thread table on exactly the same rollout shape.
     """
-    from flash.engine.worker.train.entry import opd_train
+    import flash.engine.worker.train.opd.bridging.batching as opd_batching
+    import flash.engine.worker.train.rl.rollout.multi_turn as rl_multi_turn
 
     # the teacher bridge is a module-level class, so check the type itself.
-    assert issubclass(opd_train._TeacherBridgeHTTPServer, vc.BoundedThreadingHTTPServer), (
+    assert issubclass(opd_batching._TeacherBridgeHTTPServer, vc.BoundedThreadingHTTPServer), (
         "the opd teacher bridge does not use BoundedThreadingHTTPServer"
     )
     # the reward bridge is defined inside the function that starts it, so it is only reachable
     # through the source. parse rather than substring-match: a comment mentioning the old name
     # must not pass, and a real subclass must not be missed.
-    for mod in (rl_train, opd_train):
+    for mod in (rl_multi_turn, opd_batching):
         tree = ast.parse(pathlib.Path(inspect.getfile(mod)).read_text())
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):
@@ -4399,7 +4401,7 @@ def test_rendering_the_probe_ignores_a_monkeypatched_parent(monkeypatch):
     ever resolved through ``perf.<attr>`` a test double's body would be rendered into the child and
     the shipped shim would be whatever the last test stubbed. Pin the immunity.
     """
-    from flash.engine.worker import perf
+    import flash.engine.worker.perf as perf
 
     before = vc.render_tilelang_cudart_shim()
     monkeypatch.setattr(perf, "_find_real_libcudart", lambda: "/fake/libcudart.so")

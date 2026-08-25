@@ -104,8 +104,9 @@ serving = [
     # gets Pillow transitively via vllm, but this extra deliberately excludes vllm, so it has to
     # state Pillow itself.
     "pillow>=11",
-    # imported directly by `src/schemas.py`, `src/serving_io.py` and `src/settings.py`. it does
-    # arrive under `pydantic-settings`, but a direct module-scope import should not rely on
+    # imported directly by `src/io/schemas.py`, `src/io/requests.py` and
+    # `src/store/settings.py`. it does arrive under `pydantic-settings`, but a direct module-scope
+    # import should not rely on
     # another package's dependency to keep supplying it.
     "pydantic>=2.7.0",
     "pydantic-settings>=2.6.0",
@@ -166,13 +167,13 @@ Homepage = "https://github.com/freesolo-co/flash"
 Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
-flash = "flash.cli:main"
+flash = "flash.cli.parsing.main:main"
 # Same entry point as `flash`, under a name nothing else claims. The `server` and `dev` extras
 # pull in runpod-flash, which declares its own `flash` console script; whichever distribution is
 # installed last wins, so on a plane host `flash` can silently belong to runpod-flash. `flash-cli`
 # always reaches Flash. Keep both: on a base install `flash` is unambiguous and is what every
 # existing user has.
-flash-cli = "flash.cli:main"
+flash-cli = "flash.cli.parsing.main:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
 flash-server = "flash.server.__main__:main"

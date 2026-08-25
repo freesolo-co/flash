@@ -11,7 +11,9 @@ import json
 
 import pytest
 
-import flash.cli as cli
+import flash.cli.commands.ops.deploy as cli_deploy
+import flash.cli.commands.ops.runs as cli_runs
+import flash.cli.parsing.main as cli
 from flash import __version__
 from flash.cli.ui import render
 
@@ -33,7 +35,7 @@ class _Client:
 
 @pytest.fixture
 def fake_client(monkeypatch) -> None:
-    monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _Client())
+    monkeypatch.setattr(cli_runs, "client_from_config", lambda *a, **k: _Client())
 
 
 def test_styled_flag_overrides_tty(monkeypatch) -> None:
@@ -355,18 +357,18 @@ def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         "flash.cli.commands.ops.deploy._hf_identity_and_write_access", lambda *_: "acme"
     )
-    monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _ExportClient())
+    monkeypatch.setattr(cli_deploy, "client_from_config", lambda *a, **k: _ExportClient())
 
     # default export (no --public) is private; the card must say so, not "public"
     args = argparse.Namespace(adapter_id="flash-1", repository="acme/x", public=False, api_key=None)
-    assert cli.commands.cmd_export(args) == 0
+    assert cli_deploy.cmd_export(args) == 0
     out = capsys.readouterr().out
     assert "private" in out
     assert "public" not in out
 
     # an explicit --public export is reported as public
     args.public = True
-    assert cli.commands.cmd_export(args) == 0
+    assert cli_deploy.cmd_export(args) == 0
     assert "public" in capsys.readouterr().out
 
 
@@ -377,7 +379,7 @@ def test_error_path_themed_on_tty_plain_on_machine(monkeypatch, capsys) -> None:
     def _boom(*a, **k):
         raise ValueError("bad [environment] id")
 
-    monkeypatch.setattr(cli.commands, "client_from_config", _boom)
+    monkeypatch.setattr(cli_runs, "client_from_config", _boom)
 
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")
@@ -428,7 +430,7 @@ def test_unexpected_error_themed_on_tty_traceback_on_machine(monkeypatch, capsys
     def _boom(*a, **k):
         raise OSError("disk full")  # not in _USER_ERRORS (a plain OSError, not FileNotFoundError)
 
-    monkeypatch.setattr(cli.commands, "client_from_config", _boom)
+    monkeypatch.setattr(cli_runs, "client_from_config", _boom)
 
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("NO_COLOR", "1")

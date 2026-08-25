@@ -13,6 +13,7 @@ import urllib.error
 
 import pytest
 
+import flash.providers.runpod.client.api as runpod_api
 from flash.providers.runpod.client.api import list_endpoints as _real_list_endpoints
 
 
@@ -322,7 +323,7 @@ def test_submit_job_rejects_invalid_id_without_exposing_provider_response(monkey
     with pytest.raises(
         api.RunpodApiError, match="submit_job: response did not contain a valid job id"
     ) as exc_info:
-        api.submit_job(
+        runpod_api.submit_job(
             "ep-1",
             {"x": 1},
             key_fingerprint=api.key_fingerprint(key),
@@ -345,7 +346,7 @@ def test_submit_job_returns_nonempty_string_id(monkeypatch):
     )
 
     assert (
-        api.submit_job(
+        runpod_api.submit_job(
             "ep-1",
             {"x": 1},
             key_fingerprint=api.key_fingerprint(key),
@@ -377,7 +378,7 @@ def test_submit_status_cancel_and_delete_keep_owning_key_after_rotation(monkeypa
     assert auth.active_key() == "secretB"
 
     assert (
-        api.submit_job(
+        runpod_api.submit_job(
             "ep-1",
             {"x": 1},
             key_fingerprint=owner,

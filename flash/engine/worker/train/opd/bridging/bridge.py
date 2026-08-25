@@ -22,9 +22,9 @@ import time
 from http.server import BaseHTTPRequestHandler
 from typing import TYPE_CHECKING
 
+import flash.engine.worker.perf as _worker_perf
 from flash.content.multimodal import normalize_environment_reply
 from flash.engine.worker.entry.opd import _drop_fully_forced_groups
-from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.teacher.client import TeacherClient, TeacherError
 from flash.engine.worker.teacher.tokenizer_align import groupwise_alignment, groupwise_coverage
 from flash.engine.worker.train.core.child.glue import validate_structured_messages
@@ -33,7 +33,10 @@ from flash.engine.worker.train.opd.bridging.batching import (
     _TeacherBridgeHTTPServer,
     _TextTeacherBatcher,
 )
-from flash.engine.worker.train.opd.bridging.failures import TeacherFailureRecording
+from flash.engine.worker.train.opd.bridging.failures import (
+    TeacherFailureRecording,
+    _RecordedMutationCallbackFailure,
+)
 from flash.engine.worker.train.opd.bridging.prompts import (
     _trim_response_and_forced,
     _validate_forced_mask,
@@ -51,6 +54,7 @@ from flash.engine.worker.train.opd.multiturn.media import (
     validate_start_media,
 )
 from flash.engine.worker.train.opd.multiturn.validation import validated_multiturn_response
+from flash.engine.worker.train.opd.orchestration import protocol
 from flash.engine.worker.train.opd.orchestration.gkd import (
     _rollout_terminated,
     _teacher_prompt_text,
@@ -59,22 +63,8 @@ from flash.engine.worker.train.opd.orchestration.gkd import (
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
-if TYPE_CHECKING:  # annotation-only: `opd_train` imports this module, so a runtime import
-    # here would be circular. the raise below goes through `_opd_train()`.
-    from flash.engine.worker.train.entry.opd_train import _BridgePrompt
-
-
-def _opd_train():
-    """The orchestrator module, imported lazily because it imports this one.
-
-    Everything reached through this function is a name the OPD tests patch on `opd_train` itself
-    (`_TEXT_TEACHER_FLUSH_WAIT_S` is shortened to keep the batcher's flush fast under test). Binding
-    them here with a `from ... import` would capture the originals at import time, so the patches
-    would rebind an object this module never reads and the bridge would run the real values.
-    """
-    from flash.engine.worker.train.entry import opd_train
-
-    return opd_train
+if TYPE_CHECKING:
+    from flash.engine.worker.train.opd.orchestration.state import _BridgePrompt
 
 
 class _TeacherAlignmentBridge(TeacherFailureRecording):
@@ -797,7 +787,9 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
                 self.mutation_callback()
             except Exception as error:
                 classification = (
-                    "transient" if isinstance(error, _w.RetriableInfraError) else "permanent"
+                    "transient"
+                    if isinstance(error, _worker_perf.RetriableInfraError)
+                    else "permanent"
                 )
                 callback_failure = self._record_mutation_callback_failure(
                     classification,
@@ -855,9 +847,9 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
         """Whether ``error`` should make the child retry (``transient``) or give up (``permanent``)."""
         if delivery:
             return "transient"
-        if isinstance(error, _opd_train()._RecordedMutationCallbackFailure):
+        if isinstance(error, _RecordedMutationCallbackFailure):
             return error.classification
-        retriable = isinstance(error, _w.RetriableInfraError) or (
+        retriable = isinstance(error, _worker_perf.RetriableInfraError) or (
             isinstance(error, TeacherError) and not error.permanent
         )
         return "transient" if retriable else "permanent"
@@ -945,7 +937,7 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
         self._text_teacher_batcher = _TextTeacherBatcher(
             self.teacher,
             max_batch_size=OPD_TEACHER_SCORING_CONCURRENCY,
-            flush_wait_s=_opd_train()._TEXT_TEACHER_FLUSH_WAIT_S,
+            flush_wait_s=protocol.TEXT_TEACHER_FLUSH_WAIT_S,
             on_scored=self.parent_work.complete,
         )
         self._text_teacher_batcher.start()

@@ -1,14 +1,9 @@
-"""Deploy, cancel, and recover run state transitions.
-
-Keep ``flash.runner`` imports function-local to avoid its import cycle and preserve package-level
-monkeypatch seams such as ``flash.runner._gc_run_endpoints``.
-"""
+"""deploy, cancel, and recover run state transitions."""
 
 from __future__ import annotations
 
 import contextlib
 import math
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -18,7 +13,7 @@ from flash.core.spec import JobSpec
 from flash.schema import format_adapter_revision, parse_adapter_revision
 
 if TYPE_CHECKING:
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
 # reads the TOP-LEVEL `status.state`, where `deployed` is a live value this build writes.
 _FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
@@ -29,9 +24,6 @@ _RESTORABLE_DEPLOYMENT_STATES = frozenset({"ready"})
 _DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 _REVOCATION_RETRY_STATE = "revocation_failed"
 _INACTIVE_DEPLOYMENT_STATES = frozenset({"undeployed", "dry_run"})
-_ATTACH_RECONCILE_INTERVAL_S = 120.0
-_ATTACH_RECONCILING: set[str] = set()
-_ATTACH_RECONCILING_LOCK = threading.Lock()
 
 
 class DeploymentRevocationError(RuntimeError):
@@ -76,29 +68,6 @@ class DeploymentStatePersistenceError(RuntimeError):
         self.run_id = run_id
         self.backend_outcome = backend_outcome
         self.retryable = True
-
-
-def _carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
-    """Carry the persisted allocation stamp onto adopted metrics.
-
-    Workers do not know the allocator's card, count, or provider. Recovery must restore all three or
-    multi-card Vast/Lambda runs are priced as one RunPod card. ``setdefault`` preserves worker data.
-    """
-    if not isinstance(metrics, dict) or not isinstance(remote, dict):
-        return
-    allocated_gpu = remote.get("allocated_gpu")
-    if allocated_gpu:
-        metrics.setdefault("allocated_gpu", allocated_gpu)
-    allocated_count = remote.get("allocated_gpu_count")
-    if allocated_count:
-        metrics.setdefault("allocated_gpu_count", int(allocated_count))
-    # the substrate that billed the run. `_gpu_rate` falls back to whichever configured provider
-    # offers the class, which on a multi-provider plane is normally RunPod -- so an adopted lambda
-    # or vast run is otherwise priced at RunPod's rate and its notes name the wrong provider.
-    # `provider` is required on a persisted JobHandle, so it is always present here.
-    provider = remote.get("provider")
-    if provider:
-        metrics.setdefault("allocated_provider", provider)
 
 
 def _deployment_state_and_requires_revocation(
@@ -200,7 +169,8 @@ class _CancellationFence:
         self.attempted = False
 
     def persist(self) -> None:
-        from flash.runner import TERMINAL_STATES, _update, get_status
+        from flash.runner.lifecycle.state import TERMINAL_STATES
+        from flash.runner.lifecycle.status import _update, get_status
 
         if self.attempted:
             return
@@ -231,13 +201,10 @@ def _clear_remote_if_unchanged(run_id: str, expected_remote: dict) -> bool:
     Compare-and-clear under the status guard: a racing write that installed a DIFFERENT remote must
     keep it, or the run loses the only handle to a live billing resource.
     """
-    from flash.runner import (
-        _remote_resource_identity,
-        _report_status,
-        _save_status_unlocked,
-        _status_guard,
-        get_status,
-    )
+    from flash.runner.accounting.reconciliation import _remote_resource_identity
+    from flash.runner.lifecycle.reporting import _report_status
+    from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
+    from flash.runner.lifecycle.status import get_status
 
     expected_identity = _remote_resource_identity(expected_remote)
     if expected_identity is None:
@@ -262,7 +229,7 @@ def _drain_confirmed_cleanup(run_id: str) -> set[tuple]:
     A record still present after the drain was NOT confirmed, so it is left for a later attempt;
     only records that disappeared are reported, and each has its status entry cleared.
     """
-    from flash.runner import (
+    from flash.runner.accounting.reconciliation import (
         _cleanup_remote_key,
         _drain_cleanup_remotes,
         _remote_resource_identity,
@@ -299,7 +266,7 @@ def _teardown_or_preserve_remote(run_id: str, remote: dict) -> bool:
     that would lose the only handle to a billing resource.
     """
     from flash.providers.core.base import JobHandle
-    from flash.runner import _record_cleanup_remote
+    from flash.runner.accounting.reconciliation import _record_cleanup_remote
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
     try:
@@ -327,7 +294,8 @@ def _teardown_persisted_remotes(
     Stops on the first remote that could not be confirmed torn down, unless the status has since
     moved to a different one -- an already-confirmed identity is cleared without a second teardown.
     """
-    from flash.runner import _remote_resource_identity, get_status
+    from flash.runner.accounting.reconciliation import _remote_resource_identity
+    from flash.runner.lifecycle.status import get_status
 
     processed_remote_identities = set()
     while True:
@@ -369,12 +337,14 @@ def _restore_contended_predecessor(
     Returns whether the predecessor is now the authoritative deployment AND the only verified
     revision. On failure, re-fence so no unverified attempt is left looking serveable.
     """
-    from flash.runner import (
-        get_status,
-        mark_checkpoint_deployed,
-        mark_deployment_revocation_failed,
+    from flash.runner.lifecycle.status import get_status
+    from flash.runner.results.verified_revisions import (
         read_verified_adapter_revisions,
         verified_adapter_revision_generation,
+    )
+    from flash.runner.supervise.transitions import (
+        mark_checkpoint_deployed,
+        mark_deployment_revocation_failed,
     )
 
     recommitted = False
@@ -423,7 +393,8 @@ def _fence_contended_deployment(run_id: str) -> _ContendedFence:
     Runs BEFORE the blocking acquire so an in-progress deployment cannot finish and present itself
     as serveable after the cancel decided to tear it down. A preservable checkpoint is left alone.
     """
-    from flash.runner import get_status, mark_deployment_revocation_failed
+    from flash.runner.lifecycle.status import get_status
+    from flash.runner.supervise.transitions import mark_deployment_revocation_failed
 
     prelock_status = get_status(run_id)
     prelock_raw_deployment = prelock_status.deployment
@@ -520,12 +491,12 @@ def _commit_preserved_checkpoint(run_id: str, status, preserved_checkpoint: dict
     commit could not be confirmed, which drops the run through to normal revocation. The second
     commit is the authoritative one, so its failure is fatal rather than a downgrade.
     """
-    from flash.runner import (
-        get_status,
-        mark_checkpoint_deployed,
+    from flash.runner.lifecycle.status import get_status
+    from flash.runner.results.verified_revisions import (
         read_verified_adapter_revisions,
         verified_adapter_revision_generation,
     )
+    from flash.runner.supervise.transitions import mark_checkpoint_deployed
 
     if preserved_checkpoint is None:
         return status, None
@@ -599,7 +570,10 @@ def _revoke_serving(
     and persist the cancellation before surfacing either. Local authority is fenced BEFORE the
     backend call, so a crash between the two leaves the run visibly un-serveable, not silently live.
     """
-    from flash.runner import mark_deployment_revocation_failed, mark_deployment_undeployed
+    from flash.runner.supervise.transitions import (
+        mark_deployment_revocation_failed,
+        mark_deployment_undeployed,
+    )
 
     if not active_deployment:
         try:
@@ -653,7 +627,8 @@ def _cancellation_billing(
     no longer carries it after a confirmed teardown, and it is the only durable record of the
     provider and card shape the run rented, which the cancel price must be computed on.
     """
-    from flash.runner import actual_steps_run, cancelled_charge_usd, get_status
+    from flash.runner.accounting.costs import actual_steps_run, cancelled_charge_usd
+    from flash.runner.lifecycle.status import get_status
 
     if not bill_cancel:
         return None, {}
@@ -703,13 +678,9 @@ def _prepare_cancellation(run_id: str) -> list[Exception]:
 
 def cancel_run(run_id: str) -> RunStatus:
     """Cancel training while preserving verified serving and durable cleanup targets."""
-    from flash.runner import (
-        TERMINAL_STATES,
-        _gc_run_endpoints,
-        _update,
-        effective_spec_from_status,
-        get_status,
-    )
+    from flash.runner.lifecycle.state import TERMINAL_STATES
+    from flash.runner.lifecycle.status import _update, effective_spec_from_status, get_status
+    from flash.runner.supervise.recovery import _gc_run_endpoints
     from flash.server.platform import db as server_db
     from flash.server.platform.locks import _deploy_lock
 
@@ -846,14 +817,3 @@ def cancel_run(run_id: str) -> RunStatus:
     finally:
         if lock_acquired:
             deploy_lock.release()
-
-
-# re-exported at the bottom rather than imported at the top: `attach` resolves the patched
-# reconciliation names back through this module, so a top import would be circular. `flash.runner`
-# and the attach tests both address these as attributes of THIS module.
-from flash.runner.supervise.attach import (  # noqa: E402,F401
-    _reconcile_attached_remote,
-    _resume_after_confirmed_teardown,
-    _schedule_attach_reconciliation,
-    attach_run,
-)

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-import flash.cli as cli
+import flash.cli.parsing.main as cli
 from flash.envs.meta.evaluations import (
     BaseEvalSuite,
     EvalCase,
@@ -2215,12 +2215,14 @@ def test_env_eval_is_an_org_binding_command(monkeypatch, tmp_path, capsys) -> No
     # results are recorded under a project resolved from the ambient key, so a shadowing
     # FREESOLO_API_KEY belonging to another org has to be reported BEFORE the paid requests run, not
     # discovered at upload time with the whole evaluation already spent.
-    from flash.cli import _ORG_BINDING_COMMANDS
     from flash.cli.commands.env.testing.eval import cmd_env_eval
+    from flash.cli.parsing.main import _ORG_BINDING_COMMANDS
 
     assert cmd_env_eval in _ORG_BINDING_COMMANDS
 
-    monkeypatch.setattr("flash.cli.shadowed_login_warning", lambda: "key belongs to other-org")
+    monkeypatch.setattr(
+        "flash.cli.parsing.main.shadowed_login_warning", lambda: "key belongs to other-org"
+    )
     monkeypatch.setattr(
         "flash.client.client_from_config",
         lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),

@@ -6,6 +6,9 @@ from dataclasses import asdict
 
 import pytest
 
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
+import flash.runner.accounting.costs as runner_costs
+import flash.runner.lifecycle.state as runner_state
 from flash.core.grpo import (
     DEFAULT_GRPO_GROUP_SIZE,
     DEFAULT_GRPO_PROMPTS_PER_STEP,
@@ -231,8 +234,6 @@ def test_runconfig_normalizes_defaults_and_preserves_persisted_grpo_shapes():
 
 @pytest.mark.parametrize(("prompts_per_step", "group_size"), [(4, 3), (65, 8)])
 def test_persisted_legacy_shapes_price_finite_nonzero(prompts_per_step, group_size):
-    import flash.runner as runner
-
     spec = JobSpec.from_dict(
         _internal_grpo_train(
             max_steps=10,
@@ -241,8 +242,8 @@ def test_persisted_legacy_shapes_price_finite_nonzero(prompts_per_step, group_si
         )
     )
 
-    full = runner.charge_usd_for_spec(spec, fallback=float("nan"))
-    partial = runner.charge_usd_for_spec(spec, steps=5, fallback=float("nan"))
+    full = runner_costs.charge_usd_for_spec(spec, fallback=float("nan"))
+    partial = runner_costs.charge_usd_for_spec(spec, steps=5, fallback=float("nan"))
     assert math.isfinite(full)
     assert full > 0
     assert math.isfinite(partial)
@@ -250,17 +251,15 @@ def test_persisted_legacy_shapes_price_finite_nonzero(prompts_per_step, group_si
 
 
 def test_cancellation_billing_does_not_zero_a_completed_legacy_run():
-    import flash.runner as runner
-
     spec = JobSpec.from_dict(_internal_grpo_train(max_steps=10, prompts_per_step=4, group_size=3))
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         run_id="legacy-cancel",
         state="cancelled",
         spec={},
         estimated_cost_usd=8.0,
     )
 
-    charge = runner.cancelled_charge_usd(status, spec, steps=5)
+    charge = runner_costs.cancelled_charge_usd(status, spec, steps=5)
     assert math.isfinite(charge)
     assert 0 < charge < status.estimated_cost_usd
 
@@ -401,11 +400,10 @@ def test_grpo_worker_env_reasserts_managed_native_thread_policy(monkeypatch):
 
 def test_grpo_child_env_reasserts_native_thread_policy_last(monkeypatch):
     from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
-    from flash.engine.worker.train.entry import rl_train
 
     hostile = dict.fromkeys(GRPO_NATIVE_THREAD_ENV, "999")
-    monkeypatch.setattr(rl_train, "_build_verl_child_env", lambda **_kwargs: dict(hostile))
-    env = rl_train._build_rl_child_env(
+    monkeypatch.setattr(rl_train_runner, "_build_verl_child_env", lambda **_kwargs: dict(hostile))
+    env = rl_train_runner._build_rl_child_env(
         {"multi_turn": False},
         {
             "shim_dir": "/tmp/shim",
@@ -456,7 +454,7 @@ def test_persisted_legacy_shapes_reach_worker_option_resolution(
         _internal_grpo_train(prompts_per_step=prompts_per_step, group_size=group_size)
     )
     monkeypatch.setattr(
-        inputs._w,
+        inputs._worker_config,
         "grpo_overrides",
         lambda: {"group_size": spec.train.group_size},
     )
@@ -475,7 +473,7 @@ def test_supported_shapes_reach_worker_option_resolution_exactly(monkeypatch, gr
 
     spec = spec_from_dict(_public_grpo_train(prompts_per_step=4, group_size=group_size))
     monkeypatch.setattr(
-        inputs._w,
+        inputs._worker_config,
         "grpo_overrides",
         lambda: {"group_size": spec.train.group_size},
     )

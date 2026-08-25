@@ -373,7 +373,7 @@ def _adopt_completed_attempt(
     log,
 ) -> bool:
     """Finalize a phantom-completed attempt through the expected-remote CAS."""
-    from flash.runner import _compare_and_complete_remote
+    from flash.runner.accounting.reconciliation import _compare_and_complete_remote
 
     applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
     if applied:
@@ -451,7 +451,7 @@ def _candidate_usable_vram_gb(candidate) -> float:
     can launch fewer ranks than it rents; the allocator stamps that run-specific width, while an
     unstamped candidate preserves the historical all-rented-cards behavior.
     """
-    from flash.providers.core.base import combined_vram_gb
+    from flash.providers.core.sharding import combined_vram_gb
 
     rented = int(getattr(candidate, "gpu_count", 1) or 1)
     executed = getattr(candidate, "executed_gpu_count", None)
@@ -503,7 +503,7 @@ def _await_runpod_completed_metrics(
 
 def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
     """Mirror a finished run's per-step checkpoints to the backend store (best-effort)."""
-    from flash.runner import get_status
+    from flash.runner.lifecycle.status import get_status
 
     try:
         from flash.server.domain.registry.checkpoints import register_checkpoints_best_effort
@@ -545,7 +545,8 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
     dict. Reading org/cost from the
     persisted ``RunStatus`` (never a reparsed spec) is what lets a legacy/stale spec still be charged.
     """
-    from flash.runner import get_status, record_billing_state
+    from flash.runner.accounting.costs import record_billing_state
+    from flash.runner.lifecycle.status import get_status
     from flash.server.billing.charges import BillingError
     from flash.server.platform.auth import INTERNAL_KEY_ENV, standalone
     from flash.server.platform.internal_client import internal_key as operator_internal_key
@@ -601,12 +602,11 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
 
 def _gc_run_endpoints(spec: JobSpec) -> None:
     """Best-effort teardown of every endpoint a run may have registered."""
-    from flash.runner import (
+    from flash.runner.accounting.reconciliation import (
         _drain_cleanup_remotes,
         _remote_resource_identity,
-        effective_spec_from_status,
-        get_status,
     )
+    from flash.runner.lifecycle.status import effective_spec_from_status, get_status
 
     attempted_cleanup = set()
     with contextlib.suppress(Exception):
@@ -625,7 +625,7 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
         try:
             resource_deleted = _lifecycle()._strict_teardown_handle(status.remote, spec.run_id)
             if status.remote.get("provider") == "runpod" and not resource_deleted:
-                from flash.runner import _record_cleanup_remote
+                from flash.runner.accounting.reconciliation import _record_cleanup_remote
 
                 _record_cleanup_remote(spec.run_id, status.remote)
         except Exception:

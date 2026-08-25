@@ -174,3 +174,40 @@ def test_probe_detects_a_planted_violation(tmp_path):
         f"the probe did not notice a module-level `import httpx` in flash/cost/__init__.py, so "
         f"it cannot protect the base install. reported: {failures}"
     )
+
+
+def test_implementation_package_markers_import_no_children():
+    markers = (
+        "flash.cli",
+        "flash.cli.commands",
+        "flash.runner",
+        "flash.engine.worker",
+    )
+    code = r"""
+import importlib
+import json
+import sys
+
+markers = tuple(json.loads(sys.argv[1]))
+loaded = {}
+for marker in markers:
+    before = set(sys.modules)
+    importlib.import_module(marker)
+    loaded[marker] = sorted(
+        name for name in set(sys.modules) - before if name.startswith(marker + ".")
+    )
+print(json.dumps(loaded))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", code, json.dumps(markers)],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env={
+            "PYTHONPATH": ":".join(_stdlib_only_path()),
+            "PYTHONNOUSERSITE": "1",
+            "PATH": "/usr/bin:/bin",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {marker: [] for marker in markers}

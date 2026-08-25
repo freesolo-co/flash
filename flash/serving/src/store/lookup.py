@@ -16,8 +16,8 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from flash.serving.src.http.routing import AdapterRouter
+from flash.serving.src.io.requests import _assert_supported_base_model
 from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.io.serving_io import _assert_supported_base_model
 
 
 class AdapterLookup:

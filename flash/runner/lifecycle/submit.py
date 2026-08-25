@@ -13,11 +13,17 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.core.spec import JobSpec
+from flash.core import catalog
+from flash.core.spec import TRAINER_BACKEND, JobSpec
 from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
+from flash.providers._lifecycle.net import worker as provider_worker
+from flash.runner.accounting import artifacts, weight_cache
+from flash.runner.lifecycle import preparation, reporting, state
+from flash.runner.lifecycle import status as status_ops
+from flash.runner.supervise import lifecycle as supervision
 from flash.teacher.retry_contract import OPD_RETRY_CONTRACT_VERSION
 
 logger = logging.getLogger(__name__)
@@ -29,23 +35,21 @@ class SourceSnapshotPublicationError(RuntimeError):
     plane_fault = True
 
 
-if TYPE_CHECKING:
-    # annotation-only: both are defined in `flash.runner` above the point where it imports this
-    # module, so a runtime import would be circular. the constructors below go through `_runner()`.
-    from flash.runner import PreparedJob, RunStatus
+@dataclass(frozen=True)
+class PreparedJob:
+    public_spec: JobSpec
+    worker_spec: JobSpec
+    estimated_cost_usd: float
+    adapter_identity: dict | None = None
+    prompt_budget: object | None = None
 
 
-def _runner():
-    """The runner package, imported lazily because it re-exports this module.
-
-    Most of what these two functions call is patched as an attribute of `flash.runner` by the
-    submit tests -- the status accessors, the persistence writes, the model resolver, and both
-    job-launch entry points -- so every one of those is resolved through the package here. A direct
-    call would bind this module's own copy and the patch would never be seen.
-    """
-    import flash.runner as runner
-
-    return runner
+def _with_model_disk(spec: JobSpec, info) -> dict:
+    data = spec.to_internal_dict()
+    required = int(getattr(info, "min_disk_gb", 0) or 0)
+    if required > int(data["gpu"].get("disk_gb") or 0):
+        data["gpu"] = {**data["gpu"], "disk_gb": required}
+    return data
 
 
 def prepare_job(
@@ -59,16 +63,16 @@ def prepare_job(
     # before _resolve_model_revision, and before every sizing step below: a warm start inherits its
     # source's pin and provenance, and `resolve_model`/`_with_model_disk` size against whatever
     # revision the spec carries by then.
-    spec = _runner()._inherit_warmstart_revision(
+    spec = preparation._inherit_warmstart_revision(
         spec,
-        owner_org_id=_runner()._context_org_id(billing_context)
-        or _runner()._context_org_id(platform_context),
+        owner_org_id=preparation._context_org_id(billing_context)
+        or preparation._context_org_id(platform_context),
         owner_key_id=owner_key_id,
     )
-    spec = _runner()._resolve_model_revision(spec, required=spec.algorithm == "sft")
+    spec = preparation._resolve_model_revision(spec, required=spec.algorithm == "sft")
     if spec.algorithm == "sft":
-        spec = _runner()._require_pinned_profile_environment(spec)
-        spec = _runner()._require_sft_workload_profile(spec)
+        spec = preparation._require_pinned_profile_environment(spec)
+        spec = preparation._require_sft_workload_profile(spec)
     if spec.train.structured_outputs:
         from flash.serve.deployment.preflight import preflight_serving_path
 
@@ -113,7 +117,7 @@ def prepare_job(
             for gpu_type in spec.gpu.acceptable_types:
                 if not any(name in configured for name in providers_for(gpu_type)):
                     raise ValueError(f"no configured provider can provision gpu.type {gpu_type!r}")
-    info = _runner().resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)
+    info = catalog.resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)
     if spec.algorithm == "opd" and spec.train.structured_outputs:
         # the generic serving preflight above validates the schema's SHAPE, but the
         # constraint can still be one verl OPD deterministically refuses: a guidance-only
@@ -133,15 +137,15 @@ def prepare_job(
             model_id=spec.model,
             model_revision=spec.model_revision,
         )
-    run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else _runner().new_run_id()
-    spec = JobSpec.from_dict({**_runner()._with_model_disk(spec, info), "run_id": run_id})
-    spec = _runner()._assign_managed_hf_repo(spec)
-    spec = _runner()._assign_weight_cache_volume(spec, info)
-    owner_org_id = _runner()._context_org_id(billing_context) or _runner()._context_org_id(
+    run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else state.new_run_id()
+    spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
+    spec = artifacts._assign_managed_hf_repo(spec)
+    spec = weight_cache._assign_weight_cache_volume(spec, info)
+    owner_org_id = preparation._context_org_id(billing_context) or preparation._context_org_id(
         platform_context
     )
     public_spec, worker_spec, adapter_identity, warm_start_context = (
-        _runner()._prepare_init_from_adapter(
+        preparation._prepare_init_from_adapter(
             spec,
             owner_org_id=owner_org_id,
             owner_key_id=owner_key_id,
@@ -150,7 +154,7 @@ def prepare_job(
     )
     # these read-only gates belong to preparation: every submit path passes here exactly once, and
     # callers receive the pinned worker spec before quoting, affordability, persistence, or allocation.
-    worker_spec, environment_ref_deferred = _runner().preflight_validate_environment_ref(
+    worker_spec, environment_ref_deferred = artifacts.preflight_validate_environment_ref(
         worker_spec
     )
     from flash.content.multimodal import preflight_validate_image_opd
@@ -161,9 +165,10 @@ def prepare_job(
         scan_packaged_environment=not environment_ref_deferred,
     )
     preflight_validate_managed_teacher(worker_spec)
+    from flash.cost.currency import usd_amount
     from flash.cost.spec import estimate_for_spec
 
-    estimated_cost_usd = float(estimate_for_spec(worker_spec).total_usd)
+    estimated_cost_usd = usd_amount(estimate_for_spec(worker_spec).total_usd)
     # derive the rl prompt budget from the same resolved spec the quote is built from, so the
     # reported budget describes the run that was actually priced and submitted.
     from flash.engine.plan.prompt_budget import rl_prompt_budget
@@ -172,7 +177,7 @@ def prepare_job(
         worker_spec,
         warm_start_context=warm_start_context,
     )
-    return _runner().PreparedJob(
+    return PreparedJob(
         public_spec=public_spec,
         worker_spec=worker_spec,
         estimated_cost_usd=estimated_cost_usd,
@@ -192,7 +197,7 @@ def _reject_managed_volume_removal(snapshot: object, worker_spec: JobSpec) -> No
     if not isinstance(snapshot, dict):
         return
     committed = ((snapshot.get("worker_spec") or {}).get("gpu") or {}).get("network_volume")
-    if not committed or committed == _runner().WEIGHT_CACHE_VOLUME_NAME:
+    if not committed or committed == weight_cache.WEIGHT_CACHE_VOLUME_NAME:
         return
     if worker_spec.gpu.network_volume != committed:
         raise ValueError("persisted effective preparation drops a non-shared weight-cache volume")
@@ -221,38 +226,37 @@ def _effective_preparation_snapshot(
         "worker_spec": worker_spec.to_internal_dict(),
         "workload_profile": worker_spec.workload_profile or None,
         "adapter_identity": adapter_identity,
-        "preparation_digest": _runner()._preparation_digest(
+        "preparation_digest": preparation._preparation_digest(
             public_spec, worker_spec, adapter_identity, stored_public=stored_public
         ),
-        "backend": _runner().TRAINER_BACKEND,
+        "backend": TRAINER_BACKEND,
     }
 
 
-def _persist_effective_worker_spec(
-    worker_spec: JobSpec, *, estimated_cost_usd: float | None = None
-) -> bool:
-    """Persist the selected worker spec and exact quote before provider provisioning starts."""
-    status = _runner().get_status(worker_spec.run_id)
-    if status.state in _runner().TERMINAL_STATES:
+def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
+    """Persist the selected worker spec without changing the accepted customer quote."""
+    status = status_ops.get_status(worker_spec.run_id)
+    if status.state in state.TERMINAL_STATES:
         return False
     snapshot = status.effective_preparation
     public_spec = JobSpec.from_dict(status.spec)
     if public_spec.train.init_from_adapter:
         if not isinstance(snapshot, dict):
             raise ValueError("persisted effective preparation is malformed")
-        _runner().effective_spec_from_status(status)
+        status_ops.effective_spec_from_status(status)
         adapter_identity = snapshot.get("adapter_identity")
     else:
         adapter_identity = None
     _reject_managed_volume_removal(snapshot, worker_spec)
-    _runner()._validate_effective_spec(public_spec, worker_spec)
+    preparation._validate_effective_spec(public_spec, worker_spec)
     effective_preparation = _effective_preparation_snapshot(
         public_spec, worker_spec, adapter_identity, stored_public=status.spec
     )
-    fields = {"effective_preparation": effective_preparation}
-    if estimated_cost_usd is not None:
-        fields["estimated_cost_usd"] = float(estimated_cost_usd)
-    return _runner()._update(worker_spec.run_id, status.state, **fields)
+    return status_ops._update(
+        worker_spec.run_id,
+        status.state,
+        effective_preparation=effective_preparation,
+    )
 
 
 def submit_job(
@@ -264,7 +268,7 @@ def submit_job(
     platform_context: dict | None = None,
     owner_key_id: int | None = None,
     prepared_job: PreparedJob | None = None,
-) -> RunStatus:
+) -> state.RunStatus:
     """Submit a prepared job, allocating resources only outside dry-run mode."""
     if prepared_job is not None:
         prepared = prepared_job
@@ -285,9 +289,9 @@ def submit_job(
         # record the warm-start dependency on the source repo so artifact gc spares it while this
         # child is around. source publication is also real-submit-only and completes before status
         # persistence, so no provider can be created without a durable immutable descriptor.
-        _runner()._mark_warmstart_source(worker_spec, public_spec.run_id)
+        preparation._mark_warmstart_source(worker_spec, public_spec.run_id)
         try:
-            source_snapshot = _runner().publish_source_snapshot(worker_spec.train.hf_repo)
+            source_snapshot = provider_worker.publish_source_snapshot(worker_spec.train.hf_repo)
         except Exception as exc:
             logger.warning(
                 "managed source publication failed for run %s: %s",
@@ -299,7 +303,7 @@ def submit_job(
             ) from None
     # env ref->sha pin is deferred (background) or after status save (sync), never on creation path.
     # environment staging runs after status persistence and before provider allocation.
-    status = _runner().RunStatus(
+    status = state.RunStatus(
         run_id=public_spec.run_id,
         state="queued",
         spec=public_spec.to_dict(),
@@ -325,28 +329,28 @@ def submit_job(
         "_opd_retry_contract_version": (
             OPD_RETRY_CONTRACT_VERSION
             if public_spec.algorithm == "opd"
-            else _runner()._PRIVATE_VALUE_UNSET
+            else state._PRIVATE_VALUE_UNSET
         ),
     }
-    _runner()._save_status(status, **save_kwargs)
-    _runner()._report_status(status)
+    state._save_status(status, **save_kwargs)
+    reporting._report_status(status)
     if dry_run:
         # A dry-run persists a state=dry_run record (retrievable, listable, and stageable for a
         # deploy dry-run) — same contract as a real submit minus GPU allocation, provisioning, and
         # billing. Everything above already validated the spec; just flip the state and return.
         status.state = "dry_run"
-        _runner()._save_status(status)
-        _runner()._report_status(status)
+        state._save_status(status)
+        reporting._report_status(status)
         return status
     if background:
         threading.Thread(
-            target=_runner()._run_job_background,
+            target=supervision._run_job_background,
             args=(worker_spec, runtime_secrets or {}),
             daemon=True,
         ).start()
-        return _runner().get_status(public_spec.run_id)
+        return status_ops.get_status(public_spec.run_id)
     if runtime_secrets:
-        _runner()._run_job(worker_spec, runtime_secrets=runtime_secrets)
+        supervision._run_job(worker_spec, runtime_secrets=runtime_secrets)
     else:
-        _runner()._run_job(worker_spec)
-    return _runner().get_status(public_spec.run_id)
+        supervision._run_job(worker_spec)
+    return status_ops.get_status(public_spec.run_id)

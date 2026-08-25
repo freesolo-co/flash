@@ -12,18 +12,20 @@ from __future__ import annotations
 
 import math
 
-from flash.engine.worker.runtime.pkg_proxy import W as _w
+import flash.engine.worker.model.decoding as _worker_decoding
 
 
 def _single_turn_scoring_state(
     solution_str: str, *, thinking: bool, prompt_opened_thinking: bool
 ) -> tuple[str, dict | None]:
-    graded = _w.graded_text(solution_str, prompt_opened_thinking=prompt_opened_thinking)
+    graded = _worker_decoding.graded_text(
+        solution_str, prompt_opened_thinking=prompt_opened_thinking
+    )
     state = (
         {
             "raw": solution_str,
             "completion": graded,
-            "thinking": _w.thinking_text(
+            "thinking": _worker_decoding.thinking_text(
                 solution_str, prompt_opened_thinking=prompt_opened_thinking
             ),
         }
@@ -44,7 +46,7 @@ def _finalize_single_turn_reward(
     raise_on_error: bool = False,
 ) -> float:
     if think_penalty > 0 and thinking:
-        reward -= think_penalty * _w.think_token_count(
+        reward -= think_penalty * _worker_decoding.think_token_count(
             solution_str, tok, prompt_opened_thinking=prompt_opened_thinking
         )
     reward = float(reward)

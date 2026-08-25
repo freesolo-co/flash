@@ -14,8 +14,13 @@ import types
 
 import pytest
 
-import flash.cli as cli
+import flash.cli.parsing.main as cli
+from flash.cli.commands.ops import account as account_commands
+from flash.cli.commands.ops import deploy as deploy_commands
+from flash.cli.commands.ops import log_follow
+from flash.cli.commands.ops import runs as run_commands
 from flash.cli.commands.ops import traces as cli_traces
+from flash.cli.commands.ops import train as train_commands
 from flash.client.config import DEFAULT_API_URL
 from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
@@ -198,7 +203,7 @@ def project_api(monkeypatch):
         "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
     monkeypatch.setattr(
-        cli.commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
+        account_commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
     monkeypatch.setattr(
         "flash.client.get_project", lambda project_id, api_key: {"id": project_id, "name": "Test"}
@@ -212,7 +217,10 @@ def project_api(monkeypatch):
 @pytest.fixture
 def fake_client(monkeypatch) -> _FakeClient:
     client = _FakeClient()
-    monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: client)
+    monkeypatch.setattr(account_commands, "client_from_config", lambda *a, **k: client)
+    monkeypatch.setattr(run_commands, "client_from_config", lambda *a, **k: client)
+    monkeypatch.setattr(deploy_commands, "client_from_config", lambda *a, **k: client)
+    monkeypatch.setattr(train_commands, "client_from_config", lambda *a, **k: client)
     return client
 
 
@@ -234,7 +242,7 @@ def test_project_create_prints_only_returned_id_in_plain_mode(monkeypatch, capsy
     # a Freesolo-hosted api_url: `projects create` only calls the backend on the HOSTED path
     # (a self-hosted plane mints the id locally, see the standalone tests below).
     monkeypatch.setattr(
-        cli.commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
+        account_commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
 
     def create(name, description, api_key):
@@ -294,7 +302,7 @@ def _self_hosted(monkeypatch) -> None:
     path set the var themselves after calling this.
     """
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: _SELF_HOSTED)
-    monkeypatch.setattr(cli.commands, "load_credentials", lambda: _SELF_HOSTED)
+    monkeypatch.setattr(account_commands, "load_credentials", lambda: _SELF_HOSTED)
     monkeypatch.setattr(cli_traces, "load_credentials", lambda: _SELF_HOSTED)
     monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
 
@@ -379,7 +387,7 @@ def test_hosted_plane_still_refuses_when_logged_out(monkeypatch, capsys) -> None
     # state and keep an impossible branch alive in the guard.
     logged_out = (DEFAULT_API_URL, None)
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: logged_out)
-    monkeypatch.setattr(cli.commands, "load_credentials", lambda: logged_out)
+    monkeypatch.setattr(account_commands, "load_credentials", lambda: logged_out)
     monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
 
     def _unreachable(*a, **k):
@@ -389,9 +397,9 @@ def test_hosted_plane_still_refuses_when_logged_out(monkeypatch, capsys) -> None
     monkeypatch.setattr("flash.client.list_projects", _unreachable)
 
     assert _run(["projects", "create", "no key"]) == 1
-    assert f"{cli.commands.CLI_NAME} login" in capsys.readouterr().err
+    assert f"{cli.CLI_NAME} login" in capsys.readouterr().err
     assert _run(["projects", "list"]) == 1
-    assert f"{cli.commands.CLI_NAME} login" in capsys.readouterr().err
+    assert f"{cli.CLI_NAME} login" in capsys.readouterr().err
 
 
 def test_configured_backend_keeps_the_hosted_path_on_a_self_hosted_plane(
@@ -1141,13 +1149,13 @@ def test_login_shows_who_you_are(monkeypatch, capsys) -> None:
     # Verify + store are stubbed; login should still surface the identity card itself so the
     # user sees who they are without a separate `flash whoami`. The card is built from the
     # just-verified key via ApiClient, so stub that (not client_from_config).
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
     # `kind` mirrors the real /v1/me, which always sends it alongside key_prefix (server/routes/
     # meta.py); only `email` is conditional. Login now checks for that shape before trusting a
     # plane's answer, so a fixture missing it would be asserting on a response no server can send.
     monkeypatch.setattr(
-        cli.commands,
+        account_commands,
         "ApiClient",
         lambda *a, **k: type(
             "_C",
@@ -1174,7 +1182,7 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
     def _reject(api_key, base_url=None):
         raise ClientError("freesolo rejected this API key")
 
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _reject)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", _reject)
     assert _run(["login", "--api-key", "bad-key"]) == 1
     err = capsys.readouterr().err
     assert "login failed" in err
@@ -1184,9 +1192,9 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
 
 
 def test_login_api_key_argument_warns_but_environment_route_does_not(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_identity_or_none", lambda *a, **k: None)
 
     assert _run(["login", "--api-key", "fs_secret"]) == 0
     err = capsys.readouterr().err
@@ -1399,7 +1407,7 @@ def test_inline_records_are_not_labelled_a_published_copy_in_cost_rows(monkeypat
     """
     from types import SimpleNamespace
 
-    from flash.cli.commands.ops import train_cost
+    from flash.cli.commands.ops import train
 
     monkeypatch.setenv("FLASH_STYLE", "0")
     profile = {
@@ -1414,7 +1422,7 @@ def test_inline_records_are_not_labelled_a_published_copy_in_cost_rows(monkeypat
         environment=SimpleNamespace(params={"records": [{"input": "x"}]}),
     )
 
-    rows = dict(train_cost._sft_cost_rows(spec, profile))
+    rows = dict(train._sft_cost_rows(spec, profile))
 
     assert "inline records" in rows["examples"]
     assert "published copy" not in rows["examples"]
@@ -1426,7 +1434,7 @@ def test_published_rows_keep_their_published_labels(monkeypatch) -> None:
     """The inline branch must not relabel an ordinary published quote."""
     from types import SimpleNamespace
 
-    from flash.cli.commands.ops import train_cost
+    from flash.cli.commands.ops import train
 
     monkeypatch.setenv("FLASH_STYLE", "0")
     profile = {
@@ -1438,7 +1446,7 @@ def test_published_rows_keep_their_published_labels(monkeypatch) -> None:
     }
     spec = SimpleNamespace(model="Qwen/Qwen3.5-4B", environment=SimpleNamespace(params={}))
 
-    rows = dict(train_cost._sft_cost_rows(spec, profile))
+    rows = dict(train._sft_cost_rows(spec, profile))
 
     assert "source rows in published copy" in rows["examples"]
     assert rows["env"] == "published environment owner/project/env"
@@ -1540,7 +1548,7 @@ def test_status_runs_and_log_command(fake_client, capsys, monkeypatch) -> None:
         # scoped: this iterator holds exactly the two statuses this one assertion consumes, so
         # letting it stay installed would starve every later command of a status it needs.
         patched.setattr(fake_client, "get_run", lambda _run_id: next(statuses))
-        patched.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+        patched.setattr(run_commands.time, "sleep", lambda _seconds: None)
         assert _run(["runs", "status", "flash-1", "--follow", "--json"]) == 0
         assert [json.loads(line)["state"] for line in capsys.readouterr().out.splitlines()] == [
             "running",
@@ -1785,8 +1793,8 @@ def test_ctrl_c_while_following_says_the_run_is_still_billing(
     assert _run([str(config) if a == "CONFIG" else a for a in argv]) == 130
     err = capsys.readouterr().err
     assert "still going and still billing" in err
-    assert f"{cli.commands.CLI_NAME} runs cancel flash-1" in err
-    assert f"{cli.commands.CLI_NAME} runs log flash-1 --follow" in err
+    assert f"{cli.CLI_NAME} runs cancel flash-1" in err
+    assert f"{cli.CLI_NAME} runs log flash-1 --follow" in err
     # the run was never cancelled on the user's behalf -- detaching is not stopping.
     assert not any(c[0] == "cancel" for c in fake_client.calls)
 
@@ -1812,7 +1820,7 @@ def test_train_submit_note_warns_that_ctrl_c_keeps_billing(
     assert _run(["train", str(config)]) == 0
     err = capsys.readouterr().err
     assert "keeps billing" in err
-    assert f"{cli.commands.CLI_NAME} runs cancel flash-1" in err
+    assert f"{cli.CLI_NAME} runs cancel flash-1" in err
 
 
 def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> None:
@@ -1848,10 +1856,10 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
             return next(self.statuses)
 
     stderr = _TTYBuffer()
-    monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.sys, "stderr", stderr)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any, _ = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
+    state, printed_any, _ = run_commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
 
     assert state == "done"
     assert printed_any is True
@@ -1870,9 +1878,9 @@ def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> 
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "done", "remote": {"attempt": 1}}
 
-    result = cli.commands._poll_logs(_AttemptClient(), "flash-attempt", interval=0)
+    result = run_commands._poll_logs(_AttemptClient(), "flash-attempt", interval=0)
 
-    assert result == cli.commands._LogPollResult("done", False, 1)
+    assert result == run_commands._LogPollResult("done", False, 1)
     assert result.live_attempt == 1
     assert capsys.readouterr().out == ""
 
@@ -1910,10 +1918,10 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
             return next(self.statuses)
 
     stderr = _TTYBuffer()
-    monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.sys, "stderr", stderr)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any, _ = cli.commands._poll_logs(_LaggingLogClient(), "flash-lag", interval=0.2)
+    state, printed_any, _ = run_commands._poll_logs(_LaggingLogClient(), "flash-lag", interval=0.2)
 
     assert state == "done"
     assert printed_any is False
@@ -1984,9 +1992,9 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
         def get_run(self, run_id: str) -> dict:
             return next(self.statuses)
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any, _ = cli.commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
+    state, printed_any, _ = run_commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
 
     assert state == "done"
     assert printed_any is False
@@ -2006,7 +2014,7 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
 
 
 def test_log_follow_metric_dedup_is_attempt_aware() -> None:
-    from flash.cli.commands import _log_follow_metric_rows
+    from flash.cli.commands.ops.log_follow import _log_follow_metric_rows
 
     seen = set()
     attempt_one = {
@@ -2038,9 +2046,9 @@ def test_cancel_surfaces_surviving_checkpoints(fake_client, capsys) -> None:
     out, err = capsys.readouterr()
     assert _json.loads(out)["state"] == "cancelled"  # stdout stays pure JSON in the plain path
     assert "2 deployable checkpoint(s) survive this cancel" in err
-    assert f"{cli.commands.CLI_NAME} runs checkpoint flash-1" in err
+    assert f"{cli.CLI_NAME} runs checkpoint flash-1" in err
     assert (
-        f"{cli.commands.CLI_NAME} models deploy flash-1/step-40" in err
+        f"{cli.CLI_NAME} models deploy flash-1/step-40" in err
     )  # points at the newest surviving step
 
 
@@ -2070,9 +2078,7 @@ def test_cancel_hint_survives_malformed_checkpoint_shape(fake_client, capsys, mo
     out, err = capsys.readouterr()
     assert '"state": "cancelled"' in out
     assert "3 deployable checkpoint(s) survive this cancel" in err
-    assert (
-        f"{cli.commands.CLI_NAME} models deploy flash-1/step-7" in err
-    )  # max of the RECOVERABLE steps
+    assert f"{cli.CLI_NAME} models deploy flash-1/step-7" in err  # max of the RECOVERABLE steps
 
     monkeypatch.setattr(fake_client, "checkpoints", lambda run_id: [{"no_step": 1}])
     assert _run(["runs", "cancel", "flash-1"]) == 0
@@ -2973,7 +2979,7 @@ def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None
         def get_run(self, run_id: str) -> dict:
             raise ApiError(404, "unknown run")
 
-    monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _Erroring())
+    monkeypatch.setattr(run_commands, "client_from_config", lambda *a, **k: _Erroring())
     assert _run(["runs", "status", "nope"]) != 0
     assert "unknown run" in capsys.readouterr().err
 
@@ -3798,7 +3804,7 @@ def _queued_deploy(monkeypatch, fake_client) -> None:
         lambda run_id, **_: {"run_id": run_id, "state": "queued"},
         raising=False,
     )
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _s: None)
 
 
 def test_deploy_without_wait_returns_while_still_queued(fake_client, monkeypatch, capsys) -> None:
@@ -3980,9 +3986,9 @@ def test_deploy_wait_rollback_lookup_stays_inside_the_deadline(fake_client, monk
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
 
     def _poll(run_id, timeout=None):
@@ -4003,7 +4009,9 @@ def test_deploy_wait_rollback_lookup_stays_inside_the_deadline(fake_client, monk
     for start, bound in reads:
         assert bound is not None, reads
         # the expired case is allowed the zero-wait one-shot bound and nothing wider.
-        assert bound <= max(5.0 - start, cli.commands._DEPLOY_ZERO_WAIT_READ_SECONDS) + 0.001, reads
+        assert bound <= max(5.0 - start, deploy_commands._DEPLOY_ZERO_WAIT_READ_SECONDS) + 0.001, (
+            reads
+        )
 
 
 def test_deploy_wait_rollback_lookup_gets_a_usable_bound_near_the_deadline(
@@ -4019,9 +4027,9 @@ def test_deploy_wait_rollback_lookup_gets_a_usable_bound_near_the_deadline(
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
     # stop a hair inside the deadline: positive remainder, far too little to complete a read.
     monkeypatch.setattr(
@@ -4039,8 +4047,8 @@ def test_deploy_wait_rollback_lookup_gets_a_usable_bound_near_the_deadline(
 
     def _listing(timeout=None):
         # a real client cannot answer inside a bound this small; it raises at it.
-        if timeout is not None and timeout < cli.commands._DEPLOY_ZERO_WAIT_READ_SECONDS:
-            raise cli.commands.ClientError("read timed out")
+        if timeout is not None and timeout < deploy_commands._DEPLOY_ZERO_WAIT_READ_SECONDS:
+            raise deploy_commands.ClientError("read timed out")
         return [{"run_id": "flash-1", "deployment": rolled_back}]
 
     monkeypatch.setattr(fake_client, "deployments", _listing, raising=False)
@@ -4089,7 +4097,7 @@ def test_deploy_wait_survives_a_transient_control_plane_error(
 ) -> None:
     """One failed poll must not fail a deploy that is progressing fine."""
     _queued_deploy(monkeypatch, fake_client)
-    results = iter([cli.commands.ClientError("503"), {"state": "ready"}])
+    results = iter([deploy_commands.ClientError("503"), {"state": "ready"}])
 
     def _next(run_id, timeout=None):
         value = next(results)
@@ -4141,7 +4149,7 @@ def test_deploy_wait_rejects_a_restored_previous_revision(fake_client, monkeypat
         },
         raising=False,
     )
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _s: None)
     monkeypatch.setattr(
         fake_client,
         "deployment_for",
@@ -4177,7 +4185,7 @@ def test_deploy_wait_accepts_a_ready_revision_carrying_a_stale_error(
         },
         raising=False,
     )
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _s: None)
     monkeypatch.setattr(
         fake_client,
         "deployment_for",
@@ -4250,10 +4258,10 @@ def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     # the sleep is what burns the budget, exactly as a real one would.
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
     reads: list[tuple[float, float | None]] = []
 
@@ -4316,7 +4324,7 @@ def test_deploy_wait_rejects_a_superseding_deploy_that_carries_no_error(
         },
         raising=False,
     )
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _s: None)
     monkeypatch.setattr(
         fake_client,
         "deployment_for",
@@ -4343,9 +4351,9 @@ def test_deploy_wait_observes_readiness_inside_a_short_window(fake_client, monke
     # a non-advancing sleep is an infinite poll, which is a broken test rather than a caught defect.
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
 
     def _poll(run_id, timeout=None):
@@ -4367,9 +4375,9 @@ def test_deploy_wait_observes_readiness_inside_the_final_window(fake_client, mon
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
 
     def _poll(run_id, timeout=None):
@@ -4391,9 +4399,9 @@ def test_deploy_wait_watches_the_final_window_to_its_deadline(fake_client, monke
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
 
     def _poll(run_id, timeout=None):
@@ -4415,9 +4423,9 @@ def test_deploy_wait_final_window_does_not_poll_unboundedly(fake_client, monkeyp
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
     reads = []
 
@@ -4493,7 +4501,7 @@ def test_deploy_wait_accepts_a_synchronous_success(fake_client, monkeypatch) -> 
 
 def test_deploy_notes_name_this_channels_executable(fake_client, monkeypatch, capsys) -> None:
     """The dev channel installs `flash-dev`; a hardcoded `flash ...` hint is not runnable there."""
-    monkeypatch.setattr(cli.commands, "CLI_NAME", "flash-dev")
+    monkeypatch.setattr(deploy_commands, "CLI_NAME", "flash-dev")
     _queued_deploy(monkeypatch, fake_client)
 
     assert _run(["models", "deploy", "flash-1"]) == 0
@@ -4513,7 +4521,7 @@ def test_deploy_wait_stops_retrying_a_rejected_key(fake_client, monkeypatch, cap
 
     def _denied(run_id, timeout=None):
         calls.append(1)
-        raise cli.commands.ApiError(403, "forbidden")
+        raise deploy_commands.ApiError(403, "forbidden")
 
     monkeypatch.setattr(fake_client, "deployment_for", _denied, raising=False)
 
@@ -4569,7 +4577,7 @@ def test_log_follow_progress_includes_heartbeat_age() -> None:
     "alive, throttled" instead of a frozen line."""
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     status = {
         "state": "running",
@@ -4598,7 +4606,7 @@ def test_log_follow_progress_names_the_attempt_after_a_relaunch() -> None:
     follow line must name the attempt or the rewind reads as lost progress with no cause."""
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     # attempts are 0-based, so a first attempt must stay unannotated.
     first = {
@@ -4672,7 +4680,7 @@ def test_log_follow_progress_does_not_trust_a_ping_left_by_a_cleared_remote(
     """
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     _, progress = _log_follow_progress(
         {
@@ -4705,7 +4713,7 @@ def test_log_follow_progress_names_the_attempt_before_the_first_heartbeat() -> N
     the line print a bare `running` for the whole cold start -- silent through exactly the window
     the attempt counter exists to explain, and the window a user is most likely to be watching.
     """
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     state, progress = _log_follow_progress(
         {"state": "running", "remote": {"attempt": 1}, "last_heartbeat": None},
@@ -4737,7 +4745,7 @@ def test_log_follow_progress_marks_a_stale_heartbeats_fields() -> None:
     """
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     _, progress = _log_follow_progress(
         {
@@ -4787,7 +4795,7 @@ def test_log_follow_progress_marks_a_stale_heartbeats_fields() -> None:
 def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     status = {"state": "running", "last_heartbeat": {"stage": stage, "ts": _time.time()}}
     _, progress = _log_follow_progress(status, "unknown")
@@ -4807,7 +4815,7 @@ def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
 def test_log_follow_progress_omits_warmup_claim_for_stale_heartbeat(stage: str) -> None:
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     status = {
         "state": "running",
@@ -4825,7 +4833,7 @@ def test_log_follow_progress_omits_warmup_claim_for_stale_heartbeat(stage: str) 
 def test_log_follow_progress_omits_warmup_claim_for_prior_attempt_heartbeat(stage: str) -> None:
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     # remote is on attempt 1 while last_heartbeat is the previous attempt's fresh setup ping: the
     # warmup reassurance must not fire against a superseded attempt before the new worker publishes.
@@ -4845,7 +4853,7 @@ def test_log_follow_progress_omits_warmup_claim_for_prior_attempt_heartbeat(stag
 def test_log_follow_progress_explains_warmup_when_heartbeat_matches_attempt(stage: str) -> None:
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     status = {
         "state": "running",
@@ -4893,14 +4901,14 @@ def test_runs_listing_shows_the_settled_charge_unflagged(fake_client, monkeypatc
 
 
 def test_log_follow_progress_reports_the_quote_while_live() -> None:
-    _state, progress = cli.commands._log_follow_progress(
+    _state, progress = run_commands._log_follow_progress(
         {"state": "running", "cost_usd": 0.0, "estimated_cost_usd": 2.5}, "running"
     )
     assert "cost=~$2.5000" in progress
 
 
 def test_log_follow_progress_reports_the_settled_charge_when_done() -> None:
-    _state, progress = cli.commands._log_follow_progress(
+    _state, progress = run_commands._log_follow_progress(
         {"state": "done", "cost_usd": 1.25, "estimated_cost_usd": 2.5}, "done"
     )
     assert "cost=$1.2500" in progress
@@ -4909,7 +4917,7 @@ def test_log_follow_progress_reports_the_settled_charge_when_done() -> None:
 
 def test_log_follow_progress_omits_cost_when_there_is_nothing_to_show() -> None:
     # no quote and no measured spend: don't print a misleading "cost=$0.0000".
-    _state, progress = cli.commands._log_follow_progress({"state": "queued"}, "queued")
+    _state, progress = run_commands._log_follow_progress({"state": "queued"}, "queued")
     assert "cost=" not in progress
 
 
@@ -4921,7 +4929,7 @@ def test_log_follow_progress_shows_a_settled_zero_like_the_other_surfaces() -> N
     one place and uncosted in another, which is the inconsistency, not the zero.
     """
     for state in sorted(cli.render.SETTLED_COST_STATES):
-        _state, progress = cli.commands._log_follow_progress(
+        _state, progress = run_commands._log_follow_progress(
             {"state": state, "cost_usd": 0.0}, state
         )
         assert "cost=$0.0000" in progress, state
@@ -4950,13 +4958,13 @@ def test_login_warns_before_sending_the_key_over_plaintext_http(monkeypatch, cap
         warned_before_request["stderr"] = capsys.readouterr().err
         return {"email": "operator@example.com"}
 
-    monkeypatch.setattr(cli.commands, "_verify_key_against_plane", _verify)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_verify_key_against_plane", _verify)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_identity_or_none", lambda *a, **k: None)
     monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
 
     args = types.SimpleNamespace(api_url=api_url, api_key="operator-key", debug=False)
-    assert cli.commands.cmd_login(args) == 0
+    assert account_commands.cmd_login(args) == 0
     assert "plaintext HTTP" in warned_before_request["stderr"]
 
 
@@ -4971,15 +4979,15 @@ def test_login_warns_before_sending_the_key_over_plaintext_http(monkeypatch, cap
 def test_login_stays_quiet_for_loopback_and_tls(monkeypatch, capsys, api_url):
     """Local development over http is the one safe plaintext case, and https is the fix."""
     monkeypatch.setattr(
-        cli.commands, "_verify_key_against_plane", lambda *a, **k: {"email": "op@example.com"}
+        account_commands, "_verify_key_against_plane", lambda *a, **k: {"email": "op@example.com"}
     )
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_identity_or_none", lambda *a, **k: None)
     monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
 
     args = types.SimpleNamespace(api_url=api_url, api_key="operator-key", debug=False)
-    assert cli.commands.cmd_login(args) == 0
+    assert account_commands.cmd_login(args) == 0
     assert "plaintext HTTP" not in capsys.readouterr().err
 
 
@@ -4995,10 +5003,10 @@ def test_login_warns_about_a_plaintext_freesolo_url_behind_an_https_plane(monkey
     def _verify(api_key, *, base_url):
         warned_before_request["stderr"] = capsys.readouterr().err
 
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _verify)
-    monkeypatch.setattr(cli.commands, "_verifies_against_freesolo", lambda *a, **k: True)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", _verify)
+    monkeypatch.setattr(account_commands, "_verifies_against_freesolo", lambda *a, **k: True)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_identity_or_none", lambda *a, **k: None)
     monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
 
     args = types.SimpleNamespace(
@@ -5007,7 +5015,7 @@ def test_login_warns_about_a_plaintext_freesolo_url_behind_an_https_plane(monkey
         api_key="operator-key",
         debug=False,
     )
-    assert cli.commands.cmd_login(args) == 0
+    assert account_commands.cmd_login(args) == 0
     stderr = warned_before_request["stderr"]
     assert "plaintext HTTP" in stderr, stderr
     # it names the offending url, not the https plane that is already fine.
@@ -5017,7 +5025,7 @@ def test_login_warns_about_a_plaintext_freesolo_url_behind_an_https_plane(monkey
 
 def test_login_does_not_warn_twice_for_one_url():
     """A plane that is also its own identity backend is one destination, so it warns once."""
-    warnings = cli.commands._plaintext_login_warnings(
+    warnings = account_commands._plaintext_login_warnings(
         "http://plane.example:8080", "http://plane.example:8080"
     )
     assert len(warnings) == 1, warnings
@@ -5035,9 +5043,9 @@ def test_login_warns_about_a_plaintext_freesolo_base_url_from_the_environment(mo
     def _verify(api_key, *, base_url):
         warned_before_request["stderr"] = capsys.readouterr().err
 
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _verify)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", _verify)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_identity_or_none", lambda *a, **k: None)
     monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
     monkeypatch.setenv("FREESOLO_BASE_URL", "http://identity.internal.test")
 
@@ -5045,7 +5053,7 @@ def test_login_warns_about_a_plaintext_freesolo_base_url_from_the_environment(mo
     args = types.SimpleNamespace(
         api_url="https://api.freesolo.co", api_key="operator-key", debug=False
     )
-    assert cli.commands.cmd_login(args) == 0
+    assert account_commands.cmd_login(args) == 0
     stderr = warned_before_request["stderr"]
     assert "plaintext HTTP" in stderr, stderr
     assert "identity.internal.test" in stderr
@@ -5059,7 +5067,7 @@ def test_login_ignores_the_identity_url_when_the_key_never_goes_there(monkeypatc
     """
     monkeypatch.setenv("FREESOLO_BASE_URL", "http://identity.internal.test")
 
-    warnings = cli.commands._plaintext_login_warnings("https://plane.example", None)
+    warnings = account_commands._plaintext_login_warnings("https://plane.example", None)
     assert warnings == [], warnings
 
 
@@ -5205,16 +5213,16 @@ def test_follow_survives_a_transient_502_instead_of_reporting_a_failed_submit(
         def get_logs(self, run_id: str, offset: int = 0) -> dict:
             self.log_calls += 1
             if self.log_calls == 1:
-                raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+                raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
             return {"run_id": run_id, "logs": "trained\n", "offset": 8, "state": "done"}
 
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "done"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
     client = _FlakyClient()
 
-    assert cli.commands._follow_run(client, "flash-502") == 0
+    assert run_commands._follow_run(client, "flash-502") == 0
 
     captured = capsys.readouterr()
     assert "trained" in captured.out
@@ -5245,13 +5253,13 @@ def test_follow_does_not_reprint_the_log_page_it_retried(monkeypatch, capsys) ->
         def get_run(self, run_id: str) -> dict:
             self.run_calls += 1
             if self.run_calls == 1:
-                raise cli.commands.ApiError(503, "HTTP Error 503: Service Unavailable")
+                raise deploy_commands.ApiError(503, "HTTP Error 503: Service Unavailable")
             return {"run_id": run_id, "state": "running" if self.run_calls == 2 else "done"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
     client = _StatusFlakyClient()
 
-    result = cli.commands._poll_logs(client, "flash-offset", interval=0)
+    result = run_commands._poll_logs(client, "flash-offset", interval=0)
 
     assert result.state == "done"
     assert capsys.readouterr().out.count("step 1") == 1
@@ -5264,19 +5272,19 @@ def test_follow_gives_up_after_the_retry_window_and_names_the_run(monkeypatch, c
 
     class _DeadClient(_FakeClient):
         def get_logs(self, run_id: str, offset: int = 0) -> dict:
-            raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+            raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
 
         def get_run(self, run_id: str) -> dict:
-            raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+            raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
 
     # the retry budget reads the clock in `log_follow`; patch it there rather than relying on
-    # `cli.commands.time` happening to be the same module object.
+    # `run_commands.time` happening to be the same module object.
     clock = iter([0.0] + [1000.0] * 20)
-    monkeypatch.setattr(cli.commands.ops.log_follow.time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(cli.commands.ops.log_follow.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(log_follow.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(log_follow.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    assert cli.commands._follow_run(_DeadClient(), "flash-dead") == 1
+    assert run_commands._follow_run(_DeadClient(), "flash-dead") == 1
 
     err = capsys.readouterr().err
     assert "still going and still billing" in err
@@ -5295,16 +5303,16 @@ def test_follow_surfaces_a_client_error_immediately_without_retrying(monkeypatch
 
         def get_logs(self, run_id: str, offset: int = 0) -> dict:
             self.log_calls += 1
-            raise cli.commands.ApiError(401, "invalid or missing API key")
+            raise deploy_commands.ApiError(401, "invalid or missing API key")
 
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "running"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
     client = _UnauthorizedClient()
 
-    with pytest.raises(cli.commands.ApiError) as excinfo:
-        cli.commands._poll_logs(client, "flash-401", interval=0)
+    with pytest.raises(deploy_commands.ApiError) as excinfo:
+        run_commands._poll_logs(client, "flash-401", interval=0)
 
     assert excinfo.value.status == 401
     assert client.log_calls == 1
@@ -5321,12 +5329,12 @@ def test_status_follow_survives_a_transient_502(monkeypatch, capsys) -> None:
         def get_run(self, run_id: str) -> dict:
             self.calls += 1
             if self.calls == 1:
-                raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+                raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
             return {"run_id": run_id, "state": "done"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    assert cli.commands._follow_status(_FlakyStatusClient(), "flash-st", interval=0) == 0
+    assert run_commands._follow_status(_FlakyStatusClient(), "flash-st", interval=0) == 0
     assert "done" in capsys.readouterr().out
 
 
@@ -5347,11 +5355,11 @@ def test_follow_reports_a_finished_run_even_if_the_final_status_fetch_blips(
             self.run_calls += 1
             if self.run_calls == 1:
                 return {"run_id": run_id, "state": "done"}
-            raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+            raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    assert cli.commands._follow_run(_FinalBlipClient(), "flash-final") == 0
+    assert run_commands._follow_run(_FinalBlipClient(), "flash-final") == 0
 
     err = capsys.readouterr().err
     assert "could not fetch the final status" in err
@@ -5369,15 +5377,15 @@ def test_follow_warns_once_per_outage_not_once_per_attempt(monkeypatch, capsys) 
         def get_logs(self, run_id: str, offset: int = 0) -> dict:
             self.log_calls += 1
             if self.log_calls <= 3:
-                raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+                raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
             return {"run_id": run_id, "logs": "", "offset": 0, "state": "done"}
 
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "done"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    assert cli.commands._poll_logs(_RepeatFlakyClient(), "flash-noisy", interval=0).state == "done"
+    assert run_commands._poll_logs(_RepeatFlakyClient(), "flash-noisy", interval=0).state == "done"
     assert capsys.readouterr().err.count("retrying") == 1
 
 
@@ -5405,11 +5413,11 @@ def test_follow_surfaces_a_wrong_api_url_instead_of_retrying_it(monkeypatch, cap
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "running"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
     client = _ProxyClient()
 
-    with pytest.raises(cli.commands.ClientError) as excinfo:
-        cli.commands._poll_logs(client, "flash-proxy", interval=0)
+    with pytest.raises(deploy_commands.ClientError) as excinfo:
+        run_commands._poll_logs(client, "flash-proxy", interval=0)
 
     assert "Check that --api-url points at your Flash control plane" in str(excinfo.value)
     assert client.log_calls == 1
@@ -5436,7 +5444,7 @@ def test_follow_retries_a_genuinely_unreachable_service(monkeypatch, capsys) -> 
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "done"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    assert cli.commands._poll_logs(_UnreachableClient(), "flash-down", interval=0).state == "done"
+    assert run_commands._poll_logs(_UnreachableClient(), "flash-down", interval=0).state == "done"
     assert "the service was unreachable" in capsys.readouterr().err

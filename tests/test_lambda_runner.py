@@ -183,7 +183,7 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     for sibling in ("bootstrap_secrets.py", "bootstrap_console.py", "bootstrap_pip.py"):
         assert sibling.removesuffix(".py") in shipped, sibling
     # runs the prebuilt WORKER_IMAGE via Docker with the GPU + the capsule bootstrap as the command
-    from flash.providers.runpod.serverless import WORKER_IMAGE
+    from flash.providers._lifecycle.net.worker import WORKER_IMAGE
 
     assert WORKER_IMAGE in script
     assert "docker run -d" in script
@@ -217,8 +217,8 @@ def test_user_data_skips_capacity_for_baked_image_default(monkeypatch):
 def test_image_per_sm_selects_arch_tag():
     """Per-SM warmed images (PR #213) reach Lambda too: the GPU class always picks the matching -smXX
     tag for baked arches (so the worker's baked kernel cache matches the rented GPU's arch)."""
+    from flash.providers._lifecycle.net.worker import WORKER_IMAGE
     from flash.providers.lambda_.jobs import builders
-    from flash.providers.runpod.serverless import WORKER_IMAGE
 
     # no GPU class -> flat base image (no arch to key a baked tag off)
     assert builders.lambda_image() == WORKER_IMAGE

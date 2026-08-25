@@ -246,7 +246,7 @@ def _parse_as_cli(command: str) -> Namespace:
     A hint is only useful if pasting it back works, so assert against the parser the user would
     actually hit rather than against the string we happened to build.
     """
-    from flash.cli import _build_parser
+    from flash.cli.parsing.main import _build_parser
 
     argv = _split_as_shell(command)
     assert argv[:3] == [CLI_NAME, "env", "pull"], argv

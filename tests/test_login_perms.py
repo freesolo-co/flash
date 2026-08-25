@@ -11,6 +11,7 @@ import types
 
 import pytest
 
+import flash.cli.commands.ops.account as cli_account
 from flash.serve.contract.urls import is_freesolo_hosted_url
 
 
@@ -32,13 +33,13 @@ def _check_login(monkeypatch):
         import flash.client.config as client_config
 
         importlib.reload(client_config)
-        import flash.cli as cli
+        import flash.cli.parsing.main as cli
 
         # Login verifies the freesolo key against the freesolo backend, then stores it. Stub
         # the network verify so the test stays offline; an invalid key would raise instead.
         verified: dict = {}
         monkeypatch.setattr(
-            cli.commands,
+            cli_account,
             "verify_freesolo_key",
             lambda api_key, base_url=None: verified.update(api_key=api_key, base_url=base_url),
         )
@@ -55,7 +56,7 @@ def _check_login(monkeypatch):
             def me(self):
                 return identity
 
-        monkeypatch.setattr(cli.commands, "ApiClient", _FakeApi)
+        monkeypatch.setattr(cli_account, "ApiClient", _FakeApi)
         args = types.SimpleNamespace(api_key="fs-secret-123", api_url=None, freesolo_url=None)
         rc = cli.cmd_login(args)
         assert rc == 0
@@ -83,9 +84,9 @@ def test_login_warns_when_env_key_will_override_saved_key(monkeypatch, tmp_path,
     import flash.client.config as client_config
 
     importlib.reload(client_config)
-    import flash.cli as cli
+    import flash.cli.parsing.main as cli
 
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda api_key, base_url=None: None)
+    monkeypatch.setattr(cli_account, "verify_freesolo_key", lambda api_key, base_url=None: None)
     args = types.SimpleNamespace(api_key="fs-secret-arg", api_url=None, freesolo_url=None)
 
     assert cli.cmd_login(args) == 0
@@ -129,7 +130,7 @@ def _login_capturing_the_wire(monkeypatch, tmp_path, *, api_url, freesolo_url=No
     import flash.client.config as client_config
 
     importlib.reload(client_config)
-    import flash.cli as cli
+    import flash.cli.parsing.main as cli
     import flash.client.http as client_http
 
     sent: list[tuple[str, str]] = []
@@ -165,7 +166,7 @@ def _login_capturing_the_wire(monkeypatch, tmp_path, *, api_url, freesolo_url=No
             # returning an identity is what "the plane accepted it" looks like on the wire.
             return {"kind": "internal", "key_prefix": "operator"}
 
-    monkeypatch.setattr(cli.commands, "ApiClient", _FakeApi)
+    monkeypatch.setattr(cli_account, "ApiClient", _FakeApi)
     args = types.SimpleNamespace(
         api_key="operator-root-key", api_url=api_url, freesolo_url=freesolo_url
     )
@@ -234,7 +235,7 @@ def test_login_against_a_self_hosted_plane_rejects_a_bad_key(monkeypatch, tmp_pa
     import flash.client.config as client_config
 
     importlib.reload(client_config)
-    import flash.cli as cli
+    import flash.cli.parsing.main as cli
     from flash.client import ApiError
 
     class _RejectingPlane:
@@ -244,7 +245,7 @@ def test_login_against_a_self_hosted_plane_rejects_a_bad_key(monkeypatch, tmp_pa
         def me(self):
             raise ApiError(401, "invalid or missing API key")
 
-    monkeypatch.setattr(cli.commands, "ApiClient", _RejectingPlane)
+    monkeypatch.setattr(cli_account, "ApiClient", _RejectingPlane)
     args = types.SimpleNamespace(
         api_key="wrong-key", api_url="http://my-plane:8080", freesolo_url=None
     )
@@ -263,9 +264,9 @@ def _login_against_plane(monkeypatch, tmp_path, plane_cls, *, api_key="a-key"):
     import flash.client.config as client_config
 
     importlib.reload(client_config)
-    import flash.cli as cli
+    import flash.cli.parsing.main as cli
 
-    monkeypatch.setattr(cli.commands, "ApiClient", plane_cls)
+    monkeypatch.setattr(cli_account, "ApiClient", plane_cls)
     args = types.SimpleNamespace(api_key=api_key, api_url="http://my-plane:8080", freesolo_url=None)
     try:
         rc = cli.cmd_login(args)

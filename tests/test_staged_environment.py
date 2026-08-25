@@ -18,6 +18,19 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+import flash.engine.worker.entry.sft as worker_sft
+import flash.engine.worker.entry.worker as worker_entry
+import flash.engine.worker.io.heartbeat as worker_heartbeat
+import flash.engine.worker.io.hf as worker_hf
+import flash.engine.worker.perf as worker_perf
+import flash.engine.worker.runtime.kernel_warmup as worker_kernel_warmup
+import flash.engine.worker.runtime.state as worker_state
+import flash.runner.accounting.artifacts as runner_artifacts
+import flash.runner.accounting.reconciliation as runner_reconciliation
+import flash.runner.lifecycle.preparation as runner_preparation
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.supervise.lifecycle as runner_lifecycle
 from flash.core.spec import JobSpec
 from flash.envs.loading.staged import (
     ResolvedEnvironmentSource,
@@ -130,16 +143,15 @@ def _disable_github(monkeypatch) -> None:
 
 
 def _prepared_status(public: JobSpec, worker: JobSpec, *, state: str = "provisioning"):
-    import flash.runner as runner
 
-    return runner.RunStatus(
+    return runner_state.RunStatus(
         run_id=worker.run_id,
         state=state,
         spec=public.to_dict(),
         effective_preparation={
             "worker_spec": worker.to_internal_dict(),
             "version": 1,
-            "preparation_digest": runner._preparation_digest(public, worker, None),
+            "preparation_digest": runner_preparation._preparation_digest(public, worker, None),
         },
     )
 
@@ -405,17 +417,16 @@ def test_missing_immutable_revision_is_terminal(monkeypatch, tmp_path) -> None:
 
 
 def test_worker_failure_boundary_marks_staged_transient_retriable() -> None:
-    from flash.engine import worker
     from flash.envs.meta.identity import GitHubUnavailableError
 
-    assert worker._worker_failure_flags(StagedEnvironmentTransientError("temporary")) == {
+    assert worker_entry._worker_failure_flags(StagedEnvironmentTransientError("temporary")) == {
         "retriable": True,
         "oom": False,
     }
     # the staged type is NEW, so this must not narrow the boundary to it: a github outage or quota
     # exhaustion still arrives here as GitHubTransientError, and the worker's answer to either is
     # the same -- reschedule. classifying only the staged type would fail those runs permanently.
-    assert worker._worker_failure_flags(GitHubUnavailableError("github outage")) == {
+    assert worker_entry._worker_failure_flags(GitHubUnavailableError("github outage")) == {
         "retriable": True,
         "oom": False,
     }
@@ -593,7 +604,6 @@ def test_a_stripped_package_restages_from_the_same_pin_instead_of_running_unstag
     property that matters is that the recovered spec keeps the digest-bound `resolved_sha`, so a
     restage rebuilds the SAME commit rather than resolving a newer one.
     """
-    import flash.runner as runner
 
     package, _manifest, _archive, _manifest_path, _archive_path = _staged_files(tmp_path)
     public = _spec(package=None, resolved_sha="")
@@ -601,18 +611,18 @@ def test_a_stripped_package_restages_from_the_same_pin_instead_of_running_unstag
     snapshot = {
         "worker_spec": worker.to_internal_dict(),
         "version": 1,
-        "preparation_digest": runner._preparation_digest(public, worker, None),
+        "preparation_digest": runner_preparation._preparation_digest(public, worker, None),
     }
     tampered = copy.deepcopy(snapshot)
     tampered["worker_spec"]["environment"].pop("package")
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         run_id=worker.run_id,
         state="provisioning",
         spec=public.to_dict(),
         effective_preparation=tampered,
     )
 
-    recovered = runner.effective_spec_from_status(status)
+    recovered = runner_status.effective_spec_from_status(status)
     assert recovered.environment.package is None
     # the pin survives, so a restage cannot drift to a different commit than the one staged.
     assert recovered.environment.resolved_sha == worker.environment.resolved_sha
@@ -624,16 +634,15 @@ def test_a_stripped_package_restages_from_the_same_pin_instead_of_running_unstag
 
 
 def test_initial_lifecycle_defers_transient_staging_before_training(monkeypatch, tmp_path) -> None:
-    import flash.runner as runner
     from flash.runner.supervise import lifecycle
 
     package, _manifest, _archive, _manifest_path, _archive_path = _staged_files(tmp_path)
     public = _spec(package=None, resolved_sha="")
     unstaged = _spec(package=None, resolved_sha="")
     staged_spec = _spec(package=package)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     status = _prepared_status(public, unstaged)
-    runner._save_status(
+    runner_state._save_status(
         status,
         _run_deadline_at=status.created_at + unstaged.gpu.max_wall_seconds,
     )
@@ -645,9 +654,9 @@ def test_initial_lifecycle_defers_transient_staging_before_training(monkeypatch,
             raise StagedEnvironmentTransientError("connect failed")
         return staged_spec
 
-    monkeypatch.setattr(runner, "stage_environment_package", fake_stage)
+    monkeypatch.setattr(runner_artifacts, "stage_environment_package", fake_stage)
     monkeypatch.setattr(
-        runner,
+        runner_lifecycle,
         "_run_training",
         lambda *_args, **_kwargs: calls.__setitem__("train", calls["train"] + 1),
     )
@@ -656,32 +665,31 @@ def test_initial_lifecycle_defers_transient_staging_before_training(monkeypatch,
 
     lifecycle._run_job(unstaged)
     assert calls == {"stage": 2, "train": 1}
-    assert runner.get_status(unstaged.run_id).state == "provisioning"
+    assert runner_status.get_status(unstaged.run_id).state == "provisioning"
 
 
 def test_staging_deadline_prevents_training_and_provider_allocation(monkeypatch, tmp_path) -> None:
-    import flash.runner as runner
     from flash.runner.supervise import lifecycle
 
     public = _spec(package=None, resolved_sha="")
     unstaged = _spec(package=None, resolved_sha="")
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     status = _prepared_status(public, unstaged)
     status.created_at = time.time() - unstaged.gpu.max_wall_seconds - 1
-    runner._save_status(
+    runner_state._save_status(
         status,
         _run_deadline_at=status.created_at + unstaged.gpu.max_wall_seconds,
     )
     calls = {"train": 0}
     monkeypatch.setattr(
-        runner,
+        runner_artifacts,
         "stage_environment_package",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             StagedEnvironmentTransientError("timed out")
         ),
     )
     monkeypatch.setattr(
-        runner,
+        runner_lifecycle,
         "_run_training",
         lambda *_args, **_kwargs: calls.__setitem__("train", calls["train"] + 1),
     )
@@ -690,20 +698,19 @@ def test_staging_deadline_prevents_training_and_provider_allocation(monkeypatch,
     with pytest.raises(RuntimeError, match="deadline exhausted during environment staging"):
         lifecycle._run_job(unstaged)
     assert calls == {"train": 0}
-    assert runner.get_status(unstaged.run_id).state == "failed"
+    assert runner_status.get_status(unstaged.run_id).state == "failed"
 
 
 def test_attach_boundary_schedules_reconciliation_for_staged_transient(
     monkeypatch, tmp_path
 ) -> None:
-    import flash.runner as runner
     from flash.providers.core.base import PollResult
-    from flash.runner.supervise import attach, deploy
+    from flash.runner.supervise import attach
 
     package, _manifest, _archive, _manifest_path, _archive_path = _staged_files(tmp_path)
     public = _spec(package=None, resolved_sha="")
     worker = _spec(package=package)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     remote = {
         "provider": "runpod",
         "endpoint_id": "ep",
@@ -714,7 +721,7 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
     }
     status = _prepared_status(public, worker, state="running")
     status.remote = remote
-    runner._save_status(
+    runner_state._save_status(
         status,
         _run_deadline_at=status.created_at + worker.gpu.max_wall_seconds,
     )
@@ -745,7 +752,7 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
         ),
     )
     monkeypatch.setattr(
-        deploy,
+        attach,
         "_schedule_attach_reconciliation",
         lambda *args: scheduled.append(args) or True,
     )
@@ -759,15 +766,14 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
 def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocating(
     monkeypatch, tmp_path
 ) -> None:
-    import flash.runner as runner
     from flash.providers.core.base import PollResult
-    from flash.runner.supervise import attach, deploy
+    from flash.runner.supervise import attach
     from flash.runner.supervise import lifecycle as supervise_lifecycle
 
     package, _manifest, _archive, _manifest_path, _archive_path = _staged_files(tmp_path)
     public = _spec(package=None, resolved_sha="")
     worker = _spec(package=package)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     remote = {
         "provider": "runpod",
         "endpoint_id": "ep",
@@ -779,7 +785,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
     status = _prepared_status(public, worker, state="running")
     status.remote = remote
     deadline_at = status.created_at + worker.gpu.max_wall_seconds
-    runner._save_status(status, _run_deadline_at=deadline_at)
+    runner_state._save_status(status, _run_deadline_at=deadline_at)
     context = SimpleNamespace(
         worker_spec=worker,
         persisted_remote=remote,
@@ -828,13 +834,13 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
     )
     monkeypatch.setattr(supervise_lifecycle, "_runpod_completed_metrics", lambda *_a, **_k: None)
     monkeypatch.setattr(supervise_lifecycle, "_strict_teardown_handle", lambda *_a, **_k: True)
-    monkeypatch.setattr(runner, "stage_environment_package", transient_stage)
-    monkeypatch.setattr(runner, "_compare_and_clear_remote", record_clear)
-    monkeypatch.setattr(runner, "_compare_and_fail_remote", record_fail)
-    monkeypatch.setattr(runner, "_run_training", forbidden_training)
+    monkeypatch.setattr(runner_artifacts, "stage_environment_package", transient_stage)
+    monkeypatch.setattr(runner_reconciliation, "_compare_and_clear_remote", record_clear)
+    monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", record_fail)
+    monkeypatch.setattr(runner_lifecycle, "_run_training", forbidden_training)
     monkeypatch.setattr("flash.providers.core.allocator.allocate", forbidden_allocation)
     monkeypatch.setattr(
-        deploy,
+        attach,
         "_schedule_attach_reconciliation",
         lambda *args: scheduled.append(args) or True,
     )
@@ -854,7 +860,6 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
 def test_worker_cleans_materialized_package_after_training_handler(
     monkeypatch, tmp_path, handler_fails
 ) -> None:
-    from flash.engine import worker
     from flash.envs.loading.staged import StagedEnvironmentMaterialization
 
     class WorkerExited(BaseException):
@@ -864,36 +869,36 @@ def test_worker_cleans_materialized_package_after_training_handler(
     root.mkdir()
     entrypoint = root / "environment.py"
     entrypoint.write_text("VALUE = 1\n", encoding="utf-8")
-    worker.ACTIVE_ENV_PACKAGE = StagedEnvironmentMaterialization(root, entrypoint)
+    worker_state.ACTIVE_ENV_PACKAGE = StagedEnvironmentMaterialization(root, entrypoint)
 
     def handler() -> None:
         assert root.is_dir()
         if handler_fails:
             raise RuntimeError("training failed")
 
-    monkeypatch.setattr(worker, "RUN_MODE", "sft")
-    monkeypatch.setattr(worker, "JOB_SPEC", None)
-    monkeypatch.setattr(worker, "HF_REPO", "")
-    monkeypatch.setattr(worker, "run_sft", handler)
-    monkeypatch.setattr(worker, "_disable_xet_upload_staging", lambda: None)
-    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: None)
-    monkeypatch.setattr(worker, "_preflight_gpu_occupancy_for_spec", lambda: None)
-    monkeypatch.setattr(worker, "_force_fla_triton_gdn_on_sm100", lambda: None)
-    monkeypatch.setattr(worker, "_ensure_fla_fastpath_on_hopper", lambda: None)
-    monkeypatch.setattr(worker, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)
-    monkeypatch.setattr(worker, "gpu_diagnostics", lambda **_kwargs: {})
-    monkeypatch.setattr(worker, "heartbeat", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(worker, "load_mega_cache", lambda: None)
+    monkeypatch.setattr(worker_state, "RUN_MODE", "sft")
+    monkeypatch.setattr(worker_state, "JOB_SPEC", None)
+    monkeypatch.setattr(worker_state, "HF_REPO", "")
+    monkeypatch.setattr(worker_sft, "run_sft", handler)
+    monkeypatch.setattr(worker_hf, "_disable_xet_upload_staging", lambda: None)
+    monkeypatch.setattr(worker_state, "_remaining_worker_wall_seconds", lambda: None)
+    monkeypatch.setattr(worker_entry, "_preflight_gpu_occupancy_for_spec", lambda: None)
+    monkeypatch.setattr(worker_perf, "_force_fla_triton_gdn_on_sm100", lambda: None)
+    monkeypatch.setattr(worker_perf, "_ensure_fla_fastpath_on_hopper", lambda: None)
+    monkeypatch.setattr(worker_perf, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)
+    monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_kernel_warmup, "load_mega_cache", lambda: None)
     monkeypatch.setattr(
-        worker.os,
+        worker_entry.os,
         "_exit",
         lambda _code: (_ for _ in ()).throw(WorkerExited()),
     )
 
     expected = RuntimeError if handler_fails else WorkerExited
     with pytest.raises(expected):
-        worker._run_worker_mode()
-    assert worker.ACTIVE_ENV_PACKAGE is None
+        worker_entry._run_worker_mode()
+    assert worker_state.ACTIVE_ENV_PACKAGE is None
     assert not root.exists()
 
 

@@ -18,7 +18,9 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from flash.engine.worker.runtime.pkg_proxy import W as _w
+import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.perf as _worker_perf
+import flash.engine.worker.runtime.state as _worker_state
 from flash.engine.worker.train.entry.sft_train import (
     SHIM_FRAGMENT_FAILED_EXIT_CODE,
     _export_checkpoint_adapter,
@@ -26,6 +28,10 @@ from flash.engine.worker.train.entry.sft_train import (
 )
 from flash.engine.worker.train.opd.bridging.bridge import _TeacherAlignmentBridge
 from flash.engine.worker.train.opd.child.bridge import _render_rollout_failure
+from flash.engine.worker.train.opd.orchestration.protocol import (
+    PERMANENT_TEACHER_EXIT,
+    TRANSIENT_TEACHER_EXIT,
+)
 from flash.engine.worker.verl.checkpoints import (
     checkpoint_world_size,
     resume_checkpoint_is_loadable,
@@ -177,38 +183,46 @@ def _raise_verl_failure(
     if mutation_failure is not None:
         classification, message = mutation_failure
         if classification == "transient":
-            raise _w.RetriableInfraError(f"optimizer marker failure: {message}")
+            raise _worker_perf.RetriableInfraError(f"optimizer marker failure: {message}")
         raise RuntimeError(f"permanent optimizer marker failure: {message}")
     if cycle_commit_failure is not None:
         classification, message = cycle_commit_failure
         if classification == "transient":
-            raise _w.RetriableInfraError(f"pre-update cycle commitment failure: {message}")
+            raise _worker_perf.RetriableInfraError(
+                f"pre-update cycle commitment failure: {message}"
+            )
         raise RuntimeError(f"permanent pre-update cycle commitment failure: {message}")
     if no_signal_failure is not None:
         classification, message = no_signal_failure
         if classification == "transient":
-            raise _w.RetriableInfraError(f"transient no-signal notification failure: {message}")
+            raise _worker_perf.RetriableInfraError(
+                f"transient no-signal notification failure: {message}"
+            )
         raise RuntimeError(f"permanent no-signal notification failure: {message}")
     if score_delivery_failure is not None:
         classification, message = score_delivery_failure
         if classification == "transient":
-            raise _w.RetriableInfraError(f"transient teacher score delivery failure: {message}")
+            raise _worker_perf.RetriableInfraError(
+                f"transient teacher score delivery failure: {message}"
+            )
         raise RuntimeError(f"permanent teacher score delivery failure: {message}")
     if teacher_failure is not None:
         classification, message = teacher_failure
         if classification == "transient":
-            raise _w.RetriableInfraError(
+            raise _worker_perf.RetriableInfraError(
                 f"transient teacher failure after bounded retries: {message}"
             )
         raise RuntimeError(f"permanent teacher failure: {message}")
     if rollout_failure is not None:
         detail = _render_rollout_failure(rollout_failure)
         if rollout_failure["classification"] == "transient":
-            raise _w.RetriableInfraError(f"transient multi-turn OPD rollout failure: {detail}")
+            raise _worker_perf.RetriableInfraError(
+                f"transient multi-turn OPD rollout failure: {detail}"
+            )
         raise RuntimeError(f"permanent multi-turn OPD rollout failure: {detail}")
-    if return_code == _TRANSIENT_TEACHER_EXIT:
-        raise _w.RetriableInfraError("transient teacher bridge failure")
-    if return_code == _PERMANENT_TEACHER_EXIT:
+    if return_code == TRANSIENT_TEACHER_EXIT:
+        raise _worker_perf.RetriableInfraError("transient teacher bridge failure")
+    if return_code == PERMANENT_TEACHER_EXIT:
         raise RuntimeError("permanent teacher bridge failure")
     if return_code == SHIM_FRAGMENT_FAILED_EXIT_CODE:
         # permanent, not retriable infra: the same interpreter fails the same fragment on retry.
@@ -338,7 +352,7 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
                 # opd publishes only required steps, and a required publish raises rather than
                 # returning None, so reaching the next line IS the durable fact. sft needs a
                 # returned-subfolder check because its `required` varies per step.
-                _w.publish_deployable_checkpoint(
+                _worker_hf.publish_deployable_checkpoint(
                     adapter_dir,
                     step,
                     required=True,
@@ -346,7 +360,7 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
                 )
                 self.lifecycle.mark_deployable_published(step)
 
-        uploaded = _w.upload_resume_checkpoint(
+        uploaded = _worker_hf.upload_resume_checkpoint(
             step,
             checkpoint_dir,
             before_upload=publish_required_adapter,
@@ -365,11 +379,11 @@ def _restore_verl_resume(
     update_horizon: int,
     world_size: int,
 ) -> tuple[int, dict | None]:
-    revision = _w.OPD_RESUME_REVISION or None
+    revision = _worker_state.OPD_RESUME_REVISION or None
     # no `prefer`: opd pins an exact commit via OPD_RESUME_REVISION with fail_closed, and
     # validate_opd_resume_state_metadata is keyed to that checkpoint's step, so silently picking a
     # different candidate here would violate the retry contract those enforce.
-    resume = _w.hf_resume_checkpoint(fail_closed=bool(revision), revision=revision)
+    resume = _worker_hf.hf_resume_checkpoint(fail_closed=bool(revision), revision=revision)
     if not resume:
         return 0, None
     match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(resume))
@@ -398,7 +412,7 @@ def _restore_verl_resume(
         return 0, None
     with open(os.path.join(resume, "opd_state.json"), encoding="utf-8") as file:
         state = validate_opd_resume_state_metadata(
-            json.load(file), expected_seed=int(_w.SEED), checkpoint_step=step
+            json.load(file), expected_seed=int(_worker_state.SEED), checkpoint_step=step
         )
     if state["prompt_pool_fingerprint"] != prompt_pool_fingerprint:
         raise RuntimeError("OPD resume prompt pool does not match the current run")
@@ -409,12 +423,3 @@ def _restore_verl_resume(
     with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
         file.write(str(step))
     return step, state
-
-
-# the teacher exit codes the child uses, defined in the orchestrator. imported at the BOTTOM
-# because `opd_train` imports this module, so a top-level import would be circular. neither is
-# monkeypatched, so binding them once at import time is safe.
-from flash.engine.worker.train.entry.opd_train import (  # noqa: E402
-    _PERMANENT_TEACHER_EXIT,
-    _TRANSIENT_TEACHER_EXIT,
-)

@@ -24,12 +24,12 @@ from referencing.exceptions import Unresolvable
 from flash.adapters.lora_rank import serving_completion_token_capacity
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.core.spec import JobSpec
-from flash.serve.contract.contract import LORA_REQUEST_ATTESTATION_CAPABILITY
-from flash.serve.deployment.deploy import (
+from flash.serve.contract.errors import (
     AliasThinkingSilent,
     RetryableServingUnavailable,
     ServingError,
 )
+from flash.serve.contract.protocol import LORA_REQUEST_ATTESTATION_CAPABILITY
 from flash.serve.deployment.preflight import (
     SERVING_PROMPT_TOKEN_ALLOWANCE,
     ExternalSchemaReference,

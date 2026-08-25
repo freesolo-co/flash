@@ -13,6 +13,11 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.runner.lifecycle.attempts as runner_attempts
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.supervise.lifecycle as runner_lifecycle
+import flash.runner.supervise.transitions as runner_transitions
 from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 from flash.server.domain.teacher import broker as teacher_broker
 from flash.server.platform import db
@@ -1826,18 +1831,21 @@ def test_current_nonterminal_attempt_is_checked_on_every_admission(monkeypatch):
         train=TrainSpec(teacher_model="glm-5.2"),
         run_id="run-1",
     )
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "get_status", lambda _run_id: SimpleNamespace(state="running"))
-    monkeypatch.setattr(runner, "_latest_reserved_attempt", lambda _run_id: 2)
-    monkeypatch.setattr(runner, "_internal_spec_from_status", lambda _status: spec)
+    monkeypatch.setattr(
+        runner_status, "get_status", lambda _run_id: SimpleNamespace(state="running")
+    )
+    monkeypatch.setattr(runner_attempts, "_latest_reserved_attempt", lambda _run_id: 2)
+    monkeypatch.setattr(runner_state, "_internal_spec_from_status", lambda _status: spec)
     teacher_broker._require_current_attempt(capability)
 
-    monkeypatch.setattr(runner, "_latest_reserved_attempt", lambda _run_id: 3)
+    monkeypatch.setattr(runner_attempts, "_latest_reserved_attempt", lambda _run_id: 3)
     with pytest.raises(teacher_broker.TeacherBrokerError, match="attempt_replaced"):
         teacher_broker._require_current_attempt(capability)
 
-    monkeypatch.setattr(runner, "get_status", lambda _run_id: SimpleNamespace(state="cancelled"))
+    monkeypatch.setattr(
+        runner_status, "get_status", lambda _run_id: SimpleNamespace(state="cancelled")
+    )
     with pytest.raises(teacher_broker.TeacherBrokerError, match="run_not_active"):
         teacher_broker._require_current_attempt(capability)
 
@@ -2025,7 +2033,6 @@ def test_old_attempt_context_exit_does_not_revoke_new_attempt_token(broker_db, m
 
 
 def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypatch):
-    import flash.runner as runner
     from flash.runner.supervise.deploy import cancel_run
 
     events = []
@@ -2042,18 +2049,18 @@ def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypa
         lambda run_id: events.append(("revoke", run_id)) or 1,
     )
     monkeypatch.setattr(
-        runner,
+        runner_status,
         "get_status",
         lambda run_id: events.append(("status", run_id)) or status,
     )
-    monkeypatch.setattr(runner, "effective_spec_from_status", lambda _status: None)
-    monkeypatch.setattr(runner, "mark_deployment_undeployed", lambda _run_id: None)
+    monkeypatch.setattr(runner_status, "effective_spec_from_status", lambda _status: None)
+    monkeypatch.setattr(runner_transitions, "mark_deployment_undeployed", lambda _run_id: None)
 
     def mark_cancelled(_run_id, state, **_updates):
         status.state = state
         return status
 
-    monkeypatch.setattr(runner, "_update", mark_cancelled)
+    monkeypatch.setattr(runner_status, "_update", mark_cancelled)
 
     assert cancel_run("run-1") is status
     assert status.state == "cancelled"
@@ -2068,7 +2075,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     from flash.providers._lifecycle.net.worker import build_worker_env
     from flash.providers.core.base import PollResult
     from flash.providers.lambda_.jobs.builders import build_payload as build_lambda_payload
-    from flash.providers.runpod.execution import jobs as runpod_jobs
+    from flash.providers.runpod.execution import job_execution as runpod_job_execution
     from flash.providers.vast.jobs.builders import build_payload as build_vast_payload
 
     spec = JobSpec(
@@ -2104,7 +2111,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     )
     captured = {}
     monkeypatch.setattr(
-        runpod_jobs,
+        runpod_job_execution,
         "deploy_train_endpoint",
         lambda *_args, **_kwargs: ("endpoint-id", "endpoint-name", "key-fingerprint"),
     )
@@ -2113,13 +2120,13 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
         captured["payload"] = payload
         return "job-id"
 
-    monkeypatch.setattr(runpod_jobs.runpod_api, "submit_job", submit_job)
+    monkeypatch.setattr(runpod_job_execution.runpod_api, "submit_job", submit_job)
     monkeypatch.setattr(
-        runpod_jobs,
+        runpod_job_execution,
         "poll_job",
         lambda *_args, **_kwargs: PollResult(True, metrics={}),
     )
-    runpod_jobs.submit_run(
+    runpod_job_execution.submit_run(
         spec,
         42,
         attempt=0,
@@ -2217,15 +2224,14 @@ def test_broker_gate_reason_survives_into_the_persisted_run_error(tmp_path, monk
     spec landed on that identical string, so the run itself could not say which had happened.
     """
     import flash.providers.core.allocator as allocator
-    import flash.runner as runner
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
     from flash.runner.supervise import lifecycle
 
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     monkeypatch.delenv(missing, raising=False)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     (tmp_path / "runs").mkdir()
 
     def unexpected_allocation(*_args, **_kwargs):
@@ -2238,14 +2244,14 @@ def test_broker_gate_reason_survives_into_the_persisted_run_error(tmp_path, monk
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-gate-detail",
     )
-    runner._save_status(RunStatus(run_id="run-gate-detail", state="queued", spec={}))
+    runner_state._save_status(RunStatus(run_id="run-gate-detail", state="queued", spec={}))
 
     # catch the BASE type on purpose: against the unfixed handler this test must reach the
     # assertions below and fail on the flattened message, not stop early on a missing symbol.
     with pytest.raises(RuntimeError):
         lifecycle._run_job_inner(spec, str(tmp_path / "log.txt"), lambda *_a, **_k: None)
 
-    status = runner.get_status("run-gate-detail")
+    status = runner_status.get_status("run-gate-detail")
     assert status.state == "failed"
     # the specific env var is what tells an operator which side is misconfigured
     assert missing in (status.error or "")
@@ -2258,31 +2264,30 @@ def test_unrelated_run_failures_keep_their_message_redacted(tmp_path, monkeypatc
     `RunStatus.error` is user-visible, so preserving `str(exc)` wholesale would publish internal
     storage paths and upstream bodies. Only the typed configuration gate opts back in.
     """
-    import flash.runner as runner
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
     from flash.runner.supervise import lifecycle
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     (tmp_path / "runs").mkdir()
     raw = "/internal/artifacts/secret-path exploded"
 
     def boom(*_args, **_kwargs):
         raise RuntimeError(raw)
 
-    monkeypatch.setattr(runner, "_run_training", boom)
+    monkeypatch.setattr(runner_lifecycle, "_run_training", boom)
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-generic-failure",
     )
-    runner._save_status(RunStatus(run_id="run-generic-failure", state="queued", spec={}))
+    runner_state._save_status(RunStatus(run_id="run-generic-failure", state="queued", spec={}))
 
     with pytest.raises(RuntimeError):
         lifecycle._run_job_inner(spec, str(tmp_path / "log.txt"), lambda *_a, **_k: None)
 
-    status = runner.get_status("run-generic-failure")
+    status = runner_status.get_status("run-generic-failure")
     assert status.error == "RuntimeError: run failed"
     assert raw not in (status.error or "")
 
@@ -2296,14 +2301,13 @@ def test_dry_run_rejects_an_unservable_opd_spec_before_creating_a_run(
     Hoisting it into submit-time validation means the misconfiguration is reported by the preview
     that exists to catch exactly this, and no run row is written for work that cannot start.
     """
-    import flash.runner as runner
     from flash.runner.lifecycle.submit import submit_job
 
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     monkeypatch.delenv(missing, raising=False)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     (tmp_path / "runs").mkdir()
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -2322,13 +2326,12 @@ def test_dry_run_rejects_an_unservable_opd_spec_before_creating_a_run(
 
 def test_dry_run_still_previews_a_servable_opd_spec(tmp_path, monkeypatch):
     """The hoisted gate must not reject a correctly configured plane: paired control for the above."""
-    import flash.runner as runner
     from flash.runner.lifecycle.submit import submit_job
 
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     (tmp_path / "runs").mkdir()
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",

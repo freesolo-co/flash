@@ -17,10 +17,10 @@ import json
 import os
 import time
 
-import flash.runner as runner
 from flash.core.spec import JobSpec
 from flash.core.spec_persistence import validate_persisted_spec_envelope
-from flash.runner import RunStatus
+from flash.runner.lifecycle import attempts, preparation, reporting, state
+from flash.runner.lifecycle.state import RunStatus
 
 # every other collaborator is reached through `runner.` rather than bound here. `RUNS_DIR`,
 # `get_status`, `_update`, `effective_spec_from_status`, `_gpu_rate`, `_internal_spec_from_status`
@@ -34,14 +34,14 @@ def _runstatus_from_json(d: dict) -> RunStatus:
     # malformed persisted identity must fail closed rather than be treated as a legacy absence.
     values = {k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__}
     if d.get("source_snapshot") is not None:
-        from flash.snapshot.source_snapshot import parse_descriptor
+        from flash.snapshot.archive import parse_descriptor
 
         values["source_snapshot"] = parse_descriptor(d["source_snapshot"]).to_dict()
     return RunStatus(**values)
 
 
 def _load_status_json(run_id: str) -> dict:
-    path = runner.runs_file_path(run_id, ".json")
+    path = state.runs_file_path(run_id, ".json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"unknown run_id: {run_id}")
     with open(path) as f:
@@ -52,7 +52,7 @@ def _load_status_json(run_id: str) -> dict:
 
 
 def get_status(run_id: str) -> RunStatus:
-    return runner._runstatus_from_json(runner._load_status_json(run_id))
+    return _runstatus_from_json(_load_status_json(run_id))
 
 
 def source_snapshot_from_status(status: RunStatus, *, required: bool = False) -> dict | None:
@@ -64,7 +64,7 @@ def source_snapshot_from_status(status: RunStatus, *, required: bool = False) ->
                 "managed source identity is unavailable; descriptor-less attempts cannot be replaced"
             )
         return None
-    from flash.snapshot.source_snapshot import parse_descriptor
+    from flash.snapshot.archive import parse_descriptor
 
     return parse_descriptor(raw).to_dict()
 
@@ -95,7 +95,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     if not isinstance(raw_worker, dict):
         raise ValueError("persisted effective preparation is malformed")
     worker_spec = JobSpec.from_dict(raw_worker)
-    runner._validate_effective_spec(public_spec, worker_spec)
+    preparation._validate_effective_spec(public_spec, worker_spec)
     expected = snapshot.get("adapter_identity")
     stored_digest = snapshot.get("preparation_digest")
     if stored_digest is not None:
@@ -123,7 +123,9 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     if (has_workload_profile or worker_spec.model_revision_auto) and (
         not isinstance(stored_digest, str)
         or stored_digest
-        != runner._preparation_digest(public_spec, worker_spec, expected, stored_public=status.spec)
+        != preparation._preparation_digest(
+            public_spec, worker_spec, expected, stored_public=status.spec
+        )
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
@@ -132,7 +134,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
                 f"warm-start source {public_spec.train.init_from_adapter!r} cannot be recovered "
                 "because its original artifact identity is unavailable"
             )
-        if not isinstance(stored_digest, str) or stored_digest != runner._preparation_digest(
+        if not isinstance(stored_digest, str) or stored_digest != preparation._preparation_digest(
             public_spec, worker_spec, expected, stored_public=status.spec
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
@@ -187,7 +189,7 @@ def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = Fa
     failed, so a run authored for up to 4 cards can never again be offered a 4-card shape. gpu.count
     is a CEILING, so restoring it re-widens the search rather than forcing a size.
     """
-    worker_spec = runner.effective_spec_from_status(status, verify_source=verify_source)
+    worker_spec = effective_spec_from_status(status, verify_source=verify_source)
     public_gpu = JobSpec.from_dict(status.spec).gpu
     # `gpu_count_auto` needs no restoring here: it is provenance, so the worker half carries it
     # verbatim through allocation. The public half cannot supply it -- to_dict strips the marker and
@@ -213,27 +215,27 @@ def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = Fa
 
 
 def list_runs() -> list[RunStatus]:
-    os.makedirs(runner.RUNS_DIR, exist_ok=True)
+    os.makedirs(state.RUNS_DIR, exist_ok=True)
     runs = []
-    for name in sorted(os.listdir(runner.RUNS_DIR)):
+    for name in sorted(os.listdir(state.RUNS_DIR)):
         if name.endswith(".json"):
-            with open(os.path.join(runner.RUNS_DIR, name)) as f:
-                runs.append(runner._runstatus_from_json(json.load(f)))
+            with open(os.path.join(state.RUNS_DIR, name)) as f:
+                runs.append(_runstatus_from_json(json.load(f)))
     return runs
 
 
 def list_run_ids() -> list[str]:
     """Run ids by filename only (no JSON parse) so a corrupt record can't break the listing."""
-    os.makedirs(runner.RUNS_DIR, exist_ok=True)
+    os.makedirs(state.RUNS_DIR, exist_ok=True)
     return [
         name[: -len(".json")]
-        for name in sorted(os.listdir(runner.RUNS_DIR))
+        for name in sorted(os.listdir(state.RUNS_DIR))
         if name.endswith(".json")
     ]
 
 
 def get_logs(run_id: str) -> str:
-    log_path = runner.runs_file_path(run_id, ".log")
+    log_path = state.runs_file_path(run_id, ".log")
     if not os.path.exists(log_path):
         return ""
     with open(log_path) as f:
@@ -257,7 +259,7 @@ def _sanitize_status_value(value, *, depth: int = 0, field: str = ""):
             values = value[-_STATUS_METRICS_HISTORY_LIMIT:]
         else:
             values = value[:_STATUS_LIST_LIMIT]
-        return [runner._sanitize_status_value(v, depth=depth + 1) for v in values]
+        return [_sanitize_status_value(v, depth=depth + 1) for v in values]
     if isinstance(value, dict):
         out = {}
         for i, (k, v) in enumerate(value.items()):
@@ -265,9 +267,7 @@ def _sanitize_status_value(value, *, depth: int = 0, field: str = ""):
                 out["truncated"] = True
                 break
             sanitized_key = str(k)[:120]
-            out[sanitized_key] = runner._sanitize_status_value(
-                v, depth=depth + 1, field=sanitized_key
-            )
+            out[sanitized_key] = _sanitize_status_value(v, depth=depth + 1, field=sanitized_key)
         return out
     return str(value)[:500]
 
@@ -276,13 +276,13 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
     """Persist the latest worker heartbeat/GPU snapshot without changing run state."""
     if not run_id or not isinstance(heartbeat, dict):
         return
-    if not os.path.exists(runner.runs_file_path(run_id, ".json")):
+    if not os.path.exists(state.runs_file_path(run_id, ".json")):
         return
-    hb = runner._sanitize_status_value(heartbeat)
+    hb = _sanitize_status_value(heartbeat)
     gpu = hb.get("gpu") if isinstance(hb, dict) else None
-    with runner._status_guard(run_id):
+    with state._status_guard(run_id):
         try:
-            status = runner.get_status(run_id)
+            status = get_status(run_id)
         except FileNotFoundError:
             return
         prev = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
@@ -306,8 +306,8 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         elif not same_attempt:
             status.gpu_status = None
         status.updated_at = time.time()
-        runner._save_status_unlocked(status)
-    runner._report_status(status)
+        state._save_status_unlocked(status)
+    reporting._report_status(status)
 
 
 def validate_terminal_source_metrics(
@@ -319,7 +319,7 @@ def validate_terminal_source_metrics(
     """Require trusted attempt-bound evidence for runs carrying a source descriptor."""
     if not isinstance(metrics, dict):
         raise RuntimeError("terminal metrics are invalid")
-    from flash.snapshot.source_snapshot import (
+    from flash.snapshot.archive import (
         PUBLIC_PROVENANCE_KEY,
         TERMINAL_ATTESTATION_KEY,
         safe_public_projection,
@@ -329,7 +329,7 @@ def validate_terminal_source_metrics(
     sanitized = dict(metrics)
     raw_attestation = sanitized.pop(TERMINAL_ATTESTATION_KEY, None)
     sanitized.pop(PUBLIC_PROVENANCE_KEY, None)
-    descriptor = runner.source_snapshot_from_status(status)
+    descriptor = source_snapshot_from_status(status)
     if descriptor is None:
         return sanitized, None
     if expected_attempt is None:
@@ -338,7 +338,7 @@ def validate_terminal_source_metrics(
         if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
             expected_attempt = candidate
     if expected_attempt is None:
-        expected_attempt = runner._latest_reserved_attempt(status.run_id)
+        expected_attempt = attempts._latest_reserved_attempt(status.run_id)
     if (
         isinstance(expected_attempt, bool)
         or not isinstance(expected_attempt, int)
@@ -367,14 +367,16 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     from flash.engine.result.accounting import sanitize_worker_metrics
 
     metrics = sanitize_worker_metrics(metrics)
-    dest = runner.artifacts_dir(spec)
+    dest = state.artifacts_dir(spec)
     os.makedirs(dest, exist_ok=True)
     # Use allocated_gpu (worker-stamped) not spec.gpu.type; policy GPUs can be reallocated.
     gpu_type = metrics.get("allocated_gpu") or spec.gpu.type
     # the substrate that actually billed the run; empty on a record predating the stamp, in which
     # case _gpu_rate prices off whichever configured provider offers the class.
     provider = str(metrics.get("allocated_provider") or "")
-    rate = runner._gpu_rate(gpu_type, provider)
+    from flash.runner.accounting.costs import _gpu_rate
+
+    rate = _gpu_rate(gpu_type, provider)
     # `hourly_rate` is per CARD, so a sharded run costs the wall times the rate times the number of
     # cards it actually occupied. `allocated_gpu_count` is worker/lifecycle-stamped for the same
     # reason `allocated_gpu` is: the spec's gpu.count is only a ceiling and allocation may pick
@@ -396,13 +398,13 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     with open(os.path.join(dest, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     with contextlib.suppress(Exception):
-        from flash.server.domain.registry.run_registry import record_training_checkpoint
+        from flash.server.domain.registry.runs import record_training_checkpoint
 
         record_training_checkpoint(spec=spec, metrics=metrics, artifact_path=dest)
     return float(cost)
 
 
-def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
+def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
     """Atomically transition run state with terminal-stickiness. Returns False if rejected.
 
     Returns ``True`` if the transition was applied, ``False`` if it was rejected because the run was
@@ -411,23 +413,23 @@ def _update(run_id: str, state: str, *, allow_from_terminal: bool = False, **upd
     concurrently flipped terminal does not get resumed.
     """
     report_status: RunStatus | None = None
-    with runner._status_guard(run_id):
-        status = runner.get_status(run_id)
+    with state._status_guard(run_id):
+        status = get_status(run_id)
         if (
-            status.state in runner.TERMINAL_STATES
-            and state != status.state
+            status.state in state.TERMINAL_STATES
+            and new_state != status.state
             and not allow_from_terminal
         ):
             return False
-        was_terminal = status.state in runner.TERMINAL_STATES
-        status.state = state
+        was_terminal = status.state in state.TERMINAL_STATES
+        status.state = new_state
         status.updated_at = time.time()
-        if not was_terminal and state in runner.TERMINAL_STATES and status.finished_at is None:
+        if not was_terminal and new_state in state.TERMINAL_STATES and status.finished_at is None:
             status.finished_at = status.updated_at
         for key, value in updates.items():
             setattr(status, key, value)
-        runner._save_status_unlocked(status)
+        state._save_status_unlocked(status)
         report_status = status
     if report_status is not None:
-        runner._report_status(report_status)
+        reporting._report_status(report_status)
     return True

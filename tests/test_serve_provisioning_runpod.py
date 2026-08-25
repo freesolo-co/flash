@@ -28,7 +28,7 @@ from flash.serve.provisioning import (
 )
 from flash.serve.provisioning.common import records as _common
 from flash.serve.provisioning.common.records import serving_resource_names
-from flash.serve.provisioning.runpod.lifecycle_entry import (
+from flash.serve.provisioning.runpod.operations import (
     RunPodDataCenterUnsupported,
     _delete_tolerating_ambiguity,
     _observe,

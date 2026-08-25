@@ -150,7 +150,8 @@ def record_training_checkpoint(
 ) -> bool:
     try:
         from flash.engine.result.accounting import sanitize_worker_metrics
-        from flash.runner import adapter_ref, get_status
+        from flash.runner.lifecycle.state import adapter_ref
+        from flash.runner.lifecycle.status import get_status
 
         metrics = sanitize_worker_metrics(metrics)
         status = get_status(spec.run_id)

@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-import flash.runner as runner
+from flash.adapters.artifacts import MAX_ATTEMPT_ID
+from flash.core.spec import JobSpec
+from flash.providers._lifecycle.instances.poll import _attempt_int
+from flash.runner.lifecycle import state
+from flash.runner.lifecycle import status as status_ops
+from flash.teacher.retry_contract import require_opd_retry_contract_version
 
 
 def _infer_next_attempt(raw: dict) -> int:
-    if runner._NEXT_ATTEMPT_KEY not in raw:
+    if state._NEXT_ATTEMPT_KEY not in raw:
         raise RuntimeError("stored next attempt identity is missing")
-    stored = raw[runner._NEXT_ATTEMPT_KEY]
-    if runner._attempt_int(stored) is None:
+    stored = raw[state._NEXT_ATTEMPT_KEY]
+    if _attempt_int(stored) is None:
         raise RuntimeError("stored next attempt identity is invalid")
     return stored
 
@@ -27,7 +32,7 @@ def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
     if not isinstance(hb, dict):
         return False
     try:
-        next_attempt = runner._attempt_int(runner._infer_next_attempt(raw))
+        next_attempt = _attempt_int(_infer_next_attempt(raw))
     except RuntimeError:
         return False
     if next_attempt is None:
@@ -38,7 +43,7 @@ def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
     # the worker's first heartbeat can be read back in either order, and refusing to arm would hand
     # the run a budget measured from a moment before it started working.
     expected = next_attempt - 1 if next_attempt > 0 else 0
-    return runner._attempt_int(hb.get("attempt")) == expected
+    return _attempt_int(hb.get("attempt")) == expected
 
 
 def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]:
@@ -48,23 +53,23 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]
     when nothing is pinned (no mutation) or the shards named no single width. A pinned retry has to
     be allocated at exactly that count -- see ``verify_opd_replacement_safe``.
     """
-    with runner._status_guard(run_id):
-        raw = runner._load_status_json(run_id)
-        status = runner._runstatus_from_json(raw)
+    with state._status_guard(run_id):
+        raw = status_ops._load_status_json(run_id)
+        status = status_ops._runstatus_from_json(raw)
         # hf_repo is platform-managed and stripped from the public status.spec; the opd replacement
         # locates its resume checkpoint by hf_repo, so source the complete internal worker spec.
-        spec = runner._internal_spec_from_status(status)
+        spec = state._internal_spec_from_status(status)
         if spec.algorithm != "opd":
             raise RuntimeError("opd retry verification requires an opd run")
         try:
-            contract_version = runner.require_opd_retry_contract_version(
-                raw.get(runner._OPD_RETRY_CONTRACT_KEY)
+            contract_version = require_opd_retry_contract_version(
+                raw.get(state._OPD_RETRY_CONTRACT_KEY)
             )
         except ValueError as exc:
             raise RuntimeError(
                 "opd retry contract is missing or invalid; replacement is blocked"
             ) from exc
-        next_attempt = runner._infer_next_attempt(raw)
+        next_attempt = _infer_next_attempt(raw)
         hf_repo = spec.train.hf_repo
         # phase is the hf-prefix component the worker uploads under ({phase}/{run_id}/...), so it
         # locates both the markers and any full-state resume checkpoint the replacement can continue
@@ -87,7 +92,7 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]
 
 def _verified_opd_next_attempt(run_id: str) -> int:
     """Return just the verified next attempt, discarding the resume revision."""
-    return runner._verified_opd_retry_state(run_id)[0]
+    return _verified_opd_retry_state(run_id)[0]
 
 
 def _reserve_attempt(
@@ -97,24 +102,24 @@ def _reserve_attempt(
     expected_next_attempt: int | None = None,
 ) -> int:
     """Durably consume one run-global attempt identity before provider creation."""
-    minimum = runner._attempt_int(minimum_attempt)
+    minimum = _attempt_int(minimum_attempt)
     if minimum is None:
         raise RuntimeError("minimum attempt identity is invalid")
     expected = None
     if expected_next_attempt is not None:
-        expected = runner._attempt_int(expected_next_attempt)
+        expected = _attempt_int(expected_next_attempt)
         if expected is None:
             raise RuntimeError("expected next attempt identity is invalid")
-    with runner._status_guard(run_id):
-        raw = runner._load_status_json(run_id)
-        status = runner._runstatus_from_json(raw)
-        current = runner._infer_next_attempt(raw)
+    with state._status_guard(run_id):
+        raw = status_ops._load_status_json(run_id)
+        status = status_ops._runstatus_from_json(raw)
+        current = _infer_next_attempt(raw)
         if expected is not None and current != expected:
             raise RuntimeError("stored next attempt identity changed after retry verification")
-        spec = runner.JobSpec.from_dict(status.spec)
+        spec = JobSpec.from_dict(status.spec)
         if spec.algorithm == "opd":
             try:
-                runner.require_opd_retry_contract_version(raw.get(runner._OPD_RETRY_CONTRACT_KEY))
+                require_opd_retry_contract_version(raw.get(state._OPD_RETRY_CONTRACT_KEY))
             except ValueError as exc:
                 raise RuntimeError(
                     "opd retry contract is missing or invalid; replacement is blocked"
@@ -126,17 +131,17 @@ def _reserve_attempt(
             attempt = expected
         else:
             attempt = max(current, minimum)
-        if attempt >= runner.MAX_ATTEMPT_ID:
+        if attempt >= MAX_ATTEMPT_ID:
             raise RuntimeError("run attempt identity is exhausted")
-        runner._save_status_unlocked(status, _next_attempt=attempt + 1)
+        state._save_status_unlocked(status, _next_attempt=attempt + 1)
         return attempt
 
 
 def _latest_reserved_attempt(run_id: str) -> int | None:
     """Return the newest durably reserved attempt, or none before any reservation."""
     try:
-        raw = runner._load_status_json(run_id)
-        next_attempt = runner._infer_next_attempt(raw)
+        raw = status_ops._load_status_json(run_id)
+        next_attempt = _infer_next_attempt(raw)
     except Exception:
         return None
     return next_attempt - 1 if next_attempt > 0 else None

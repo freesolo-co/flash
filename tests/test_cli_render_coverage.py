@@ -383,6 +383,11 @@ def test_cost_panel_grpo_with_teacher_and_wall_cap(styled_plain) -> None:
     assert "heads up: capped" in out  # notes section rendered
 
 
+def test_server_backed_sft_total_uses_billing_round_half_up(styled_plain) -> None:
+    assert f"{1.005:.2f}" == "1.00", "the fixture must expose half-even formatting"
+    assert "$1.01" in render.sft_cost_panel([("run", "model  [SFT]")], 1.005)
+
+
 def test_cost_panel_sft_omits_optional_sections(styled_plain) -> None:
     est = types.SimpleNamespace(
         method="sft",
@@ -464,7 +469,7 @@ def test_settled_cost_states_cover_every_runner_terminal_state() -> None:
     instead of importing them. If the runner ever adds a terminal state, this fails here rather
     than silently showing a settled charge as an estimate forever.
     """
-    from flash.runner import TERMINAL_STATES
+    from flash.runner.lifecycle.state import TERMINAL_STATES
 
     assert TERMINAL_STATES | {"deployed"} == render.SETTLED_COST_STATES
 
@@ -518,7 +523,7 @@ def test_a_failed_run_that_never_measured_a_charge_is_not_reported_as_settled_ze
 def test_realized_cogs_is_never_shown_as_the_customers_cost() -> None:
     """``realized_cost_usd`` is provider COGS, not what the customer is charged.
 
-    ``runner.RunStatus`` says so directly: it is pulled from the provider's billing API by
+    ``runner_state.RunStatus`` says so directly: it is pulled from the provider's billing API by
     reconciliation and is "distinct from ``cost_usd`` (the flash.cost ESTIMATE we charge the
     customer)". Promoting it into the cost slot would bill the user our internal spend, and
     ``run_status`` already prints it on its own dedicated ``realized`` row.
