@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import flash.engine.worker.io.heartbeat as worker_heartbeat
+import flash.engine.worker.io.progress as worker_progress
 import flash.engine.worker.model.adapter as worker_adapter
 
 
@@ -264,7 +264,7 @@ def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
     monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: None)
     monkeypatch.setattr(hf, "_hf_cache_bytes", lambda *args, **kwargs: 0)
     monkeypatch.setattr(hf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_progress, "publish_progress", lambda *args, **kwargs: None)
 
     assert hf.load_tokenizer("org/model", revision="refs/pr/123") is not None
     hf.prefetch_model("org/model", revision="refs/pr/123")
@@ -313,255 +313,6 @@ def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
     assert diag["power_w"] == 412.5
     assert diag["processes"][0]["process_name"] == "/usr/bin/python"
     assert diag["processes"][0]["used_memory_gb"] == pytest.approx(23.34, rel=1e-3)
-
-
-def test_heartbeat_commit_is_throttled(monkeypatch):
-    """heartbeat() must rate-limit HF commits (per-step commits blow HF's 128/hour repo cap),
-    while always committing milestone stages."""
-    monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker.io.heartbeat as w
-
-    calls = []
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, **k: calls.append(a[1]))
-
-    # Large interval -> only milestone + the first commit; per-step heartbeats throttled.
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 9999.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 0.0)
-    worker_heartbeat.heartbeat("rl_start")  # milestone -> commits
-    worker_heartbeat.heartbeat("rl_step", step=1)  # throttled
-    worker_heartbeat.heartbeat("rl_step", step=2)  # throttled
-    assert calls.count("heartbeat.json") == 1
-
-    # Zero interval -> every call commits.
-    calls.clear()
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 0.0)
-    worker_heartbeat.heartbeat("rl_step", step=1)
-    worker_heartbeat.heartbeat("rl_step", step=2)
-    assert len(calls) == 2
-
-
-@pytest.mark.parametrize(
-    "stage", ["model_prefetching", "sft_pretokenizing", "sft_initializing", "rl_initializing"]
-)
-def test_setup_progress_heartbeats_are_throttled(monkeypatch, stage):
-    """The periodic setup pings run on a side thread every 30s through a long phase (a cold
-    snapshot_download can pull tens of GB for ~40 min, and disaggregated workers share one HF_REPO),
-    so their HF UPLOAD must be throttled like rl_step or they blow HF's 128/hour repo commit cap. The
-    "HEARTBEAT" stderr line still prints every call (the only per-call side effect now — HF is the one
-    durable channel); this pins only that the repeated stage does NOT commit to HF on every call."""
-    monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker.io.heartbeat as w
-
-    calls = []
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, **k: calls.append(a[1]))
-    # Large interval -> only the FIRST emit of the stage commits; the rest are upload-throttled.
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 9999.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 0.0)
-    worker_heartbeat.heartbeat(stage, elapsed_seconds=1)
-    worker_heartbeat.heartbeat(stage, elapsed_seconds=31)
-    worker_heartbeat.heartbeat(stage, elapsed_seconds=61)
-    assert calls.count("heartbeat.json") == 1, f"{stage} must be upload-throttled, got {calls}"
-
-
-def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
-    """Perf regression guard: the synchronous hf_upload_file network call must run OUTSIDE
-    _HB_LOCK. Holding the lock across the upload serializes the trainer's per-step reward
-    callback behind the checkpoint daemon's HF commit during GRPO."""
-    monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker.io.heartbeat as w
-
-    # When hf_upload_file is invoked, the lock must be acquirable (i.e. not held).
-    lock_free_during_upload = []
-
-    def fake_upload(*a, **k):
-        acquired = w._HB_LOCK.acquire(blocking=False)
-        lock_free_during_upload.append(acquired)
-        if acquired:
-            w._HB_LOCK.release()
-
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", fake_upload)
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 0.0)
-    worker_heartbeat.heartbeat("rl_start")
-    assert lock_free_during_upload == [True], "hf_upload_file must run with _HB_LOCK released"
-
-
-def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
-    """A wedged upload holding _HB_UPLOAD_LOCK must not block the NEXT heartbeat. A milestone like
-    model_prefetched (unthrottled, on the worker's critical path right before trainer construction)
-    must skip its best-effort commit after a bounded wait rather than wedge the worker."""
-    import importlib
-    import time as _time
-
-    # NB: resolve the submodule explicitly (the package re-exports the heartbeat() function).
-    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
-
-    monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker.io.heartbeat as w
-
-    monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
-    uploads = []
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, **k: uploads.append(a))
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
-    sentinel_last_upload = 123.0  # a prior successful-commit timestamp the skip must NOT clobber
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", sentinel_last_upload)
-
-    assert hbmod._HB_UPLOAD_LOCK.acquire(blocking=False), "lock should be free at test start"
-    try:
-        t0 = _time.monotonic()
-        worker_heartbeat.heartbeat("model_prefetched")  # must NOT block on the held lock
-        elapsed = _time.monotonic() - t0
-    finally:
-        hbmod._HB_UPLOAD_LOCK.release()
-
-    assert elapsed < 5.0, f"heartbeat wedged on the held upload lock ({elapsed:.2f}s)"
-    assert uploads == [], "the best-effort commit must be skipped while the lock is stuck"
-    # The skipped upload must ROLL BACK its optimistic slot claim — otherwise the throttle defers the
-    # next real commit and the throttle treats a stale channel as fresh.
-    assert sentinel_last_upload == worker_heartbeat._HB_LAST_UPLOAD, (
-        f"a skipped commit must not advance _HB_LAST_UPLOAD (got {worker_heartbeat._HB_LAST_UPLOAD})"
-    )
-
-
-def test_heartbeat_rolls_back_slot_when_upload_reports_failure(monkeypatch):
-    """The optimistic _HB_LAST_UPLOAD slot is claimed BEFORE the best-effort HF commit. If that commit
-    fails, hf_upload_file swallows the error and returns False (it never raises on best-effort) — HF is
-    still stale, so the slot must roll back exactly as the lock-timeout skip does. Otherwise the
-    throttle defers the next retry on the strength of an upload that never happened.
-    """
-    import importlib
-
-    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
-
-    monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker.io.heartbeat as w
-
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
-    sentinel_last_upload = (
-        123.0  # a prior successful-commit timestamp the failed retry must restore
-    )
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", sentinel_last_upload)
-
-    calls = []
-    # Mirror the real hf_upload_file contract: best-effort failure returns False (does not raise).
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, **k: (calls.append(a[1]), False)[1])
-
-    worker_heartbeat.heartbeat("model_prefetched")
-
-    assert calls == ["heartbeat.json"], "the upload must actually be attempted"
-    assert sentinel_last_upload == worker_heartbeat._HB_LAST_UPLOAD, (
-        f"a failed upload must roll _HB_LAST_UPLOAD back to its prior value (got {worker_heartbeat._HB_LAST_UPLOAD})"
-    )
-
-
-def test_heartbeat_keeps_slot_when_upload_reports_success(monkeypatch):
-    """The dual of the rollback test: a SUCCESSFUL commit (or a mock that doesn't report False) must
-    KEEP the advanced slot so the throttle works. ``is False`` — not falsy — gates the rollback, so a
-    None-returning mock counts as success."""
-    import importlib
-
-    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
-
-    monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker.io.heartbeat as w
-
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 0.0)
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, **k: True)
-
-    worker_heartbeat.heartbeat("model_prefetched")
-
-    assert worker_heartbeat._HB_LAST_UPLOAD > 0.0, (
-        "a successful commit must keep the advanced throttle slot"
-    )
-
-
-def test_critical_stages_wait_longer_for_upload_lock(monkeypatch):
-    """done/already_done/error_* are CRITICAL — no later heartbeat repairs a skipped terminal commit,
-    and error_* carries the `retriable` flag worker_flagged_retriable() reads. So they wait the LONGER
-    _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S for the upload lock before skipping, vs the short progress
-    timeout. Proven by timing: with the lock held, a terminal stage blocks for the critical timeout
-    while a progress stage gives up after the short one."""
-    import importlib
-    import time as _time
-
-    hbmod = importlib.import_module("flash.engine.worker.io.heartbeat")
-
-    monkeypatch.setenv("RUN_MODE", "rl")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker.io.heartbeat as w
-
-    monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
-    monkeypatch.setattr(hbmod, "_HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S", 0.4)
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, **k: None)
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 0.0)
-
-    assert hbmod._HB_UPLOAD_LOCK.acquire(blocking=False), "lock should be free at test start"
-    try:
-        t = _time.monotonic()
-        worker_heartbeat.heartbeat("rl_step", step=1)  # progress -> short timeout, skips fast
-        progress_wait = _time.monotonic() - t
-
-        t = _time.monotonic()
-        worker_heartbeat.heartbeat("done")  # critical -> waits the long timeout before skipping
-        critical_wait = _time.monotonic() - t
-    finally:
-        hbmod._HB_UPLOAD_LOCK.release()
-
-    assert progress_wait < 0.3, (
-        f"progress stage should skip after the short timeout, waited {progress_wait:.2f}s"
-    )
-    assert critical_wait >= 0.3, (
-        f"critical stage should wait the long timeout, waited {critical_wait:.2f}s"
-    )
-    assert critical_wait > progress_wait + 0.15
-
-
-def test_heartbeat_terminal_only_mode(monkeypatch):
-    """TERMINAL_ONLY mode throttles every non-terminal stage (not just rl_step) so a fan-out of
-    runs sharing one HF_REPO stays under the 128-commits/hour cap; terminal done/error_* still
-    always commit so the control plane never misses a transition."""
-    monkeypatch.setenv("RUN_MODE", "sft")
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker.io.heartbeat as w
-
-    calls = []
-
-    def _fake_upload(*a, **k):
-        calls.append(a[1])
-        return True  # simulate a successful commit so the throttle clock advances
-
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", _fake_upload)
-    monkeypatch.setattr(worker_heartbeat, "_HB_TERMINAL_ONLY", True)
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 9999.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 0.0)
-
-    # Short interval: terminal-only must STILL suppress non-terminal after the first, NOT
-    # leak a commit once the window elapses (the bot-caught 128/hr re-breach).
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
-    worker_heartbeat.heartbeat("sft_start")  # first non-terminal -> commits (last_upload==0)
-    worker_heartbeat.heartbeat("sft_model_load")  # suppressed despite 0s interval
-    worker_heartbeat.heartbeat("sft_trained")  # suppressed
-    assert len(calls) == 1
-    worker_heartbeat.heartbeat("error_sft", error="boom")  # terminal -> always commits
-    worker_heartbeat.heartbeat("done")  # terminal -> always commits
-    assert calls.count("heartbeat.json") == 3
 
 
 def test_liger_default_model_size_gate(monkeypatch):
@@ -683,7 +434,7 @@ def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
         finalize.worker_state, "require_active_env", lambda: SimpleNamespace(id="org/env")
     )
     monkeypatch.setattr(finalize.hf_io, "hf_upload_file", lambda *args, **kwargs: None)
-    monkeypatch.setattr(finalize.heartbeat_io, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(finalize.progress_io, "publish_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         finalize, "_finalize", lambda metrics, **kwargs: captured.append((metrics, kwargs))
     )
@@ -701,10 +452,10 @@ def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
     )
 
     assert captured[0][0].notes["job_spec"]["model_revision"] == "refs/pr/123"
-    assert captured[0][1] == {"heartbeat_fields": {}}
+    assert captured[0][1] == {"progress_fields": {}}
 
 
-def test_train_metadata_preserves_terminal_heartbeat_fields(monkeypatch):
+def test_train_metadata_preserves_terminal_progress_fields(monkeypatch):
     from flash.engine.worker.train.core.lifecycle import finalize
 
     emitted = []
@@ -718,8 +469,8 @@ def test_train_metadata_preserves_terminal_heartbeat_fields(monkeypatch):
     )
     monkeypatch.setattr(finalize.hf_io, "hf_upload_file", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        finalize.heartbeat_io,
-        "heartbeat",
+        finalize.progress_io,
+        "publish_progress",
         lambda stage, **kwargs: emitted.append((stage, kwargs)),
     )
     monkeypatch.setattr(
@@ -738,15 +489,15 @@ def test_train_metadata_preserves_terminal_heartbeat_fields(monkeypatch):
         train_tokens=0,
         generated_tokens=3,
         notes={},
-        heartbeat_fields={"metrics_last": metrics_last},
+        progress_fields={"metrics_last": metrics_last},
     )
 
     assert emitted[-1][0] == "rl_train_done"
     assert emitted[-1][1]["metrics_last"] == metrics_last
-    assert finalized[0][1] == {"heartbeat_fields": {"metrics_last": metrics_last}}
+    assert finalized[0][1] == {"progress_fields": {"metrics_last": metrics_last}}
 
 
-def test_finalize_preserves_terminal_heartbeat_fields(monkeypatch):
+def test_finalize_publishes_result_receipt_progress(monkeypatch):
     from unittest.mock import mock_open
 
     from flash.engine.result.accounting import RunMetrics
@@ -757,17 +508,25 @@ def test_finalize_preserves_terminal_heartbeat_fields(monkeypatch):
     monkeypatch.setattr(RunMetrics, "save", lambda self, path: None)
     monkeypatch.setattr(finalize.hf_io, "hf_upload_file", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        finalize.heartbeat_io,
-        "heartbeat",
+        finalize.result_io,
+        "publish_result",
+        lambda **_kwargs: SimpleNamespace(
+            run_id="run-1", phase_namespace="rl", attempt_id=1, fence=1
+        ),
+    )
+    monkeypatch.setattr(finalize.result_io, "result_path", lambda _manifest: "result.json")
+    monkeypatch.setattr(
+        finalize.progress_io,
+        "publish_progress",
         lambda stage, **kwargs: emitted.append((stage, kwargs)),
     )
     monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
     monkeypatch.setattr("builtins.open", mock_open())
 
-    finalize._finalize(RunMetrics(phase="rl"), heartbeat_fields={"metrics_last": metrics_last})
+    finalize._finalize(RunMetrics(phase="rl"), progress_fields={"metrics_last": metrics_last})
 
-    assert emitted[-1][0] == "done"
-    assert emitted[-1][1]["metrics_last"] == metrics_last
+    assert emitted[-1][0] == "result_published"
+    assert emitted[-1][1]["result_path"] == "result.json"
 
 
 # ---------------------------------------------------------------------------

@@ -191,12 +191,18 @@ def _latest_local_progress() -> dict:
     return max(candidates, key=lambda value: int(value.get("sequence") or 0))
 
 
-def publish_deadline_result(*, started_at: float) -> ResultManifest:
-    """publish a deadline outcome after exact top-level process-group termination."""
+def _publish_supervisor_result(
+    *,
+    outcome: str,
+    failure_class: str | None,
+    started_at: float,
+    error: str,
+) -> ResultManifest:
+    """publish a terminal supervisor decision after exact worker process-group termination."""
     progress = _latest_local_progress()
     return publish_result(
-        outcome="deadline",
-        failure_class="deadline",
+        outcome=outcome,
+        failure_class=failure_class,
         started_at=started_at,
         training_entered=progress.get("training_entered") is True,
         completed_steps=int(progress.get("completed_steps") or 0),
@@ -205,7 +211,27 @@ def publish_deadline_result(*, started_at: float) -> ResultManifest:
             progress.get("checkpoint") if isinstance(progress.get("checkpoint"), dict) else {}
         ),
         artifacts={"console": f"console_{state.PHASE}.txt"},
-        diagnostics={"error": "fixed work deadline expired"},
+        diagnostics={"error": error},
+    )
+
+
+def publish_deadline_result(*, started_at: float) -> ResultManifest:
+    """publish a deadline outcome after exact top-level process-group termination."""
+    return _publish_supervisor_result(
+        outcome="deadline",
+        failure_class="deadline",
+        started_at=started_at,
+        error="fixed work deadline expired",
+    )
+
+
+def publish_cancelled_result(*, started_at: float) -> ResultManifest:
+    """publish cancellation after exact top-level process-group termination."""
+    return _publish_supervisor_result(
+        outcome="cancelled",
+        failure_class=None,
+        started_at=started_at,
+        error="worker attempt cancelled",
     )
 
 

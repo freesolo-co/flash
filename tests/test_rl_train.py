@@ -39,7 +39,7 @@ import flash.engine.worker.train.rl.rollout.reward_module as rl_reward
 import flash.engine.worker.train.rl.rollout.single_turn as rl_single
 from flash.core.grpo import SUPPORTED_GRPO_GROUP_SIZES
 from flash.engine.worker.entry import rl
-from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
+from flash.engine.worker.io.progress import RewardObservabilityBuffer
 from flash.engine.worker.train.core.child import runtime as child_runtime
 from flash.engine.worker.train.core.child import runtime as verl_child_runtime
 from flash.engine.worker.train.entry import backend_common, rl_train, sft_train
@@ -296,9 +296,26 @@ def test_run_rl_train_reaches_the_executable_grpo_subprocess_stream():
     source = inspect.getsource(rl_runner._execute_rl_child)
 
     assert "child_stream = _GrpoSubprocessStream(" in source
-    assert "silence_watchdog=silence_watchdog" in source
+    assert "silence_observer=silence_observer" in source
     assert "for line in child_stream" in source
     assert "return child_stream.wait_and_classify()" in source
+
+
+def test_verl_uses_canonical_progress_stage_contracts():
+    from flash.runner.lifecycle.state import _TRAINING_STAGES
+
+    source = inspect.getsource(rl_train.run_rl_train)
+    assert '_worker_progress.publish_progress("rl_step", step=0, initial=True)' in source
+    assert 'with observe_phase( "rl_step"' in " ".join(source.split())
+    assert 'with observe_phase( "rl_finalizing"' in " ".join(source.split())
+    assert "rl_step" in _TRAINING_STAGES
+
+
+def test_reward_observability_uses_progress_without_periodic_liveness_records():
+    source = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    assert "reward_runtime.observability.progress_fields()" in source
+    assert 'fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()}' in source
+    assert "liveness_heartbeat" not in source
 
 
 # ------------------------------- data conversion -------------------------------
@@ -2575,50 +2592,6 @@ def test_build_verl_overrides_kl_on_when_requested():
     # log_prob_use_dynamic_bsz / log_prob_max_token_len_per_gpu through oc.select on the actor keys
     # the block above sets, so emitting a sequence-count micro batch here would contradict them.
     assert not any("ref.log_prob_micro_batch" in x for x in o)
-
-
-def test_verl_uses_canonical_heartbeat_stage_contracts():
-    from flash.engine.worker.io.heartbeat import _HB_THROTTLED_STAGES
-    from flash.providers._lifecycle.instances.poll import STEP_GATED_STAGES
-    from flash.runner.lifecycle.state import _TRAINING_STAGES
-
-    src = inspect.getsource(rl_train.run_rl_train)
-    # the stage names are a cross-process contract: the poller, the throttle table and the runner
-    # all key off "rl_step"/"rl_finalizing". the tempting mistake is to coin a module-prefixed
-    # variant, which reports a stage none of those three recognise. assert against the spelling the
-    # CURRENT module name would produce -- pinning the pre-rename "rl_verl_*" spelling here would be
-    # asserting the absence of a string nothing can emit any more, which no regression can fail.
-    assert "rl_train_training" not in src
-    assert "rl_train_finalizing" not in src
-    initial_heartbeat = '_worker_heartbeat.heartbeat("rl_step", step=0, initial=True)'
-    assert initial_heartbeat in src
-    # ordering is read off the ast, not off substring offsets: the liveness call spans several lines
-    # once it carries keywords, and a text search for the one-line spelling would report "missing"
-    # for a call that is present and correctly placed.
-    tree = ast.parse(textwrap.dedent(src))
-    stage_linenos = {}
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and node.args):
-            continue
-        first = node.args[0]
-        if not (isinstance(first, ast.Constant) and first.value == "rl_step"):
-            continue
-        if isinstance(node.func, ast.Name) and node.func.id == "liveness_heartbeat":
-            stage_linenos["liveness"] = node.lineno
-        elif (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "heartbeat"
-            and any(kw.arg == "initial" for kw in node.keywords)
-        ):
-            stage_linenos["initial"] = node.lineno
-    assert "initial" in stage_linenos
-    assert "liveness" in stage_linenos
-    assert stage_linenos["initial"] < stage_linenos["liveness"]
-    assert '"rl_finalizing"' in src
-    assert "rl_step" in _HB_THROTTLED_STAGES
-    assert "rl_step" in STEP_GATED_STAGES
-    assert "rl_step" in _TRAINING_STAGES
-    assert "rl_finalizing" in _HB_THROTTLED_STAGES
 
 
 # ------------------------------- reward module render -------------------------------
@@ -6580,7 +6553,7 @@ def test_the_buffer_keeps_the_rollout_sample_and_its_named_breakdown():
     assert score(0, "7") == 1.0
     assert buffer.latest() == ("prompt-0", "7", 1.0)
     buffer.close_generation(1)
-    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+    assert buffer.progress_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -6614,7 +6587,7 @@ def test_every_completion_counts_toward_the_mean_however_large_the_generation():
     buffer.close_generation(1)
 
     # the env numbers each grading, so the true mean of `n` is the mean of 0..total-1.
-    assert buffer.heartbeat_fields()["reward_metrics"]["n"] == (total - 1) / 2
+    assert buffer.progress_fields()["reward_metrics"]["n"] == (total - 1) / 2
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -6643,7 +6616,7 @@ def test_a_run_with_no_rollouts_yet_omits_sampled_completions():
     # produced no rollouts", which is a different claim from "none have been scored yet".
     buffer = RewardObservabilityBuffer()
 
-    assert "sampled_completions" not in buffer.heartbeat_fields()
+    assert "sampled_completions" not in buffer.progress_fields()
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -6663,7 +6636,7 @@ def test_both_signals_pass_their_wire_bounds_before_publication():
     with buffer._lock:  # 13 names, over the 12-metric cap
         buffer._latest_metrics.update({f"m{i}": 1.0 for i in range(13)})
 
-    fields = buffer.heartbeat_fields()
+    fields = buffer.progress_fields()
 
     assert len(fields["reward_metrics"]) == 12
     assert len(fields["sampled_completions"]) == 3
@@ -6691,7 +6664,7 @@ def test_a_scalar_reward_run_publishes_no_named_metrics_at_all():
     score(0, "the answer is 7")
     buffer.close_generation(1)
 
-    fields = buffer.heartbeat_fields()
+    fields = buffer.progress_fields()
     assert "reward_metrics" not in fields
     assert len(fields["sampled_completions"]) == 1
 
@@ -6707,7 +6680,7 @@ def test_the_heartbeat_publishes_averaged_metrics_and_bounded_samples():
         score(index, completion)
 
     buffer.close_generation(5)
-    fields = buffer.heartbeat_fields()
+    fields = buffer.progress_fields()
 
     # two of four completions matched their gt, so success averages 0.5 across the generation.
     assert fields["reward_metrics"] == {"success": 0.5, "quality": 0.5}
@@ -6732,19 +6705,19 @@ def test_a_heartbeat_landing_mid_generation_republishes_the_last_complete_one():
     )
     score(0, "7")  # the fast completion: success 1.0
     buffer.close_generation(1)
-    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 1.0
+    assert buffer.progress_fields()["reward_metrics"]["success"] == 1.0
 
     # generation 2 is under way and only its fast half has been graded.
     score(1, "wrong")  # success 0.0
 
-    mid = buffer.heartbeat_fields()
+    mid = buffer.progress_fields()
     assert mid["reward_metrics"]["success"] == 1.0, "published a partial generation's mean"
     assert [s["reward"] for s in mid["sampled_completions"]] == [1.0]
 
     # the slow half lands, then the boundary: now the whole generation publishes at once.
     score(0, "7")
     buffer.close_generation(2)
-    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 0.5
+    assert buffer.progress_fields()["reward_metrics"]["success"] == 0.5
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -6761,14 +6734,14 @@ def test_the_next_generation_cannot_be_sealed_into_the_step_line_that_is_still_i
     score(0, "wrong")  # generation 2 begins while `step:1` is still in the pipe
 
     buffer.close_generation(1)
-    first = buffer.heartbeat_fields()
+    first = buffer.progress_fields()
     assert first["reward_metrics"]["success"] == 1.0, "next generation leaked into this mean"
     assert [s["completion"] for s in first["sampled_completions"]] == ["7", "7"]
     assert {s["generated_at_step"] for s in first["sampled_completions"]} == {1}
 
     score(0, "wrong")
     buffer.close_generation(2)
-    second = buffer.heartbeat_fields()
+    second = buffer.progress_fields()
     assert second["reward_metrics"]["success"] == 0.0, "step 2 republished step 1"
     assert {s["generated_at_step"] for s in second["sampled_completions"]} == {2}
 
@@ -6787,7 +6760,7 @@ def test_a_generation_that_completes_before_the_previous_step_line_is_not_lost()
     score(0, "wrong")  # generation 2 complete too, and NEITHER step line has arrived
 
     buffer.close_generation(1)
-    first = buffer.heartbeat_fields()
+    first = buffer.progress_fields()
     assert first["reward_metrics"]["success"] == 1.0, (
         "generation 1 was overwritten before it published"
     )
@@ -6795,7 +6768,7 @@ def test_a_generation_that_completes_before_the_previous_step_line_is_not_lost()
     assert {s["generated_at_step"] for s in first["sampled_completions"]} == {1}
 
     buffer.close_generation(2)
-    second = buffer.heartbeat_fields()
+    second = buffer.progress_fields()
     assert second["reward_metrics"]["success"] == 0.0
     assert [s["completion"] for s in second["sampled_completions"]] == ["wrong", "wrong"]
     assert {s["generated_at_step"] for s in second["sampled_completions"]} == {2}
@@ -6857,7 +6830,7 @@ def test_the_step_preview_reads_the_generation_that_step_published():
 
     assert buffer.latest()[1] == "gen1-b", "the preview labelled the next generation as this step"
     # and the heartbeat agrees with it, which is the point of reading the published generation.
-    fields = buffer.heartbeat_fields()
+    fields = buffer.progress_fields()
     assert [s["completion"] for s in fields["sampled_completions"]] == ["gen1-a", "gen1-b"]
 
 
@@ -6879,7 +6852,7 @@ def test_a_component_too_large_to_be_a_float_does_not_fail_the_reward_request():
 
     assert score(0, "7") == 1.0  # the total graded fine; only the diagnostic component is unusable
     buffer.close_generation(1)
-    metrics = buffer.heartbeat_fields()["reward_metrics"]
+    metrics = buffer.progress_fields()["reward_metrics"]
     assert metrics["success"] == 1.0, "a usable component was dropped with the unusable one"
     assert metrics["enormous"] == 0.0
 
@@ -6887,7 +6860,7 @@ def test_a_component_too_large_to_be_a_float_does_not_fail_the_reward_request():
 def test_the_published_metric_bound_survives_a_value_too_large_to_be_a_float():
     # the same coercion runs again on the publish side, on the heartbeat thread, over a dict the
     # trl callback takes from its caller. escaping there kills liveness reporting for the whole run.
-    from flash.engine.worker.io.heartbeat import _bounded_reward_metrics
+    from flash.engine.worker.io.progress import _bounded_reward_metrics
 
     assert _bounded_reward_metrics({"huge": 10**400, "fine": 0.25}) == {"fine": 0.25}
 
@@ -6905,7 +6878,7 @@ def test_the_step_line_names_the_generation_the_count_already_sealed():
     # verl resumed from a checkpoint: its first logged step is 41, not the buffer's internal 1.
     buffer.close_generation(41)
 
-    assert {s["generated_at_step"] for s in buffer.heartbeat_fields()["sampled_completions"]} == {
+    assert {s["generated_at_step"] for s in buffer.progress_fields()["sampled_completions"]} == {
         41
     }
 
@@ -6920,13 +6893,13 @@ def test_a_counted_seal_does_not_disarm_the_boundary_for_later_generations():
     for _ in range(2):
         score(0, "7")
     buffer.close_generation(1)
-    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 1.0
+    assert buffer.progress_fields()["reward_metrics"]["success"] == 1.0
 
     for _ in range(2):
         score(0, "wrong")
     buffer.close_generation(2)
 
-    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 0.0, "boundary went dead"
+    assert buffer.progress_fields()["reward_metrics"]["success"] == 0.0, "boundary went dead"
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -6940,13 +6913,13 @@ def test_a_generation_short_of_its_count_is_still_sealed_by_the_step_line():
     for _ in range(2):
         score(0, "7")
     buffer.close_generation(1)
-    assert buffer.heartbeat_fields()["reward_metrics"]["success"] == 1.0
+    assert buffer.progress_fields()["reward_metrics"]["success"] == 1.0
 
     # one of the two completions never reached the bridge, so the count cannot fire
     score(0, "wrong")
     buffer.close_generation(2)
 
-    fields = buffer.heartbeat_fields()
+    fields = buffer.progress_fields()
     assert fields["reward_metrics"]["success"] == 0.0, "stale generation republished as step 2"
     assert len(fields["sampled_completions"]) == 1, "generation 1's samples leaked into 2"
 
@@ -6962,7 +6935,7 @@ def test_a_completion_that_failed_scoring_still_counts_toward_the_denominator():
     buffer.record("prompt-0", "b", 0.0, [None])
     buffer.close_generation(1)
 
-    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 0.5}
+    assert buffer.progress_fields()["reward_metrics"] == {"success": 0.5}
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -6975,7 +6948,7 @@ def test_a_component_whose_values_are_all_unusable_is_reported_as_zero_not_dropp
     score(0, "7")
     buffer.close_generation(1)
 
-    assert buffer.heartbeat_fields()["reward_metrics"] == {
+    assert buffer.progress_fields()["reward_metrics"] == {
         "broken": 0.0,
         "diverged": 0.0,
         "quality": 0.5,
@@ -6992,12 +6965,12 @@ def test_a_generation_that_reports_no_components_at_all_leaves_the_metrics_stand
     buffer = RewardObservabilityBuffer()
     buffer.record("p", "a", 1.0, [{"success": 1.0, "total": 1.0}])
     buffer.close_generation(1)
-    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0}
+    assert buffer.progress_fields()["reward_metrics"] == {"success": 1.0}
 
     buffer.record("p", "b", 1.0)  # a scored episode, no per-completion breakdown to report
     buffer.close_generation(2)
 
-    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0}, "read as an outage"
+    assert buffer.progress_fields()["reward_metrics"] == {"success": 1.0}, "read as an outage"
 
 
 def test_a_generation_whose_every_grading_failed_publishes_the_known_names_as_zero():
@@ -7009,13 +6982,13 @@ def test_a_generation_whose_every_grading_failed_publishes_the_known_names_as_ze
     buffer = RewardObservabilityBuffer()
     buffer.record("p", "a", 1.0, [{"success": 1.0, "total": 1.0}])
     buffer.close_generation(1)
-    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0}
+    assert buffer.progress_fields()["reward_metrics"] == {"success": 1.0}
 
     # a breakdown slot per failed grading: attempted, produced nothing
     buffer.record("p", "b", 0.0, [None])
     buffer.close_generation(2)
 
-    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 0.0}
+    assert buffer.progress_fields()["reward_metrics"] == {"success": 0.0}
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -7030,7 +7003,7 @@ def test_one_non_finite_score_cannot_poison_a_whole_components_mean():
     buffer.record("p", "c", 1.0, [{"quality": 1.0, "total": 1.0}])
     buffer.close_generation(1)
 
-    assert buffer.heartbeat_fields()["reward_metrics"] == {"quality": 2.0 / 3.0}
+    assert buffer.progress_fields()["reward_metrics"] == {"quality": 2.0 / 3.0}
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -7039,7 +7012,7 @@ def test_the_published_payload_is_read_under_one_acquisition():
     seal land between the two and the payload tears: metrics from generation N+1 shipped beside
     samples from N. Asserted on the source because reproducing the interleave needs a scoring
     thread to win a specific race -- a test that passes when it loses proves nothing."""
-    body = inspect.getsource(RewardObservabilityBuffer.heartbeat_fields)
+    body = inspect.getsource(RewardObservabilityBuffer.progress_fields)
     snapshot = body[body.index("with self._lock:") : body.index("fields: dict = {}")]
 
     assert snapshot.count("with self._lock:") == 1, "the two reads can straddle a seal"
@@ -7076,7 +7049,7 @@ def test_samples_carry_the_step_they_were_generated_at_not_the_current_one():
     buffer.close_generation(5)
     buffer.close_generation(6)
 
-    fields = buffer.heartbeat_fields()
+    fields = buffer.progress_fields()
     assert {s["generated_at_step"] for s in fields["sampled_completions"]} == {4}
 
 
@@ -7089,14 +7062,14 @@ def test_the_drain_clears_pending_breakdowns_and_then_repeats_the_last_reading()
     score(0, "7")
     buffer.close_generation(1)
 
-    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+    assert buffer.progress_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
     assert buffer._pending_totals == {}
     assert buffer._pending_count == 0
-    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
+    assert buffer.progress_fields()["reward_metrics"] == {"success": 1.0, "quality": 0.5}
 
     score(0, "wrong")
     buffer.close_generation(2)
-    assert buffer.heartbeat_fields()["reward_metrics"] == {"success": 0.0, "quality": 0.5}
+    assert buffer.progress_fields()["reward_metrics"] == {"success": 0.0, "quality": 0.5}
 
 
 class _ReleaseHookedLock:
@@ -7147,7 +7120,7 @@ def test_metrics_and_samples_in_one_payload_describe_the_same_gradings():
 
     buffer._lock = _ReleaseHookedLock(buffer._lock, _land_a_grading_the_instant_the_lock_drops)
     buffer.close_generation(1)
-    fields = buffer.heartbeat_fields()
+    fields = buffer.progress_fields()
 
     assert landed, "the hook never fired, so this asserts nothing about atomicity"
     # the second grading landed after the whole section, so NEITHER signal carries it.
@@ -7155,58 +7128,13 @@ def test_metrics_and_samples_in_one_payload_describe_the_same_gradings():
     assert [sample["reward"] for sample in fields["sampled_completions"]] == [1.0]
 
 
-def test_the_first_sample_bearing_heartbeat_is_forced():
-    # the liveness daemon can claim a step before the stdout loop reaches it, and a step-gated stage
-    # drops a second payload at an already-committed step. without force, the first heartbeat
-    # carrying samples is exactly the one most likely to be suppressed.
-    src = inspect.getsource(rl_runner._ingest_step_metrics)
-    forced = src[src.index("if not state.sent_first_metrics or") :]
-    forced = forced[: forced.index("gpu=gpu_diagnostics")]
-    assert "heartbeat_fields = _reward_observability()" in src
-    assert "force=True" in forced
-    assert "**heartbeat_fields" in forced
-
-
-def test_the_liveness_fields_hook_carries_reward_observability():
-    # the rl_step liveness wrap is what publishes between stdout lines. without the fields hook
-    # merging it, samples would only ever reach the wire on the one forced first-metrics heartbeat.
-    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    assert 'fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()}' in src
-
-
-def test_the_generation_boundary_is_the_step_line_and_the_heartbeat_never_drains():
-    """The boundary is verl's step line, and it is the ONLY drain.
-
-    Both halves are load-bearing and neither is reachable from a unit test -- `_reward_observability`
-    is a local of a body that needs a model, a dataset and a verl interpreter. If the heartbeat
-    drained as well, a 30s tick landing mid-generation would publish the subset of completions that
-    had finished by then. If the step line did not close the generation, nothing ever would, and the
-    buffer would report its first generation for the whole run.
-    """
-    entry_src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-
-    hook = entry_src[entry_src.index("def _reward_observability()") :]
-    hook = hook[: hook.index("with liveness_heartbeat(")]
-    assert "reward_runtime.observability.heartbeat_fields()" in hook
-    assert "close_generation" not in hook, "the heartbeat drains; the boundary would be bypassed"
-
-    # sealed on the new-step branch, and BEFORE the preview reads the published rows so the logged
-    # sample and the heartbeat describe the same generation.
-    stdout_loop = " ".join(inspect.getsource(rl_runner._execute_rl_child).split())
-    stdout_loop = stdout_loop[stdout_loop.index('progress["step"] = step_number') :]
-    assert 'reward_runtime.identity_ledger.seal(progress["step"])' in stdout_loop
-    assert 'reward_runtime.observability.close_generation(progress["step"])' in stdout_loop
-    assert stdout_loop.index("identity_ledger.seal(") < stdout_loop.index(
-        "observability.close_generation("
-    )
-    assert stdout_loop.index("observability.close_generation(") < stdout_loop.index(
-        'samp = reward_runtime.observability.latest_for_step(progress["step"])'
-    )
-    # and the preview asks for THIS step's rows. the unchecked accessor answers with whatever was
-    # published last, which on the drop-spend path belongs to an earlier step.
-    assert "observability.latest()" not in stdout_loop, (
-        "the preview would print older rows under this step number"
-    )
+def test_the_first_sample_bearing_progress_is_published():
+    source = inspect.getsource(rl_runner._ingest_step_metrics)
+    publication = source[source.index("if not state.sent_first_metrics or") :]
+    publication = publication[: publication.index("gpu=gpu_diagnostics")]
+    assert "progress_fields = _reward_observability()" in source
+    assert "publish_progress(" in publication
+    assert "**progress_fields" in publication
 
 
 def test_a_step_whose_generation_was_dropped_previews_nothing_rather_than_older_text():
@@ -8113,7 +8041,7 @@ def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(monke
         rl_runner._execute_rl_child.__globals__, "adopt_orphaned_descendants", lambda: None
     )
     monkeypatch.setattr(rl_runner, "ChildOutputTail", lambda: object())
-    monkeypatch.setattr(rl_runner, "VerlChildSilenceWatchdog", lambda *args, **kwargs: object())
+    monkeypatch.setattr(rl_runner, "VerlChildSilenceObserver", lambda *args, **kwargs: object())
     monkeypatch.setattr(rl_runner, "_GrpoSubprocessStream", _EmptyChildStream)
     reward_runtime = SimpleNamespace(
         observability=SimpleNamespace(parent_work=object()), wandb_link={}

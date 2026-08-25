@@ -12,7 +12,6 @@ import time
 
 import pytest
 
-import flash.engine.worker.io.heartbeat as worker_heartbeat
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 SOURCE_SNAPSHOT = valid_source_snapshot()
@@ -1434,18 +1433,6 @@ def test_train_body_rejects_malformed_source_descriptor_before_download(monkeypa
         )
 
 
-def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
-    import flash.providers.runpod.serverless.endpoints as endpoints
-    from flash.providers._lifecycle.bootstrapping import bootstrap as instance_bootstrap
-
-    assert endpoints._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
-    assert instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
-    steady_state_commits_per_hour = (
-        3600.0 / worker_heartbeat._HB_MIN_INTERVAL_S + 3600.0 / endpoints._CONSOLE_UPLOAD_INTERVAL_S
-    )
-    assert steady_state_commits_per_hour <= 5.0
-
-
 def test_first_console_snapshot_precedes_stall_teardown():
     import importlib
     import inspect
@@ -1463,39 +1450,6 @@ def test_first_console_snapshot_precedes_stall_teardown():
     assert training_stall_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
     assert setup_grace_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
     assert training_stall_s > 2 * bootstrap_console._CONSOLE_UPLOAD_POLL_S
-
-
-def test_console_heartbeat_stays_flat_so_the_scanner_can_match_on_substrings(tmp_path):
-    """the console scanner matches marker keys as raw substrings, which is only sound because the
-    producer compacts every nested field away first.
-
-    a nested ``{"pending": ...}`` anywhere in the line would read as an uncommitted beat and make a
-    healthy run look wedged. that cannot happen while the producer replaces list values with counts,
-    so this pins the producer side of that contract rather than the scanner's.
-    """
-    import json
-
-    from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
-    from flash.providers._lifecycle.bootstrapping import console as bootstrap_console
-
-    snapshot = _console_heartbeat_snapshot(
-        {
-            "stage": "rl_step",
-            "step": 3,
-            "sampled_completions": [{"completion": "x" * 100_000, "pending": True}],
-            "metrics_last": [{"throttled": True}],
-        }
-    )
-    assert '"samples_count": 1' in snapshot
-    assert '"metrics_last_count": 1' in snapshot
-    assert "sampled_completions" not in snapshot
-    assert "metrics_last" not in snapshot.replace('"metrics_last_count"', "")
-    # no nested container survives, so no marker substring can come from anything but a real marker.
-    assert not any(isinstance(value, (dict, list)) for value in json.loads(snapshot).values())
-
-    console = tmp_path / "console_large_managed_heartbeat.txt"
-    console.write_bytes(f"HEARTBEAT {snapshot}\n".encode())
-    assert bootstrap_console._console_progress(str(console), 0)[2:] == (1, 1)
 
 
 def test_min_cuda_for_uses_the_gpu_class_floor():

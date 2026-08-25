@@ -86,6 +86,69 @@ def test_exactly_once_publish_adopts_matching_concurrent_result(monkeypatch, tmp
     assert api.created == 1
 
 
+def test_cancelled_result_uses_latest_current_fence_progress(monkeypatch) -> None:
+    _set_identity(monkeypatch)
+    captured = []
+    monkeypatch.setattr(
+        result_io,
+        "_latest_local_progress",
+        lambda: {
+            "training_entered": True,
+            "completed_steps": 4,
+            "metrics": {"loss": 0.25},
+            "checkpoint": {"step": 4},
+        },
+    )
+    monkeypatch.setattr(
+        result_io,
+        "publish_result",
+        lambda **kwargs: captured.append(kwargs) or _manifest(),
+    )
+
+    result_io.publish_cancelled_result(started_at=100.0)
+
+    assert captured == [
+        {
+            "outcome": "cancelled",
+            "failure_class": None,
+            "started_at": 100.0,
+            "training_entered": True,
+            "completed_steps": 4,
+            "metrics": {"loss": 0.25},
+            "checkpoint": {"step": 4},
+            "artifacts": {"console": "console_rl.txt"},
+            "diagnostics": {"error": "worker attempt cancelled"},
+        }
+    ]
+
+
+def test_worker_surfaces_required_result_publication_failure(monkeypatch) -> None:
+    from flash.engine.worker.entry import worker
+
+    class ResultPublicationError(RuntimeError):
+        pass
+
+    original = ValueError("training failed")
+    publication = ResultPublicationError("result transport failed")
+    monkeypatch.setattr(worker, "_run_worker_mode", lambda: (_ for _ in ()).throw(original))
+    monkeypatch.setattr(worker.hf_io, "hf_upload_file", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker.backend_common, "collect_ray_failure_logs", lambda **_kwargs: "")
+    monkeypatch.setattr(
+        worker.result_io,
+        "publish_result",
+        lambda **_kwargs: (_ for _ in ()).throw(publication),
+    )
+    monkeypatch.setattr(worker.progress_io, "publish_progress", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(worker.worker_perf, "gpu_diagnostics", dict)
+    monkeypatch.setattr(worker.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(ResultPublicationError) as exc_info:
+        worker.main()
+
+    assert exc_info.value is publication
+    assert exc_info.value.__cause__ is original
+
+
 def test_exactly_once_publish_rejects_conflicting_existing_result(monkeypatch, tmp_path) -> None:
     _set_identity(monkeypatch)
     proposed = _manifest()

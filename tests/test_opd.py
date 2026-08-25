@@ -664,84 +664,6 @@ class _CharTok:
         pass
 
 
-def test_opd_filtering_stage_is_setup_not_training():
-    """Regression (_poll.py): opd_filtering_prompts emits REAL progress heartbeats, so
-    is_training_heartbeat would classify it as TRAINING (the tight, sticky stall window) mid-setup
-    unless it's registered as a setup stage. It must be treated as cold-start setup."""
-    from flash.providers._lifecycle.instances.poll import (
-        SETUP_HEARTBEAT_STAGES,
-        is_training_heartbeat,
-    )
-
-    assert "opd_filtering_prompts" in SETUP_HEARTBEAT_STAGES
-    assert is_training_heartbeat("opd_filtering_prompts", 0) is False
-    assert (
-        is_training_heartbeat("opd_filtering_prompts", 5) is False
-    )  # progress count doesn't flip it
-
-
-def test_opd_preprocessing_stages_are_setup_on_the_provider_side():
-    """Regression (_poll.py): the worker-side registry gained opd_prompt_scan and
-    opd_image_prep, but SETUP_HEARTBEAT_STAGES kept only the retired opd_filtering_prompts. Both
-    stages carry a progress callback, so is_training_heartbeat classified a run that was still
-    preprocessing as TRAINING and judged it by the tight (sticky) stall window instead of the
-    cold-start grace -- a large split is torn down as "stalled" before its first step."""
-    from flash.providers._lifecycle.instances.poll import (
-        SETUP_HEARTBEAT_STAGES,
-        is_training_heartbeat,
-    )
-
-    for stage in ("opd_prompt_scan", "opd_image_prep"):
-        assert stage in SETUP_HEARTBEAT_STAGES
-        assert is_training_heartbeat(stage, 0) is False
-        # these emit a REAL progress heartbeat per advance; a nonzero count must not flip them.
-        assert is_training_heartbeat(stage, 5) is False
-
-
-def test_opd_liveness_stages_are_throttled_at_setup_cadence():
-    """opd liveness threads must use the throttled setup-liveness cadence."""
-    from flash.engine.worker.io.heartbeat import _HB_SETUP_LIVENESS_STAGES, _HB_THROTTLED_STAGES
-
-    opd_liveness_stages = {"opd_prompt_scan", "opd_image_prep", "opd_finalizing"}
-    assert opd_liveness_stages <= _HB_SETUP_LIVENESS_STAGES
-    assert opd_liveness_stages <= _HB_THROTTLED_STAGES
-
-    assert "opd_filtering_prompts" in _HB_THROTTLED_STAGES
-    assert "opd_filtering_prompts" in _HB_SETUP_LIVENESS_STAGES
-    # parity with the sft pre-tokenize stage this mirrors (same dual membership).
-    assert "sft_pretokenizing" in _HB_THROTTLED_STAGES
-    assert "sft_pretokenizing" in _HB_SETUP_LIVENESS_STAGES
-
-
-def test_liveness_heartbeat_merges_fields_into_every_emission(monkeypatch):
-    """Regression (heartbeat.py): the liveness thread emits stage=<stage> with NO step,
-    and because it shares the opd_step upload-throttle slot it can win the slot and overwrite the
-    main thread's stepped heartbeat -- actual_steps_run then sees a training-stage heartbeat with no
-    step and floors a cancelled run to 1 step. A `fields` callback must be merged into every emission
-    so the step rides along on the liveness pings too."""
-    import importlib
-    import time
-
-    # The worker package re-exports the `heartbeat` FUNCTION, shadowing the submodule name, so import
-    # the module object explicitly rather than via attribute access.
-    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
-
-    emitted: list[tuple[str, dict]] = []
-    monkeypatch.setattr(hb, "heartbeat", lambda stage, **kw: emitted.append((stage, kw)))
-    monkeypatch.setattr(hb, "_HB_LAST_PROGRESS_TS", 0.0)
-    monkeypatch.setattr(hb.worker_perf, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(hb, "_LIVENESS_TICK_S", 0.001)
-
-    with hb.liveness_heartbeat("opd_step", progress=lambda: 1, fields=lambda: {"step": 7}):
-        deadline = time.time() + 2.0
-        while not emitted and time.time() < deadline:
-            time.sleep(0.005)
-    assert emitted, "liveness thread never emitted a heartbeat"
-    assert any(kw.get("step") == 7 for (s, kw) in emitted if s == "opd_step"), (
-        f"fields must stamp the step onto opd_step liveness emissions; saw {emitted}"
-    )
-
-
 def test_opd_teacher_prompt_includes_thinking_prefill():
     """Regression (opd.py:93): in thinking mode the student template opens a reasoning
     block (e.g. <think>) AFTER the generation prompt and samples its completion after it. The teacher
@@ -1058,8 +980,8 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     monkeypatch.setattr(opd_mod, "_load_opd_model", _boom)
     monkeypatch.setattr(opd_mod, "_probe_gpu_in_subprocess", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod._worker_perf, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(opd_mod._worker_heartbeat, "heartbeat", lambda *a, **k: None)
-    monkeypatch.setattr(opd_train_runner._worker_heartbeat, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod._worker_progress, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(opd_train_runner._worker_progress, "heartbeat", lambda *a, **k: None)
 
     import transformers
 
@@ -1838,7 +1760,7 @@ def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
     fake_torch.manual_seed = lambda _seed: None
     fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    import flash.engine.worker.io.heartbeat as worker_heartbeat
+    import flash.engine.worker.io.progress as worker_progress
     import flash.engine.worker.teacher.client as teacher_mod
     from flash.engine.worker.train.entry import opd_train as opd_mod
 
@@ -1871,7 +1793,7 @@ def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
             gpu=SimpleNamespace(type=None),
         ),
     )
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_progress, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         teacher_mod,
         "TeacherClient",

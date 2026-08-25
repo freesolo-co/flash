@@ -589,26 +589,36 @@ def fetch_code(payload: dict) -> None:
     )
 
 
-def _publish_deadline_result(
+class _CancellationRequested(BaseException):
+    """interrupt blocking worker supervision when the provider requests cancellation."""
+
+
+def _request_cancellation(*_args) -> None:
+    raise _CancellationRequested
+
+
+def _publish_supervisor_result(
     payload: dict,
     env: dict,
     *,
     code_dir: str,
     started_at: float,
+    publisher: str,
+    label: str,
 ) -> None:
     result_deadline = _finite_positive_number(
         payload.get("result_deadline_at"), "result visibility deadline"
     )
     remaining = result_deadline - _finite_positive_number(time.time(), "current clock")
     if remaining <= 0:
-        raise TimeoutError("result visibility deadline expired before deadline publication")
+        raise TimeoutError(f"result visibility deadline expired before {label} publication")
     result_env = {
         **env,
         "FLASH_RUN_DEADLINE_AT": str(result_deadline),
     }
     command = (
-        "from flash.engine.worker.io.result import publish_deadline_result; "
-        f"publish_deadline_result(started_at={started_at!r})"
+        f"from flash.engine.worker.io.result import {publisher}; "
+        f"{publisher}(started_at={started_at!r})"
     )
     process, process_group_id = bootstrap_processes.start_process_group(
         [sys.executable, "-c", command],
@@ -622,9 +632,43 @@ def _publish_deadline_result(
             process,
             process_group_id=process_group_id,
         )
-        raise TimeoutError("deadline result publication exceeded its visibility window") from None
+        raise TimeoutError(f"{label} result publication exceeded its visibility window") from None
     if process.returncode != 0:
-        raise RuntimeError("deadline result publication failed")
+        raise RuntimeError(f"{label} result publication failed")
+
+
+def _publish_deadline_result(
+    payload: dict,
+    env: dict,
+    *,
+    code_dir: str,
+    started_at: float,
+) -> None:
+    _publish_supervisor_result(
+        payload,
+        env,
+        code_dir=code_dir,
+        started_at=started_at,
+        publisher="publish_deadline_result",
+        label="deadline",
+    )
+
+
+def _publish_cancelled_result(
+    payload: dict,
+    env: dict,
+    *,
+    code_dir: str,
+    started_at: float,
+) -> None:
+    _publish_supervisor_result(
+        payload,
+        env,
+        code_dir=code_dir,
+        started_at=started_at,
+        publisher="publish_cancelled_result",
+        label="cancellation",
+    )
 
 
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
@@ -646,6 +690,7 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                 _finite_positive_number(time.time(), "current clock") + budget,
             )
     timed_out = False
+    cancelled = False
 
     with open(console, "w", buffering=1) as cf:
         code_dir = _code_dir(payload)
@@ -715,6 +760,12 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                     proc,
                     process_group_id=process_group_id,
                 )
+            except _CancellationRequested:
+                cancelled = True
+                bootstrap_processes.terminate_process_group(
+                    proc,
+                    process_group_id=process_group_id,
+                )
 
             drain_timeout = max(
                 0.0,
@@ -740,6 +791,8 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         extra = ""
         if timed_out:
             extra = f"\n--- bootstrap: mode '{mode}' hit the wall-clock cap; killed ---\n"
+        elif cancelled:
+            extra = f"\n--- bootstrap: mode '{mode}' was cancelled; killed ---\n"
         if upload_deadline_at <= _finite_positive_number(time.time(), "current clock"):
             print("final console upload skipped; uploader reaping reserve reached", flush=True)
         elif not _upload_console_tail_bounded(
@@ -764,6 +817,14 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             started_at=worker_started_at,
         )
         raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
+    if cancelled:
+        _publish_cancelled_result(
+            payload,
+            env,
+            code_dir=code_dir,
+            started_at=worker_started_at,
+        )
+        raise _CancellationRequested
     return proc.returncode
 
 
@@ -844,7 +905,7 @@ def run_preload(payload: dict) -> dict:
 
 
 def main() -> int:
-    signal.signal(signal.SIGTERM, lambda *a: sys.exit(1))
+    signal.signal(signal.SIGTERM, _request_cancellation)
     payload = load_payload()
     deadline_watchdog = None
     try:

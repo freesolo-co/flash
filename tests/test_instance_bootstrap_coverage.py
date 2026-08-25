@@ -1754,6 +1754,47 @@ def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
     assert proc.killed is True  # the child was killed on the deadline
 
 
+def test_run_mode_cancellation_terminates_exact_group_and_publishes_result(monkeypatch):
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *_args: True)
+    process = _RaisingWaitProc(b._CancellationRequested())
+    process.pid = 123
+    events = []
+    monkeypatch.setattr(
+        b.bootstrap_processes,
+        "start_process_group",
+        lambda *_args, **_kwargs: (process, 123),
+    )
+
+    def terminate(proc, *, process_group_id):
+        events.append((proc, process_group_id))
+        proc.returncode = -15
+
+    monkeypatch.setattr(b.bootstrap_processes, "terminate_process_group", terminate)
+    monkeypatch.setattr(
+        b,
+        "_publish_cancelled_result",
+        lambda *_args, **kwargs: events.append(("result", kwargs["started_at"])),
+    )
+    now = b.time.time()
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+        "work_deadline_at": now + 100,
+        "result_deadline_at": now + 200,
+    }
+
+    with pytest.raises(b._CancellationRequested):
+        b.run_mode(payload, {}, "sft", deadline_ts=now + 300)
+
+    assert events[0] == (process, 123)
+    assert events[1][0] == "result"
+
+
 def test_run_mode_starts_no_subprocess_at_deadline(monkeypatch):
     monkeypatch.setattr(b.time, "time", lambda: 200.0)
     monkeypatch.setattr(

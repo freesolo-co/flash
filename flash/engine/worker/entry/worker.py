@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
 import sys
 import time
@@ -132,7 +131,8 @@ def main():
         flags = _worker_failure_flags(e)
         detail = sanitize_diagnostic(e, limit=500)
         failure_class = "oom" if flags["oom"] else "artifact_transport" if flags["retriable"] else "worker"
-        with contextlib.suppress(Exception):
+        result_publication_error: Exception | None = None
+        try:
             result_io.publish_result(
                 outcome="failed",
                 failure_class=failure_class,
@@ -145,6 +145,13 @@ def main():
                 },
                 artifacts={"error": err_name if "err_name" in locals() else None},
                 diagnostics={"error": detail, "traceback": tb},
+            )
+        except Exception as result_error:
+            result_publication_error = result_error
+            print(
+                "result-publication failed:",
+                sanitize_diagnostic(result_error, limit=500),
+                flush=True,
             )
         # preserve the bounded metric backlog on BOTH the primary and the fallback error
         # progress. compute it (and detail) before the guarded call -- both are cheap and
@@ -175,4 +182,6 @@ def main():
         delay = 10.0 if remaining is None else min(10.0, remaining)
         if delay > 0:
             time.sleep(delay)
+        if result_publication_error is not None:
+            raise result_publication_error from e
         raise
