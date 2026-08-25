@@ -40,6 +40,11 @@ from flash.serve.deployment import adapter_check, readiness
 from flash.serve.request import streaming as streaming_support
 from flash.serve.request import thinking as thinking_support
 from flash.serve.request import transport
+from flash.serve.runtime.sampling import (
+    validate_choice_count,
+    validate_logprobs,
+    validate_top_logprobs,
+)
 
 logger = get_logger(__name__)
 
@@ -712,6 +717,9 @@ def chat_stream(
 ) -> Iterator[str]:
     """yield one decoded choice while preserving eager open and cleanup semantics."""
 
+    n = validate_choice_count(n)
+    logprobs = validate_logprobs(logprobs)
+    top_logprobs = validate_top_logprobs(top_logprobs)
     if n != 1:
         raise ValueError("text-only chat_stream requires n=1")
     if logprobs or top_logprobs:

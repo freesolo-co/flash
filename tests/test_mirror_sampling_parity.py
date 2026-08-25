@@ -342,3 +342,24 @@ def test_text_only_stream_rejects_multi_choice_before_transport(monkeypatch):
         deploy.chat_stream("run", [{"role": "user", "content": "hi"}], n=2)
     with pytest.raises(ValueError, match="does not expose logprobs"):
         deploy.chat_stream("run", [{"role": "user", "content": "hi"}], logprobs=True)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"n": True}, "n must be an integer"),
+        ({"n": 1.0}, "n must be an integer"),
+        ({"logprobs": 0}, "logprobs must be a boolean"),
+        ({"top_logprobs": False}, "top_logprobs must be an integer"),
+    ],
+)
+def test_text_only_stream_rejects_wrong_control_types_before_transport(
+    monkeypatch, kwargs, message
+):
+    monkeypatch.setattr(
+        deploy.transport,
+        "request_chat_stream",
+        lambda *_args, **_kwargs: pytest.fail("transport must not open"),
+    )
+    with pytest.raises(ValueError, match=message):
+        deploy.chat_stream("run", [{"role": "user", "content": "hi"}], **kwargs)
