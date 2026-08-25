@@ -155,12 +155,10 @@ def test_sweep_charges_historical_removed_model_without_runtime_activation(
 ):
     import json
 
-    import flash.runner as runner
-
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    _save_run(runner, tmp_path, billing_state="pending")
-    path = runner.runs_file_path("run-1", ".json")
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    _save_run(tmp_path, billing_state="pending")
+    path = runner_state.runs_file_path("run-1", ".json")
     with open(path, encoding="utf-8") as handle:
         stored = json.load(handle)
     stored["spec"]["model"] = retired_model
@@ -177,7 +175,7 @@ def test_sweep_charges_historical_removed_model_without_runtime_activation(
 
     assert billing_retry.retry_completion_charges_once() == 1
     assert calls == [retired_model]
-    assert runner.get_status("run-1").billing_state == "charged"
+    assert runner_status.get_status("run-1").billing_state == "charged"
 
 
 def test_transient_failure_then_retry_charges_exactly_once(monkeypatch, tmp_path):

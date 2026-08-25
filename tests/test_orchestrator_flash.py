@@ -67,7 +67,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         # Stub the submit/poll path (the seam that used to be the in-process
         # offline shortcut) so the run completes without provisioning a GPU.
-        # _run_training resolves it via `from flash.runner import _submit_seed_supervised`.
+        # _run_training resolves it from the canonical supervise lifecycle owner.
         monkeypatch.setattr(runner_lifecycle, "_submit_seed_supervised", fake_submit)
 
         spec = JobSpec(

@@ -1942,7 +1942,7 @@ def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algo
 
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
 def test_qwen38_catalog_revision_is_forced_and_verified(monkeypatch, algorithm) -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     exact = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
     asked_for = []
@@ -1966,7 +1966,7 @@ def test_qwen38_catalog_revision_is_forced_and_verified(monkeypatch, algorithm) 
 
 
 def test_qwen38_catalog_revision_rejects_inherited_qwen36_pin() -> None:
-    from flash.runner.preparation import _resolve_model_revision
+    from flash.runner.lifecycle.preparation import _resolve_model_revision
 
     inherited = _job_from_dict(
         {

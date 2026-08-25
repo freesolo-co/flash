@@ -593,11 +593,6 @@ def _patch_fused_submit_preflight(
         ),
     )
     status = SimpleNamespace(state="done")
-    runner = SimpleNamespace(
-        get_status=lambda _run_id: status,
-        _warmstart_source_is_authorized=lambda *_args, **_kwargs: True,
-        effective_spec_from_status=lambda _status: source_spec,
-    )
     events = []
 
     def load_config(_ref, _token, _revision):
@@ -618,7 +613,17 @@ def _patch_fused_submit_preflight(
         events.append(("preflight", seen))
         return SimpleNamespace(rank=resolved_rank, alpha=2 * resolved_rank)
 
-    monkeypatch.setattr(preparation, "_runner", lambda: runner)
+    monkeypatch.setattr(preparation.status_ops, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(
+        preparation,
+        "_warmstart_source_is_authorized",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        preparation.status_ops,
+        "effective_spec_from_status",
+        lambda _status: source_spec,
+    )
     monkeypatch.setattr(preparation, "_adopted_warmstart_revision", lambda spec, _source: spec)
     monkeypatch.setattr(checkpoints, "adapter_artifact_exists", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(lora_rank, "resolve_hf_dataset_revision", lambda *_args: "revision")
