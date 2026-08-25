@@ -312,12 +312,11 @@ def test_sft_warns_while_the_run_is_live_when_it_leaves_cards_idle(monkeypatch, 
 
     spec, captured = _stub_sft_run(monkeypatch)
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         captured["command"] = command
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
-        heartbeat()
         return 0
 
     monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
@@ -430,11 +429,10 @@ def test_sft_stays_quiet_when_every_allocated_card_is_used(monkeypatch, capsys):
     # one card allocated: the resolved width can only equal it, so there is nothing to warn about.
     spec.gpu.count = 1
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
-        heartbeat()
         return 0
 
     monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
@@ -2143,7 +2141,7 @@ def test_zero_grad_norm_fails_the_run(monkeypatch, lines):
 
     spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         for step, line in enumerate(lines, start=1):
             on_line(line + "\n")
@@ -2183,7 +2181,7 @@ def test_healthy_grad_norms_do_not_trip_the_guard(monkeypatch, lines):
 
     spec, _ = _stub_sft_run(monkeypatch)
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         for step, line in enumerate(lines, start=1):
             on_line(line + "\n")
@@ -2636,8 +2634,8 @@ def _stub_sft_run(
     """
     import flash.core.catalog as catalog
     import flash.engine.plan.vram as vram
-    import flash.engine.worker.io.heartbeat as worker_heartbeat
     import flash.engine.worker.io.hf as worker_hf
+    import flash.engine.worker.io.progress as worker_progress
     import flash.engine.worker.io.wandb_log as worker_wandb
     import flash.engine.worker.model.adapter as worker_adapter
     import flash.engine.worker.perf as worker_perf
@@ -2826,7 +2824,7 @@ def _stub_sft_run(
 
     Watcher = watcher_cls or _DefaultWatcher
 
-    captured = {"heartbeats": [], "published": [], "uploads": []}
+    captured = {"progress": [], "published": [], "uploads": []}
     real_sft_grad_accum = vram.sft_grad_accum
 
     def capture_sft_grad_accum(batch_size, **kwargs):
@@ -2865,9 +2863,9 @@ def _stub_sft_run(
     monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
     monkeypatch.setattr(worker_state, "require_active_env", EnvClass)
     monkeypatch.setattr(
-        worker_heartbeat,
-        "heartbeat",
-        lambda stage, **fields: captured["heartbeats"].append((stage, fields)),
+        worker_progress,
+        "publish_progress",
+        lambda stage, **fields: captured["progress"].append((stage, fields)),
     )
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **kwargs: {})
     monkeypatch.setattr(worker_hf, "prefetch_model", lambda *args, **kwargs: 1.25)
@@ -2894,7 +2892,7 @@ def _stub_sft_run(
     )
     monkeypatch.setattr(
         sft_train,
-        "liveness_heartbeat",
+        "observe_phase",
         lambda *args, **kwargs: contextlib.nullcontext(),
     )
     monkeypatch.setattr(
@@ -3044,13 +3042,12 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PYTHONPATH")
     spec, captured = _stub_sft_run(monkeypatch)
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         captured["command"] = command
         captured["child_env"] = env
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
-        heartbeat()
         return 0
 
     monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
@@ -3166,7 +3163,7 @@ def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monke
 
     monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", strict_export)
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         captured["command"] = command
         captured["child_env"] = env
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
@@ -3174,7 +3171,6 @@ def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monke
         on_step(1)
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
-        heartbeat()
         return 0
 
     monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
@@ -3232,7 +3228,7 @@ def test_sft_runner_carries_the_prepared_processor_to_every_export(monkeypatch, 
     def fake_export(_actor_dir, _adapter_dir, **kwargs):
         captured["final_preprocessor"] = kwargs["preprocessor"]
 
-    def fake_training(_command, *, env, on_step, on_line, heartbeat):
+    def fake_training(_command, *, env, on_step, on_line):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
@@ -3270,7 +3266,7 @@ def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypa
 
     spec, captured = _stub_sft_run(monkeypatch, watcher_cls=Watcher)
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
@@ -3304,7 +3300,7 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
         lambda local_dir, *, world_size, expected_fsdp_generation: 2,
     )
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         raise AssertionError("a run resumed at its horizon must not start the child")
 
     monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
@@ -3352,7 +3348,7 @@ def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
         sft_train_runner._worker_hf, "prefetch_model", lambda *_args, **_kwargs: 0.0
     )
     monkeypatch.setattr(
-        sft_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: None
+        sft_train_runner._worker_progress, "publish_progress", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(sft_train_runner._worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
     monkeypatch.setattr(sft_train_runner._worker_adapter, "make_lora", lambda _model: LoraConfig())
@@ -3566,12 +3562,11 @@ def test_environment_processing_may_change_the_static_estimate_without_repricing
         )
         return replace(prepared, profile=moved)
 
-    def completed_training(command, *, env, on_step, on_line, heartbeat):
+    def completed_training(command, *, env, on_step, on_line):
         training_calls.append(command)
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
-        heartbeat()
         return 0
 
     monkeypatch.setattr(sft_train, "prepare_sft_workload", drifted)
@@ -3623,7 +3618,7 @@ def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monke
     # validate_save_steps rejects anything beyond it at config time.)
     spec, _ = _stub_sft_run(monkeypatch, save_at_steps=(2,), watcher_cls=Watcher)
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         for step in range(1, _MAX_ZERO_GRAD_STEPS + 1):
             on_line(
@@ -3659,7 +3654,7 @@ def test_zero_grad_guard_survives_an_lr_that_decays_to_zero(monkeypatch):
 
     spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line(
             "step:1 - train/loss:0.5464 - train/grad_norm:0.0 - train/lr:5e-05 "
@@ -3688,7 +3683,7 @@ def test_zero_grad_guard_clears_on_a_recovered_step(monkeypatch):
 
     spec, captured = _stub_sft_run(monkeypatch)
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         # zero, healthy (clears), zero, healthy (clears). two zero-grad steps in total but never
         # two in a row, so the run must survive.
@@ -3723,7 +3718,7 @@ def test_a_single_step_run_with_no_gradient_is_rejected(monkeypatch):
     # earlier updates this session never observed.
     monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         # both updates report a dead gradient. the in-loop guard would also fire on two consecutive
         # zeros, so the horizon is cut to one below to isolate the end-of-run check.
@@ -3756,7 +3751,7 @@ def test_a_fresh_run_with_any_real_gradient_still_completes(monkeypatch, grads):
     spec, captured = _stub_sft_run(monkeypatch)
     monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
 
-    def fake_training(command, *, env, on_step, on_line, heartbeat):
+    def fake_training(command, *, env, on_step, on_line):
         on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         for step, grad in enumerate(grads, start=1):
             on_line(
@@ -3789,7 +3784,7 @@ def test_sft_line_handler_reads_metrics_through_the_shared_parser():
     Metric(SUM) they do not currently print in numpy's np.float64(...) spelling. the
     duplicate parser was still removed: one upstream metric-type change would have
     reintroduced the same silent drop, and the shared helper additionally rejects nan/inf,
-    which would otherwise serialize into the heartbeat as bare NaN.
+    which would otherwise serialize into progress as bare NaN.
     """
     import ast
     import inspect
@@ -3815,7 +3810,7 @@ def test_sft_line_handler_reads_metrics_through_the_shared_parser():
     assert not hasattr(sv, "_VERL_METRIC_RE")
 
 
-def test_sft_drops_a_non_finite_loss_instead_of_poisoning_the_heartbeat():
+def test_sft_drops_a_non_finite_loss_instead_of_poisoning_progress():
     """a nan loss serializes as bare NaN, which strict json consumers reject."""
     import flash.engine.worker.train.entry.sft_train as sv
 
@@ -3885,32 +3880,16 @@ def test_sft_never_enables_liger_because_it_zeroes_the_lora_gradient():
 
 
 def test_drain_join_waits_out_a_slow_upload_until_the_run_deadline(monkeypatch):
-    """VERL-131: a checkpoint drain is bounded by the RUN's wall deadline, not a constant.
-
-    The measured failure was a 35B-A3B full-state upload that needed 607.6s against a fixed 600s
-    join. It was healthy and still uploading -- it emitted another `checkpoint_uploading` heartbeat
-    9s AFTER the join gave up -- and the timeout converted a run that had already trained and
-    published into `failed`.
-
-    The bound deliberately does NOT try to sample upload progress. `_HB_LAST_PROGRESS_TS` looks like
-    a progress signal but is stamped unconditionally every 30s by the upload's own
-    `liveness_heartbeat(keepalive=True)` daemon (heartbeat.py: `liveness=... and not keepalive`),
-    so it advances whether or not bytes move -- a no-progress window keyed to it could never fire.
-    The upload is already bounded from the inside by its retry budget and per-attempt deadline
-    checks, so the only correct job here is to not impose a second, tighter deadline on top.
-    """
+    """a checkpoint drain is bounded only by the fixed run deadline."""
     import threading
     import time as real_time
 
-    # NB: the worker package rebinds the name `heartbeat` to the re-exported heartbeat
-    # FUNCTION, so `import ... as hb` yields that function rather than this module.
-    # import_module returns the real module object.
-    hb = importlib.import_module("flash.engine.worker.io.heartbeat")
+    import flash.engine.worker.io.progress as progress_io
     from flash.engine.worker.runtime import state as worker_state
 
-    # virtual clock: the test must not actually take an hour.
+    # virtual clock: the test must not actually take an hour
     now = [0.0]
-    monkeypatch.setattr(hb.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(progress_io.time, "monotonic", lambda: now[0])
 
     class _SlowUpload:
         """alive for 3600 virtual seconds -- six times the old fixed deadline."""
@@ -3931,7 +3910,7 @@ def test_drain_join_waits_out_a_slow_upload_until_the_run_deadline(monkeypatch):
     monkeypatch.setattr(
         worker_state, "_remaining_worker_wall_seconds", lambda: 7200.0, raising=False
     )
-    hb.join_while_draining(_SlowUpload(), "slow uploader")
+    progress_io.join_while_draining(_SlowUpload(), "slow uploader")
 
     # and the converse: once the RUN is out of time the drain must be cut off, or a wedged upload
     # holds the worker open past its own deadline.
@@ -3951,7 +3930,7 @@ def test_drain_join_waits_out_a_slow_upload_until_the_run_deadline(monkeypatch):
         worker_state, "_remaining_worker_wall_seconds", lambda: budget[0], raising=False
     )
     with pytest.raises(RuntimeError, match="wall deadline expired"):
-        hb.join_while_draining(_Wedged(), "wedged uploader")
+        progress_io.join_while_draining(_Wedged(), "wedged uploader")
 
     # a real finished thread returns immediately rather than waiting out a window.
     monkeypatch.setattr(
@@ -3961,7 +3940,7 @@ def test_drain_join_waits_out_a_slow_upload_until_the_run_deadline(monkeypatch):
     done.start()
     done.join()
     started = real_time.monotonic()
-    hb.join_while_draining(done, "finished uploader")
+    progress_io.join_while_draining(done, "finished uploader")
     assert real_time.monotonic() - started < 5.0
 
 
@@ -5104,7 +5083,7 @@ def test_the_worker_disables_xet_as_its_very_first_action():
     `_run_worker_mode` -- I verified that by removing it, and all three stayed green.
 
     Asserted over the AST rather than by running the worker. `_run_worker_mode` performs real boot
-    work (heartbeat, kernel cache, gpu probe) and cannot be driven to a mode handler in a test
+    work (progress transport, kernel cache, gpu probe) and cannot be driven to a mode handler in a test
     process, and observing `os.environ` in-process cannot attribute the value anyway: an earlier
     test in the same session may already have set it.
 
