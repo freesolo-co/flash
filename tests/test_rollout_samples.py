@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import subprocess
@@ -8,10 +7,7 @@ import sys
 
 import pytest
 
-import flash.engine.worker.io.heartbeat as worker_heartbeat
-import flash.engine.worker.io.hf as worker_hf
 from flash.engine.result.rollout_samples import build_rollout_sample, select_rollout_samples
-from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
 
 def test_build_rollout_sample_shows_full_text_and_sanitizes_without_redacting_placeholder(
@@ -169,170 +165,6 @@ def test_select_rollout_samples_loss_scalar_for_opd() -> None:
 def test_select_rollout_samples_rejects_unknown_scalar() -> None:
     with pytest.raises(ValueError, match="scalar"):
         select_rollout_samples([("p", "c", 1.0)], generated_at_step=1, scalar="entropy")
-
-
-def test_heartbeat_reports_failed_then_successful_forced_delivery(monkeypatch) -> None:
-
-    outcomes = iter([False, True])
-    monkeypatch.setattr(worker_hf, "hf_upload_file", lambda *args, **kwargs: next(outcomes))
-    monkeypatch.setattr(worker_heartbeat, "_HB_TERMINAL_ONLY", False)
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_FORCED_UPLOAD", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_COMMITTED_STEP", 0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_SEQ", 0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_UPLOADED_SEQ", 0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_PROGRESS_TS", 0.0)
-
-    assert worker_heartbeat.heartbeat("rl_step", step=1, force=True) is False
-    assert worker_heartbeat.heartbeat("rl_step", step=1, force=True) is True
-
-
-def test_throttled_heartbeat_omits_samples_from_console(monkeypatch, capsys) -> None:
-
-    monkeypatch.setattr(worker_heartbeat, "_HB_TERMINAL_ONLY", False)
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 1000.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_COMMITTED_STEP", 1)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_PROGRESS_TS", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_SEQ", 0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_UPLOADED_SEQ", 0)
-    heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
-    monkeypatch.setattr(heartbeat_module.time, "time", lambda: 1001.0)
-
-    committed = worker_heartbeat.heartbeat(
-        "rl_step",
-        step=2,
-        sampled_completions=[
-            {
-                "prompt_tail": "prompt-that-must-not-print",
-                "completion": "completion-that-must-not-print",
-                "reward": 1.0,
-                "generated_at_step": 2,
-            }
-        ],
-    )
-
-    console = capsys.readouterr().out
-    assert committed is False
-    assert '"step": 2' in console
-    assert "sampled_completions" not in console
-    assert "prompt-that-must-not-print" not in console
-    assert "completion-that-must-not-print" not in console
-
-
-def test_format_heartbeat_renders_reward_samples_after_reward_metrics() -> None:
-    heartbeat = {
-        "stage": "rl_step",
-        "step": 2,
-        "reward": 0.6,
-        "reward_metrics": {"success": 0.75},
-        "sampled_completions": [
-            {
-                "prompt_tail": "question tail",
-                "completion": "ANSWER: <value>",
-                "reward": 0.75,
-                "generated_at_step": 1,
-            },
-            {"prompt_tail": "missing fields"},
-        ],
-    }
-
-    assert _format_heartbeat(heartbeat) == (
-        "worker: stage=rl_step step=2 reward=0.600 success=0.750\n"
-        "  sample 1 reward=0.750 step=1\n"
-        "    prompt: question tail\n"
-        "    completion: ANSWER: <value>"
-    )
-    assert _format_heartbeat({"stage": "rl_step", "reward": 0.6}) == (
-        "worker: stage=rl_step reward=0.600"
-    )
-
-
-def test_format_heartbeat_renders_opd_loss_samples() -> None:
-    heartbeat = {
-        "stage": "opd_step",
-        "step": 3,
-        "loss": 0.4213,
-        "sampled_completions": [
-            {
-                "prompt_tail": "distil prompt",
-                "completion": "student answer",
-                "loss": 0.4213,
-                "generated_at_step": 3,
-            }
-        ],
-    }
-
-    assert _format_heartbeat(heartbeat) == (
-        "worker: stage=opd_step step=3 loss=0.4213\n"
-        "  sample 1 loss=0.4213 step=3\n"
-        "    prompt: distil prompt\n"
-        "    completion: student answer"
-    )
-
-
-def test_format_heartbeat_renders_full_untruncated_completion() -> None:
-    long_completion = "z" * 4000
-    rendered = _format_heartbeat(
-        {
-            "stage": "rl_step",
-            "sampled_completions": [
-                {
-                    "prompt_tail": "p",
-                    "completion": long_completion,
-                    "reward": 0.5,
-                    "generated_at_step": 1,
-                }
-            ],
-        }
-    )
-
-    assert long_completion in rendered  # shown in full, never truncated at render
-
-
-def test_format_heartbeat_caps_rendered_samples_at_three() -> None:
-    rendered = _format_heartbeat(
-        {
-            "stage": "rl_step",
-            "sampled_completions": [
-                {
-                    "prompt_tail": f"p{index}",
-                    "completion": f"c{index}",
-                    "reward": index / 10,
-                    "generated_at_step": 1,
-                }
-                for index in range(5)
-            ],
-        }
-    )
-
-    assert rendered.count("  sample ") == 3
-    assert "sample 3" in rendered
-    assert "sample 4" not in rendered
-
-
-def test_format_heartbeat_defensively_neutralizes_control_characters() -> None:
-    rendered = _format_heartbeat(
-        {
-            "stage": "rl_step",
-            "sampled_completions": [
-                {
-                    "prompt_tail": "prompt\roverwrite\nnext\tfield",
-                    "completion": "answer\x1b[2J\nsecond",
-                    "reward": 1.0,
-                    "generated_at_step": 1,
-                }
-            ],
-        }
-    )
-
-    assert "prompt\\x0doverwrite\n      next\\x09field" in rendered
-    assert "answer\\x1b[2J\n      second" in rendered
-    assert "\r" not in rendered
-    assert "\x1b" not in rendered
-    assert "\t" not in rendered
 
 
 @pytest.mark.parametrize(

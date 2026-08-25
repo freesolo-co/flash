@@ -16,8 +16,7 @@ import types
 
 import pytest
 
-from flash.cli.ui import cost, env_panels, heartbeat, render, tables
-from flash.cli.ui import heartbeat as ui_heartbeat
+from flash.cli.ui import cost, env_panels, lifecycle, render, tables
 
 
 @pytest.fixture
@@ -253,20 +252,15 @@ def test_humanize_ts_formats_epoch_and_rejects_non_numbers() -> None:
 
 
 def test_humanize_age_buckets(monkeypatch) -> None:
-    # the age panel composes these two: _heartbeat_age_seconds turns a heartbeat ts into an age,
-    # _humanize_age_seconds buckets it. asserted as that pair rather than through a one-line
-    # wrapper, so the bucket edges stay pinned to the composition the panel actually renders.
-    def humanize(value: object) -> str | None:
-        return heartbeat._humanize_age_seconds(heartbeat._heartbeat_age_seconds(value))
-
     now = 1_000_000.0
-    # patch the clock in the module that READS it: both helpers live in `flash.cli.ui.heartbeat`
-    # and are re-exported through `render`, so patching a `time` on `render` would miss them (and
-    # `render` no longer imports `time` at all).
-    monkeypatch.setattr(ui_heartbeat.time, "time", lambda: now)
-    assert humanize(now - 30) == "30s ago"  # < 90s
-    assert humanize(now - 600) == "10m ago"  # < 5400s -> minutes
-    assert humanize(now - 7200) == "2.0h ago"  # >= 5400s -> hours
+    monkeypatch.setattr(lifecycle.time, "time", lambda: now)
+
+    def humanize(value: object) -> str | None:
+        return lifecycle._humanize_age(lifecycle._age_seconds(value))
+
+    assert humanize(now - 30) == "30s ago"
+    assert humanize(now - 600) == "10m ago"
+    assert humanize(now - 7200) == "2.0h ago"
     assert humanize(0) is None
     assert humanize("x") is None
 

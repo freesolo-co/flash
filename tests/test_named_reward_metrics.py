@@ -1,6 +1,6 @@
 import inspect
 
-from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
+from flash.engine.worker.io.progress import RewardObservabilityBuffer
 from flash.engine.worker.train.entry.rl_train import run_rl_train
 from flash.engine.worker.train.entry.rl_train_runner import (
     _ingest_step_metrics,
@@ -17,13 +17,13 @@ def _published_reward_metrics(breakdowns: list[dict[str, float] | None]) -> dict
     slot, a non-finite value is masked to zero) are asserted through it rather than through a
     standalone helper no caller reaches. One ``record`` per completion mirrors ``score_single_turn``,
     which appends a 0-or-1 element accumulator per completion; ``close_generation`` then seals the
-    generation and ``heartbeat_fields`` reads back what a heartbeat would actually ship.
+    generation and ``progress_fields`` reads back what a progress would actually ship.
     """
     buffer = RewardObservabilityBuffer()
     for index, breakdown in enumerate(breakdowns):
         buffer.record(f"prompt-{index}", f"completion-{index}", 0.0, [breakdown])
     buffer.close_generation(1)
-    return buffer.heartbeat_fields().get("reward_metrics", {})
+    return buffer.progress_fields().get("reward_metrics", {})
 
 
 def test_named_reward_metrics_are_averaged_across_completions() -> None:
@@ -78,7 +78,7 @@ def test_scoring_validates_total_before_aggregating_breakdown() -> None:
     assert "breakdowns.append(None)" in source
 
 
-def test_reward_metrics_reach_the_step_heartbeat() -> None:
+def test_reward_metrics_reach_the_step_progress() -> None:
     """verl's trainer is out of process and cannot host trl's TrainerCallback, so the per-name
     breakdowns travel through the reward-observability buffer into the rl_step liveness fields."""
     source = "\n".join(
@@ -89,5 +89,5 @@ def test_reward_metrics_reach_the_step_heartbeat() -> None:
         "observability.record(message_prompts[int(index)], solution_str, score, breakdowns)"
         in source
     )
-    assert "observability.heartbeat_fields()" in source
+    assert "observability.progress_fields()" in source
     assert "**_reward_observability()" in source
