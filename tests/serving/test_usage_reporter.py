@@ -88,6 +88,26 @@ def test_hosted_usage_outbox_builds_only_with_complete_configuration(modal_app_m
     asyncio.run(outbox.aclose())
 
 
+def test_hosted_usage_outbox_worker_id_is_unique_per_instance(modal_app_module):
+    settings = Settings(
+        _env_file=None,
+        PLATFORM_BACKEND_URL="https://api.example.com",
+        FREESOLO_INTERNAL_KEY="internal-key",
+        FREESOLO_DEPLOYMENT_ID="deployment-1",
+        SUPABASE_URL="https://project.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="service-role",
+    )
+
+    first = modal_app_module._build_usage_outbox(settings)
+    second = modal_app_module._build_usage_outbox(settings)
+
+    assert first._worker_id != second._worker_id
+    assert first._generation_owner_id == second._generation_owner_id
+    assert first._generation_owner_epoch != second._generation_owner_epoch
+    asyncio.run(first.aclose())
+    asyncio.run(second.aclose())
+
+
 def test_stream_text_delta_keeps_native_delta_chunks(modal_app_module):
     previous = ""
     deltas = []

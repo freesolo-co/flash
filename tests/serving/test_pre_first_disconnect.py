@@ -9,6 +9,7 @@ import pytest
 from fastapi import Request
 
 from flash.serving.src import inference_routes
+from flash.serving.src.context import ServingContext
 from flash.serving.src.inference_routes import _discard_prepared_stream, _stream_chat_completion
 from flash.serving.src.routing import AdapterRouter
 from flash.serving.src.schemas import AdapterRecord, GenerateRequest
@@ -151,6 +152,90 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
     completed, generation_cancelled = asyncio.run(scenario())
     assert completed
     assert generation_cancelled
+
+
+@pytest.mark.parametrize("route", ["generate", "generate_for_adapter", "chat_completions"])
+def test_non_streaming_disconnect_after_engine_completion_finishes_finalization_once(
+    monkeypatch, route: str
+) -> None:
+    async def scenario() -> tuple[Any, RecordingUsageStore]:
+        finalization_entered = asyncio.Event()
+        release_finalization = asyncio.Event()
+        messages: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        record = _record()
+        store = RecordingUsageStore()
+
+        async def blocking_finalize(event) -> None:
+            finalization_entered.set()
+            await release_finalization.wait()
+            store.finalized.append(event)
+
+        store.finalize = blocking_finalize  # type: ignore[method-assign]
+
+        class Lookup:
+            async def resolve(self, _adapter_id: str):
+                return record, record
+
+        class Context(ServingContext):
+            async def authorize_inference(self, *_args):
+                return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
+
+        context = Context(
+            object(),  # type: ignore[arg-type]
+            AdapterRouter([record]),
+            Lookup(),  # type: ignore[arg-type]
+            store,
+            internal_key=None,
+            deployment_id="deployment-1",
+            serving_release="release-1",
+            reload_records=None,
+            lookup_record=None,
+            chat_authorizer=None,
+        )
+
+        async def completed_generation(*_args, generation_id: str, **_kwargs):
+            return _ready(record, generation_id)
+
+        async def receive():
+            return await messages.get()
+
+        monkeypatch.setattr("flash.serving.src.context.generate_once", completed_generation)
+        monkeypatch.setattr(
+            inference_routes.ServingContext,
+            "of",
+            staticmethod(lambda _request: context),
+        )
+        request = _request(receive)
+        if route == "generate":
+            awaitable = inference_routes.generate(
+                GenerateRequest(adapter_id=record.adapter_id, prompt="hi"), request
+            )
+        elif route == "generate_for_adapter":
+            awaitable = inference_routes.generate_for_adapter(
+                record.adapter_id, {"prompt": "hi"}, request
+            )
+        else:
+            awaitable = inference_routes.chat_completions(
+                {
+                    "model": record.adapter_id,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                request,
+            )
+        task = asyncio.create_task(awaitable)
+        await _wait_event_or_task(finalization_entered, task)
+        await messages.put({"type": "http.disconnect"})
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_finalization.set()
+        result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1)
+        return result[0], store
+
+    result, store = asyncio.run(scenario())
+
+    assert isinstance(result, asyncio.CancelledError)
+    assert len(store.finalized) == 1
+    assert store.failed == []
 
 
 class _Context:

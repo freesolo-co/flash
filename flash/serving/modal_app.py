@@ -6,6 +6,7 @@ README to deploy.
 
 import asyncio
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -514,7 +515,7 @@ def _build_usage_outbox(settings: Any) -> Any:
 
     return DurableUsageOutbox(
         settings,
-        worker_id=f"serving-{settings.deployment_id}-{os.getpid()}",
+        worker_id=f"serving-{settings.deployment_id}-{os.getpid()}-{uuid.uuid4().hex}",
     )
 
 

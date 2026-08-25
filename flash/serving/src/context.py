@@ -1,5 +1,6 @@
 """The per-app collaborators serving request handlers use."""
 
+import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
@@ -142,7 +143,12 @@ class ServingContext:
             serving_release=self.serving_release,
             captured_at=captured_at,
         )
-        await session.finalize(result)
+        finalization = asyncio.create_task(session.finalize(result))
+        try:
+            await asyncio.shield(finalization)
+        except asyncio.CancelledError:
+            await finalization
+            raise
         return result
 
     def usage_session(

@@ -380,7 +380,6 @@ class DurableUsageOutbox:
         *,
         client: httpx.AsyncClient | None = None,
         worker_id: str,
-        batch_size: int = 50,
         lease_seconds: int = 60,
         max_attempts: int = 8,
         poll_seconds: float = 2.0,
@@ -404,7 +403,6 @@ class DurableUsageOutbox:
             "fsrouter-" + hashlib.sha256(settings.deployment_id.encode()).hexdigest()[:32]
         )
         self._generation_owner_epoch = owner_epoch or uuid.uuid4()
-        self._batch_size = batch_size
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
         self._poll_seconds = poll_seconds
@@ -417,7 +415,9 @@ class DurableUsageOutbox:
         self._worker: asyncio.Task[None] | None = None
         self._heartbeat_worker: asyncio.Task[None] | None = None
         self._heartbeat_seconds: int | None = None
+        self._generation_lease_seconds: int | None = None
         self._active_generations: set[str] = set()
+        self._generation_lease_deadlines: dict[str, datetime] = {}
         self._active_leases: set[str] = set()
         self._background_error: BaseException | None = None
 
@@ -431,24 +431,33 @@ class DurableUsageOutbox:
 
     async def capture(self, event: UsageEvent) -> None:
         self._raise_background_error()
+        lease_started_at = self._clock()
         result = await self._generation_rpc("capture_serving_usage", event)
         timing = _generation_capture_result(result)
-        self._set_heartbeat_seconds(timing["heartbeat_seconds"])
+        self._set_generation_timing(timing["heartbeat_seconds"], timing["lease_seconds"])
         if timing["state"] == "in_progress":
-            self._active_generations.add(event.identity.request_id)
+            request_id = event.identity.request_id
+            self._active_generations.add(request_id)
+            self._generation_lease_deadlines[request_id] = lease_started_at + timedelta(
+                seconds=timing["lease_seconds"]
+            )
             self._heartbeat_wake.set()
 
     async def finalize(self, event: UsageEvent) -> None:
         self._raise_background_error()
         await self._generation_rpc("finalize_serving_usage", event)
-        self._active_generations.discard(event.identity.request_id)
+        request_id = event.identity.request_id
+        self._active_generations.discard(request_id)
+        self._generation_lease_deadlines.pop(request_id, None)
         self._wake.set()
         self._heartbeat_wake.set()
 
     async def fail(self, event: UsageEvent, code: str) -> None:
         self._raise_background_error()
         await self._generation_rpc("fail_serving_generation", event, failure_code=code)
-        self._active_generations.discard(event.identity.request_id)
+        request_id = event.identity.request_id
+        self._active_generations.discard(request_id)
+        self._generation_lease_deadlines.pop(request_id, None)
         self._heartbeat_wake.set()
 
     async def snapshot(self) -> OutboxSnapshot:
@@ -563,11 +572,15 @@ class DurableUsageOutbox:
             payload["p_failure_code"] = failure_code
         return await self._rpc(name, payload)
 
-    def _set_heartbeat_seconds(self, heartbeat_seconds: int) -> None:
+    def _set_generation_timing(self, heartbeat_seconds: int, lease_seconds: int) -> None:
         if self._heartbeat_seconds is None:
             self._heartbeat_seconds = heartbeat_seconds
+            self._generation_lease_seconds = lease_seconds
             return
-        if self._heartbeat_seconds != heartbeat_seconds:
+        if (
+            self._heartbeat_seconds != heartbeat_seconds
+            or self._generation_lease_seconds != lease_seconds
+        ):
             raise UsageOutboxError("generation_heartbeat_timing_changed")
 
     def _raise_background_error(self) -> None:
@@ -633,7 +646,7 @@ class DurableUsageOutbox:
             except TimeoutError:
                 pass
             try:
-                await self._heartbeat_active_generations()
+                await self._heartbeat_active_generations_with_retry()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -641,6 +654,29 @@ class DurableUsageOutbox:
                 self._stopping.set()
                 self._wake.set()
                 return
+
+    async def _heartbeat_active_generations_with_retry(self) -> None:
+        while self._active_generations:
+            try:
+                await self._heartbeat_active_generations()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not _is_transient_heartbeat_error(exc):
+                    raise
+                active_deadlines = [
+                    deadline
+                    for request_id, deadline in self._generation_lease_deadlines.items()
+                    if request_id in self._active_generations
+                ]
+                if not active_deadlines:
+                    return
+                remaining = (min(active_deadlines) - self._clock()).total_seconds()
+                if remaining <= 0:
+                    raise UsageOutboxError("generation_heartbeat_lease_expired") from exc
+                retry_delay = min(float(self._heartbeat_seconds or 1), remaining)
+                await self._sleep(retry_delay)
 
     async def _heartbeat_active_generations(self) -> None:
         request_ids = sorted(self._active_generations)
@@ -654,14 +690,20 @@ class DurableUsageOutbox:
                     "p_request_ids": batch,
                 },
             )
-            renewed = {
-                str(row.get("request_id"))
-                for row in result or []
-                if isinstance(row, dict) and row.get("request_id")
-            }
+            renewed: set[str] = set()
+            for row in result or []:
+                if not isinstance(row, dict) or not row.get("request_id"):
+                    continue
+                request_id = str(row["request_id"])
+                renewed.add(request_id)
+                expires_at = row.get("generation_lease_expires_at")
+                if request_id in self._active_generations and expires_at is not None:
+                    self._generation_lease_deadlines[request_id] = _parse_datetime(expires_at)
             missing = (set(batch) - renewed) & self._active_generations
             if missing:
                 self._active_generations.difference_update(missing)
+                for request_id in missing:
+                    self._generation_lease_deadlines.pop(request_id, None)
                 raise UsageOutboxError("generation_heartbeat_lease_lost")
 
     async def _claim(self) -> list[dict[str, Any]]:
@@ -669,13 +711,21 @@ class DurableUsageOutbox:
             "claim_serving_usage_batch",
             {
                 "p_worker_id": self._worker_id,
-                "p_limit": self._batch_size,
+                "p_limit": 1,
                 "p_lease_seconds": self._lease_seconds,
             },
         )
-        if not isinstance(data, list):
+        if not isinstance(data, list) or len(data) > 1:
             raise UsageOutboxError("usage_claim_invalid")
-        return [dict(row) for row in data if isinstance(row, dict)]
+        rows = [dict(row) for row in data if isinstance(row, dict)]
+        if len(rows) != len(data):
+            raise UsageOutboxError("usage_claim_invalid")
+        for row in rows:
+            outbox_id = row.get("id")
+            if not isinstance(outbox_id, str) or not outbox_id:
+                raise UsageOutboxError("usage_claim_invalid")
+            self._active_leases.add(outbox_id)
+        return rows
 
     async def _deliver(self, row: dict[str, Any]) -> None:
         outbox_id = str(row.get("id") or "")
@@ -795,6 +845,7 @@ class DurableUsageOutbox:
                 errors.append(exc)
             else:
                 self._active_generations.clear()
+                self._generation_lease_deadlines.clear()
 
         for outbox_id in tuple(self._active_leases):
             try:
@@ -824,6 +875,19 @@ class DurableUsageOutbox:
             errors.append(self._background_error)
         if errors:
             raise UsageOutboxError("usage_outbox_shutdown_failed") from errors[0]
+
+
+def _is_transient_heartbeat_error(exc: BaseException) -> bool:
+    if not isinstance(exc, UsageOutboxError):
+        return False
+    code = str(exc)
+    if code == "supabase_transport_failure":
+        return True
+    match = re.fullmatch(r"supabase_rpc_([0-9]{3})", code)
+    if match is None:
+        return False
+    status_code = int(match.group(1))
+    return status_code in {408, 429} or status_code >= 500
 
 
 def _generation_capture_result(data: Any) -> dict[str, Any]:

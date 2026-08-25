@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -557,9 +557,14 @@ def _outbox_settings() -> Settings:
     )
 
 
-def _claimed_row(*, attempt_count: int = 1, state: str = "leased") -> dict[str, Any]:
+def _claimed_row(
+    *,
+    attempt_count: int = 1,
+    state: str = "leased",
+    outbox_id: str = "10000000-0000-4000-8000-000000000001",
+) -> dict[str, Any]:
     return {
-        "id": "10000000-0000-4000-8000-000000000001",
+        "id": outbox_id,
         "state": state,
         "request_id": new_generation_id(),
         "attempt_count": attempt_count,
@@ -680,6 +685,71 @@ def test_finalize_replays_identical_rpc_after_committed_response_is_lost() -> No
 
     assert len(client.calls) == 2
     assert client.calls[0] == client.calls[1]
+    assert event.identity.request_id not in outbox._active_generations
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_failures", "expected_sleeps"),
+    [
+        (
+            [
+                httpx.ConnectError("transient heartbeat failure"),
+                httpx.ConnectError("transient heartbeat failure"),
+            ],
+            [0.05, 20.0],
+        ),
+        ([(503, {"error": "temporarily unavailable"})], [20.0]),
+    ],
+)
+def test_transient_heartbeat_failure_recovers_without_poisoning_terminal_rpc(
+    heartbeat_failures: list[Any], expected_sleeps: list[float]
+) -> None:
+    event = _usage_event()
+    fixed_now = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+    client = _QueuedClient(
+        [
+            *heartbeat_failures,
+            (
+                200,
+                [
+                    {
+                        "request_id": event.identity.request_id,
+                        "generation_lease_expires_at": "2026-08-24T12:02:00Z",
+                    }
+                ],
+            ),
+            (200, [{"state": "pending", "replay": False}]),
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    outbox = DurableUsageOutbox(
+        _outbox_settings(),
+        client=client,
+        worker_id="worker-1",
+        sleep=record_sleep,
+        clock=lambda: fixed_now,
+    )
+    outbox._heartbeat_seconds = 20
+    outbox._generation_lease_seconds = 120
+    outbox._active_generations.add(event.identity.request_id)
+    outbox._generation_lease_deadlines[event.identity.request_id] = fixed_now + timedelta(
+        seconds=120
+    )
+
+    async def run() -> None:
+        await outbox._heartbeat_active_generations_with_retry()
+        await outbox.finalize(event)
+
+    asyncio.run(run())
+
+    assert sleeps == expected_sleeps
+    assert client.calls[-1][0].endswith("/rpc/finalize_serving_usage")
+    assert outbox._background_error is None
+    assert not outbox._stopping.is_set()
     assert event.identity.request_id not in outbox._active_generations
 
 
@@ -970,7 +1040,7 @@ def test_startup_claim_recovers_expired_lease_and_delivers() -> None:
     assert any(url.endswith("/rpc/acknowledge_serving_usage_delivered") for url, _ in client.calls)
 
 
-def test_graceful_shutdown_releases_active_lease_for_replay() -> None:
+def test_slow_delivery_shutdown_releases_every_single_row_claim() -> None:
     row = _claimed_row()
     entered = asyncio.Event()
     unblock = asyncio.Event()
@@ -993,15 +1063,29 @@ def test_graceful_shutdown_releases_active_lease_for_replay() -> None:
     async def run() -> None:
         await outbox.start()
         await asyncio.wait_for(entered.wait(), timeout=1)
+        assert outbox._active_leases == {row["id"]}
         await outbox.aclose()
         unblock.set()
 
     asyncio.run(run())
 
-    release_url, release = client.calls[-1]
-    assert release_url.endswith("/rpc/reschedule_serving_usage")
-    assert release["p_error_code"] == "worker_shutdown"
-    assert release["p_retry_at"] == fixed_now.isoformat()
+    claim_calls = [
+        payload for url, payload in client.calls if url.endswith("/rpc/claim_serving_usage_batch")
+    ]
+    assert claim_calls == [{"p_worker_id": "worker-1", "p_limit": 1, "p_lease_seconds": 60}]
+    release_calls = [
+        payload for url, payload in client.calls if url.endswith("/rpc/reschedule_serving_usage")
+    ]
+    assert release_calls == [
+        {
+            "p_outbox_id": row["id"],
+            "p_worker_id": "worker-1",
+            "p_retry_at": fixed_now.isoformat(),
+            "p_error_code": "worker_shutdown",
+        }
+    ]
+    assert not any(url.endswith("/rpc/quarantine_serving_usage") for url, _ in client.calls)
+    assert outbox._active_leases == set()
 
 
 def test_snapshot_is_immutable_and_does_not_mutate_state() -> None:
