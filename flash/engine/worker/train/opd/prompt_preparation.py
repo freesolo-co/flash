@@ -118,7 +118,7 @@ def prepare_prompts(
         raise RuntimeError("opd max_context_tokens leaves no room for a prompt")
     if request.multi_turn:
         validate_glue_template(tokenizer, thinking=bool(_w.THINKING))
-    prompts: list[Any] = []
+    prompts: list[_BridgePrompt] = []
     dropped_long = 0
     package_root_value = getattr(request.env, "package_root", None)
     package_root = str(Path(package_root_value).resolve()) if package_root_value else None
