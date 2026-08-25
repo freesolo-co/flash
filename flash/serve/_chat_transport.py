@@ -6,11 +6,12 @@ import math
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Any, Protocol
-
-import httpx
+from typing import TYPE_CHECKING, Any, Protocol
 
 from flash.serve.errors import RetryableServingUnavailable
+
+if TYPE_CHECKING:
+    import httpx
 
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 _SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0

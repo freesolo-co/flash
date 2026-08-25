@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from flash.serve.request_validation import (
+    MAX_COMPRESSED_BYTES,
     MAX_SOURCE_CHARS,
     normalize_messages,
     normalize_structured_outputs,
@@ -177,7 +178,11 @@ def _messages(value: object) -> list[dict[str, Any]]:
             error_type=OpenAIRequestError,
             max_source_chars=MAX_SOURCE_CHARS,
         )
-    except OpenAIRequestError:
+    except OpenAIRequestError as exc:
+        if str(exc) == "image source exceeds the per-image encoded-size limit":
+            raise OpenAIRequestError(
+                f"image source exceeds the {MAX_COMPRESSED_BYTES}-byte limit"
+            ) from exc
         raise
     return [dict(message) for message in value]
 

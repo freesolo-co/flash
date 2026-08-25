@@ -125,6 +125,28 @@ def test_client_modules_import_without_any_third_party_package():
     )
 
 
+def test_chat_transport_boundaries_import_without_httpx():
+    env = {
+        "PYTHONPATH": ":".join(_stdlib_only_path()),
+        "PYTHONNOUSERSITE": "1",
+        "PATH": "/usr/bin:/bin",
+    }
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "import flash.serve._chat_transport; import flash.serve.streaming",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_probe_detects_a_planted_violation(tmp_path):
     """The guard above is worthless if it cannot fail, so prove it fails on a real violation.
 
