@@ -17,14 +17,7 @@ from typing import Any
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
-from flash.providers._lifecycle.instances.poll import (
-    FIRST_LIVENESS_S,
-    LOAD_TIMEOUT_S,
-    SETUP_GRACE_S,
-    STALL_AFTER_S,
-    make_say,
-    preload_box_reap_due,
-)
+from flash.providers._lifecycle.instances.poll import make_say, preload_box_reap_due
 from flash.providers._lifecycle.instances.poll_instance import (
     InstancePollAdapter,
     poll_instance_job,
@@ -34,11 +27,7 @@ from flash.providers._lifecycle.net.deadline import (
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers.artifacts.hf import (
-    error_artifact_name,
-    heartbeat_reader_for,
-    make_hf_text_reader,
-)
+from flash.providers.artifacts.hf import error_artifact_name, make_hf_text_reader
 from flash.providers.core.base import (
     GPU_INFO,
     PollResult,
@@ -200,6 +189,7 @@ def _build_launch_user_data(
     spec,
     seed: int,
     attempt: int,
+    fence: int,
     runtime_secrets: dict | None,
     source_snapshot: dict | None,
     absolute_deadline: float,
@@ -219,7 +209,7 @@ def _build_launch_user_data(
     if cache_host_mount is not None:
         payload_kwargs["cache_host_mount"] = cache_host_mount
     return build_user_data(
-        build_payload(spec, seed, attempt, **payload_kwargs),
+        build_payload(spec, seed, attempt, fence, **payload_kwargs),
         gpu=spec.gpu.type,
     )
 
@@ -285,7 +275,13 @@ def _disk_capable_instances(spec, instances: list[LambdaInstance], say) -> list[
     )
 
 
-def _lambda_job_handle(instance_id: str, inst: LambdaInstance, name: str, attempt: int):
+def _lambda_job_handle(
+    instance_id: str,
+    inst: LambdaInstance,
+    name: str,
+    attempt: int,
+    fence: int,
+):
     return LambdaJobHandle(
         instance_id=instance_id,
         instance_type=inst.instance_type,
@@ -297,6 +293,7 @@ def _lambda_job_handle(instance_id: str, inst: LambdaInstance, name: str, attemp
         # WHOLE instance or an n-card box under-reports by exactly n.
         hourly_usd=inst.price_usd_hr * inst.gpu_count,
         attempt=attempt,
+        fence=fence,
         started_ts=time.time(),
     )
 
@@ -346,7 +343,7 @@ def _rent_instance(
         # (interrupt, SystemExit) tears the still-unpublished box down first.
         with contextlib.suppress(Exception):
             say(describe(instance_id))
-        return _lambda_job_handle(instance_id, inst, plan.name, plan.attempt)
+        return _lambda_job_handle(instance_id, inst, plan.name, plan.attempt, plan.fence)
     except BaseException as error:
         _cleanup_unpublished_instance(
             plan.spec.run_id, instance_id, context="post-launch handle acquisition"
@@ -432,6 +429,7 @@ class _LaunchPlan:
     spec: Any
     seed: int
     attempt: int
+    fence: int
     runtime_secrets: dict | None
     source_snapshot: dict | None
     absolute_deadline: float
@@ -449,6 +447,7 @@ def _build_launch_plan(
     spec,
     seed: int,
     attempt: int,
+    fence: int,
     runtime_secrets: dict | None,
     source_snapshot: dict | None,
     absolute_deadline: float,
@@ -458,11 +457,12 @@ def _build_launch_plan(
     """Build the label, SSH key, and both user_data variants once, before any region is tried."""
     cache_name = getattr(spec.gpu, "network_volume", None)
     default_cache_mount = f"/lambda/nfs/{cache_name}" if cache_name else ""
-    build_kwargs = (spec, seed, attempt, runtime_secrets, source_snapshot, absolute_deadline)
+    build_kwargs = (spec, seed, attempt, fence, runtime_secrets, source_snapshot, absolute_deadline)
     return _LaunchPlan(
         spec=spec,
         seed=seed,
         attempt=attempt,
+        fence=fence,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         absolute_deadline=absolute_deadline,
@@ -516,6 +516,7 @@ def _region_launch_inputs(
                 plan.spec,
                 plan.seed,
                 plan.attempt,
+                plan.fence,
                 plan.runtime_secrets,
                 plan.source_snapshot,
                 plan.absolute_deadline,
@@ -542,6 +543,7 @@ def launch_and_submit(
     seed: int,
     instances: list[LambdaInstance],
     attempt: int = 0,
+    fence: int = 1,
     log=None,
     runtime_secrets: dict | None = None,
     mode: str | None = None,
@@ -563,7 +565,7 @@ def launch_and_submit(
         )
     instances = _disk_capable_instances(spec, instances, say)
     plan = _build_launch_plan(
-        spec, seed, attempt, runtime_secrets, source_snapshot, absolute_deadline, mode, models
+        spec, seed, attempt, fence, runtime_secrets, source_snapshot, absolute_deadline, mode, models
     )
 
     tried_regions: set[str] = set()
@@ -694,10 +696,6 @@ def poll_lambda_job(
     seed: int,
     log=None,
     interval_s: float = 15.0,
-    heartbeat_reader=None,
-    setup_grace_s: float = SETUP_GRACE_S,
-    stall_after_s: float = STALL_AFTER_S,
-    first_liveness_s: float = FIRST_LIVENESS_S,
     deadline_at: float | None = None,
 ) -> PollResult:
     """Poll instance status + HF artifacts to a terminal state.
@@ -709,16 +707,10 @@ def poll_lambda_job(
     (a module global) so ``monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", ...)`` still bites.
     """
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
+    from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
+
     hf_repo = spec.train.hf_repo
-    prefix = f"{spec.phase}/{spec.run_id}"
-    err_name = error_artifact_name(spec.phase, handle.attempt)
-    # Absence of boot.log while active = cloud-init never ran (sick region / stuck host).
-    boot_log_reader = _make_hf_file_reader(
-        hf_repo,
-        f"{prefix}/lambda_attempt{handle.attempt}_boot.log",
-        min_interval_s=60.0,
-        **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
-    )
+    source_snapshot = source_snapshot_from_status(get_status(spec.run_id), required=True)
 
     def stamp_cost_and_notes(metrics, *, end_ts, launch_ts) -> None:
         # Lambda bills the INSTANCE wall (launch -> completion), not the worker's train wall.
@@ -737,27 +729,16 @@ def poll_lambda_job(
         metrics["notes"] = notes
 
     adapter = InstancePollAdapter(
+        provider="lambda",
         instance_id=handle.instance_id,
         run_id=spec.run_id,
         current_attempt=handle.attempt,
+        fence=handle.fence,
         launch_ts=handle.started_ts,
-        done_reader=_make_hf_file_reader(
-            hf_repo,
-            f"{prefix}/DONE",
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
-        ),
-        marker_reader=_make_hf_file_reader(
-            hf_repo,
-            f"{prefix}/lambda_attempt{handle.attempt}.json",
-            min_interval_s=60.0,
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
-        ),
-        metrics_reader=_make_hf_file_reader(
-            hf_repo,
-            f"{prefix}/metrics.json",
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
-        ),
-        # Resolve get_instance on the api MODULE at call time so a monkeypatch bites.
+        hf_repo=hf_repo,
+        phase=spec.phase,
+        source_snapshot=source_snapshot,
+        # resolve get_instance on the api module at call time so a monkeypatch bites.
         fetch_instance=lambda: lambda_api.get_instance(
             handle.instance_id,
             **deadline_kwargs(lambda_api.get_instance, absolute_deadline),
@@ -767,35 +748,12 @@ def poll_lambda_job(
         running_status="active",
         dead_states=_DEAD_STATES,
         missing_dead_threshold=3,
-        # Empty "" boot.log counts as liveness (existence = cloud-init ran) -> ``is not None``.
-        early_liveness_alive=lambda: boot_log_reader(force=True) is not None,
-        read_current_error=lambda: _make_hf_file_reader(
-            hf_repo,
-            f"{prefix}/{err_name}",
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
-        )(force=True),
         stamp_cost_and_notes=stamp_cost_and_notes,
-        failure_detail=lambda marker: _failure_detail(
-            hf_repo, prefix, spec.phase, marker, handle.attempt
-        ),
-        load_timeout_detail=lambda status, elapsed: (
-            f"instance stuck in '{status}' for {int(elapsed)}s "
-            f"(never became active; provisioning / host issue)"
-        ),
-        first_liveness_detail=lambda elapsed, fl: (
-            f"no worker liveness (boot.log/heartbeat) for {int(elapsed)}s after instance became active "
-            f"(cloud-init/worker never started; limit {int(fl)}s)"
-        ),
     )
     return poll_instance_job(
         adapter,
         log=log,
         interval_s=interval_s,
-        heartbeat_reader=heartbeat_reader,
-        setup_grace_s=setup_grace_s,
-        stall_after_s=stall_after_s,
-        first_liveness_s=first_liveness_s,
-        load_timeout_s=LOAD_TIMEOUT_S,
         **deadline_kwargs(poll_instance_job, absolute_deadline),
     )
 
@@ -821,6 +779,7 @@ def submit_run_lambda(
     log=None,
     on_handle=None,
     attempt: int = 0,
+    fence: int = 1,
     runtime_secrets: dict | None = None,
     source_snapshot: dict | None = None,
     deadline_at: float | None = None,
@@ -845,6 +804,7 @@ def submit_run_lambda(
         seed,
         instances,
         attempt=attempt,
+        fence=fence,
         log=log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
@@ -853,16 +813,11 @@ def submit_run_lambda(
     try:
         if on_handle is not None:
             on_handle(handle.to_dict())
-        reader = heartbeat_reader_for(
-            spec,
-            **deadline_kwargs(heartbeat_reader_for, absolute_deadline),
-        )
         return poll_lambda_job(
             handle,
             spec,
             seed,
             log=log,
-            heartbeat_reader=reader,
             **deadline_kwargs(poll_lambda_job, absolute_deadline),
         )
     finally:

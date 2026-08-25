@@ -11,12 +11,12 @@ from __future__ import annotations
 import contextlib
 import os
 
-import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.io.progress as _worker_progress
 import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
 from flash.engine.plan.steps import final_save_due
-from flash.engine.worker.io.heartbeat import liveness_heartbeat
+from flash.engine.worker.io.progress import observe_phase
 from flash.engine.worker.model.packing import model_is_gdn_hybrid
 from flash.engine.worker.perf import gpu_diagnostics
 from flash.engine.worker.train.entry.backend_common import (
@@ -77,7 +77,7 @@ def _write_terminal_metadata(
     gdn_hybrid,
 ):
     metrics_last = state.metrics_last
-    _worker_heartbeat.heartbeat(
+    _worker_progress.publish_progress(
         "rl_trained",
         train_wall=train_wall,
         step=steps_run,
@@ -92,11 +92,11 @@ def _write_terminal_metadata(
         setup_seconds=setup_seconds,
         train_tokens=0,
         # carry the completed step, as the sft and opd finalizers already do. without it the
-        # rl_train_done and done heartbeats land stepless and overwrite the stepped rl_trained ping
+        # rl_train_done and done progresss land stepless and overwrite the stepped rl_trained ping
         # above, so a cancel arriving between here and DONE reprices a fully trained run at zero
         # steps (actual_steps_run returns 0 for a non-training stage with no step).
         step=steps_run,
-        heartbeat_fields={"metrics_last": list(metrics_last)},
+        progress_fields={"metrics_last": list(metrics_last)},
         generated_tokens=int(
             sum(state.resp_len_history)
             / max(1, len(state.resp_len_history))
@@ -246,7 +246,7 @@ def run_rl_train():
     # env load, prompt render and tokenization run for minutes on a large split and emit nothing of
     # their own; without the wrap the provider sees silence from rl_start until rl_train_start.
     # (the warm-start adapter pull nested inside carries its own rl_adapter_loading wrap.)
-    with liveness_heartbeat("rl_data_loading"):
+    with observe_phase("rl_data_loading"):
         t_start, inp, env, tok, preprocessor, prompts, download_seconds = _prepare_rl_inputs()
     # verl resolves model.path with HF_HUB_OFFLINE=1, so pass a real snapshot directory. bare ids can
     # miss pinned revisions or cache symlinks and fail after gpu rental. _cached_model_path handles
@@ -259,7 +259,7 @@ def run_rl_train():
         # provisioning and the cold verl capability probe can take minutes without step output. keep
         # liveness running so the stall watchdog does not fail healthy setup (#442). there is no
         # monotonic progress counter here, only the keepalive.
-        with liveness_heartbeat("rl_configuring"):
+        with observe_phase("rl_configuring"):
             python_bin = resolve_verl_python(
                 files["workdir"], install_wandb=bool(os.environ.get("WANDB_API_KEY"))
             )
@@ -283,7 +283,7 @@ def run_rl_train():
             caps=caps,
         )
         expected_steps, loggers = configured["expected_steps"], configured["loggers"]
-        _worker_heartbeat.heartbeat("rl_step", step=0, initial=True)
+        _worker_progress.publish_progress("rl_step", step=0, initial=True)
         state = _StepMetricState(resume_step=int(files["resume_step"]))
         resume_uploader = _start_resume_uploader(
             local_dir=files["local_dir"],
@@ -301,13 +301,13 @@ def run_rl_train():
             return state.progress["step"]
 
         def _reward_observability() -> dict:
-            """return reward observability and measured pace for one heartbeat."""
+            """return reward observability and measured pace for one progress."""
             return {
-                **reward_runtime.observability.heartbeat_fields(),
+                **reward_runtime.observability.progress_fields(),
                 **_step_timing_fields(inp, state),
             }
 
-        with liveness_heartbeat(
+        with observe_phase(
             "rl_step",
             progress=_progress,
             fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
@@ -343,7 +343,7 @@ def run_rl_train():
         raise RuntimeError(
             f"grpo completed {steps_run}/{expected_steps} requested optimizer updates"
         )
-    with liveness_heartbeat(
+    with observe_phase(
         "rl_finalizing",
         progress=lambda: steps_run,
         fields=lambda: {"metrics_last": list(metrics_last)},

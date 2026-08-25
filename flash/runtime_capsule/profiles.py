@@ -35,6 +35,7 @@ _INSTANCE_BOOTSTRAP_SOURCES = (
     (f"{_LIFECYCLE}/bootstrapping/secrets.py", "bootstrap_secrets.py"),
     (f"{_LIFECYCLE}/bootstrapping/console.py", "bootstrap_console.py"),
     (f"{_LIFECYCLE}/bootstrapping/pip.py", "bootstrap_pip.py"),
+    (f"{_LIFECYCLE}/bootstrapping/processes.py", "bootstrap_processes.py"),
     ("flash/snapshot/archive.py", "archive.py"),
 )
 

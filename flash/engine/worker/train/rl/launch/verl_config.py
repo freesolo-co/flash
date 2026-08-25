@@ -795,7 +795,7 @@ def _build_verl_train_notes(
         "grad_norm_evidence": copy.deepcopy(grad_norm_evidence or []),
         # episode and turn totals for a multi-turn run; None for single-turn, which has no
         # episode loop to account for. published in the durable notes rather than only on the
-        # heartbeat because this is the evidence that separates "multi-turn was configured" from
+        # progress because this is the evidence that separates "multi-turn was configured" from
         # "multi-turn actually iterated", and a one-turn collapse passes every other gate.
         "multi_turn_accounting": copy.deepcopy(multi_turn_accounting),
         "grpo_recipe": {

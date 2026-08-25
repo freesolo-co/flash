@@ -1,19 +1,8 @@
-"""Provider-neutral HF-artifact reading + heartbeat provenance.
-
-The control plane observes a remote worker purely through the artifacts it uploads to a private HF
-dataset repo: rate-limited text/JSON readers for ``heartbeat.json`` / ``error_*.txt`` / console logs,
-plus the provenance predicates that decide whether a heartbeat belongs to THIS attempt or a leftover
-prior one. None of this is provider-specific — RunPod, Lambda, and Vast all poll the same artifact
-shape — so it lives here in the shared kernel and no provider package imports another for it.
-
-The worker-side bootstrap (``_instance_bootstrap``) cannot import flash, so it re-implements the
-upload half; this module is the read half every poller shares.
-"""
+"""provider-neutral Hugging Face artifact readers and retry safety checks."""
 
 from __future__ import annotations
 
 import json
-import math
 import os
 import time
 from collections.abc import Callable
@@ -368,47 +357,6 @@ def make_hf_text_reader(
     return read
 
 
-def make_hf_heartbeat_reader(
-    hf_repo: str,
-    prefix: str,
-    min_interval_s: float = 30.0,
-    *,
-    deadline_at: float | None = None,
-):
-    """Rate-limited JSON reader for ``{prefix}/heartbeat.json`` on HF."""
-    text_reader = make_hf_text_reader(
-        hf_repo,
-        f"{prefix}/heartbeat.json",
-        min_interval_s,
-        **deadline_kwargs(make_hf_text_reader, deadline_at),
-    )
-
-    def read(force: bool = False, *, deadline_at: float | None = deadline_at) -> dict | None:
-        raw = text_reader(force=force, deadline_at=deadline_at)
-        if raw is None:
-            return None
-        try:
-            return json.loads(raw)
-        except (ValueError, TypeError):
-            return None
-
-    return read
-
-
-def heartbeat_reader_for(spec, *, deadline_at: float | None = None):
-    """The HF heartbeat reader for a run's spec (None when the run has no hf_repo)."""
-    hf_repo = spec.train.hf_repo
-    return (
-        make_hf_heartbeat_reader(
-            hf_repo,
-            f"{spec.phase}/{spec.run_id}",
-            **deadline_kwargs(make_hf_heartbeat_reader, deadline_at),
-        )
-        if hf_repo
-        else None
-    )
-
-
 def error_artifact_name(phase: str, attempt) -> str:
     """Worker error-artifact filename for one exact bounded attempt identity.
 
@@ -464,42 +412,6 @@ def make_hf_failure_detail_reader(
         return "\n".join(parts) if parts else None
 
     return read
-
-
-def _heartbeat_matches_attempt(hb: dict, launch_ts: float | None, current_attempt) -> bool:
-    """Require exact attempt and timestamp provenance for one current worker heartbeat."""
-    expected_attempt = _attempt_int(current_attempt)
-    heartbeat_attempt = _attempt_int(hb.get("attempt"))
-    if expected_attempt is None or heartbeat_attempt != expected_attempt:
-        return False
-    if isinstance(launch_ts, bool) or not isinstance(launch_ts, (int, float)):
-        return False
-    launch = float(launch_ts)
-    ts = hb.get("ts")
-    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
-        return False
-    now = time.time()
-    timestamp = float(ts)
-    return (
-        math.isfinite(launch)
-        and launch > 0
-        and math.isfinite(timestamp)
-        and launch <= timestamp <= now + 120.0
-    )
-
-
-def worker_flagged_retriable(
-    heartbeat_reader, *, launch_ts: float | None = None, current_attempt: int | None = None
-) -> bool:
-    """Honor a retriable heartbeat only when its exact attempt provenance is current."""
-    if heartbeat_reader is None:
-        return False
-    hb = heartbeat_reader(force=True)
-    return (
-        isinstance(hb, dict)
-        and hb.get("retriable") is True
-        and _heartbeat_matches_attempt(hb, launch_ts, current_attempt)
-    )
 
 
 T = TypeVar("T")

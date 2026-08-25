@@ -6,7 +6,6 @@ Launch scripts must ship ``bootstrap_console.py``, ``bootstrap_secrets.py`` and 
 
 from __future__ import annotations
 
-import contextlib
 import json
 import math
 import multiprocessing
@@ -22,6 +21,7 @@ from email.utils import parsedate_to_datetime
 if __package__:
     from flash.providers._lifecycle.bootstrapping import console as _bootstrap_console
     from flash.providers._lifecycle.bootstrapping import pip as bootstrap_pip
+    from flash.providers._lifecycle.bootstrapping import processes as bootstrap_processes
     from flash.providers._lifecycle.bootstrapping.secrets import (
         _payload_secrets,
         _read_console_tail,
@@ -34,6 +34,7 @@ else:
     import archive as _source_snapshot  # type: ignore[no-redef]
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
+    import bootstrap_processes  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
         _read_console_tail,
@@ -91,23 +92,9 @@ def require_deadline_at(payload: dict) -> float:
     return deadline
 
 
-def _publish_timeout_marker_then_exit(payload: dict, message: str) -> None:
+def _deadline_exit(message: str) -> None:
     print(f"FLASH: {message}", flush=True)
-    marker_done = threading.Event()
-
-    def _publish() -> None:
-        try:
-            with contextlib.suppress(Exception):
-                write_attempt_marker(payload, ok=False, error=message)
-        finally:
-            marker_done.set()
-
-    try:
-        marker_thread = threading.Thread(target=_publish, daemon=True)
-        marker_thread.start()
-        marker_done.wait(_TERMINAL_MARKER_GRACE_S)
-    finally:
-        os._exit(124)
+    os._exit(124)
 
 
 def arm_deadline_watchdog(
@@ -120,10 +107,7 @@ def arm_deadline_watchdog(
     def _fire() -> None:
         if done.is_set():
             return
-        _publish_timeout_marker_then_exit(
-            payload,
-            "run wall deadline exceeded; self-terminating box",
-        )
+        _deadline_exit("run wall deadline exceeded; self-terminating box")
 
     timer = threading.Timer(max(0.0, deadline_at - time.time()), _fire)
     timer.daemon = True
@@ -546,6 +530,12 @@ def build_worker_env(payload: dict) -> dict:
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise RuntimeError("bootstrap attempt identity is invalid")
     env["ATTEMPT"] = str(attempt)
+    fence = payload.get("fence")
+    if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
+        raise RuntimeError("bootstrap fence identity is invalid")
+    env["FENCE"] = str(fence)
+    if payload.get("source_snapshot") is not None:
+        env["FLASH_SOURCE_SNAPSHOT_JSON"] = json.dumps(payload["source_snapshot"], sort_keys=True)
     # Override runpod-stamped FLASH_ARM to the real backend from the payload.
     env["FLASH_ARM"] = _arm(payload)
     code_dir = _code_dir(payload)
@@ -599,11 +589,52 @@ def fetch_code(payload: dict) -> None:
     )
 
 
+def _publish_deadline_result(
+    payload: dict,
+    env: dict,
+    *,
+    code_dir: str,
+    started_at: float,
+) -> None:
+    result_deadline = _finite_positive_number(
+        payload.get("result_deadline_at"), "result visibility deadline"
+    )
+    remaining = result_deadline - _finite_positive_number(time.time(), "current clock")
+    if remaining <= 0:
+        raise TimeoutError("result visibility deadline expired before deadline publication")
+    result_env = {
+        **env,
+        "FLASH_RUN_DEADLINE_AT": str(result_deadline),
+    }
+    command = (
+        "from flash.engine.worker.io.result import publish_deadline_result; "
+        f"publish_deadline_result(started_at={started_at!r})"
+    )
+    process, process_group_id = bootstrap_processes.start_process_group(
+        [sys.executable, "-c", command],
+        cwd=code_dir,
+        env=result_env,
+    )
+    try:
+        process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        bootstrap_processes.terminate_process_group(
+            process,
+            process_group_id=process_group_id,
+        )
+        raise TimeoutError("deadline result publication exceeded its visibility window") from None
+    if process.returncode != 0:
+        raise RuntimeError("deadline result publication failed")
+
+
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """Run one worker subprocess; tee console to a file and upload periodically for live logs."""
     console = f"/tmp/console_{mode}.txt"
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
-    worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
+    worker_deadline_at = min(
+        _worker_execution_deadline(upload_deadline_at),
+        _finite_positive_number(payload.get("work_deadline_at"), "work deadline"),
+    )
     # cap work from its actual start: the absolute deadline includes boot grace, whose unused
     # portion must not extend the declared wall-time budget.
     budget = payload.get("run_max_wall_seconds")
@@ -620,7 +651,8 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         code_dir = _code_dir(payload)
         if worker_deadline_at - _finite_positive_number(time.time(), "current clock") <= 0:
             raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
-        proc = subprocess.Popen(
+        worker_started_at = _finite_positive_number(time.time(), "current clock")
+        proc, process_group_id = bootstrap_processes.start_process_group(
             [sys.executable, "-m", "flash.engine.support.worker_entrypoint"],
             cwd=code_dir,
             env={
@@ -679,13 +711,10 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                 proc.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                proc.kill()
-                remaining = max(
-                    0.0,
-                    worker_deadline_at - _finite_positive_number(time.time(), "current clock"),
+                bootstrap_processes.terminate_process_group(
+                    proc,
+                    process_group_id=process_group_id,
                 )
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=remaining)
 
             drain_timeout = max(
                 0.0,
@@ -728,6 +757,12 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             flush=True,
         )
     if timed_out:
+        _publish_deadline_result(
+            payload,
+            env,
+            code_dir=code_dir,
+            started_at=worker_started_at,
+        )
         raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
     return proc.returncode
 
@@ -763,6 +798,7 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
             _source_descriptor(payload),
             run_id=run_id,
             attempt=attempt,
+            fence=int(payload["fence"]),
         )
     p = "/tmp/attempt_marker.json"
     with open(p, "w") as f:
@@ -785,10 +821,7 @@ def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Eve
     def _fire() -> None:
         if done.is_set():
             return
-        _publish_timeout_marker_then_exit(
-            payload,
-            "preload exceeded the run wall deadline; self-terminating box",
-        )
+        _deadline_exit("preload exceeded the run wall deadline; self-terminating box")
 
     timer = threading.Timer(max(0.0, remaining), _fire)
     timer.daemon = True
@@ -855,12 +888,8 @@ def run_preload(payload: dict) -> dict:
 
 
 def main() -> int:
-    # SIGTERM → sys.exit so the finally block still uploads the terminal marker.
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(1))
     payload = load_payload()
-    ok = False
-    error = ""
-    retriable = False
     deadline_watchdog = None
     try:
         try:
@@ -876,85 +905,29 @@ def main() -> int:
             result = run_preload(payload)
             with open("/tmp/preload_result.json", "w") as f:
                 json.dump(result, f)
-            # preload_result.json is the completion signal the warm driver polls.
-            confirmed = False
-            for attempt in range(3):
-                remaining = deadline - _finite_positive_number(time.time(), "current clock")
-                if remaining <= 0:
-                    break
-                hf_upload(payload, "/tmp/preload_result.json", "preload_result.json")
-                try:
-                    confirmed = hf_file_exists(payload, "preload_result.json")
-                except Exception as exc:
-                    print(
-                        f"preload_result.json upload confirm warn: "
-                        f"{_safe_detail(exc, secrets=_payload_secrets(payload))}",
-                        flush=True,
-                    )
-                if confirmed:
-                    break
-                if attempt < 2:
-                    remaining = deadline - _finite_positive_number(time.time(), "current clock")
-                    if remaining <= 0:
-                        break
-                    time.sleep(min(2.0 * (attempt + 1), remaining))
-            if not confirmed:
-                print(
-                    "preload_result.json upload FAILED before the run deadline "
-                    "(driver falls back to the attempt marker)",
-                    flush=True,
-                )
-            ok = not result.get("error") and not result.get("failed")
-            error = "model preload failed" if not ok else ""
-            return 0 if ok else 1
+            hf_upload(payload, "/tmp/preload_result.json", "preload_result.json")
+            return 0 if not result.get("error") and not result.get("failed") else 1
         deadline_watchdog = arm_deadline_watchdog(deadline, payload)
-        # fetch and verify the pinned archive before pip, downloaded imports, path mutation, or child.
         fetch_code(payload)
         install_extra_pip(payload)
         env = build_worker_env(payload)
         phase = payload["phase"]
-        for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(stale)
         rc = run_mode(payload, env, phase, deadline)
-        # run_mode enforces the absolute subprocess deadline. once it returns, required completion
-        # artifacts take precedence over bootstrap bookkeeping that happens to cross the boundary.
-        if not os.path.exists("/tmp/metrics.json"):
-            # Missing local metrics but the run is confirmed complete on HF (DONE+metrics uploaded) —
-            # e.g. the idempotency replay hit a transient HF read. The run SUCCEEDED; retry so a fresh
-            # worker re-fetches the metrics, never fail a confirmed-complete run as a crash.
-            if remote_completion_confirmed(payload):
-                raise RetriableBootstrapError(
-                    f"train phase '{phase}' is complete on HF but its local metrics.json is missing "
-                    f"(transient HF read); retrying to re-fetch the persisted metrics"
-                )
-            raise RuntimeError(
-                f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
-                f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
-                f"dataset repo"
-            )
-        # Non-zero rc is tolerated only when completion artifacts landed on HF: RL's vLLM can
-        # segfault at interpreter exit AFTER DONE/metrics.json are already uploaded.
-        if rc != 0 and not remote_completion_confirmed(payload):
+        if rc != 0:
             raise RetriableBootstrapError(
-                f"train phase '{phase}' exited non-zero ({rc}) and its required completion "
-                f"artifacts (DONE/metrics.json) are not on HF — the run did not finish (e.g. a "
-                f"failed upload after the local metrics.json was written); see "
-                f"error_{phase}_attempt*.txt and console_{phase}.txt in the HF dataset repo"
+                f"train phase '{phase}' exited non-zero ({rc}); the control plane will resolve "
+                "the fenced result manifest or classify resource loss"
             )
-        ok = True
-    except BaseException as exc:  # incl. SIGTERM's SystemExit / KeyboardInterrupt
-        retriable = isinstance(exc, RetriableBootstrapError)
+        return 0
+    except BaseException as exc:
         detail = _safe_detail(exc, 1800, secrets=_payload_secrets(payload))
-        error = f"run wall deadline exceeded: {detail}" if isinstance(exc, TimeoutError) else detail
-        print(f"bootstrap failed: {error}", flush=True)
+        print(f"bootstrap failed: {detail}", flush=True)
+        return 1
     finally:
-        write_attempt_marker(payload, ok, error, retriable=retriable)
         if deadline_watchdog is not None:
             deadline_timer, deadline_done = deadline_watchdog
             deadline_done.set()
             deadline_timer.cancel()
-    return 0 if ok else 1
 
 
 if __name__ == "__main__":

@@ -482,7 +482,7 @@ def resume_upload_unavailable(step: int, checkpoint_dir: str, *, job_label: str)
     largest = _largest_file_bytes(checkpoint_dir)
     detail = f" largest member {largest / 1e9:.1f} GB." if largest else ""
     # "not confirmed", not "not uploaded": the False this reports on is also returned when the
-    # folder commit landed and only the closing heartbeat exhausted its retries, so the restart
+    # folder commit landed and only the closing progress exhausted its retries, so the restart
     # state may well be present. the run is continued either way, and the next attempt re-checks
     # what is actually in the repo rather than trusting this line.
     print(

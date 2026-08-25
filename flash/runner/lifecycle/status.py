@@ -16,11 +16,12 @@ import contextlib
 import json
 import os
 import time
+from dataclasses import replace
 
 from flash.core.catalog import validate_model_for_algorithm
 from flash.core.spec import JobSpec
 from flash.core.spec_persistence import validate_persisted_spec_envelope
-from flash.runner.lifecycle import attempts, preparation, reporting, state
+from flash.runner.lifecycle import preparation, reporting, state
 from flash.runner.lifecycle.state import RunStatus
 
 # every other collaborator is reached through `runner.` rather than bound here. `RUNS_DIR`,
@@ -278,6 +279,38 @@ def _record_projection(
     return True
 
 
+def record_attempt_handle(
+    run_id: str,
+    handle: dict,
+    *,
+    attempt_id: int,
+    fence: int,
+) -> bool:
+    """Bind the exact provider resource to the current fenced attempt."""
+    from flash.runner.lifecycle.protocol import bounded_json
+
+    with state._status_guard(run_id):
+        status = get_status(run_id)
+        attempt = _current_attempt(status)
+        if attempt.attempt_id != attempt_id or attempt.fence != fence:
+            return False
+        if status.state in state.TERMINAL_STATES:
+            return False
+        resource = bounded_json(handle)
+        status.attempt = replace(
+            attempt,
+            state="active",
+            provider=handle.get("provider"),
+            resource=resource,
+        ).to_dict()
+        status.remote = resource
+        status.state = "running"
+        status.updated_at = time.time()
+        state._save_status_unlocked(status)
+    reporting._report_status(status)
+    return True
+
+
 def record_progress(run_id: str, value: dict, *, attempt_id: int, fence: int) -> bool:
     return _record_projection(run_id, "progress", value, attempt_id=attempt_id, fence=fence)
 
@@ -309,6 +342,7 @@ def validate_terminal_source_metrics(
     metrics: dict,
     *,
     expected_attempt: int | None = None,
+    expected_fence: int | None = None,
 ) -> tuple[dict, int | None]:
     """Require trusted attempt-bound evidence for runs carrying a source descriptor."""
     if not isinstance(metrics, dict):
@@ -326,24 +360,19 @@ def validate_terminal_source_metrics(
     descriptor = source_snapshot_from_status(status)
     if descriptor is None:
         return sanitized, None
+    attempt_record = _current_attempt(status)
     if expected_attempt is None:
-        remote = status.remote if isinstance(status.remote, dict) else {}
-        candidate = remote.get("attempt")
-        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
-            expected_attempt = candidate
-    if expected_attempt is None:
-        expected_attempt = attempts._latest_reserved_attempt(status.run_id)
-    if (
-        isinstance(expected_attempt, bool)
-        or not isinstance(expected_attempt, int)
-        or expected_attempt < 0
-    ):
-        raise RuntimeError("managed attempt identity is unavailable for source attestation")
+        expected_attempt = attempt_record.attempt_id
+    if expected_fence is None:
+        expected_fence = attempt_record.fence
+    if expected_attempt != attempt_record.attempt_id or expected_fence != attempt_record.fence:
+        raise RuntimeError("terminal evidence does not match the current fenced attempt")
     validate_attestation(
         raw_attestation,
         descriptor,
         run_id=status.run_id,
         attempt=expected_attempt,
+        fence=expected_fence,
     )
     sanitized[PUBLIC_PROVENANCE_KEY] = safe_public_projection(
         descriptor,

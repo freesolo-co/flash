@@ -13,7 +13,7 @@ import flash.engine.worker.train.opd.bridging.prompts as _opd_prompts
 from flash.content.thinking import messages_for_chat_template
 from flash.engine.support.huggingface import model_revision_kwargs
 from flash.engine.worker.entry.opd import _thinking_prefill_text
-from flash.engine.worker.io.heartbeat import liveness_heartbeat
+from flash.engine.worker.io.progress import observe_phase
 from flash.engine.worker.model.decoding import prompt_opens_thinking
 from flash.engine.worker.runtime.rng import seed_training_rngs
 from flash.engine.worker.train.core.child.glue import (
@@ -39,7 +39,7 @@ def render_prompt_rows(request: _OpdRequest) -> tuple[list[tuple[Any, Any]], boo
     if max_examples > 0:
         train = train[:max_examples]
     scanned = [0]
-    with liveness_heartbeat("opd_prompt_scan", progress=lambda: scanned[0]):
+    with observe_phase("opd_prompt_scan", progress=lambda: scanned[0]):
         prompt_rows = []
         for example in train:
             prompt_rows.append((example, request.env.prompt_messages(example)))
@@ -128,7 +128,7 @@ def prepare_prompts(
     package_root = str(Path(package_root_value).resolve()) if package_root_value else None
     prepped = [0]
     thinking_semantics_set = False
-    with liveness_heartbeat("opd_image_prep", progress=lambda: prepped[0]):
+    with observe_phase("opd_image_prep", progress=lambda: prepped[0]):
         for example, messages in prompt_rows:
             prepped[0] += 1
             student_messages, image_descriptors = _prepare_prompt_messages(

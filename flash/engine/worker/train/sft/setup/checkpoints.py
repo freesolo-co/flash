@@ -15,7 +15,7 @@ import threading
 import time
 
 import flash.engine.worker.io.hf as _worker_hf
-from flash.engine.worker.io.heartbeat import join_while_draining
+from flash.engine.worker.io.progress import join_while_draining
 from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 from flash.engine.worker.train.entry.backend_common import (
     completed_checkpoint_step,

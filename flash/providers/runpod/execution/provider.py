@@ -79,6 +79,7 @@ class RunpodProvider:
         log: Any = None,
         on_handle: Any = None,
         attempt: int = 0,
+        fence: int = 1,
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
         source_snapshot: dict | None = None,
@@ -92,6 +93,7 @@ class RunpodProvider:
             "log": log,
             "on_handle": on_handle,
             "attempt": attempt,
+            "fence": fence,
             "on_last_gpu": on_last_gpu,
             "source_snapshot": source_snapshot,
             **deadline_kwargs(submit_run, _deadline_at),
@@ -110,50 +112,22 @@ class RunpodProvider:
         _deadline_at: float | None = None,
     ) -> PollResult:
         from flash.core.spec import gpu_count_of, require_matching_seed
-        from flash.providers.artifacts.hf import (
-            make_hf_failure_detail_reader,
-            make_hf_heartbeat_reader,
-        )
         from flash.providers.runpod.execution import polling as runpod_polling
         from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
-        from flash.providers.runpod.execution.jobs import stall_kwargs
+        from flash.providers.runpod.execution.jobs import capacity_wait_kwargs
 
         seed = require_matching_seed(spec, seed)
-        hf_repo = spec.train.hf_repo
-        prefix = f"{spec.phase}/{spec.run_id}"
         hd = handle.to_dict()
         rh = RunpodJobHandle.from_dict(hd)
         if not rh.job_id:
             raise ValueError("endpoint-only RunPod handles cannot be polled")
-        reader = (
-            make_hf_heartbeat_reader(
-                hf_repo,
-                prefix,
-                **deadline_kwargs(make_hf_heartbeat_reader, _deadline_at),
-            )
-            if hf_repo
-            else None
-        )
-        failure_reader = (
-            make_hf_failure_detail_reader(
-                hf_repo,
-                prefix,
-                spec.phase,
-                attempt=rh.attempt,
-                **deadline_kwargs(make_hf_failure_detail_reader, _deadline_at),
-            )
-            if hf_repo
-            else None
-        )
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
         on_last_gpu = bool(hd.get("on_last_gpu", False))
         return runpod_polling.poll_job(
             rh,
+            spec,
             log=log,
-            heartbeat_reader=reader,
-            failure_detail_reader=failure_reader,
-            current_attempt=rh.attempt,
             **deadline_kwargs(runpod_polling.poll_job, _deadline_at),
             # the persisted scarcity flag controls stall grace, not capacity wording. recovery
             # rebuilds the unpinned allocation with a fresh candidate set, so claiming no escalation
@@ -163,7 +137,7 @@ class RunpodProvider:
             # attach polls the persisted EFFECTIVE worker spec, which submission already stamped
             # with the count allocation resolved, and the attach context pops that handle key off
             # before the handle reaches here. same number, but sourced where it is always present.
-            **stall_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
+            **capacity_wait_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
         )
 
     def cancel(self, handle: JobHandle) -> None:

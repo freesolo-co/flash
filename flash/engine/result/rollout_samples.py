@@ -1,4 +1,4 @@
-"""Credential-safe rollout samples (full, untruncated) for heartbeat diagnostics.
+"""Credential-safe rollout samples (full, untruncated) for progress diagnostics.
 
 A "sample" is one on-policy generation surfaced so a user can SEE what the model produced on a logged
 training step (GRPO carries the scored ``reward``; OPD carries the distillation ``loss``). Text content
@@ -129,7 +129,7 @@ def build_rollout_sample(
     }
     # this is the one place the scalar is coerced, so it is the one place a non-finite one can be
     # created. omit rather than publish it: json.dumps writes bare NaN/Infinity, which is not json,
-    # and a strict reader rejects the whole heartbeat over it -- losing the step's other fields too.
+    # and a strict reader rejects the whole progress over it -- losing the step's other fields too.
     # a sample without its scalar is then skipped by the reader, so a diverged step publishes fewer
     # samples rather than a payload that will not parse.
     for key, value in (("reward", reward), ("loss", loss)):

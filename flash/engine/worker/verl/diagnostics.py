@@ -3,7 +3,7 @@
 A wedged or crashed child is diagnosed from two places: the tail of its own stdout, which
 `ChildOutputTail` retains in a bounded ring buffer and `ChildTailStaleness` times, and ray's
 per-session log directory, which holds the raylet and worker output the child never printed. Both
-end up on a heartbeat payload, so both are size-capped and sanitized.
+end up on a progress payload, so both are size-capped and sanitized.
 
 Split out of `flash.engine.worker.train.entry.backend_common` to keep that module under the file-size limit.
 """
@@ -11,10 +11,13 @@ Split out of `flash.engine.worker.train.entry.backend_common` to keep that modul
 from __future__ import annotations
 
 import collections
+import json
 import os
 import re
+import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable
 
 from flash._internal.diagnostics import sanitize_diagnostic
@@ -25,9 +28,9 @@ from flash.engine.worker.verl.parent_work import ParentWorkGauge
 # (a ray warning, a placement-group notice, a partial traceback), so a small window suffices.
 CHILD_TAIL_LINES = 60
 # per-line cap when rendering the retained tail. verl prints resolved-config blocks thousands of
-# characters wide; an unbounded tail would blow the heartbeat payload it has to travel inside.
+# characters wide; an unbounded tail would blow the progress payload it has to travel inside.
 _CHILD_TAIL_LINE_CHARS = 300
-# how many retained lines ride along on a pre-first-step heartbeat. narrower than what is retained:
+# how many retained lines ride along on a pre-first-step progress. narrower than what is retained:
 # this payload is uploaded every tick, so it stays small enough not to bloat the snapshot.
 STALL_TAIL_LINES = 15
 _RETRIABLE_VERL_CHILD_SIGNATURES = (
@@ -52,7 +55,7 @@ def _backend_common():
 class ChildOutputTail:
     """bounded ring buffer of a subprocess's most recent output lines.
 
-    child stdout is absent from collected logs; only heartbeat markers survive. retain the tail so
+    child stdout is absent from collected logs; only progress markers survive. retain the tail so
     setup stalls can report the child's last words (ISSUES VERL-061).
     """
 
@@ -90,7 +93,7 @@ class ChildOutputTail:
         if text:
             # sanitize before the per-line cap, not after: truncating first could split a credential
             # across the cut and defeat full-value redaction. this is the worker side, where the
-            # run's secret values are known, and every consumer of the retained tail (heartbeat
+            # run's secret values are known, and every consumer of the retained tail (progress
             # payload, streamed run log, persisted status) reads it from here.
             sanitized = sanitize_diagnostic(text, limit=_CHILD_TAIL_LINE_CHARS)
             self._lines.append(sanitized)
@@ -198,7 +201,7 @@ class ChildTailStaleness:
     and a child wedged forever both present a fully populated tail whose newest line is plausible,
     so the only thing separating them is whether the tail CHANGED between two dumps -- and a
     stateless report throws that comparison away, leaving it to be reconstructed by hand from
-    consecutive heartbeats after the money is already spent (ISSUES VERL-067). holding the previous
+    consecutive progresss after the money is already spent (ISSUES VERL-067). holding the previous
     line count here turns that into a number the first dump already carries.
     """
 
@@ -226,7 +229,7 @@ def stall_tail_fields(
     limit: int = STALL_TAIL_LINES,
     staleness: ChildTailStaleness | None = None,
 ) -> dict[str, object]:
-    """heartbeat fields carrying the child's last words, but only while it has made no progress.
+    """progress fields carrying the child's last words, but only while it has made no progress.
 
     before the first step, the tail is the only collected setup-stall evidence. with ``staleness``,
     include silent ticks to distinguish a slow start from a wedge. return empty after progress or
@@ -252,10 +255,10 @@ def build_verl_line_handler(
     *,
     on_step: Callable[[int], None] | None,
     on_line: Callable[[str], None] | None,
-    heartbeat: Callable[[], None] | None,
+    progress: Callable[[], None] | None,
     step_pattern: str,
-    heartbeat_interval_s: float,
-    silence_watchdog: VerlChildSilenceWatchdog | None,
+    progress_interval_s: float,
+    silence_observer: VerlChildSilenceObserver | None,
 ) -> Callable[[str], None]:
     """build the per-line callback the streaming verl subprocess runs on every child line.
 
@@ -269,21 +272,21 @@ def build_verl_line_handler(
         nonlocal last_hb
         print(line, end="", flush=True)
         child_tail.record(line)
-        if silence_watchdog is not None:
-            silence_watchdog.observe_line(line)
+        if silence_observer is not None:
+            silence_observer.observe_line(line)
         if on_line is not None:
             on_line(line)
         match = step_re.search(line)
         if match:
             step = int(match.group(1))
-            if silence_watchdog is not None:
-                silence_watchdog.observe_step(step)
+            if silence_observer is not None:
+                silence_observer.observe_step(step)
             if on_step is not None:
                 on_step(step)
-        if heartbeat is not None:
+        if progress is not None:
             now = time.monotonic()
-            if now - last_hb >= heartbeat_interval_s:
-                heartbeat()
+            if now - last_hb >= progress_interval_s:
+                progress()
                 last_hb = now
 
     return handle_line
@@ -293,8 +296,8 @@ VERL_CHILD_SILENCE_SECONDS = 1200.0
 _VERL_CHILD_WATCH_TICK_SECONDS = 5.0
 
 
-class VerlChildSilenceWatchdog:
-    """tear down one live training child after sustained parent-and-child silence."""
+class VerlChildSilenceObserver:
+    """emit bounded diagnostics for sustained child silence without affecting lifecycle."""
 
     def __init__(
         self,
@@ -303,13 +306,11 @@ class VerlChildSilenceWatchdog:
         baseline_step: int,
         parent_work: ParentWorkGauge | None = None,
         child_alive: Callable[[], bool] | None = None,
-        teardown: Callable[[], None] | None = None,
     ) -> None:
         self._tail = tail
         self._baseline_step = int(baseline_step)
         self._parent_work = parent_work
         self._child_alive = child_alive
-        self._teardown = teardown
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -317,8 +318,7 @@ class VerlChildSilenceWatchdog:
         self._last_activity = time.monotonic()
         self._tail_progress = tail.written
         self._parent_completed = self._parent_snapshot().completed
-        self._failure: str | None = None
-        self._tore_down = False
+        self._reported = False
 
     def _parent_snapshot(self):
         if self._parent_work is None:
@@ -327,18 +327,17 @@ class VerlChildSilenceWatchdog:
             return ParentWorkSnapshot(0, 0)
         return self._parent_work.snapshot()
 
-    def bind(self, *, child_alive: Callable[[], bool], teardown: Callable[[], None]) -> None:
+    def bind(self, *, child_alive: Callable[[], bool]) -> None:
         self._child_alive = child_alive
-        self._teardown = teardown
 
     def start(self) -> None:
         if self._thread is not None:
             return
-        if self._child_alive is None or self._teardown is None:
-            raise RuntimeError("verl child silence watchdog is not bound")
+        if self._child_alive is None:
+            raise RuntimeError("verl child silence observer is not bound")
         self._thread = threading.Thread(
             target=self._watch,
-            name="verl-child-silence-watchdog",
+            name="verl-child-silence-observer",
             daemon=True,
         )
         self._thread.start()
@@ -371,35 +370,38 @@ class VerlChildSilenceWatchdog:
             completed = snapshot.completed != self._parent_completed
             if changed or completed or snapshot.depth > 0:
                 self._last_activity = time.monotonic()
+                self._reported = False
             self._tail_progress = self._tail.written
             self._parent_completed = snapshot.completed
 
     def check(self) -> None:
         self._record_activity()
-        teardown = None
         with self._lock:
             alive = self._child_alive is not None and self._child_alive()
-            expired = time.monotonic() - self._last_activity >= VERL_CHILD_SILENCE_SECONDS
-            if self._armed and alive and expired and self._failure is None:
-                self._failure = (
-                    "verl_child_silence: no distinct child output or parent work completed for "
-                    f"{VERL_CHILD_SILENCE_SECONDS:.0f}s while training"
-                )
-                if not self._tore_down:
-                    self._tore_down = True
-                    teardown = self._teardown
-        if teardown is not None:
-            teardown()
+            elapsed = time.monotonic() - self._last_activity
+            if not self._armed or not alive or elapsed < VERL_CHILD_SILENCE_SECONDS or self._reported:
+                return
+            self._reported = True
+            snapshot = self._parent_snapshot()
+            payload = {
+                "kind": "verl_child_silence_diagnostic",
+                "elapsed_s": round(elapsed, 1),
+                "parent_completed": snapshot.completed,
+                "parent_depth": snapshot.depth,
+                "child_tail": self._tail.tail(limit=STALL_TAIL_LINES),
+            }
+        print("VERL DIAGNOSTIC", json.dumps(payload, sort_keys=True), flush=True)
+        frames = sys._current_frames()
+        for thread in threading.enumerate():
+            frame = frames.get(thread.ident)
+            if frame is None:
+                continue
+            stack = "".join(traceback.format_stack(frame, limit=20))
+            print(f"VERL DIAGNOSTIC THREAD {thread.name}\n{stack}", flush=True)
 
     def _watch(self) -> None:
         while not self._stop.wait(_VERL_CHILD_WATCH_TICK_SECONDS):
             self.check()
-            if self._failure is not None:
-                return
-
-    def raise_if_failed(self) -> None:
-        if self._failure is not None:
-            raise RuntimeError(self._failure)
 
 
 # the ray logs worth keeping when a raylet dies. the driver's own stdout only ever shows the

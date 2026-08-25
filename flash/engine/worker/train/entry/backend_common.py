@@ -480,7 +480,7 @@ def _run_streaming_verl_subprocess(
     env: dict[str, str],
     on_line: Callable[[str], None],
     errors: str | None = None,
-    silence_watchdog: VerlChildSilenceWatchdog | None = None,
+    silence_observer: VerlChildSilenceObserver | None = None,
 ) -> int:
     """stream a verl subprocess under the shared process-group lifecycle supervisor."""
     adopt_orphaned_descendants()
@@ -495,12 +495,9 @@ def _run_streaming_verl_subprocess(
         start_new_session=True,
     )
     process_group_id = proc.pid
-    if silence_watchdog is not None:
-        silence_watchdog.bind(
-            child_alive=lambda: proc.poll() is None,
-            teardown=lambda: kill_process_group(proc, process_group_id=process_group_id),
-        )
-        silence_watchdog.start()
+    if silence_observer is not None:
+        silence_observer.bind(child_alive=lambda: proc.poll() is None)
+        silence_observer.start()
     try:
         with _ChildExitWatchdog(
             proc, process_group_id=process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
@@ -513,8 +510,8 @@ def _run_streaming_verl_subprocess(
         kill_process_group(proc, process_group_id=process_group_id)
         raise
     finally:
-        if silence_watchdog is not None:
-            silence_watchdog.stop()
+        if silence_observer is not None:
+            silence_observer.stop()
         if proc.poll() is None:
             try:
                 proc.wait(timeout=_TEARDOWN_GRACE_S)
@@ -543,39 +540,36 @@ def run_verl_training(
     env: dict[str, str],
     on_step: Callable[[int], None] | None = None,
     on_line: Callable[[str], None] | None = None,
-    heartbeat: Callable[[], None] | None = None,
+    progress: Callable[[], None] | None = None,
     step_pattern: str = r"step:\s*(\d+)",
-    heartbeat_interval_s: float = 20.0,
+    progress_interval_s: float = 20.0,
     tail: ChildOutputTail | None = None,
-    silence_watchdog: VerlChildSilenceWatchdog | None = None,
+    silence_observer: VerlChildSilenceObserver | None = None,
 ) -> int:
     """run a verl trainer subprocess, streaming stdout and surfacing step progress.
 
     returns the process exit code. stdout+stderr are merged and scanned line by line: ``on_line``
-    receives every line, ``on_step`` receives each parsed training step, and ``heartbeat`` is called
-    at most once per ``heartbeat_interval_s``. callback failures terminate the process group before
-    they are re-raised. ``silence_watchdog`` tears the group down when a child that reached the fit
-    loop stops producing distinct output while the parent is idle.
+    receives every line, ``on_step`` receives each parsed training step, and ``progress`` is called
+    at most once per ``progress_interval_s``. callback failures terminate the process group before
+    they are re-raised. ``silence_observer`` records diagnostics without changing process state.
     """
     child_tail = tail if tail is not None else ChildOutputTail()
     handle_line = build_verl_line_handler(
         child_tail,
         on_step=on_step,
         on_line=on_line,
-        heartbeat=heartbeat,
+        progress=progress,
         step_pattern=step_pattern,
-        heartbeat_interval_s=heartbeat_interval_s,
-        silence_watchdog=silence_watchdog,
+        progress_interval_s=progress_interval_s,
+        silence_observer=silence_observer,
     )
     return_code = _run_streaming_verl_subprocess(
         cmd,
         env=env,
         on_line=handle_line,
-        silence_watchdog=silence_watchdog,
+        silence_observer=silence_observer,
     )
     raise_for_classified_verl_exit(return_code, child_tail)
-    if silence_watchdog is not None:
-        silence_watchdog.raise_if_failed()
     return return_code
 
 
@@ -590,7 +584,7 @@ class _ChildExitWatchdog:
     """Tears the group down when the direct child exits but a descendant holds the pipe open.
 
     this prevents an EngineCore-held pipe from blocking teardown forever (PR #730). it arms only after
-    child exit, so ordinary trainer silence remains ``VerlChildSilenceWatchdog``'s responsibility.
+    child exit, so ordinary trainer silence remains diagnostics-only.
     """
 
     def __init__(self, proc: subprocess.Popen, *, process_group_id: int, grace_s: float) -> None:
@@ -989,7 +983,7 @@ from flash.engine.worker.verl.diagnostics import (  # noqa: E402,F401
     STALL_TAIL_LINES,
     ChildOutputTail,
     ChildTailStaleness,
-    VerlChildSilenceWatchdog,
+    VerlChildSilenceObserver,
     build_verl_line_handler,
     collect_ray_failure_logs,
     latest_ray_session_dir,

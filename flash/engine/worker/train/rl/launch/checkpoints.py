@@ -17,7 +17,7 @@ from flash._internal.fileio import reject_duplicate_keys
 from flash.adapters.artifacts import MAX_ATTEMPT_ID, has_loadable_adapter_weights
 from flash.engine.support.verl_checkpoint import FsdpCheckpointInspection
 from flash.engine.support.verl_policy import FsdpGeneration
-from flash.engine.worker.io.heartbeat import join_while_draining
+from flash.engine.worker.io.progress import join_while_draining
 from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 from flash.engine.worker.train.entry.backend_common import (
     completed_checkpoint_step,

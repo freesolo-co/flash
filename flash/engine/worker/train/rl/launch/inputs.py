@@ -37,7 +37,7 @@ from flash.engine.plan.steps import (
     validate_save_steps,
 )
 from flash.engine.support.verl_policy import _resolve_fsdp_generation
-from flash.engine.worker.io.heartbeat import liveness_heartbeat
+from flash.engine.worker.io.progress import observe_phase
 from flash.engine.worker.runtime.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.train.core.child.glue import validate_glue_template
 from flash.engine.worker.train.entry.backend_common import (
@@ -503,7 +503,7 @@ def _resolve_grpo_inputs():
         # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
         # a multi-GB adapter pull emits nothing of its own, so it must run under a liveness wrap or
         # the provider judges the silence as a stall.
-        with liveness_heartbeat("rl_adapter_loading"):
+        with observe_phase("rl_adapter_loading"):
             warmstart_adapter = _download_adapter(_t.init_from_adapter)
         if not warmstart_adapter:
             raise RuntimeError(

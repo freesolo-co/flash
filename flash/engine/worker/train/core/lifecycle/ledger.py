@@ -92,7 +92,7 @@ class CheckpointLedger:
         once the folder commit and its prune have both succeeded. The function's boolean return
         cannot carry this fact: it is also True when there is no artifact repository at all and
         when a caller's ``skip_upload`` short-circuits, and it is False when the commit landed but
-        the closing heartbeat failed.
+        the closing progress failed.
         """
         self._mark(step, resume_uploaded=True)
 

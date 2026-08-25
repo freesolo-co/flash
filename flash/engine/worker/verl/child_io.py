@@ -269,7 +269,7 @@ def parse_wandb_link(line: str) -> dict | None:
 # would parse nothing at all in production. and not "preceded by whitespace" either (VERL-134):
 # verl's LocalLogger shares its stream with tqdm, which ends a bar with "]" and no trailing
 # newline, so the metric line arrives glued to it -- "...81.49s/it]step:2 - train/loss:...". a \s
-# edge matched step 1 and missed every step after it, which froze the sft heartbeat on step 1's
+# edge matched step 1 and missed every step after it, which froze the sft progress on step 1's
 # metrics and kept the zero-grad guard from ever arming. excluding / as well as word characters
 # still refuses "global_step:" and a path's ".../step:".
 _VERL_STEP_LEFT_EDGE = r"(?:^|[^\w/])"
@@ -370,7 +370,7 @@ def append_step_metrics(backlog: list[dict], metrics: dict, *, limit: int) -> No
 
     verl reprints a step on a validation pass, and a resumed run replays its resume step, so a
     repeat must replace rather than append -- otherwise the CLI renders the same step twice. the
-    heartbeat thread reads ``backlog`` while the stdout loop writes it, so the new contents are
+    progress thread reads ``backlog`` while the stdout loop writes it, so the new contents are
     published in ONE slice assignment: a filter/append/truncate sequence would let that reader
     observe a torn intermediate state with the step momentarily missing.
     """

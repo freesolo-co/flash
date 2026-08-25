@@ -5,13 +5,13 @@ from __future__ import annotations
 import os
 import time
 
-import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.io.progress as _worker_progress
 import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
 from flash.engine.plan.steps import final_save_due
-from flash.engine.worker.io.heartbeat import liveness_heartbeat
+from flash.engine.worker.io.progress import observe_phase
 from flash.engine.worker.train.entry.backend_common import (
     fused_ce_backend,
     gdn_probe_module,
@@ -78,12 +78,12 @@ def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[f
     config read, which is minutes of silence on a cold cache mount.
     """
     download_seconds = _worker_hf.prefetch_model(model_id, revision=model_revision)
-    _worker_heartbeat.heartbeat(
+    _worker_progress.publish_progress(
         "opd_model_load",
         download_seconds=download_seconds,
         gpu=_worker_perf.gpu_diagnostics(include_torch=False),
     )
-    with liveness_heartbeat("opd_model_load"):
+    with observe_phase("opd_model_load"):
         # reads the snapshot with local_files_only, so it has to follow the prefetch.
         eos_token_ids = generation_eos_from_cached_config(
             model_id, model_revision, prompt_state.tokenizer
@@ -117,7 +117,7 @@ def run_opd_train(spec=None) -> None:
         _validate_multimodal_opd(request, spec, model_id)
     started_at = time.time()
     capability, control_panel_url = _validate_teacher_transport()
-    _worker_heartbeat.heartbeat("opd_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False))
+    _worker_progress.publish_progress("opd_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False))
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
@@ -130,7 +130,7 @@ def run_opd_train(spec=None) -> None:
     workload = _prepare_workload(request, prompt_state, multimodal)
     update_horizon, prompts_per_step = workload.update_horizon, workload.prompts_per_step
     # same silent boundary the sft path guards: with no prebuilt worker image this builds a venv and installs the training stack, minutes long with nothing to report and no liveness thread running.
-    with liveness_heartbeat("opd_configuring"):
+    with observe_phase("opd_configuring"):
         python_bin = resolve_verl_python(
             workload.workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
         )
@@ -186,7 +186,7 @@ def run_opd_train(spec=None) -> None:
                 "not cover every update"
             )
         _validate_aligned_sequences(final_accounting)
-        with liveness_heartbeat(
+        with observe_phase(
             "opd_finalizing", progress=lambda: final_step, progress_step=True, keepalive=True
         ):
             adapter_dir = _export_and_upload_adapter(request, workload, runtime, result)

@@ -181,6 +181,10 @@ class RunStatus:
         data.pop("effective_preparation", None)
         source_snapshot = data.pop("source_snapshot", None)
         data.pop("source_verified_attempt", None)
+        for lifecycle_field in ("attempt", "progress", "resource", "result"):
+            projection = data.get(lifecycle_field)
+            if isinstance(projection, dict):
+                projection.pop("source_provenance", None)
         if source_snapshot is not None:
             from flash.snapshot.archive import safe_public_projection
 

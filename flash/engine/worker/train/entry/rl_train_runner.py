@@ -16,8 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.io.progress as _worker_progress
 import flash.engine.worker.io.wandb_log as _worker_wandb_log
 import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.train.rl.launch.checkpoints as rl_checkpoints
@@ -29,9 +29,9 @@ from flash.core.catalog import get_model
 from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.result.rollout_samples import sample_completion_text, sanitize_rollout_text
-from flash.engine.worker.io.heartbeat import (
+from flash.engine.worker.io.progress import (
     GRPO_METRIC_HISTORY_LIMIT,
-    LATEST_GRPO_METRICS_LAST,
+    LATEST_GRPO_METRICS,
     RewardObservabilityBuffer,
 )
 from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
@@ -41,7 +41,7 @@ from flash.engine.worker.train.entry.backend_common import (
     _TEARDOWN_GRACE_S,
     SHIM_FRAGMENT_FAILED_EXIT_CODE,
     ChildOutputTail,
-    VerlChildSilenceWatchdog,
+    VerlChildSilenceObserver,
     _ChildExitWatchdog,
     adopt_orphaned_descendants,
     append_step_metrics,
@@ -83,12 +83,12 @@ from flash.engine.worker.verl.process_census import GrpoProcessCensus
 class _GrpoSubprocessStream:
     """one grpo child stream and the evidence latched from that same stream."""
 
-    def __init__(self, proc, *, tail=None, silence_watchdog=None) -> None:
+    def __init__(self, proc, *, tail=None, silence_observer=None) -> None:
         self._proc = proc
         # the caller uses start_new_session, so the leader pid remains the group's stable identity.
         self._process_group_id = proc.pid
         self._tail = tail if tail is not None else ChildOutputTail()
-        self._silence_watchdog = silence_watchdog
+        self._silence_observer = silence_observer
         self._terminated = False
         self._orphaned_pipe = False
 
@@ -98,12 +98,9 @@ class _GrpoSubprocessStream:
         # inherits this same pipe, so a trainer that dies while it lives leaves a pipe nobody will
         # close and this loop would run forever on a paid gpu. the watchdog tears the group down,
         # which frees the cuda context AND closes the pipe, ending this loop.
-        if self._silence_watchdog is not None:
-            self._silence_watchdog.bind(
-                child_alive=lambda: self._proc.poll() is None,
-                teardown=self.terminate,
-            )
-            self._silence_watchdog.start()
+        if self._silence_observer is not None:
+            self._silence_observer.bind(child_alive=lambda: self._proc.poll() is None)
+            self._silence_observer.start()
         try:
             with _ChildExitWatchdog(
                 self._proc, process_group_id=self._process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
@@ -113,12 +110,12 @@ class _GrpoSubprocessStream:
                     # runs while suspended here; counting only arrival makes a long callback look idle.
                     with watchdog.handling_line():
                         self._tail.record(line)
-                        if self._silence_watchdog is not None:
-                            self._silence_watchdog.observe_line(line)
+                        if self._silence_observer is not None:
+                            self._silence_observer.observe_line(line)
                         yield line
         finally:
-            if self._silence_watchdog is not None:
-                self._silence_watchdog.stop()
+            if self._silence_observer is not None:
+                self._silence_observer.stop()
         if watchdog.tore_down:
             self._orphaned_pipe = True
             # the group is already gone, so teardown must not be attempted a second time.
@@ -148,8 +145,6 @@ class _GrpoSubprocessStream:
             return_code = int(collected) if collected is not None else 1
         try:
             raise_for_classified_verl_exit(return_code, self._tail)
-            if self._silence_watchdog is not None:
-                self._silence_watchdog.raise_if_failed()
         except BaseException:
             self.terminate()
             raise
@@ -254,7 +249,7 @@ class _RewardRuntime:
 
 def _prepare_rl_inputs():
     t_start = time.time()
-    _worker_heartbeat.heartbeat("rl_start", gpu=gpu_diagnostics())
+    _worker_progress.publish_progress("rl_start", gpu=gpu_diagnostics())
     wait_for_gpu(
         _worker_state.JOB_SPEC.gpu.type if _worker_state.JOB_SPEC else None,
         gpu_type=_worker_state.JOB_SPEC.gpu.type if _worker_state.JOB_SPEC else "",
@@ -533,7 +528,7 @@ def _announce_training(t_start: float, cfg) -> tuple[float, float]:
     # otherwise invisible in the log.
     print(f"[rl-verl] rollout gpu_memory_utilization={cfg['gpu_mem_util']:.4f}", flush=True)
     setup_seconds = time.time() - t_start
-    _worker_heartbeat.heartbeat(
+    _worker_progress.publish_progress(
         "rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics()
     )
     return setup_seconds, time.time()
@@ -590,7 +585,7 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
 
 
 def _step_timing_fields(inp, state: _StepMetricState) -> dict:
-    return state.step_timing.heartbeat_fields(
+    return state.step_timing.progress_fields(
         current_step=state.progress["step"],
         total_steps=int(inp["steps"]),
         remaining_wall_s=_worker_state._remaining_worker_wall_seconds(),
@@ -621,23 +616,23 @@ def _ingest_step_metrics(
         append_step_metrics(state.metrics_last, step_metrics, limit=GRPO_METRIC_HISTORY_LIMIT)
         # the worker's error path reads this global, so a run that dies mid-training
         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
-        LATEST_GRPO_METRICS_LAST[:] = state.metrics_last
-        heartbeat_fields = _reward_observability()
-        has_step_timing = "step_duration_s" in heartbeat_fields
+        LATEST_GRPO_METRICS[:] = state.metrics_last
+        progress_fields = _reward_observability()
+        has_step_timing = "step_duration_s" in progress_fields
         # rl_train_start arms a 900s throttle, so force until both the first backlog and the first
         # usable timing payload commit. the backlog commit also arms the force floor, so mark the first
         # timing attempt for the wrapper's dedicated floor bypass until that upload succeeds.
         if not state.sent_first_metrics or (has_step_timing and not state.sent_first_timing):
-            heartbeat_committed = _worker_heartbeat.heartbeat(
+            progress_committed = _worker_progress.publish_progress(
                 "rl_step",
                 force=True,
                 first_timing=has_step_timing and not state.sent_first_timing,
                 step=step_metrics["step"],
                 metrics_last=list(state.metrics_last),
-                **heartbeat_fields,
+                **progress_fields,
                 gpu=gpu_diagnostics(include_torch=False),
             )
-            if heartbeat_committed:
+            if progress_committed:
                 state.sent_first_metrics = True
                 if has_step_timing:
                     state.sent_first_timing = True
@@ -709,7 +704,7 @@ def _execute_rl_child(
         state.host_census = census.stop()
         raise
     child_tail = ChildOutputTail()
-    silence_watchdog = VerlChildSilenceWatchdog(
+    silence_observer = VerlChildSilenceObserver(
         child_tail,
         baseline_step=int((files or {}).get("resume_step", 0)),
         parent_work=reward_runtime.observability.parent_work,
@@ -717,7 +712,7 @@ def _execute_rl_child(
     child_stream = _GrpoSubprocessStream(
         proc,
         tail=child_tail,
-        silence_watchdog=silence_watchdog,
+        silence_observer=silence_observer,
     )
     progress, last_dump_step = state.progress, state.last_dump_step
     # verl replays its resume step's metrics line before producing the first NEW step
@@ -740,7 +735,7 @@ def _execute_rl_child(
             step_number = verl_step_number(line)
             if step_number is not None:
                 progress["step"] = step_number
-                silence_watchdog.observe_step(step_number)
+                silence_observer.observe_step(step_number)
                 # the first step line is the training-start boundary: sitecustomize import is long
                 # finished by then, so a marker still missing means this child is training with no
                 # flash patch at all, so fail now rather than after the whole run is paid for. not
@@ -802,7 +797,7 @@ def _execute_rl_child(
                     if value is not None
                 }
             )
-            LATEST_GRPO_METRICS_LAST[:] = state.metrics_last
+            LATEST_GRPO_METRICS[:] = state.metrics_last
 
 
 def _finalize_advantage_evidence(state, resume_step: int, expected_steps: int) -> None:

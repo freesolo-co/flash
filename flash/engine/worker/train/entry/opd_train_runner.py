@@ -6,8 +6,8 @@ import shutil
 import time
 from typing import Any
 
-import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.io.progress as _worker_progress
 import flash.engine.worker.io.wandb_log as _worker_wandb
 import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.perf as _worker_perf
@@ -507,16 +507,13 @@ def _build_child_callbacks(
         if progress["truncation_step"] == step and progress["truncation_rate"] is not None:
             payload["truncation_rate"] = progress["truncation_rate"]
             payload["discarded_rollouts"] = progress["discarded_rollouts"]
-        _worker_heartbeat.heartbeat("opd_step", **payload)
-
-    def child_heartbeat() -> None:
-        _worker_heartbeat.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
+        _worker_progress.publish_progress("opd_step", **payload)
 
     child_tail = _backend.ChildOutputTail()
     # one instance for the whole run: it measures silence across ticks, so it cannot live inside
     # the per-tick callback.
     tail_staleness = _backend.ChildTailStaleness()
-    silence_watchdog = _backend.VerlChildSilenceWatchdog(
+    silence_observer = _backend.VerlChildSilenceObserver(
         child_tail,
         baseline_step=resume_step,
         parent_work=bridge.parent_work,
@@ -530,12 +527,12 @@ def _build_child_callbacks(
     return _ChildCallbacks(
         on_line,
         on_step,
-        child_heartbeat,
+        None,
         liveness_fields,
         progress,
         wandb_link,
         child_tail,
-        silence_watchdog,
+        silence_observer,
     )
 
 
@@ -577,7 +574,7 @@ def _run_child(
     try:
         if runtime.resume_step < workload.update_horizon:
             progress_state.start_training()
-            with _worker_heartbeat.liveness_heartbeat(
+            with _worker_progress.observe_phase(
                 "opd_step",
                 progress=lambda: int(callbacks.progress["step"] or 0),
                 progress_step=True,
@@ -589,9 +586,9 @@ def _run_child(
                     env=child_env,
                     on_step=callbacks.on_step,
                     on_line=callbacks.on_line,
-                    heartbeat=callbacks.child_heartbeat,
+                    progress=callbacks.child_progress,
                     tail=callbacks.child_tail,
-                    silence_watchdog=callbacks.silence_watchdog,
+                    silence_observer=callbacks.silence_observer,
                 )
                 training_completed = return_code == 0
     finally:
@@ -768,7 +765,7 @@ def _validate_aligned_sequences(final_accounting: dict[str, Any]) -> None:
 
 
 def _report_training_complete(result: _ChildResult, started_at: float) -> float:
-    _worker_heartbeat.heartbeat(
+    _worker_progress.publish_progress(
         "opd_trained",
         step=result.final_step,
         train_wall=result.train_wall,
