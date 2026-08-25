@@ -42,6 +42,12 @@ from flash.serve.errors import (  # noqa: F401 -- re-exported: callers import th
     RetryableServingUnavailable,
     ServingError,
 )
+from flash.serve.readiness import (  # noqa: F401 -- re-exported: callers import these from here
+    REVISION_READY_MAX_BUDGET_SECONDS,
+    REVISION_READY_MIN_BUDGET_SECONDS,
+    REVISION_READY_SECONDS_PER_PARAM_B,
+    revision_ready_budget_seconds,
+)
 from flash.serve.responses import (
     active_alias_target as _active_alias_target,
 )
@@ -72,31 +78,6 @@ logger = get_logger(__name__)
 DEFAULT_FREESOLO_SERVING_URL = default_serving_url()
 READBACK_DELAY_SECONDS = 0.5
 READBACK_MAX_DELAY_SECONDS = 2.0
-# how long to wait for serving to report a newly registered revision ready. the wait covers a COLD
-# engine: serving pulls the base model, starts the engine, then loads the adapter, and none of that
-# is proportional to the adapter, which is megabytes. so the budget scales with the BASE model.
-#
-# the floor is NOT the old 5 minutes: a 4B deploy was observed timing out on a cold engine and then
-# succeeding in ~4.6 minutes against the now-warm one, so 5 minutes did not even cover the warm case
-# with margin. the floor is doubled to 10 and the per-B term covers a bigger base on top.
-#
-# the cap is the real constraint, and readiness is only one leg of the attempt. the same deploy also
-# spends time before this wait (resolving the hub revision, downloading the adapter config to read
-# its rank, the capability check, registration) and after it (600s of immutable smoke, activation,
-# then 600s of alias smoke). the whole attempt must finish inside both
-# `_DEPLOYMENT_STALE_SECONDS` (2400s, when the plane declares an in-flight attempt abandoned) and
-# the CLI's 2400s default `--wait`, or a deploy that is still progressing is reaped or reported as
-# failed.
-#
-# so the cap leaves real slack rather than just clearing smoke: 900 + 600 + 600 = 2100, keeping 300s
-# for the surrounding hub reads, registration, activation, and poll latency, none of which share a
-# wall-clock bound with this one.
-#
-# a longer budget costs little: an adapter serving REJECTS raises as soon as the revision reports
-# `failed`, so only a revision that is genuinely still loading waits out the clock.
-REVISION_READY_MIN_BUDGET_SECONDS = 10 * 60.0
-REVISION_READY_MAX_BUDGET_SECONDS = 15 * 60.0
-REVISION_READY_SECONDS_PER_PARAM_B = 20.0
 ACTIVATION_READBACK_ATTEMPTS = 3
 ACTIVATION_READBACK_DELAY_SECONDS = 2.0
 # smoke-retry fallback when a 503 carries no usable Retry-After: keep the prior 2s default rather
@@ -548,25 +529,6 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
             ", ".join(missing_preferred),
         )
     return advertised
-
-
-def revision_ready_budget_seconds(model: str) -> float:
-    """Readiness budget for a cold serving engine holding ``model``, scaled by base-model size.
-
-    An unknown model keeps the floor: a fork can add a catalog entry, and a revision-pinned id need
-    not be a catalog key, so a lookup miss must not fail a deploy that would otherwise succeed.
-    """
-    from flash.core.catalog import MODELS
-
-    info = MODELS.get(str(model or "").strip())
-    if info is None:
-        return REVISION_READY_MIN_BUDGET_SECONDS
-    # total params, not active: an MoE loads every expert into VRAM even though a token routes
-    # through few, so the cold-start cost tracks the full checkpoint.
-    scaled = REVISION_READY_MIN_BUDGET_SECONDS + REVISION_READY_SECONDS_PER_PARAM_B * max(
-        0.0, float(info.params_b)
-    )
-    return min(scaled, REVISION_READY_MAX_BUDGET_SECONDS)
 
 
 def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
