@@ -3687,19 +3687,25 @@ def test_opd_failure_diagnosis_is_not_cumulative_accounting_dict():
         _failure_accounting_metadata(diagnosis)
 
 
-def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path):
+@pytest.mark.parametrize("expected_fsdp_generation", [1, 2])
+def test_restore_verl_resume_returns_validated_accounting(
+    monkeypatch, tmp_path, expected_fsdp_generation
+):
     from flash.engine.worker import opd_train
 
     resume = tmp_path / "checkpoint-2"
-    resume.mkdir()
+    actor = resume / "actor"
+    (actor / "huggingface").mkdir(parents=True)
     state = _resume_accounting()
     import json
 
     (resume / "opd_state.json").write_text(json.dumps(state))
     (resume / "payload.bin").write_bytes(b"checkpoint")
-    # this test is about accounting restoration, not topology matching; stamp a world_size that
-    # legitimately matches world_size=1 below rather than relying on unreadable-topology behaviour.
-    (resume / "fsdp_config.json").write_text(json.dumps({"world_size": 1}))
+    (actor / "fsdp_config.json").write_text(
+        json.dumps({"FSDP_version": expected_fsdp_generation, "world_size": 1})
+    )
+    for kind in ("model", "optim", "extra_state"):
+        (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
     monkeypatch.setattr(opd_train._w, "OPD_RESUME_REVISION", "revision")
     monkeypatch.setattr(opd_train._w, "SEED", 42)
     monkeypatch.setattr(
@@ -3711,12 +3717,51 @@ def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path)
     local_dir.mkdir()
 
     step, restored = _restore_verl_resume(
-        str(local_dir), prompt_pool_fingerprint="a" * 64, update_horizon=3, world_size=1
+        str(local_dir),
+        prompt_pool_fingerprint="a" * 64,
+        update_horizon=3,
+        world_size=1,
+        expected_fsdp_generation=expected_fsdp_generation,
     )
 
     assert step == 2
     assert restored == state
     assert (local_dir / "global_step_2" / "payload.bin").read_bytes() == b"checkpoint"
+
+
+@pytest.mark.parametrize("expected_fsdp_generation", [1, 2])
+def test_restore_verl_resume_rejects_the_other_fsdp_generation(
+    monkeypatch, tmp_path, expected_fsdp_generation
+):
+    from flash.engine.worker import opd_train
+
+    resume = tmp_path / "checkpoint-2"
+    actor = resume / "actor"
+    (actor / "huggingface").mkdir(parents=True)
+    checkpoint_generation = 2 if expected_fsdp_generation == 1 else 1
+    (actor / "fsdp_config.json").write_text(
+        json.dumps({"FSDP_version": checkpoint_generation, "world_size": 1})
+    )
+    for kind in ("model", "optim", "extra_state"):
+        (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
+    monkeypatch.setattr(opd_train._w, "OPD_RESUME_REVISION", "revision")
+    monkeypatch.setattr(opd_train._w, "hf_resume_checkpoint", lambda **_kwargs: str(resume))
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"not complete fsdp{expected_fsdp_generation} native state",
+    ):
+        _restore_verl_resume(
+            str(local_dir),
+            prompt_pool_fingerprint="a" * 64,
+            update_horizon=3,
+            world_size=1,
+            expected_fsdp_generation=expected_fsdp_generation,
+        )
+
+    assert not (local_dir / "global_step_2").exists()
 
 
 def test_opd_checkpoint_watcher_forwards_processor_to_every_export(monkeypatch, tmp_path):
@@ -6430,7 +6475,15 @@ def _config(**overrides):
     return config
 
 
-def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
+def _materialized_opd_save_freq(
+    monkeypatch,
+    *,
+    save_at_steps,
+    save_every,
+    horizon,
+    target_parameters=None,
+    resume_calls=None,
+):
     from flash.engine.worker import opd_train_runner as runner
 
     knobs = SimpleNamespace(
@@ -6468,10 +6521,19 @@ def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horiz
     monkeypatch.setattr(runner._opd_train, "_cached_model_path", lambda *_args: "/model")
     monkeypatch.setattr(runner._opd_train, "resolve_verl_loggers", lambda _caps: ["console"])
     monkeypatch.setattr(runner._opd_train._w, "wandb_run_name", lambda: "opd-test")
-    monkeypatch.setattr(runner, "_write_child_shims", lambda *_args: ("entry.py", "reward.py"))
     monkeypatch.setattr(
-        runner._opd_train, "_restore_verl_resume", lambda *_args, **_kwargs: (0, None)
+        runner._opd_train._w,
+        "lora_target_parameters",
+        lambda _model_id: target_parameters,
     )
+    monkeypatch.setattr(runner, "_write_child_shims", lambda *_args: ("entry.py", "reward.py"))
+
+    def restore(*_args, **kwargs):
+        if resume_calls is not None:
+            resume_calls.append(kwargs)
+        return 0, None
+
+    monkeypatch.setattr(runner._opd_train, "_restore_verl_resume", restore)
 
     class Bridge:
         def __init__(self, **_kwargs):
@@ -6490,6 +6552,27 @@ def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horiz
         None,
         (),
     ).save_freq
+
+
+@pytest.mark.parametrize(
+    ("target_parameters", "expected_generation"),
+    [(None, 1), (["mlp.experts.gate_up_proj"], 2)],
+)
+def test_opd_resume_gate_uses_the_same_generation_as_the_actor_strategy(
+    monkeypatch, target_parameters, expected_generation
+):
+    calls = []
+
+    _materialized_opd_save_freq(
+        monkeypatch,
+        save_at_steps=(),
+        save_every=20,
+        horizon=10,
+        target_parameters=target_parameters,
+        resume_calls=calls,
+    )
+
+    assert [call["expected_fsdp_generation"] for call in calls] == [expected_generation]
 
 
 def test_opd_save_freq_clamps_to_a_short_derived_horizon(monkeypatch):
@@ -6586,24 +6669,38 @@ def test_overrides_omit_layered_summon_for_dense_models():
     ]
 
 
-def test_overrides_put_fused_expert_lora_on_fsdp2():
-    # opd used to pin `actor.strategy=fsdp` unconditionally. the strategy is now derived from the
-    # targets in one place shared with the rl driver, so a fused-expert model gets the only
-    # wrapper PEFT can parametrize.
-    built = build_opd_overrides(
-        _config(target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
-    )
+@pytest.mark.parametrize(
+    ("target_parameters", "expected_strategy"),
+    [
+        (None, "fsdp"),
+        (["mlp.experts.gate_up_proj", "mlp.experts.down_proj"], "fsdp2"),
+    ],
+)
+def test_overrides_select_the_explicit_opd_fsdp_strategy(target_parameters, expected_strategy):
+    built = build_opd_overrides(_config(target_parameters=target_parameters))
     overrides = dict(value.split("=", 1) for value in built)
-    assert overrides["actor_rollout_ref.actor.strategy"] == "fsdp2"
-    # dict() would silently keep the last of a duplicated key, so count on the raw list
-    assert len([v for v in built if v.startswith("actor_rollout_ref.actor.strategy=")]) == 1
+    assert overrides["actor_rollout_ref.actor.strategy"] == expected_strategy
+    # dict() would silently keep the last of a duplicated key, so count the exact bare override
+    strategy_overrides = [v for v in built if "actor_rollout_ref.actor.strategy=" in v]
+    assert strategy_overrides == [f"actor_rollout_ref.actor.strategy={expected_strategy}"]
 
 
-def test_overrides_keep_dense_models_on_fsdp1():
-    built = build_opd_overrides(_config(target_parameters=None))
-    overrides = dict(value.split("=", 1) for value in built)
-    assert overrides["actor_rollout_ref.actor.strategy"] == "fsdp"
-    assert len([v for v in built if v.startswith("actor_rollout_ref.actor.strategy=")]) == 1
+@pytest.mark.parametrize("reshard_after_forward", [False, True])
+def test_opd_fsdp_generation_does_not_change_zero2_or_zero3(reshard_after_forward):
+    for target_parameters in (None, ["mlp.experts.gate_up_proj"]):
+        overrides = dict(
+            value.split("=", 1)
+            for value in build_opd_overrides(
+                _config(
+                    target_parameters=target_parameters,
+                    reshard_after_forward=reshard_after_forward,
+                )
+            )
+        )
+        assert (
+            overrides["actor_rollout_ref.actor.fsdp_config.reshard_after_forward"]
+            == str(reshard_after_forward).lower()
+        )
 
 
 def test_overrides_match_verl_0_8_sync_distillation_contract():

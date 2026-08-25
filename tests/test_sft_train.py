@@ -82,7 +82,8 @@ def _as_map(overrides):
 
 
 def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
-    overrides = _as_map(build_sft_overrides(_cfg()))
+    built = build_sft_overrides(_cfg())
+    overrides = _as_map(built)
     assert overrides == {
         "data.train_files": "/w/train.parquet",
         # hardcoded null, not a cfg value: see test_sft_ships_no_val_file_so_the_child_cannot_validate
@@ -134,9 +135,16 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
         "trainer.max_ckpt_to_keep": "1",
         "trainer.total_training_steps": "120",
     }
+    assert [value for value in built if "engine.strategy=" in value] == ["engine.strategy=fsdp2"]
     assert "optim.eps" not in overrides
     assert "optim.lr_scheduler_type" not in overrides
     assert "data.messages_key" not in overrides
+
+
+def test_sft_strategy_cannot_be_downgraded_by_internal_config_injection():
+    built = build_sft_overrides(_cfg(strategy="fsdp"))
+
+    assert [value for value in built if "engine.strategy=" in value] == ["engine.strategy=fsdp2"]
 
 
 def test_overrides_point_verl_at_a_warm_start_adapter():
@@ -2545,9 +2553,17 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
     local_dir.mkdir()
     resume_dir = tmp_path / "downloaded" / "checkpoint-1"
     (resume_dir / "huggingface").mkdir(parents=True)
-    # verl stamps every checkpoint with its writer's world size; staging demands a match.
+    # native staging requires a complete fsdp2 checkpoint from every writer rank.
     (resume_dir / "fsdp_config.json").write_text(json.dumps({"FSDP_version": 2, "world_size": 1}))
-    resume_step = stage_verl_resume(str(resume_dir), str(local_dir), job_label="SFT", world_size=1)
+    for kind in ("model", "optim", "extra_state"):
+        (resume_dir / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
+    resume_step = stage_verl_resume(
+        str(resume_dir),
+        str(local_dir),
+        job_label="SFT",
+        world_size=1,
+        expected_fsdp_generation=2,
+    )
     # a checkpoint this attempt actually trained, which must still be exported and uploaded.
     (local_dir / "global_step_2" / "huggingface").mkdir(parents=True)
     (local_dir / "latest_checkpointed_iteration.txt").write_text("2")

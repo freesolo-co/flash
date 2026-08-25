@@ -135,11 +135,21 @@ def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
     starve a compatible checkpoint uploaded after the one this attempt already rejected.
     """
     resume = _w.hf_resume_checkpoint(
-        prefer=lambda path: resume_checkpoint_is_loadable(path, world_size=world_size)
+        prefer=lambda path: resume_checkpoint_is_loadable(
+            path,
+            world_size=world_size,
+            expected_fsdp_generation=2,
+        )
     )
     if not resume:
         return 0
-    return stage_verl_resume(resume, local_dir, job_label="SFT", world_size=world_size)
+    return stage_verl_resume(
+        resume,
+        local_dir,
+        job_label="SFT",
+        world_size=world_size,
+        expected_fsdp_generation=2,
+    )
 
 
 def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:

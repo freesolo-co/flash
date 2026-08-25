@@ -234,13 +234,17 @@ def _materialize_child_files(
         gdn_reset_arch,
         loggers,
     )
+    target_parameters = _opd_train._w.lora_target_parameters(request.model_id)
     resume_step, resume_state = _opd_train._restore_verl_resume(
         workload.local_dir,
         prompt_pool_fingerprint=workload.prompt_pool_fingerprint,
         update_horizon=workload.update_horizon,
-        # the same count this attempt hands verl as n_gpus_per_node, which is the DATA-parallel
+        # the same count this attempt hands verl as n_gpus_per_node, which is the data-parallel
         # width: ulysses is pinned to 1, so every rank is a dp rank.
         world_size=gpu_count,
+        # dense opd remains fsdp1; fused-expert target_parameters requires fsdp2. native state is
+        # generation-specific, so the resume gate must enforce the same choice as the child config.
+        expected_fsdp_generation=2 if target_parameters else 1,
     )
     bridge = _opd_train._TeacherAlignmentBridge(
         prompts=prompt_state.prompts,

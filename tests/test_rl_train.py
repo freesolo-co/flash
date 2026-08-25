@@ -1358,23 +1358,35 @@ def test_build_verl_overrides_omits_layered_summon_for_dense_models():
     assert not [x for x in o if "layered_summon" in x]
 
 
-def test_build_verl_overrides_puts_fused_expert_lora_on_fsdp2():
-    # end-to-end through the real builder. PEFT's forward-time parametrization needs
-    # `mlp.experts.down_proj` reachable by name AND its slot free after `delattr`; fsdp1 cannot
-    # give both, because FSDP.__getattr__ keeps resolving the name from the wrapped module. the
-    # sft driver has always pinned fsdp2 for this reason (train/sft/config.py:138).
-    o = rl_train.build_verl_overrides(
-        _overrides_cfg(target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
-    )
+@pytest.mark.parametrize(
+    "target_parameters",
+    [None, ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]],
+)
+def test_build_verl_overrides_puts_every_actor_on_fsdp2(target_parameters):
+    o = rl_train.build_verl_overrides(_overrides_cfg(target_parameters=target_parameters))
     assert "actor_rollout_ref.actor.strategy=fsdp2" in o
-    # exactly one writer of the key, so the value cannot be ambiguous at merge time
-    assert len([x for x in o if x.startswith("actor_rollout_ref.actor.strategy=")]) == 1
+    # exactly one bare writer of the key, so the value cannot be ambiguous at merge time
+    strategy_overrides = [x for x in o if "actor_rollout_ref.actor.strategy=" in x]
+    assert strategy_overrides == ["actor_rollout_ref.actor.strategy=fsdp2"]
 
 
-def test_build_verl_overrides_keeps_dense_models_on_fsdp1():
-    o = rl_train.build_verl_overrides(_overrides_cfg(target_parameters=None))
-    assert "actor_rollout_ref.actor.strategy=fsdp" in o
-    assert len([x for x in o if x.startswith("actor_rollout_ref.actor.strategy=")]) == 1
+@pytest.mark.parametrize("reshard_after_forward", [False, True])
+def test_grpo_fsdp2_does_not_change_zero2_or_zero3(reshard_after_forward):
+    for target_parameters in (None, ["mlp.experts.gate_up_proj"]):
+        overrides = dict(
+            value.split("=", 1)
+            for value in rl_train.build_verl_overrides(
+                _overrides_cfg(
+                    target_parameters=target_parameters,
+                    reshard_after_forward=reshard_after_forward,
+                )
+            )
+        )
+        assert overrides["actor_rollout_ref.actor.strategy"] == "fsdp2"
+        assert (
+            overrides["actor_rollout_ref.actor.fsdp_config.reshard_after_forward"]
+            == str(reshard_after_forward).lower()
+        )
 
 
 def test_build_verl_overrides_carries_dr_grpo_recipe():
@@ -4215,9 +4227,12 @@ def test_restore_verl_resume_stages_the_checkpoint_where_verl_looks(tmp_path, mo
     src = tmp_path / "checkpoint-7"
     (src / "actor").mkdir(parents=True)
     (src / "actor" / "model.safetensors").write_text("weights")
-    # this test is about the staging mechanics, not topology matching; stamp a world_size that
-    # legitimately matches world_size=1 below rather than relying on unreadable-topology behaviour.
-    (src / "actor" / "fsdp_config.json").write_text(json.dumps({"world_size": 1}))
+    # this test is about staging mechanics, so provide one complete native fsdp2 rank.
+    (src / "actor" / "fsdp_config.json").write_text(
+        json.dumps({"FSDP_version": 2, "world_size": 1})
+    )
+    for kind in ("model", "optim", "extra_state"):
+        (src / "actor" / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(src))

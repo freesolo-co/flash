@@ -864,35 +864,19 @@ def rollout_layered_summon_overrides(target_parameters: Sequence[str] | None) ->
     return ["actor_rollout_ref.rollout.layered_summon=true"]
 
 
-def actor_fsdp_strategy_overrides(target_parameters: list[str] | None) -> list[str]:
-    """select the actor's fsdp wrapper: fused-expert lora needs fsdp2, dense keeps fsdp1.
+def actor_fsdp_strategy_overrides(*, require_fsdp2: bool) -> list[str]:
+    """render one explicit bare actor strategy override.
 
-    PEFT implements ``target_parameters`` by registering a torch parametrization onto a NAMED
-    TENSOR at forward time (``peft/tuners/lora/layer.py:2463``), unlike ``target_modules``, which
-    swaps in a wrapper layer once at injection. ``register_parametrization`` calls
-    ``delattr(module, name)`` and then asserts the name is gone
-    (``torch/nn/utils/parametrize.py:387``). fsdp1 cannot satisfy that on either setting:
-    ``use_orig_params=False`` (verl's default, ``workers/config/engine.py:254``) flattens the
-    tensor away so the name never resolves (``parametrize.py:639``), and ``use_orig_params=True``
-    leaves ``FSDP.__getattr__`` resolving it from ``_fsdp_wrapped_module``, so ``hasattr`` stays
-    True after ``delattr`` and the bare assert fires (``parametrize.py:634`` -> ``:387``).
+    callers state the algorithm's validated requirement instead of letting this shared boundary infer
+    it from targeting. grpo requires fsdp2 for dense and fused-expert actors. opd keeps dense actors on
+    fsdp1 because live opd fsdp2 was not validated, while fused-expert opd requires fsdp2 because peft
+    ``target_parameters`` registers parametrizations on named tensors that fsdp1 cannot preserve.
 
-    no config value satisfies that assert while fsdp1 owns the module, so the strategy itself has
-    to change. fsdp2's ``fully_shard`` keeps parameters under their own names with no wrapper
-    indirection. flash's sft driver has always pinned ``engine.strategy=fsdp2``
-    (``train/sft/config.py:138``) and trains this same model with these same ``target_parameters``.
-
-    verl supports it here: ``strategy`` is declared in ``actor/dp_actor.yaml:26`` so it takes a
-    bare override, ``workers/config/engine.py:265`` accepts ``fsdp2``, the ref policy interpolates
-    the actor's value (``ref/ref.yaml:5``) so the two cannot drift, and ``layered_summon_lora_params``
-    carries an explicit fsdp2 prefix block (``utils/fsdp_utils.py:646-649``).
-
-    dense models stay on fsdp1: their lora lives on wrapper modules swapped in at injection, so no
-    parametrization is ever registered. the key is written for BOTH cases rather than omitted for
-    dense, so it has exactly one writer per config and the rl and opd drivers cannot disagree about
-    the dense default or inherit a future change to verl's yaml.
+    this is independent of ``fsdp_config.reshard_after_forward``. that field continues to select the
+    allocator-approved zero-2 or zero-3 behavior within the chosen generation. ``strategy`` is
+    declared in ``actor/dp_actor.yaml``, so the override must stay bare and have exactly one writer.
     """
-    strategy = "fsdp2" if target_parameters else "fsdp"
+    strategy = "fsdp2" if require_fsdp2 else "fsdp"
     return [f"actor_rollout_ref.actor.strategy={strategy}"]
 
 

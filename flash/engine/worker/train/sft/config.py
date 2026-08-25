@@ -135,7 +135,7 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         f"model.fused_kernel_options.impl_backend={cfg['fused_ce_backend']}",
         f"model.use_liger={_hydra_val(cfg.get('use_liger', False))}",
         f"model.enable_gradient_checkpointing={_hydra_val(cfg.get('gradient_checkpointing', True))}",
-        f"engine.strategy={_hydra_val(cfg.get('strategy', 'fsdp2'))}",
+        "engine.strategy=fsdp2",
         "engine.model_dtype=bfloat16",
         f"engine.seed={_hydra_val(cfg['seed'])}",
         f"engine.ulysses_sequence_parallel_size={_hydra_val(cfg['ulysses_sp_size'])}",

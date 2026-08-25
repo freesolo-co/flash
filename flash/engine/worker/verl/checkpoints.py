@@ -17,8 +17,9 @@ import re
 import shutil
 import subprocess
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
+from flash._internal.fileio import reject_duplicate_keys
 from flash.adapters.fused_experts import (
     fused_expert_lora_tensor_pairs,
     is_non_language_lora_key,
@@ -78,7 +79,7 @@ def _model_shard_bytes(path: str) -> int:
         return 0
     total = 0
     for name in names:
-        if _FSDP_SHARD_RE.fullmatch(name) is None:
+        if _FSDP_MODEL_SHARD_RE.fullmatch(name) is None:
             continue
         try:
             total += os.stat(os.path.join(path, name)).st_size
@@ -273,104 +274,173 @@ def undiscovered_checkpoint_dirs(
     return sorted(found)
 
 
-# verl stamps the writing topology next to the shards on every save
-# (`utils/checkpoint/fsdp_checkpoint_manager.py` writes `FSDPConfig(world_size=...)`, and its own
-# model_merger reads the file back). flash reads verl's stamp rather than writing a second one of
-# its own, because every checkpoint already on the hub carries it.
+# verl stamps the fsdp generation and writing topology next to the shards on every save. flash reads
+# that authoritative stamp rather than inferring generation from filenames or writing a second one.
 VERL_FSDP_CONFIG_FILE = "fsdp_config.json"
 
-# the shards themselves carry the same number: verl saves and loads
-# `model_world_size_{W}_rank_{R}.pt`, which is exactly why a cross-count resume cannot open a file.
-_FSDP_SHARD_RE = re.compile(r"model_world_size_(\d+)_rank_\d+\.pt")
+# every native resume requires the model, optimizer, and extra state written by each rank. parsing
+# rank as an integer also exposes duplicate representations such as rank_0 and rank_00.
+_FSDP_SHARD_RE = re.compile(r"(model|optim|extra_state)_world_size_(\d+)_rank_(\d+)\.pt")
+_FSDP_MODEL_SHARD_RE = re.compile(r"model_world_size_(\d+)_rank_\d+\.pt")
+_REQUIRED_FSDP_SHARD_CLASSES = ("model", "optim", "extra_state")
+_REJECT_DUPLICATE_FSDP_CONFIG_KEYS = reject_duplicate_keys(
+    lambda key: ValueError(f"duplicate fsdp config key: {key}")
+)
 
 
-def checkpoint_world_size(step_dir: str) -> int | None:
-    """the number of ranks that wrote ``step_dir``'s fsdp shards, or none when it is unreadable.
+def _valid_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
-    prefers verl's ``fsdp_config.json`` stamp and falls back to the shard filenames, which encode
-    the same width. a checkpoint carrying neither is unclassifiable rather than single-rank, so it
-    reports none and lets the caller decide.
-    """
-    actor_dir = resolve_checkpoint_actor_dir(step_dir)
+
+def _checkpoint_fsdp_stamp(actor_dir: str) -> tuple[int, int] | None:
+    """return the stamped ``(fsdp version, world size)``, or none when either field is invalid."""
     try:
         with open(os.path.join(actor_dir, VERL_FSDP_CONFIG_FILE), encoding="utf-8") as file:
-            decoded = json.load(file)
+            decoded = json.load(file, object_pairs_hook=_REJECT_DUPLICATE_FSDP_CONFIG_KEYS)
     except (OSError, ValueError):
-        decoded = None
-    # decoded json that is null, a list, or a bare scalar is not verl's stamp (a mapping with a
-    # "world_size" key); treat it as unreadable rather than let .get() raise, so the shard-filename
-    # fallback below still runs instead of the exception escaping to the caller.
-    stamped = decoded.get("world_size") if isinstance(decoded, dict) else None
-    if isinstance(stamped, int) and not isinstance(stamped, bool) and stamped >= 1:
-        return stamped
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    version = decoded.get("FSDP_version")
+    world_size = decoded.get("world_size")
+    if not _valid_positive_int(version) or not _valid_positive_int(world_size):
+        return None
+    return version, world_size
+
+
+def _readable_regular_file(path: str) -> bool:
+    """whether ``path`` resolves to a nonempty regular file readable in binary mode."""
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as file:
+            return file.read(1) != b""
+    except OSError:
+        return False
+
+
+def _complete_fsdp_shards(actor_dir: str, *, world_size: int) -> bool:
+    """whether the directory has exactly the canonical, readable native fsdp shard set."""
     try:
         names = os.listdir(actor_dir)
     except OSError:
-        return None
-    widths = {int(m.group(1)) for m in map(_FSDP_SHARD_RE.fullmatch, names) if m is not None}
-    # more than one width means a torn or merged directory: not a topology this code can vouch for.
-    return widths.pop() if len(widths) == 1 else None
+        return False
+    actual: set[str] = set()
+    for name in names:
+        match = _FSDP_SHARD_RE.fullmatch(name)
+        if match is None:
+            if any(name.startswith(f"{kind}_world_size_") for kind in _REQUIRED_FSDP_SHARD_CLASSES):
+                return False
+            continue
+        _kind, width_text, rank_text = match.groups()
+        width = int(width_text)
+        rank = int(rank_text)
+        if width_text != str(width) or rank_text != str(rank):
+            return False
+        actual.add(name)
+    expected = {
+        f"{kind}_world_size_{world_size}_rank_{rank}.pt"
+        for kind in _REQUIRED_FSDP_SHARD_CLASSES
+        for rank in range(world_size)
+    }
+    if actual != expected:
+        return False
+    return all(_readable_regular_file(os.path.join(actor_dir, name)) for name in expected)
 
 
-def resume_checkpoint_is_loadable(resume_dir: str, *, world_size: int) -> bool:
-    """whether an attempt running ``world_size`` ranks can load ``resume_dir``'s fsdp shards.
+def checkpoint_world_size(step_dir: str) -> int | None:
+    """the stamped rank count for ``step_dir``, or none when the native stamp is unreadable."""
+    stamp = _checkpoint_fsdp_stamp(resolve_checkpoint_actor_dir(step_dir))
+    return stamp[1] if stamp is not None else None
 
-    quiet by design (no logging): ``resume_topology_matches`` below is the loud form that explains a
-    discard, but a caller ranking several downloaded candidates (``hf_resume_checkpoint``'s
-    ``prefer``) needs to probe many of them before any discard decision, and thus any discard log
-    line, has been made.
+
+FsdpGeneration = Literal[1, 2]
+
+
+def resume_checkpoint_is_loadable(
+    resume_dir: str,
+    *,
+    world_size: int,
+    expected_fsdp_generation: FsdpGeneration,
+) -> bool:
+    """whether the expected fsdp actor can load ``resume_dir`` without recovery.
+
+    native resume fails closed unless verl's stamp names the exact expected generation and current
+    rank count, and every rank has exactly one model, optimizer, and extra-state shard. exported peft
+    warm starts do not use this path and remain independent of native checkpoint generation.
+
+    quiet by design: ``resume_topology_matches`` below is the loud form that explains a discard, but
+    candidate ranking must probe several downloads before making any discard decision.
     """
-    return checkpoint_world_size(resume_dir) == world_size
+    actor_dir = resolve_checkpoint_actor_dir(resume_dir)
+    if _checkpoint_fsdp_stamp(actor_dir) != (expected_fsdp_generation, world_size):
+        return False
+    return _complete_fsdp_shards(actor_dir, world_size=world_size)
 
 
-def resume_topology_matches(resume_dir: str, *, world_size: int, job_label: str) -> bool:
-    """whether an attempt running ``world_size`` ranks can load ``resume_dir``'s fsdp shards.
+def resume_topology_matches(
+    resume_dir: str,
+    *,
+    world_size: int,
+    expected_fsdp_generation: FsdpGeneration,
+    job_label: str,
+) -> bool:
+    """whether the expected fsdp actor can load ``resume_dir``'s complete native state.
 
-    infra recovery deliberately re-allocates a retry across card counts (2x and 4x of the same
-    class are distinct rentable shapes), and the worker then launches verl at the new count. verl
-    loads exactly ``model_world_size_{world_size}_rank_{rank}.pt``, so a retry that changed shape
-    cannot open a single shard: the load dies with a missing-file error that is not oom-shaped, so
-    the supervisor burns another retry on it. discarding instead restarts from step 0, which is
-    what a failed resume fetch already does, and costs only the steps since the last save.
+    infra recovery may change card count, and the training paths intentionally use different fsdp
+    generations. verl native checkpoints are not cross-generation or cross-width artifacts, and a
+    partial upload can omit one state class or rank while still leaving a plausible directory.
+    discarding any unverified native state restarts from step 0 through the existing recovery path.
 
-    an unreadable topology is always a mismatch, with no single-gpu exemption: ``rentable_gpu_counts``
-    in ``flash/providers/base.py`` walks every power-of-two card count up to a spec's cap, largest
-    first, and the allocator rewrites the retried attempt to whichever count it lands on, so a
-    single-gpu retry can follow a multi-gpu attempt that wrote the checkpoint -- the card count this
-    attempt runs at is no evidence of the count the checkpoint was written at. a directory with no
-    readable topology (no verl stamp, no single consistent shard width) is not one this code can
-    vouch for at any world size, and discarding it costs only the same steps-since-last-save the
-    mismatch path already pays.
+    there is no single-gpu exemption: the retry's current shape is not evidence of the checkpoint's
+    writer shape. the authoritative fsdp stamp and exact rank-complete model, optimizer, and
+    extra-state shard sets must all agree before staging.
     """
-    if resume_checkpoint_is_loadable(resume_dir, world_size=world_size):
+    if resume_checkpoint_is_loadable(
+        resume_dir,
+        world_size=world_size,
+        expected_fsdp_generation=expected_fsdp_generation,
+    ):
         return True
     written = checkpoint_world_size(resume_dir)
     print(
-        f"[{job_label}] discarding resume checkpoint {os.path.basename(resume_dir)}: its fsdp "
-        f"shards were written at world size {written if written is not None else 'unknown'} but "
-        f"this attempt runs at {world_size}; restarting from step 0",
+        f"[{job_label}] discarding resume checkpoint {os.path.basename(resume_dir)}: it is not a "
+        f"complete fsdp{expected_fsdp_generation} checkpoint; its stamped world size "
+        f"{written if written is not None else 'unknown'} and this attempt runs at {world_size}; "
+        "restarting from step 0",
         flush=True,
     )
     return False
 
 
-def stage_verl_resume(resume_dir: str, local_dir: str, *, job_label: str, world_size: int) -> int:
+def stage_verl_resume(
+    resume_dir: str,
+    local_dir: str,
+    *,
+    job_label: str,
+    world_size: int,
+    expected_fsdp_generation: FsdpGeneration,
+) -> int:
     """stage a downloaded ``checkpoint-N`` into local_dir where verl looks; return its step.
 
     the resume artifact is keyed on the run prefix, not the job type, so the control plane hands
     every trainer the same ``checkpoint-N`` layout. verl finds it via
     latest_checkpointed_iteration.txt under trainer.default_local_dir once resume_mode=auto.
-    ``job_label`` names the job in the error raised for an unparseable path and in the discard log,
-    which is the sole thing the trainers ever varied here.
+    ``job_label`` names the job in the error raised for an unparseable path and in the discard log.
 
-    returns 0, staging nothing, when the checkpoint's world size does not match ``world_size``: see
-    ``resume_topology_matches``. 0 is the fresh-run answer every caller already handles.
+    returns 0, staging nothing, when the checkpoint is not complete native state for the expected
+    generation and ``world_size``. 0 is the fresh-run answer every caller handles.
     """
     match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(resume_dir))
     if match is None:
         raise RuntimeError(f"invalid {job_label} resume checkpoint path {resume_dir!r}")
     step = int(match.group(1))
-    if not resume_topology_matches(resume_dir, world_size=world_size, job_label=job_label):
+    if not resume_topology_matches(
+        resume_dir,
+        world_size=world_size,
+        expected_fsdp_generation=expected_fsdp_generation,
+        job_label=job_label,
+    ):
         return 0
     shutil.copytree(resume_dir, os.path.join(local_dir, f"global_step_{step}"), dirs_exist_ok=True)
     with open(os.path.join(local_dir, "latest_checkpointed_iteration.txt"), "w") as file:
