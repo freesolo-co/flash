@@ -72,38 +72,21 @@ def _expected_remote_matches(current: object, expected: dict | None) -> bool:
 
 
 def _provider_cost_record(remote: dict, *, terminated_ts: float) -> dict | None:
-    """Return the immutable non-secret billing identity for one exact instance attempt."""
-    provider = remote.get("provider")
-    if provider == "runpod":
-        from flash.providers.runpod.pods import RunpodPodHandle
-
-        handle = RunpodPodHandle.from_dict(remote)
-        if handle.pending:
-            return None
-        provider_fields = {
-            "account_id": handle.account_id,
-            "data_center_id": handle.data_center_id,
-            "gpu_count": handle.gpu_count,
-            "key_fingerprint": handle.key_fingerprint,
-        }
-    elif provider == "lambda":
-        from flash.providers.lambda_.jobs.builders import LambdaJobHandle
-
-        handle = LambdaJobHandle.from_dict(remote)
-        provider_fields = {
-            "instance_type": handle.instance_type,
-            "region": handle.region,
-        }
-    elif provider == "vast":
-        from flash.providers.vast.jobs.builders import VastJobHandle
-
-        handle = VastJobHandle.from_dict(remote)
-        provider_fields = {
-            "machine_id": handle.machine_id,
-            "offer_id": handle.offer_id,
-        }
-    else:
+    """Return immutable non-secret billing identity for one exact managed RunPod Pod attempt."""
+    if remote.get("provider") != "runpod":
         return None
+
+    from flash.providers.runpod.pods import RunpodPodHandle
+
+    handle = RunpodPodHandle.from_dict(remote)
+    if handle.pending:
+        return None
+    provider_fields = {
+        "account_id": handle.account_id,
+        "data_center_id": handle.data_center_id,
+        "gpu_count": handle.gpu_count,
+        "key_fingerprint": handle.key_fingerprint,
+    }
     ended = float(terminated_ts)
     if not math.isfinite(ended) or ended < handle.started_ts:
         raise ValueError("provider attempt termination timestamp is invalid")
@@ -140,6 +123,8 @@ def _merge_provider_cost_history(existing: object, incoming: object) -> list[dic
             raise RuntimeError("persisted provider cost history is invalid")
         for item in value:
             record = dict(item)
+            if record.get("provider") != "runpod":
+                raise RuntimeError("provider cost history contains a non-RunPod record")
             key = _provider_cost_key(record)
             prior = by_key.get(key)
             if prior is not None:

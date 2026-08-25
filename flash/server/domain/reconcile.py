@@ -88,18 +88,47 @@ def _attempt_cost_records(status: runner.RunStatus, *, run_end: float) -> list[d
     records = []
     seen = set()
     for record in history:
+        if record.get("provider") != "runpod":
+            raise ValueError("provider cost history contains a non-RunPod record")
         key = (record.get("provider"), record.get("instance_id"), record.get("attempt"))
         if key in seen:
             raise ValueError("provider cost history contains a duplicate attempt")
         seen.add(key)
         records.append(dict(record))
-    if isinstance(status.remote, dict):
+    if (
+        isinstance(status.remote, dict)
+        and status.remote.get("provider") == "runpod"
+        and status.remote.get("phase") == "exact"
+    ):
         active = {**status.remote, "terminated_ts": run_end}
-        is_exact = active.get("provider") != "runpod" or active.get("phase") == "exact"
         key = (active.get("provider"), active.get("instance_id"), active.get("attempt"))
-        if is_exact and key not in seen:
+        if key not in seen:
             records.append(active)
     return records
+
+
+def _combine_realized_costs(costs: list[RealizedCost | None]) -> RealizedCost | None:
+    included = [cost for cost in costs if cost is not None]
+    if not included:
+        return None
+    providers = {cost.provider for cost in included}
+    by_resource: dict[str, float] = {}
+    sources = []
+    for cost in included:
+        for resource, amount in cost.by_resource.items():
+            by_resource[resource] = round(by_resource.get(resource, 0.0) + amount, 6)
+        attempts = cost.source.get("attempts") if isinstance(cost.source, dict) else None
+        if isinstance(attempts, list):
+            sources.extend(attempts)
+        else:
+            sources.append(cost.source)
+    return RealizedCost(
+        provider=next(iter(providers)) if len(providers) == 1 else "mixed",
+        realized_usd=round(sum(cost.realized_usd for cost in included), 6),
+        by_resource=by_resource,
+        wall_seconds=sum(float(cost.wall_seconds or 0.0) for cost in included),
+        source={"attempts": sources},
+    )
 
 
 def _aggregate_attempt_costs(status: runner.RunStatus, *, run_end: float) -> RealizedCost | None:
@@ -108,28 +137,15 @@ def _aggregate_attempt_costs(status: runner.RunStatus, *, run_end: float) -> Rea
         ended = record.get("terminated_ts")
         if isinstance(ended, bool) or not isinstance(ended, (int, float)):
             raise ValueError("provider attempt termination timestamp is invalid")
-        cost = realized_cost_for_remote(
-            record,
-            start=float(record.get("started_ts") or status.created_at),
-            end=float(ended),
-            run_end=float(ended),
+        costs.append(
+            realized_cost_for_remote(
+                record,
+                start=float(record.get("started_ts") or status.created_at),
+                end=float(ended),
+                run_end=float(ended),
+            )
         )
-        if cost is not None:
-            costs.append(cost)
-    if not costs:
-        return None
-    providers = {cost.provider for cost in costs}
-    by_resource: dict[str, float] = {}
-    for cost in costs:
-        for resource, amount in cost.by_resource.items():
-            by_resource[resource] = round(by_resource.get(resource, 0.0) + amount, 6)
-    return RealizedCost(
-        provider=next(iter(providers)) if len(providers) == 1 else "mixed",
-        realized_usd=round(sum(cost.realized_usd for cost in costs), 6),
-        by_resource=by_resource,
-        wall_seconds=sum(float(cost.wall_seconds or 0.0) for cost in costs),
-        source={"attempts": [cost.source for cost in costs]},
-    )
+    return _combine_realized_costs(costs)
 
 
 def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool:
@@ -142,7 +158,24 @@ def reconcile_run(status: runner.RunStatus, *, now: float | None = None) -> bool
     remote = status.remote or {}
     spec = status.spec or {}
     run_end = _terminal_ts(status)
-    realized = _aggregate_attempt_costs(status, run_end=run_end)
+    if remote.get("provider") == "runpod":
+        realized = _aggregate_attempt_costs(status, run_end=run_end)
+    elif status.provider_cost_history:
+        historical = _aggregate_attempt_costs(status, run_end=run_end)
+        final_remote = realized_cost_for_remote(
+            remote,
+            start=float(remote.get("started_ts") or status.created_at),
+            end=run_end + _SETTLE_SECONDS,
+            run_end=run_end,
+        )
+        realized = _combine_realized_costs([historical, final_remote])
+    else:
+        realized = realized_cost_for_remote(
+            remote,
+            start=float(remote.get("started_ts") or status.created_at),
+            end=run_end + _SETTLE_SECONDS,
+            run_end=run_end,
+        )
     if realized is None or realized.realized_usd <= 0:
         return False
 

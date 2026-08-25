@@ -198,30 +198,67 @@ def test_get_status_tolerates_stale_unknown_keys(monkeypatch):
         assert "old" in {r.run_id for r in runner.list_runs()}
 
 
-def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_path):
+def test_unstructured_prepare_does_not_import_optional_serving_preflight(monkeypatch):
+    import builtins
+
+    import flash.runner as runner
+    from flash.core.spec import JobSpec, TrainSpec
+
+    class ReachedModelResolution(Exception):
+        pass
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "flash.serve.preflight":
+            pytest.fail("unstructured preparation imported optional serving dependencies")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(
+        runner,
+        "resolve_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ReachedModelResolution),
+    )
+
+    with pytest.raises(ReachedModelResolution):
+        runner.prepare_job(
+            JobSpec(
+                run_id="base-install-dry-run",
+                model="Qwen/Qwen3.5-9B",
+                algorithm="grpo",
+                train=TrainSpec(epochs=1, max_examples=1),
+            )
+        )
+
+
+def test_submit_job_freezes_quote_and_completion_charges_it_without_refresh(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
     import flash.runner as runner
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.cost.currency import usd_amount
-    from flash.cost.spec import estimate_for_spec
 
     importlib.reload(runner)
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner, "_assign_resolved_env_sha", lambda spec: spec)
     monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
 
-    seen: dict[str, float] = {}
+    estimate_calls = []
+
+    def fixed_estimate(spec):
+        estimate_calls.append(spec.gpu.type)
+        return SimpleNamespace(total_usd=1.005)
 
     def fake_run(spec, runtime_secrets=None):
         status = runner.get_status(spec.run_id)
         priced_spec = JobSpec.from_dict(status.spec)
-        seen["estimate"] = float(status.estimated_cost_usd)
-        seen["expected"] = usd_amount(estimate_for_spec(priced_spec).total_usd)
         runner._update(
             spec.run_id,
             "done",
-            cost_usd=runner._status_estimated_charge(status, priced_spec, fallback=0.01),
+            cost_usd=runner._status_estimated_charge(status, priced_spec, fallback=99.0),
         )
 
+    monkeypatch.setattr("flash.cost.spec.estimate_for_spec", fixed_estimate)
     monkeypatch.setattr(runner, "_run_job", fake_run)
 
     status = runner.submit_job(
@@ -234,9 +271,9 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
         )
     )
 
-    assert seen["estimate"] == pytest.approx(seen["expected"])
-    assert status.estimated_cost_usd == pytest.approx(seen["expected"])
-    assert status.cost_usd == pytest.approx(seen["expected"])
+    assert estimate_calls == [""]
+    assert status.estimated_cost_usd == 1.01
+    assert status.cost_usd == 1.01
     raw = runner._load_status_json(status.run_id)
     assert raw[runner._RUN_DEADLINE_AT_KEY] == pytest.approx(
         status.created_at + JobSpec.from_dict(status.spec).gpu.max_wall_seconds
@@ -1334,17 +1371,8 @@ def test_multiprocess_attempt_reservations_preserve_concurrent_status_update(mon
     assert raw["error"] == "concurrent-update"
 
 
-@pytest.mark.parametrize(
-    "remote",
-    [
-        _runpod_remote(attempt=2),
-        _lambda_remote(attempt=2),
-        _vast_remote(attempt=2),
-    ],
-)
-def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
-    monkeypatch, tmp_path, remote
-):
+def test_compare_and_clear_remote_uses_exact_runpod_resource_identity(monkeypatch, tmp_path):
+    remote = _runpod_remote(attempt=2)
     import flash.runner as runner
     from flash.core.spec import JobSpec
 
@@ -1376,6 +1404,29 @@ def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
     runner._save_status(stale)
     persisted = runner.get_status(spec.run_id)
     assert persisted.provider_cost_history == [record]
+
+
+@pytest.mark.parametrize("remote", [_lambda_remote(attempt=2), _vast_remote(attempt=2)])
+def test_compare_and_clear_instance_remote_stores_no_cost_history(monkeypatch, tmp_path, remote):
+    import flash.runner as runner
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="compare-clear-instance", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner._save_status(
+        runner.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote=remote,
+        )
+    )
+
+    assert runner._compare_and_clear_remote(spec.run_id, remote) is True
+    cleared = runner.get_status(spec.run_id)
+    assert cleared.remote is None
+    assert cleared.provider_cost_history is None
+    assert "provider_cost_history" not in runner._load_status_json(spec.run_id)
 
 
 @pytest.mark.parametrize(
@@ -1665,6 +1716,37 @@ def test_provider_cost_history_keeps_first_termination_but_rejects_billing_drift
     assert runner._merge_provider_cost_history([existing], [later]) == [existing]
     with pytest.raises(RuntimeError, match="conflicts with the exact attempt"):
         runner._merge_provider_cost_history([existing], [{**later, "hourly_usd": 0.99}])
+
+
+@pytest.mark.parametrize("provider", ["lambda", "vast"])
+def test_provider_cost_history_rejects_non_runpod_records(provider):
+    import flash.runner as runner
+
+    record = {
+        "provider": provider,
+        "instance_id": "instance-1",
+        "attempt": 0,
+        "hourly_usd": 1.0,
+        "started_ts": 1_000.0,
+        "terminated_ts": 2_800.0,
+    }
+
+    with pytest.raises(RuntimeError, match="non-RunPod record"):
+        runner._merge_provider_cost_history([record], None)
+    assert runner._provider_cost_record(record, terminated_ts=2_800.0) is None
+
+
+def test_pending_runpod_provider_cost_record_is_excluded():
+    import flash.runner as runner
+
+    pending = _runpod_remote(
+        secret_id=None,
+        phase="secret_create_pending",
+        started_ts=1_000.0,
+    )
+    pending["instance_id"] = pending["label"]
+
+    assert runner._provider_cost_record(pending, terminated_ts=2_800.0) is None
 
 
 def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypatch, tmp_path):

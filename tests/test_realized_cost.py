@@ -129,6 +129,44 @@ def test_reconcile_excludes_a_pending_runpod_identity_from_provider_cogs():
     assert reconcile._aggregate_attempt_costs(status, run_end=2_800.0) is None
 
 
+def test_reconcile_rejects_non_runpod_attempt_history():
+    status = _status(
+        provider_cost_history=[
+            {
+                "provider": "lambda",
+                "instance_id": "i-1",
+                "attempt": 0,
+                "hourly_usd": 1.0,
+                "started_ts": 1_000.0,
+                "terminated_ts": 2_800.0,
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="non-RunPod record"):
+        reconcile._attempt_cost_records(status, run_end=2_800.0)
+
+
+def test_reconcile_deduplicates_final_runpod_remote_already_in_history():
+    record = {
+        "provider": "runpod",
+        "phase": "exact",
+        "instance_id": "pod-final",
+        "attempt": 1,
+        "hourly_usd": 4.0,
+        "started_ts": 1_000.0,
+        "terminated_ts": 2_800.0,
+    }
+    status = _status(remote=dict(record), provider_cost_history=[record])
+
+    aggregate = reconcile._aggregate_attempt_costs(status, run_end=2_800.0)
+
+    assert aggregate is not None
+    assert aggregate.realized_usd == 2.0
+    assert aggregate.wall_seconds == 1_800.0
+    assert len(aggregate.source["attempts"]) == 1
+
+
 def test_reconcile_aggregates_failed_attempt_and_success_without_repricing_customer(monkeypatch):
     now = 1_000_000.0
     status = _status(
@@ -299,6 +337,126 @@ def test_reconcile_leaves_invalid_instance_launch_unsettled_and_due(monkeypatch)
     assert reconcile.reconcile_run(status, now=now) is False
     assert status.reconciled_at is None
     assert reconcile._due(status, now) is True
+
+
+@pytest.mark.parametrize("final_provider", ["lambda", "vast"])
+def test_reconcile_combines_runpod_history_with_final_instance_provider(
+    monkeypatch, final_provider
+):
+    now = 1_000_000.0
+    run_end = now - 7_200.0
+    historical = {
+        "provider": "runpod",
+        "instance_id": "pod-failed",
+        "attempt": 0,
+        "hourly_usd": 2.0,
+        "started_ts": run_end - 3_600.0,
+        "terminated_ts": run_end - 1_800.0,
+    }
+    remote = {
+        "provider": final_provider,
+        "instance_id": "instance-final",
+        "hourly_usd": 3.0,
+        "started_ts": run_end - 1_800.0,
+        "allocated_gpu": "A100" if final_provider == "lambda" else "RTX 4090",
+    }
+    status = _status(
+        run_id=f"runpod-to-{final_provider}",
+        created_at=historical["started_ts"],
+        updated_at=run_end,
+        finished_at=run_end,
+        remote=remote,
+        provider_cost_history=[historical],
+    )
+    calls = []
+
+    def fake_realized(captured_remote, *, start, end, run_end):
+        calls.append((captured_remote, start, end, run_end))
+        if captured_remote["provider"] == "runpod":
+            return realized.RealizedCost(
+                provider="runpod",
+                realized_usd=1.0,
+                by_resource={"gpu": 1.0},
+                wall_seconds=1_800.0,
+                source={"resource_id": "pod-failed", "attempt_detail": "historical"},
+            )
+        return realized.RealizedCost(
+            provider=final_provider,
+            realized_usd=1.5,
+            by_resource={"gpu": 1.5},
+            wall_seconds=1_800.0,
+            source={"resource_id": "instance-final", "provider_detail": final_provider},
+        )
+
+    posted = {}
+    monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
+    monkeypatch.setattr(reconcile, "_report", lambda body: posted.update(body) or True)
+    monkeypatch.setattr(runner, "record_realized_cost", lambda *_args, **_kwargs: None)
+
+    assert reconcile.reconcile_run(status, now=now) is True
+    assert calls == [
+        (
+            historical,
+            historical["started_ts"],
+            historical["terminated_ts"],
+            historical["terminated_ts"],
+        ),
+        (remote, remote["started_ts"], run_end + reconcile._SETTLE_SECONDS, run_end),
+    ]
+    assert posted["provider"] == "mixed"
+    assert posted["realizedCostUsd"] == 2.5
+    assert posted["costByResource"] == {"gpu": 2.5}
+    assert posted["wallSeconds"] == 3_600.0
+    assert posted["source"] == {
+        "attempts": [
+            {"resource_id": "pod-failed", "attempt_detail": "historical"},
+            {"resource_id": "instance-final", "provider_detail": final_provider},
+        ]
+    }
+
+
+@pytest.mark.parametrize("provider", ["lambda", "vast"])
+def test_reconcile_instance_provider_preserves_direct_last_remote_attribution(
+    monkeypatch, provider
+):
+    now = 1_000_000.0
+    run_end = now - 7_200.0
+    remote = {
+        "provider": provider,
+        "instance_id": "instance-final",
+        "hourly_usd": 2.0,
+        "started_ts": run_end - 1_800.0,
+        "allocated_gpu": "A100" if provider == "lambda" else "RTX 4090",
+    }
+    status = _status(
+        run_id=f"{provider}-direct",
+        created_at=run_end - 2_000.0,
+        updated_at=run_end,
+        finished_at=run_end,
+        remote=remote,
+    )
+    calls = []
+
+    def fake_realized(captured_remote, *, start, end, run_end):
+        calls.append((captured_remote, start, end, run_end))
+        return realized.RealizedCost(
+            provider=provider,
+            realized_usd=1.0,
+            by_resource={"gpu": 1.0},
+            wall_seconds=1_800.0,
+            source={"resource_id": "instance-final", "provider_detail": provider},
+        )
+
+    posted = {}
+    monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
+    monkeypatch.setattr(reconcile, "_report", lambda body: posted.update(body) or True)
+    monkeypatch.setattr(runner, "record_realized_cost", lambda *_args, **_kwargs: None)
+
+    assert reconcile.reconcile_run(status, now=now) is True
+    assert calls == [(remote, remote["started_ts"], run_end + reconcile._SETTLE_SECONDS, run_end)]
+    assert posted["provider"] == provider
+    assert posted["wallSeconds"] == 1_800.0
+    assert posted["source"] == {"resource_id": "instance-final", "provider_detail": provider}
 
 
 def test_reconcile_uses_finished_at_not_deploy_bumped_updated_at_for_instance(monkeypatch):
