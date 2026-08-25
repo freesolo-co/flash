@@ -10,6 +10,7 @@ import math
 import os
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -177,11 +178,15 @@ class _StepMetricState:
     loss_curve: list[float] = field(default_factory=list)
     adv_spread_history: list[float] = field(default_factory=list)
     advantage_bounds: dict[int, tuple[float, float]] = field(default_factory=dict)
+    grad_norms: dict[int, float] = field(default_factory=dict)
+    prior_positive_grad_step: int | None = None
+    _metric_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # the last step a previous attempt already completed; 0 for a fresh run. a resumed verl child
     # replays this step's metrics line, which belongs to the earlier attempt, so its bounds are not
     # evidence for the steps THIS attempt executed.
     resume_step: int = 0
     advantage_bounds_evidence: list[dict[str, int | float]] = field(default_factory=list)
+    grad_norm_evidence: list[dict[str, int | float]] = field(default_factory=list)
     last_dump_step: list[int] = field(default_factory=lambda: [-1])
     metrics_last: list[dict] = field(default_factory=list)
     step_timing: StepTiming = field(default_factory=StepTiming)
@@ -191,6 +196,50 @@ class _StepMetricState:
     )
     sent_first_metrics: bool = False
     sent_first_timing: bool = False
+
+    def set_prior_positive_step(self, step: int | None, *, checkpoint_step: int) -> None:
+        """install the strict durable positive-gradient fact before uploader start."""
+        if step is not None and (
+            isinstance(step, bool)
+            or not isinstance(step, int)
+            or step <= 0
+            or step > int(checkpoint_step)
+        ):
+            raise RuntimeError("invalid prior GRPO positive-gradient evidence")
+        with self._metric_lock:
+            self.prior_positive_grad_step = step
+
+    def record_grad_norm(self, step: int, value: float | None) -> None:
+        """replace one current-attempt step's evidence under the uploader's lock."""
+        with self._metric_lock:
+            self.grad_norms.pop(int(step), None)
+            if isinstance(value, float):
+                self.grad_norms[int(step)] = value
+
+    def checkpoint_manifest_evidence(self, checkpoint_step: int) -> tuple[bool, int | None]:
+        """return readiness and first positive step after metric N has been ingested."""
+        checkpoint_step = int(checkpoint_step)
+        with self._metric_lock:
+            if checkpoint_step <= self.resume_step:
+                return True, self.prior_positive_grad_step
+            expected = range(self.resume_step + 1, checkpoint_step + 1)
+            if any(
+                step not in self.grad_norms
+                or not math.isfinite(self.grad_norms[step])
+                or self.grad_norms[step] < 0.0
+                for step in expected
+            ):
+                return False, None
+            current_positive = min(
+                (step for step in expected if self.grad_norms[step] > 0.0),
+                default=None,
+            )
+            candidates = [
+                step
+                for step in (self.prior_positive_grad_step, current_positive)
+                if step is not None
+            ]
+            return True, min(candidates) if candidates else None
 
 
 @dataclass
@@ -261,6 +310,7 @@ def _prepare_rl_files(inp, prompts):
         local_dir,
         world_size=int(inp["dp_cards"]),
         expected_fsdp_generation=inp["fsdp_generation"],
+        required_steps=tuple(inp["save_at_steps"]),
     )
     train_pq = os.path.join(workdir, "train.parquet")
     val_pq = os.path.join(workdir, "val.parquet")
@@ -490,7 +540,7 @@ def _announce_training(t_start: float, cfg) -> tuple[float, float]:
 
 
 def _start_resume_uploader(
-    *, local_dir, resume_step, inp, workdir, python_bin, preprocessor, adv_spread_history
+    *, local_dir, resume_step, inp, workdir, python_bin, preprocessor, metric_evidence
 ):
     targeting = resolve_lora_targeting(
         inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
@@ -498,6 +548,7 @@ def _start_resume_uploader(
     resume_uploader = rl_checkpoints._VerlResumeUploader(
         local_dir,
         resume_step=resume_step,
+        metric_evidence=metric_evidence,
         required_steps=inp["save_at_steps"],
         export_root=os.path.join(workdir, "exports"),
         python_bin=python_bin,
@@ -505,14 +556,9 @@ def _start_resume_uploader(
         model_revision=inp["model_revision"],
         exclude_modules=targeting.exclude_modules,
         preprocessor=preprocessor,
-        # a resumed run's restored weights already carry the earlier steps' updates, so this
-        # worker's own spread history cannot speak for them; let it publish as before and leave
-        # the verdict to the same abstention _check_grpo_had_a_gradient makes.
-        had_gradient=(
-            None if resume_step else lambda: any(spread > 0.0 for spread in adv_spread_history)
-        ),
     )
     resume_uploader.credit_durable_required_steps(resume_step)
+    resume_uploader.restore_staged_adapters(resume_step)
     resume_uploader.start()
     return resume_uploader
 
@@ -558,6 +604,8 @@ def _ingest_step_metrics(
     _reward_observability: Callable[[], dict],
 ) -> None:
     step_metrics = parse_verl_step_metrics(line)
+    step_number = verl_step_number(line)
+    pg_loss = parse_verl_metric(line, "actor/pg_loss") if step_number is not None else None
     if step_metrics is not None:
         state.step_timing.record_duration(parse_verl_metric(line, "timing_s/step"))
         # a run constant rather than a verl metric, so it is stamped here from
@@ -599,32 +647,32 @@ def _ingest_step_metrics(
         # so a line without a step carries no metric to collect.
         for verl_key, sink in (
             ("critic/rewards/mean", state.reward_history),
-            ("actor/pg_loss", state.loss_curve),
             ("response_length/mean", state.resp_len_history),
         ):
             value = parse_verl_metric(line, verl_key)
             if value is not None:
                 sink.append(value)
-        # the structured parser admits advantage bounds only as a complete finite ordered pair.
-        # key them by optimizer step so replayed lines replace rather than duplicate terminal proof.
-        adv_min = step_metrics.get("advantage_min")
-        adv_max = step_metrics.get("advantage_max")
-        step_number = int(step_metrics["step"])
-        # a resumed child replays its resume step before producing the first new one. that line
-        # describes the PREVIOUS attempt's step, and `_finalize_advantage_evidence` expects exactly
-        # `resume_step + 1 .. horizon`, so admitting it reports the resume step as an extra step.
-        if (
-            isinstance(adv_min, float)
-            and isinstance(adv_max, float)
-            and step_number > state.resume_step
-        ):
-            state.advantage_bounds[step_number] = (adv_min, adv_max)
-            state.adv_spread_history[:] = [
-                maximum - minimum
-                for minimum, maximum in (
-                    state.advantage_bounds[step] for step in sorted(state.advantage_bounds)
-                )
-            ]
+    if pg_loss is not None:
+        state.loss_curve.append(pg_loss)
+    # a structured training row or a renderable actor loss is authoritative for terminal evidence.
+    # validation-only rows have neither, and a replay of the resume boundary belongs to the prior worker.
+    authoritative_training_line = step_metrics is not None or pg_loss is not None
+    if authoritative_training_line and step_number is not None and step_number > state.resume_step:
+        state.advantage_bounds.pop(step_number, None)
+        grad_norm = None
+        if step_metrics is not None:
+            grad_norm = step_metrics.get("grad_norm")
+            adv_min = step_metrics.get("advantage_min")
+            adv_max = step_metrics.get("advantage_max")
+            if isinstance(adv_min, float) and isinstance(adv_max, float):
+                state.advantage_bounds[step_number] = (adv_min, adv_max)
+        state.adv_spread_history[:] = [
+            maximum - minimum
+            for minimum, maximum in (
+                state.advantage_bounds[step] for step in sorted(state.advantage_bounds)
+            )
+        ]
+        state.record_grad_norm(step_number, grad_norm if isinstance(grad_norm, float) else None)
 
 
 def _execute_rl_child(
@@ -823,20 +871,28 @@ def _validate_rl_child(
     shim_markers = (files or {}).get("shim_markers")
     if shim_markers is not None:
         verify_applied_shim_markers(shim_markers, (files or {}).get("expected_shims", ()))
-    # the gradient verdict runs here, ahead of required-save completeness, because a zero-spread
-    # run withholds every required deployable BY DESIGN: checking completeness first would raise
-    # on artifacts the gate is deliberately holding and report a checkpoint-publication failure
-    # -- the symptom -- instead of the constant reward signal that caused it.
+    # the gradient verdict runs here, ahead of required-save completeness, because a zero-gradient
+    # run withholds every required deployable by design. checking completeness first would report
+    # the publication symptom instead of the missing actor update evidence that caused it.
     rl_checkpoints._check_grpo_had_a_gradient(
         state.reward_history,
         state.adv_spread_history,
-        resumed=bool(resume_step),
-        # a resume already at the target runs zero steps and emits zero metrics; that is a
-        # complete policy, not a broken reward bridge. steps_run below still has to reach
-        # expected_steps, so this cannot excuse a run that stopped short.
+        state.grad_norms,
+        resume_step=int(resume_step),
+        prior_positive_step=state.prior_positive_grad_step,
+        # a resume already at the target runs zero steps and emits zero metrics. publication is
+        # allowed only when the restored checkpoint carried trusted prior positive evidence.
         already_complete=bool(resume_step) and resume_step >= expected_steps,
+        expected_steps=range(int(resume_step) + 1, int(expected_steps) + 1),
     )
+    state.grad_norm_evidence = [
+        {"step": step, "grad_norm": state.grad_norms[step]} for step in sorted(state.grad_norms)
+    ]
     _finalize_advantage_evidence(state, resume_step, expected_steps)
+    if resume_uploader is not None:
+        # only the terminal verdict may make staged required adapters servable. open before stop so
+        # its final sweep observes the latch and publishes every validated staged checkpoint.
+        resume_uploader.allow_deployable_publication()
     # training finished cleanly, so a missing required save is a real defect rather than a
     # side effect of a crash. stop here (not in finally, which suppresses) to surface it.
     # only when exact saves were requested: without them the drain stays best-effort, and

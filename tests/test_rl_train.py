@@ -13,7 +13,6 @@ import json
 import math
 import os
 import re
-import shutil
 import signal
 import socket
 import subprocess
@@ -32,7 +31,6 @@ import pytest
 
 import flash.engine.plan.steps as plan_steps
 import flash.engine.worker.train.entry.rl_train_runner as rl_runner
-import flash.engine.worker.train.rl.launch.checkpoints as rl_checkpoints
 import flash.engine.worker.train.rl.launch.config as worker_config
 import flash.engine.worker.train.rl.launch.inputs as rl_inputs
 import flash.engine.worker.train.rl.launch.verl_config as rl_verl
@@ -2417,94 +2415,6 @@ def test_final_publish_is_suppressed_when_exact_save_steps_are_set():
     assert final_save_due(100, ())
 
 
-def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, monkeypatch):
-    # the deployable at a required step is the whole point of save_at_steps. a resume-state upload
-    # alone leaves the step resumable but not servable, which is the gap this closes.
-    published: list[tuple[str, int, bool]] = []
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf,
-        "publish_deployable_checkpoint",
-        lambda d, s, **kw: published.append((d, s, kw.get("required", False))),
-    )
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf, "upload_resume_checkpoint", lambda *a, **kw: True
-    )
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf, "write_base_model_provenance", lambda *a, **kw: None
-    )
-    monkeypatch.setattr(rl_checkpoints, "export_peft_adapter", lambda *a, **kw: None)
-    monkeypatch.setattr(rl_checkpoints, "stamp_adapter_dir_provenance", lambda *a, **kw: None)
-
-    local_dir = tmp_path / "ckpt"
-    (local_dir / "global_step_10" / "actor").mkdir(parents=True)
-    (local_dir / "global_step_5" / "actor").mkdir(parents=True)
-    (local_dir / "latest_checkpointed_iteration.txt").write_text("10")
-
-    class _Tok:
-        def save_pretrained(self, path):
-            pass
-
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(local_dir),
-        resume_step=0,
-        required_steps=(10, 20),
-        export_root=str(tmp_path / "exports"),
-        python_bin="python",
-        model_id="Qwen/Qwen3.5-9B",
-        model_revision="rev",
-        preprocessor=_Tok(),
-    )
-    uploader.start()
-    uploader.stop()
-
-    # step 10 was required and completed, so it published as a REQUIRED deployable. step 5 is a gcd
-    # by-product verl wrote on the way there; it is resume state only and must not be published.
-    assert [(step, required) for _, step, required in published] == [(10, True)]
-    # step 20 never completed, so the run must fail rather than silently ship an incomplete set.
-    with pytest.raises(RuntimeError, match="required saves were not durably published: \\[20\\]"):
-        uploader.raise_if_incomplete()
-
-
-def test_resume_credits_required_steps_already_durable_on_hf(tmp_path, monkeypatch):
-    # a resumed run never re-saves a step it trained past. without crediting the earlier required
-    # steps a retry that resumes at 20 would report step 10 missing and fail a successful run.
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf, "_deployable_adapter_on_hf", lambda step: step == 10
-    )
-
-    class _Tok:
-        def save_pretrained(self, path):
-            pass
-
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(tmp_path),
-        resume_step=20,
-        required_steps=(10, 15, 25),
-        preprocessor=_Tok(),
-    )
-    uploader.credit_durable_required_steps(20)
-
-    # step 10 is verified on hf, so it is credited. step 15 is below the resume point but its
-    # adapter never landed, so it stays uncredited and completeness still catches it. step 25 is
-    # ahead of the resume point and is this run's job to publish.
-    assert uploader.lifecycle.deployable_published_steps == {10}
-    with pytest.raises(RuntimeError, match=r"not durably published: \[15, 25\]"):
-        uploader.raise_if_incomplete()
-
-
-def test_resume_step_is_not_credited_without_a_durable_adapter(tmp_path, monkeypatch):
-    # a preempted worker can advance past a required step without its deployable ever reaching hf,
-    # so the restored step counter alone must never credit a required save.
-    monkeypatch.setattr(rl_checkpoints._worker_hf, "_deployable_adapter_on_hf", lambda step: False)
-
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(tmp_path), resume_step=10, required_steps=(10,)
-    )
-    uploader.credit_durable_required_steps(10)
-
-    assert uploader.lifecycle.deployable_published_steps == set()
-
-
 def test_checkpoint_retention_outlives_the_export_when_exact_saves_are_set(monkeypatch):
     # verl prunes a checkpoint once the NEXT save completes, so keeping 1 gives the uploader a
     # single save interval to export before its source is deleted. with a gcd of 1 that interval is
@@ -4233,757 +4143,21 @@ def test_build_verl_overrides_enables_resume_mode():
     assert "trainer.resume_mode=auto" in o
 
 
-def test_restore_verl_resume_is_a_noop_without_a_checkpoint(tmp_path, monkeypatch):
-    monkeypatch.setattr(rl_checkpoints._worker_hf, "hf_resume_checkpoint", lambda *a, **k: None)
-    assert (
-        rl_checkpoints._restore_verl_resume(str(tmp_path), world_size=1, expected_fsdp_generation=2)
-        == 0
-    )
-    assert not (tmp_path / "latest_checkpointed_iteration.txt").exists()
-
-
-def test_restore_verl_resume_stages_the_checkpoint_where_verl_looks(tmp_path, monkeypatch):
-    src = tmp_path / "checkpoint-7"
-    (src / "actor").mkdir(parents=True)
-    (src / "actor" / "model.safetensors").write_text("weights")
-    # this test is about staging mechanics, so provide one complete native fsdp2 rank.
-    (src / "actor" / "fsdp_config.json").write_text(
-        json.dumps({"FSDP_version": 2, "world_size": 1})
-    )
-    for kind in ("model", "optim", "extra_state"):
-        (src / "actor" / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    monkeypatch.setattr(rl_checkpoints._worker_hf, "hf_resume_checkpoint", lambda *a, **k: str(src))
-
-    assert (
-        rl_checkpoints._restore_verl_resume(
-            str(local_dir), world_size=1, expected_fsdp_generation=2
-        )
-        == 7
-    )
-    # verl discovers the checkpoint through this marker plus the global_step_N layout.
-    assert (local_dir / "latest_checkpointed_iteration.txt").read_text().strip() == "7"
-    assert (local_dir / "global_step_7" / "actor" / "model.safetensors").read_text() == "weights"
-
-
-def test_restore_verl_resume_rejects_an_unparseable_checkpoint_path(tmp_path, monkeypatch):
-    bad = tmp_path / "not-a-checkpoint"
-    bad.mkdir()
-    monkeypatch.setattr(rl_checkpoints._worker_hf, "hf_resume_checkpoint", lambda *a, **k: str(bad))
-    with pytest.raises(RuntimeError, match="invalid GRPO resume checkpoint path"):
-        rl_checkpoints._restore_verl_resume(
-            str(tmp_path / "ckpt"), world_size=1, expected_fsdp_generation=2
-        )
-
-
-def _write_step(local_dir, step):
-    d = local_dir / f"global_step_{step}"
-    (d / "actor").mkdir(parents=True)
-    (local_dir / "latest_checkpointed_iteration.txt").write_text(str(step))
-    return d
-
-
-def test_resume_uploader_uploads_each_completed_step(tmp_path):
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    seen = []
-    uploader = rl_checkpoints._VerlResumeUploader(str(local_dir), resume_step=0)
-
-    original = rl_checkpoints._worker_hf.upload_resume_checkpoint
-    rl_checkpoints._worker_hf.upload_resume_checkpoint = lambda step, path, **k: seen.append(
-        int(step)
-    )
-    try:
-        _write_step(local_dir, 4)
-        uploader.start()
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and 4 not in seen:
-            time.sleep(0.05)
-        _write_step(local_dir, 8)
-        while time.monotonic() < deadline and 8 not in seen:
-            time.sleep(0.05)
-        uploader.stop()
-    finally:
-        rl_checkpoints._worker_hf.upload_resume_checkpoint = original
-    assert seen == [4, 8]
-
-
-def test_resume_uploader_skips_the_step_it_resumed_from(tmp_path):
-    # that checkpoint is already durable on hf; re-uploading it wastes the upload slot.
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    seen = []
-    original = rl_checkpoints._worker_hf.upload_resume_checkpoint
-    rl_checkpoints._worker_hf.upload_resume_checkpoint = lambda step, path, **k: seen.append(
-        int(step)
-    )
-    try:
-        _write_step(local_dir, 5)
-        uploader = rl_checkpoints._VerlResumeUploader(str(local_dir), resume_step=5)
-        uploader.start()
-        time.sleep(0.5)
-        uploader.stop()
-    finally:
-        rl_checkpoints._worker_hf.upload_resume_checkpoint = original
-    assert seen == []
-
-
-def test_resume_uploader_never_fails_the_run_on_an_upload_error(tmp_path):
-    # the policy is still trained and published; a failed resume upload only costs restart distance.
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-
-    def boom(step, path, **k):
-        raise RuntimeError("hf is down")
-
-    original = rl_checkpoints._worker_hf.upload_resume_checkpoint
-    rl_checkpoints._worker_hf.upload_resume_checkpoint = boom
-    try:
-        _write_step(local_dir, 2)
-        uploader = rl_checkpoints._VerlResumeUploader(str(local_dir), resume_step=0)
-        uploader.start()
-        time.sleep(0.5)
-        uploader.stop()  # must not raise
-    finally:
-        rl_checkpoints._worker_hf.upload_resume_checkpoint = original
-    assert 2 in uploader.lifecycle.discovered_steps
-
-
-def test_grpo_gradient_check_rejects_a_run_whose_rewards_never_varied():
-    # the defect this guards: a run on a constant-reward environment reaches state=done with a
-    # written checkpoint and an exported adapter, and its reward history looks perfectly healthy,
-    # but every advantage was 0 so the published adapter equals its initialization.
-    with pytest.raises(RuntimeError, match="zero advantage spread"):
-        rl_checkpoints._check_grpo_had_a_gradient([1.0, 1.0, 1.0], [0.0, 0.0, 0.0])
-
-
-def test_grpo_gradient_check_admits_a_run_with_spread_on_any_step():
-    # zero spread on some steps is legitimate (a converged run, or one unlucky all-equal group), so
-    # the guard must key on "no step ever had spread" rather than "some step had none".
-    rl_checkpoints._check_grpo_had_a_gradient([0.4, 0.6], [0.0, 1.5])
-    rl_checkpoints._check_grpo_had_a_gradient([0.4], [2.0])
-
-
-def test_grpo_gradient_check_rejects_reward_metrics_without_advantage_metrics():
-    # both series are parsed off the same verl log line, so advantages missing while rewards are
-    # present means the parse regressed. without this the spread check silently cannot fire.
-    with pytest.raises(RuntimeError, match="no advantage metrics"):
-        rl_checkpoints._check_grpo_had_a_gradient([1.0], [])
-
-
-def test_grpo_gradient_check_still_rejects_an_unconsulted_reward_bridge():
-    with pytest.raises(RuntimeError, match="never consulted"):
-        rl_checkpoints._check_grpo_had_a_gradient([], [])
-
-
-def test_advantage_spread_is_parsed_from_a_real_verl_step_line():
-    # the guard is only as good as this parse: verl namespaces both keys under critic/ even though
-    # grpo runs without a critic, and emits them outside its use_critic branch
-    # (verl/trainer/ppo/metric_utils.py), so they are present for every grpo step.
-    line = (
-        "step:1 - critic/rewards/mean:1.0 - critic/rewards/max:1.0 - critic/rewards/min:1.0 - "
-        "critic/advantages/mean:0.0 - critic/advantages/max:0.0 - critic/advantages/min:0.0 - "
-        "actor/pg_loss:0.0"
-    )
-    adv_max = backend_common.parse_verl_metric(line, "critic/advantages/max")
-    adv_min = backend_common.parse_verl_metric(line, "critic/advantages/min")
-    assert adv_max == 0.0
-    assert adv_min == 0.0
-    # this is the exact shape of the run in ISSUES VERL-064: healthy reward, zero spread.
-    with pytest.raises(RuntimeError, match="zero advantage spread"):
-        rl_checkpoints._check_grpo_had_a_gradient([1.0], [adv_max - adv_min])
-
-    varied = line.replace("critic/advantages/max:0.0", "critic/advantages/max:0.67").replace(
-        "critic/advantages/min:0.0", "critic/advantages/min:-0.33"
-    )
-    spread = backend_common.parse_verl_metric(
-        varied, "critic/advantages/max"
-    ) - backend_common.parse_verl_metric(varied, "critic/advantages/min")
-    assert spread > 0.0
-    rl_checkpoints._check_grpo_had_a_gradient([0.5], [spread])
-
-
-def test_run_rl_train_wires_the_gradient_check_into_the_publish_path():
-    # a helper nothing calls is not a guard. assert the training path actually invokes it, and that
-    # it does so before the adapter export rather than after a publish has already happened.
+def test_run_rl_train_wires_direct_gradient_evidence_into_the_publish_path():
     entry_source = inspect.getsource(rl_train.run_rl_train)
     verdict_source = inspect.getsource(rl_runner._validate_rl_child)
     metrics_source = inspect.getsource(rl_runner._ingest_step_metrics)
     export_source = inspect.getsource(rl_runner._export_final_adapter)
     assert "_validate_rl_child(" in entry_source
     assert "_check_grpo_had_a_gradient(" in verdict_source
-    assert "resumed=bool(resume_step)," in verdict_source
-    assert "already_complete=bool(resume_step) and resume_step >= expected_steps," in verdict_source
+    assert "state.grad_norms," in verdict_source
+    assert "expected_steps=range(" in verdict_source
     assert entry_source.index("_validate_rl_child(") < entry_source.index("_export_final_adapter(")
     assert "export_peft_adapter(" in export_source
-    # and that the spread series it passes is collected from the structured durable metrics row.
+    assert 'step_metrics.get("grad_norm")' in metrics_source
     assert 'step_metrics.get("advantage_max")' in metrics_source
     assert 'step_metrics.get("advantage_min")' in metrics_source
     assert "_finalize_advantage_evidence(state, resume_step, expected_steps)" in verdict_source
-    assert verdict_source.index("_check_grpo_had_a_gradient(") < verdict_source.index(
-        "_finalize_advantage_evidence(state, resume_step, expected_steps)"
-    )
-
-
-def test_grpo_gradient_check_abstains_for_a_resumed_run():
-    # a run resuming at step 9 of 10 observes ONE step; if that group ties, the spread history is
-    # all-zero even though the restored weights carry nine steps of real updates. rejecting it would
-    # throw away a correctly trained policy, so the resumed case abstains from the spread verdict.
-    rl_checkpoints._check_grpo_had_a_gradient([1.0], [0.0], resumed=True)
-    # abstaining is scoped to the spread verdict only: the parse/wiring checks still apply, because
-    # a missing metric stream is a regression no matter where training started.
-    with pytest.raises(RuntimeError, match="no advantage metrics"):
-        rl_checkpoints._check_grpo_had_a_gradient([1.0], [], resumed=True)
-    with pytest.raises(RuntimeError, match="never consulted"):
-        rl_checkpoints._check_grpo_had_a_gradient([], [], resumed=True)
-    # and a FRESH run with the same all-zero history is still rejected -- the abstention must be
-    # about the resume boundary, not a weakening of the guard.
-    with pytest.raises(RuntimeError, match="zero advantage spread"):
-        rl_checkpoints._check_grpo_had_a_gradient([1.0], [0.0], resumed=False)
-
-
-def test_terminal_advantage_evidence_rejects_missing_nonfinite_and_zero_spread():
-    missing = rl_runner._StepMetricState()
-    missing.reward_history[:] = [0.5, 0.5]
-    missing.adv_spread_history[:] = [1.0]
-    missing.advantage_bounds[1] = (-0.5, 0.5)
-    with pytest.raises(RuntimeError, match=r"missing=\[2\], extra=\[\]"):
-        rl_runner._validate_rl_child(0, missing, 0, 2, None)
-
-    nonfinite = rl_runner._StepMetricState()
-    nonfinite.reward_history.append(0.5)
-    nonfinite.adv_spread_history.append(1.0)
-    nonfinite.advantage_bounds[1] = (0.0, float("inf"))
-    with pytest.raises(RuntimeError, match="not finite and ordered"):
-        rl_runner._validate_rl_child(0, nonfinite, 0, 1, None)
-
-    zero = rl_runner._StepMetricState()
-    zero.reward_history.append(0.5)
-    zero.adv_spread_history.append(0.0)
-    zero.advantage_bounds[1] = (0.0, 0.0)
-    with pytest.raises(RuntimeError, match="zero advantage spread"):
-        rl_runner._validate_rl_child(0, zero, 0, 1, None)
-
-
-def test_grpo_gradient_check_accepts_a_resume_that_is_already_complete():
-    # a checkpoint already at the target yields no metrics because verl runs zero steps.
-    # empty histories are therefore valid for a fully trained resume.
-    rl_checkpoints._check_grpo_had_a_gradient([], [], resumed=True, already_complete=True)
-
-    # the exemption is ONLY for the zero-step case. a resume that ran steps and produced no metrics
-    # is still a wiring regression, and a fresh run can never claim it.
-    with pytest.raises(RuntimeError, match="never consulted"):
-        rl_checkpoints._check_grpo_had_a_gradient([], [], resumed=True, already_complete=False)
-    with pytest.raises(RuntimeError, match="never consulted"):
-        rl_checkpoints._check_grpo_had_a_gradient([], [], resumed=False)
-
-
-def test_resume_uploader_withholds_deployables_until_spread_appears():
-    # the uploader publishes servable adapters WHILE training runs, so a degenerate-reward run would
-    # make untrained adapters durable minutes before the end-of-run guard fails the run.
-    spread: list[float] = []
-    uploader = rl_checkpoints._VerlResumeUploader(
-        "/nonexistent",
-        resume_step=0,
-        required_steps=(1,),
-        had_gradient=lambda: any(s > 0.0 for s in spread),
-    )
-    assert uploader._deployable_allowed() is False
-    spread.append(0.0)  # a step ran, but its group tied: still no gradient evidence
-    assert uploader._deployable_allowed() is False
-    spread.append(1.25)
-    assert uploader._deployable_allowed() is True
-
-
-def test_resume_uploader_treats_an_unreadable_gradient_signal_as_closed():
-    # this gate decides whether an artifact becomes durable and servable, so a callback that raises
-    # must not be read as permission to publish.
-    def boom() -> bool:
-        raise RuntimeError("signal unavailable")
-
-    uploader = rl_checkpoints._VerlResumeUploader("/nonexistent", resume_step=0, had_gradient=boom)
-    assert uploader._deployable_allowed() is False
-    # and no callback at all means no gate, which is the resume-only configuration.
-    assert (
-        rl_checkpoints._VerlResumeUploader("/nonexistent", resume_step=0)._deployable_allowed()
-        is True
-    )
-
-
-def test_run_rl_train_gates_midtraining_deployables_and_exempts_resumes():
-    entry_source = inspect.getsource(rl_train.run_rl_train)
-    uploader_source = inspect.getsource(rl_runner._start_resume_uploader)
-    # the gate must be wired into the uploader, not merely available on it.
-    assert "had_gradient=(" in uploader_source
-    # a resumed run publishes as before: its restored weights already carry earlier updates that
-    # this worker's spread history cannot speak for.
-    assert "if resume_step" in uploader_source.split("had_gradient=(")[1].split(")")[0] + ")"
-    # the spread series must be declared before the uploader closes over it, or the closure raises
-    # NameError the first time the drain thread consults it.
-    assert entry_source.index("adv_spread_history = state.adv_spread_history") < entry_source.index(
-        "_start_resume_uploader("
-    )
-
-
-def _patch_stage_and_publish(monkeypatch, staged: list[int], published: list[int]) -> None:
-    """record staging and publication separately, without running model_merger or touching hf.
-
-    they are patched as two seams because the production code separates them: staging is bounded by
-    verl's checkpoint retention, publication by the gradient gate.
-    """
-    monkeypatch.setattr(
-        rl_checkpoints._VerlResumeUploader,
-        "_stage_deployable",
-        lambda self, step, path: (staged.append(int(step)), f"{path}-adapter")[1],
-    )
-    monkeypatch.setattr(
-        rl_checkpoints._VerlResumeUploader,
-        "_publish_staged",
-        lambda self, step, adapter_dir: (
-            published.append(int(step)),
-            self.lifecycle.mark_deployable_published(step),
-        )[0],
-    )
-
-
-def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path, monkeypatch):
-    # withholding gates PUBLICATION only. the resume upload is internal retry scaffolding, and with
-    # exact save_at_steps these are often the only on-disk checkpoints -- skipping it would leave a run
-    # preempted before the first nonzero spread with nothing to resume from. neither the upload nor the
-    # staging may repeat on every 0.5s sweep while the step waits for the gate.
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    uploaded: list[int] = []
-    staged: list[int] = []
-    published: list[int] = []
-    spread: list[float] = []
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf,
-        "upload_resume_checkpoint",
-        lambda step, path, **k: uploaded.append(int(step)),
-        raising=False,
-    )
-    _patch_stage_and_publish(monkeypatch, staged, published)
-    _write_step(local_dir, 3)
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(local_dir),
-        resume_step=0,
-        required_steps=(3,),
-        had_gradient=lambda: any(s > 0.0 for s in spread),
-    )
-    uploader.start()
-    try:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and 3 not in uploaded:
-            time.sleep(0.05)
-        # the gate is shut, so publication is withheld -- but resume state IS durable, and the
-        # adapter is already staged out of verl's reach.
-        assert uploaded == [3]
-        assert staged == [3]
-        assert published == []
-        time.sleep(1.5)  # several sweeps: neither the upload nor the export may repeat
-        assert uploaded == [3]
-        assert staged == [3]
-        spread.append(2.0)  # gradient evidence appears; the held-back deployable is released
-        while time.monotonic() < deadline and not published:
-            time.sleep(0.05)
-        assert published == [3]
-        assert uploaded == [3]
-        assert staged == [3]
-    finally:
-        uploader.stop()
-    uploader.raise_if_incomplete()
-
-
-def test_a_gate_already_open_publishes_the_deployable_before_the_resume_upload(
-    tmp_path, monkeypatch
-):
-    """the opposite publication order to the withheld case above, and equally legitimate.
-
-    with gradient evidence already present, a required step is staged and published on the sweep
-    that finds it, BEFORE its resume upload runs. the withheld case reaches the same two facts in
-    the other order. the lifecycle records them independently precisely so neither ordering has to
-    be called the canonical one.
-    """
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    order: list[str] = []
-    staged: list[int] = []
-    published: list[int] = []
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf,
-        "upload_resume_checkpoint",
-        lambda step, path, **k: (order.append("resume"), k["after_upload"]())[0],
-        raising=False,
-    )
-    _patch_stage_and_publish(monkeypatch, staged, published)
-    _write_step(local_dir, 3)
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(3,), had_gradient=lambda: True
-    )
-    uploader.start()
-    try:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and not published:
-            time.sleep(0.05)
-    finally:
-        uploader.stop()
-
-    assert published == [3]
-    assert order.index("resume") == len(order) - 1, "the resume upload must not precede the publish"
-    facts = uploader.lifecycle.facts(3)
-    assert facts.staged
-    assert facts.deployable_published
-    assert facts.resume_uploaded
-    uploader.raise_if_incomplete()
-
-
-def test_a_failed_resume_upload_is_not_recorded_as_durable_and_stays_non_fatal(
-    tmp_path, monkeypatch
-):
-    """a resume upload that raises leaves resume_uploaded unset without failing the run.
-
-    grpo treats resume state as internal retry scaffolding: losing it costs restart distance, not
-    the policy. the attempt is still recorded so a permanently failing upload cannot respin every
-    0.5s, which is why "attempted" and "uploaded" have to be two different things.
-    """
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    attempts: list[int] = []
-
-    def exploding_upload(step, path, **kwargs):
-        attempts.append(int(step))
-        raise RuntimeError("hub is down")
-
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf, "upload_resume_checkpoint", exploding_upload, raising=False
-    )
-    _patch_stage_and_publish(monkeypatch, [], [])
-    _write_step(local_dir, 2)
-    uploader = rl_checkpoints._VerlResumeUploader(str(local_dir), resume_step=0, required_steps=())
-    uploader.start()
-    try:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and not attempts:
-            time.sleep(0.05)
-        time.sleep(1.0)  # several sweeps: the failed upload must not be retried on each one
-    finally:
-        uploader.stop()
-
-    assert attempts == [2], f"a permanently failing upload respun: {attempts}"
-    assert not uploader.lifecycle.facts(2).resume_uploaded
-    assert uploader.lifecycle.facts(2).discovered
-    uploader.raise_if_incomplete()  # non-fatal: no required save was owed
-
-
-def test_a_permanently_withheld_step_fails_the_run_and_does_not_hang_stop(tmp_path, monkeypatch):
-    # the gate never opening must not wedge stop() waiting for a step it will never release, and the
-    # run must still fail rather than silently ship without the customer's requested deployable.
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf,
-        "upload_resume_checkpoint",
-        lambda step, path, **k: True,
-        raising=False,
-    )
-    _patch_stage_and_publish(monkeypatch, [], [])
-    _write_step(local_dir, 3)
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(3,), had_gradient=lambda: False
-    )
-    uploader.start()
-    time.sleep(0.5)
-    uploader.stop()  # must return, not hang
-    with pytest.raises(RuntimeError, match="required saves were not durably published"):
-        uploader.raise_if_incomplete()
-
-
-def test_gate_opening_just_before_stop_still_publishes_rather_than_failing_on_timing(
-    tmp_path, monkeypatch
-):
-    # the drain loop samples the gate once per sweep. if the main thread records the run's first
-    # positive spread and calls stop() after that sample, publishing nothing would fail a genuinely
-    # trained run for no reason but thread scheduling. the sweep that observes stop() must therefore
-    # still act on the gate as it stands then.
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    published: list[int] = []
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf,
-        "upload_resume_checkpoint",
-        lambda step, path, **k: True,
-        raising=False,
-    )
-    _patch_stage_and_publish(monkeypatch, [], published)
-    _write_step(local_dir, 3)
-    gate = [False]
-    # flips the gate open on the sweep *after* the first sample, mimicking the main thread recording
-    # spread while the drain loop is already past its own read.
-    reads = [0]
-
-    def _had_gradient():
-        reads[0] += 1
-        return gate[0]
-
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(3,), had_gradient=_had_gradient
-    )
-    uploader.start()
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and reads[0] < 1:
-        time.sleep(0.01)
-    gate[0] = True  # spread appears, then the run ends immediately
-    uploader.stop()
-    assert published == [3]
-    uploader.raise_if_incomplete()
-
-
-def test_resumed_required_step_can_still_publish_its_withheld_deployable(tmp_path, monkeypatch):
-    # a previous worker resume-uploads a required checkpoint while withholding its adapter behind the
-    # gradient gate, so the step is durable as resume state but NOT published. seeding the lifecycle
-    # with resume_step would hide it from _pending forever, and completeness would then fail a run on
-    # the one step this worker is both able and allowed to publish.
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    published: list[int] = []
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf,
-        "upload_resume_checkpoint",
-        lambda step, path, **k: True,
-        raising=False,
-    )
-    _patch_stage_and_publish(monkeypatch, [], published)
-    _write_step(local_dir, 4)
-    # resumed at exactly the required step, and no adapter on hf for it, so it stays uncredited.
-    monkeypatch.setattr(rl_checkpoints._worker_hf, "_deployable_adapter_on_hf", lambda step: False)
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(local_dir), resume_step=4, required_steps=(4,)
-    )
-    uploader.credit_durable_required_steps(4)
-    uploader.start()
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and not published:
-        time.sleep(0.01)
-    uploader.stop()
-    assert published == [4]
-    uploader.raise_if_incomplete()
-
-
-def test_checkpoint_appearing_at_stop_is_uploaded_before_the_exit(tmp_path, monkeypatch):
-    # verl advances latest_checkpointed_iteration.txt right up to the moment the child exits, so the
-    # newest resume checkpoint can appear after the drain's last scan but before stop(). exiting
-    # without sweeping that checkpoint would drop durable work a preemption then has to redo. resume
-    # upload is not gated, and with the gradient gate shut nothing may be PUBLISHED.
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    uploaded: list[int] = []
-    staged: list[int] = []
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf,
-        "upload_resume_checkpoint",
-        lambda step, path, **k: uploaded.append(int(step)),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        rl_checkpoints._VerlResumeUploader,
-        "_stage_deployable",
-        lambda self, step, path: (staged.append(int(step)), f"{path}-adapter")[1],
-    )
-    monkeypatch.setattr(
-        rl_checkpoints._VerlResumeUploader,
-        "_publish_staged",
-        lambda self, step, adapter_dir: (_ for _ in ()).throw(AssertionError("gate is shut")),
-    )
-    # the checkpoint must become visible AFTER a sweep has already decided what to scan, with stop
-    # already set -- writing it between sweeps does not discriminate, because the next top-of-loop
-    # scan picks it up either way. the tracker read is that boundary: _pending only accepts steps at
-    # or below the value it returns, so a step written right after that read is invisible to the
-    # sweep holding it and visible to the next one.
-    real_completed = rl_checkpoints._VerlResumeUploader._completed_step
-    raced = [False]
-
-    def _completed_then_race(self):
-        value = real_completed(self)
-        if not raced[0]:
-            raced[0] = True
-            # verl finishes step 5 and advances its tracker here, then the child exits and the main
-            # thread calls stop() -- all after this sweep already read the pre-step-5 tracker.
-            _write_step(local_dir, 5)
-            self._stop.set()
-        return value
-
-    monkeypatch.setattr(
-        rl_checkpoints._VerlResumeUploader, "_completed_step", _completed_then_race, raising=True
-    )
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(5,), had_gradient=lambda: False
-    )
-    uploader.start()
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and uploader._thread.is_alive():
-        time.sleep(0.01)
-    uploader.stop()
-    assert uploaded == [5]
-    # staged out of verl's reach on the same sweep, so the gate opening later can still publish it.
-    assert staged == [5]
-
-
-def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monkeypatch):
-    # verl keeps only max_actor_ckpt_to_keep=3 actor checkpoints, so with four or more required steps
-    # written before the first varying-reward group it deletes the earliest source while its
-    # deployable is still withheld. deferring the EXPORT until the gate opens would then leave that
-    # step unpublishable and fail an otherwise valid run, so the export is staged under export_root
-    # (flash's own workdir, outside verl's retention) and only the upload waits for the gate.
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    staged: list[int] = []
-    published: list[int] = []
-    gate = [False]
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf,
-        "upload_resume_checkpoint",
-        lambda step, path, **k: True,
-        raising=False,
-    )
-
-    def _stage_requiring_its_source(self, step, path):
-        # the real _stage_deployable runs model_merger over <path>/actor, so it cannot succeed once
-        # verl has pruned that directory. asserting it here is what makes this test fail on the
-        # actual defect -- an unpublishable required step -- rather than on bookkeeping.
-        if not os.path.isdir(path):
-            raise AssertionError(f"staged step {step} after verl pruned {path}")
-        staged.append(int(step))
-        return f"{path}-adapter"
-
-    monkeypatch.setattr(
-        rl_checkpoints._VerlResumeUploader, "_stage_deployable", _stage_requiring_its_source
-    )
-    monkeypatch.setattr(
-        rl_checkpoints._VerlResumeUploader,
-        "_publish_staged",
-        lambda self, step, adapter_dir: (
-            published.append(int(step)),
-            self.lifecycle.mark_deployable_published(step),
-        )[0],
-    )
-    for step in (1, 2, 3, 4):
-        (local_dir / f"global_step_{step}").mkdir()
-    _write_step(local_dir, 4)
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(1, 2, 3, 4), had_gradient=lambda: gate[0]
-    )
-    uploader.start()
-    try:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and len(staged) < 4:
-            time.sleep(0.01)
-        # nothing may be servable yet: the gate is still shut.
-        assert published == []
-        # verl prunes the oldest checkpoints now that step 4 has landed -- exactly what strands a
-        # step whose export was deferred until the gate opened.
-        for step in (1, 2):
-            shutil.rmtree(local_dir / f"global_step_{step}")
-        gate[0] = True  # the first varying-reward group finally arrives
-        while time.monotonic() < deadline and len(published) < 4:
-            time.sleep(0.01)
-    finally:
-        uploader.stop()
-    # every required step publishes, including the two whose verl checkpoints no longer exist. this
-    # is asserted before `staged` so a deferred export fails here, on the unpublishable step, rather
-    # than on the bookkeeping that led to it.
-    assert published == [1, 2, 3, 4]
-    uploader.raise_if_incomplete()
-    assert staged == [1, 2, 3, 4]
-
-
-def test_staging_failure_does_not_strand_an_earlier_publishable_step(tmp_path, monkeypatch):
-    # a sweep can find several new checkpoints at once, and exporting one of them can fail (a corrupt
-    # shard, a full disk, an OOM in model_merger). publishing only after the whole sweep finished let
-    # that failure abort the thread with earlier, fully exported adapters still local-only -- and the
-    # same window swallows a preemption during the resume upload that runs between the two. each step
-    # is therefore made durable as soon as it is staged and permitted.
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    published: list[int] = []
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf,
-        "upload_resume_checkpoint",
-        lambda step, path, **k: True,
-        raising=False,
-    )
-
-    def _stage_failing_on_step_2(self, step, path):
-        if int(step) == 2:
-            raise RuntimeError("model_merger ran out of memory")
-        return f"{path}-adapter"
-
-    monkeypatch.setattr(
-        rl_checkpoints._VerlResumeUploader, "_stage_deployable", _stage_failing_on_step_2
-    )
-    monkeypatch.setattr(
-        rl_checkpoints._VerlResumeUploader,
-        "_publish_staged",
-        lambda self, step, adapter_dir: (
-            published.append(int(step)),
-            self.lifecycle.mark_deployable_published(step),
-        )[0],
-    )
-    for step in (1, 2):
-        (local_dir / f"global_step_{step}").mkdir()
-    _write_step(local_dir, 2)
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(1, 2), had_gradient=lambda: True
-    )
-    uploader.start()
-    try:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and uploader._error is None:
-            time.sleep(0.01)
-    finally:
-        uploader.stop()
-    # step 1 was exported before step 2 failed, so it must already be durable. the run still fails --
-    # step 2 was required -- but a retry does not have to redo step 1, and step 1 is servable.
-    assert published == [1]
-    with pytest.raises(RuntimeError, match="verl resume uploader failed"):
-        uploader.raise_if_incomplete()
-
-
-def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, monkeypatch):
-    # a zero-spread run withholds every required deployable by design. checking completeness first
-    # would raise on artifacts the gate is deliberately holding, reporting a checkpoint-publication
-    # failure -- the symptom -- instead of the constant reward signal that caused it.
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    _write_step(local_dir, 6)
-    monkeypatch.setattr(
-        rl_checkpoints._worker_hf,
-        "upload_resume_checkpoint",
-        lambda step, path, **k: True,
-        raising=False,
-    )
-    _patch_stage_and_publish(monkeypatch, [], [])
-    uploader = rl_checkpoints._VerlResumeUploader(
-        str(local_dir), resume_step=0, required_steps=(6,), had_gradient=lambda: False
-    )
-    uploader.start()
-    uploader.stop()
-    # both failures are live: the deployable was withheld, and the run produced no spread. the
-    # gradient verdict must be the one that speaks.
-    with pytest.raises(RuntimeError, match="zero advantage spread on all"):
-        rl_checkpoints._check_grpo_had_a_gradient([0.5, 0.5], [0.0, 0.0], resumed=False)
-    with pytest.raises(RuntimeError, match="required saves were not durably published"):
-        uploader.raise_if_incomplete()
-    # ordering is asserted at the call site: the verdict precedes stop()/raise_if_incomplete().
-    # match on the call name alone -- the argument list spans several lines, so pinning an argument
-    # would make this fail on a reformat rather than on a reordering, which is the real invariant.
-    source = inspect.getsource(rl_runner._validate_rl_child)
-    assert source.count("_check_grpo_had_a_gradient(") == 1
-    assert source.count("resume_uploader.raise_if_incomplete()") == 1
-    verdict = source.index("_check_grpo_had_a_gradient(")
-    completeness = source.index("resume_uploader.raise_if_incomplete()")
-    assert verdict < completeness
 
 
 def test_train_notes_report_whether_the_run_resumed():
@@ -5062,6 +4236,7 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
     state.reward_history.append(0.5)
     state.adv_spread_history.append(1.0)
     state.advantage_bounds[1] = (-0.25, 0.75)
+    state.grad_norms[1] = 0.25
     runtime = SimpleNamespace(identity_ledger=ledger)
     rl_runner._validate_rl_child(0, state, 0, 1, None, reward_runtime=runtime)
 
@@ -5069,12 +4244,14 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
     assert "rollout_identity_evidence=state.rollout_identity_evidence" in terminal_source
     assert "advantage_spread_history=state.adv_spread_history" in terminal_source
     assert "advantage_bounds=state.advantage_bounds_evidence" in terminal_source
+    assert "grad_norm_evidence=state.grad_norm_evidence" in terminal_source
     notes = rl_verl._build_verl_train_notes(
         _notes_inp(),
         **_notes_common(),
         rollout_identity_evidence=state.rollout_identity_evidence,
         advantage_spread_history=state.adv_spread_history,
         advantage_bounds=state.advantage_bounds_evidence,
+        grad_norm_evidence=state.grad_norm_evidence,
     )
     assert notes["rollout_identity_evidence"] == {
         "steps": [
@@ -5088,25 +4265,30 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
     }
     assert notes["advantage_spread_history"] == [1.0]
     assert notes["advantage_bounds"] == [{"step": 1, "min": -0.25, "max": 0.75, "spread": 1.0}]
+    assert notes["grad_norm_evidence"] == [{"step": 1, "grad_norm": 0.25}]
 
 
 def test_already_complete_resume_finalizes_empty_rollout_identity_evidence():
     from flash.engine.worker.train.rl.rollout.identity import RolloutIdentityLedger
 
-    state = rl_runner._StepMetricState()
+    state = rl_runner._StepMetricState(resume_step=5)
+    state.set_prior_positive_step(3, checkpoint_step=5)
     runtime = SimpleNamespace(identity_ledger=RolloutIdentityLedger(1, 2))
     rl_runner._validate_rl_child(0, state, 5, 5, None, reward_runtime=runtime)
     assert state.rollout_identity_evidence == {"steps": [], "validation": []}
     assert state.adv_spread_history == []
     assert state.advantage_bounds_evidence == []
+    assert state.grad_norm_evidence == []
     notes = rl_verl._build_verl_train_notes(
         _notes_inp(),
         **_notes_common(),
         advantage_spread_history=state.adv_spread_history,
         advantage_bounds=state.advantage_bounds_evidence,
+        grad_norm_evidence=state.grad_norm_evidence,
     )
     assert notes["advantage_spread_history"] == []
     assert notes["advantage_bounds"] == []
+    assert notes["grad_norm_evidence"] == []
 
 
 def test_train_notes_carry_the_trl_observability_fields():
@@ -9111,6 +8293,7 @@ def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
     state.reward_history.append(0.5)
     state.adv_spread_history.append(1.0)
     state.advantage_bounds[1] = (-0.5, 0.5)
+    state.grad_norms[1] = 1.0
     marker = tmp_path / "applied_shims.txt"
     marker.write_text("entropy-quantile\n")
     # the complete set passes and falls through to the gradient verdict.
@@ -9510,13 +8693,13 @@ def test_single_turn_run_records_multi_turn_accounting_as_an_explicit_none():
     assert notes["multi_turn_accounting"] is None
 
 
-def _verl_step_line(step: int, *, adv_min: float, adv_max: float) -> str:
+def _verl_step_line(step: int, *, adv_min: float, adv_max: float, grad_norm: float = 1.0) -> str:
     """one verl LocalLogger step line, in the exact shape the child prints."""
     return (
         f"step:{step} - critic/rewards/mean:1.0 - critic/rewards/max:1.0 - "
         f"critic/rewards/min:1.0 - critic/advantages/mean:0.0 - "
         f"critic/advantages/max:{adv_max} - critic/advantages/min:{adv_min} - "
-        "actor/pg_loss:0.0"
+        f"actor/pg_loss:0.0 - actor/grad_norm:{grad_norm}"
     )
 
 
@@ -9541,6 +8724,7 @@ def test_resumed_grpo_ignores_the_replayed_resume_step_bounds():
         observability,
     )
     assert 2 not in state.advantage_bounds
+    assert 2 not in state.grad_norms
 
     # the first genuinely new step is recorded.
     rl_runner._ingest_step_metrics(
@@ -9550,6 +8734,7 @@ def test_resumed_grpo_ignores_the_replayed_resume_step_bounds():
         observability,
     )
     assert sorted(state.advantage_bounds) == [3]
+    assert state.grad_norms == {3: 1.0}
 
     # and the terminal verdict accepts the run instead of reporting step 2 as extra.
     rl_train_runner._finalize_advantage_evidence(state, 2, 3)

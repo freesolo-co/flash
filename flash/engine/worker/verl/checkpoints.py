@@ -16,7 +16,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from flash.adapters.fused_experts import (
@@ -318,19 +318,13 @@ def inspect_resume_checkpoint(
     )
 
 
-def restore_verl_resume(
-    local_dir: str,
+def select_verl_resume_checkpoint(
     *,
     world_size: int,
     expected_fsdp_generation: FsdpGeneration,
-    job_label: str,
-) -> int:
-    """select, inspect once, and stage the newest loadable streamed checkpoint.
-
-    the artifact fetch prefers a lower loadable checkpoint over a higher incompatible one, so a
-    repeated discard cannot starve compatible state uploaded after the rejected checkpoint. the
-    cached inspection is passed into staging so selection and diagnostics share one verdict.
-    """
+    accept: Callable[[str, FsdpCheckpointInspection], bool] | None = None,
+) -> tuple[str | None, FsdpCheckpointInspection | None]:
+    """select the newest caller-accepted loadable checkpoint and return its cached inspection."""
     import flash.engine.worker.io.hf as worker_hf
 
     inspections: dict[str, FsdpCheckpointInspection] = {}
@@ -344,18 +338,41 @@ def restore_verl_resume(
                 expected_fsdp_generation=expected_fsdp_generation,
             )
             inspections[path] = inspection
-        return inspection.loadable
+        return inspection.loadable and (accept is None or accept(path, inspection))
 
     resume = worker_hf.hf_resume_checkpoint(prefer=prefer)
     if not resume:
+        return None, None
+    inspection = inspections.get(resume)
+    if inspection is None:
+        prefer(resume)
+        inspection = inspections[resume]
+    return resume, inspection
+
+
+def restore_verl_resume(
+    local_dir: str,
+    *,
+    world_size: int,
+    expected_fsdp_generation: FsdpGeneration,
+    job_label: str,
+) -> int:
+    """select, inspect once, and stage the newest loadable streamed checkpoint."""
+    resume, inspection = select_verl_resume_checkpoint(
+        world_size=world_size,
+        expected_fsdp_generation=expected_fsdp_generation,
+    )
+    if not resume:
         return 0
+    if inspection is None:
+        raise RuntimeError("selected verl resume checkpoint is missing its inspection")
     return stage_verl_resume(
         resume,
         local_dir,
         job_label=job_label,
         world_size=world_size,
         expected_fsdp_generation=expected_fsdp_generation,
-        inspection=inspections.get(resume),
+        inspection=inspection,
     )
 
 

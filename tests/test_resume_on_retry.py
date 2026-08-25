@@ -373,6 +373,17 @@ def _staged_checkpoint(root, step, *, world_size=None, fsdp_version=2, shards=0,
     for kind in ("model", "optim", "extra_state"):
         for rank in range(shards):
             (inner / f"{kind}_world_size_{shards}_rank_{rank}.pt").write_bytes(b"shard")
+    (src / "_flash_resume_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "checkpoint_step": step,
+                "checkpoint_attempt": 0,
+                "required_adapters": [],
+                "first_positive_grad_step": 1,
+            }
+        )
+    )
     return src
 
 
@@ -626,14 +637,114 @@ def test_sft_flat_layout_is_guarded_too(monkeypatch, tmp_path, capsys):
     assert not (local_dir / "global_step_10").exists()
 
 
-def test_sft_and_grpo_restore_use_the_canonical_worker_helper():
+def test_sft_and_grpo_restore_use_the_canonical_worker_helper(monkeypatch, tmp_path):
+    from flash.engine.support.verl_checkpoint import FsdpCheckpointInspection
     from flash.engine.worker.train.entry import sft_train
     from flash.engine.worker.verl import checkpoints as verl_checkpoints
 
     assert sft_train._restore_verl_resume.func is verl_checkpoints.restore_verl_resume
     assert sft_train._restore_verl_resume.keywords == {"job_label": "SFT"}
-    assert rl_checkpoints._restore_verl_resume.func is verl_checkpoints.restore_verl_resume
-    assert rl_checkpoints._restore_verl_resume.keywords == {"job_label": "GRPO"}
+
+    checkpoint = _staged_checkpoint(tmp_path, 3, world_size=1, shards=1)
+    inspection = FsdpCheckpointInspection(loadable=True, width=1)
+    seen = {}
+
+    def select(**kwargs):
+        seen["accept"] = kwargs["accept"]
+        assert kwargs["accept"](str(checkpoint), inspection)
+        return str(checkpoint), inspection
+
+    def stage(resume, local_dir, **kwargs):
+        seen["staged"] = (resume, kwargs["inspection"])
+        return 3
+
+    monkeypatch.setattr(verl_checkpoints, "select_verl_resume_checkpoint", select)
+    monkeypatch.setattr(verl_checkpoints, "stage_verl_resume", stage)
+
+    assert (
+        rl_checkpoints._restore_verl_resume(
+            str(tmp_path / "local"), world_size=1, expected_fsdp_generation=2
+        )
+        == 3
+    )
+    assert seen["staged"] == (str(checkpoint), inspection)
+
+
+def test_canonical_resume_selection_inspects_once_and_stages_the_same_verdict(
+    monkeypatch, tmp_path
+):
+    from flash.engine.support.verl_checkpoint import FsdpCheckpointInspection
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    checkpoint = str(tmp_path / "checkpoint-5")
+    inspection = FsdpCheckpointInspection(loadable=True, width=2)
+    inspections = []
+    staged = []
+
+    def inspect(path, **kwargs):
+        inspections.append(path)
+        return inspection
+
+    def select(*, prefer=None, **kwargs):
+        assert prefer(checkpoint)
+        assert prefer(checkpoint)
+        return checkpoint
+
+    def stage(resume, local_dir, **kwargs):
+        staged.append((resume, kwargs["inspection"]))
+        return 5
+
+    monkeypatch.setattr(verl_checkpoints, "inspect_resume_checkpoint", inspect)
+    monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", select)
+    monkeypatch.setattr(verl_checkpoints, "stage_verl_resume", stage)
+
+    assert (
+        verl_checkpoints.restore_verl_resume(
+            str(tmp_path / "local"),
+            world_size=2,
+            expected_fsdp_generation=2,
+            job_label="SFT",
+        )
+        == 5
+    )
+    assert inspections == [checkpoint]
+    assert staged == [(checkpoint, inspection)]
+
+
+@pytest.mark.parametrize("caller", ["generic", "grpo"])
+def test_resume_restore_fails_closed_when_selection_omits_its_inspection(
+    monkeypatch, tmp_path, caller
+):
+    from flash.engine.worker.verl import checkpoints as verl_checkpoints
+
+    checkpoint = str(tmp_path / "checkpoint-5")
+    staged = []
+    monkeypatch.setattr(
+        verl_checkpoints,
+        "select_verl_resume_checkpoint",
+        lambda **kwargs: (checkpoint, None),
+    )
+    monkeypatch.setattr(
+        verl_checkpoints,
+        "stage_verl_resume",
+        lambda *args, **kwargs: staged.append((args, kwargs)),
+    )
+
+    def restore():
+        if caller == "generic":
+            return verl_checkpoints.restore_verl_resume(
+                str(tmp_path / "local"),
+                world_size=2,
+                expected_fsdp_generation=2,
+                job_label="SFT",
+            )
+        return rl_checkpoints._restore_verl_resume(
+            str(tmp_path / "local"), world_size=2, expected_fsdp_generation=2
+        )
+
+    with pytest.raises(RuntimeError, match="missing its inspection"):
+        restore()
+    assert staged == []
 
 
 def _fake_hf_resume_checkpoint_over(*candidates):
@@ -697,6 +808,32 @@ def test_grpo_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
 
     assert step == 3
     assert counts == {str(incompatible): 1, str(compatible): 1}
+    assert (local_dir / "global_step_3" / "actor" / "model.safetensors").exists()
+    assert not (local_dir / "global_step_7").exists()
+
+
+def test_grpo_resume_skips_a_higher_loadable_checkpoint_with_a_malformed_manifest(
+    monkeypatch, tmp_path
+):
+    counts = _count_resume_inspections(monkeypatch)
+    malformed = _staged_checkpoint(tmp_path, 7, world_size=2, shards=2)
+    valid = _staged_checkpoint(tmp_path, 3, world_size=2, shards=2)
+    (malformed / "_flash_resume_manifest.json").write_text("{not-json")
+    local_dir = tmp_path / "ckpt"
+    local_dir.mkdir()
+    monkeypatch.setattr(
+        worker_hf,
+        "hf_resume_checkpoint",
+        _fake_hf_resume_checkpoint_over(malformed, valid),
+    )
+
+    assert (
+        rl_checkpoints._restore_verl_resume(
+            str(local_dir), world_size=2, expected_fsdp_generation=2
+        )
+        == 3
+    )
+    assert counts == {str(malformed): 1, str(valid): 1}
     assert (local_dir / "global_step_3" / "actor" / "model.safetensors").exists()
     assert not (local_dir / "global_step_7").exists()
 
