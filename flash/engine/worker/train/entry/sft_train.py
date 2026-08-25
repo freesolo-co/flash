@@ -15,8 +15,8 @@ import threading
 import time
 from functools import partial
 
-import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.io.progress as _worker_progress
 import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.runtime.state as _worker_state
@@ -387,7 +387,7 @@ from flash.engine.profiling.sft_workload import (  # noqa: E402,F401
     sft_tokens_for_updates,
 )
 from flash.engine.worker.entry.sft import _model_arch_dims, sft_under_ran  # noqa: E402,F401
-from flash.engine.worker.io.heartbeat import liveness_heartbeat  # noqa: E402
+from flash.engine.worker.io.progress import observe_phase  # noqa: E402
 from flash.engine.worker.model.packing import model_is_gdn_hybrid  # noqa: E402
 from flash.engine.worker.runtime.rng import seed_training_rngs  # noqa: E402,F401
 from flash.engine.worker.train.entry.backend_common import (  # noqa: E402,F401
@@ -449,7 +449,7 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
     adapter_dir = outputs.adapter_dir
     train_wall = outputs.train_wall
     device_peak_gpu_gb = outputs.device_peak_gpu_gb
-    _worker_heartbeat.heartbeat(
+    _worker_progress.publish_progress(
         "sft_trained",
         train_wall=train_wall,
         step=verified.final_step,
@@ -527,7 +527,7 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
 def run_sft_train(spec=None) -> None:
     """run flash sft through verl's out-of-process fsdp trainer."""
     options = _resolve_sft_options(spec)
-    with liveness_heartbeat("sft_data_loading"):
+    with observe_phase("sft_data_loading"):
         data = _prepare_sft_data(options)
     model = _prepare_sft_model(options, data)
 
@@ -535,7 +535,7 @@ def run_sft_train(spec=None) -> None:
     # run has no prebuilt worker image, which is minutes of silence with no training step to report
     # and no liveness thread otherwise running here -- long enough for the stall watchdog to fail a
     # healthy run. no progress= : there is no monotonic counter to read, only the keepalive.
-    with liveness_heartbeat("sft_configuring"):
+    with observe_phase("sft_configuring"):
         python_bin = resolve_verl_python(
             options.paths.workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
         )
@@ -613,7 +613,7 @@ def run_sft_train(spec=None) -> None:
         if not _consume_sft_marker_line(child_progress, line):
             return
         # these metrics are currently floats, but use the shared parser to tolerate upstream metric
-        # wrapper changes and reject nan/inf before strict-json heartbeat serialization.
+        # wrapper changes and reject nan/inf before strict-json progress serialization.
         loss = parse_verl_metric(line, "train/loss")
         grad_norm = parse_verl_metric(line, "train/grad_norm")
         learning_rate_value = parse_verl_metric(line, "train/lr")
@@ -630,7 +630,7 @@ def run_sft_train(spec=None) -> None:
         # with a missing-save error. opd_train uses the same guard.
         training_completed = False
         try:
-            with liveness_heartbeat(
+            with observe_phase(
                 "sft_step",
                 progress=lambda: int(progress["step"] or 0),
                 progress_step=True,
@@ -645,7 +645,7 @@ def run_sft_train(spec=None) -> None:
     verified = _verify_sft_run(options, data, model, child_progress, child.resume_step)
     actor_dir = verified.actor_dir
     final_step = verified.final_step
-    with liveness_heartbeat(
+    with observe_phase(
         "sft_finalizing",
         progress=lambda: final_step,
         progress_step=True,

@@ -11,7 +11,7 @@ _RETAINED_DURATION_SAMPLES = 64
 
 @dataclass
 class StepTiming:
-    """Retain recent steady-state RL durations for heartbeat projections."""
+    """Retain recent steady-state RL durations for progress projections."""
 
     _warmup_seen: bool = False
     _durations: list[float] = field(default_factory=list)
@@ -25,7 +25,7 @@ class StepTiming:
             return
         self._durations = [*self._durations, duration][-_RETAINED_DURATION_SAMPLES:]
 
-    def heartbeat_fields(
+    def progress_fields(
         self,
         *,
         current_step: int,

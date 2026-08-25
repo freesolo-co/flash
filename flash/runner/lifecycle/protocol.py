@@ -249,9 +249,12 @@ class ResultManifest:
         _whole(self.fence, "fence", minimum=1)
         if self.outcome not in RESULT_OUTCOMES:
             raise ValueError("invalid result outcome")
-        if self.outcome == "succeeded":
+        if self.outcome in {"succeeded", "cancelled"}:
             if self.failure_class is not None:
-                raise ValueError("successful result cannot carry a failure class")
+                raise ValueError(f"{self.outcome} result cannot carry a failure class")
+        elif self.outcome == "deadline":
+            if self.failure_class != "deadline":
+                raise ValueError("deadline result requires the deadline failure class")
         elif self.failure_class not in FAILURE_CLASSES:
             raise ValueError("failed result requires a closed failure class")
         started = _finite(self.started_at, "started_at", positive=True)
@@ -269,10 +272,12 @@ class ResultManifest:
         ):
             if not isinstance(value, dict):
                 raise ValueError(f"{label} must be an object")
-        if self.source_attestation is not None and not isinstance(self.source_attestation, dict):
-            raise ValueError("source_attestation must be an object")
+        if not isinstance(self.source_attestation, dict) or not self.source_attestation:
+            raise ValueError("result requires source attestation")
         if self.outcome == "succeeded" and not self.metrics:
             raise ValueError("successful result requires final metrics")
+        if self.outcome == "succeeded" and not self.artifacts:
+            raise ValueError("successful result requires final artifacts")
         canonical_bytes(asdict(self))
 
     def to_dict(self) -> dict:

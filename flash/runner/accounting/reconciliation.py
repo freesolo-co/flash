@@ -7,7 +7,7 @@ import time
 
 from flash.core.spec import JobSpec
 from flash.runner.accounting import costs
-from flash.runner.lifecycle import attempts, reporting, state
+from flash.runner.lifecycle import reporting, state
 from flash.runner.lifecycle import status as status_ops
 from flash.runner.lifecycle.state import RunStatus
 
@@ -162,15 +162,13 @@ def _compare_and_complete_remote(
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
-    expected_attempt = (
-        expected_remote.get("attempt")
-        if isinstance(expected_remote, dict)
-        else attempts._latest_reserved_attempt(run_id)
-    )
+    expected_attempt = expected_remote.get("attempt") if isinstance(expected_remote, dict) else None
+    expected_fence = expected_remote.get("fence") if isinstance(expected_remote, dict) else None
     metrics, verified_attempt = status_ops.validate_terminal_source_metrics(
         status,
         metrics,
         expected_attempt=expected_attempt,
+        expected_fence=expected_fence,
     )
     if expected_remote is not None and not _record_cleanup_remote(run_id, expected_remote):
         return False

@@ -204,10 +204,10 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
 
     shared_hub = _hf()._shared_weight_cache_dir()
     t0 = time.time()
-    # Cold downloads can take tens of GB; liveness_heartbeat keeps the worker alive during the fetch.
-    from flash.engine.worker.io.heartbeat import liveness_heartbeat
+    # Cold downloads can take tens of GB; observe_phase keeps the worker alive during the fetch.
+    from flash.engine.worker.io.progress import observe_phase
 
-    with liveness_heartbeat(
+    with observe_phase(
         "model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub)
     ):
 
@@ -277,10 +277,10 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
                 # cache lookup may still succeed (warm cache), and prefetch is best-effort there.
                 print("prefetch_model warn:", e)
     secs = round(time.time() - t0, 1)
-    from flash.engine.worker.io.heartbeat import heartbeat
+    from flash.engine.worker.io.progress import publish_progress
     from flash.engine.worker.perf import gpu_diagnostics
 
-    heartbeat(
+    publish_progress(
         "model_prefetched",
         model=model_id,
         download_seconds=secs,

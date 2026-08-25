@@ -65,6 +65,7 @@ class InstanceProvider(abc.ABC):
         log: Any,
         on_handle: Any,
         attempt: int,
+        fence: int,
         runtime_secrets: dict[str, str] | None,
         source_snapshot: dict | None,
         deadline_at: float | None,
@@ -120,6 +121,7 @@ class InstanceProvider(abc.ABC):
         log: Any = None,
         on_handle: Any = None,
         attempt: int = 0,
+        fence: int = 1,
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
         source_snapshot: dict | None = None,
@@ -135,6 +137,7 @@ class InstanceProvider(abc.ABC):
             log=log,
             on_handle=on_handle,
             attempt=attempt,
+            fence=fence,
             runtime_secrets=runtime_secrets,
             source_snapshot=source_snapshot,
             deadline_at=_deadline_at,
@@ -152,10 +155,8 @@ class InstanceProvider(abc.ABC):
         import contextlib
 
         from flash.core.spec import require_matching_seed
-        from flash.providers.artifacts.hf import heartbeat_reader_for
 
         seed = require_matching_seed(spec, seed)
-        reader = heartbeat_reader_for(spec, deadline_at=_deadline_at)
         h = self._handle_cls.from_dict(handle.to_dict())
         if log is not None:
             print(f"attaching: {self.name} instance={h.instance_id}", file=log, flush=True)
@@ -165,7 +166,6 @@ class InstanceProvider(abc.ABC):
                 spec,
                 seed,
                 log=log,
-                heartbeat_reader=reader,
                 deadline_at=_deadline_at,
             )
         finally:

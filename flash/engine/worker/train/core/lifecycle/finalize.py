@@ -6,8 +6,9 @@ import json
 import os
 
 from flash.engine.result.accounting import RunMetrics, sanitize_worker_metrics
-from flash.engine.worker.io import heartbeat as heartbeat_io
 from flash.engine.worker.io import hf as hf_io
+from flash.engine.worker.io import progress as progress_io
+from flash.engine.worker.io import result as result_io
 from flash.engine.worker.perf import gpu_diagnostics
 from flash.engine.worker.runtime import state as worker_state
 
@@ -41,7 +42,7 @@ def write_train_meta(
     notes,
     *,
     step=None,
-    heartbeat_fields=None,
+    progress_fields=None,
 ):
     env = worker_state.require_active_env()
     meta = sanitize_worker_metrics(
@@ -59,23 +60,21 @@ def write_train_meta(
     with open("/tmp/train_meta.json", "w") as f:
         json.dump(meta, f)
     hf_io.hf_upload_file("/tmp/train_meta.json", "train_meta.json")
-    # Carry the completed optimizer ``step`` (when the caller supplies it) so this final pre-DONE
-    # heartbeat doesn't clobber the last stepped training ping with a stepless one -- a cancel
-    # between here and DONE would otherwise re-price a fully-trained run to 0 steps.
+    # carry the completed optimizer step into the final cumulative progress record.
     _step_field = {"step": int(step)} if isinstance(step, (int, float)) and step > 0 else {}
-    _heartbeat_fields = heartbeat_fields or {}
-    heartbeat_io.heartbeat(
+    _progress_fields = progress_fields or {}
+    progress_io.publish_progress(
         f"{phase}_train_done",
         **_step_field,
         **{k: meta[k] for k in ("train_wall", "train_tokens", "generated_tokens")},
-        **_heartbeat_fields,
+        **_progress_fields,
         gpu=gpu_diagnostics(),
     )
     m = RunMetrics(
         arm=os.environ.get("FLASH_ARM", "runpod"),
         phase=phase,
         # Completed optimizer updates (opd passes step=opt_steps; sft/rl omit it -> None). _finalize
-        # reads metrics.step to carry the true step onto the terminal `done` heartbeat.
+        # reads metrics.step to carry the true step onto the terminal `done` progress.
         step=step,
         seed=worker_state.SEED,
         model_id=model_id,
@@ -96,18 +95,27 @@ def write_train_meta(
             "job_spec": _train_meta_job_spec(),
         },
     )
-    _finalize(m, heartbeat_fields=_heartbeat_fields)
+    _finalize(m, progress_fields=_progress_fields)
 
 
-def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
-    import time
-
+def _finalize(metrics: RunMetrics, *, progress_fields=None):
     metrics.save("/tmp/metrics.json")
-    hf_io.hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
-    with open("/tmp/DONE", "w") as handle:
-        handle.write(str(time.time()))
-    hf_io.hf_upload_file("/tmp/DONE", "DONE", required=True)
     step = metrics.step
-    step_field = {"step": int(step)} if isinstance(step, (int, float)) and step > 0 else {}
-    heartbeat_io.heartbeat("done", **step_field, **(heartbeat_fields or {}), gpu=gpu_diagnostics())
-    print("NODE DONE:", metrics.to_json())
+    completed_steps = int(step) if isinstance(step, (int, float)) and step > 0 else 0
+    manifest = result_io.publish_result(
+        outcome="succeeded",
+        failure_class=None,
+        started_at=worker_state.WORKER_START_TIME,
+        training_entered=True,
+        completed_steps=completed_steps,
+        metrics=json.loads(metrics.to_json()),
+        checkpoint={"failure": (progress_fields or {}).get("checkpoint_failure")},
+        artifacts={"metrics": "embedded", "adapter": "published"},
+    )
+    progress_io.publish_progress(
+        "result_published",
+        step=completed_steps,
+        result_path=result_io.result_path(manifest),
+        gpu=gpu_diagnostics(),
+    )
+    print("NODE RESULT:", metrics.to_json())

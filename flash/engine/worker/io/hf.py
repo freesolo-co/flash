@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Callable
 
-import flash.engine.worker.io.heartbeat as _worker_heartbeat
+import flash.engine.worker.io.progress as _worker_progress
 import flash.engine.worker.runtime.state as _worker_state
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.artifacts import attempt_scoped_artifact_name, has_loadable_adapter_weights
@@ -171,19 +171,24 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> bool
     return False
 
 
-def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False) -> bool:
-    """Upload one file to the run's HF prefix. Returns True on success (see ``_hf_upload``)."""
+def hf_upload_absolute(local_path: str, path_in_repo: str, required: bool = False) -> bool:
+    """Upload one file to an exact repository path."""
     return _hf_upload(
         lambda: hf_api().upload_file(
             path_or_fileobj=local_path,
-            path_in_repo=f"{hf_prefix()}/{repo_subpath}",
+            path_in_repo=path_in_repo,
             repo_id=_worker_state.HF_REPO,
             repo_type="dataset",
         ),
-        repo_subpath,
+        path_in_repo,
         required,
-        "hf_upload_file",
+        "hf_upload_absolute",
     )
+
+
+def hf_upload_file(local_path: str, repo_subpath: str, required: bool = False) -> bool:
+    """Upload one file to the run's HF prefix. Returns True on success."""
+    return hf_upload_absolute(local_path, f"{hf_prefix()}/{repo_subpath}", required=required)
 
 
 _RESUME_CHECKPOINT_UPLOAD_LOCK = threading.Lock()
@@ -256,12 +261,12 @@ def hf_resume_checkpoint(
     try:
         from huggingface_hub import snapshot_download
 
-        from flash.engine.worker.io.heartbeat import liveness_heartbeat
+        from flash.engine.worker.io.progress import observe_phase
 
         # remove prior local materialization so pinned absence cannot reuse a stale checkpoint.
         shutil.rmtree(base, ignore_errors=True)
-        # resume checkpoints carry the full optimizer state (multi-gb); keep the heartbeat fresh.
-        with liveness_heartbeat("checkpoint_prefetching"):
+        # resume checkpoints carry the full optimizer state (multi-gb); keep the progress fresh.
+        with observe_phase("checkpoint_prefetching"):
             _require_hf_deadline_allowance()
             snapshot_download(
                 repo_id=_worker_state.HF_REPO,
@@ -351,7 +356,7 @@ def publish_deployable_checkpoint(
     backoff_s: float = 0.0,
     required: bool = False,
     _provenance_ready: bool = False,
-    _emit_heartbeat: bool = True,
+    _emit_progress: bool = True,
 ) -> str | None:
     """Mirror a verl checkpoint's LoRA adapter to a stable per-step path.
 
@@ -384,8 +389,8 @@ def publish_deployable_checkpoint(
                 repo_type="dataset",
                 ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
             )
-            if _emit_heartbeat:
-                _worker_heartbeat.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
+            if _emit_progress:
+                _worker_progress.publish_progress("checkpoint_deployable", step=step, subfolder=subfolder)
             return subfolder
         except Exception as e:
             last_error = e
@@ -480,14 +485,14 @@ def upload_resume_checkpoint(
     before_upload=None,
     after_upload=None,
     skip_upload=None,
-    emit_heartbeat: bool = True,
+    emit_progress: bool = True,
     lock_timeout_s: float | None = None,
 ) -> bool:
     """synchronously stream one full-state resume checkpoint and ordered companion artifacts."""
     if not _worker_state.HF_REPO:
         return True
 
-    from flash.engine.worker.io.heartbeat import liveness_heartbeat
+    from flash.engine.worker.io.progress import observe_phase
 
     before_completed = before_upload is None
     resume_completed = False
@@ -498,14 +503,14 @@ def upload_resume_checkpoint(
             return False
         if skip_upload is not None and skip_upload():
             return True
-        heartbeat_context = (
-            liveness_heartbeat(
+        progress_context = (
+            observe_phase(
                 "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
             )
-            if emit_heartbeat
+            if emit_progress
             else contextlib.nullcontext()
         )
-        with heartbeat_context:
+        with progress_context:
             for attempt in range(_CKPT_UPLOAD_RETRIES):
                 failure_stage = "resume"
                 try:
@@ -530,9 +535,9 @@ def upload_resume_checkpoint(
                         failure_stage = "after"
                         after_upload()
                         after_completed = True
-                    if emit_heartbeat:
-                        failure_stage = "heartbeat"
-                        _worker_heartbeat.heartbeat("checkpoint_uploaded", step=step)
+                    if emit_progress:
+                        failure_stage = "progress"
+                        _worker_progress.publish_progress("checkpoint_uploaded", step=step)
                     return True
                 except RequiredSaveError:
                     raise
@@ -552,11 +557,11 @@ def upload_resume_checkpoint(
                             f"[ckpt] step {step} upload FAILED after "
                             f"{_CKPT_UPLOAD_RETRIES} attempts: {e}"
                         )
-                        if emit_heartbeat:
+                        if emit_progress:
                             with contextlib.suppress(Exception):
                                 # worker stdout is not part of control-plane run logs, so the stage
                                 # name alone would otherwise be the entire failure report.
-                                _worker_heartbeat.heartbeat(
+                                _worker_progress.publish_progress(
                                     "checkpoint_upload_failed",
                                     step=step,
                                     checkpoint_failure={

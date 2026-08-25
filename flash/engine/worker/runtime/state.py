@@ -24,19 +24,23 @@ def _resolve_worker_seed(job_spec, env_seed: str | None) -> int:
     return seed if 0 <= seed <= 2**63 - 1 else FIXED_SEED
 
 
-def _parse_attempt_env() -> int:
-    raw = os.environ.get("ATTEMPT")
+def _parse_identity_env(name: str, *, default: int) -> int:
+    raw = os.environ.get(name)
     if raw is None:
-        return 0
+        return default
     if not raw or any(char < "0" or char > "9" for char in raw):
-        raise RuntimeError("managed worker ATTEMPT must be an unsigned decimal integer")
-    return int(raw)
+        raise RuntimeError(f"managed worker {name} must be an unsigned decimal integer")
+    value = int(raw)
+    if name == "FENCE" and value < 1:
+        raise RuntimeError("managed worker FENCE must be positive")
+    return value
 
 
 HF_REPO = os.environ.get("HF_REPO", "")
 RUN_ID = os.environ.get("RUN_ID", "local")
 RUN_MODE = os.environ.get("RUN_MODE", "sft")
-ATTEMPT = _parse_attempt_env()
+ATTEMPT = _parse_identity_env("ATTEMPT", default=0)
+FENCE = _parse_identity_env("FENCE", default=1)
 # captured at import, which is before this attempt can have started ray. any ray session older than
 # this belongs to a PREVIOUS attempt on the same reused pod (/tmp survives a retry), and reporting
 # one as this attempt's evidence would send the next diagnosis after a failure that never happened.

@@ -24,7 +24,7 @@ _DESCRIPTOR_FIELDS = frozenset(
     {"kind", "format_version", "archive_path", "sha256", "size", "revision"}
 )
 _ATTESTATION_FIELDS = frozenset(
-    {"kind", "format_version", "sha256", "revision", "run_id", "attempt"}
+    {"kind", "format_version", "sha256", "revision", "run_id", "attempt", "fence"}
 )
 _SHA256_ALPHABET = frozenset("0123456789abcdef")
 _FIXED_DATE_TIME = (1980, 1, 1, 0, 0, 0)
@@ -205,12 +205,15 @@ def source_attestation(
     *,
     run_id: str,
     attempt: int,
+    fence: int,
 ) -> dict:
     parsed = parse_descriptor(descriptor)
     if not isinstance(run_id, str) or not run_id:
         raise SourceSnapshotError("source attestation run_id is invalid")
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise SourceSnapshotError("source attestation attempt is invalid")
+    if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
+        raise SourceSnapshotError("source attestation fence is invalid")
     return {
         "kind": ATTESTATION_KIND,
         "format_version": ATTESTATION_FORMAT_VERSION,
@@ -218,6 +221,7 @@ def source_attestation(
         "revision": parsed.revision,
         "run_id": run_id,
         "attempt": attempt,
+        "fence": fence,
     }
 
 
@@ -233,6 +237,9 @@ def parse_attestation(raw: object) -> dict:
     attempt = raw["attempt"]
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise SourceSnapshotError("source attestation attempt is invalid")
+    fence = raw["fence"]
+    if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
+        raise SourceSnapshotError("source attestation fence is invalid")
     return dict(raw)
 
 
@@ -242,9 +249,10 @@ def validate_attestation(
     *,
     run_id: str,
     attempt: int,
+    fence: int,
 ) -> dict:
     attestation = parse_attestation(raw)
-    expected = source_attestation(descriptor, run_id=run_id, attempt=attempt)
+    expected = source_attestation(descriptor, run_id=run_id, attempt=attempt, fence=fence)
     if attestation != expected:
         raise SourceSnapshotError("terminal source attestation does not match the managed attempt")
     return attestation

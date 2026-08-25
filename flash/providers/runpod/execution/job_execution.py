@@ -25,10 +25,6 @@ from flash.providers._lifecycle.net.deadline import (
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers.artifacts.hf import (
-    make_hf_failure_detail_reader,
-    make_hf_heartbeat_reader,
-)
 from flash.providers.core.base import PollResult, UnreconciledCreateError, canonical_gpu
 from flash.providers.runpod.client import api as runpod_api
 from flash.providers.runpod.client.gpus import flash_gpu
@@ -36,7 +32,7 @@ from flash.providers.runpod.execution import polling as runpod_polling
 from flash.providers.runpod.execution import resources as runpod_resources
 from flash.providers.runpod.execution.jobs import (
     JobHandle,
-    stall_kwargs,
+    capacity_wait_kwargs,
 )
 from flash.providers.runpod.execution.resources import WEIGHT_CACHE_GROW_BUDGET_S
 
@@ -62,6 +58,7 @@ def submit_run(
     log=None,
     on_handle=None,
     attempt: int = 0,
+    fence: int = 1,
     runtime_secrets: dict[str, str] | None = None,
     on_last_gpu: bool = False,
     *,
@@ -89,7 +86,10 @@ def submit_run(
         seed,
         runtime_secrets=runtime_secrets,
     )
+    if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
+        raise ValueError("RunPod fence identity is invalid")
     worker_env["ATTEMPT"] = str(attempt_id)
+    worker_env["FENCE"] = str(fence)
     endpoint_id, name, key_fingerprint = deploy_train_endpoint(
         spec.gpu.type,
         execution_timeout_ms=timeout_s * 1000,
@@ -98,17 +98,26 @@ def submit_run(
         spec=spec,
         **deadline_kwargs(deploy_train_endpoint, deadline_at),
     )
+    from flash.runner.lifecycle.protocol import AttemptRecord
+    from flash.runner.lifecycle.status import get_status
+
+    attempt_record = AttemptRecord.from_dict(get_status(spec.run_id).attempt)
+    if attempt_record.attempt_id != attempt_id or attempt_record.fence != fence:
+        raise RuntimeError("RunPod payload does not match the current fenced attempt")
     payload = {
         "hf_repo": spec.train.hf_repo,
         "job_spec_json": spec.to_json(),
         "phase": spec.phase,
         "run_id": spec.run_id,
         "attempt": attempt_id,
+        "fence": fence,
         "seed": spec.seed,
         "env": worker_env,
         "extra_pip": extra_pip,
         "source_snapshot": source_descriptor.to_dict(),
         "deadline_at": deadline_at,
+        "work_deadline_at": attempt_record.work_deadline_at,
+        "result_deadline_at": attempt_record.result_deadline_at,
     }
     try:
         require_create_allowance(deadline_at)
@@ -137,6 +146,7 @@ def submit_run(
                     key_fingerprint,
                     None,
                     attempt_id,
+                    fence,
                     time.time(),
                 ).to_dict()
             )
@@ -149,6 +159,7 @@ def submit_run(
         key_fingerprint,
         job_id,
         attempt_id,
+        fence,
         submitted_ts,
     )
     if log is not None:
@@ -160,39 +171,15 @@ def submit_run(
         )
     if on_handle is not None:
         on_handle(handle.to_dict())
-    hf_repo = spec.train.hf_repo
-    prefix = f"{spec.phase}/{spec.run_id}"
-    reader = (
-        make_hf_heartbeat_reader(
-            hf_repo,
-            prefix,
-            **deadline_kwargs(make_hf_heartbeat_reader, deadline_at),
-        )
-        if hf_repo
-        else None
-    )
-    failure_reader = (
-        make_hf_failure_detail_reader(
-            hf_repo,
-            prefix,
-            spec.phase,
-            attempt=attempt_id,
-            **deadline_kwargs(make_hf_failure_detail_reader, deadline_at),
-        )
-        if hf_repo
-        else None
-    )
     return runpod_polling.poll_job(
         handle,
+        spec,
         log=log,
-        heartbeat_reader=reader,
-        failure_detail_reader=failure_reader,
-        current_attempt=attempt_id,
         **deadline_kwargs(runpod_polling.poll_job, deadline_at),
         on_last_gpu=on_last_gpu,
         # the count actually rented for this attempt, which allocation may have resolved to fewer
         # cards than the spec's ceiling named -- so read the effective spec, not the run's request.
-        **stall_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
+        **capacity_wait_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
     )
 
 

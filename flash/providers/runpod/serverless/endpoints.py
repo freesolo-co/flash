@@ -259,7 +259,7 @@ def _train_body(input_data: dict) -> dict:
             "hf_home": os.environ.get("HF_HOME"),
         }
 
-    raw_deadline = input_data.get("deadline_at")
+    raw_deadline = input_data.get("work_deadline_at")
     if isinstance(raw_deadline, bool) or not isinstance(raw_deadline, (int, float)):
         raise RuntimeError("run wall deadline is invalid")
     deadline_at = float(raw_deadline)
@@ -280,8 +280,14 @@ def _train_body(input_data: dict) -> dict:
     except TimeoutError:
         raise RuntimeError("run wall deadline exceeded before bootstrap") from None
 
+    deadline_termination = {"callback": None}
+
     def _deadline_exit() -> None:
         print("run wall deadline exceeded; terminating worker", flush=True)
+        callback = deadline_termination["callback"]
+        if callback is not None:
+            callback()
+            return
         os._exit(124)
 
     deadline_timer = threading.Timer(remaining, _deadline_exit)
@@ -544,6 +550,11 @@ def _train_body(input_data: dict) -> dict:
             "flash/providers/_lifecycle/bootstrapping/console.py",
             "_flash_downloaded_bootstrap_console",
         )
+        process_module = _load_exact_module(
+            code_dir,
+            "flash/providers/_lifecycle/bootstrapping/processes.py",
+            "_flash_downloaded_bootstrap_processes",
+        )
         artifact_module = _load_exact_module(
             code_dir,
             "flash/adapters/artifacts.py",
@@ -567,6 +578,10 @@ def _train_body(input_data: dict) -> dict:
         env["PHASE"] = input_data["phase"]
         env["SEED"] = str(input_data["seed"])
         env["ATTEMPT"] = str(input_data["attempt"])
+        env["FENCE"] = str(input_data["fence"])
+        env["FLASH_SOURCE_SNAPSHOT_JSON"] = json.dumps(
+            input_data["source_snapshot"], sort_keys=True
+        )
         env["PYTHONPATH"] = code_dir + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
@@ -650,6 +665,36 @@ def _train_body(input_data: dict) -> dict:
                 print("console upload warn:", _safe_detail(e, env))
                 return False
 
+        def _publish_deadline_result(started_at: float) -> None:
+            raw_result_deadline = input_data.get("result_deadline_at")
+            if isinstance(raw_result_deadline, bool) or not isinstance(
+                raw_result_deadline, (int, float)
+            ):
+                raise RuntimeError("result visibility deadline is invalid")
+            result_deadline = float(raw_result_deadline)
+            remaining = result_deadline - time.time()
+            if not math.isfinite(remaining) or remaining <= 0:
+                raise TimeoutError("result visibility deadline expired before publication")
+            command = (
+                "from flash.engine.worker.io.result import publish_deadline_result; "
+                f"publish_deadline_result(started_at={started_at!r})"
+            )
+            result_process, result_group = process_module.start_process_group(
+                [sys.executable, "-c", command],
+                cwd=code_dir,
+                env={**env, "FLASH_RUN_DEADLINE_AT": str(result_deadline)},
+            )
+            try:
+                result_process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                process_module.terminate_process_group(
+                    result_process,
+                    process_group_id=result_group,
+                )
+                raise TimeoutError("deadline result publication exceeded its window") from None
+            if result_process.returncode != 0:
+                raise RuntimeError("deadline result publication failed")
+
         def run_mode(mode: str, check: bool) -> int:
             """run the worker, stream its console, and upload live and terminal tails."""
             console = f"/tmp/console_{mode}.txt"
@@ -660,7 +705,8 @@ def _train_body(input_data: dict) -> dict:
 
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
-                proc = subprocess.Popen(
+                worker_started_at = time.time()
+                proc, process_group_id = process_module.start_process_group(
                     [sys.executable, "-m", "flash.engine.support.worker_entrypoint"],
                     cwd=code_dir,
                     env={**env, "RUN_MODE": mode},
@@ -669,6 +715,17 @@ def _train_body(input_data: dict) -> dict:
                     text=True,
                     errors="replace",
                 )
+                deadline_fired = threading.Event()
+
+                def _stop_at_deadline() -> None:
+                    deadline_fired.set()
+                    if proc.poll() is None:
+                        process_module.terminate_process_group(
+                            proc,
+                            process_group_id=process_group_id,
+                        )
+
+                deadline_termination["callback"] = _stop_at_deadline
                 uploader = threading.Thread(
                     target=console_module._run_console_upload_loop,
                     args=(console, 3600.0, stop_upload),
@@ -686,9 +743,13 @@ def _train_body(input_data: dict) -> dict:
                         cf.write(line)
                     proc.wait()
                 finally:
+                    deadline_termination["callback"] = None
                     stop_upload.set()
                     uploader.join(timeout=10)
             _upload_console(mode, final=True)
+            if deadline_fired.is_set():
+                _publish_deadline_result(worker_started_at)
+                raise TimeoutError("fixed work deadline expired")
             if proc.returncode != 0 and check:
                 raise RuntimeError(
                     f"worker mode '{mode}' exited {proc.returncode}; see console_{mode}.txt "
@@ -696,29 +757,14 @@ def _train_body(input_data: dict) -> dict:
                 )
             return proc.returncode
 
-        # Clear stale metrics from a previous seed so a crash can't report wrong numbers.
-        for stale in ("/tmp/train_meta.json", "/tmp/metrics.json"):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(stale)
-        # check=False: RL's colocated vLLM can segfault at interpreter exit after saving — not a failure.
+        # check=false preserves the known colocated vllm interpreter-exit behavior. the immutable
+        # result manifest, not the provider response, is the worker terminal authority.
         run_mode(input_data["phase"], check=False)
-        if not os.path.exists("/tmp/metrics.json"):
-            phase = input_data["phase"]
-            raise RuntimeError(
-                f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
-                f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
-                f"dataset repo for the full traceback"
-            )
-        with open("/tmp/metrics.json") as f:
-            metrics = json.load(f)
-        if not isinstance(metrics, dict):
-            raise RuntimeError("train metrics are invalid")
-        metrics[_source_snapshot.TERMINAL_ATTESTATION_KEY] = _source_snapshot.source_attestation(
-            descriptor,
-            run_id=input_data["run_id"],
-            attempt=input_data["attempt"],
-        )
-        return metrics
+        return {
+            "attempt": input_data["attempt"],
+            "fence": input_data["fence"],
+            "result_transport": "hf",
+        }
     finally:
         deadline_timer.cancel()
 

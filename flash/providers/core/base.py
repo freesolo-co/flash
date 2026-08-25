@@ -892,6 +892,7 @@ class Provider(Protocol):
         log: Any = None,
         on_handle: Any = None,
         attempt: int = 0,
+        fence: int = 1,
         runtime_secrets: dict[str, str] | None = None,
         on_last_gpu: bool = False,
         source_snapshot: dict | None = None,

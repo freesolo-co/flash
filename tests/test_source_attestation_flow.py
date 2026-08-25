@@ -19,7 +19,7 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
-def _status(*, attempt: int = 2, source_snapshot: dict | None = SOURCE_SNAPSHOT):
+def _status(*, attempt: int = 2, fence: int = 9, source_snapshot: dict | None = SOURCE_SNAPSHOT):
     from flash.runner.lifecycle.state import RunStatus
 
     return RunStatus(
@@ -27,17 +27,36 @@ def _status(*, attempt: int = 2, source_snapshot: dict | None = SOURCE_SNAPSHOT)
         state="running",
         spec={},
         source_snapshot=source_snapshot,
-        remote={"attempt": attempt},
+        remote={"attempt": attempt, "fence": fence},
+        attempt={
+            "attempt_id": attempt,
+            "fence": fence,
+            "state": "active",
+            "reserved_at": 1.0,
+            "grant_deadline_at": 2.0,
+            "work_deadline_at": 3.0,
+            "result_deadline_at": 5.0,
+            "run_deadline_at": 4.0,
+            "provider": None,
+            "provider_contract": None,
+            "resource": None,
+            "allocation": None,
+            "progress_receipt": None,
+            "result_receipt": None,
+            "cleanup": {},
+            "schema_version": 1,
+        },
     )
 
 
-def _metrics(*, attempt: int = 2, descriptor: dict = SOURCE_SNAPSHOT) -> dict:
+def _metrics(*, attempt: int = 2, fence: int = 9, descriptor: dict = SOURCE_SNAPSHOT) -> dict:
     return {
         "wall_seconds": 1.0,
         TERMINAL_ATTESTATION_KEY: source_attestation(
             descriptor,
             run_id="run-1",
             attempt=attempt,
+            fence=fence,
         ),
     }
 
@@ -90,8 +109,9 @@ def test_descriptorless_attempt_stays_unverified_even_with_forged_evidence() -> 
 def test_public_status_exposes_only_safe_source_projection() -> None:
     status = _status()
     status.source_verified_attempt = 2
-    status.last_heartbeat = {
-        "stage": "sft_step",
+    status.progress = {
+        "attempt_id": 2,
+        "fence": 9,
         PUBLIC_PROVENANCE_KEY: {
             "sha256": SOURCE_SNAPSHOT["sha256"],
             "verified": True,
@@ -101,8 +121,8 @@ def test_public_status_exposes_only_safe_source_projection() -> None:
     public = status.to_dict()
     assert public[PUBLIC_PROVENANCE_KEY]["sha256"] == SOURCE_SNAPSHOT["sha256"]
     assert public[PUBLIC_PROVENANCE_KEY]["verified_attempt"] == 2
-    assert PUBLIC_PROVENANCE_KEY not in public["last_heartbeat"]
-    assert status.last_heartbeat[PUBLIC_PROVENANCE_KEY]["verified_attempt"] == 99
+    assert PUBLIC_PROVENANCE_KEY not in public["progress"]
+    assert status.progress[PUBLIC_PROVENANCE_KEY]["verified_attempt"] == 99
     rendered = repr(public)
     assert SOURCE_SNAPSHOT["archive_path"] not in rendered
     assert SOURCE_SNAPSHOT["revision"] not in rendered
@@ -128,6 +148,7 @@ def test_recovery_completion_requires_attestation_before_done(monkeypatch, tmp_p
         state="running",
         spec=spec.to_dict(),
         source_snapshot=SOURCE_SNAPSHOT,
+        attempt=_status().attempt,
     )
     runner_state._save_status(status, _next_attempt=3)
     monkeypatch.setattr(runner_status, "_persist_metrics", lambda _spec, _metrics: 1.0)

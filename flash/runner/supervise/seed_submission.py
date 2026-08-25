@@ -36,6 +36,7 @@ class _SubmitContext:
     # persisted into the run handle so attach_run recovery polls with the same stall tuning.
     current_on_last_gpu: bool = False
     current_attempt: int = 0
+    current_fence: int = 0
     # tracks complete rN-suffixed retry handles that registry-less gc cannot reconstruct by name.
     seen_endpoints: dict[str, dict] = field(default_factory=dict)
     submission_lock: object | None = None
@@ -54,7 +55,7 @@ class _SubmitContext:
 
     def on_handle(self, handle: dict) -> None:
         from flash.runner.accounting.reconciliation import _preserve_cleanup_remote
-        from flash.runner.lifecycle.status import _update
+        from flash.runner.lifecycle.status import record_attempt_handle
         from flash.runner.supervise.errors import _TerminalHandleRace
 
         try:
@@ -67,6 +68,8 @@ class _SubmitContext:
                 raise RuntimeError("provider handle identity does not match the selected provider")
             if canonical_handle["attempt"] != self.current_attempt:
                 raise RuntimeError("provider handle attempt does not match the reserved attempt")
+            if canonical_handle["fence"] != self.current_fence:
+                raise RuntimeError("provider handle fence does not match the reserved attempt")
             self.last_handle.clear()
             self.last_handle.update(canonical_handle)
             if canonical_handle.get("endpoint_id"):
@@ -82,7 +85,12 @@ class _SubmitContext:
                 "allocated_gpu_count": self.current_gpu.get("count"),
                 "on_last_gpu": bool(self.current_on_last_gpu),
             }
-            if _update(self.spec.run_id, "running", remote=persisted_handle):
+            if record_attempt_handle(
+                self.spec.run_id,
+                persisted_handle,
+                attempt_id=self.current_attempt,
+                fence=self.current_fence,
+            ):
                 return
             resource_deleted = False
             with contextlib.suppress(Exception):
@@ -152,6 +160,7 @@ class _SubmitContext:
 class _PreparedAttempt:
     local_attempt: int
     attempt: int
+    fence: int
     attempt_spec: JobSpec
     runtime_secrets: dict[str, str]
     # the rank count a pinned opd resume checkpoint was written at, or None when this attempt
@@ -351,7 +360,7 @@ def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
 
 
 def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOutcome:
-    from flash.runner.lifecycle.attempts import _reserve_attempt, _verified_opd_retry_state
+    from flash.runner.lifecycle.attempts import _reserve_attempt_record, _verified_opd_retry_state
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
 
     attempt = ctx.attempt_start + local_attempt
@@ -371,11 +380,12 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
         )
     else:
         expected_next_attempt, opd_resume_revision, resume_world_size = None, None, None
-    attempt = _reserve_attempt(
+    attempt_record = _reserve_attempt_record(
         ctx.spec.run_id,
         minimum_attempt=ctx.attempt_start if local_attempt == 0 else 0,
         expected_next_attempt=expected_next_attempt,
     )
+    attempt = attempt_record.attempt_id
     ctx.current_attempt = attempt
     _mark_attempt_boundary(ctx, attempt)
     attempt_runtime_secrets = dict(ctx.runtime_secrets or {})
@@ -386,6 +396,7 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
         prepared=_PreparedAttempt(
             local_attempt,
             attempt,
+            attempt_record.fence,
             attempt_spec,
             attempt_runtime_secrets,
             # only a pinned resume constrains the shape; without one the retry re-ranks freely.
@@ -589,6 +600,7 @@ def _build_candidate_plan(
         count=int(getattr(chosen, "gpu_count", 1) or 1),
     )
     ctx.current_attempt = prepared.attempt
+    ctx.current_fence = prepared.fence
     return _CandidatePlan(allocation, candidates, chosen, on_last_gpu, effective_spec, run_spec)
 
 
@@ -628,6 +640,7 @@ def _submit_provider(
                 "log": ctx.log,
                 "on_handle": ctx.on_handle,
                 "attempt": prepared.attempt,
+                "fence": prepared.fence,
                 "on_last_gpu": plan.on_last_gpu,
                 "source_snapshot": ctx.source_snapshot,
                 # bounded, not the raw run deadline: while a profile is unarmed the

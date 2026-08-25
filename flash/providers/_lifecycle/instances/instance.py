@@ -92,6 +92,7 @@ class InstanceJobHandle:
     gpu: str
     hourly_usd: float
     attempt: int
+    fence: int
     started_ts: float
 
     provider: ClassVar[str] = "instance"
@@ -118,6 +119,7 @@ class InstanceJobHandle:
             "gpu": self.gpu,
             "hourly_usd": self.hourly_usd,
             "attempt": self.attempt,
+            "fence": self.fence,
             "started_ts": self.started_ts,
         }
 
@@ -132,6 +134,9 @@ class InstanceJobHandle:
         attempt = _attempt_int(d.get("attempt"))
         if attempt is None:
             raise ValueError(f"persisted {cls.provider} attempt identity is invalid")
+        fence = d.get("fence")
+        if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
+            raise ValueError(f"persisted {cls.provider} fence identity is invalid")
         started_raw = d.get("started_ts")
         if isinstance(started_raw, bool) or not isinstance(started_raw, (int, float)):
             raise ValueError(f"persisted {cls.provider} launch timestamp is invalid")
@@ -152,6 +157,7 @@ class InstanceJobHandle:
             gpu=gpu,
             hourly_usd=hourly_usd,
             attempt=attempt,
+            fence=fence,
             started_ts=started_ts,
             **cls._extra_from_dict(d),
         )
@@ -185,6 +191,7 @@ def build_payload(
     spec,
     seed: int,
     attempt: int,
+    fence: int,
     *,
     arm: str,
     runtime_secrets: dict | None = None,
@@ -220,6 +227,14 @@ def build_payload(
     attempt_id = _attempt_int(attempt)
     if attempt_id is None:
         raise ValueError("instance attempt identity is invalid")
+    if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
+        raise ValueError("instance fence identity is invalid")
+    from flash.runner.lifecycle.protocol import AttemptRecord
+    from flash.runner.lifecycle.status import get_status
+
+    attempt_record = AttemptRecord.from_dict(get_status(spec.run_id).attempt)
+    if attempt_record.attempt_id != attempt_id or attempt_record.fence != fence:
+        raise RuntimeError("instance payload does not match the current fenced attempt")
     max_wall_seconds = float(spec.gpu.max_wall_seconds)
     payload = {
         "hf_repo": spec.train.hf_repo,
@@ -234,9 +249,12 @@ def build_payload(
         "extra_pip": worker_pip_with_extras(spec.environment.id, spec.environment.pip),
         "hf_prefix": f"{spec.phase}/{spec.run_id}",
         "deadline_at": absolute_deadline,
+        "work_deadline_at": attempt_record.work_deadline_at,
+        "result_deadline_at": attempt_record.result_deadline_at,
         "run_created_at": absolute_deadline - max_wall_seconds,
         "run_max_wall_seconds": max_wall_seconds,
         "attempt": attempt_id,
+        "fence": fence,
     }
     if mode != "preload":
         payload["source_snapshot"] = parse_descriptor(source_snapshot).to_dict()

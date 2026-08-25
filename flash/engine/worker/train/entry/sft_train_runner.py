@@ -14,8 +14,8 @@ from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
-import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.io.progress as _worker_progress
 import flash.engine.worker.io.wandb_log as _worker_wandb
 import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.perf as _worker_perf
@@ -40,7 +40,7 @@ _VERL_OPTIMIZER_NAME = _sft_train._VERL_OPTIMIZER_NAME
 build_sft_overrides = _sft_train.build_sft_overrides
 # taken from the parent like every other name here, so the runner and `sft_train`'s own
 # `sft_data_loading`/`sft_configuring` wraps use one object rather than two imports of it.
-liveness_heartbeat = _sft_train.liveness_heartbeat
+observe_phase = _sft_train.observe_phase
 render_sitecustomize_bootstrap = _sft_train.render_sitecustomize_bootstrap
 shim_marker_file = _sft_train.shim_marker_file
 verify_applied_shim_markers = _sft_train.verify_applied_shim_markers
@@ -179,7 +179,7 @@ def _resolve_sft_options(spec) -> _SftOptions:
     # targets for any env whose row construction uses python/numpy randomness.
     _sft_train.seed_training_rngs(_worker_state.SEED)
     started_at = time.time()
-    _worker_heartbeat.heartbeat("sft_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False))
+    _worker_progress.publish_progress("sft_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False))
     gpu_probe = _sft_train._probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
@@ -343,7 +343,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
 
     download_seconds = _worker_hf.prefetch_model(options.model_id, revision=options.model_revision)
     setup_seconds = time.time() - options.started_at
-    _worker_heartbeat.heartbeat(
+    _worker_progress.publish_progress(
         "sft_model_load",
         setup_seconds=setup_seconds,
         gpu=_worker_perf.gpu_diagnostics(include_torch=False),
@@ -353,7 +353,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     # one-shot above, so `runs status` freezes on sft_model_load for the whole span and a healthy
     # cold cache is indistinguishable from a dead worker -- the exact ambiguity the stage was added
     # to resolve. same stage name, so the provider's setup-grace classification is unchanged.
-    with liveness_heartbeat("sft_model_load"):
+    with observe_phase("sft_model_load"):
         lora_config = _worker_adapter.make_lora(options.model_id)
         targeting = resolve_lora_targeting(
             options.model_id, algorithm="sft", multimodal=data.multimodal
@@ -807,13 +807,8 @@ class _SftProgressCallbacks:
             "grad_norm": self.progress.values["grad_norm"],
             "learning_rate": self.progress.values["lr"],
         }
-        _worker_heartbeat.heartbeat(
+        _worker_progress.publish_progress(
             "sft_step", **{key: value for key, value in payload.items() if value is not None}
-        )
-
-    def child_heartbeat(self) -> None:
-        _worker_heartbeat.heartbeat(
-            "sft_step", liveness=True, step=int(self.progress.values["step"] or 0)
         )
 
 
@@ -823,7 +818,6 @@ def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_lin
         env=child.child_env,
         on_step=callbacks.on_step,
         on_line=on_line,
-        heartbeat=callbacks.child_heartbeat,
     )
 
 
