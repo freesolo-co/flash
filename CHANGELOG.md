@@ -69,6 +69,8 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- Qwen3.6 FP8 MoE serving now preserves unquantized activations for LoRA A while keeping the base
+  MoE path quantized, backporting the exact vLLM PR #42120 behavior into the pinned 0.23.0 image.
 - Completed verl children now finish each captured W&B run before the W&B service shuts down,
   avoiding teardown tracebacks, and `flash env setup` now gives every starter config explicit W&B
   project and folder-derived run metadata.

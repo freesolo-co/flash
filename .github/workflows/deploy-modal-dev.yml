@@ -86,7 +86,8 @@ jobs:
             deploy=true
           elif ! changed="$(git diff --name-only "$last_deployed_sha" "$CURRENT_SHA" 2>/dev/null)"; then
             deploy=true
-          elif grep -qE '^(flash/|pyproject\.toml$|uv\.lock$|\.github/workflows/deploy-modal-dev\.yml$)' <<<"$changed"; then
+          # the build-time vllm repair lives outside flash/, so name its exact image input path.
+          elif grep -qE '^(flash/|docker/patch_vllm_moe_lora\.py$|pyproject\.toml$|uv\.lock$|\.github/workflows/deploy-modal-dev\.yml$)' <<<"$changed"; then
             deploy=true
           fi
           echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
