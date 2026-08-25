@@ -383,7 +383,7 @@ def test_chat_template_kwargs_forwarded_on_openai_chat(app_setup):
         },
     )
     assert resp.status_code == 200
-    assert pool.template_kwargs[-1] == {"enable_thinking": False}
+    assert pool.template_kwargs[-1] == {"enable_thinking": True}
 
 
 def test_generate_without_chat_template_kwargs_is_none(app_setup):
@@ -402,9 +402,95 @@ def test_generate_without_chat_template_kwargs_is_none(app_setup):
 _PERSON_SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}
 
 
-def test_chat_uses_our_structured_outputs_extension(app_setup):
-    """The chat endpoint honours our structured_outputs/structured_outputs extension; any vLLM
-    guided_* field alongside it is ignored (guided_* is no longer accepted)."""
+def test_thinking_logprobs_policy_runs_after_adapter_resolution(app_setup):
+    client, pool, _ = app_setup
+    context = client.app.state.serving_context
+    original_resolve = context.lookup.resolve
+    resolved = []
+
+    async def tracked_resolve(adapter_id):
+        result = await original_resolve(adapter_id)
+        resolved.append(result[1].adapter_id)
+        return result
+
+    context.lookup.resolve = tracked_resolve
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "qa",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": True,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "thinking-enabled" in response.json()["detail"]
+    assert resolved == [_revision_id("qa")]
+    assert pool.generated == []
+
+
+def test_base_model_false_thinking_override_allows_logprobs() -> None:
+    record = AdapterRecord(
+        adapter_id=QWEN,
+        repo_id=QWEN,
+        base_model=QWEN,
+        serve_base_model=True,
+        thinking=True,
+        status="ready",
+    )
+    pool = FakePool()
+    client = _serve(pool, AdapterRouter([record]))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": QWEN,
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": True,
+            "top_logprobs": 1,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert pool.template_kwargs[-1]["enable_thinking"] is False
+
+
+def test_immutable_adapter_ignores_false_thinking_override_for_logprobs(app_setup):
+    client, pool, _ = app_setup
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "qa",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+
+    assert response.status_code == 422
+    assert "thinking-enabled" in response.json()["detail"]
+    assert pool.generated == []
+
+
+def test_unknown_adapter_does_not_reveal_thinking_logprobs_policy(app_setup):
+    client, pool, _ = app_setup
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "missing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": True,
+        },
+    )
+
+    assert response.status_code == 404
+    assert "thinking" not in response.text.lower()
+    assert pool.generated == []
+
+
+def test_chat_rejects_unrelated_vllm_extensions(app_setup):
+    """The canonical OpenAI grammar rejects unrelated vLLM extension fields."""
     client, pool, _ = app_setup
     resp = client.post(
         "/v1/chat/completions",
@@ -415,8 +501,8 @@ def test_chat_uses_our_structured_outputs_extension(app_setup):
             "guided_regex": r"\d+",
         },
     )
-    assert resp.status_code == 200
-    assert pool.structured[-1] == {"choice": ["a", "b"]}
+    assert resp.status_code == 422
+    assert not pool.structured
 
 
 def test_chat_accepts_openai_response_format(app_setup):
@@ -429,7 +515,6 @@ def test_chat_accepts_openai_response_format(app_setup):
             {"type": "json_schema", "json_schema": {"name": "p", "schema": _PERSON_SCHEMA}},
             {"json": _PERSON_SCHEMA},
         ),
-        ({"type": "json_schema", "schema": _PERSON_SCHEMA}, {"json": _PERSON_SCHEMA}),
     ):
         resp = client.post(
             "/v1/chat/completions",
@@ -490,7 +575,7 @@ def test_chat_response_format_json_schema_without_schema_is_422(app_setup):
         },
     )
     assert resp.status_code == 422
-    assert "requires a schema" in resp.json()["detail"]
+    assert "response_format.json_schema is malformed" in resp.json()["detail"]
     assert pool.generated == []
 
 
@@ -506,13 +591,12 @@ def test_chat_response_format_unknown_type_is_422(app_setup):
         },
     )
     assert resp.status_code == 422
-    assert "unsupported response_format type" in resp.json()["detail"]
+    assert "response_format type is not supported" in resp.json()["detail"]
     assert pool.generated == []
 
 
-def test_guided_fields_are_ignored(app_setup):
-    """vLLM guided_* request fields are no longer accepted; a request carrying only guided_*
-    generates unconstrained."""
+def test_guided_fields_are_rejected(app_setup):
+    """vLLM guided_* request fields are rejected by the canonical grammar."""
     client, pool, _ = app_setup
     resp = client.post(
         "/v1/chat/completions",
@@ -522,8 +606,8 @@ def test_guided_fields_are_ignored(app_setup):
             "guided_regex": r"\d+",
         },
     )
-    assert resp.status_code == 200
-    assert pool.structured[-1] is None
+    assert resp.status_code == 422
+    assert not pool.structured
 
 
 def test_chat_without_structured_outputs_is_unconstrained(app_setup):
@@ -640,6 +724,28 @@ def test_raw_generate_responses_exclude_internal_fields(app_setup, path, payload
     # none of the old camelcase spellings survive anywhere in the response.
     for camel in ("adapterId", "finishReason", "tokenIds", "inferenceTimeSeconds", "requestId"):
         assert camel not in body
+
+
+@pytest.mark.parametrize(
+    "field", ["n", "seed", "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs"]
+)
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/generate", {"adapter_id": "qa", "prompt": "hi"}),
+        ("/adapters/qa/generate", {"prompt": "hi"}),
+    ],
+)
+def test_raw_generate_routes_reject_openai_only_sampling_fields(
+    app_setup, field: str, path: str, payload: dict[str, object]
+) -> None:
+    client, pool, _ = app_setup
+    value: object = True if field == "logprobs" else 1
+
+    response = client.post(path, json={**payload, field: value})
+
+    assert response.status_code == 422
+    assert pool.generated == []
 
 
 def test_openai_chat_completions_routes_and_shapes(app_setup):
@@ -900,7 +1006,7 @@ def test_unknown_adapter_is_404_not_misrouted(app_setup):
     assert client.post("/generate", json={"adapter_id": "nope", "prompt": "hi"}).status_code == 404
     assert (
         client.post("/v1/chat/completions", json={"model": "nope", "messages": []}).status_code
-        == 404
+        == 422
     )
     assert pool.generated == []
 

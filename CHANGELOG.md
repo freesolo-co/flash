@@ -13,6 +13,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Added
 
+- OpenAI chat serving now preserves mirror sampling controls across packaged, hosted, and managed
+  entry points: up to four indexed choices, signed seeds, frequency and presence penalties, and
+  OpenAI token logprobs. Buffered and raw SSE responses retain independent choice terminals and
+  aggregate request usage; the decoded text-only stream remains single-choice.
 - A `flash-cli` console script, the same entry point as `flash`, retained as a stable alias for
   existing operator automation and self-hosting instructions.
 
@@ -78,6 +82,8 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- Qwen3.6 FP8 MoE serving now preserves unquantized activations for LoRA A while keeping the base
+  MoE path quantized, backporting the exact vLLM PR #42120 behavior into the pinned 0.23.0 image.
 - GRPO publication now validates complete finite optimizer-step actor gradient norms instead of
   masked advantage-bound spread, so valid truncated groups are not falsely rejected and deployable
   checkpoints remain withheld until terminal evidence validation succeeds.

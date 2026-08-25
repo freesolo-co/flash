@@ -211,6 +211,7 @@ class ServingContext:
         include_usage: bool,
         usage_session: UsageSession,
         thinking: bool = False,
+        choice_count: int = 1,
     ) -> AsyncIterator[bytes]:
         return openai_chat_stream(
             self.router,
@@ -222,4 +223,5 @@ class ServingContext:
             include_usage=include_usage,
             usage_session=usage_session,
             thinking=thinking,
+            choice_count=choice_count,
         )

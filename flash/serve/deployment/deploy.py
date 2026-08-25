@@ -40,6 +40,11 @@ from flash.serve.deployment import adapter_check, readiness
 from flash.serve.request import streaming as streaming_support
 from flash.serve.request import thinking as thinking_support
 from flash.serve.request import transport
+from flash.serve.runtime.sampling import (
+    validate_choice_count,
+    validate_logprobs,
+    validate_top_logprobs,
+)
 
 logger = get_logger(__name__)
 
@@ -663,6 +668,12 @@ def chat_sse(
     chat_template_kwargs: dict[str, Any] | None = None,
     structured_outputs: dict[str, Any] | None = None,
     stream_options: dict[str, bool] | None = None,
+    n: int = 1,
+    seed: int | None = None,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
 ) -> transport.OpenAIStreamResponse:
     """open a raw openai stream while preserving status, headers, and sse bytes."""
 
@@ -676,6 +687,12 @@ def chat_sse(
         max_tokens=max_tokens,
         thinking=thinking,
         top_p=top_p,
+        n=n,
+        seed=seed,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,
@@ -691,8 +708,22 @@ def chat_stream(
     max_tokens: int = 512,
     thinking: bool = False,
     stop: list[str] | None = None,
+    n: int = 1,
+    seed: int | None = None,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
 ) -> Iterator[str]:
-    """yield decoded text while preserving eager open and cleanup semantics."""
+    """yield one decoded choice while preserving eager open and cleanup semantics."""
+
+    n = validate_choice_count(n)
+    logprobs = validate_logprobs(logprobs)
+    top_logprobs = validate_top_logprobs(top_logprobs)
+    if n != 1:
+        raise ValueError("text-only chat_stream requires n=1")
+    if logprobs or top_logprobs:
+        raise ValueError("text-only chat_stream does not expose logprobs")
 
     def decode_body(upstream: transport.OpenAIStreamResponse, enabled: bool) -> Iterator[str]:
         return streaming_support._streamed_body(
@@ -710,6 +741,12 @@ def chat_stream(
         temperature=temperature,
         max_tokens=max_tokens,
         thinking=thinking,
+        n=n,
+        seed=seed,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
         stop=stop,
         frame_bytes=streaming_support._complete_sse_frames,
         decode_body=decode_body,
@@ -730,6 +767,12 @@ def chat(
     structured_outputs: dict | None = None,
     top_p: float = 0.95,
     chat_template_kwargs: dict | None = None,
+    n: int = 1,
+    seed: int | None = None,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
@@ -771,6 +814,12 @@ def chat(
         max_tokens=max_tokens,
         thinking=thinking,
         top_p=top_p,
+        n=n,
+        seed=seed,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,

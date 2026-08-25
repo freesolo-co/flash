@@ -13,22 +13,36 @@ from flash.serve.request.validation import (
     normalize_messages,
     normalize_structured_outputs,
 )
+from flash.serve.runtime.sampling import (
+    validate_choice_count,
+    validate_logprobs,
+    validate_penalty,
+    validate_sampling_relationships,
+    validate_seed,
+    validate_top_logprobs,
+)
 
 DEFAULT_MAX_TOKENS = 1024
 _ALLOWED_REQUEST_KEYS = frozenset(
     {
         "adapter_revision",
         "chat_template_kwargs",
+        "frequency_penalty",
+        "logprobs",
         "max_tokens",
         "messages",
         "model",
+        "n",
+        "presence_penalty",
         "response_format",
+        "seed",
         "step",
         "stop",
         "stream",
         "stream_options",
         "structured_outputs",
         "temperature",
+        "top_logprobs",
         "top_p",
     }
 )
@@ -63,6 +77,12 @@ class NormalizedChatRequest:
     temperature: float
     max_tokens: int
     top_p: float
+    n: int
+    seed: int | None
+    frequency_penalty: float
+    presence_penalty: float
+    logprobs: bool
+    top_logprobs: int
     stop: tuple[str, ...]
     chat_template_kwargs: dict[str, Any]
     structured_outputs: dict[str, Any] | None
@@ -99,6 +119,25 @@ def parse_chat_request(
     temperature = _temperature(payload.get("temperature", 0.0))
     max_tokens = _max_tokens(payload.get("max_tokens", DEFAULT_MAX_TOKENS))
     top_p = _top_p(payload.get("top_p", 0.95))
+    try:
+        n = validate_choice_count(payload.get("n", 1))
+        seed = validate_seed(payload.get("seed"))
+        frequency_penalty = validate_penalty(
+            payload.get("frequency_penalty", 0.0), "frequency_penalty"
+        )
+        presence_penalty = validate_penalty(
+            payload.get("presence_penalty", 0.0), "presence_penalty"
+        )
+        logprobs = validate_logprobs(payload.get("logprobs", False))
+        top_logprobs = validate_top_logprobs(payload.get("top_logprobs", 0))
+        validate_sampling_relationships(
+            n=n,
+            temperature=temperature,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
+        )
+    except ValueError as exc:
+        raise OpenAIRequestError(str(exc)) from exc
 
     return NormalizedChatRequest(
         model=model,
@@ -106,12 +145,25 @@ def parse_chat_request(
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
+        n=n,
+        seed=seed,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
         stop=_stop_values(payload.get("stop")),
         chat_template_kwargs=_chat_template_kwargs(payload.get("chat_template_kwargs")),
         structured_outputs=_structured_outputs(payload),
         stream=stream,
         stream_options=_stream_options(payload.get("stream_options"), stream),
     )
+
+
+def reject_thinking_logprobs(*, thinking: bool, logprobs: bool) -> None:
+    """reject logprobs only after authoritative thinking resolution."""
+
+    if thinking and logprobs:
+        raise OpenAIRequestError("logprobs are not supported for thinking-enabled generation")
 
 
 def merge_stop_sequences(
@@ -215,9 +267,16 @@ def _chat_template_kwargs(value: object) -> dict[str, Any]:
         raise OpenAIRequestError(
             "chat_template_kwargs must contain only finite json values"
         ) from exc
-    return {
+    has_enable_thinking = "enable_thinking" in caller
+    enable_thinking = caller.get("enable_thinking")
+    if has_enable_thinking and type(enable_thinking) is not bool:
+        raise OpenAIRequestError("chat_template_kwargs.enable_thinking must be a boolean")
+    normalized = {
         key: nested for key, nested in caller.items() if key not in _RESERVED_CHAT_TEMPLATE_KWARGS
     }
+    if has_enable_thinking:
+        normalized["enable_thinking"] = enable_thinking
+    return normalized
 
 
 def _require_finite_json(value: Any) -> None:

@@ -26,12 +26,15 @@ from .prompt import (
     effective_chat_template_kwargs,
     resolve_thinking,
 )
+from .sampling import complete_indexed_outputs, indexed_outputs, normalize_token_logprobs
 from .types import (
     AdapterSpec,
     EngineConfig,
+    GenerationChoice,
     GenerationRequest,
     GenerationResult,
     RuntimeHealth,
+    StreamChoiceFinished,
     StreamDelta,
     StreamEvent,
     StreamFinished,
@@ -50,35 +53,98 @@ class _StructuredState:
 
 
 @dataclass(slots=True)
-class _StreamState:
+class _ChoiceStreamState:
     token_ids: list[int]
+    logprobs: list[dict[str, Any]]
     text: str = ""
-    final_output: Any = None
+    finish_reason: str | None = None
+    terminal_emitted: bool = False
+
+
+@dataclass(slots=True)
+class _StreamState:
+    n: int
+    top_logprobs: int
+    choices: dict[int, _ChoiceStreamState]
     prompt_tokens: int | None = None
     cached_tokens: int = 0
     cached_reported: bool = False
 
-    def consume(self, request_output: Any) -> str:
-        self.final_output = request_output
-        # under delta output vllm reports prompt and cache metadata on the first delta only, so
-        # keep the first values seen instead of reading them off the last one.
+    @classmethod
+    def create(cls, n: int, top_logprobs: int) -> _StreamState:
+        return cls(
+            n=n,
+            top_logprobs=top_logprobs,
+            choices={index: _ChoiceStreamState(token_ids=[], logprobs=[]) for index in range(n)},
+        )
+
+    def consume(
+        self, request_output: Any
+    ) -> list[tuple[StreamDelta | None, StreamChoiceFinished | None]]:
         if self.prompt_tokens is None:
             self.prompt_tokens = _optional_prompt_tokens(request_output)
         if not self.cached_reported:
             self.cached_tokens, self.cached_reported = _cached_token_state(request_output)
-        output = _single_sequence(request_output)
-        chunk_ids = [int(value) for value in (getattr(output, "token_ids", None) or [])]
-        self.token_ids.extend(chunk_ids)
-        chunk_text = str(getattr(output, "text", "") or "")
-        self.text += chunk_text
-        return chunk_text
+        events: list[tuple[StreamDelta | None, StreamChoiceFinished | None]] = []
+        for index, output in sorted(indexed_outputs(request_output, n=self.n).items()):
+            choice = self.choices[index]
+            if choice.finish_reason is not None:
+                raise RuntimeNotReadyError("vllm emitted data after a choice terminal")
+            chunk_ids = [int(value) for value in (getattr(output, "token_ids", None) or [])]
+            chunk_logprobs = normalize_token_logprobs(
+                chunk_ids,
+                getattr(output, "logprobs", None),
+                top_logprobs=self.top_logprobs,
+            )
+            choice.token_ids.extend(chunk_ids)
+            if chunk_logprobs is not None:
+                choice.logprobs.extend(chunk_logprobs)
+            chunk_text = str(getattr(output, "text", "") or "")
+            choice.text += chunk_text
+            delta = (
+                StreamDelta(index=index, text=chunk_text, logprobs=chunk_logprobs)
+                if chunk_text or chunk_logprobs
+                else None
+            )
+            finish_reason = getattr(output, "finish_reason", None)
+            terminal = None
+            if finish_reason is not None:
+                if not isinstance(finish_reason, str) or not finish_reason:
+                    raise RuntimeNotReadyError("vllm returned an invalid finish reason")
+                choice.finish_reason = finish_reason
+                choice.terminal_emitted = True
+                terminal = StreamChoiceFinished(
+                    index=index,
+                    text=choice.text,
+                    finish_reason=finish_reason,
+                    token_ids=tuple(choice.token_ids),
+                )
+            events.append((delta, terminal))
+        return events
+
+    def validate_complete(self) -> None:
+        if self.prompt_tokens is None:
+            raise RuntimeNotReadyError("vllm did not report the expanded prompt token count")
+        if any(choice.finish_reason is None for choice in self.choices.values()):
+            raise RuntimeNotReadyError("vllm ended with unterminated output choices")
 
 
-def _single_sequence(request_output: Any) -> Any:
-    outputs = getattr(request_output, "outputs", None)
-    if not isinstance(outputs, list | tuple) or len(outputs) != 1:
-        raise RuntimeNotReadyError("vllm must return exactly one output sequence")
-    return outputs[0]
+def _generation_choice(index: int, output: Any, *, top_logprobs: int) -> GenerationChoice:
+    token_ids = tuple(int(value) for value in (getattr(output, "token_ids", None) or []))
+    finish_reason = getattr(output, "finish_reason", None)
+    if not isinstance(finish_reason, str) or not finish_reason:
+        raise RuntimeNotReadyError("vllm generation ended without a finish reason")
+    return GenerationChoice(
+        index=index,
+        text=str(getattr(output, "text", "") or ""),
+        finish_reason=finish_reason,
+        token_ids=token_ids,
+        logprobs=normalize_token_logprobs(
+            token_ids,
+            getattr(output, "logprobs", None),
+            top_logprobs=top_logprobs,
+        ),
+    )
 
 
 def _optional_prompt_tokens(request_output: Any) -> int | None:
@@ -229,6 +295,8 @@ class VllmLoraRuntime:
             adapter = binding.spec if binding is not None else None
             lora_request = binding.lora_request if binding is not None else None
             thinking = resolve_thinking(request, adapter)
+            if thinking and request.logprobs:
+                raise PromptError("logprobs are not supported for thinking-enabled generation")
             structured = self._structured_state(request, adapter, thinking)
             sampling = self._sampling_params(request, structured, streaming=False)
             prompt = await self._prepare_prompt(request, thinking)
@@ -250,17 +318,18 @@ class VllmLoraRuntime:
                 prompt.close()
         if final_output is None:
             raise RuntimeNotReadyError("vllm returned no output")
-        sequence = _single_sequence(final_output)
-        token_ids = tuple(int(value) for value in (getattr(sequence, "token_ids", None) or []))
+        choices = tuple(
+            _generation_choice(index, output, top_logprobs=request.top_logprobs)
+            for index, output in sorted(complete_indexed_outputs(final_output, n=request.n).items())
+        )
         cached_tokens, cached_reported = _cached_token_state(final_output)
         return GenerationResult(
             request_id=request_id,
             adapter_id=request.adapter_id,
             incarnation=adapter.incarnation if adapter is not None else None,
-            text=str(getattr(sequence, "text", "") or ""),
-            finish_reason=getattr(sequence, "finish_reason", None),
+            choices=choices,
             prompt_tokens=_num_prompt_tokens(final_output),
-            completion_tokens=len(token_ids),
+            completion_tokens=sum(len(choice.token_ids) for choice in choices),
             cached_tokens=cached_tokens,
             cached_tokens_reported=cached_reported,
             thinking=thinking,
@@ -274,6 +343,8 @@ class VllmLoraRuntime:
             adapter = binding.spec if binding is not None else None
             lora_request = binding.lora_request if binding is not None else None
             thinking = resolve_thinking(request, adapter)
+            if thinking and request.logprobs:
+                raise PromptError("logprobs are not supported for thinking-enabled generation")
             structured = self._structured_state(request, adapter, thinking)
             sampling = self._sampling_params(request, structured, streaming=True)
             prompt = await self._prepare_prompt(request, thinking)
@@ -294,12 +365,14 @@ class VllmLoraRuntime:
                     incarnation=adapter.incarnation if adapter is not None else None,
                     thinking=thinking,
                 )
-                state = _StreamState(token_ids=[])
+                state = _StreamState.create(request.n, request.top_logprobs)
                 output = first_output
                 while True:
-                    delta = state.consume(output)
-                    if delta:
-                        yield StreamDelta(text=delta)
+                    for delta, terminal in state.consume(output):
+                        if delta is not None:
+                            yield delta
+                        if terminal is not None:
+                            yield terminal
                     try:
                         output = await anext(output_stream)
                     except StopAsyncIteration:
@@ -500,6 +573,11 @@ class VllmLoraRuntime:
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             top_p=request.top_p,
+            n=request.n,
+            seed=request.seed,
+            frequency_penalty=request.frequency_penalty,
+            presence_penalty=request.presence_penalty,
+            logprobs=request.top_logprobs if request.logprobs else None,
             output_kind=output_kind,
             structured_outputs=structured.params,
             # pass none rather than an empty list so vllm keeps its own default.
@@ -546,20 +624,25 @@ class VllmLoraRuntime:
         request_id: str,
         state: _StreamState,
     ) -> StreamFinished:
-        if state.final_output is None:
-            raise RuntimeNotReadyError("vllm returned no output")
-        sequence = _single_sequence(state.final_output)
-        if state.prompt_tokens is None:
-            raise RuntimeNotReadyError("vllm did not report the expanded prompt token count")
+        state.validate_complete()
+        assert state.prompt_tokens is not None
         return StreamFinished(
             request_id=request_id,
             runtime_id=self.runtime_id,
             adapter_id=request.adapter_id,
             incarnation=adapter.incarnation if adapter is not None else None,
-            text=state.text,
-            finish_reason=getattr(sequence, "finish_reason", None),
+            choices=tuple(
+                GenerationChoice(
+                    index=index,
+                    text=choice.text,
+                    finish_reason=choice.finish_reason,
+                    token_ids=tuple(choice.token_ids),
+                    logprobs=choice.logprobs or None,
+                )
+                for index, choice in sorted(state.choices.items())
+            ),
             prompt_tokens=state.prompt_tokens,
-            completion_tokens=len(state.token_ids),
+            completion_tokens=sum(len(choice.token_ids) for choice in state.choices.values()),
             cached_tokens=state.cached_tokens,
             cached_tokens_reported=state.cached_reported,
             thinking=thinking,
