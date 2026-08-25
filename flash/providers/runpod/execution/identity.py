@@ -358,14 +358,12 @@ def pod_identity_is_incomplete(
     allow_preplacement: bool = False,
 ) -> bool:
     """Return whether missing realized fields prevent a conclusive identity decision."""
-    preplacement = allow_preplacement and pod.desired_status in {"CREATED", "PENDING"}
     required = (
         pod.docker_start_cmd,
         pod.payload_env_sha256,
         pod.payload_secret_name,
         pod.secure_cloud,
-        pod.interruptible,
-        pod.support_public_ip,
+        pod.public_ip_assigned,
         pod.volume_mount_path,
     )
     if any(value is None for value in required):
@@ -375,13 +373,11 @@ def pod_identity_is_incomplete(
         and pod.container_registry_auth_id is None
     ):
         return True
-    if not preplacement and pod.gpu_type_id is None:
+    if pod.gpu_type_id is None:
         return True
-    if not preplacement and pod.data_center_id is None:
+    if data_center_id is not None and network_volume_id is None and pod.data_center_id is None:
         return True
-    return bool(
-        not preplacement and network_volume_id is not None and pod.network_volume_id is None
-    )
+    return bool(network_volume_id is not None and pod.network_volume_id is None)
 
 
 def pod_matches(
@@ -396,17 +392,14 @@ def pod_matches(
     expected_env = payload["env"][PAYLOAD_ENV]
     expected_env_sha256 = hashlib.sha256(expected_env.encode("utf-8")).hexdigest()
     expected_registry_id = payload.get("containerRegistryAuthId")
-    preplacement = allow_preplacement and pod.desired_status in {"CREATED", "PENDING"}
-    gpu_matches = pod.gpu_type_id == expected_gpu or (preplacement and pod.gpu_type_id is None)
+    gpu_matches = pod.gpu_type_id == expected_gpu
     if data_center_id is None:
-        placement_matches = pod.data_center_id is not None or preplacement
+        placement_matches = True
+    elif network_volume_id is not None:
+        placement_matches = pod.data_center_id in {None, data_center_id}
     else:
-        placement_matches = pod.data_center_id == data_center_id or (
-            preplacement and pod.data_center_id is None
-        )
-    volume_matches = pod.network_volume_id == network_volume_id or (
-        preplacement and network_volume_id is not None and pod.network_volume_id is None
-    )
+        placement_matches = pod.data_center_id == data_center_id
+    volume_matches = pod.network_volume_id == network_volume_id
     return bool(
         pod.name == payload["name"]
         and pod.image_name == payload["imageName"]
@@ -419,8 +412,9 @@ def pod_matches(
         and pod.payload_env_sha256 == expected_env_sha256
         and pod.payload_secret_name == payload_secret_name_from_pod_label(payload["name"])
         and pod.secure_cloud is True
-        and pod.interruptible is False
-        and pod.support_public_ip is False
+        and (pod.interruptible is None or pod.interruptible is False)
+        and (pod.support_public_ip is None or pod.support_public_ip is False)
+        and pod.public_ip_assigned is False
         and pod.volume_mount_path == payload["volumeMountPath"]
         and pod.container_registry_auth_id == expected_registry_id
     )

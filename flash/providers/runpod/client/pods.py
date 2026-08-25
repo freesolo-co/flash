@@ -113,6 +113,7 @@ class RunpodPod:
     secure_cloud: bool | None = None
     interruptible: bool | None = None
     support_public_ip: bool | None = None
+    public_ip_assigned: bool | None = None
     volume_mount_path: str | None = None
     container_registry_auth_id: str | None = None
 
@@ -173,6 +174,15 @@ def _optional_bool(value: object, field: str) -> bool | None:
     return value
 
 
+def _public_ip_assigned(row: dict) -> bool | None:
+    if "publicIp" not in row:
+        return None
+    value = row["publicIp"]
+    if type(value) is not str or value != value.strip():
+        raise RunpodApiError("runpod Pod public IP observation is invalid")
+    return bool(value)
+
+
 def _optional_string_tuple(value: object, field: str) -> tuple[str, ...] | None:
     if value is None:
         return None
@@ -218,9 +228,7 @@ def _parse_pod(row: object) -> RunpodPod:
         volume_id = volume.get("id")
     desired_status = row.get("desiredStatus", row.get("status"))
     image_name = row.get("imageName") if "imageName" in row else row.get("image")
-    support_public_ip = (
-        row.get("supportPublicIp") if "supportPublicIp" in row else machine.get("supportPublicIp")
-    )
+    support_public_ip = row.get("supportPublicIp") if "supportPublicIp" in row else None
     payload_env_sha256, payload_secret_name = _payload_env_identity(row.get("env"))
     return RunpodPod(
         id=_strict_id(row.get("id"), "Pod id"),
@@ -241,6 +249,7 @@ def _parse_pod(row: object) -> RunpodPod:
         secure_cloud=_optional_bool(machine.get("secureCloud"), "Pod secure cloud flag"),
         interruptible=_optional_bool(row.get("interruptible"), "Pod interruptible flag"),
         support_public_ip=_optional_bool(support_public_ip, "Pod public IP flag"),
+        public_ip_assigned=_public_ip_assigned(row),
         volume_mount_path=_optional_string(row.get("volumeMountPath"), "Pod volume mount path"),
         container_registry_auth_id=_optional_string(
             row.get("containerRegistryAuthId"), "Pod registry credential id"

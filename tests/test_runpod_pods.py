@@ -121,8 +121,9 @@ def _pod(
             hashlib.sha256(reference.encode("utf-8")).hexdigest() if complete else None
         ),
         secure_cloud=True if complete else None,
-        interruptible=False if complete else None,
-        support_public_ip=False if complete else None,
+        interruptible=None,
+        support_public_ip=None,
+        public_ip_assigned=False if complete else None,
         volume_mount_path=pod_identity.NETWORK_VOLUME_MOUNT if complete else None,
         container_registry_auth_id=registry_id,
         payload_secret_name=secret_name if complete else None,
@@ -167,10 +168,52 @@ def _api_pod_row(env: object) -> dict:
         "gpuCount": 2,
         "containerDiskInGb": 120,
         "costPerHr": 5.0,
-        "machine": {"gpuTypeId": "NVIDIA H100", "dataCenterId": "US-KS-2"},
+        "publicIp": "",
+        "machine": {
+            "gpuTypeId": "NVIDIA H100",
+            "dataCenterId": "US-KS-2",
+            "supportPublicIp": True,
+        },
         "networkVolume": {"id": "volume123"},
         "env": env,
     }
+
+
+def _live_api_pod_row(
+    pending: pods.RunpodPodHandle,
+    payload: dict,
+    *,
+    public_ip: object = "",
+    data_center: str | None = None,
+    volume_id: str | None = None,
+) -> dict:
+    row = {
+        "id": "pod123456",
+        "name": pending.label,
+        "desiredStatus": "RUNNING",
+        "imageName": payload["imageName"],
+        "gpuCount": payload["gpuCount"],
+        "containerDiskInGb": payload["containerDiskInGb"],
+        "costPerHr": 0.74,
+        "dockerStartCmd": payload["dockerStartCmd"],
+        "env": payload["env"],
+        "machine": {
+            "gpuTypeId": payload["gpuTypeIds"][0],
+            "location": "US",
+            "secureCloud": True,
+            "supportPublicIp": True,
+        },
+        "publicIp": public_ip,
+        "volumeInGb": 0,
+        "volumeMountPath": payload["volumeMountPath"],
+    }
+    if data_center is not None:
+        row["machine"]["dataCenterId"] = data_center
+    if volume_id is not None:
+        row["networkVolume"] = {"id": volume_id}
+    if "containerRegistryAuthId" in payload:
+        row["containerRegistryAuthId"] = payload["containerRegistryAuthId"]
+    return row
 
 
 def test_api_parses_payload_only_env_identity():
@@ -181,7 +224,39 @@ def test_api_parses_payload_only_env_identity():
     assert parsed[0].gpu_type_id == "NVIDIA H100"
     assert parsed[0].payload_env_sha256 == hashlib.sha256(reference.encode()).hexdigest()
     assert parsed[0].payload_secret_name == "FLASH_PAYLOAD_0123456789abcdef"
+    assert parsed[0].support_public_ip is None
+    assert parsed[0].public_ip_assigned is False
     assert reference not in repr(parsed)
+
+
+@pytest.mark.parametrize(
+    "public_ip",
+    [None, True, 1, [], {}, " ", "\t", " padded", "padded "],
+)
+def test_api_rejects_malformed_public_ip_without_exposing_it(public_ip):
+    row = _api_pod_row({"FLASH_INSTANCE_PAYLOAD": "{{ RUNPOD_SECRET_SAFE_NAME }}"})
+    row["publicIp"] = public_ip
+    with pytest.raises(api.RunpodApiError, match="public IP observation") as exc_info:
+        pod_api._pod_rows([row])
+    sensitive_fragment = public_ip.strip() if type(public_ip) is str else repr(public_ip)
+    if sensitive_fragment:
+        assert sensitive_fragment not in str(exc_info.value)
+        assert sensitive_fragment not in repr(exc_info.value)
+
+
+def test_api_preserves_missing_public_ip_as_unknown():
+    row = _api_pod_row({"FLASH_INSTANCE_PAYLOAD": "{{ RUNPOD_SECRET_SAFE_NAME }}"})
+    del row["publicIp"]
+    assert pod_api._pod_rows([row])[0].public_ip_assigned is None
+
+
+def test_api_redacts_nonempty_public_ip_to_assignment_boolean():
+    address = "203.0.113.10"
+    row = _api_pod_row({"FLASH_INSTANCE_PAYLOAD": "{{ RUNPOD_SECRET_SAFE_NAME }}"})
+    row["publicIp"] = address
+    parsed = pod_api._pod_rows([row])[0]
+    assert parsed.public_ip_assigned is True
+    assert address not in repr(parsed)
 
 
 @pytest.mark.parametrize("public_key", ["", "ssh-ed25519 provider-managed-raw-value"])
@@ -488,6 +563,80 @@ def test_multi_card_shape_is_not_widened():
     assert payload["allowedCudaVersions"] == ["13.0"]
 
 
+def test_live_shaped_volume_free_pod_matches_and_is_adopted(monkeypatch):
+    pending = _handle(count=1, data_center=None, volume_id=None)
+    payload = pods._payload_for_handle(pending)
+    row = _live_api_pod_row(pending, payload)
+    created = pod_api._parse_pod(row)
+    listed = pod_api._parse_pod(dict(row))
+    assert created == listed
+    assert created.data_center_id is None
+    assert created.network_volume_id is None
+    assert created.interruptible is None
+    assert created.support_public_ip is None
+    assert created.public_ip_assigned is False
+    assert pods._pod_matches(created, payload, network_volume_id=None, data_center_id=None)
+    monkeypatch.setattr(pod_api, "create_pod_for_fingerprint", lambda *args, **kwargs: created)
+    monkeypatch.setattr(pod_api, "list_pods_for_key", lambda *args, **kwargs: [listed])
+    exact = pods.create_or_adopt_pod(pending, payload, deadline_at=time.time() + 60)
+    assert exact.pod_id == created.id
+
+
+def test_live_shaped_pod_with_public_ip_fails_closed(monkeypatch):
+    pending = _handle(count=1, data_center=None, volume_id=None)
+    payload = pods._payload_for_handle(pending)
+    observed = pod_api._parse_pod(_live_api_pod_row(pending, payload, public_ip="203.0.113.10"))
+    deleted = []
+    monkeypatch.setattr(pod_api, "create_pod_for_fingerprint", lambda *args, **kwargs: observed)
+    monkeypatch.setattr(pod_api, "list_pods_for_key", lambda *args, **kwargs: [observed])
+    monkeypatch.setattr(
+        pod_api,
+        "delete_pod_for_fingerprint",
+        lambda pod_id, *args, **kwargs: deleted.append(pod_id),
+    )
+    with pytest.raises(pods.UnreconciledCreateError, match="conflicting"):
+        pods.create_or_adopt_pod(pending, payload, deadline_at=time.time() + 60)
+    assert deleted == [observed.id]
+    assert "203.0.113.10" not in repr(observed)
+
+
+def test_exact_volume_identity_proves_placement_when_data_center_is_omitted():
+    pending = _handle(count=1, data_center="US-KS-2", volume_id="volume123")
+    payload = pods._payload_for_handle(pending)
+    observed = pod_api._parse_pod(
+        _live_api_pod_row(pending, payload, volume_id=pending.network_volume_id)
+    )
+    assert observed.data_center_id is None
+    assert pods._pod_matches(
+        observed,
+        payload,
+        network_volume_id=pending.network_volume_id,
+        data_center_id=pending.data_center_id,
+    )
+
+
+def test_authored_data_center_without_exact_volume_remains_incomplete():
+    pending = _handle(count=1, data_center="US-KS-2", volume_id=None)
+    payload = pods._payload_for_handle(pending)
+    row = _live_api_pod_row(pending, payload)
+    row["desiredStatus"] = "PENDING"
+    observed = pod_api._parse_pod(row)
+    assert pods._pod_identity_is_incomplete(
+        observed,
+        payload,
+        network_volume_id=None,
+        data_center_id=pending.data_center_id,
+        allow_preplacement=True,
+    )
+    assert not pods._pod_matches(
+        observed,
+        payload,
+        network_volume_id=None,
+        data_center_id=pending.data_center_id,
+        allow_preplacement=True,
+    )
+
+
 def test_create_ambiguity_adopts_one_and_terminates_duplicates(monkeypatch):
     pending = _handle()
     payload = pod_identity.build_pod_payload(
@@ -553,7 +702,7 @@ def test_ambiguous_create_adopts_matching_pod_and_terminates_conflicts(monkeypat
     assert deleted == ["pod-b"]
 
 
-def test_direct_created_response_allows_missing_preplacement_fields(monkeypatch):
+def test_direct_created_response_rejects_missing_exact_gpu_and_volume(monkeypatch):
     pending = _handle()
     payload = pods._payload_for_handle(pending)
     created = _pod(
@@ -565,11 +714,11 @@ def test_direct_created_response_allows_missing_preplacement_fields(monkeypatch)
     )
     monkeypatch.setattr(pod_api, "create_pod_for_fingerprint", lambda *args, **kwargs: created)
     monkeypatch.setattr(pod_api, "list_pods_for_key", lambda *args, **kwargs: [created])
-    exact = pods.create_or_adopt_pod(pending, payload, deadline_at=time.time() + 60)
-    assert exact.pod_id == created.id
+    with pytest.raises(pods.UnreconciledCreateError, match="incomplete"):
+        pods.create_or_adopt_pod(pending, payload, deadline_at=time.time() + 60)
 
 
-def test_created_reconciliation_allows_missing_preplacement_fields(monkeypatch):
+def test_created_reconciliation_rejects_missing_exact_gpu_and_volume(monkeypatch):
     pending = _handle()
     payload = pods._payload_for_handle(pending)
     created = _pod(
@@ -585,8 +734,8 @@ def test_created_reconciliation_allows_missing_preplacement_fields(monkeypatch):
         lambda *args, **kwargs: (_ for _ in ()).throw(pod_api.RunpodMutationAmbiguous("unknown")),
     )
     monkeypatch.setattr(pod_api, "list_pods_for_key", lambda *args, **kwargs: [created])
-    exact = pods.create_or_adopt_pod(pending, payload, deadline_at=time.time() + 60)
-    assert exact.pod_id == created.id
+    with pytest.raises(pods.UnreconciledCreateError, match="incomplete"):
+        pods.create_or_adopt_pod(pending, payload, deadline_at=time.time() + 60)
 
 
 @pytest.mark.parametrize(
@@ -1190,7 +1339,7 @@ def test_custom_pending_pod_recovers_from_its_exact_persisted_request(monkeypatc
     observed = _pod(
         name=label,
         status="PENDING",
-        gpu=None,
+        gpu="NVIDIA A100 80GB PCIe",
         count=1,
         data_center=None,
         volume_id=None,
