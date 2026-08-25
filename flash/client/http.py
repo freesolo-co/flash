@@ -15,6 +15,12 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from flash._internal.channel import CLI_NAME
+from flash._internal.openai_sse import (
+    DeltaEvent,
+    ErrorEvent,
+    OpenAISSEError,
+    iter_openai_sse_events,
+)
 from flash.client.config import load_credentials_with_source
 from flash.client.shapes import RequireSpec, matches_require
 from flash.client.streaming import (
@@ -233,64 +239,36 @@ def _prepare_chat_request(
 
 
 def _openai_sse_text(chunks: Iterator[str]) -> Iterator[str]:
-    """decode raw openai sse into the text stream used by cli and env evaluation."""
+    """render normalized openai events for cli and environment evaluation."""
 
-    buffered = ""
     reasoning_open = False
     reasoning_done = False
-    terminal = False
-    for chunk in chunks:
-        buffered += chunk
-        while "\n" in buffered:
-            line, buffered = buffered.split("\n", 1)
-            line = line.rstrip("\r")
-            if not line.startswith("data:"):
+    try:
+        for event in iter_openai_sse_events(chunks):
+            if isinstance(event, ErrorEvent):
+                raise ClientError(event.message)
+            if not isinstance(event, DeltaEvent):
                 continue
-            data = line.removeprefix("data:").strip()
-            if not data:
-                continue
-            if data == "[DONE]":
-                terminal = True
-                continue
-            try:
-                payload = json.loads(data)
-            except json.JSONDecodeError as exc:
-                raise ClientError("chat stream contained invalid openai sse json") from exc
-            if not isinstance(payload, dict):
-                raise ClientError("chat stream contained a non-object openai sse payload")
-            error = payload.get("error")
-            if isinstance(error, dict):
-                terminal = True
-                raise ClientError(str(error.get("message") or "chat stream ended with an error"))
-            for choice in payload.get("choices") or []:
-                if not isinstance(choice, dict):
-                    continue
-                if choice.get("finish_reason") == "error":
-                    terminal = True
-                    raise ClientError("chat stream ended with an engine error")
-                delta = choice.get("delta") or {}
-                if not isinstance(delta, dict):
-                    continue
-                reasoning = delta.get("reasoning_content")
-                if isinstance(reasoning, str):
-                    if not reasoning_open and not (reasoning_done and not reasoning):
-                        reasoning_open = True
-                        yield "<think>"
-                    if reasoning:
-                        yield reasoning
-                content = delta.get("content")
-                if isinstance(content, str) and content:
-                    if reasoning_open:
-                        reasoning_open = False
-                        reasoning_done = True
-                        yield "</think>"
-                    yield content
-    if buffered.strip():
-        raise ClientError("chat stream ended with an incomplete server-sent event frame")
+            reasoning = event.reasoning_content
+            if reasoning is not None:
+                if not reasoning_open and not (reasoning_done and not reasoning):
+                    reasoning_open = True
+                    yield "<think>"
+                if reasoning:
+                    yield reasoning
+            content = event.content
+            if content:
+                if reasoning_open:
+                    reasoning_open = False
+                    reasoning_done = True
+                    yield "</think>"
+                yield content
+    except OpenAISSEError as exc:
+        if reasoning_open:
+            yield "</think>"
+        raise ClientError(str(exc)) from exc
     if reasoning_open:
         yield "</think>"
-    if not terminal:
-        raise ClientError("chat stream ended before the terminal [DONE] event")
 
 
 def _parse_adapter_target(target: str) -> tuple[str, int | None]:

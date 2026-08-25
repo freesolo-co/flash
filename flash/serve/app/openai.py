@@ -3,44 +3,26 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 from dataclasses import dataclass
 from typing import Any
 
+from flash.serve.openai_request import OpenAIRequestError, parse_stream_options  # noqa: F401
+from flash.serve.openai_request import (
+    parse_chat_request as parse_normalized_chat_request,
+)
 from flash.serve.runtime import GenerationRequest, GenerationResult, StreamFinished
-from flash.serve.runtime.multimodal import validate_messages
-from flash.serve.runtime.structured_outputs import normalize_structured_outputs
 
 from .bootstrap import PublishedAdapter
 from .manifest import ServingManifest
 
-_REQUEST_KEYS = frozenset(
-    {
-        "model",
-        "messages",
-        "stream",
-        "max_tokens",
-        "temperature",
-        "top_p",
-        "stop",
-        "chat_template_kwargs",
-        "structured_outputs",
-        "response_format",
-        "stream_options",
-    }
-)
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
 
-class OpenAIRequestError(ValueError):
-    """one public request failed strict shape or semantic validation."""
-
-
 @dataclass(frozen=True, slots=True)
 class OpenAIChatRequest:
-    """strict normalized subset accepted by the packaged serving app."""
+    """one normalized request bound to an exact immutable adapter."""
 
     stream: bool
     include_usage: bool
@@ -48,132 +30,32 @@ class OpenAIChatRequest:
 
 
 def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAIChatRequest:
-    """reject unknown keys and bind one request to an exact immutable adapter."""
+    """bind the canonical request grammar to an exact immutable adapter."""
 
-    if type(payload) is not dict:
-        raise OpenAIRequestError("request body must be a json object")
-    unknown = sorted(set(payload) - _REQUEST_KEYS)
-    if unknown:
-        raise OpenAIRequestError("request contains unknown keys")
-    model = _required_string(payload.get("model"), "model")
-    if model != resolved.requested_model:
+    request = parse_normalized_chat_request(
+        payload,
+        require_model=True,
+        allow_managed_selectors=False,
+    )
+    if request.model != resolved.requested_model:
         raise OpenAIRequestError("resolved model binding does not match the request")
-    messages = payload.get("messages")
-    if (
-        type(messages) is not list
-        or not messages
-        or any(type(item) is not dict for item in messages)
-    ):
-        raise OpenAIRequestError("messages must be a nonempty array of objects")
-    # being a dict is not being a *message*. the checks above accept `{}`, `{"role": "bogus"}`, and
-    # a `content` of any type, none of which generation can honor. rejecting here makes those a
-    # 422 rather than an empty prompt rendered from a missing `content` (200 on nonsense) or a
-    # template failure answered 503, which reads as "retry later" for a request that can never
-    # succeed. this only validates: the accepted spellings are rewritten to what the template
-    # understands in `PromptPreparer`, past the image dispatch, because normalizing here would
-    # strip the image payloads this endpoint must forward.
-    validate_messages(messages)
-    stream = payload.get("stream", False)
-    if type(stream) is not bool:
-        raise OpenAIRequestError("stream must be a boolean")
-    include_usage = parse_stream_options(payload.get("stream_options"), stream)
-    structured = _structured_override(payload)
     generation = GenerationRequest(
         adapter_id=resolved.adapter.adapter_revision,
         expected_incarnation=resolved.adapter.aggregate_sha256,
-        messages=messages,
-        max_tokens=_positive_int(payload.get("max_tokens", 1024), "max_tokens"),
-        temperature=_number(payload.get("temperature", 0.0), "temperature", minimum=0.0),
-        top_p=_top_p(payload.get("top_p", 0.95)),
-        stop=payload.get("stop"),
-        chat_template_kwargs=_mapping(
-            payload.get("chat_template_kwargs", {}), "chat_template_kwargs"
-        ),
-        structured_outputs=structured,
+        messages=request.messages,
+        max_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        thinking=resolved.adapter.thinking_default,
+        stop=request.stop,
+        chat_template_kwargs=request.chat_template_kwargs,
+        structured_outputs=request.structured_outputs,
     )
     return OpenAIChatRequest(
-        stream=stream,
-        include_usage=include_usage,
+        stream=request.stream,
+        include_usage=request.include_usage,
         generation=generation,
     )
-
-
-def _structured_override(payload: dict[str, Any]) -> Any:
-    has_structured = "structured_outputs" in payload and payload["structured_outputs"] is not None
-    has_response = "response_format" in payload and payload["response_format"] is not None
-    if has_structured and has_response:
-        raise OpenAIRequestError("structured_outputs and response_format cannot both be set")
-    if has_structured:
-        return normalize_structured_outputs(payload["structured_outputs"])
-    if has_response:
-        return _response_format(payload["response_format"])
-    return None
-
-
-def _response_format(value: object) -> dict[str, Any]:
-    data = _mapping(value, "response_format")
-    kind = data.get("type")
-    if kind == "text":
-        if set(data) != {"type"}:
-            raise OpenAIRequestError("text response_format contains unknown keys")
-        return {}
-    if kind == "json_object":
-        if set(data) != {"type"}:
-            raise OpenAIRequestError("json_object response_format contains unknown keys")
-        return {"json_object": True}
-    if kind != "json_schema" or set(data) != {"type", "json_schema"}:
-        raise OpenAIRequestError("response_format type is not supported")
-    declaration = _mapping(data["json_schema"], "response_format.json_schema")
-    allowed = {"name", "description", "schema", "strict"}
-    if set(declaration) - allowed or "schema" not in declaration:
-        raise OpenAIRequestError("json_schema response_format is malformed")
-    schema = _mapping(declaration["schema"], "response_format.json_schema.schema")
-    return {"json": schema}
-
-
-def parse_stream_options(value: object, stream: bool) -> bool:
-    if value is None:
-        return False
-    if not stream:
-        raise OpenAIRequestError("stream_options requires stream=true")
-    options = _mapping(value, "stream_options")
-    if set(options) != {"include_usage"} or type(options["include_usage"]) is not bool:
-        raise OpenAIRequestError("stream_options accepts only boolean include_usage")
-    return options["include_usage"]
-
-
-def _required_string(value: object, name: str) -> str:
-    if type(value) is not str or not value or value != value.strip():
-        raise OpenAIRequestError(f"{name} must be a nonempty string")
-    return value
-
-
-def _positive_int(value: object, name: str) -> int:
-    if type(value) is not int or value <= 0:
-        raise OpenAIRequestError(f"{name} must be a positive integer")
-    return value
-
-
-def _number(value: object, name: str, *, minimum: float) -> float:
-    if type(value) not in {int, float}:
-        raise OpenAIRequestError(f"{name} must be a finite number")
-    result = float(value)
-    if not math.isfinite(result) or result < minimum:
-        raise OpenAIRequestError(f"{name} is outside its accepted range")
-    return result
-
-
-def _top_p(value: object) -> float:
-    result = _number(value, "top_p", minimum=0.0)
-    if result <= 0 or result > 1:
-        raise OpenAIRequestError("top_p must be greater than zero and at most one")
-    return result
-
-
-def _mapping(value: object, name: str) -> dict[str, Any]:
-    if type(value) is not dict:
-        raise OpenAIRequestError(f"{name} must be an object")
-    return dict(value)
 
 
 def split_reasoning(text: str, *, thinking: bool) -> tuple[str | None, str]:

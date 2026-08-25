@@ -34,7 +34,7 @@ from flash.runner import (
     mark_undeployed,
     verified_adapter_revision_generation,
 )
-from flash.schema import parse_adapter_revision
+from flash.serve._chat_transport import RawChatStream
 
 # `RetryableServingUnavailable` is raised by the serving-coverage tests as
 # `serving.RetryableServingUnavailable`, so it stays reachable here even though the smoke path
@@ -45,18 +45,21 @@ from flash.serve.deploy import (  # noqa: F401
     RetryableServingUnavailable,
     ServingError,
 )
+from flash.serve.openai_request import (
+    OpenAIRequestError,
+    merge_stop_sequences,
+    parse_chat_request,
+)
+from flash.serve.provenance import (
+    ImmutableProvenance,
+    validate_body_provenance,
+    validate_header_provenance,
+)
 from flash.serve.urls import public_deployment
 from flash.server import app as _app
 from flash.server.platform import auth, db
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
 from flash.server.platform.internal_client import run_org_id
-from flash.server.routes.chat_contract import (
-    attach_immutable_provenance,
-    combined_stop_sequences,
-    immutable_provenance,
-    immutable_provenance_headers,
-    parse_managed_chat_request,
-)
 
 router = APIRouter()
 
@@ -689,27 +692,6 @@ def _upstream_response_headers(headers: dict[str, str]) -> dict[str, str]:
     return {key: value for key, value in headers.items() if key.lower() not in excluded}
 
 
-def _validate_stream_provenance(headers: dict[str, str], expected: dict[str, str]) -> None:
-    normalized = {key.lower(): value for key, value in headers.items()}
-    candidates = {
-        "adapter_revision": (
-            "x-freesolo-adapter-revision",
-            "x-flash-adapter-revision",
-        ),
-        "checkpoint": ("x-freesolo-checkpoint", "x-flash-checkpoint"),
-        "hf_revision": (
-            "x-freesolo-hf-revision",
-            "x-flash-source-revision",
-        ),
-    }
-    for field, names in candidates.items():
-        values = [normalized[name] for name in names if name in normalized]
-        if not values:
-            raise ValueError(f"serving backend omitted {field} provenance")
-        if any(value != expected[field] for value in values):
-            raise ValueError(f"serving backend returned mismatched {field} provenance")
-
-
 class _UpstreamStreamingResponse(StreamingResponse):
     def __init__(self, *args, upstream, **kwargs):
         self._upstream = upstream
@@ -736,47 +718,34 @@ def chat(
         x_freesolo_org_id,
         x_freesolo_project_id,
     )
-    messages = _chat_messages_from_payload(payload)
-    if not messages:
-        raise HTTPException(status_code=400, detail="messages must be a non-empty list")
+    try:
+        request = parse_chat_request(
+            payload,
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+    except OpenAIRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    messages = _managed_chat_messages(request.messages)
     adapter_revision = payload.get("adapter_revision")
     step = payload.get("step")
     verified_revisions = _verified_adapter_revisions(status)
     deployment = status.deployment or {}
-    ready_deployment = _previous_ready_deployment(deployment)
-    ready_revision = (
-        ready_deployment.get("adapter_revision") if ready_deployment is not None else None
-    )
-    pinned_revision = _resolve_explicit_chat_revision(
+    authorized_revision = _authorized_chat_revision(
         run_id,
+        deployment,
         adapter_revision,
         step,
         verified_revisions,
-        preferred_revision=ready_revision if isinstance(ready_revision, str) else None,
     )
     try:
         effective_spec = effective_spec_from_status(status)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    request = parse_managed_chat_request(payload, thinking=effective_spec.thinking)
     deployment_state = deployment.get("state")
-    has_ready_deploy = pinned_revision is not None or ready_deployment is not None
-    authorized_revision = pinned_revision
-    if pinned_revision is None and ready_deployment is not None:
-        ready_revision = ready_deployment.get("adapter_revision")
-        parsed_ready_revision = (
-            parse_adapter_revision(ready_revision) if isinstance(ready_revision, str) else None
-        )
-        has_ready_deploy = bool(
-            parsed_ready_revision is not None
-            and parsed_ready_revision[0] == run_id
-            and ready_revision in verified_revisions
-        )
-        if has_ready_deploy:
-            authorized_revision = ready_revision
     # a cancelled run can still serve a per-step checkpoint it deployed. only block chat when there
     # is no active immutable deployment to serve.
-    if not has_ready_deploy or authorized_revision is None:
+    if authorized_revision is None:
         if deployment_state in _DEPLOYMENT_BUSY_STATES:
             raise HTTPException(
                 status_code=409,
@@ -808,12 +777,16 @@ def chat(
             detail=f"run {run_id} has no [train].hf_repo; its adapter cannot be served",
         )
     mandatory_stops = tuple(getattr(effective_spec.train, "stop_sequences", ()) or ())
-    stop_sequences = combined_stop_sequences(mandatory_stops, request.stop)
-    provenance = immutable_provenance(authorized_revision)
+    stop_sequences = merge_stop_sequences(mandatory_stops, request.stop)
+    chat_template_kwargs = {
+        **request.chat_template_kwargs,
+        "enable_thinking": effective_spec.thinking,
+    }
+    provenance = ImmutableProvenance.from_adapter_revision(authorized_revision)
     serving_model = authorized_revision
     try:
         if request.stream:
-            upstream = _app.serve_chat_sse(
+            upstream: RawChatStream = _app.serve_chat_sse(
                 run_id=serving_model,
                 messages=messages,
                 temperature=request.temperature,
@@ -821,7 +794,7 @@ def chat(
                 thinking=effective_spec.thinking,
                 top_p=request.top_p,
                 stop=stop_sequences,
-                chat_template_kwargs=request.chat_template_kwargs,
+                chat_template_kwargs=chat_template_kwargs,
                 structured_outputs=request.structured_outputs,
                 stream_options=request.stream_options,
             )
@@ -831,8 +804,8 @@ def chat(
                 if upstream.status_code < 400:
                     if "text/event-stream" not in content_type.lower():
                         raise ValueError("serving backend returned a non-sse streaming response")
-                    _validate_stream_provenance(upstream.headers, provenance)
-                    headers.update(immutable_provenance_headers(provenance))
+                    validate_header_provenance(upstream.headers, provenance)
+                    headers.update(provenance.freesolo_headers())
                 return _UpstreamStreamingResponse(
                     upstream.iter_bytes(),
                     status_code=upstream.status_code,
@@ -850,12 +823,12 @@ def chat(
             thinking=effective_spec.thinking,
             top_p=request.top_p,
             stop=stop_sequences,
-            chat_template_kwargs=request.chat_template_kwargs,
+            chat_template_kwargs=chat_template_kwargs,
             structured_outputs=request.structured_outputs,
         )
         if not isinstance(response, dict):
             raise ValueError("serving backend returned a non-object chat response")
-        return attach_immutable_provenance(response, provenance)
+        return validate_body_provenance(response, provenance)
     except HTTPException:
         raise
     except Exception as exc:
@@ -883,9 +856,11 @@ from flash.server.routes.serving_revisions import (  # noqa: E402,F401
     _DEPLOYMENT_BUSY_STATES,
     _DEPLOYMENT_READY_STATES,
     _activation_predecessor,
+    _authorized_chat_revision,
     _chat_messages_from_payload,
     _deployment_predecessor,
     _format_deployed_steps,
+    _managed_chat_messages,
     _parse_checkpoint_step,
     _previous_ready_deployment,
     _resolve_deploy_step,

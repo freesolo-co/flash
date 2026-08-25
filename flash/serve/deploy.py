@@ -8,8 +8,9 @@ import math
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -18,6 +19,13 @@ from flash._internal.logging import get_logger
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.envs.loader import is_commit_sha
 from flash.schema import format_adapter_revision
+from flash.serve._chat_transport import (
+    OpenAIStreamResponse,
+    request_chat_json,
+    request_chat_sse,
+    request_chat_stream,
+    retryable_smoke_unavailable,
+)
 from flash.serve.contract import (
     PREFERRED_SERVING_CAPABILITIES,
     REQUIRED_SERVING_CAPABILITIES,
@@ -46,6 +54,8 @@ from flash.serve.responses import (
 from flash.serve.responses import (
     validate_activation_response as _validate_activation_response,
 )
+from flash.serve.streaming import _complete_sse_frames, _streamed_body
+from flash.serve.streaming import _openai_stream_content as _decode_openai_stream_content
 from flash.serve.urls import (  # noqa: F401 -- re-exported: callers import these from here
     DEV_FREESOLO_SERVING_URL,
     PROD_FREESOLO_SERVING_URL,
@@ -92,7 +102,6 @@ ACTIVATION_READBACK_DELAY_SECONDS = 2.0
 # smoke-retry fallback when a 503 carries no usable Retry-After: keep the prior 2s default rather
 # than the 0.5s readiness backoff base, so cold-start smoke retries don't hammer serving.
 SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
-_RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 _INTERNAL_KEY_HEADER = "X-Freesolo-Internal-Key"
 # modal 303-redirects a slow request to an async-result poll url on the same origin, once per poll
 # cycle until the result is ready, so the cap must cover a full 30-minute chat window of polls
@@ -821,32 +830,80 @@ def _retryable_smoke_unavailable(
     requested_model: str,
     expected_adapter_revision: str,
 ) -> RetryableServingUnavailable | None:
-    if response.status_code != 503:
-        return None
-    try:
-        payload = response.json()
-    except ValueError:
-        return None
-    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
-        return None
-    error = payload["error"]
-    code = error.get("code")
-    if (
-        error.get("type") != "adapter_unavailable"
-        or error.get("retryable") is not True
-        or code not in _RETRYABLE_SMOKE_503_CODES
-        or error.get("requested_model") != requested_model
-        or error.get("adapter_revision") != expected_adapter_revision
-    ):
-        return None
-    raw_delay = response.headers.get("Retry-After") or error.get("retry_after_seconds")
-    try:
-        retry_after_seconds = float(raw_delay)
-    except (TypeError, ValueError):
-        retry_after_seconds = SMOKE_RETRY_FALLBACK_DELAY_SECONDS
-    if not math.isfinite(retry_after_seconds) or retry_after_seconds <= 0:
-        retry_after_seconds = SMOKE_RETRY_FALLBACK_DELAY_SECONDS
-    return RetryableServingUnavailable(str(code), retry_after_seconds)
+    return retryable_smoke_unavailable(
+        response,
+        requested_model=requested_model,
+        expected_adapter_revision=expected_adapter_revision,
+        fallback_delay_seconds=SMOKE_RETRY_FALLBACK_DELAY_SECONDS,
+    )
+
+
+def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[str]:
+    return _decode_openai_stream_content(lines, thinking=thinking, find_delimiter=_find_delimiter)
+
+
+def chat_sse(
+    run_id: str,
+    messages: list[dict],
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+    thinking: bool = False,
+    top_p: float = 0.95,
+    stop: list[str] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    structured_outputs: dict[str, Any] | None = None,
+    stream_options: dict[str, bool] | None = None,
+) -> OpenAIStreamResponse:
+    """open a raw openai stream while preserving status, headers, and sse bytes."""
+
+    return request_chat_sse(
+        _stream_http_client(),
+        url=f"{serving_openai_base_url()}/chat/completions",
+        headers=_internal_key_header(),
+        run_id=run_id,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        top_p=top_p,
+        stop=stop,
+        chat_template_kwargs=chat_template_kwargs,
+        structured_outputs=structured_outputs,
+        stream_options=stream_options,
+        frame_bytes=_complete_sse_frames,
+    )
+
+
+def chat_stream(
+    run_id: str,
+    messages: list[dict],
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+    thinking: bool = False,
+    stop: list[str] | None = None,
+) -> Iterator[str]:
+    """yield decoded text while preserving eager open and cleanup semantics."""
+
+    def decode_body(upstream: OpenAIStreamResponse, enabled: bool) -> Iterator[str]:
+        return _streamed_body(
+            upstream,
+            thinking=enabled,
+            find_delimiter=_find_delimiter,
+        )
+
+    return request_chat_stream(
+        _stream_http_client(),
+        url=f"{serving_openai_base_url()}/chat/completions",
+        headers=_internal_key_header(),
+        run_id=run_id,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        stop=stop,
+        frame_bytes=_complete_sse_frames,
+        decode_body=decode_body,
+    )
 
 
 def chat(
@@ -871,21 +928,6 @@ def chat(
     ``stop`` carries the run's own stop sequences so a model trained to terminate on a delimiter
     rather than EOS finishes on ``stop`` instead of running to ``max_tokens``.
     """
-    base = serving_openai_base_url()
-    body = {
-        "model": run_id,
-        "messages": messages,
-        "max_tokens": int(max_tokens),
-        "temperature": float(temperature),
-        "top_p": float(top_p),
-        "chat_template_kwargs": chat_template_kwargs
-        if chat_template_kwargs is not None
-        else {"enable_thinking": bool(thinking)},
-    }
-    if stop:
-        body["stop"] = [str(value) for value in stop]
-    if structured_outputs is not None:
-        body["structured_outputs"] = structured_outputs
     # follow_redirects: modal 303-redirects slow cold-start requests across many poll cycles
     # before the result is ready (bounded by _MAX_REDIRECTS, all on the serving origin).
     headers = _internal_key_header()
@@ -895,29 +937,38 @@ def chat(
     client_context = (
         _new_serving_client() if retry_unavailable else contextlib.nullcontext(_chat_http_client())
     )
-    with client_context as client:
-        resp = client.post(f"{base}/chat/completions", json=body, headers=headers, timeout=timeout)
-        if retry_unavailable:
-            retryable_error = _retryable_smoke_unavailable(
-                resp,
-                requested_model=run_id,
-                expected_adapter_revision=expected_adapter_revision or run_id,
-            )
-            if retryable_error is not None:
-                raise retryable_error
-        resp.raise_for_status()
-        payload = resp.json()
-        _balance_thinking_payload(payload, thinking=thinking)
-        if expected_checkpoint and isinstance(payload, dict):
-            payload["_freesolo_headers"] = {
-                "adapter_revision": resp.headers.get("X-Freesolo-Adapter-Revision"),
-                "checkpoint": resp.headers.get("X-Freesolo-Checkpoint"),
-                "hf_revision": resp.headers.get("X-Freesolo-HF-Revision"),
-            }
-            payload["_freesolo_lora_request_adapter"] = resp.headers.get(
-                "X-Freesolo-LoRA-Request-Adapter"
-            )
-        return payload
+
+    def classify_unavailable(response: httpx.Response) -> None:
+        if not retry_unavailable:
+            return
+        retryable_error = _retryable_smoke_unavailable(
+            response,
+            requested_model=run_id,
+            expected_adapter_revision=expected_adapter_revision or run_id,
+        )
+        if retryable_error is not None:
+            raise retryable_error
+
+    return request_chat_json(
+        client_context,
+        url=f"{serving_openai_base_url()}/chat/completions",
+        headers=headers,
+        run_id=run_id,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        top_p=top_p,
+        stop=stop,
+        chat_template_kwargs=chat_template_kwargs,
+        structured_outputs=structured_outputs,
+        timeout=timeout,
+        before_raise=classify_unavailable,
+        balance_payload=lambda payload, enabled: _balance_thinking_payload(
+            payload, thinking=enabled
+        ),
+        expected_checkpoint=expected_checkpoint,
+    )
 
 
 # Adapter artifact validation lives in `flash.serve.adapter_check`, which imports the exception
@@ -930,18 +981,7 @@ from flash.serve.adapter_check import (  # noqa: E402,F401
     validate_serving_lora_rank,
 )
 
-# `chat_stream` and its SSE decoder live in `flash.serve.streaming`, which imports the client
-# helpers above. Re-exported so `from flash.serve.deploy import chat_stream` (flash.server.app,
-# and the CLI through the client) keeps resolving.
-from flash.serve.streaming import (  # noqa: E402,F401
-    _openai_stream_content,
-    chat_sse,
-    chat_stream,
-)
-
-# The reasoning-delimiter parsing lives in `flash.serve.thinking`, which imports the tag
-# constants above. Re-exported so the existing `deploy._balanced_thinking_content` call sites
-# and tests keep resolving.
+# re-export reasoning helpers so existing deploy call sites and tests keep resolving.
 from flash.serve.thinking import (  # noqa: E402,F401
     _TAG_CLOSE,
     _TAG_OPEN,
