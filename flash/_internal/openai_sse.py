@@ -29,17 +29,35 @@ class DoneEvent:
 
 OpenAISSEEvent = DeltaEvent | ErrorEvent | DoneEvent
 
+_UTF8_BOM = chr(0xFEFF)
+
+
+def _next_sse_line(buffered: str, *, final: bool = False) -> tuple[str, str] | None:
+    for index, character in enumerate(buffered):
+        if character == "\n":
+            return buffered[:index], buffered[index + 1 :]
+        if character != "\r":
+            continue
+        if index + 1 == len(buffered) and not final:
+            return None
+        delimiter_length = 2 if buffered[index + 1 : index + 2] == "\n" else 1
+        return buffered[:index], buffered[index + delimiter_length :]
+    return None
+
 
 def iter_openai_sse_events(chunks: Iterable[str]) -> Iterator[OpenAISSEEvent]:
     """decode arbitrary text chunks and require one terminal event."""
 
     buffered = ""
     frame_lines: list[str] = []
+    first_line = True
     for chunk in chunks:
         buffered += chunk
-        while "\n" in buffered:
-            line, buffered = buffered.split("\n", 1)
-            line = line.rstrip("\r")
+        while parsed := _next_sse_line(buffered):
+            line, buffered = parsed
+            if first_line:
+                line = line.removeprefix(_UTF8_BOM)
+                first_line = False
             if line:
                 frame_lines.append(line)
                 continue
@@ -48,6 +66,19 @@ def iter_openai_sse_events(chunks: Iterable[str]) -> Iterator[OpenAISSEEvent]:
                 if isinstance(event, DoneEvent | ErrorEvent):
                     return
             frame_lines = []
+    while parsed := _next_sse_line(buffered, final=True):
+        line, buffered = parsed
+        if first_line:
+            line = line.removeprefix(_UTF8_BOM)
+            first_line = False
+        if line:
+            frame_lines.append(line)
+            continue
+        for event in _events_from_frame(frame_lines):
+            yield event
+            if isinstance(event, DoneEvent | ErrorEvent):
+                return
+        frame_lines = []
     if buffered or frame_lines:
         raise OpenAISSEError("chat stream ended with an incomplete server-sent event frame")
     raise OpenAISSEError("chat stream ended before the terminal [DONE] event")
@@ -56,9 +87,10 @@ def iter_openai_sse_events(chunks: Iterable[str]) -> Iterator[OpenAISSEEvent]:
 def sse_data_is_terminal(data: bytes) -> bool:
     """return whether one complete raw sse frame is terminal."""
 
+    normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     data_lines = [
         line.removeprefix(b"data:").strip()
-        for line in data.replace(b"\r\n", b"\n").split(b"\n")
+        for line in normalized.split(b"\n")
         if line.startswith(b"data:")
     ]
     if not data_lines:

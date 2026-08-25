@@ -610,7 +610,11 @@ def test_chat_stream_rejects_sse_eof_without_done(monkeypatch):
         next(stream)
 
 
-def test_chat_stream_accepts_json_fallback(monkeypatch):
+@pytest.mark.parametrize(
+    "content_type",
+    ["application/json", "Application/JSON; Charset=UTF-8"],
+)
+def test_chat_stream_accepts_json_fallback(monkeypatch, content_type):
     """A new Flash server can still talk to an older serving app that ignores stream=true.
 
     Drives a REAL httpx streaming response (MockTransport) so the read-before-.json() contract is
@@ -624,8 +628,10 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
 
     def handler(request):
         return httpx.Response(
-            200, json={"choices": [{"message": {"content": "full reply"}}]}
-        )  # httpx sets content-type: application/json
+            200,
+            headers={"content-type": content_type},
+            json={"choices": [{"message": {"content": "full reply"}}]},
+        )
 
     transport = httpx.MockTransport(handler)
     real_client = httpx.Client
@@ -639,6 +645,25 @@ def test_chat_stream_accepts_json_fallback(monkeypatch):
     assert list(d.chat_stream("flash-7-abcd", [{"role": "user", "content": "hi"}])) == [
         "full reply"
     ]
+
+
+def test_chat_stream_does_not_treat_a_non_json_media_type_as_json(monkeypatch):
+    import flash.serve.deploy as d
+
+    upstream = StreamResponse(
+        headers={"content-type": "text/application/json"},
+        line_chunks=(
+            'data: {"choices":[{"delta":{"content":"streamed"}}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ),
+    )
+    client = StreamClient(StreamContext(upstream))
+    monkeypatch.setattr(d, "_stream_http_client", lambda: client)
+    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+
+    assert list(d.chat_stream("run-1", [{"role": "user", "content": "hi"}])) == ["streamed"]
 
 
 def _erroring_stream_seams(monkeypatch, resp):

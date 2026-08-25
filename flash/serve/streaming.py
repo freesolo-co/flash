@@ -176,26 +176,52 @@ def _openai_stream_content(
         yield from held
 
 
+def _next_sse_frame_end(buffered: bytearray, *, final: bool = False) -> int | None:
+    line_start = 0
+    index = 0
+    while index < len(buffered):
+        value = buffered[index]
+        if value == 10:
+            line_end = index + 1
+        elif value == 13:
+            if index + 1 == len(buffered) and not final:
+                return None
+            line_end = index + (2 if buffered[index + 1 : index + 2] == b"\n" else 1)
+        else:
+            index += 1
+            continue
+        if index == line_start:
+            return line_end
+        line_start = line_end
+        index = line_end
+    return None
+
+
 def _complete_sse_frames(chunks: Iterator[bytes]) -> Iterator[bytes]:
     """yield only complete sse frames while preserving every upstream byte."""
 
     buffered = bytearray()
+    first_frame = True
     for chunk in chunks:
         buffered.extend(chunk)
-        while True:
-            lf = buffered.find(b"\n\n")
-            crlf = buffered.find(b"\r\n\r\n")
-            ends = [end for end in (lf, crlf) if end >= 0]
-            if not ends:
-                break
-            end = min(ends)
-            delimiter_length = 4 if buffered[end : end + 4] == b"\r\n\r\n" else 2
-            frame = bytes(buffered[: end + delimiter_length])
-            del buffered[: end + delimiter_length]
-            terminal = sse_data_is_terminal(frame)
+        while end := _next_sse_frame_end(buffered):
+            frame = bytes(buffered[:end])
+            del buffered[:end]
+            terminal_data = frame.removeprefix(b"\xef\xbb\xbf") if first_frame else frame
+            first_frame = False
+            terminal = sse_data_is_terminal(terminal_data)
             yield frame
             if terminal:
                 return
+    while end := _next_sse_frame_end(buffered, final=True):
+        frame = bytes(buffered[:end])
+        del buffered[:end]
+        terminal_data = frame.removeprefix(b"\xef\xbb\xbf") if first_frame else frame
+        first_frame = False
+        terminal = sse_data_is_terminal(terminal_data)
+        yield frame
+        if terminal:
+            return
     if buffered:
         raise ClientError("chat stream ended with an incomplete server-sent event frame")
     raise ClientError("chat stream ended before the terminal [DONE] event")
@@ -212,7 +238,9 @@ def _streamed_body(
     response = upstream.response
     try:
         yield ""
-        if "application/json" in response.headers.get("content-type", ""):
+        content_type = response.headers.get("content-type", "")
+        media_type = content_type.partition(";")[0].strip().lower()
+        if media_type == "application/json":
             # client.stream() leaves body unread; must call read before json.
             response.read()
             payload = response.json()

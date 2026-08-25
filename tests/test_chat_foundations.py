@@ -12,6 +12,7 @@ from flash._internal.openai_sse import (
     OpenAISSEError,
     iter_openai_sse_events,
 )
+from flash.client.http import ClientError
 from flash.serve._chat_transport import OpenAIStreamResponse
 from flash.serve.openai_request import DEFAULT_MAX_TOKENS, OpenAIRequestError, parse_chat_request
 from flash.serve.provenance import (
@@ -21,6 +22,7 @@ from flash.serve.provenance import (
     decode_freesolo_body,
     decode_freesolo_headers,
 )
+from flash.serve.streaming import _complete_sse_frames
 from flash.server.routes.serving_revisions import _authorized_chat_revision
 
 
@@ -167,6 +169,62 @@ def test_decoded_sse_parser_rejects_present_non_object_error(error: object) -> N
         list(iter_openai_sse_events([f'data: {{"error":{json.dumps(error)}}}\n\n']))
 
 
+def test_decoded_sse_parser_accepts_cr_only_line_endings() -> None:
+    payload = 'data: {"choices":[{"delta":{"content":"cr"}}]}\r\rdata: [DONE]\r\r'
+
+    assert list(iter_openai_sse_events(payload)) == [DeltaEvent(None, "cr"), DoneEvent()]
+
+
+def test_decoded_sse_parser_accepts_mixed_line_endings_across_chunks() -> None:
+    chunks = iter(
+        [
+            'data: {"choices":[{"delta":{"content":"mixed"}}]}\r',
+            "\n\r",
+            "data: [DONE]\n",
+            "\r",
+            "\n",
+        ]
+    )
+
+    assert list(iter_openai_sse_events(chunks)) == [DeltaEvent(None, "mixed"), DoneEvent()]
+
+
+def test_decoded_sse_parser_strips_one_initial_bom() -> None:
+    chunks = [
+        '﻿data: {"choices":[{"delta":{"content":"accepted"}}]}\n\n',
+        "data: [DONE]\n\n",
+    ]
+
+    assert list(iter_openai_sse_events(chunks)) == [DeltaEvent(None, "accepted"), DoneEvent()]
+
+
+def test_decoded_sse_parser_strips_only_one_leading_bom() -> None:
+    bom = chr(0xFEFF)
+
+    with pytest.raises(OpenAISSEError, match=r"terminal \[DONE\]"):
+        list(iter_openai_sse_events([f"{bom}{bom}data: [DONE]\n\n"]))
+
+
+def test_decoded_sse_parser_does_not_strip_a_later_event_bom() -> None:
+    chunks = [
+        'data: {"choices":[{"delta":{"content":"first"}}]}\n\n',
+        "﻿data: [DONE]\n\n",
+    ]
+
+    events = iter_openai_sse_events(chunks)
+    assert next(events) == DeltaEvent(None, "first")
+    with pytest.raises(OpenAISSEError, match=r"terminal \[DONE\]"):
+        next(events)
+
+
+def test_decoded_sse_parser_preserves_bom_in_payload_content() -> None:
+    payload = {"choices": [{"delta": {"content": "﻿answer"}}]}
+
+    assert list(
+        iter_openai_sse_events([f"data: {json.dumps(payload)}\n\n", "data: [DONE]\n\n"])
+    ) == [DeltaEvent(None, "﻿answer"), DoneEvent()]
+
+
 def test_decoded_sse_parser_joins_data_lines_only_after_frame_delimiter() -> None:
     chunks = iter(
         [
@@ -204,6 +262,45 @@ class _Context:
     def __exit__(self, *_args):
         self.closed = True
         return False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'data: {"choices":[]}\r\rdata: [DONE]\r\r',
+        b'data: {"choices":[]}\r\n\rdata: [DONE]\n\r\n',
+    ],
+    ids=["cr-only", "mixed"],
+)
+def test_raw_sse_framing_preserves_valid_line_endings_across_byte_chunks(payload: bytes) -> None:
+    chunks = (payload[index : index + 1] for index in range(len(payload)))
+
+    assert b"".join(_complete_sse_frames(chunks)) == payload
+
+
+def test_raw_sse_framing_preserves_an_initial_bom() -> None:
+    payload = b"\xef\xbb\xbfdata: [DONE]\r\r"
+
+    assert b"".join(_complete_sse_frames(iter([payload]))) == payload
+
+
+def test_raw_sse_framing_strips_only_one_leading_bom_for_terminal_detection() -> None:
+    payload = b"\xef\xbb\xbf\xef\xbb\xbfdata: [DONE]\r\r"
+    frames = _complete_sse_frames(iter([payload]))
+
+    assert next(frames) == payload
+    with pytest.raises(ClientError, match=r"terminal \[DONE\]"):
+        next(frames)
+
+
+def test_raw_sse_framing_does_not_accept_a_later_bom_as_terminal() -> None:
+    payload = b'data: {"choices":[]}\n\n\xef\xbb\xbfdata: [DONE]\n\n'
+    frames = _complete_sse_frames(iter([payload]))
+
+    assert next(frames) == b'data: {"choices":[]}\n\n'
+    assert next(frames) == b"\xef\xbb\xbfdata: [DONE]\n\n"
+    with pytest.raises(ClientError, match=r"terminal \[DONE\]"):
+        next(frames)
 
 
 def test_raw_stream_bytes_are_one_shot_and_owned() -> None:
