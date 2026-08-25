@@ -1,117 +1,211 @@
-"""Fire-and-forget usage metering for the serving front door.
+"""Request-scoped durable usage event construction for hosted serving."""
 
-Split out of router.py's app builder. Owns the detached-task set that keeps in-flight billing
-reports alive, so the app factory holds a reporter rather than bare bookkeeping state.
-"""
+from __future__ import annotations
 
-import asyncio
 import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
+from fastapi import Request
+
 from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.usage_outbox import (
+    CapturedPrice,
+    FreesoloOrgTrafficPrincipal,
+    ImmutableTarget,
+    RequestIdentity,
+    ServingTrafficPrincipal,
+    TrustedInternalTrafficPrincipal,
+    UsageEvent,
+    UsageStore,
+    usage_facts,
+)
+
+FREESOLO_PRICING_SOURCE = "freesolo_backend_catalog"
+FREESOLO_PRICING_VERSION = "2026-08-24.1"
+_FREESOLO_USD_PER_MTOK: dict[str, tuple[str, str, str]] = {
+    "Qwen/Qwen3.5-0.8B": ("0.01", "0.05", "0.002"),
+    "Qwen/Qwen3.5-2B": ("0.02", "0.10", "0.004"),
+    "Qwen/Qwen3.5-4B": ("0.03", "0.15", "0.006"),
+    "Qwen/Qwen3.5-9B": ("0.114", "0.19", "0.023"),
+    "Qwen/Qwen3.6-27B": ("0.4254", "3.055", "0.14"),
+    "Qwen/Qwen3.6-35B-A3B": ("0.198", "1.265", "0.066"),
+}
+_FREESOLO_MARKUP = Decimal("1.2")
+_USD_PER_MTOK_DIVISOR = Decimal("1000000")
 
 
-def usage_payload(
-    record: AdapterRecord,
+@dataclass(frozen=True)
+class AuthorizedTraffic:
+    principal: ServingTrafficPrincipal
+    openrouter_request_id: str | None = None
+    openrouter_generation_id: str | None = None
+    upstream_id: str | None = None
+
+
+@dataclass(frozen=True)
+class UsageSession:
+    store: UsageStore
+    identity: RequestIdentity
+    principal: ServingTrafficPrincipal
+    target: ImmutableTarget
+    price: CapturedPrice
+    captured_at: datetime
+    deployment_id: str | None
+    serving_release: str | None
+    attested_adapter: str | None
+
+    def event(self, result: dict[str, Any]) -> UsageEvent:
+        attested_adapter = result.get("lora_request_adapter") or self.attested_adapter
+        evidence = (
+            {"resolved_adapter_revision": attested_adapter}
+            if isinstance(attested_adapter, str) and attested_adapter
+            else {}
+        )
+        return UsageEvent(
+            identity=self.identity,
+            principal=self.principal,
+            target=self.target,
+            price=self.price,
+            captured_at=self.captured_at,
+            deployment_id=self.deployment_id,
+            serving_release=self.serving_release,
+            tokenizer_identity=_optional_text(result.get("tokenizer_identity")),
+            tokenizer_version=_optional_text(result.get("tokenizer_version")),
+            attestation_evidence=evidence,
+            facts=usage_facts(result),
+        )
+
+    async def capture(self, result: dict[str, Any]) -> None:
+        if self.store.enabled:
+            await self.store.capture(self.event(result))
+
+    async def finalize(self, result: dict[str, Any]) -> None:
+        if self.store.enabled:
+            await self.store.finalize(self.event(result))
+
+    async def fail(self, result: dict[str, Any], code: str) -> None:
+        if self.store.enabled:
+            await self.store.fail(self.event(result), code)
+
+
+def new_generation_id() -> str:
+    return f"fsgen-{uuid.uuid4().hex}"
+
+
+def new_request_identity(
+    request: Request,
+    *,
+    openai_completion_id: str | None = None,
+    traffic: AuthorizedTraffic | None = None,
+) -> RequestIdentity:
+    request_id = new_generation_id()
+    supplied_correlation = _bounded_header(request, "X-Correlation-ID")
+    correlation_id = supplied_correlation or str(uuid.uuid4())
+    return RequestIdentity(
+        request_id=request_id,
+        correlation_id=correlation_id,
+        openai_completion_id=openai_completion_id,
+        openrouter_request_id=traffic.openrouter_request_id if traffic else None,
+        openrouter_generation_id=traffic.openrouter_generation_id if traffic else None,
+        upstream_id=traffic.upstream_id if traffic else None,
+    )
+
+
+def build_usage_session(
+    store: UsageStore,
+    identity: RequestIdentity,
+    principal: ServingTrafficPrincipal,
+    requested: AdapterRecord,
+    target: AdapterRecord,
     result: dict[str, Any],
-    caller_org: str | None,
+    *,
     deployment_id: str,
-) -> dict[str, Any] | None:
-    """Backend usage-report body, or None when there's nothing billable to report.
+    serving_release: str,
+    captured_at: datetime,
+) -> UsageSession:
+    resolved_checkpoint = _optional_text(result.get("checkpoint"))
+    public_model_id = (
+        principal.publicModelId if principal.kind == "openrouter" else requested.adapter_id
+    )
+    requested_adapter_id = None if principal.kind == "openrouter" else requested.adapter_id
+    resolved_revision = target.adapter_id if target.is_revision else None
+    immutable_target = ImmutableTarget(
+        public_model_id=public_model_id,
+        base_model=target.base_model,
+        requested_adapter_id=requested_adapter_id,
+        resolved_adapter_revision=resolved_revision,
+        resolved_checkpoint_id=resolved_checkpoint,
+        resolved_hf_revision=target.hf_revision,
+    )
+    price = (
+        CapturedPrice(
+            source="openrouter_admission",
+            version=principal.providerCatalogDigest,
+            snapshot=principal.acceptedPriceSnapshot.model_dump(mode="json"),
+        )
+        if principal.kind == "openrouter"
+        else freesolo_price(target.base_model)
+    )
+    if principal.kind == "trusted_internal" and target.org_id is not None:
+        principal = TrustedInternalTrafficPrincipal(
+            orgId=target.org_id,
+            billingAttributionExplicit=True,
+        )
+    return UsageSession(
+        store=store,
+        identity=identity,
+        principal=principal,
+        target=immutable_target,
+        price=price,
+        captured_at=captured_at,
+        deployment_id=deployment_id or None,
+        serving_release=serving_release or None,
+        attested_adapter=_optional_text(result.get("lora_request_adapter")),
+    )
 
-    A LoRA serve reports by ``adapterId`` — the backend resolves the OWNING org and bills it. A
-    base-model serve has no owner, so it carries the CALLER's ``orgId`` and OMITS ``adapterId``
-    (which is authoritative when present and would fail to resolve for a base model); the backend
-    bills that org. When a base serve has no known caller org (an internal-key server-to-server
-    caller), it is dropped rather than misbilled.
-    """
-    # The engine result is snake_case (the serving API's internal contract); this OUTBOUND
-    # billing payload keeps the platform backend's camelCase keys (a separate service's
-    # contract), so we read snake here and write camel below.
-    prompt_tokens = result.get("prompt_tokens")
-    completion_tokens = result.get("completion_tokens")
-    # The engine reports token counts; without them there is nothing to meter.
-    if prompt_tokens is None or completion_tokens is None:
+
+def freesolo_price(base_model: str) -> CapturedPrice:
+    try:
+        prompt_mtok, completion_mtok, cached_mtok = _FREESOLO_USD_PER_MTOK[base_model]
+    except KeyError as exc:
+        raise ValueError(f"no durable serving price for base model {base_model!r}") from exc
+
+    def per_token(rate: str) -> str:
+        return format(Decimal(rate) * _FREESOLO_MARKUP / _USD_PER_MTOK_DIVISOR, "f")
+
+    return CapturedPrice(
+        source=FREESOLO_PRICING_SOURCE,
+        version=FREESOLO_PRICING_VERSION,
+        snapshot={
+            "prompt_token_usd": per_token(prompt_mtok),
+            "cached_prompt_token_usd": per_token(cached_mtok),
+            "completion_token_usd": per_token(completion_mtok),
+        },
+    )
+
+
+def principal_for_external_org(org_id: str) -> FreesoloOrgTrafficPrincipal:
+    return FreesoloOrgTrafficPrincipal(orgId=org_id)
+
+
+def principal_for_trusted_internal() -> TrustedInternalTrafficPrincipal:
+    return TrustedInternalTrafficPrincipal()
+
+
+def captured_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _bounded_header(request: Request, name: str) -> str | None:
+    value = request.headers.get(name)
+    if value is None:
         return None
-    payload: dict[str, Any] = {
-        "baseModel": record.base_model,
-        "promptTokens": int(prompt_tokens),
-        "completionTokens": int(completion_tokens),
-        # Prefix-cached subset of the prompt (engine num_cached_tokens); billed at a
-        # discount by the backend. Defaults to 0 when the engine doesn't report it.
-        "cachedTokens": int(result.get("cached_tokens") or 0),
-        "cachedTokensReported": result.get("cached_tokens_reported") is True,
-        "gpuSeconds": result.get("inference_time_seconds"),
-        # stable per-generation id from the engine is the backend idempotency key for retries.
-        # fall back to a fresh id only when an offline test pool did not supply one.
-        "requestId": result.get("request_id") or str(uuid.uuid4()),
-        "engineReplicaId": result.get("engine_replica_id"),
-        "servingDeploymentId": deployment_id or None,
-    }
-    if record.serve_base_model:
-        if not caller_org:
-            return None
-        payload["orgId"] = caller_org
-    else:
-        payload["adapterId"] = record.adapter_id
-    return payload
+    stripped = value.strip()
+    return stripped[:512] if stripped else None
 
 
-class UsageReporter:
-    """Schedules usage reports as detached tasks and drains them on shutdown.
-
-    Holds strong refs to the fire-and-forget tasks. asyncio only keeps a WEAK reference to a bare
-    create_task(), so without this the GC can collect a still-pending billing report mid event
-    loop (silently dropping it and emitting "Task was destroyed but it is pending"). The
-    done-callback discards each task once it settles, so the set stays bounded by in-flight count.
-    """
-
-    def __init__(
-        self,
-        report: Any,
-        *,
-        deployment_id: str = "",
-        drain_timeout_seconds: float = 45.0,
-    ) -> None:
-        self._report = report
-        self._deployment_id = deployment_id
-        self._drain_timeout_seconds = drain_timeout_seconds
-        self._pending: set[Any] = set()
-
-    async def _report_safe(self, usage: dict[str, Any]) -> None:
-        # fire-and-forget: the reporter performs its bounded idempotent retries, and any final
-        # failure remains isolated from the response that has already been sent.
-        assert self._report is not None
-        try:
-            await self._report(usage)
-        except Exception as exc:  # never fail the (already-sent) response
-            print(f"serving usage report dropped for {usage.get('requestId')}: {exc!r}", flush=True)
-
-    def schedule(
-        self,
-        record: AdapterRecord,
-        result: dict[str, Any],
-        caller_org: str | None,
-    ) -> None:
-        if self._report is None:
-            return
-        payload = usage_payload(record, result, caller_org, self._deployment_id)
-        if payload is None:
-            return
-        task = asyncio.create_task(self._report_safe(payload))
-        self._pending.add(task)
-        task.add_done_callback(self._pending.discard)
-
-    async def drain(self) -> None:
-        """Settle in-flight reports before their shared client closes.
-
-        The timeout bounds graceful shutdown; any remainder is cancelled and settled so no task
-        can wake against a closed client after a rolling deployment.
-        """
-        if not self._pending:
-            return
-        _, pending = await asyncio.wait(tuple(self._pending), timeout=self._drain_timeout_seconds)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+def _optional_text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None

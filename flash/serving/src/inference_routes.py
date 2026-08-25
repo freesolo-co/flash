@@ -31,6 +31,8 @@ from flash.serving.src.serving_io import (
 )
 from flash.serving.src.streaming import _close_async_iterator
 from flash.serving.src.structured_outputs import StructuredOutputsError
+from flash.serving.src.usage import captured_now, new_request_identity
+from flash.serving.src.usage_outbox import UsageOutboxError
 
 _FLASH_CHECKPOINT_MODEL_RE = re.compile(
     r"(?P<run_id>flash-[0-9]{1,20}-[0-9a-f]{8})/step-[0-9]{1,18}"
@@ -42,19 +44,29 @@ inference_router = APIRouter()
 @inference_router.post("/generate", tags=["inference"])
 async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     context = ServingContext.of(request)
-    caller_org = await context.authorize_inference(request, payload.adapter_id)
+    traffic = await context.authorize_inference(request, payload.adapter_id)
     requested, target = await context.lookup.resolve(payload.adapter_id)
+    context.reject_unsettleable_thinking(payload, target)
     await _prepare_generate_request(payload, target)
-    result = await _await_until_disconnect(
-        request,
-        context.generate(
-            payload,
-            requested,
-            target,
-            expected_checkpoint=_expected_checkpoint(request),
-            caller_org=caller_org,
-        ),
-    )
+    identity = new_request_identity(request, traffic=traffic)
+    admitted_at = captured_now()
+    try:
+        result = await _await_until_disconnect(
+            request,
+            context.generate(
+                payload,
+                requested,
+                target,
+                identity=identity,
+                traffic=traffic,
+                captured_at=admitted_at,
+                expected_checkpoint=_expected_checkpoint(request),
+            ),
+        )
+    except UsageOutboxError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "durable serving accounting unavailable"
+        ) from exc
     return _inference_json_response(result, target)
 
 
@@ -64,20 +76,30 @@ async def generate_for_adapter(
 ) -> JSONResponse:
     context = ServingContext.of(request)
     normalized_adapter_id = _path_adapter_id(adapter_id)
-    caller_org = await context.authorize_inference(request, normalized_adapter_id)
+    traffic = await context.authorize_inference(request, normalized_adapter_id)
     req = _parse_generate({**payload, "adapter_id": adapter_id})
     requested, target = await context.lookup.resolve(req.adapter_id)
+    context.reject_unsettleable_thinking(req, target)
     await _prepare_generate_request(req, target)
-    result = await _await_until_disconnect(
-        request,
-        context.generate(
-            req,
-            requested,
-            target,
-            expected_checkpoint=_expected_checkpoint(request),
-            caller_org=caller_org,
-        ),
-    )
+    identity = new_request_identity(request, traffic=traffic)
+    admitted_at = captured_now()
+    try:
+        result = await _await_until_disconnect(
+            request,
+            context.generate(
+                req,
+                requested,
+                target,
+                identity=identity,
+                traffic=traffic,
+                captured_at=admitted_at,
+                expected_checkpoint=_expected_checkpoint(request),
+            ),
+        )
+    except UsageOutboxError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "durable serving accounting unavailable"
+        ) from exc
     return _inference_json_response(result, target)
 
 
@@ -112,7 +134,7 @@ def _validate_openai_model_id(adapter_id: str) -> None:
 async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     context = ServingContext.of(request)
     adapter_id = _openai_adapter_id(payload)
-    caller_org = await context.authorize_inference(request, adapter_id)
+    traffic = await context.authorize_inference(request, adapter_id)
     _validate_openai_model_id(adapter_id)
     stream = payload.get("stream", False)
     if type(stream) is not bool:
@@ -129,8 +151,11 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         # 422, not 500.
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     req = _parse_generate(fields)
+    context.reject_unsettleable_thinking(req, target)
     await _prepare_generate_request(req, target)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    identity = new_request_identity(request, openai_completion_id=completion_id, traffic=traffic)
+    admitted_at = captured_now()
     created = int(time.time())
     if stream:
         return await _stream_chat_completion(
@@ -143,19 +168,28 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
             completion_id=completion_id,
             created=created,
             include_usage=include_usage,
-            caller_org=caller_org,
+            identity=identity,
+            traffic=traffic,
+            admitted_at=admitted_at,
         )
 
-    generation = await _await_until_disconnect(
-        request,
-        context.generate(
-            req,
-            requested,
-            target,
-            expected_checkpoint=_expected_checkpoint(request),
-            caller_org=caller_org,
-        ),
-    )
+    try:
+        generation = await _await_until_disconnect(
+            request,
+            context.generate(
+                req,
+                requested,
+                target,
+                identity=identity,
+                traffic=traffic,
+                captured_at=admitted_at,
+                expected_checkpoint=_expected_checkpoint(request),
+            ),
+        )
+    except UsageOutboxError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "durable serving accounting unavailable"
+        ) from exc
     # already attested in `generate_once`, before usage was metered; this only strips the field
     # off the body so it does not leak into the OpenAI-shaped response.
     lora_request_adapter = generation.pop("lora_request_adapter", None)
@@ -180,8 +214,8 @@ async def _await_until_disconnect(request: Request, awaitable: Awaitable[Any]) -
     try:
         done, _ = await asyncio.wait({operation, disconnect}, return_when=asyncio.FIRST_COMPLETED)
         # `done` is a SET: if generation finished and the peer left in the same tick, both are in
-        # it. deciding on the disconnect first discards a result whose `schedule_usage` already
-        # ran, billing the caller for a response nobody receives. resolve the tie toward the
+        # it. deciding on the disconnect first discards a completed, durably finalized result.
+        # resolve the tie toward the
         # operation, matching the packaged helper in flash/serve/app/http.py.
         if operation in done:
             return operation.result()
@@ -201,19 +235,11 @@ async def _wait_for_disconnect(request: Request) -> None:
             return
 
 
-async def _discard_prepared_stream(
-    context: ServingContext,
-    requested: Any,
-    caller_org: str | None,
-    events: Any,
-) -> None:
+async def _discard_prepared_stream(usage_session: Any, events: Any) -> None:
     try:
-        # prepare_stream always returns a replay iterator whose first advance is already-resolved.
-        # advancing it activates the wrapper's finally block and preserves billing for first-output
-        # work that won the race with a disconnect, without waiting for another engine event.
         first = await anext(events)
         if first.get("prompt_tokens") is not None and first.get("completion_tokens") is not None:
-            context.schedule_usage(requested, first, caller_org)
+            await usage_session.fail(first, "client_disconnected")
     except StopAsyncIteration:
         pass
     finally:
@@ -231,26 +257,41 @@ async def _stream_chat_completion(
     completion_id: str,
     created: int,
     include_usage: bool,
-    caller_org: str | None,
+    identity: Any,
+    traffic: Any,
+    admitted_at: Any,
 ) -> StreamingResponse:
     preparation = asyncio.create_task(
         context.prepare_stream(
             req,
             requested,
             target,
+            generation_id=identity.request_id,
             expected_checkpoint=_expected_checkpoint(request),
         )
     )
     disconnect = asyncio.create_task(_wait_for_disconnect(request))
     prepared = None
+    usage_session = None
     transferred = False
     try:
         done, _ = await asyncio.wait({preparation, disconnect}, return_when=asyncio.FIRST_COMPLETED)
-        if disconnect in done:
+        if preparation not in done:
             disconnect.result()
             raise asyncio.CancelledError
         prepared = preparation.result()
-        events, checkpoint_headers, thinking = prepared
+        events, checkpoint_headers, thinking, first = prepared
+        usage_session = context.usage_session(
+            identity, traffic, requested, target, first, admitted_at
+        )
+        try:
+            await usage_session.capture(first)
+        except UsageOutboxError as exc:
+            await _close_async_iterator(events)
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "durable serving accounting unavailable",
+            ) from exc
         response = StreamingResponse(
             context.chat_stream(
                 record=requested,
@@ -259,7 +300,7 @@ async def _stream_chat_completion(
                 completion_id=completion_id,
                 created=created,
                 include_usage=include_usage,
-                caller_org=caller_org,
+                usage_session=usage_session,
                 thinking=thinking,
             ),
             media_type="text/event-stream",
@@ -284,4 +325,9 @@ async def _stream_chat_completion(
         if prepared is None and isinstance(preparation_result, tuple):
             prepared = preparation_result
         if prepared is not None and not transferred:
-            await _discard_prepared_stream(context, requested, caller_org, prepared[0])
+            if usage_session is None:
+                first = prepared[3]
+                usage_session = context.usage_session(
+                    identity, traffic, requested, target, first, admitted_at
+                )
+            await _discard_prepared_stream(usage_session, prepared[0])

@@ -12,6 +12,8 @@ import sys
 import types
 from typing import Any
 
+from flash.serving.src.usage_outbox import OfflineUsageStore, UsageEvent, UsageOutboxError
+
 
 def _install_vllm_stub() -> None:
     try:
@@ -180,6 +182,35 @@ def _install_vllm_stub() -> None:
 
 
 _install_vllm_stub()
+
+
+class RecordingUsageStore(OfflineUsageStore):
+    enabled = True
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail_writes = fail
+        self.captured: list[UsageEvent] = []
+        self.finalized: list[UsageEvent] = []
+        self.failed: list[tuple[UsageEvent, str]] = []
+        self.closed = False
+
+    async def capture(self, event: UsageEvent) -> None:
+        if self.fail_writes:
+            raise UsageOutboxError("usage store failure")
+        self.captured.append(event)
+
+    async def finalize(self, event: UsageEvent) -> None:
+        if self.fail_writes:
+            raise UsageOutboxError("usage store failure")
+        self.finalized.append(event)
+
+    async def fail(self, event: UsageEvent, code: str) -> None:
+        if self.fail_writes:
+            raise UsageOutboxError("usage store failure")
+        self.failed.append((event, code))
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def attest(record: Any, result: dict[str, Any]) -> dict[str, Any]:

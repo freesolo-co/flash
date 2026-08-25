@@ -17,7 +17,8 @@ from flash.serving.src.persistence import (
     PersistenceRecordError,
     PersistenceReferenceError,
 )
-from flash.serving.src.router import AdapterRouter, build_serving_app
+from flash.serving.src.router import AdapterRouter
+from flash.serving.src.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.schemas import (
     AdapterRecord,
     ImmutableAdapterRegistration,

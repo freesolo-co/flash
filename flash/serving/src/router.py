@@ -10,6 +10,7 @@ through ``ServingContext``, which this builder attaches to ``app.state``.
 # Do NOT add `from __future__ import annotations`: the FastAPI handlers use closure-local body
 # models as annotations, which the future import turns into unresolvable strings -> silent 422.
 
+import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -24,10 +25,10 @@ from flash.serving.src.inference_routes import inference_router
 from flash.serving.src.lookup import AdapterLookup
 from flash.serving.src.routing import AdapterRouter, EnginePool, health_body
 from flash.serving.src.schemas import AdapterRecord
-from flash.serving.src.usage import UsageReporter
+from flash.serving.src.usage_outbox import OfflineUsageStore, UsageStore
 
 THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY = "thinking_structured_outputs_deferred_v1"
-_USAGE_REPORT_DRAIN_TIMEOUT_SECONDS = 45.0
+_CLEANUP_TIMEOUT_SECONDS = 10.0
 
 _CAPABILITIES = (
     "immutable_adapter_revisions",
@@ -35,6 +36,15 @@ _CAPABILITIES = (
     "revision_provenance",
     THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY,
 )
+
+
+def build_offline_serving_app(
+    pool: EnginePool,
+    router: AdapterRouter,
+    **kwargs: Any,
+):
+    """Build an explicitly unmetered app for hermetic tests and local offline use."""
+    return build_serving_app(pool, router, usage_store=OfflineUsageStore(), **kwargs)
 
 
 def build_serving_app(
@@ -47,7 +57,7 @@ def build_serving_app(
     reload_records: Callable[[], list[AdapterRecord]] | None = None,
     lookup_record: Callable[[str], AdapterRecord | None] | None = None,
     reload_interval_seconds: float = 30.0,
-    usage_reporter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    usage_store: UsageStore,
     chat_authorizer: Callable[[str, str], Awaitable["str | None"]] | None = None,
 ):
     """Front-door FastAPI app. ``reload_records`` re-reads persisted ready adapters so a router
@@ -57,11 +67,9 @@ def build_serving_app(
     ``lookup_record`` reads one persisted adapter regardless of lifecycle status for control-plane
     status requests. Its result is never inserted into the ready-only routing registry.
 
-    ``usage_reporter`` (optional) is called fire-and-forget after each successful generation with
-    a usage dict (adapterId, baseModel, promptTokens, completionTokens, cachedTokens, gpuSeconds,
-    requestId, engineReplicaId, servingDeploymentId, cachedTokensReported) so the backend can
-    meter/bill it. It runs as a managed detached task, and its failures are swallowed so metering
-    never affects serving latency or success. Pending reports drain before the shared client closes.
+    ``usage_store`` is explicit: hosted construction passes the durable store, while offline tests
+    must deliberately pass ``OfflineUsageStore``. There is no configuration-based fallback from a
+    partially wired hosted deployment to unmetered serving.
 
     External chat/inference auth is ALWAYS enforced. ``chat_authorizer`` authorizes a user request:
     it is called with ``(freesolo_api_key, adapter_id)`` and must raise an ``HTTPException`` (401/403)
@@ -79,12 +87,10 @@ def build_serving_app(
             lookup_record=lookup_record,
             reload_interval_seconds=reload_interval_seconds,
         ),
-        UsageReporter(
-            usage_reporter,
-            deployment_id=deployment_id,
-            drain_timeout_seconds=_USAGE_REPORT_DRAIN_TIMEOUT_SECONDS,
-        ),
+        usage_store,
         internal_key=internal_key,
+        deployment_id=deployment_id,
+        serving_release=deployment_sha,
         reload_records=reload_records,
         lookup_record=lookup_record,
         chat_authorizer=chat_authorizer,
@@ -93,7 +99,7 @@ def build_serving_app(
     api = FastAPI(
         title="Freesolo LoRA Serving (multi base model)",
         version="0.2.0",
-        lifespan=_lifespan_for(context, usage_reporter, chat_authorizer),
+        lifespan=_lifespan_for(context, chat_authorizer),
     )
     setattr(api.state, APP_STATE_ATTR, context)
     # fastapi resolves body parameters before handlers run, so cap the raw receive channel first.
@@ -115,24 +121,21 @@ def build_serving_app(
 
 def _lifespan_for(
     context: ServingContext,
-    usage_reporter: Any,
     chat_authorizer: Any,
 ):
     """Build the app's ordered shutdown lifespan."""
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: "FastAPI"):
+        await context.usage.start()
         yield
-        # drain detached usage reports before closing their shared client.
-        await context.usage.drain()
+        await context.usage.aclose()
 
-        # Close persistent httpx clients (usage reporter + chat authorizer) on shutdown so
-        # long-lived containers don't leak sockets / emit "Unclosed client" ResourceWarnings.
-        for client_owner in (usage_reporter, chat_authorizer):
+        # close persistent authorization clients on shutdown.
+        for client_owner in (chat_authorizer,):
             aclose = getattr(client_owner, "aclose", None)
             if aclose is not None:
-                # best-effort cleanup must not fail shutdown
                 with contextlib.suppress(Exception):
-                    await aclose()
+                    await asyncio.wait_for(aclose(), timeout=_CLEANUP_TIMEOUT_SECONDS)
 
     return _lifespan

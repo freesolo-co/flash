@@ -23,8 +23,17 @@ from flash.serving.src.multimodal import (
     prepare_multimodal_request,
 )
 from flash.serving.src.registry import AdapterRegistry
-from flash.serving.src.router import AdapterRouter, build_serving_app
+from flash.serving.src.router import (
+    AdapterRouter,
+)
+from flash.serving.src.router import (
+    build_offline_serving_app as build_serving_app,
+)
+from flash.serving.src.router import (
+    build_serving_app as build_durable_serving_app,
+)
 from flash.serving.src.schemas import AdapterRecord, GenerateRequest
+from tests.serving.conftest import RecordingUsageStore
 
 QWEN = "Qwen/Qwen3.5-0.8B"
 QWEN_2B = "Qwen/Qwen3.5-2B"
@@ -747,8 +756,8 @@ class _Pool:
         return None
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
-    return None
+async def _allow(_token: str, _adapter_id: str) -> str:
+    return "org-1"
 
 
 def _client(base_model: str) -> tuple[TestClient, _Pool]:
@@ -987,24 +996,22 @@ def test_a_refused_attestation_is_never_metered(monkeypatch) -> None:
     # already been billed for a generation we then rejected with a 502. the check has to run
     # before metering, not after it.
     _unattesting_pool(monkeypatch)
-    reported: list[dict[str, Any]] = []
-
-    async def record_usage(payload: dict[str, Any]) -> None:
-        reported.append(payload)
-
-    revision = _revision(QWEN)
-    app = build_serving_app(
+    store = RecordingUsageStore()
+    revision = _revision(QWEN).model_copy(update={"thinking": False})
+    app = build_durable_serving_app(
         _Pool(),
         AdapterRouter([revision, _alias(revision)]),
         chat_authorizer=_allow,
-        usage_reporter=record_usage,
+        usage_store=store,
     )
     client = TestClient(app, headers={"Authorization": "Bearer test"})
 
     response = client.post("/generate", json={"adapter_id": REVISION_ID, "prompt": "hi"})
 
     assert response.status_code == 502
-    assert reported == []
+    assert store.captured == []
+    assert store.finalized == []
+    assert store.failed == []
 
 
 def test_mismatched_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> None:
