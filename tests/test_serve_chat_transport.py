@@ -492,10 +492,15 @@ def test_chat_stream_yields_openai_sse_content(monkeypatch):
             return iter(
                 [
                     'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}',
+                    "",
                     'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}',
+                    "",
                     'data: {"choices":[{"delta":{"content":" there"},"finish_reason":null}]}',
+                    "",
                     'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                    "",
                     "data: [DONE]",
+                    "",
                 ]
             )
 
@@ -552,10 +557,15 @@ def test_chat_stream_uses_the_deploy_delimiter_patch_seam(monkeypatch):
     upstream = StreamResponse(
         line_chunks=(
             'data: {"choices":[{"delta":{"reasoning_content":"reason"}}]}',
+            "",
             'data: {"choices":[{"delta":{"content":"reason"}}]}',
+            "",
             'data: {"choices":[{"delta":{"content":"</think>"}}]}',
+            "",
             'data: {"choices":[{"delta":{"content":"answer"}}]}',
+            "",
             "data: [DONE]",
+            "",
         )
     )
     client = StreamClient(StreamContext(upstream))
@@ -583,6 +593,7 @@ def test_chat_stream_rejects_sse_eof_without_done(monkeypatch):
 
         def iter_lines(self):
             yield 'data: {"choices":[{"delta":{"content":"partial"}}]}'
+            yield ""
 
     class _Context:
         def __enter__(self):
@@ -696,6 +707,7 @@ class _MidstreamFailureResp:
 
     def iter_lines(self):
         yield 'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}'
+        yield ""
         raise RuntimeError("upstream connection lost")
 
 

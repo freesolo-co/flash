@@ -60,6 +60,19 @@ def test_canonical_request_parser_owns_defaults_and_strict_schema() -> None:
             )
 
 
+@pytest.mark.parametrize("field", ["temperature", "top_p"])
+def test_request_parser_rejects_numeric_overflow_as_a_controlled_error(field: str) -> None:
+    with pytest.raises(OpenAIRequestError, match=f"{field} must be a finite number"):
+        parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                field: 10**400,
+            },
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
 def test_thinking_import_does_not_load_deploy() -> None:
     result = subprocess.run(
         [
@@ -82,21 +95,21 @@ def test_decoded_sse_parser_yields_typed_events_and_requires_done() -> None:
     events = list(
         iter_openai_sse_events(
             [
-                'data: {"choices":[{"delta":{"reasoning_content":"r"}}]}\n',
-                'data: {"choices":[{"delta":{"content":"a"}}]}\n',
-                "data: [DONE]\n",
+                'data: {"choices":[{"delta":{"reasoning_content":"r"}}]}\n\n',
+                'data: {"choices":[{"delta":{"content":"a"}}]}\n\n',
+                "data: [DONE]\n\n",
             ]
         )
     )
     assert events == [DeltaEvent("r", None), DeltaEvent(None, "a"), DoneEvent()]
 
     with pytest.raises(OpenAISSEError, match=r"terminal \[DONE\]"):
-        list(iter_openai_sse_events(['data: {"choices":[{"delta":{"content":"partial"}}]}\n']))
+        list(iter_openai_sse_events(['data: {"choices":[{"delta":{"content":"partial"}}]}\n\n']))
 
 
 @pytest.mark.parametrize("payload", [{}, {"choices": []}])
 def test_decoded_sse_parser_accepts_absent_or_empty_choices(payload: dict) -> None:
-    events = list(iter_openai_sse_events([f"data: {json.dumps(payload)}\n", "data: [DONE]\n"]))
+    events = list(iter_openai_sse_events([f"data: {json.dumps(payload)}\n\n", "data: [DONE]\n\n"]))
 
     assert events == [DoneEvent()]
 
@@ -104,13 +117,39 @@ def test_decoded_sse_parser_accepts_absent_or_empty_choices(payload: dict) -> No
 @pytest.mark.parametrize("choices", [{}, "", 0, False, None])
 def test_decoded_sse_parser_rejects_present_non_array_choices(choices: object) -> None:
     with pytest.raises(OpenAISSEError, match="choices must be an array"):
-        list(iter_openai_sse_events([f'data: {{"choices":{json.dumps(choices)}}}\n']))
+        list(iter_openai_sse_events([f'data: {{"choices":{json.dumps(choices)}}}\n\n']))
 
 
 @pytest.mark.parametrize("choice", [None, "", 0, False, []])
 def test_decoded_sse_parser_rejects_non_object_choice_entries(choice: object) -> None:
     with pytest.raises(OpenAISSEError, match="choice must be an object"):
-        list(iter_openai_sse_events([f'data: {{"choices":[{json.dumps(choice)}]}}\n']))
+        list(iter_openai_sse_events([f'data: {{"choices":[{json.dumps(choice)}]}}\n\n']))
+
+
+@pytest.mark.parametrize("delta", [None, "", 0, False, []])
+def test_decoded_sse_parser_rejects_present_non_object_delta(delta: object) -> None:
+    with pytest.raises(OpenAISSEError, match="delta must be an object"):
+        list(iter_openai_sse_events([f'data: {{"choices":[{{"delta":{json.dumps(delta)}}}]}}\n\n']))
+
+
+def test_decoded_sse_parser_joins_data_lines_only_after_frame_delimiter() -> None:
+    chunks = iter(
+        [
+            'data: {"choices":\n',
+            'data: [{"delta":{"content":"joined"}}]}\n',
+            "\n",
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    events = iter_openai_sse_events(chunks)
+    assert next(events) == DeltaEvent(None, "joined")
+    assert next(events) == DoneEvent()
+
+
+def test_decoded_sse_parser_rejects_complete_line_without_frame_delimiter() -> None:
+    with pytest.raises(OpenAISSEError, match="incomplete server-sent event frame"):
+        list(iter_openai_sse_events(['data: {"choices":[]}\n']))
 
 
 class _Response:

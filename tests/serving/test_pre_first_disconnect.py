@@ -311,6 +311,7 @@ def test_connected_preparation_preserves_headers_events_and_usage() -> None:
                         "prompt_tokens": 2,
                         "completion_tokens": 1,
                         "request_id": "req-connected",
+                        "lora_request_adapter": record.adapter_id,
                     }
                     yield {
                         "type": "delta",

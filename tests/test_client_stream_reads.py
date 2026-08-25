@@ -93,7 +93,7 @@ def test_chat_stream_decodes_raw_openai_sse_for_cli_callers(
         b"data: [DONE]\n\n"
     )
     response = _Read1Response(payload)
-    response.headers = {"Content-Type": "text/event-stream"}
+    response.headers = {"Content-Type": "Text/Event-Stream; Charset=UTF-8"}
     monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
 
     chunks = list(ApiClient("http://test").chat_stream("run-a", []))

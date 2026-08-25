@@ -34,20 +34,23 @@ def iter_openai_sse_events(chunks: Iterable[str]) -> Iterator[OpenAISSEEvent]:
     """decode arbitrary text chunks and require one terminal event."""
 
     buffered = ""
-    terminal = False
+    frame_lines: list[str] = []
     for chunk in chunks:
         buffered += chunk
         while "\n" in buffered:
             line, buffered = buffered.split("\n", 1)
-            for event in _events_from_line(line.rstrip("\r")):
+            line = line.rstrip("\r")
+            if line:
+                frame_lines.append(line)
+                continue
+            for event in _events_from_frame(frame_lines):
                 yield event
                 if isinstance(event, DoneEvent | ErrorEvent):
-                    terminal = True
                     return
-    if buffered.strip():
+            frame_lines = []
+    if buffered or frame_lines:
         raise OpenAISSEError("chat stream ended with an incomplete server-sent event frame")
-    if not terminal:
-        raise OpenAISSEError("chat stream ended before the terminal [DONE] event")
+    raise OpenAISSEError("chat stream ended before the terminal [DONE] event")
 
 
 def sse_data_is_terminal(data: bytes) -> bool:
@@ -77,10 +80,16 @@ def sse_data_is_terminal(data: bytes) -> bool:
     )
 
 
-def _events_from_line(line: str) -> tuple[OpenAISSEEvent, ...]:
-    if not line.startswith("data:"):
+def _events_from_frame(lines: list[str]) -> tuple[OpenAISSEEvent, ...]:
+    data_lines = []
+    for line in lines:
+        if not line.startswith("data:"):
+            continue
+        data = line.removeprefix("data:")
+        data_lines.append(data.removeprefix(" "))
+    if not data_lines:
         return ()
-    data = line.removeprefix("data:").strip()
+    data = "\n".join(data_lines)
     if not data:
         return ()
     if data == "[DONE]":
@@ -104,9 +113,9 @@ def _events_from_line(line: str) -> tuple[OpenAISSEEvent, ...]:
         if choice.get("finish_reason") == "error":
             events.append(ErrorEvent("chat stream ended with an engine error"))
             continue
-        delta = choice.get("delta") or {}
+        delta = choice.get("delta", {})
         if not isinstance(delta, dict):
-            continue
+            raise OpenAISSEError("chat stream delta must be an object")
         reasoning = delta.get("reasoning_content")
         content = delta.get("content")
         normalized_reasoning = reasoning if isinstance(reasoning, str) else None

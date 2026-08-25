@@ -85,7 +85,10 @@ class _Pool:
         )
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        yield {"type": "ready", "checkpoint": "", "thinking": self._thinking}
+        yield attest(
+            record,
+            {"type": "ready", "checkpoint": "", "thinking": self._thinking},
+        )
         for delta in self._deltas:
             yield {"type": "delta", "text": delta}
         yield {"type": "final", "finish_reason": "stop"}
@@ -101,7 +104,9 @@ class _NoReadyPool(_Pool):
     """Streams without a leading ``ready`` event, so the router takes the replay path."""
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        for delta in self._deltas:
+        first, *remaining = self._deltas
+        yield attest(record, {"type": "delta", "text": first})
+        for delta in remaining:
             yield {"type": "delta", "text": delta}
         yield {"type": "final", "finish_reason": "stop"}
 

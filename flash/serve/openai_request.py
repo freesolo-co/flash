@@ -147,7 +147,10 @@ def _max_tokens(value: object) -> int:
 def _finite_number(value: object, name: str) -> float:
     if type(value) not in {int, float}:
         raise OpenAIRequestError(f"{name} must be a finite number")
-    normalized = float(cast("int | float", value))
+    try:
+        normalized = float(cast("int | float", value))
+    except OverflowError as exc:
+        raise OpenAIRequestError(f"{name} must be a finite number") from exc
     if not math.isfinite(normalized):
         raise OpenAIRequestError(f"{name} must be a finite number")
     return normalized

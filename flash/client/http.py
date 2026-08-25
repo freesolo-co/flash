@@ -857,7 +857,8 @@ class ApiClient:
             urllib.request.urlopen(req, timeout=30 * 60) as resp,
         ):
             content_type = resp.headers.get("Content-Type", "")
-            if "application/json" in content_type:
+            media_type = content_type.partition(";")[0].strip().lower()
+            if media_type == "application/json":
                 payload = self._decode_response(
                     f"/v1/runs/{base_run_id}/chat",
                     resp.read(),
@@ -890,7 +891,7 @@ class ApiClient:
 
             try:
                 chunks = decoded_chunks()
-                if "text/event-stream" in content_type:
+                if media_type == "text/event-stream":
                     yield from _openai_sse_text(chunks)
                 else:
                     yield from chunks
