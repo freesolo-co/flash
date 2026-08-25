@@ -9,11 +9,11 @@ from flash.core.spec import JobSpec
     ("model", "expected_cap"),
     [
         ("Qwen/Qwen3.5-9B", 32768),
-        ("Qwen/Qwen3.8-27B", 32768),
+        ("Qwen/Qwen3.8-27B", None),
         ("Qwen/Qwen3.6-35B-A3B", 32768),
     ],
 )
-def test_serving_context_cap(model: str, expected_cap: int) -> None:
+def test_serving_context_cap(model: str, expected_cap: int | None) -> None:
     assert serving_context_cap(model) == expected_cap
 
 

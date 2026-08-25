@@ -1261,6 +1261,23 @@ def test_text_only_parquet_preserves_reasoning_first_authored_on_a_later_row(tmp
     assert "reasoning_content" in restored.features["prompt"].feature
 
 
+def test_grpo_reasoning_only_assistant_round_trips_with_empty_content(tmp_path):
+    rows = rl_train.build_verl_dataset_rows(
+        [[{"role": "assistant", "content": None, "reasoning_content": "working"}]],
+        [0],
+        ["a"],
+    )
+    path = str(tmp_path / "reasoning-only.parquet")
+
+    rl_train.write_verl_grpo_parquet(rows, path)
+
+    datasets = pytest.importorskip("datasets")
+    restored = datasets.Dataset.from_parquet(path)
+    assert restored[0]["prompt"] == [
+        {"role": "assistant", "content": "", "reasoning_content": "working"}
+    ]
+
+
 def test_grpo_rows_reject_non_string_authored_reasoning():
     with pytest.raises(ValueError, match="reasoning_content must be text"):
         rl_train.build_verl_dataset_rows(

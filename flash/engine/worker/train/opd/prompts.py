@@ -12,14 +12,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING
 
 from flash.content.multimodal import messages_with_decoded_images
 from flash.content.thinking import messages_for_chat_template
 from flash.engine.worker.train.opd.gkd import _trim_trailing_stop
-
-if TYPE_CHECKING:  # the prompt record, for annotations only -- it lives in the orchestrator
-    from flash.engine.worker.opd_train import _BridgePrompt
+from flash.engine.worker.train.opd.state import _BridgePrompt
 
 
 def _prompt_pool_fingerprint(prompts: list[_BridgePrompt]) -> str:

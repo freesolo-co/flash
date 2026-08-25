@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import threading
 import time
-from dataclasses import dataclass
 
 from flash.engine.plan.recipe import RECIPE  # noqa: F401
 from flash.engine.plan.steps import (  # noqa: F401
@@ -89,17 +88,6 @@ class _RecordedMutationCallbackFailure(RuntimeError):
     def __init__(self, classification: str, message: str) -> None:
         super().__init__(message)
         self.classification = classification
-
-
-@dataclass(frozen=True)
-class _BridgePrompt:
-    student_messages: list[dict]
-    teacher_messages: list[dict]
-    prompt_ids: tuple[int, ...]
-    image_descriptors: tuple[str, ...]
-    package_root: str | None
-    example: dict | None = None
-    image_digests: tuple[str, ...] = ()
 
 
 class _OpdProgressState:
@@ -532,3 +520,6 @@ from flash.engine.worker.train.opd.prompts import (  # noqa: E402,F401
     _validate_forced_mask,
     encode_shifted_group_metadata,
 )
+
+# immutable prompt state, re-exported because the opd tests construct it from this facade.
+from flash.engine.worker.train.opd.state import _BridgePrompt  # noqa: E402,F401

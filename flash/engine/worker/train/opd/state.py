@@ -7,6 +7,17 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class _BridgePrompt:
+    student_messages: list[dict]
+    teacher_messages: list[dict]
+    prompt_ids: tuple[int, ...]
+    image_descriptors: tuple[str, ...]
+    package_root: str | None
+    example: dict | None = None
+    image_digests: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class _OpdRequest:
     spec: Any
     env: Any

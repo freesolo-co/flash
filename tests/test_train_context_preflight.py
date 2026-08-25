@@ -42,16 +42,12 @@ def test_sft_max_context_tokens_at_cap_allowed():
     )
 
 
-def test_pending_hosted_candidate_retains_serving_context_metadata():
-    preflight_train_context_within_serving(
-        _spec(model="Qwen/Qwen3.8-27B", algorithm="sft", max_context_tokens=32768)
-    )
+def test_inactive_hosted_candidate_does_not_constrain_training_context():
     for spec in (
         _spec(model="Qwen/Qwen3.8-27B", algorithm="sft", max_context_tokens=32769),
         _spec(model="Qwen/Qwen3.8-27B", algorithm="grpo", max_completion_tokens=40000),
     ):
-        with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
-            preflight_train_context_within_serving(spec)
+        preflight_train_context_within_serving(spec)
 
 
 def test_sft_unset_max_context_tokens_allowed():
@@ -109,9 +105,8 @@ def test_opd_rollout_context_within_serving_cap_allowed():
 
 
 def test_a_model_without_a_serving_entry_is_skipped(monkeypatch):
-    # serving_context_cap is None -> the preflight is a no-op even for a huge context. Every
-    # current catalog entry declares `serving`, so the None branch is reached by clearing it on a
-    # curated model rather than by naming an uncataloged one (submit rejects those outright).
+    # clear an active model's serving entry to prove this branch follows catalog state rather than
+    # relying only on the naturally inactive hosted candidate.
     from dataclasses import replace
 
     import flash.core.catalog as catalog

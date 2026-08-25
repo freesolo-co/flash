@@ -20,7 +20,6 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler
-from typing import TYPE_CHECKING
 
 from flash.content.multimodal import normalize_environment_reply
 from flash.engine.worker.entry.opd import _drop_fully_forced_groups
@@ -56,12 +55,9 @@ from flash.engine.worker.train.opd.scoring import (
     score_multimodal_items,
     score_rollout,
 )
+from flash.engine.worker.train.opd.state import _BridgePrompt
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
-
-if TYPE_CHECKING:  # annotation-only: `opd_train` imports this module, so a runtime import
-    # here would be circular. the raise below goes through `_opd_train()`.
-    from flash.engine.worker.opd_train import _BridgePrompt
 
 
 def _opd_train():

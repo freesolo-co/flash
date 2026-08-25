@@ -25,8 +25,18 @@ def canonical_prompt_messages(
         if not isinstance(role, str) or not role.strip():
             raise ValueError(f"prompt message {position} has an invalid role")
         content = message.get("content")
+        reasoning = message.get("reasoning_content")
+        if "reasoning_content" in message and not isinstance(reasoning, str):
+            raise ValueError("prompt reasoning_content must be text")
         if isinstance(content, str):
             rendered = content
+        elif (
+            content is None
+            and "content" in message
+            and role == "assistant"
+            and isinstance(reasoning, str)
+        ):
+            rendered = ""
         elif isinstance(content, list):
             parts: list[str] = []
             for block_index, block in enumerate(content):
@@ -53,10 +63,7 @@ def canonical_prompt_messages(
         else:
             raise ValueError(f"prompt message {position} content must be text or content blocks")
         row = {"role": role, "content": rendered}
-        if "reasoning_content" in message:
-            reasoning = message["reasoning_content"]
-            if not isinstance(reasoning, str):
-                raise ValueError("prompt reasoning_content must be text")
+        if isinstance(reasoning, str):
             row["reasoning_content"] = reasoning
         normalized.append(row)
     return normalized

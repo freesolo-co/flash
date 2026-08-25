@@ -76,12 +76,11 @@ def test_preflight_accepts_child_rank_and_alpha_mismatches():
     assert metadata.alpha == 128
 
 
-@pytest.mark.parametrize("model", ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B"])
-def test_preflight_rejects_adapter_rank_above_serving_cap(model):
+def test_preflight_rejects_adapter_rank_above_serving_cap():
     from flash.core.catalog import serving_lora_rank_cap
 
-    # each tier's own cap, read from the catalog. these were pinned to a shared literal 64, which
-    # silently stopped testing the 4B once its cap rose to 128 -- rank 96 then FITS.
+    model = "Qwen/Qwen3.5-9B"
+    # read the active hosted model's cap so catalog changes cannot make the rejection case fit.
     cap = serving_lora_rank_cap(model)
     assert cap is not None
     adapter_rank = cap + 1
@@ -92,6 +91,23 @@ def test_preflight_rejects_adapter_rank_above_serving_cap(model):
                 r=adapter_rank, base_model_name_or_path=model
             ),
         )
+
+
+def test_inactive_hosted_candidate_has_no_serving_rank_cap():
+    from flash.core.catalog import serving_lora_rank_cap
+
+    model = "Qwen/Qwen3.8-27B"
+    assert serving_lora_rank_cap(model) is None
+    metadata = preflight_init_adapter_lora_rank(
+        _spec(model=model),
+        config_loader=lambda _ref, _token, _revision: _config(
+            r=256,
+            lora_alpha=512,
+            base_model_name_or_path=model,
+        ),
+    )
+    assert metadata is not None
+    assert metadata.rank == 256
 
 
 @pytest.mark.parametrize("field", ["rank_pattern", "alpha_pattern"])

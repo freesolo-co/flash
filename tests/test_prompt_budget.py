@@ -133,10 +133,9 @@ def test_grpo_worker_keeps_clamp_and_value_error_contract(monkeypatch, capsys) -
 
 
 def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int = 32768):
-    import flash.engine.worker.opd_train as opd_train
     import flash.engine.worker.teacher.client as teacher_client
     from flash.engine.worker.entry.opd import OpdKnobs
-    from flash.engine.worker.opd_train_runner import _prepare_prompts
+    from flash.engine.worker.train.opd import prompt_preparation
     from flash.engine.worker.train.opd.state import _OpdRequest
 
     class Tokenizer:
@@ -146,13 +145,19 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
         def apply_chat_template(self, *_args, **_kwargs):
             return list(range(100))
 
-    monkeypatch.setattr(opd_train._w, "THINKING", False)
-    monkeypatch.setattr(opd_train._w, "load_tokenizer", lambda *_args, **_kwargs: Tokenizer())
-    monkeypatch.setattr(opd_train, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(prompt_preparation._w, "THINKING", False)
+    monkeypatch.setattr(prompt_preparation, "load_tokenizer", lambda *_args, **_kwargs: Tokenizer())
+    monkeypatch.setattr(prompt_preparation, "_thinking_prefill_text", lambda _tokenizer: "")
     monkeypatch.setattr(
-        opd_train, "model_max_position_embeddings", lambda *_args: architecture_limit
+        prompt_preparation,
+        "model_max_position_embeddings",
+        lambda *_args: architecture_limit,
     )
-    monkeypatch.setattr(opd_train, "liveness_heartbeat", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        prompt_preparation,
+        "liveness_heartbeat",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
     monkeypatch.setattr(teacher_client, "TeacherClient", lambda *_args, **_kwargs: object())
     request = _OpdRequest(
         spec=None,
@@ -163,7 +168,7 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
         model_id="Qwen/Qwen3.5-9B",
         model_revision="",
     )
-    state = _prepare_prompts(
+    state = prompt_preparation.prepare_prompts(
         request,
         [({}, [{"role": "user", "content": "question"}])],
         False,
