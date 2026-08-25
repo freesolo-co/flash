@@ -525,7 +525,7 @@ def build_worker_env(payload: dict) -> dict:
         env["FLASH_JOB_SPEC_JSON"] = spec_json
     env["PHASE"] = payload["phase"]
     env["SEED"] = str(payload["seed"])
-    # drives the poller's stale-heartbeat rejection across retries.
+    # binds every worker artifact to this reserved attempt.
     attempt = payload.get("attempt")
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise RuntimeError("bootstrap attempt identity is invalid")
@@ -765,50 +765,6 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         )
         raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
     return proc.returncode
-
-
-def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bool = False) -> None:
-    """Upload one identity-bound terminal marker using the strict poller schema."""
-    attempt = payload.get("attempt")
-    run_id = payload.get("run_id")
-    if (
-        isinstance(attempt, bool)
-        or not isinstance(attempt, int)
-        or not 0 <= attempt <= _MAX_ATTEMPT_ID
-    ):
-        raise RuntimeError("attempt marker identity is invalid")
-    if not isinstance(run_id, str) or not run_id:
-        raise RuntimeError("attempt marker identity is invalid")
-    if type(ok) is not bool or type(retriable) is not bool:
-        raise RuntimeError("attempt marker state is invalid")
-    if not isinstance(error, str):
-        raise RuntimeError("attempt marker error is invalid")
-    _canonical_deadline_at(payload)
-    now = _finite_positive_number(time.time(), "current clock")
-    marker = {
-        "attempt": attempt,
-        "error": _safe_detail(error, 2000, secrets=_payload_secrets(payload)),
-        "ok": ok,
-        "retriable": retriable,
-        "run_id": run_id,
-        "ts": now,
-    }
-    if ok:
-        marker["source_attestation"] = _source_snapshot.source_attestation(
-            _source_descriptor(payload),
-            run_id=run_id,
-            attempt=attempt,
-            fence=int(payload["fence"]),
-        )
-    p = "/tmp/attempt_marker.json"
-    with open(p, "w") as f:
-        json.dump(marker, f)
-    hf_upload(
-        payload,
-        p,
-        f"{_arm(payload)}_attempt{attempt}.json",
-        enforce_deadline=False,
-    )
 
 
 def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Event]:

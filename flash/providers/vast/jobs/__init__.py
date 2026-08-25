@@ -56,16 +56,13 @@ logger = get_logger(__name__)
 # host-uptime score: 0.995 (~1-in-200) nearly eliminates mid-run host deaths while keeping supply usable.
 RELIABILITY_FLOOR = 0.995
 MIN_INET_MBPS = 200.0
-# setup and training use separate poll graces; LOAD_TIMEOUT_S remains a test seam.
-# vast boards under-report VRAM, so search gets slack while vast_gpu_for_offer remains exact.
+# vast boards under-report vram, so search gets slack while vast_gpu_for_offer remains exact.
 _SEARCH_VRAM_SLACK = 0.92
 # Minimum disk every instance is provisioned with (bootstrap + worker + weights need headroom). The
 # offer search MUST use the same floor so a thin-disk offer can't pass search then fail at create.
 MIN_DISK_GB = 60.0
 
-# Vast states meaning "the container is gone / won't progress". ``frozen`` is paused-but-still-billing
-# yet emits no DONE/heartbeat, so classify it dead for fast failover. Unlike ``unknown`` it is never
-# this poller's no-status fallback, so it needs no ``became_running`` gate.
+# vast states meaning the container is gone or cannot resume. frozen remains billable but inactive.
 _DEAD_STATES = {"exited", "stopped", "offline", "deleted", "frozen"}
 
 # Machines this run has already rented and lost, keyed by run id.
@@ -92,25 +89,6 @@ _DEAD_MACHINE_RUNS_MAX = 512
 # class is gone". only paid when the default page is entirely blacklisted, which needs a run that
 # already lost that many hosts.
 _EXHAUSTION_RECHECK_LIMIT = 1024
-# The tail of vast's own ``load_timeout_detail`` below. It is what identifies the ONE stall that
-# indicts the host, and interpolating the same constant into both sides is what keeps them from
-# drifting apart.
-#
-# Keying on ``failure == "stalled"`` alone was wrong: four different conditions report that name,
-# and only this one is the pre-boot load timeout (``_classify_load_timeout``, gated on ``not
-# state.became_running``). The others -- a mid-TRAINING progress stall, a post-running liveness
-# stall, and the client-side wall deadline -- all describe a box that booted and worked. Retiring a
-# healthy host for one of those shrinks the pool on every attempt and, with a small pool, makes the
-# next resumable attempt hit the "already rented and lost" error instead of reusing the only machine
-# available: the same starvation this fix exists to stop, arriving from the other direction.
-_NEVER_STARTED_MARKER = "never started; image pull / host issue"
-
-
-def _is_never_started_stall(result: PollResult) -> bool:
-    """True only for the pre-boot load timeout: rented, never ran, never sent a heartbeat."""
-    return result.failure == "stalled" and _NEVER_STARTED_MARKER in (result.detail or "")
-
-
 def _note_dead_machine(run_id: str, machine_id: int | None) -> None:
     """Remember that ``machine_id`` took this run's money and did not deliver a worker."""
     if not run_id or not machine_id or machine_id <= 0:

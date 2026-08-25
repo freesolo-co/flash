@@ -83,7 +83,6 @@ class VastProvider(InstanceProvider):
         seed: int,
         *,
         log: Any,
-        heartbeat_reader: Any,
         deadline_at: float | None,
     ) -> PollResult:
         from flash.providers.vast.jobs import poll_vast_job
@@ -93,7 +92,6 @@ class VastProvider(InstanceProvider):
             spec,
             seed,
             log=log,
-            heartbeat_reader=heartbeat_reader,
             deadline_at=deadline_at,
         )
 

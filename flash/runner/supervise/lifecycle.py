@@ -12,7 +12,7 @@ from flash.core.spec import JobSpec, gpu_count_of, require_matching_seed
 # Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
 # max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
 INFRA_RETRY_FLOOR = 5
-INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_preempted"})
+INFRA_RETRY_FAILURES = frozenset({"no_capacity", "poll_error", "job_preempted"})
 RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
 
@@ -338,21 +338,16 @@ def _run_training(
 # run-management tests both address these as attributes of THIS module, which is why they stay on
 # it after the move.
 from flash.runner.supervise.recovery import (  # noqa: E402,F401
-    _RECOVERY_MARKER_GRACE_S,
-    _RECOVERY_METRICS_POLL_S,
     _RUNPOD_STATUS_PROBE_TIMEOUT_S,
     _adopt_completed_attempt,
     _apply_charge_with_state,
-    _await_runpod_completed_metrics,
+    _attempt_result_metrics,
     _candidate_usable_vram_gb,
     _canonical_provider_handle,
     _charge_completed_run_by_id,
-    _completed_attempt_metrics,
-    _CompletedAttemptPending,
     _oom_escalated,
     _projected_retry_class,
     _register_checkpoints_best_effort,
-    _runpod_completed_metrics,
     _select_candidate,
     _shape_key,
     _strict_teardown_handle,

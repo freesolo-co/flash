@@ -92,8 +92,7 @@ def _worker_deadline_at(run_id: str, spec: JobSpec, *, now: float | None = None)
 
     Unarmed, the work budget from launch is the authority. So an unarmed profile also carries the
     provisioning allowance -- otherwise docker+gpu waits, the image pull, pip install and the code
-    fetch all come out of the work budget, and a slow-to-boot box self-terminates before it can emit
-    the first heartbeat that would have armed the plane's own clock.
+    fetch all come out of the work budget, and a slow-to-boot box self-terminates before training.
     """
     return _load_run_deadline_at(run_id)
 

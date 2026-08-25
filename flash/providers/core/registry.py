@@ -1,7 +1,7 @@
 """Pluggable GPU substrates.
 
 The training worker (``flash.engine.worker``) reads a JobSpec from the environment, pulls code
-from the HF dataset repo, and streams artifacts/heartbeats/metrics back to it. The provider
+from the hf dataset repo, and streams immutable progress and result artifacts back to it. the provider
 owns pricing, provisioning, polling, cancellation, and teardown.
 
   runpod      serverless Flash endpoints (always on)

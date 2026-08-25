@@ -728,7 +728,7 @@ class JobHandle:
 class PollResult:
     ok: bool
     metrics: dict | None = None
-    # failure: job_failed, oom, job_preempted, no_capacity, stalled, or poll_error.
+    # failure: job_failed, oom, job_preempted, no_capacity, or poll_error.
     failure: str | None = None
     detail: str | None = None
 

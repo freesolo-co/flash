@@ -79,7 +79,6 @@ class InstanceProvider(abc.ABC):
         seed: int,
         *,
         log: Any,
-        heartbeat_reader: Any,
         deadline_at: float | None,
     ) -> PollResult: ...
 
