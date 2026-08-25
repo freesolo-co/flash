@@ -1,4 +1,4 @@
-"""Strict account-scoped RunPod Pod, volume, catalog, and opaque-secret API."""
+"""Strict account-scoped RunPod Pod, volume, data center, and opaque-secret API."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from flash.providers._lifecycle.http import is_not_found
 from flash.providers.runpod.api import (
     _CLIENT,
     _NO_REDIRECT_OPENER,
-    CATALOG_BASE,
     REST_BASE,
     RunpodApiError,
     _key_for_fingerprint,
@@ -51,6 +50,15 @@ query FlashTrainingSecrets {
       id
       name
     }
+  }
+}
+""".strip()
+
+_OBSERVE_STORAGE_DATA_CENTERS = """
+query FlashTrainingStorageDataCenters {
+  dataCenters {
+    id
+    storageSupport
   }
 }
 """.strip()
@@ -121,12 +129,6 @@ class RunpodNetworkVolume:
     name: str
     size_gb: int
     data_center_id: str
-
-
-@dataclass(frozen=True, slots=True)
-class RunpodDataCenter:
-    id: str
-    network_volume_types: tuple[str, ...]
 
 
 def _strict_string(value: object, field: str) -> str:
@@ -664,34 +666,36 @@ def grow_network_volumes_for_fingerprint(
     )
 
 
-def _parse_data_centers(value: object) -> list[RunpodDataCenter]:
-    rows = value.get("dataCenters") if type(value) is dict else value
+def _parse_storage_data_centers(value: object) -> list[str]:
+    if type(value) is not dict or "errors" in value:
+        raise RunpodApiError("runpod data center observation is invalid")
+    data = value.get("data")
+    rows = data.get("dataCenters") if type(data) is dict else None
     if type(rows) is not list:
-        raise RunpodApiError("runpod data center response must be a list")
+        raise RunpodApiError("runpod data center observation is invalid")
     parsed = []
     seen = set()
     for raw in rows:
         if type(raw) is not dict:
-            raise RunpodApiError("runpod data center response row is invalid")
+            raise RunpodApiError("runpod data center observation row is invalid")
         data_center_id = _strict_id(raw.get("id"), "data center id")
-        volume_types = raw.get("networkVolumeTypes")
-        if type(volume_types) is not list:
-            raise RunpodApiError("runpod data center volume types are invalid")
-        types = tuple(
-            sorted({_strict_string(item, "network volume type") for item in volume_types})
-        )
         if data_center_id in seen:
-            raise RunpodApiError("runpod data center response contains duplicate ids")
+            raise RunpodApiError("runpod data center observation contains duplicate ids")
         seen.add(data_center_id)
-        parsed.append(RunpodDataCenter(data_center_id, types))
+        storage_support = raw.get("storageSupport")
+        if type(storage_support) is not bool:
+            raise RunpodApiError("runpod data center storage support is invalid")
+        if storage_support:
+            parsed.append(data_center_id)
     return parsed
 
 
 def list_storage_datacenters_for_fingerprint(fingerprint: str, *, deadline_at: float) -> list[str]:
-    out = _CLIENT.request_with_retries_for_key(
-        _key_for_fingerprint(fingerprint),
-        f"{CATALOG_BASE}/datacenters",
-        retries=2,
-        deadline_at=deadline_at,
+    return _parse_storage_data_centers(
+        _graphql_read(
+            _key_for_fingerprint(fingerprint),
+            _OBSERVE_STORAGE_DATA_CENTERS,
+            {},
+            deadline_at=deadline_at,
+        )
     )
-    return [item.id for item in _parse_data_centers(out) if item.network_volume_types]

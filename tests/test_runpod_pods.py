@@ -184,6 +184,74 @@ def test_api_rejects_malformed_owned_pod_rows(field, value):
         api._pod_rows([row])
 
 
+def test_api_parses_only_storage_capable_data_centers():
+    assert api._parse_storage_data_centers(
+        {
+            "data": {
+                "dataCenters": [
+                    {"id": "US-KS-2", "storageSupport": True},
+                    {"id": "EU-RO-1", "storageSupport": False},
+                    {"id": "US-CA-2", "storageSupport": True},
+                ]
+            }
+        }
+    ) == ["US-KS-2", "US-CA-2"]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"data": {"dataCenters": [None]}},
+        {"data": {"dataCenters": [{"id": "US-KS-2", "storageSupport": None}]}},
+        {"data": {"dataCenters": [{"id": "US-KS-2", "storageSupport": 1}]}},
+        {"data": {"dataCenters": [{"id": "US-KS-2", "storageSupport": "true"}]}},
+        {"errors": [{"message": "forbidden"}]},
+    ],
+)
+def test_api_rejects_malformed_data_center_observations(response):
+    with pytest.raises(api.RunpodApiError, match="data center"):
+        api._parse_storage_data_centers(response)
+
+
+def test_api_rejects_duplicate_data_center_ids():
+    response = {
+        "data": {
+            "dataCenters": [
+                {"id": "US-KS-2", "storageSupport": True},
+                {"id": "US-KS-2", "storageSupport": False},
+            ]
+        }
+    }
+    with pytest.raises(api.RunpodApiError, match="duplicate ids"):
+        api._parse_storage_data_centers(response)
+
+
+def test_storage_data_center_discovery_uses_account_key_and_graphql(monkeypatch):
+    fingerprint = api.key_fingerprint("owner-key")
+    captured = {}
+
+    def graphql_read(key, document, variables, *, deadline_at):
+        captured.update(
+            key=key,
+            document=document,
+            variables=variables,
+            deadline_at=deadline_at,
+        )
+        return {"data": {"dataCenters": [{"id": "US-KS-2", "storageSupport": True}]}}
+
+    monkeypatch.setattr(pod_api, "_graphql_read", graphql_read)
+    deadline_at = time.time() + 60
+    assert api.list_storage_datacenters_for_fingerprint(fingerprint, deadline_at=deadline_at) == [
+        "US-KS-2"
+    ]
+    assert captured == {
+        "key": "owner-key",
+        "document": pod_api._OBSERVE_STORAGE_DATA_CENTERS,
+        "variables": {},
+        "deadline_at": deadline_at,
+    }
+
+
 def test_pending_and_exact_handles_round_trip_with_full_owner_identity():
     pending = _handle()
     exact = _handle(exact=True)

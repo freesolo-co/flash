@@ -15,7 +15,6 @@ from flash.providers.runpod import auth as _keys
 logger = get_logger(__name__)
 
 REST_BASE = "https://rest.runpod.io/v1"
-CATALOG_BASE = "https://api.runpod.io/v2/catalog"
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -143,7 +142,6 @@ def grow_network_volumes_for_key(
 
 from flash.providers.runpod.pod_api import (  # noqa: E402,F401
     RunpodCapacityError,
-    RunpodDataCenter,
     RunpodMutationAmbiguous,
     RunpodNetworkVolume,
     RunpodPod,
@@ -151,9 +149,9 @@ from flash.providers.runpod.pod_api import (  # noqa: E402,F401
     RunpodSecret,
     _graphql_error_status,
     _mutation_once,
-    _parse_data_centers,
     _parse_pod,
     _parse_secret_account,
+    _parse_storage_data_centers,
     _pod_rows,
     create_network_volume_for_fingerprint,
     create_pod_for_fingerprint,
