@@ -50,6 +50,12 @@ def _steps(job: dict[str, Any]) -> list[dict[str, Any]]:
     return job.get("steps") or []
 
 
+def _named_step(job: dict[str, Any], name: str) -> dict[str, Any]:
+    matches = [step for step in _steps(job) if step.get("name") == name]
+    assert len(matches) == 1, f"expected one step named {name!r}, found {len(matches)}"
+    return matches[0]
+
+
 def _assert_gated_upstream(condition: str | None, where: str) -> None:
     """Assert `condition` contains a POSITIVE equality against the upstream repository.
 
@@ -155,6 +161,127 @@ def test_every_job_bounds_its_runtime(path: Path):
         )
         assert isinstance(timeout, int), uncapped
         assert timeout > 0, uncapped
+
+
+@pytest.mark.parametrize(
+    (
+        "filename",
+        "secret_suffix",
+        "presence_step_name",
+        "required_names",
+        "deploy_step_name",
+        "recreate_command",
+        "rolling_command",
+    ),
+    [
+        (
+            "deploy-modal.yml",
+            "PROD",
+            "Verify required serving runtime secrets",
+            (
+                "HF_TOKEN",
+                "SUPABASE_URL",
+                "SUPABASE_SERVICE_ROLE_KEY",
+                "FREESOLO_INTERNAL_KEY",
+                "PLATFORM_BACKEND_URL",
+                "OPENROUTER_INFERENCE_KEY_SHA256_CURRENT",
+                "OPENROUTER_SETTLEMENT_ORG_ID",
+            ),
+            "Deploy serving",
+            "deploy --strategy recreate flash/serving/modal_app.py",
+            "modal deploy --strategy rolling flash/serving/modal_app.py",
+        ),
+        (
+            "deploy-modal-dev.yml",
+            "DEV",
+            "Verify development deployment inputs",
+            (
+                "MODAL_TOKEN_ID",
+                "MODAL_TOKEN_SECRET",
+                "HF_TOKEN",
+                "FREESOLO_INTERNAL_KEY",
+                "SUPABASE_SERVICE_ROLE_KEY",
+                "SUPABASE_PROJECT_REF",
+                "SUPABASE_PROJECT_REF_DEV",
+                "OPENROUTER_INFERENCE_KEY_SHA256_CURRENT",
+                "OPENROUTER_SETTLEMENT_ORG_ID",
+            ),
+            "Deploy development serving",
+            "deploy --env dev --strategy recreate flash/serving/modal_app.py",
+            "modal deploy --env dev --strategy rolling flash/serving/modal_app.py",
+        ),
+    ],
+)
+def test_modal_deploy_openrouter_contract(
+    filename: str,
+    secret_suffix: str,
+    presence_step_name: str,
+    required_names: tuple[str, ...],
+    deploy_step_name: str,
+    recreate_command: str,
+    rolling_command: str,
+) -> None:
+    document = _load(WORKFLOW_DIR / filename)
+    job = _jobs(document)["deploy"]
+
+    env = job["env"]
+    expected_sources = {
+        "OPENROUTER_INFERENCE_KEY_SHA256_CURRENT": (
+            f"${{{{ secrets.OPENROUTER_INFERENCE_KEY_SHA256_CURRENT_{secret_suffix} }}}}"
+        ),
+        "OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS": (
+            f"${{{{ secrets.OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS_{secret_suffix} }}}}"
+        ),
+        "OPENROUTER_SETTLEMENT_ORG_ID": (
+            f"${{{{ secrets.OPENROUTER_SETTLEMENT_ORG_ID_{secret_suffix} }}}}"
+        ),
+    }
+    assert {name: env.get(name) for name in expected_sources} == expected_sources
+
+    strategy = _triggers(document)["workflow_dispatch"]["inputs"]["deployment_strategy"]
+    assert strategy["required"] is True
+    assert strategy["default"] == "rolling"
+    assert strategy["type"] == "choice"
+    assert strategy["options"] == ["rolling", "recreate"]
+
+    expected_cancel = (
+        "${{ github.event_name == 'workflow_dispatch' "
+        "&& inputs.deployment_strategy == 'recreate' }}"
+    )
+    assert job["concurrency"]["cancel-in-progress"] == expected_cancel
+
+    presence_script = _named_step(job, presence_step_name)["run"]
+    required_match = re.search(r"required=\(\n(?P<body>.*?)\n\s*\)", presence_script, re.DOTALL)
+    assert required_match is not None, f"{filename}:{presence_step_name} has no required array"
+    configured_required = tuple(
+        line.strip() for line in required_match.group("body").splitlines() if line.strip()
+    )
+    assert configured_required == required_names
+    assert "OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS" not in configured_required
+
+    preflight_name = "Validate OpenRouter authorization configuration"
+    preflight_script = _named_step(job, preflight_name)["run"]
+    assert (
+        "from flash.serving.src.openrouter_auth import OpenRouterAuthorization" in preflight_script
+    )
+    assert "OpenRouterAuthorization.from_environment(" in preflight_script
+    assert "os.environ" in preflight_script
+    assert 'internal_key=os.environ.get("FREESOLO_INTERNAL_KEY")' in preflight_script
+    assert "authorization is None" in preflight_script
+    assert "print(" not in preflight_script
+    assert "echo " not in preflight_script
+
+    deploy_script = _named_step(job, deploy_step_name)["run"]
+    assert 'if [ "$DEPLOYMENT_STRATEGY" = "recreate" ]; then' in deploy_script
+    assert 'PYTHONWARNINGS="error::UserWarning:modal.runner:318"' in deploy_script
+    assert "^App updated successfully, but containers did not all terminate" in deploy_script
+    assert 'module=r"^modal\\.runner$"' in deploy_script
+    assert recreate_command in deploy_script
+    assert rolling_command in deploy_script
+
+    step_names = [step.get("name") for step in _steps(job)]
+    assert step_names.index(presence_step_name) < step_names.index(preflight_name)
+    assert step_names.index(preflight_name) < step_names.index(deploy_step_name)
 
 
 def test_the_tests_repo_dispatch_cannot_silently_no_op():

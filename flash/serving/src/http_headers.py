@@ -38,8 +38,15 @@ def is_trusted_internal(request: Request, trusted_keys: tuple[str, ...]) -> bool
     return any([hmac.compare_digest(presented, k) for k in trusted_keys])  # noqa: C419
 
 
-def _bearer_token(request: Request) -> str | None:
-    header = request.headers.get("Authorization") or ""
+def bearer_token(request: Request) -> str | None:
+    """Extract a Bearer token with the existing tolerant single-header semantics."""
+    values = request.headers.getlist("Authorization")
+    if len(values) > 1:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "ambiguous Authorization header")
+
+    header = values[0] if values else ""
+    if "," in header:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "ambiguous Authorization header")
     scheme, _, value = header.partition(" ")
     if scheme.lower() != "bearer":
         return None

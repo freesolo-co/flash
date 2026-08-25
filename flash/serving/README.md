@@ -59,8 +59,9 @@ uv run modal deploy flash/serving/modal_app.py
 ```
 
 Required production wiring is `HF_TOKEN`, `FREESOLO_INTERNAL_KEY`,
-`PLATFORM_BACKEND_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and
-`SERVING_CUSTOM_DOMAIN=serve.freesolo.co`.
+`PLATFORM_BACKEND_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`,
+`OPENROUTER_INFERENCE_KEY_SHA256_CURRENT`, `OPENROUTER_SETTLEMENT_ORG_ID`, and
+`SERVING_CUSTOM_DOMAIN=serve.freesolo.co`. `OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS` is optional.
 
 ### Development
 
@@ -101,6 +102,10 @@ export SUPABASE_URL=https://${SUPABASE_PROJECT_REF_DEV}.supabase.co
 export SUPABASE_SERVICE_ROLE_KEY="replace-with-development-server-key"
 export FREESOLO_INTERNAL_KEY="replace-with-shared-internal-key"
 export HF_TOKEN="replace-with-hugging-face-token"
+export OPENROUTER_INFERENCE_KEY_SHA256_CURRENT="replace-with-development-key-sha256"
+export OPENROUTER_SETTLEMENT_ORG_ID="replace-with-development-settlement-org"
+# optional during a planned credential rotation
+export OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS="replace-with-previous-development-key-sha256"
 uv run modal deploy --env dev flash/serving/modal_app.py
 ```
 
@@ -221,6 +226,45 @@ The one-off quantization job that produced them is not kept in this repo.
 - `POST /generate` with `adapter_id`
 - `POST /adapters/{adapter_id}/generate`
 - `POST /v1/chat/completions` where `model` is the adapter id
+
+### Provisional OpenRouter Bearer boundary
+
+Pending negotiated OpenRouter onboarding, the CPU router accepts a distinct provisional Bearer
+principal only on `POST /v1/chat/completions`, and only when `model` is the exact id of a canonical,
+seeded hosted base-model record. It cannot address adapter aliases, immutable revisions, checkpoints,
+forged records, or unknown models. It is explicitly denied on `/generate`,
+`/adapters/{id}/generate`, every adapter lifecycle route, deployment and export surfaces, internal
+callbacks, and control-plane routes. Existing Freesolo user keys, the training-agent and internal key
+paths, sampling, adapter ownership, and usage behavior remain separate and unchanged.
+
+The router receives only SHA-256 hex digests in
+`OPENROUTER_INFERENCE_KEY_SHA256_CURRENT` and optional
+`OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS`; raw OpenRouter credentials are never deployment inputs.
+`OPENROUTER_SETTLEMENT_ORG_ID` identifies the dedicated org billed for accepted base-model calls.
+Current and previous slots support overlap during rotation. These values live only in the router
+secret and are excluded from GPU engine secrets and cached `Settings`. Production and development use
+distinct GitHub secret sources ending `_PROD` and `_DEV`.
+
+Authorization extraction preserves the existing Freesolo behavior: the `Bearer` scheme is
+case-insensitive, the value after the first ASCII space is stripped, and an empty or non-Bearer value
+is treated as missing. Duplicate or comma-coalesced `Authorization` fields are rejected as ambiguous.
+The extracted token is classified as OpenRouter only when its SHA-256 digest matches a configured
+slot; every nonmatch follows the ordinary Freesolo or internal path unchanged. A matched OpenRouter
+principal used outside its single route and base-model scope returns 403 without falling through to
+Freesolo authorization. Missing credentials and Freesolo 401 responses carry
+`WWW-Authenticate: Bearer`. A catalog base whose seeded router record is missing returns 503 before
+any engine dispatch.
+
+The workflow's manual `deployment_strategy` choice is `rolling` by default. Use `recreate` for
+emergency revocation so old router containers are torn down rather than allowed to drain with a
+revoked digest. A manually dispatched recreate preempts a running rolling deployment; push and
+rolling runs remain queued so they cannot cancel the recreate. Revocation completes only after Modal
+emits no incomplete-container-termination warning for that recreate deploy and the new router passes
+readiness; the workflows turn that exact Modal warning into a failed deploy instead of reporting a
+false success. This provisional boundary
+intentionally adds no IP allowlist, request signing, mTLS, custom authentication headers, or
+synchronous spend gate. Bearer replay and spend exposure remain residual risks until negotiated
+onboarding replaces or strengthens this mechanism.
 
 ### Checkpoint headers (all three inference endpoints)
 

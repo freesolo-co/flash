@@ -22,6 +22,7 @@ from flash.serving.src.body_limit import RequestBodyLimitMiddleware
 from flash.serving.src.context import APP_STATE_ATTR, ServingContext
 from flash.serving.src.inference_routes import inference_router
 from flash.serving.src.lookup import AdapterLookup
+from flash.serving.src.openrouter_auth import OpenRouterAuthorization
 from flash.serving.src.routing import AdapterRouter, EnginePool, health_body
 from flash.serving.src.schemas import AdapterRecord
 from flash.serving.src.usage import UsageReporter
@@ -49,6 +50,7 @@ def build_serving_app(
     reload_interval_seconds: float = 30.0,
     usage_reporter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     chat_authorizer: Callable[[str, str], Awaitable["str | None"]] | None = None,
+    openrouter_authorization: OpenRouterAuthorization | None = None,
 ):
     """Front-door FastAPI app. ``reload_records`` re-reads persisted ready adapters so a router
     that missed a (un)registration on another container still resolves it: reload once on a miss
@@ -69,6 +71,9 @@ def build_serving_app(
     It returns the caller's org id, which bills a base-model serve to the caller (no adapter owner).
     Trusted server-to-server callers presenting the shared internal key bypass it. If no
     ``chat_authorizer`` is wired, a non-internal request fails closed (503) — prod always wires it.
+
+    ``openrouter_authorization`` is a router-local digest matcher. It can authorize only the OpenAI
+    chat route for canonical hosted base-model records; every other route keeps the existing auth.
     """
     context = ServingContext(
         pool,
@@ -88,6 +93,7 @@ def build_serving_app(
         reload_records=reload_records,
         lookup_record=lookup_record,
         chat_authorizer=chat_authorizer,
+        openrouter_authorization=openrouter_authorization,
     )
 
     api = FastAPI(

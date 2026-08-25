@@ -112,7 +112,7 @@ def _validate_openai_model_id(adapter_id: str) -> None:
 async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     context = ServingContext.of(request)
     adapter_id = _openai_adapter_id(payload)
-    caller_org = await context.authorize_inference(request, adapter_id)
+    caller_org = await context.authorize_chat_completion(request, adapter_id)
     _validate_openai_model_id(adapter_id)
     stream = payload.get("stream", False)
     if type(stream) is not bool:

@@ -10,12 +10,14 @@ reached from a handler through ``ServingContext.of(request)``.
 
 import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
+from typing import Any, NoReturn
 
 from fastapi import HTTPException, Request, status
 
-from flash.serving.src.http_headers import _bearer_token, assert_internal, is_trusted_internal
+from flash.serving.src.http_headers import assert_internal, bearer_token, is_trusted_internal
 from flash.serving.src.lookup import AdapterLookup
+from flash.serving.src.model_config import is_supported_base_model
+from flash.serving.src.openrouter_auth import OpenRouterAuthorization
 from flash.serving.src.routing import AdapterRouter, EnginePool
 from flash.serving.src.schemas import AdapterRecord
 from flash.serving.src.streaming import generate_once, openai_chat_stream, prepare_stream
@@ -36,6 +38,7 @@ class ServingContext:
         reload_records: Callable[[], list[AdapterRecord]] | None,
         lookup_record: Callable[[str], AdapterRecord | None] | None,
         chat_authorizer: Callable[[str, str], Awaitable[str | None]] | None,
+        openrouter_authorization: OpenRouterAuthorization | None,
     ) -> None:
         self.pool = pool
         self.router = router
@@ -45,6 +48,7 @@ class ServingContext:
         self.reload_records = reload_records
         self.lookup_record = lookup_record
         self.chat_authorizer = chat_authorizer
+        self.openrouter_authorization = openrouter_authorization
         # the shared internal key lets a trusted server-to-server caller skip external chat auth: it
         # guards /adapters and is presented by the flash control plane (registration) and the backend
         # /api/sample proxy. compared with hmac.compare_digest to avoid timing leaks.
@@ -55,31 +59,109 @@ class ServingContext:
         return getattr(request.app.state, APP_STATE_ATTR)
 
     def assert_internal(self, request: Request) -> None:
+        if is_trusted_internal(request, self.trusted_internal_keys):
+            return
+        token = bearer_token(request)
+        if token is not None and self._matches_openrouter(token):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "OpenRouter is not authorized for this route",
+            )
         assert_internal(request, self.internal_key)
 
-    async def authorize_inference(self, request: Request, adapter_id: str) -> str | None:
-        """Gate every chat/inference request on a Freesolo API key, and resolve its billing org.
+    @staticmethod
+    def _raise_bearer_unauthorized(detail: str) -> NoReturn:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            detail,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-        Always enforced: a valid Freesolo API key is required. For a LoRA adapter the key's org must
-        own it; for a base-model serve any valid key is accepted (no owner) -- the backend decides.
-        The authorizer returns the caller's org id, which bills a base-model serve to the caller (no
-        adapter owner). Trusted internal callers (the backend proxy / control plane) bypass via the
-        internal key and return None. With no authorizer wired we fail closed (503).
-        """
-        if is_trusted_internal(request, self.trusted_internal_keys):
-            return None
-        token = _bearer_token(request)
-        if not token:
-            raise HTTPException(
-                status.HTTP_401_UNAUTHORIZED,
-                "Missing Freesolo API key (send 'Authorization: Bearer <key>')",
+    def _external_bearer(self, request: Request) -> str:
+        token = bearer_token(request)
+        if token is None:
+            self._raise_bearer_unauthorized(
+                "Missing Freesolo API key (send 'Authorization: Bearer <key>')"
             )
+        return token
+
+    async def _authorize_freesolo(self, token: str, adapter_id: str) -> str | None:
         if self.chat_authorizer is None:
-            # No authorizer wired -> fail closed rather than serve open (prod always wires it).
+            # no authorizer wired -> fail closed rather than serve open (prod always wires it).
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is not configured"
             )
-        return await self.chat_authorizer(token, adapter_id)
+        try:
+            return await self.chat_authorizer(token, adapter_id)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_401_UNAUTHORIZED:
+                raise
+            headers = dict(exc.headers or {})
+            headers.setdefault("WWW-Authenticate", "Bearer")
+            raise HTTPException(exc.status_code, exc.detail, headers=headers) from exc
+
+    def _matches_openrouter(self, token: str) -> bool:
+        authorization = self.openrouter_authorization
+        return authorization is not None and authorization.matches(token)
+
+    def _authorize_openrouter_base_model(self, model_id: str) -> str:
+        authorization = self.openrouter_authorization
+        if authorization is None:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "OpenRouter auth is unavailable"
+            )
+        if not is_supported_base_model(model_id):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "OpenRouter is authorized only for canonical hosted base models",
+            )
+
+        requested = self.router.get(model_id)
+        if requested is None:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "hosted base model routing record is unavailable",
+            )
+        resolved = self.router.resolve(model_id)
+        canonical = (
+            requested.serve_base_model
+            and requested.status == "ready"
+            and requested.adapter_id == requested.base_model == requested.repo_id == model_id
+            and requested.org_id is None
+            and requested.checkpoint is None
+            and not requested.is_alias
+            and not requested.is_revision
+            and resolved is not None
+            and resolved[0] is requested
+            and resolved[1] is requested
+        )
+        if not canonical:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "OpenRouter is authorized only for canonical hosted base models",
+            )
+        return authorization.settlement_org_id
+
+    async def authorize_inference(self, request: Request, adapter_id: str) -> str | None:
+        """Authorize the legacy inference routes without granting the OpenRouter principal."""
+        if is_trusted_internal(request, self.trusted_internal_keys):
+            return None
+        token = self._external_bearer(request)
+        if self._matches_openrouter(token):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "OpenRouter is not authorized for this route",
+            )
+        return await self._authorize_freesolo(token, adapter_id)
+
+    async def authorize_chat_completion(self, request: Request, model_id: str) -> str | None:
+        """Authorize chat, including the base-only provisional OpenRouter principal."""
+        if is_trusted_internal(request, self.trusted_internal_keys):
+            return None
+        token = self._external_bearer(request)
+        if self._matches_openrouter(token):
+            return self._authorize_openrouter_base_model(model_id)
+        return await self._authorize_freesolo(token, model_id)
 
     async def reload_if_configured(self) -> None:
         if self.reload_records is not None:

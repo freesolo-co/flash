@@ -500,6 +500,9 @@ def test_engine_secret_contains_only_engine_credentials(modal_app_module, monkey
         "FREESOLO_INTERNAL_KEY",
         "SUPABASE_URL",
         "SUPABASE_SERVICE_ROLE_KEY",
+        "OPENROUTER_INFERENCE_KEY_SHA256_CURRENT",
+        "OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS",
+        "OPENROUTER_SETTLEMENT_ORG_ID",
     ):
         monkeypatch.setenv(name, f"value-for-{name}")
 
@@ -511,6 +514,9 @@ def test_engine_secret_contains_only_engine_credentials(modal_app_module, monkey
     assert "PLATFORM_BACKEND_URL" not in engine_values
     assert "SUPABASE_URL" not in engine_values
     assert "SUPABASE_SERVICE_ROLE_KEY" not in engine_values
+    assert "OPENROUTER_INFERENCE_KEY_SHA256_CURRENT" not in engine_values
+    assert "OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS" not in engine_values
+    assert "OPENROUTER_SETTLEMENT_ORG_ID" not in engine_values
 
     modal_app_module.modal.Secret.from_dict.reset_mock()
     modal_app_module._runtime_secret()
@@ -520,6 +526,15 @@ def test_engine_secret_contains_only_engine_credentials(modal_app_module, monkey
     assert router_values["PLATFORM_BACKEND_URL"] == "value-for-PLATFORM_BACKEND_URL"
     assert router_values["SUPABASE_URL"] == "value-for-SUPABASE_URL"
     assert router_values["SUPABASE_SERVICE_ROLE_KEY"] == "value-for-SUPABASE_SERVICE_ROLE_KEY"
+    assert router_values["OPENROUTER_INFERENCE_KEY_SHA256_CURRENT"] == (
+        "value-for-OPENROUTER_INFERENCE_KEY_SHA256_CURRENT"
+    )
+    assert router_values["OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS"] == (
+        "value-for-OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS"
+    )
+    assert router_values["OPENROUTER_SETTLEMENT_ORG_ID"] == (
+        "value-for-OPENROUTER_SETTLEMENT_ORG_ID"
+    )
     assert all(
         call.kwargs["secrets"] is modal_app_module.engine_secrets
         for call in modal_app_module.app.cls.call_args_list

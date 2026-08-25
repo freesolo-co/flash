@@ -5,6 +5,15 @@ on:
     branches:
       - dev
   workflow_dispatch:
+    inputs:
+      deployment_strategy:
+        description: Deployment strategy for secret rotation or emergency revocation
+        required: true
+        default: rolling
+        type: choice
+        options:
+          - rolling
+          - recreate
 
 jobs:
   deploy:
@@ -14,11 +23,11 @@ jobs:
     # same bound as the production deploy: its own readiness polls plus the remote image build fit
     # well inside this, and a wedged job releases the runner instead of holding it for 6 hours.
     timeout-minutes: 30
-    # github can replace a pending run even though a running deploy is preserved. compare against the
-    # sha reported by the deployed app so the replacement repeats every change not actually deployed.
+    # only a manually requested emergency recreate may preempt a running rolling deploy. push and
+    # rolling runs queue so they cannot cancel a recreate; the deployed app sha still guards coverage.
     concurrency:
       group: deploy-modal-dev-serving
-      cancel-in-progress: false
+      cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && inputs.deployment_strategy == 'recreate' }}
     permissions:
       contents: read
     defaults:
@@ -35,6 +44,10 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY_DEV }}
       SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
       SUPABASE_PROJECT_REF_DEV: ${{ secrets.SUPABASE_PROJECT_REF_DEV }}
+      OPENROUTER_INFERENCE_KEY_SHA256_CURRENT: ${{ secrets.OPENROUTER_INFERENCE_KEY_SHA256_CURRENT_DEV }}
+      OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS: ${{ secrets.OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS_DEV }}
+      OPENROUTER_SETTLEMENT_ORG_ID: ${{ secrets.OPENROUTER_SETTLEMENT_ORG_ID_DEV }}
+      DEPLOYMENT_STRATEGY: ${{ inputs.deployment_strategy || 'rolling' }}
       PLATFORM_BACKEND_URL: https://api-dev.freesolo.co
       SERVING_DEPLOYMENT_MODE: development
       SERVING_CUSTOM_DOMAIN: serve-dev.freesolo.co
@@ -121,7 +134,18 @@ jobs:
         run: |
           set -euo pipefail
           missing=""
-          for name in MODAL_TOKEN_ID MODAL_TOKEN_SECRET HF_TOKEN FREESOLO_INTERNAL_KEY SUPABASE_SERVICE_ROLE_KEY SUPABASE_PROJECT_REF SUPABASE_PROJECT_REF_DEV; do
+          required=(
+            MODAL_TOKEN_ID
+            MODAL_TOKEN_SECRET
+            HF_TOKEN
+            FREESOLO_INTERNAL_KEY
+            SUPABASE_SERVICE_ROLE_KEY
+            SUPABASE_PROJECT_REF
+            SUPABASE_PROJECT_REF_DEV
+            OPENROUTER_INFERENCE_KEY_SHA256_CURRENT
+            OPENROUTER_SETTLEMENT_ORG_ID
+          )
+          for name in "${required[@]}"; do
             if [ -z "${!name}" ]; then
               missing="$missing $name"
             fi
@@ -139,6 +163,24 @@ jobs:
             exit 1
           fi
           printf 'SUPABASE_URL=https://%s.supabase.co\n' "$SUPABASE_PROJECT_REF_DEV" >> "$GITHUB_ENV"
+
+      - name: Validate OpenRouter authorization configuration
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          python - <<'PY'
+          import os
+
+          from flash.serving.src.openrouter_auth import OpenRouterAuthorization
+
+
+          authorization = OpenRouterAuthorization.from_environment(
+              os.environ,
+              internal_key=os.environ.get("FREESOLO_INTERNAL_KEY"),
+          )
+          if authorization is None:
+              raise SystemExit("OpenRouter authorization is not configured")
+          PY
 
       - name: Ensure development Modal environment
         if: steps.gate.outputs.deploy == 'true'
@@ -227,7 +269,15 @@ jobs:
 
       - name: Deploy development serving
         if: steps.gate.outputs.deploy == 'true'
-        run: modal deploy --env dev flash/serving/modal_app.py
+        run: |
+          set -euo pipefail
+          if [ "$DEPLOYMENT_STRATEGY" = "recreate" ]; then
+            PYTHONWARNINGS="error::UserWarning:modal.runner:318" \
+              python -c 'import warnings; warnings.filterwarnings("error", message=r"^App updated successfully, but containers did not all terminate", category=UserWarning, module=r"^modal\.runner$"); from modal.__main__ import main; main()' \
+              deploy --env dev --strategy recreate flash/serving/modal_app.py
+          else
+            modal deploy --env dev --strategy rolling flash/serving/modal_app.py
+          fi
 
       - name: Verify development serving URL
         if: steps.gate.outputs.deploy == 'true'

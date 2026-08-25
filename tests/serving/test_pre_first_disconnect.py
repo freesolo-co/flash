@@ -70,6 +70,9 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
             async def authorize_inference(self, *_args):
                 return "org-1"
 
+            async def authorize_chat_completion(self, *_args):
+                return "org-1"
+
             async def generate(self, *_args, **_kwargs):
                 entered.set()
                 try:

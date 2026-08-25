@@ -65,6 +65,8 @@ if _validate_deploy_wiring and SERVING_DEPLOYMENT_MODE == "development":
         "SUPABASE_PROJECT_REF_DEV",
         "SUPABASE_URL",
         "SUPABASE_SERVICE_ROLE_KEY",
+        "OPENROUTER_INFERENCE_KEY_SHA256_CURRENT",
+        "OPENROUTER_SETTLEMENT_ORG_ID",
     )
     missing = [name for name in required if not os.environ.get(name, "").strip()]
     if not os.environ.get("HF_TOKEN", "").strip():
@@ -161,6 +163,9 @@ _RUNTIME_SECRET_NAMES = (
     "SERVING_CUSTOM_DOMAIN",
     "PLATFORM_BACKEND_URL",
     "FREESOLO_INTERNAL_KEY",
+    "OPENROUTER_INFERENCE_KEY_SHA256_CURRENT",
+    "OPENROUTER_INFERENCE_KEY_SHA256_PREVIOUS",
+    "OPENROUTER_SETTLEMENT_ORG_ID",
     # immutable deployment provenance and attempt identity used by the public readiness endpoint.
     "FREESOLO_DEPLOYMENT_SHA",
     "FREESOLO_DEPLOYMENT_ID",
@@ -742,11 +747,16 @@ def _base_model_records() -> list:
 )
 def router():
     from flash.serving.src import settings as cfg
+    from flash.serving.src.openrouter_auth import OpenRouterAuthorization
     from flash.serving.src.persistence import get_adapter, load_adapters
     from flash.serving.src.router import AdapterRouter, build_serving_app
     from flash.serving.src.settings import Settings
 
     settings = Settings()
+    openrouter_authorization = OpenRouterAuthorization.from_environment(
+        os.environ,
+        internal_key=settings.internal_key,
+    )
     # Seed the base-model records alongside the persisted LoRA adapters so every base model is
     # reachable by name with no adapter. Re-seed on every reload (hydrate replaces the registry).
     adapter_router = AdapterRouter(load_adapters(settings) + _base_model_records())
@@ -767,6 +777,7 @@ def router():
         # the adapter (the backend authorizes), or the shared internal key to bypass. The authorizer
         # must be wired (backend URL + internal key) or non-internal chat fails closed.
         chat_authorizer=_build_chat_authorizer(settings),
+        openrouter_authorization=openrouter_authorization,
     )
 
 

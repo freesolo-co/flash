@@ -13,6 +13,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Added
 
+- Hosted serving now has a provisional, digest-only OpenRouter Bearer principal restricted to
+  `POST /v1/chat/completions` for canonical seeded base models, with current/previous rotation slots,
+  strict Authorization syntax, dedicated settlement-org usage attribution, and no adapter or
+  control-plane access.
 - A `flash-cli` console script, the same entry point as `flash` under a name nothing else
   claims. The `server` and `dev` extras install `runpod-flash`, which declares its own `flash`
   script; whichever distribution is installed last wins, so on a control-plane host
