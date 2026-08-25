@@ -480,14 +480,15 @@ def run_logs(
                     status_code=400, detail=f"invalid log offset {offset}: {exc}"
                 ) from exc
             end = f.tell()
-    public_status = status.to_dict()
     return {
         "run_id": run_id,
         "logs": chunk,
         "offset": end,
         "state": status.state,
-        "last_heartbeat": public_status.get("last_heartbeat"),
-        "gpu_status": status.gpu_status,
+        "attempt": status.attempt,
+        "progress": status.progress,
+        "resource": status.resource,
+        "result": status.result,
     }
 
 

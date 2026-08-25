@@ -1149,16 +1149,9 @@ def test_record_training_run_posts_to_backend(monkeypatch):
                 "api_key_id": "key-1",
             },
             source_snapshot=valid_source_snapshot(),
-            last_heartbeat={
-                "attempt": 0,
-                "stage": "sft_step",
-                "source_provenance": {
-                    "format_version": 1,
-                    "sha256": "a" * 64,
-                    "verified": True,
-                    "verified_attempt": 0,
-                },
-            },
+            attempt={"attempt_id": 0, "fence": 1},
+            progress={"attempt_id": 0, "fence": 1, "phase": "sft_step"},
+            resource={"attempt_id": 0, "fence": 1, "state": "running"},
         )
     )
 
@@ -1173,7 +1166,10 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     # the exact canonical project uuid is persisted with every managed training run.
     assert body["projectId"] == "11111111-1111-4111-8111-111111111111"
     assert body["model"] == "Qwen/Qwen3.5-9B"
-    assert body["lastHeartbeat"] == {"attempt": 0, "stage": "sft_step"}
+    assert "lastHeartbeat" not in body
+    assert "gpuStatus" not in body
+    assert "progress" not in body
+    assert "resource" not in body
     assert "source_snapshot" not in json.dumps(body)
     assert "source_provenance" not in json.dumps(body)
 

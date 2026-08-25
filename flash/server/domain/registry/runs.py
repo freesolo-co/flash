@@ -94,8 +94,6 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "error": status.error,
         "spec": spec,
         "deployment": status.deployment,
-        "lastHeartbeat": public_status.get("last_heartbeat"),
-        "gpuStatus": status.gpu_status,
         "createdAt": _iso_from_epoch(status.created_at),
         "updatedAt": _iso_from_epoch(status.updated_at),
         "metadata": {"source": "flash.control_plane"},

@@ -7,7 +7,7 @@ import sys
 
 from flash._internal.channel import BRAND_NAME, CLI_NAME
 from flash.cli.ui import cost as cost_ui
-from flash.cli.ui import heartbeat
+from flash.cli.ui import lifecycle
 from flash.cost.currency import format_usd
 
 # one spelling of the VRAM clause for both quote renderers: the themed panel and
@@ -517,7 +517,7 @@ def run_status(obj: dict) -> str:
     realized = obj.get("realized_cost_usd")
     if realized is not None:
         pairs.append(("realized", money(realized)))
-    pairs += heartbeat._heartbeat_pairs(obj, format_hint=_dim)
+    pairs += lifecycle._lifecycle_pairs(obj, format_hint=_dim)
     pairs += [
         ("created", _humanize_ts(obj.get("created_at"))),
         ("updated", _humanize_ts(obj.get("updated_at"))),

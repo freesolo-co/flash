@@ -353,18 +353,18 @@ def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) 
 
 
 def actual_steps_run(status: RunStatus) -> int:
-    """How many optimizer steps to bill a (cancelled) run for.
-
-    Cancelled after N steps -> N. The first step reports no ``step`` until it completes, so a cancel
-    mid-first-step would look like 0 steps despite real GPU time -- we floor to 1 whenever a
-    training-stage heartbeat is present.
-    """
-    hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
-    step = hb.get("step")
-    if isinstance(step, (int, float)) and step > 0:
-        return int(step)
-    # training started (rl_step/sft_step/opd_step) but no completed step yet means mid-first-step.
-    if hb.get("stage") in state._TRAINING_STAGES:
+    """return current-fence cumulative work for cancellation billing."""
+    progress = status.progress if isinstance(status.progress, dict) else {}
+    attempt = status.attempt if isinstance(status.attempt, dict) else {}
+    if (
+        progress.get("attempt_id") != attempt.get("attempt_id")
+        or progress.get("fence") != attempt.get("fence")
+    ):
+        return 0
+    completed = progress.get("completed_steps")
+    if isinstance(completed, int) and not isinstance(completed, bool) and completed > 0:
+        return completed
+    if progress.get("training_entered") is True:
         return 1
     return 0
 
