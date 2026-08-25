@@ -26,10 +26,14 @@ RUN python -c 'import sys; assert sys.version_info[:2] == (3, 12)' \
 
 COPY pyproject.toml uv.lock README.md LICENSE NOTICE ./
 COPY flash ./flash
+COPY docker/patch_vllm_moe_lora.py ./docker/patch_vllm_moe_lora.py
 COPY serve_launch.py ./serve_launch.py
 RUN uv sync --frozen --no-dev --extra serve-runtime
+RUN /opt/flash-venv/bin/python /app/docker/patch_vllm_moe_lora.py \
+    && /opt/flash-venv/bin/python /app/docker/patch_vllm_moe_lora.py --verify \
+    && rm /app/docker/patch_vllm_moe_lora.py
 
-# The CUDA this image runs on is decided by vllm's own compiled extension, not by us: every vllm
+# the cuda this image runs on is decided by vllm's own compiled extension, not by us: every vllm
 # wheel from 0.20.2 onward (0.23.0 included) ships a vllm/_C.abi3.so linked against
 # libcudart.so.13. Measured across the published wheels -- 0.19.1 links libcudart.so.12, 0.20.2 and
 # later link .13 -- so no pin inside the 0.2x line escapes CUDA 13, and downgrading torch to a
