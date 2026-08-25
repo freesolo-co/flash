@@ -80,7 +80,6 @@ class LambdaProvider(InstanceProvider):
         seed: int,
         *,
         log: Any,
-        heartbeat_reader: Any,
         deadline_at: float | None,
     ) -> PollResult:
         from flash.providers.lambda_.jobs import poll_lambda_job
@@ -90,7 +89,6 @@ class LambdaProvider(InstanceProvider):
             spec,
             seed,
             log=log,
-            heartbeat_reader=heartbeat_reader,
             deadline_at=deadline_at,
         )
 

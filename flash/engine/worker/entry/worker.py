@@ -164,9 +164,7 @@ def main():
                 **_err_metrics,
                 # `gpu=`, like every other producer here: this was the one path spelling it `diag`,
                 # and the consumer reads `gpu` alone. the mismatch is worse than a missing field --
-                # `record_progress` assigns `gpu_status` unconditionally, so an error progress
-                # whose diagnostics land under an unread key CLEARS the snapshot a healthy
-                # progress already stored, losing the evidence exactly when an oom needs it.
+                # use the canonical gpu section so the error record retains the final observation.
                 gpu=worker_perf.gpu_diagnostics(),
             )
         except Exception:

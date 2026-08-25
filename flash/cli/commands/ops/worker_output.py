@@ -56,7 +56,7 @@ def live_attempt_of(run: Mapping[str, object]) -> int | str | None:
 
     Takes the status dict rather than fetching it, because ``--follow`` already holds one: the two
     log paths must derive this from the SAME rule, or a follow that ends mid-teardown prints the
-    unmarked dead heartbeats the non-follow path tags.
+    unmarked output from a superseded attempt the non-follow path tags.
     """
     identity = lifecycle_ui.live_attempt(dict(run))
     if identity is None and run.get("remote", False) is None:

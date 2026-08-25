@@ -264,15 +264,6 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         _compare_and_clear_remote,
         _record_cleanup_remote,
     )
-    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-
-    completed_metrics = _lifecycle._await_runpod_completed_metrics(
-        ctx.last_handle,
-        _load_run_deadline_at(ctx.spec.run_id),
-        check_cancelled=ctx.raise_if_cancelled,
-    )
-    if completed_metrics is not None:
-        return completed_metrics
     resource_deleted = False
     teardown_error: Exception | None = None
     try:
@@ -338,7 +329,7 @@ def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
     the dead attempt's traceback with nothing in between. `flash runs log` tails that file, so while
     a replacement worker is booting the tail still ends in the OOM stack that caused the retry --
     an operator checking a run that is currently fine reads a failure. The status line already
-    carries `attempt=` and `(prev attempt)`, but those come from the heartbeat and describe the run,
+    carries `attempt=` and `(prev attempt)`, but those come from lifecycle state and describe the run,
     not the bytes; nothing marked the bytes themselves.
 
     Written for attempt > 0 only. Attempt 0 has nothing above it to disown, and a header on every
@@ -776,20 +767,12 @@ def _handle_failure(
 ) -> _FailureDecision:
     from flash.providers.core.registry import get_provider
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
-    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
     # cancel wins over any retry-shaped failure.
     ctx.raise_if_cancelled()
-    completed_metrics = _lifecycle._await_runpod_completed_metrics(
-        ctx.last_handle,
-        _load_run_deadline_at(ctx.spec.run_id),
-        check_cancelled=ctx.raise_if_cancelled,
-    )
-    if completed_metrics is not None:
-        return _FailureDecision(ctx.return_completed_runpod_metrics(completed_metrics), False)
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
-    if outcome.chosen is not None and result.failure in ("stalled", "job_preempted", "oom"):
+    if outcome.chosen is not None and result.failure in ("job_preempted", "oom"):
         # these outcomes happen after the class admitted the run, so an older no-capacity refusal no
         # longer describes the current market. poll_error stays ambiguous because submit and lookup
         # failures can happen before any capacity was granted.

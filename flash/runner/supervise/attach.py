@@ -167,10 +167,11 @@ def _reconcile_completed_remote(
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
-    from flash.runner.supervise.lifecycle import (
-        _RECOVERY_MARKER_GRACE_S,
-        _adopt_completed_attempt,
-    )
+    from flash.runner.lifecycle.protocol import AttemptRecord
+    from flash.runner.lifecycle.status import get_status
+    from flash.runner.supervise.lifecycle import _adopt_completed_attempt
+
+    result_deadline_at = AttemptRecord.from_dict(get_status(run_id).attempt).result_deadline_at
 
     try:
         if _adopt_completed_attempt(
@@ -188,7 +189,7 @@ def _reconcile_completed_remote(
     # deadline plus the recovery grace, or a persistently failing adoption
     # would leave the run non-terminal forever. past the grace, preserve the
     # remote for cost reconciliation and fail the run.
-    if time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S:
+    if time.time() >= result_deadline_at:
         # best-effort: preserve the remote for cost reconciliation, but do NOT
         # gate termination on it -- a persistently failing cleanup-persist must
         # not leave the run non-terminal forever (the whole point of the grace
@@ -210,7 +211,7 @@ def _reconcile_completed_remote(
         # sleep below would sleep 0 and busy-spin the reconciler.
         time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
         return False
-    remaining_grace = deadline_at + _RECOVERY_MARKER_GRACE_S - time.time()
+    remaining_grace = result_deadline_at - time.time()
     time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, remaining_grace)))
     return False
 
@@ -232,18 +233,11 @@ def _reconcile_expired_remote(
     )
     from flash.runner.supervise.lifecycle import (
         _adopt_completed_attempt,
-        _completed_attempt_metrics,
+        _attempt_result_metrics,
     )
 
     try:
-        metrics = _completed_attempt_metrics(
-            worker_spec,
-            provider=handle.provider,
-            attempt=next_attempt - 1,
-            launch_floor=float(expected_remote["started_ts"]),
-            deadline_at=deadline_at,
-            log=log,
-        )
+        metrics = _attempt_result_metrics(run_id, expected_remote)
     except Exception:
         time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
         return False
@@ -322,12 +316,11 @@ def _reconcile_attached_remote(
         _remote_resource_identity,
     )
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.lifecycle.protocol import AttemptRecord
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
-        _RECOVERY_MARKER_GRACE_S,
-        _CompletedAttemptPending,
-        _runpod_completed_metrics,
+        _attempt_result_metrics,
         _strict_teardown_handle,
         _worker_provably_gone,
     )
@@ -354,24 +347,12 @@ def _reconcile_attached_remote(
                 time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
                 continue
             return
+        attempt_record = AttemptRecord.from_dict(status.attempt)
+        result_deadline_at = attempt_record.result_deadline_at
         try:
-            completed_metrics = _runpod_completed_metrics(
-                expected_remote,
-                deadline_at=deadline_at,
-            )
-        except _CompletedAttemptPending:
-            # the queue job already completed but its metrics are still landing; keep
-            # reconciling (do not tear it down) until they are readable -- but do not sleep
-            # past the grace cutoff, or a run that fails at the cutoff keeps reconciling a
-            # full interval beyond it before terminating.
-            pending_interval = _ATTACH_RECONCILE_INTERVAL_S
-            if deadline_at is not None:
-                pending_interval = min(
-                    pending_interval,
-                    max(0.0, deadline_at + _RECOVERY_MARKER_GRACE_S - time.time()),
-                )
-            time.sleep(pending_interval)
-            continue
+            completed_metrics = _attempt_result_metrics(run_id, expected_remote)
+        except Exception:
+            completed_metrics = None
         if completed_metrics is not None:
             if _reconcile_completed_remote(
                 run_id,
@@ -383,7 +364,7 @@ def _reconcile_attached_remote(
             ):
                 return
             continue
-        if time.time() >= deadline_at:
+        if time.time() >= result_deadline_at:
             if _reconcile_expired_remote(
                 run_id,
                 worker_spec,
@@ -589,26 +570,12 @@ def _handle_attach_wall_deadline(
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
         _adopt_completed_attempt,
-        _completed_attempt_metrics,
-        _runpod_completed_metrics,
+        _attempt_result_metrics,
         _strict_teardown_handle,
     )
 
-    deadline_at = _load_run_deadline_at(run_id)
-    metrics = _runpod_completed_metrics(
-        context.persisted_remote,
-        deadline_at=deadline_at,
-    )
-    started_ts = context.persisted_remote.get("started_ts")
-    if metrics is None and started_ts is not None:
-        metrics = _completed_attempt_metrics(
-            context.worker_spec,
-            provider=context.handle.provider,
-            attempt=context.recovered_attempt,
-            launch_floor=float(started_ts),
-            deadline_at=deadline_at,
-            log=log,
-        )
+    _load_run_deadline_at(run_id)
+    metrics = _attempt_result_metrics(run_id, context.persisted_remote)
     if metrics is not None:
         _carry_allocation_stamp(metrics, context.persisted_remote)
         try:
@@ -664,21 +631,17 @@ def _handle_failed_attach_poll(
 ) -> RunStatus:
     """Adopt completed work or safely recover from an unsuccessful provider poll."""
     from flash.runner.accounting.reconciliation import _record_cleanup_remote
-    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
         _adopt_completed_attempt,
-        _runpod_completed_metrics,
+        _attempt_result_metrics,
         _strict_teardown_handle,
         _worker_provably_gone,
     )
 
     failure = f"{result.failure or 'job_failed'}: {result.detail or 'provider attempt failed'}"
     print(f"attach: {run_id} ended ({result.failure}); evaluating recovery", file=log)
-    completed_metrics = _runpod_completed_metrics(
-        context.persisted_remote,
-        deadline_at=_load_run_deadline_at(run_id),
-    )
+    completed_metrics = _attempt_result_metrics(run_id, context.persisted_remote)
     if completed_metrics is not None:
         # the job completed. adoption may return False (a transient defer, e.g. a
         # cleanup-remote CAS lost) OR raise (e.g. a durable-confirmation exception);
@@ -792,7 +755,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import effective_spec_from_status, get_status
     from flash.runner.supervise.errors import _RunCancelled
-    from flash.runner.supervise.lifecycle import _CompletedAttemptPending
     from flash.runner.supervise.recovery import _gc_run_endpoints
 
     cleanup_terminal = False
@@ -848,21 +810,6 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         if not result.ok:
             return _handle_failed_attach_poll(run_id, context, result, log)
         _adopt_attached_poll_result(run_id, context, result, log)
-        return status_for_return()
-    except _CompletedAttemptPending as exc:
-        _schedule_attach_reconciliation(
-            run_id,
-            persisted_remote,
-            worker_spec,
-            next_attempt,
-            source_snapshot,
-            log,
-            str(exc),
-        )
-        print(
-            f"attach: {run_id} completed successfully; waiting for metrics.json visibility",
-            file=log,
-        )
         return status_for_return()
     except _RunCancelled:
         with contextlib.suppress(Exception):

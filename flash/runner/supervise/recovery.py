@@ -1,19 +1,9 @@
-"""Reconciling a training attempt whose worker is already gone, and settling what it owes.
-
-When a run's process disappears -- preempted, restarted, or torn down mid-flight -- the supervisor
-cannot ask it how it finished, so the outcome has to be reconstructed from what the provider and
-the output directory still say. `_completed_attempt_metrics` is that reconstruction; the strict
-teardown and charge helpers below are what a settled attempt then triggers.
-
-Split out of `flash.runner.supervise.lifecycle` to keep that module under the file-size limit.
-"""
+"""reconcile fenced attempt results, exact cleanup, and terminal accounting."""
 
 from __future__ import annotations
 
 import contextlib
-import json
 import time
-from collections.abc import Callable
 
 from flash.core.spec import JobSpec
 
@@ -21,7 +11,7 @@ from flash.core.spec import JobSpec
 def _lifecycle():
     """The supervisor module, imported lazily because it re-exports this one.
 
-    `_register_checkpoints_best_effort`, `_strict_teardown_handle` and `_runpod_completed_metrics`
+    `_register_checkpoints_best_effort` and `_strict_teardown_handle`
     are patched as attributes of `flash.runner.supervise.lifecycle` by the run-management and
     resume tests, and their callers live here. Resolving them through the parent is what keeps
     those patches effective; a direct call would bind this module's own function.
@@ -31,14 +21,7 @@ def _lifecycle():
     return lifecycle
 
 
-_RECOVERY_MARKER_GRACE_S = 120.0
-_RECOVERY_METRICS_POLL_S = 5.0
 _RUNPOD_STATUS_PROBE_TIMEOUT_S = 10.0
-
-
-class _CompletedAttemptPending(RuntimeError):
-    """A strict success marker exists, but its metrics are not readable yet."""
-
 
 def _canonical_provider_handle(handle):
     """Validate and canonicalize one complete provider-specific persisted handle."""
@@ -61,87 +44,40 @@ def _canonical_provider_handle(handle):
     raise ValueError("persisted provider identity is missing or unsupported")
 
 
-def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> dict | None:
-    """Return decoded metrics only when the exact RunPod job completed successfully."""
-    try:
-        original = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
-        canonical = _canonical_provider_handle(original)
-        data = canonical.to_dict()
-        if canonical.provider != "runpod" or not data.get("job_id"):
-            return None
-        from flash.providers.runpod.client import api as runpod_api
-        from flash.providers.runpod.execution.jobs import TERMINAL_OK, decode_output
+def _attempt_result_metrics(run_id: str, handle) -> dict | None:
+    """return metrics only from the current verified fenced success result."""
+    from flash.providers.artifacts.attempts import (
+        persist_attempt_artifacts,
+        poll_result_from_manifest,
+        read_attempt_artifacts,
+    )
+    from flash.runner.lifecycle.protocol import AttemptRecord
+    from flash.runner.lifecycle.status import (
+        effective_spec_from_status,
+        get_status,
+        source_snapshot_from_status,
+    )
 
-        # a status probe must fail fast: cap it at a short fresh timeout regardless of how far
-        # the run wall deadline is. handing job_status the wall+grace deadline (which can be
-        # hours out for a run that just started) lets a runpod api outage burn the full
-        # per-request retry budget before returning None, stalling the reconciler each pass.
-        # the wall+grace value governs only the pending-output decision below, never the probe.
-        probe_deadline_at = (
-            time.time() + _RUNPOD_STATUS_PROBE_TIMEOUT_S if deadline_at is not None else None
-        )
-        job = runpod_api.job_status(
-            data["endpoint_id"],
-            data["job_id"],
-            key_fingerprint=data["key_fingerprint"],
-            deadline_at=probe_deadline_at,
-        )
-        if not isinstance(job, dict) or job.get("status") not in TERMINAL_OK:
-            return None
-        try:
-            metrics = decode_output(job.get("output"))
-            output_readable = isinstance(metrics, dict)
-        except Exception:
-            raw_output = job.get("output")
-            if isinstance(raw_output, str):
-                # a string-form envelope (json text) is still a READABLE failure if it decodes to one;
-                # parse it before falling through to the pending path so a completed-with-failure job
-                # is not kept reconciling as if its output were merely lagging.
-                try:
-                    decoded = json.loads(raw_output)
-                except (ValueError, TypeError):
-                    decoded = None
-                if isinstance(decoded, dict):
-                    raw_output = decoded
-            if isinstance(raw_output, dict) and (
-                raw_output.get("error")
-                or ("success" in raw_output and not raw_output.get("success"))
-            ):
-                # the terminal-ok job's output is a READABLE worker-failure envelope, not
-                # lagging success metrics: the attempt definitively completed with a failure.
-                # do not raise _CompletedAttemptPending (which would keep reconciling a job
-                # that already failed); return None so the caller takes the completed-without-
-                # metrics (failed) path.
-                return None
-            # otherwise the output is present but not yet decodable (unparseable/non-dict):
-            # treat it like a missing output below (pending within grace) so a job that
-            # already completed is not torn down over a transient output lag.
-            metrics = None
-            output_readable = False
-        if not output_readable:
-            # the queue job is terminal-ok but its output metrics are not readable yet
-            # (missing, non-dict, or not yet decodable); treat this lag like instance
-            # recovery (raise pending) so callers keep reconciling instead of tearing down
-            # a job that already completed.
-            grace_expired = (
-                deadline_at is None or time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S
-            )
-            if grace_expired:
-                return None
-            raise _CompletedAttemptPending(
-                "runpod job completed but its output metrics are not readable yet"
-            )
-        allocated_gpu = original.get("allocated_gpu")
-        if allocated_gpu:
-            metrics.setdefault("allocated_gpu", allocated_gpu)
-        allocated_count = original.get("allocated_gpu_count")
-        if allocated_count:
-            metrics.setdefault("allocated_gpu_count", int(allocated_count))
-        return metrics
-    except _CompletedAttemptPending:
-        raise
-    except Exception:
+    canonical = _canonical_provider_handle(handle)
+    status = get_status(run_id)
+    attempt = AttemptRecord.from_dict(status.attempt)
+    data = canonical.to_dict()
+    if data.get("attempt") != attempt.attempt_id or data.get("fence") != attempt.fence:
+        raise RuntimeError("persisted provider handle does not match the current fenced attempt")
+    spec = effective_spec_from_status(status)
+    artifacts = read_attempt_artifacts(
+        spec.train.hf_repo,
+        phase=spec.phase,
+        run_id=run_id,
+        attempt_id=attempt.attempt_id,
+        fence=attempt.fence,
+        source_snapshot=source_snapshot_from_status(status, required=True),
+    )
+    persist_attempt_artifacts(run_id, artifacts)
+    if artifacts.result is None:
         return None
+    result = poll_result_from_manifest(artifacts.result)
+    return result.metrics if result.ok else None
 
 
 def _worker_provably_gone(run_id: str, handle) -> bool:
@@ -297,73 +233,6 @@ def _strict_teardown_handle(handle, run_id: str) -> bool:
     return True
 
 
-def _completed_attempt_metrics(
-    spec: JobSpec,
-    *,
-    provider: str,
-    attempt: int,
-    launch_floor: float,
-    deadline_at: float,
-    log=None,
-) -> dict | None:
-    """Read a strict successful instance marker plus its run-scoped metrics."""
-    if provider not in {"vast", "lambda"} or not spec.train.hf_repo:
-        return None
-    from flash.providers._lifecycle.instances.poll import make_say
-    from flash.providers._lifecycle.instances.poll_instance import (
-        _TERMINAL_REREAD_RETRIES,
-        _TERMINAL_REREAD_WAIT_S,
-    )
-    from flash.providers._lifecycle.instances.terminal_artifacts import (
-        INVALID_MARKER_DETAIL,
-        AttemptIdentity,
-        ProbeBudget,
-        TerminalKind,
-        resolve_terminal_artifacts,
-    )
-    from flash.providers.artifacts.hf import make_hf_text_reader
-
-    prefix = f"{spec.phase}/{spec.run_id}"
-    marker_reader = make_hf_text_reader(
-        spec.train.hf_repo,
-        f"{prefix}/{provider}_attempt{attempt}.json",
-    )
-    metrics_reader = make_hf_text_reader(spec.train.hf_repo, f"{prefix}/metrics.json")
-    say = make_say(log)
-    marker_bound = deadline_at + _RECOVERY_MARKER_GRACE_S
-    # ONE observation window for both artifacts. it previously computed a fresh window for the
-    # marker and then another fresh one for metrics, so the real ceiling was their sum and moved
-    # with however long the marker read took.
-    resolution = resolve_terminal_artifacts(
-        AttemptIdentity(run_id=spec.run_id, attempt=attempt, launch_floor=launch_floor),
-        read_marker=lambda: marker_reader(force=True),
-        read_metrics=lambda: metrics_reader(force=True),
-        budget=ProbeBudget(
-            tries=_TERMINAL_REREAD_RETRIES,
-            wait_s=_TERMINAL_REREAD_WAIT_S,
-            cutoff_at=time.time() + _TERMINAL_REREAD_RETRIES * _TERMINAL_REREAD_WAIT_S,
-        ),
-        say=say,
-        marker_deadline_at=marker_bound,
-        marker_wait_message="recovery deadline reached; waiting for the terminal attempt marker",
-        metrics_message="successful recovery marker seen; waiting for metrics.json",
-    )
-    if resolution.kind is TerminalKind.SUCCESS:
-        return resolution.metrics
-    if resolution.kind is TerminalKind.UNVERIFIABLE:
-        # name it the way live polling does instead of logging it as silence. it is still not
-        # completed work, so recovery does not adopt it either way.
-        say(f"recovery: {INVALID_MARKER_DETAIL}; not adopting it as completed work")
-        return None
-    # a success marker landed but its metrics have not. keep reconciling within the grace window
-    # rather than tearing down an attempt that already finished its paid work.
-    if resolution.kind is TerminalKind.PENDING and time.time() < marker_bound:
-        raise _CompletedAttemptPending(
-            "successful recovery marker is present but metrics.json is not readable yet"
-        )
-    return None
-
-
 def _adopt_completed_attempt(
     run_id: str,
     spec: JobSpec,
@@ -468,37 +337,6 @@ def _oom_escalated(candidates, oom_vram_floor: float):
     if not oom_vram_floor:
         return list(candidates)
     return [c for c in candidates if _candidate_usable_vram_gb(c) > oom_vram_floor]
-
-
-def _await_runpod_completed_metrics(
-    last_handle,
-    deadline_at,
-    *,
-    check_cancelled: Callable[[], None] | None = None,
-) -> dict | None:
-    # a terminal-ok runpod job whose output metrics are not decodable yet raises
-    # _CompletedAttemptPending within the grace window; keep reconciling (like attach_run
-    # and background reconciliation) instead of letting it escape the supervisor and fail
-    # a job that already completed.
-    #
-    # bound the wait to a short observation window measured from first observation (never past the
-    # run wall), not the full run wall deadline. callers pass the run wall deadline, up to
-    # max_wall_seconds (default 24h); passing it straight through let a terminal-ok job whose output
-    # never became readable pin the supervisor for the remainder of the run instead of failing over
-    # to a retry. _runpod_completed_metrics returns None once time >= observation_floor +
-    # _RECOVERY_MARKER_GRACE_S, so this synchronous poll is bounded to ~the grace window.
-    observation_floor = time.time()
-    if deadline_at is not None:
-        observation_floor = min(observation_floor, deadline_at)
-    while True:
-        try:
-            return _lifecycle()._runpod_completed_metrics(
-                last_handle, deadline_at=observation_floor
-            )
-        except _CompletedAttemptPending:
-            if check_cancelled is not None:
-                check_cancelled()
-            time.sleep(_RECOVERY_METRICS_POLL_S)
 
 
 def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:

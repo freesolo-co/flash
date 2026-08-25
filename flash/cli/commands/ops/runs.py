@@ -102,7 +102,7 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> _LogPollResul
             # storm costs the stream a pause rather than the whole follow.
             try:
                 page = client.get_logs(run_id, offset=offset)
-                # The log file can lag worker heartbeat/status updates, so lifecycle/progress must
+                # the log file can lag lifecycle observations, so progress must
                 # come from the run status endpoint. The log page's embedded state is only a
                 # fallback for older servers or test doubles.
                 status = client.get_run(run_id)
