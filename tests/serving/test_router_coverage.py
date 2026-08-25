@@ -10,6 +10,8 @@ Targets branches the existing suites miss:
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -199,6 +201,39 @@ class FakePool:
 # --------------------------------------------------------------------------------------------
 
 
+def test_exceptional_lifespan_exit_closes_usage_and_authorizer():
+    from flash.serving.src.accounting.usage_outbox import OfflineUsageStore
+
+    closed = []
+
+    class Store(OfflineUsageStore):
+        async def aclose(self):
+            closed.append("usage")
+
+    class Authorizer:
+        async def __call__(self, _token, _adapter_id):
+            return "org-1"
+
+        async def aclose(self):
+            closed.append("authorizer")
+
+    app = build_durable_serving_app(
+        FakePool(),
+        AdapterRouter([_rec("qa")]),
+        usage_store=Store(),
+        chat_authorizer=Authorizer(),
+    )
+
+    async def fail_inside_lifespan():
+        async with app.router.lifespan_context(app):
+            raise RuntimeError("app failed")
+
+    with pytest.raises(RuntimeError, match="app failed"):
+        asyncio.run(fail_inside_lifespan())
+
+    assert closed == ["usage", "authorizer"]
+
+
 def test_shutdown_propagates_usage_store_close_failure():
     from flash.serving.src.accounting.usage_outbox import OfflineUsageStore, UsageOutboxError
 
@@ -208,17 +243,29 @@ def test_shutdown_propagates_usage_store_close_failure():
         async def aclose(self):
             raise UsageOutboxError("durable_close_failed")
 
+    class Authorizer:
+        def __init__(self):
+            self.closed = False
+
+        async def __call__(self, _token, _adapter_id):
+            return "org-1"
+
+        async def aclose(self):
+            self.closed = True
+
+    authorizer = Authorizer()
     app = build_durable_serving_app(
         FakePool(),
         AdapterRouter([_rec("qa")]),
         usage_store=Store(),
-        chat_authorizer=_allow,
+        chat_authorizer=authorizer,
     )
     with (
         pytest.raises(UsageOutboxError, match="durable_close_failed"),
         TestClient(app) as client,
     ):
         assert client.get("/healthz").status_code == 200
+    assert authorizer.closed is True
 
 
 def test_shutdown_swallows_authorizer_aclose_errors():

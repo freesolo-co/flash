@@ -127,15 +127,18 @@ def _lifespan_for(
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: "FastAPI"):
-        await context.usage.start()
-        yield
-        await context.usage.aclose()
-
-        # close persistent authorization clients on shutdown.
-        for client_owner in (chat_authorizer,):
-            aclose = getattr(client_owner, "aclose", None)
-            if aclose is not None:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(aclose(), timeout=_CLEANUP_TIMEOUT_SECONDS)
+        try:
+            await context.usage.start()
+            yield
+        finally:
+            try:
+                await context.usage.aclose()
+            finally:
+                # close persistent authorization clients even when durable shutdown fails.
+                for client_owner in (chat_authorizer,):
+                    aclose = getattr(client_owner, "aclose", None)
+                    if aclose is not None:
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(aclose(), timeout=_CLEANUP_TIMEOUT_SECONDS)
 
     return _lifespan
