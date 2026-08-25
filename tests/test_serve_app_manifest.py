@@ -95,7 +95,7 @@ def _spec_and_inputs(
         artifact_revision=SOURCE_REVISION,
         artifact_digest=aggregate,
         artifact_subfolder="sft/run-1/adapter",
-        base_model="Qwen/Qwen3.5-4B",
+        base_model="Qwen/Qwen3.5-9B",
         base_model_revision=BASE_REVISION,
         lora_rank=16,
         thinking_default=True,

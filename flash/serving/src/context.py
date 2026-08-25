@@ -9,7 +9,6 @@ reached from a handler through ``ServingContext.of(request)``.
 """
 
 import asyncio
-import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -131,11 +130,17 @@ class ServingContext:
     async def unregister_safe(
         self, base_model: str, adapter_id: str, expected_generation: str | None
     ) -> None:
-        # gpu cleanup is best-effort and may wait for the model's warm engine. the engine compares
-        # this deployment generation under its per-adapter lock so stale cleanup cannot remove a
-        # redeployment of the same immutable revision id.
-        with contextlib.suppress(Exception):
+        # gpu cleanup may wait for the model's warm engine. the engine compares this deployment
+        # generation under its per-adapter lock so stale cleanup cannot remove a redeployment of the
+        # same immutable revision id. durable routing is already disabled, but an exact eviction
+        # failure must remain observable rather than making the successful api response imply it ran.
+        try:
             await self.pool.unregister(base_model, adapter_id, expected_generation)
+        except Exception as error:
+            print(
+                f"hosted adapter gpu cleanup failed for {adapter_id} on {base_model}: {error!r}",
+                flush=True,
+            )
 
     async def generate(
         self,

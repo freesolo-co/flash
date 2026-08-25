@@ -2,7 +2,7 @@
 
 Modal fixes a class's GPU and concurrency at decoration time, so the serving app registers one
 ``LoraEngine`` ``@app.cls`` per distinct (GPU tier, max_inputs) key and dispatches each base model to
-its class (4B -> L4, 9B -> L40S, 27B -> H100, small models -> L4, 35B -> H200). modal_app imports the ``modal`` SDK
+its class (9b -> l40s, 35b -> h200). modal_app imports the ``modal`` sdk
 at module top, which isn't installed offline, so we stub it just enough to import the module and
 reach the built engine classes.
 """
@@ -350,7 +350,7 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
     record_dict = {
         "adapter_id": adapter_id,
         "repo_id": "org/private-adapter",
-        "base_model": "Qwen/Qwen3.5-4B",
+        "base_model": "Qwen/Qwen3.5-9B",
         "org_id": "org-1",
         "checkpoint": "run-1/step-1",
         "private": True,
@@ -423,20 +423,22 @@ assert "flash.serving.src.multimodal" not in sys.modules
 
 def test_one_engine_class_per_supported_model(modal_app_module):
     assert set(modal_app_module.ENGINE_BY_MODEL) == set(base_models())
-    assert len(modal_app_module.ENGINE_BY_MODEL) == 6
-    assert len({id(engine) for engine in modal_app_module.ENGINE_BY_MODEL.values()}) == 6
+    assert len(modal_app_module.ENGINE_BY_MODEL) == len(base_models())
+    assert len({id(engine) for engine in modal_app_module.ENGINE_BY_MODEL.values()}) == len(
+        base_models()
+    )
 
 
 def test_engine_concurrency_comes_from_validated_model_policy(modal_app_module):
-    assert modal_app_module._engine_concurrency("Qwen/Qwen3.5-0.8B") == (64, 48)
-    assert modal_app_module._engine_concurrency("Qwen/Qwen3.5-4B") == (8, 6)
+    assert modal_app_module._engine_concurrency("Qwen/Qwen3.5-9B") == (8, 6)
+    assert modal_app_module._engine_concurrency("Qwen/Qwen3.6-35B-A3B") == (8, 6)
     with pytest.raises(ValueError, match="Unsupported base model"):
         modal_app_module._engine_concurrency("unsupported/model")
 
 
 def test_class_names_are_deterministic_distinct_and_modal_safe(modal_app_module):
     names = [modal_app_module._engine_class_name(model) for model in base_models()]
-    assert len(set(names)) == 6
+    assert len(set(names)) == len(base_models())
     assert names == [modal_app_module._engine_class_name(model) for model in base_models()]
     assert all(name.startswith("LoraEngine_") for name in names)
     assert all(name.replace("_", "").isalnum() for name in names)
@@ -449,6 +451,13 @@ def test_each_model_routes_to_its_exact_identity(modal_app_module, base_model: s
     assert engine.pinned_gpu == gpu_for(base_model)
 
 
+def test_pending_qwen38_candidate_has_no_active_engine_dispatch(modal_app_module):
+    with pytest.raises(ValueError, match="Unsupported base model"):
+        gpu_for("Qwen/Qwen3.8-27B")
+    with pytest.raises(ValueError, match="Unsupported base model"):
+        modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B")
+
+
 def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module):
     """An unseen base model must not silently dispatch to the L4 default tier."""
     with pytest.raises(ValueError, match="Unsupported base model"):
@@ -456,11 +465,11 @@ def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module)
 
 
 def test_modal_capacity_snapshot_parses_exact_stats_and_identity(modal_app_module, monkeypatch):
-    model = "Qwen/Qwen3.5-0.8B"
+    model = "Qwen/Qwen3.5-9B"
     stats = types.SimpleNamespace(
         num_total_runners=1,
-        num_running_inputs=10,
-        input_headroom=54,
+        num_running_inputs=4,
+        input_headroom=4,
         backlog=3,
     )
 
@@ -480,21 +489,21 @@ def test_modal_capacity_snapshot_parses_exact_stats_and_identity(modal_app_modul
     )
     pool = modal_app_module._ModalEnginePool(clock=lambda: 10.0)
 
-    snapshot = asyncio.run(pool.capacity_snapshot(model, observed_local_active=10))
+    snapshot = asyncio.run(pool.capacity_snapshot(model, observed_local_active=4))
 
     assert snapshot.model == model
     assert snapshot.deployment_identity == modal_app_module._capacity_deployment_identity(model)
     assert snapshot.total_runners == 1
-    assert snapshot.running_inputs == 10
-    assert snapshot.input_headroom == 54
+    assert snapshot.running_inputs == 4
+    assert snapshot.input_headroom == 4
     assert snapshot.backlog == 3
-    assert snapshot.observed_local_active == 10
-    assert snapshot.local_active_limit == 64
-    assert pool.current_dispatch_capacity(model) == 64
+    assert snapshot.observed_local_active == 4
+    assert snapshot.local_active_limit == 8
+    assert pool.current_dispatch_capacity(model) == 8
 
 
 def test_capacity_timestamp_is_taken_after_stats_rpc(modal_app_module, monkeypatch) -> None:
-    model = "Qwen/Qwen3.5-0.8B"
+    model = "Qwen/Qwen3.5-9B"
     clock = {"now": 10.0}
     stats = types.SimpleNamespace(
         num_total_runners=1,
@@ -524,7 +533,7 @@ def test_capacity_timestamp_is_taken_after_stats_rpc(modal_app_module, monkeypat
 def test_transient_stats_failure_preserves_valid_snapshot_until_expiry(
     modal_app_module, monkeypatch
 ) -> None:
-    model = "Qwen/Qwen3.5-0.8B"
+    model = "Qwen/Qwen3.5-9B"
     clock = {"now": 10.0}
     fail = {"value": False}
 
@@ -560,7 +569,7 @@ def test_transient_stats_failure_preserves_valid_snapshot_until_expiry(
 
 
 def test_no_warm_runners_replaces_valid_snapshot_immediately(modal_app_module, monkeypatch) -> None:
-    model = "Qwen/Qwen3.5-0.8B"
+    model = "Qwen/Qwen3.5-9B"
     clock = {"now": 10.0}
     runners = {"value": 1}
 
@@ -592,7 +601,7 @@ def test_no_warm_runners_replaces_valid_snapshot_immediately(modal_app_module, m
 def test_slow_success_does_not_trigger_immediate_serial_refresh(
     modal_app_module, monkeypatch
 ) -> None:
-    model = "Qwen/Qwen3.5-0.8B"
+    model = "Qwen/Qwen3.5-9B"
     clock = {"now": 10.0}
     calls = 0
 
@@ -625,7 +634,7 @@ def test_slow_success_does_not_trigger_immediate_serial_refresh(
 def test_fixed_stats_snapshot_never_self_inflates_admission_limit(
     modal_app_module, monkeypatch
 ) -> None:
-    model = "Qwen/Qwen3.5-0.8B"
+    model = "Qwen/Qwen3.5-9B"
     stats = types.SimpleNamespace(
         num_total_runners=1,
         num_running_inputs=60,
@@ -674,7 +683,7 @@ def test_fixed_stats_snapshot_never_self_inflates_admission_limit(
 def test_modal_capacity_snapshot_fails_closed_on_invalid_or_mismatched_identity(
     modal_app_module,
 ) -> None:
-    model = "Qwen/Qwen3.5-0.8B"
+    model = "Qwen/Qwen3.5-9B"
     identity = modal_app_module._capacity_deployment_identity(model)
     snapshot = modal_app_module.CapacitySnapshot(
         model=model,
@@ -697,7 +706,7 @@ def test_modal_capacity_snapshot_fails_closed_on_invalid_or_mismatched_identity(
     clock["now"] = 10.0
 
     pool._capacity[model] = modal_app_module.CapacitySnapshot(
-        model="Qwen/Qwen3.5-2B",
+        model="Qwen/Qwen3.6-35B-A3B",
         deployment_identity=identity,
         observed_at=10.0,
         total_runners=1,
@@ -756,7 +765,7 @@ def test_modal_capacity_is_isolated_per_model(modal_app_module) -> None:
 def test_new_function_stats_replace_fixed_limit_for_scale_up_and_down(
     modal_app_module, monkeypatch
 ) -> None:
-    model = "Qwen/Qwen3.5-0.8B"
+    model = "Qwen/Qwen3.5-9B"
     clock = {"now": 10.0}
     stats = {
         "value": types.SimpleNamespace(
@@ -827,7 +836,7 @@ def test_model_class_identity_is_fixed_before_decoration(modal_app_module):
         assert getattr(modal_app_module, class_name) is engine
 
 
-def test_installed_modal_registers_six_unparameterized_exact_warm_classes() -> None:
+def test_installed_modal_registers_unparameterized_exact_warm_classes() -> None:
     code = """
 import inspect
 import json
@@ -869,7 +878,7 @@ print(json.dumps(observed, sort_keys=True))
     assert result.returncode == 0, result.stderr
     observed = json.loads(result.stdout)
     assert set(observed) == set(base_models())
-    assert len({entry["class_name"] for entry in observed.values()}) == 6
+    assert len({entry["class_name"] for entry in observed.values()}) == len(base_models())
     for model, entry in observed.items():
         assert entry["parameters"] == {}
         assert entry["instance_model"] == model
@@ -906,14 +915,12 @@ def test_changed_hosted_sources_describe_warm_policy() -> None:
 
 
 def test_health_reports_pinned_gpu_over_derived_tier(modal_app_module):
-    """_health() reports the class's ACTUAL pinned tier, not gpu_for(base_model): a base model
-    instantiated on the wrong tier's class (here an A100-pinned class holding a 4B model whose
-    expected tier is L4) must surface as the real A100 tier, otherwise misrouting is masked."""
+    """_health reports the class's actual pinned tier rather than the derived model tier."""
     impl = modal_app_module._LoraEngineImpl
 
     class _Fake:
         pinned_gpu = "A100-80GB"
-        base_model = "Qwen/Qwen3.5-4B"  # gpu_for -> L4 (the EXPECTED tier)
+        base_model = "Qwen/Qwen3.5-9B"
         registry = type("R", (), {"list_ready": lambda self: []})()
 
     health = impl._health(_Fake())
@@ -923,10 +930,10 @@ def test_health_reports_pinned_gpu_over_derived_tier(modal_app_module):
 
     class _Bare:
         # No pinned_gpu (the shared impl used directly) -> fall back to the expected tier.
-        base_model = "Qwen/Qwen3.5-4B"
+        base_model = "Qwen/Qwen3.5-9B"
         registry = type("R", (), {"list_ready": lambda self: []})()
 
-    assert impl._health(_Bare())["configured_gpu"] == "L4"  # fallback to gpu_for(base_model)
+    assert impl._health(_Bare())["configured_gpu"] == "L40S"
 
 
 def test_health_reports_effective_max_model_len_override(modal_app_module):
@@ -944,7 +951,7 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
     assert impl._health(_Big())["max_model_len"] == 32768  # the override, not cfg.MAX_MODEL_LEN
 
     class _Dense:
-        base_model = "Qwen/Qwen3.5-2B"  # per-model 32k override
+        base_model = "Qwen/Qwen3.5-9B"  # per-model 32k override
         registry = type("R", (), {"list_ready": lambda self: []})()
 
     assert impl._health(_Dense())["max_model_len"] == 32768
@@ -1055,7 +1062,7 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
 
     result = asyncio.run(
         pool.generate(
-            "Qwen/Qwen3.5-4B",
+            "Qwen/Qwen3.5-9B",
             payload,
             record,
             expected_checkpoint="step-1",
@@ -1066,7 +1073,7 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
         return [
             event
             async for event in pool.stream_generate(
-                "Qwen/Qwen3.5-4B",
+                "Qwen/Qwen3.5-9B",
                 payload,
                 record,
                 expected_checkpoint="step-1",
@@ -1074,14 +1081,14 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
         ]
 
     stream_events = asyncio.run(_collect_stream())
-    asyncio.run(pool.register("Qwen/Qwen3.5-4B", record))
+    asyncio.run(pool.register("Qwen/Qwen3.5-9B", record))
 
     assert result == {"ok": True}
     assert stream_events == [{"delta": "hello"}, {"delta": " world"}]
     assert bound_models == [
-        "Qwen/Qwen3.5-4B",
-        "Qwen/Qwen3.5-4B",
-        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-9B",
     ]
     expected_inference_call = (
         {"messages": [{"role": "user", "content": "hello"}]},
@@ -1110,7 +1117,12 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
 
 
 def _load_engine_and_args(
-    modal_app_module, monkeypatch, tmp_path, base_model: str
+    modal_app_module,
+    monkeypatch,
+    tmp_path,
+    base_model: str,
+    *,
+    engine_type: type | None = None,
 ) -> tuple[Any, Any]:
     """Run _LoraEngineImpl._load() for ``base_model`` with the tokenizer + vLLM engine stubbed, and
     return the engine instance plus the AsyncEngineArgs it was constructed with."""
@@ -1134,7 +1146,7 @@ def _load_engine_and_args(
 
     monkeypatch.setattr(vllm.AsyncLLMEngine, "from_engine_args", staticmethod(_capture))
 
-    engine = object.__new__(modal_app_module._LoraEngineImpl)
+    engine = object.__new__(engine_type or modal_app_module._LoraEngineImpl)
     engine.base_model = base_model
     asyncio.run(engine._load())
     return engine, captured["args"]
@@ -1152,41 +1164,17 @@ def test_every_catalog_model_forwards_its_reasoning_parser(
     assert args.reasoning_parser == "qwen3"
 
 
-def test_load_prequant_fp8_checkpoint_for_dense_small(modal_app_module, monkeypatch, tmp_path):
-    """A small dense base (2B) now loads its owned PRE-QUANTIZED FP8 checkpoint: model =
-    serve_model_id, quantization = None (vLLM auto-detects the checkpoint's FP8 — no online quant),
-    FP8 KV, rank-128 / max_loras-16 buffers, NO moe_backend (that's MoE-only)."""
-    args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-2B")
-    assert args.model == "Freesolo-Co/Qwen3.5-2B-FP8"  # owned pre-quant checkpoint
-    assert args.quantization is None  # auto-detected from the checkpoint, not online-quantized
-    assert args.kv_cache_dtype == "fp8"
-    assert args.enable_lora is True
-    assert args.max_lora_rank == 128
-    assert args.max_loras == 16
-    assert args.max_model_len == 32768
-    assert args.gpu_memory_utilization == 0.98  # small L4 tiers pin 0.98, not the global 0.90
-    assert (
-        args.max_num_seqs == 64
-    )  # capped to the MAX_INPUTS concurrency ceiling, not vLLM's default
-    assert getattr(args, "moe_backend", None) in (None, "auto")
-    assert args.limit_mm_per_prompt == {"image": 4}
-    assert args.mm_processor_cache_gb == 0
-    assert args.enable_tower_connector_lora is True
-    assert getattr(args, "calculate_kv_scales", None) in (None, False)  # never enabled (GDN-safe)
-
-
 def test_lora_pinning_only_when_hot_pool_covers_cpu_pool(modal_app_module, monkeypatch, tmp_path):
     """Pinned LoRAs cannot be LRU-evicted, so capped hot pools must stay unpinned if 256 adapters
     are deployable through max_cpu_loras."""
-    engine, args = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-2B")
+    engine, args = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-9B")
     assert args.max_loras == 16
     assert args.max_cpu_loras == 256
     assert engine._pin_loras is False
 
     for model, max_loras in (
-        ("Qwen/Qwen3.5-4B", 16),
         ("Qwen/Qwen3.5-9B", 16),
-        ("Qwen/Qwen3.6-27B", 16),
+        ("Qwen/Qwen3.6-35B-A3B", 6),
     ):
         engine, args = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, model)
         assert args.max_loras == max_loras
@@ -1209,23 +1197,16 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
     assert getattr(args, "max_num_batched_tokens", None) is None
 
 
-def test_load_owned_fp8_checkpoint_for_27b(modal_app_module, monkeypatch, tmp_path):
-    args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.6-27B")
-    assert args.model == "Freesolo-Co/Qwen3.6-27B-FP8"  # owned pre-quant checkpoint
-    assert args.tensor_parallel_size == 1
-    assert args.quantization is None
-    assert args.kv_cache_dtype == "fp8"
-    assert args.max_loras == 16
-    assert args.max_lora_rank == 64
-    assert args.max_model_len == 32768
-    assert args.max_num_seqs == 8
-    assert args.gpu_memory_utilization == 0.90  # 0.90 leaves CUDA-graph capture headroom (was 0.98)
-    assert args.enforce_eager is False  # CUDA graphs ON: ~7x faster decode on the hybrid GDN model
-    assert args.reasoning_parser == "qwen3"
-    assert args.limit_mm_per_prompt == {"image": 4}
-    assert args.enable_tower_connector_lora is True
-    assert not args.language_model_only
-    assert getattr(args, "max_num_batched_tokens", None) is None
+def test_qwen38_candidate_immutable_args_fail_closed_when_vllm_drops_revision_support():
+    from flash.serving.src import engine_boot
+    from flash.serving.src.model_config import _QWEN38_HOSTED_CANDIDATE
+
+    with pytest.raises(RuntimeError, match=r"cannot pin.*missing engine args"):
+        engine_boot._required_immutable_args(
+            "Qwen/Qwen3.8-27B",
+            _QWEN38_HOSTED_CANDIDATE["engine"],
+            {"model"},
+        )
 
 
 def test_load_bf16_base_with_full_experts_for_35b(modal_app_module, monkeypatch, tmp_path):

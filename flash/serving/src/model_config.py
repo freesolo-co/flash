@@ -2,11 +2,10 @@
 
 The serving app runs one vLLM GPU engine per base model, each on the Modal GPU class set by its
 catalog ``gpu`` (see below). Adapters and routing key off the logical ``base_model``; the engine
-loads a PRE-QUANTIZED FP8 checkpoint for that model (see ``src.prequant_config``) at the checkpoint's
-own dtype. Every DENSE catalog model serves a pre-quantized FP8 checkpoint (no online quantization, no
-community-repo dependence); vLLM auto-detects the checkpoint's compressed-tensors quantization, so
-the engine passes no online ``quantization``. The 35B-A3B MoE is the exception: it serves the BASE
-bf16 weights (the fused-MoE LoRA path won't compile on FP8), see the 35B block below.
+loads its configured checkpoint at that checkpoint's own dtype. The active dense 9B uses Freesolo
+compressed-tensors FP8. Qwen3.8-27B retains pinned candidate metadata but is excluded from active
+lookups until its exact canary passes. The active 35B-A3B MoE serves base bf16 weights because its
+fused-MoE LoRA path will not compile on FP8, as detailed below.
 """
 
 from __future__ import annotations
@@ -28,33 +27,15 @@ from flash.serving.src.prequant_config import fp8_serve_model_for as _prequant_s
 # `engine` (optional): per-model vLLM engine-arg overrides (LoRA buffer shape, scheduler/memory caps,
 # language_model_only, …). The engine's LOADED checkpoint is NOT in here — it is resolved centrally by
 # ``serve_model_for`` from ``src.prequant_config`` and injected into the overrides as ``serve_model_id``.
-# so every model loads a pre-quantized FP8 checkpoint: Freesolo-owned FP8_DYNAMIC for the dense
-# models (including the 27B) and official Qwen FP8 for the 35B VL MoE.
+# active models resolve through prequant_config unless an exact validated override is present. the
+# pending 27b candidate carries its own immutable checkpoint pin without entering active resolution.
 # ⚠ serve_model_id is pointed only at checkpoints VERIFIED to exist (a missing repo 404-crash-loops
 # the engine — the reason this mechanism was removed once); the owned repos are VL-preserving FP8
 # checkpoints published to the operator HF org.
 #
-# Sizing rationale. Two things dominate per-engine VRAM:
-#   1. The PRE-ALLOCATED LoRA buffers (max_loras x max_lora_rank, fixed at init, independent of how
-#      many adapters load) — they can DWARF the (now-quantized) base weights. Both are linear levers.
-#      the dense tiers keep max_loras=16 (the global default) and move the rank: rank-128 for
-#      0.8B/2B/4B/9B, rank-64 for 27B. the 35B MoE is the exception; its fused-MoE LoRA buffer is far
-#      larger per (lora, rank), so it runs rank-64 at 6 hot slots.
-#   2. Quantized base weights (FP8 ~half bf16) + FP8 KV (~half). Loaded directly from the
-#      pre-quantized serve_model_id checkpoint (no bf16 load transient).
-# Net result across native-FP8 cards (compute capability >= 8.9) and A100's Marlin FP8 fallback:
-#   - 0.8B / 2B -> L4 (24 GiB, Ada sm89, ~$0.80/hr — the cheapest vLLM-capable card on
-#     Modal), owned pre-quantized checkpoints, 16 x 128 LoRA, at gpu_memory_utilization 0.98 (same as
-#     the 4B on this card). The FP8 weights + LoRA buffer occupy only a fraction of the 24 GiB, so
-#     the small tiers previously inherited the global 0.90 and left ~2 GiB idle; pinning 0.98 turns
-#     that headroom into KV-cache blocks (more concurrent sequences / longer prefix-cache residency).
-#     They CANNOT drop to a smaller/cheaper card: T4 is the only cheaper Modal GPU and is NOT an
-#     option — sm75 (Turing) is below vLLM V1's compute-capability >= 8.0 floor, so vLLM >= 0.19 won't
-#     initialize (no V1 attention backend for Turing); the next card up, A10G, costs MORE than the L4.
-#   - 4B -> L4 with an owned PRE-QUANTIZED checkpoint, max_model_len=32768, max_num_seqs=8, and
-#     16 x 128 LoRA. CUDA graphs remain enabled.
-#   - 9B -> L40S (48 GiB, Ada sm89) at 32k context with CUDA graphs on and 16 x 128 LoRA.
-#   - 27B -> H100 (80 GiB) at 32k context with CUDA graphs on and 16 x 64 LoRA.
+# sizing rationale. preallocated lora buffers and loaded checkpoint weights dominate engine vram.
+# the active 9b uses 16 rank-128 slots on l40s and the active 35b moe uses 6 rank-64 slots on h200.
+# the pending 27b candidate retains its proposed h100 shape only for the exact canary.
 #   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> H200
 #     (141 GiB) with the base bf16 weights, 6 x 64 LoRA at 32k. bf16 (not FP8) is the one path giving
 #     full-expert LoRA + CUDA graphs because the fused-MoE LoRA path won't compile on fp8e4nv. see the
@@ -126,61 +107,6 @@ class HostedTrafficPolicy:
 
 
 SERVING_MODELS: list[dict[str, Any]] = [
-    # Small L4 tiers: owned pre-quantized FP8 checkpoints with rank-128 adapters, keeping 16 hot LoRAs
-    # resident (the global default). The loaded checkpoint is resolved centrally (serve_model_for) —
-    # the engine dict carries only the LoRA/tier shape. These tiny models have ample L4 headroom, so
-    # the 16 x 128 buffer fits comfortably; they now pin gpu_memory_utilization=0.98 (matching the
-    # 4B on the same L4) instead of inheriting the global 0.90, so the ~2 GiB the default left idle
-    # becomes KV cache — more concurrent sequences / longer prefix-cache residency per engine.
-    # They also cap max_num_seqs=64 to the container's real concurrency ceiling (modal_app.MAX_INPUTS
-    # packs at most 64 in-flight requests per engine). Left at vLLM's ~1024 default the engine
-    # over-reserved logits/activation + captured CUDA graphs for ~1000 sequences that can never
-    # arrive; capping to 64 reclaims that reservation as KV cache (thoroughly-used memory) and
-    # shortens cold-boot, with NO throughput loss — all 64 in-flight requests still decode at once.
-    {
-        "base_model": "Qwen/Qwen3.5-0.8B",
-        "image_input_limit": 4,
-        "gpu": "L4",
-        "engine": {
-            "gpu_memory_utilization": 0.98,
-            "max_lora_rank": 128,
-            "max_model_len": 32768,
-            "max_num_seqs": 64,
-            # CUDA graphs ON (explicit; was the vLLM default) — documents intent, de-risks a default change.
-            "enforce_eager": False,
-            "reasoning_parser": "qwen3",
-        },
-    },
-    {
-        "base_model": "Qwen/Qwen3.5-2B",
-        "image_input_limit": 4,
-        "gpu": "L4",
-        "engine": {
-            "gpu_memory_utilization": 0.98,
-            "max_lora_rank": 128,
-            "max_model_len": 32768,
-            "max_num_seqs": 64,
-            # CUDA graphs ON (explicit; was the vLLM default) — documents intent, de-risks a default change.
-            "enforce_eager": False,
-            "reasoning_parser": "qwen3",
-        },
-    },
-    # the 4B and 9B use rank-128 LoRA buffers, the 27B rank-64 (16 hot each) and 32k context. adapters still key
-    # off the logical base_model while the engine loads the configured pre-quantized checkpoint.
-    {
-        "base_model": "Qwen/Qwen3.5-4B",
-        "image_input_limit": 4,
-        "gpu": "L4",
-        "engine": {
-            "gpu_memory_utilization": 0.98,
-            "max_loras": 16,
-            "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (the 4 GiB FP8 4B has ample L4 headroom); 32k.
-            "max_model_len": 32768,
-            "max_num_seqs": 8,
-            "enforce_eager": False,
-            "reasoning_parser": "qwen3",
-        },
-    },
     {
         "base_model": "Qwen/Qwen3.5-9B",
         "image_input_limit": 4,
@@ -192,22 +118,6 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "gpu_memory_utilization": 0.90,
             "max_loras": 16,
             "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); 32k context.
-            "max_model_len": 32768,
-            "max_num_seqs": 8,
-            "enforce_eager": False,
-            "reasoning_parser": "qwen3",
-        },
-    },
-    {
-        "base_model": "Qwen/Qwen3.6-27B",
-        "image_input_limit": 4,
-        "gpu": "H100",
-        "engine": {
-            # 0.90 (was 0.98) makes room for CUDA-graph capture. this hybrid GatedDeltaNet measured
-            # about 11 tok/s eager versus 80 tok/s with CUDA graphs on the H100.
-            "gpu_memory_utilization": 0.90,
-            "max_loras": 16,
-            "max_lora_rank": 64,
             "max_model_len": 32768,
             "max_num_seqs": 8,
             "enforce_eager": False,
@@ -267,17 +177,31 @@ _HOSTED_TRAFFIC_POLICY_BY_MODEL: dict[str, HostedTrafficPolicy] = {
     for model in SERVING_MODELS
 }
 
-
-def supports_image_input(base_model: str) -> bool:
-    return image_limit_for(base_model) is not None
-
-
-def image_limit_for(base_model: str) -> int | None:
-    return _config_for(base_model)["image_input_limit"]
+# inert descriptor for the exact pending canary. activation means moving this descriptor into
+# SERVING_MODELS, not consulting a second runtime allowlist.
+_QWEN38_HOSTED_CANDIDATE: dict[str, Any] = {
+    "base_model": "Qwen/Qwen3.8-27B",
+    "image_input_limit": 4,
+    "gpu": "H100",
+    "engine": {
+        "serve_model_id": "Qwen/Qwen3.8-27B-FP8",
+        "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+        "tokenizer_model": "Qwen/Qwen3.8-27B",
+        "tokenizer_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        "processor_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        "gpu_memory_utilization": 0.90,
+        "max_loras": 16,
+        "max_lora_rank": 64,
+        "max_model_len": 32768,
+        "max_num_seqs": 8,
+        "enforce_eager": False,
+        "reasoning_parser": "qwen3",
+    },
+}
 
 
 def base_models() -> list[str]:
-    return [m["base_model"] for m in SERVING_MODELS]
+    return [model["base_model"] for model in SERVING_MODELS]
 
 
 def is_supported_base_model(base_model: str) -> bool:
@@ -313,36 +237,57 @@ def _config_for(base_model: str) -> dict[str, Any]:
     if cfg is None:
         allowed = ", ".join(base_models())
         raise ValueError(
-            f"Unsupported base model {base_model!r}; add it to SERVING_MODELS after a "
+            f"Unsupported base model {base_model!r}; add it to hosted serving only after a "
             f"real-GPU serving canary. Supported base models: {allowed}"
         )
     return cfg
 
 
+def supports_image_input(base_model: str) -> bool:
+    return image_limit_for(base_model) is not None
+
+
+def image_limit_for(base_model: str) -> int | None:
+    return _config_for(base_model)["image_input_limit"]
+
+
 def gpu_for(base_model: str) -> str:
-    """The Modal GPU class to run ``base_model``'s engine on (catalog ``gpu``, else ``DEFAULT_GPU``)."""
+    """return the Modal GPU class for an active hosted engine."""
     return _config_for(base_model).get("gpu") or DEFAULT_GPU
 
 
 def serve_model_for(base_model: str) -> str:
-    """The pre-quantized FP8 checkpoint the engine LOADS for ``base_model``. Every catalog model
-    resolves to a verified pre-quant checkpoint; adapters and routing still key off the logical
-    ``base_model``, and vLLM auto-detects the checkpoint's compressed-tensors quantization (no online
-    override)."""
-    _config_for(base_model)  # reject uncataloged models before resolving a checkpoint
+    """return the pre-quantized checkpoint an active hosted engine loads."""
+    _config_for(base_model)
     return _prequant_serve_model_for(base_model)
 
 
+def tokenizer_model_for(base_model: str) -> str:
+    """return the logical tokenizer and processor repository for a hosted engine."""
+    engine = _config_for(base_model).get("engine") or {}
+    return str(engine.get("tokenizer_model") or base_model)
+
+
+def immutable_serving_revisions(base_model: str) -> dict[str, str]:
+    """return model/tokenizer/processor pins required by this hosted engine."""
+    engine = _config_for(base_model).get("engine") or {}
+    return {
+        key: str(engine[key])
+        for key in ("model_revision", "tokenizer_revision", "processor_revision")
+        if engine.get(key)
+    }
+
+
 def engine_overrides_for(base_model: str) -> dict[str, Any]:
-    """Per-base-model vLLM engine-arg overrides, with the resolved pre-quantized FP8 ``serve_model_id``
-    injected. So every model carries a ``serve_model_id`` (the FP8 checkpoint to load), plus any tier
-    shape (the 35B MoE's lower max_loras, the L4 rank overrides, …)."""
-    overrides = dict(_config_for(base_model).get("engine") or {})
-    overrides.setdefault("serve_model_id", serve_model_for(base_model))
+    """return vLLM overrides for an active hosted engine."""
+    config = _config_for(base_model)
+    overrides = dict(config.get("engine") or {})
+    if "serve_model_id" not in overrides:
+        overrides["serve_model_id"] = serve_model_for(base_model)
     return overrides
 
 
 def reasoning_parser_for(base_model: str) -> str | None:
-    """The model-scoped vLLM reasoning parser, or None when parsing is disabled."""
+    """the model-scoped vLLM reasoning parser, or None when parsing is disabled."""
     parser = (_config_for(base_model).get("engine") or {}).get("reasoning_parser")
     return str(parser) if parser else None

@@ -25,8 +25,8 @@ from flash.serving.src.schemas import AdapterRecord
 from flash.serving.src.settings import Settings
 from tests.serving.conftest import attest
 
-QWEN = "Qwen/Qwen3.5-0.8B"
-QWEN_2B = "Qwen/Qwen3.5-2B"
+QWEN = "Qwen/Qwen3.5-9B"
+QWEN_35B = "Qwen/Qwen3.6-35B-A3B"
 DEPLOYMENT_SHA = "a" * 40
 
 
@@ -221,7 +221,7 @@ def test_publication_rejects_padded_identity_before_storage(monkeypatch) -> None
 def test_exact_identity_and_contract_qualify_while_stale_digest_does_not(monkeypatch) -> None:
     settings = _settings()
     stale = "c" * 64
-    rows = [_row(QWEN, settings=settings), _row(QWEN_2B, settings=settings, contract_digest=stale)]
+    rows = [_row(QWEN, settings=settings), _row(QWEN_35B, settings=settings, contract_digest=stale)]
     _patch_client(monkeypatch, _Client(get=lambda *_a, **_k: _response(200, rows)))
 
     records = qualified_base_records(settings)
@@ -236,7 +236,7 @@ def test_exact_identity_and_contract_qualify_while_stale_digest_does_not(monkeyp
 def test_mismatched_identity_isolated_from_valid_sibling(monkeypatch) -> None:
     settings = _settings()
     other_settings = _settings(FREESOLO_DEPLOYMENT_ID="other-deployment")
-    stale = _row(QWEN_2B, settings=other_settings)
+    stale = _row(QWEN_35B, settings=other_settings)
     rows = [_row(QWEN, settings=settings), stale]
     _patch_client(monkeypatch, _Client(get=lambda *_a, **_k: _response(200, rows)))
 
@@ -284,10 +284,10 @@ def test_unknown_evidence_model_fails_closed(monkeypatch) -> None:
 
 def test_cold_start_retains_valid_sibling_when_other_rows_are_invalid(monkeypatch) -> None:
     settings = _settings()
-    malformed = _row(QWEN_2B, settings=settings)
+    malformed = _row(QWEN_35B, settings=settings)
     malformed["evidence"] = {"outcome": "failed"}
     malformed["evidence_sha256"] = evidence_sha256(malformed["evidence"])
-    unknown = _row(QWEN_2B, settings=settings)
+    unknown = _row(QWEN_35B, settings=settings)
     unknown["model_id"] = "unknown/model"
     unknown["evidence"]["model_id"] = "unknown/model"
     unknown["evidence_sha256"] = evidence_sha256(unknown["evidence"])
@@ -333,8 +333,8 @@ def test_generation_evidence_is_bound_to_exact_logical_model() -> None:
     with pytest.raises(ValueError, match="exact readiness model"):
         build_runtime_readiness_evidence(
             settings,
-            QWEN_2B,
-            engine_health={**engine_health, "base_model": QWEN_2B},
+            QWEN_35B,
+            engine_health={**engine_health, "base_model": QWEN_35B},
             non_streaming=non_streaming,
             streaming=streaming,
             deployment_health=deployment_health,
@@ -344,16 +344,16 @@ def test_generation_evidence_is_bound_to_exact_logical_model() -> None:
 def test_copied_cross_model_publication_is_rejected() -> None:
     settings = _settings()
     copied = _evidence(QWEN, settings=settings)
-    copied["model_id"] = QWEN_2B
-    copied["engine_contract_sha256"] = engine_contract_sha256(QWEN_2B)
+    copied["model_id"] = QWEN_35B
+    copied["engine_contract_sha256"] = engine_contract_sha256(QWEN_35B)
 
     with pytest.raises(ValueError, match="checkpoint must match model_id"):
-        build_readiness_publication(settings, QWEN_2B, copied)
+        build_readiness_publication(settings, QWEN_35B, copied)
 
 
 def test_partial_qualification_gates_each_adapter_base() -> None:
     first = _revision("first", QWEN)
-    second = _revision("second", QWEN_2B)
+    second = _revision("second", QWEN_35B)
     router = AdapterRouter(
         [first, _alias(first), second, _alias(second), _base(QWEN)],
         require_base_qualification=True,
@@ -363,7 +363,7 @@ def test_partial_qualification_gates_each_adapter_base() -> None:
     assert router.resolve("second") is None
     assert router.is_unqualified_adapter("second") is True
     assert router.resolve(QWEN) == (router.get(QWEN), router.get(QWEN))
-    assert router.resolve(QWEN_2B) is None
+    assert router.resolve(QWEN_35B) is None
 
 
 class _Pool:

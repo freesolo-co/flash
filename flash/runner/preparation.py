@@ -496,6 +496,21 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
 def _resolve_model_revision(spec: JobSpec, *, required: bool = False) -> JobSpec:
     if spec.model_revision and not spec.model_revision_auto:
         raise ValueError("unmanaged model_revision is unsupported")
+    from flash.core.catalog import MODELS
+
+    catalog_pin = getattr(MODELS.get(spec.model), "managed_revision", "") or ""
+    if catalog_pin and spec.model_revision and spec.model_revision != catalog_pin:
+        raise ValueError(
+            f"model {spec.model!r} requires immutable revision {catalog_pin}; inherited "
+            f"model_revision {spec.model_revision!r} is incompatible"
+        )
+    if catalog_pin and not spec.model_revision:
+        spec = replace(
+            spec,
+            model_revision=catalog_pin,
+            model_revision_auto=True,
+            model_revision_force_pin=True,
+        )
     if not spec.model_revision and not required:
         return spec
     # an inherited warm-start pin is already an immutable sha chosen by a previous run, so there is

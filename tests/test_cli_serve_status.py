@@ -12,7 +12,7 @@ from flash.cli.commands import serve_deploy
 from flash.cli.commands.serve_status import cmd_serve_status
 from flash.cli.serve_parser import _add_serve_commands
 from flash.serve.control import DeploymentResult
-from tests.test_cli_serve_deploy import IMAGE, MODEL, _stub_resolution
+from tests.test_cli_serve_deploy import IMAGE, MODEL, _historical_identity, _stub_resolution
 from tests.test_cli_serve_deploy import _result as ready_result
 
 
@@ -226,6 +226,29 @@ def test_status_without_inference_key_reports_provider_observable_states(
     assert cmd_serve_status(modal_args) == 0
     assert cmd_serve_status(runpod_args) == 0
     assert observed == [("modal", None), ("runpod", None)]
+
+
+@pytest.mark.parametrize(
+    "retired_model",
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
+)
+def test_status_uses_immutable_identity_for_removed_model(
+    monkeypatch: pytest.MonkeyPatch, retired_model: str
+) -> None:
+    _stub_environment(monkeypatch)
+    args = _args("modal")
+    args.deployment_identity = _historical_identity(monkeypatch, args, retired_model)
+    args.model = retired_model
+    seen = []
+
+    def _modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        seen.append(bundle.spec.adapters[0].base_model)
+        return _result(bundle, "absent")
+
+    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _modal)
+
+    assert cmd_serve_status(args) == 0
+    assert seen == [retired_model]
 
 
 def test_status_routes_to_the_named_read_only_provider(monkeypatch: pytest.MonkeyPatch) -> None:

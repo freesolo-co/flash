@@ -18,7 +18,7 @@ from tests._helpers.profile import satisfy_sft_profile
 def _spec(**train) -> JobSpec:
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"epochs": 1, "max_examples": 8, **train},
@@ -69,7 +69,7 @@ def test_managed_hf_repo_finalizes_local_run_id(monkeypatch):
 
     base = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"epochs": 1, "max_examples": 8},

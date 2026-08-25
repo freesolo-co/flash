@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 
+from flash.content.thinking import _messages_for_content_only_serialization
 from flash.engine.worker.teacher.tokenizer_align import StudentToken
 from flash.engine.worker.train.core.child.glue import trim_trailing_stop
 
@@ -24,7 +25,7 @@ def _teacher_prompt_text(prompt_messages: list[dict], thinking_prefill: str = ""
     from flash.content.multimodal import message_content_text
 
     parts = []
-    for m in prompt_messages:
+    for m in _messages_for_content_only_serialization(prompt_messages):
         role = str(m.get("role", "user")).capitalize()
         # `!s` on a content-block list renders a python repr ("[{'type': 'text', ...}]") and the
         # teacher scores that literal without failing. a mixed image/text opd job carries block

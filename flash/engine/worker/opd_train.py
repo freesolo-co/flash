@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import threading
 import time
-from dataclasses import dataclass
 
 from flash.engine.plan.recipe import RECIPE  # noqa: F401
 from flash.engine.plan.steps import (  # noqa: F401
@@ -57,7 +56,6 @@ from flash.engine.worker.sft_train import (  # noqa: F401
     _NvidiaSmiPeakSampler,
     _probe_gpu_in_subprocess,
     _seed_resume_lifecycle,
-    _verl_image_message_content,
     _warmstart_adapter_path,
 )
 from flash.engine.worker.train.core.child.glue import (  # noqa: F401
@@ -90,17 +88,6 @@ class _RecordedMutationCallbackFailure(RuntimeError):
     def __init__(self, classification: str, message: str) -> None:
         super().__init__(message)
         self.classification = classification
-
-
-@dataclass(frozen=True)
-class _BridgePrompt:
-    student_messages: list[dict]
-    teacher_messages: list[dict]
-    prompt_ids: tuple[int, ...]
-    image_descriptors: tuple[str, ...]
-    package_root: str | None
-    example: dict | None = None
-    image_digests: tuple[str, ...] = ()
 
 
 class _OpdProgressState:
@@ -456,10 +443,8 @@ from flash.engine.worker.opd_train_runner import (  # noqa: E402
     _build_train_note_sections,
     _export_and_upload_adapter,
     _materialize_child_files,
-    _prepare_prompts,
     _prepare_request,
     _prepare_workload,
-    _render_prompt_rows,
     _report_training_complete,
     _resolve_opd_gpu_mem_util,
     _run_child,
@@ -513,9 +498,15 @@ from flash.engine.worker.train.opd.overrides import (  # noqa: E402,F401
     _OPD_PARQUET_WRITE_BATCH_ROWS,
     _build_opd_child_env,
     _build_opd_plugin_config,
-    _opd_multimodal_parquet_features,
+    _opd_parquet_features,
     _write_opd_parquet,
     build_opd_overrides,
+)
+from flash.engine.worker.train.opd.prompt_preparation import (  # noqa: E402
+    prepare_prompts as _prepare_prompts,
+)
+from flash.engine.worker.train.opd.prompt_preparation import (  # noqa: E402
+    render_prompt_rows as _render_prompt_rows,
 )
 
 # prompt fingerprinting and token-mask helpers, implemented in `.train.opd.prompts`.
@@ -529,3 +520,6 @@ from flash.engine.worker.train.opd.prompts import (  # noqa: E402,F401
     _validate_forced_mask,
     encode_shifted_group_metadata,
 )
+
+# immutable prompt state, re-exported because the opd tests construct it from this facade.
+from flash.engine.worker.train.opd.state import _BridgePrompt  # noqa: E402,F401

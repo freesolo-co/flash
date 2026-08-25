@@ -12,8 +12,8 @@ from flash.serving.src.capacity import (
     fixed_local_active_limit,
 )
 
-MODEL = "Qwen/Qwen3.5-0.8B"
-IDENTITY = "modal-app-class:freesolo-lora-serving/LoraEngine_Qwen3_5_0_8B_deadbeef0000"
+MODEL = "Qwen/Qwen3.5-9B"
+IDENTITY = "modal-app-class:freesolo-lora-serving/LoraEngine_Qwen3_5_9B_deadbeef0000"
 
 
 def _snapshot(**updates: object) -> CapacitySnapshot:
@@ -140,5 +140,5 @@ def test_configured_provider_is_explicitly_offline_test_only() -> None:
 
     assert snapshot.deployment_identity == "offline/test-only:configured-capacity"
     assert snapshot.observed_local_active == 3
-    assert snapshot.local_active_limit == 128
-    assert provider.current_dispatch_capacity(MODEL) == 128
+    assert snapshot.local_active_limit == 16
+    assert provider.current_dispatch_capacity(MODEL) == 16

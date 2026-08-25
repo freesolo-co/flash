@@ -228,7 +228,7 @@ def _new_authorizer(modal_app_module):
     )
 
 
-_QWEN = "Qwen/Qwen3.5-0.8B"
+_QWEN = "Qwen/Qwen3.5-9B"
 _INTERNAL_KEY = "fs-internal"
 
 

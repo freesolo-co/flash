@@ -297,7 +297,7 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
 
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
             "train": {"epochs": 1, "max_examples": 1},

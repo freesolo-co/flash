@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from flash.core.grpo import DEFAULT_GRPO_GROUP_SIZE, DEFAULT_GRPO_PROMPTS_PER_STEP
 
 # keep in sync with catalog.default_model.
-HF_MODEL_ID = "Qwen/Qwen3.5-4B"
+HF_MODEL_ID = "Qwen/Qwen3.5-9B"
 
 
 @dataclass(frozen=True)

@@ -17,30 +17,22 @@ from flash.serving.src.model_config import (
 )
 
 
-def test_small_model_policy_derives_64_max_and_48_target_inputs() -> None:
-    policy = hosted_traffic_policy_for("Qwen/Qwen3.5-0.8B")
-
-    assert policy.max_num_seqs == 64
-    assert policy.max_inputs == 64
-    assert policy.target_inputs == 48
-    assert policy.min_containers == 1
-    assert policy.max_containers == 2
-    assert policy.buffer_containers == 0
-    assert policy.queue_capacity == 2
-    assert policy.retry_after_seconds == 1
-
-
-def test_large_model_policy_derives_8_max_and_6_target_inputs() -> None:
-    for model in base_models()[2:]:
+def test_catalog_policy_derives_8_max_and_6_target_inputs() -> None:
+    for model in base_models():
         policy = hosted_traffic_policy_for(model)
         assert policy.max_num_seqs == 8
         assert policy.max_inputs == 8
         assert policy.target_inputs == 6
+        assert policy.min_containers == 1
+        assert policy.max_containers == 2
+        assert policy.buffer_containers == 0
+        assert policy.queue_capacity == 2
+        assert policy.retry_after_seconds == 1
 
 
 def test_catalog_warm_floor_and_hard_gpu_ceiling_are_aggregated() -> None:
-    assert configured_warm_container_floor() == 6
-    assert configured_hard_gpu_ceiling() == 12
+    assert configured_warm_container_floor() == len(base_models())
+    assert configured_hard_gpu_ceiling() == 2 * len(base_models())
 
 
 def test_catalog_remains_json_serializable() -> None:

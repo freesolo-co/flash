@@ -32,7 +32,7 @@ def _set_thinking_worker_env():
     # thinking is a run-config field (TOML `thinking`), not an env knob: drive it via the JobSpec.
     os.environ["FLASH_JOB_SPEC_JSON"] = json.dumps(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "thinking": True,
             "environment": {"id": "stub/env"},
@@ -49,6 +49,129 @@ def _restore_env(saved):
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+
+
+def test_messages_for_chat_template_exposes_inline_reasoning_without_mutating_input():
+    from flash.content.thinking import messages_for_chat_template
+
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "<think>reason\n</think>\nanswer"},
+    ]
+
+    from flash.engine.worker.train.core.child.glue import _messages_for_chat_template
+
+    normalized = messages_for_chat_template(messages)
+
+    assert normalized == [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "reasoning_content": "reason", "content": "answer"},
+    ]
+    assert _messages_for_chat_template(messages) == normalized
+    assert messages[1] == {"role": "assistant", "content": "<think>reason\n</think>\nanswer"}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "quote <think>x</think>",
+        "literal </think> close",
+        "<think>unclosed",
+        "<think>a</think>mid<think>b</think>answer",
+        "<think>a</think>answer</think>",
+    ],
+)
+def test_messages_for_chat_template_preserves_ambiguous_or_noncanonical_markers(content):
+    from flash.content.thinking import messages_for_chat_template
+    from flash.engine.worker.train.core.child.glue import _messages_for_chat_template
+
+    messages = [{"role": "assistant", "content": content}]
+
+    assert messages_for_chat_template(messages) == messages
+    assert _messages_for_chat_template(messages) == messages
+
+
+def test_messages_for_chat_template_matches_scalar_and_leading_text_blocks_before_media():
+    from flash.content.thinking import messages_for_chat_template
+
+    scalar = [{"role": "assistant", "content": "<think>reason</think>answer"}]
+    blocks = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "input_text", "text": "<think>rea"},
+                {"type": "text", "text": "son</think>answer"},
+                {"type": "image"},
+                {"type": "text", "text": "later"},
+            ],
+        }
+    ]
+
+    scalar_result = messages_for_chat_template(scalar)[0]
+    block_result = messages_for_chat_template(blocks)[0]
+    assert scalar_result == {
+        "role": "assistant",
+        "reasoning_content": "reason",
+        "content": "answer",
+    }
+    assert block_result == {
+        "role": "assistant",
+        "reasoning_content": "reason",
+        "content": [
+            {"type": "input_text", "text": "answer"},
+            {"type": "image"},
+            {"type": "text", "text": "later"},
+        ],
+    }
+
+
+def test_messages_for_chat_template_preserves_explicit_reasoning_and_nonassistant_tags():
+    from flash.content.thinking import messages_for_chat_template
+    from flash.engine.worker.train.core.child.glue import _messages_for_chat_template
+
+    messages = [
+        {"role": "user", "content": "quote <think>x</think>"},
+        {"role": "assistant", "reasoning_content": "", "content": "<think>tag</think> answer"},
+    ]
+
+    assert messages_for_chat_template(messages) == messages
+    assert _messages_for_chat_template(messages) == messages
+
+
+def test_child_prompt_transport_preserves_reasoning_content_and_rejects_metadata():
+    import asyncio
+
+    from flash.engine.worker.train.core.child.glue import prepare_episode_prompt
+
+    class _Loop:
+        processor = None
+
+        async def process_multi_modal_info(self, messages):
+            self.messages = messages
+            return {}
+
+        def _get_mm_processor_kwargs(self, _audios):
+            return {}
+
+        async def apply_chat_template(self, messages, **_kwargs):
+            assert messages[1]["reasoning_content"] == "old"
+            return [1, 2]
+
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+    ]
+    prompt = asyncio.run(prepare_episode_prompt(_Loop(), messages))
+    assert prompt.structured_messages == messages
+
+    with pytest.raises(ValueError, match="unsupported transcript metadata"):
+        asyncio.run(prepare_episode_prompt(_Loop(), [{**messages[0], "name": None}, messages[1]]))
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        asyncio.run(
+            prepare_episode_prompt(
+                _Loop(), [messages[0], {**messages[1], "reasoning_content": ["old"]}]
+            )
+        )
 
 
 def test_strip_think_unit():
@@ -101,7 +224,7 @@ def test_thinking_budget_selection(monkeypatch):
     # thinking off: a JobSpec with thinking=false -> original (larger) micro-batch
     os.environ["FLASH_JOB_SPEC_JSON"] = json.dumps(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "thinking": False,
             "environment": {"id": "stub/env"},
