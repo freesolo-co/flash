@@ -501,7 +501,7 @@ def test_a_cap_that_does_not_bind_reports_no_truncation_and_stays_quiet(capsys) 
 class ThinkingTokenizer(FakeTokenizer):
     """A tokenizer whose chat template reproduces Qwen3.5's ``<think>`` placement rule.
 
-    Transcribed from ``Qwen/Qwen3.5-0.8B``'s own template rather than paraphrased, because three
+    Transcribed from ``Qwen/Qwen3.5-9B``'s own template rather than paraphrased, because three
     details are easy to get wrong from memory:
 
     * reasoning survives only on assistant turns AFTER the last non-tool user message (``loop.index0
@@ -1395,16 +1395,20 @@ def test_an_image_rows_visual_tokens_are_charged_against_the_reasoning_cap() -> 
         def apply_chat_template(
             self, messages, *, tokenize, return_dict, return_tensors, enable_thinking, **_kwargs
         ):
-            text = "".join(
-                block.get("text") or ""
-                for message in messages
-                for block in (
-                    message["content"]
-                    if isinstance(message.get("content"), list)
-                    else [{"type": "text", "text": str(message.get("content") or "")}]
+            text = ""
+            for message in messages:
+                reasoning = message.get("reasoning_content")
+                if isinstance(reasoning, str):
+                    text += f"<think>{reasoning}</think>"
+                content = message.get("content")
+                blocks = (
+                    content
+                    if isinstance(content, list)
+                    else [{"type": "text", "text": str(content or "")}]
                 )
-                if isinstance(block, dict)
-            )
+                text += "".join(
+                    block.get("text") or "" for block in blocks if isinstance(block, dict)
+                )
             ids = [3 + ord(char) % 89 for char in text] + [7] * self.visual
             return {"input_ids": [ids], "attention_mask": [[1] * len(ids)]}
 
@@ -1412,7 +1416,7 @@ def test_an_image_rows_visual_tokens_are_charged_against_the_reasoning_cap() -> 
         ImageEnvironment(),
         max_context_tokens=200,
         # image-bearing rows are refused outright for a model the catalog says cannot train on them
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         processor_loader=lambda _model, _revision: ExpandingProcessor(),
     )
 

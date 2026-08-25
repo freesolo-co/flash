@@ -17,7 +17,7 @@ def _wall_capped_spec(max_wall_seconds: float):
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "gpu": {"type": "H100", "count": 1, "provider": "vast"},
             "train": {"max_examples": 4},

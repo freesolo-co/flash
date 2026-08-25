@@ -590,7 +590,7 @@ def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
         types.SimpleNamespace(
             run_id="r-settled",
             deployment={"state": "ready"},
-            spec={"run_id": "r-settled", "model": "Qwen/Qwen3.5-4B", "algorithm": "sft"},
+            spec={"run_id": "r-settled", "model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
         ),
     ]
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
@@ -622,7 +622,7 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
             deployment={"state": "ready"},
             spec={
                 "run_id": "r-retired",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "opsd",
                 "project": project,
             },
@@ -635,7 +635,7 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
             deployment={"state": "ready"},
             spec={
                 "run_id": "r-servable",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "project": project,
             },
@@ -796,7 +796,7 @@ def test_real_image_capable_model_with_text_adapter_uses_fixed_prompt(monkeypatc
         def __getattribute__(self, name):
             pytest.fail(f"control-plane smoke accessed user environment field {name!r}")
 
-    spec = _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B")
+    spec = _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B")
     spec.environment = UntrustedEnvironment()
     calls = []
 
@@ -845,7 +845,7 @@ def test_image_deployment_smoke_uses_valid_trusted_image_without_persisting_it(m
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
     out = _run_smoke(
-        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
         adapter_targets_images=True,
     )
 
@@ -882,13 +882,13 @@ def test_smoke_uses_the_capability_set_deploy_gated_on_not_a_second_healthz(monk
     # the handed-down set still enforces the contract strictly...
     with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             advertised=_ATTESTING,
             adapter_targets_images=True,
         )
     # ...and a backend that never claimed the header still degrades rather than failing.
     out = _run_smoke(
-        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
         advertised=frozenset(),
         adapter_targets_images=True,
     )
@@ -909,7 +909,7 @@ def test_image_deployment_smoke_rejects_missing_lora_request_attestation(monkeyp
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
     with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             advertised=_ATTESTING,
             adapter_targets_images=True,
         )
@@ -925,7 +925,7 @@ def test_image_deployment_smoke_allows_missing_attestation_when_not_advertised(m
     response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
     out = _run_smoke(
-        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+        _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
         advertised=frozenset(),
         adapter_targets_images=True,
     )
@@ -942,7 +942,7 @@ def test_image_deployment_smoke_rejects_wrong_adapter_even_when_not_advertised(m
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
     with pytest.raises(ServingError, match="wrong LoRA request adapter"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             advertised=frozenset(),
             adapter_targets_images=True,
         )
@@ -954,7 +954,7 @@ def test_image_deployment_smoke_rejects_mismatched_lora_request_adapter(monkeypa
 
     with pytest.raises(ServingError, match="wrong LoRA request adapter"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             adapter_targets_images=True,
         )
 
@@ -966,7 +966,7 @@ def test_image_deployment_smoke_still_rejects_wrong_provenance(monkeypatch):
 
     with pytest.raises(ServingError, match="wrong checkpoint"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             adapter_targets_images=True,
         )
 
@@ -987,7 +987,7 @@ def test_image_deployment_smoke_rejects_an_answer_that_is_not_the_shown_square(m
 
     with pytest.raises(ServingError, match="did not identify the trusted"):
         _run_smoke(
-            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+            _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
             adapter_targets_images=True,
         )
 
@@ -1031,7 +1031,7 @@ def test_image_deployment_smoke_rejects_the_other_trusted_colours(monkeypatch):
         monkeypatch.setattr(serving._app, "serve_chat", lambda _r=response, **_kwargs: _r)
         with pytest.raises(ServingError, match="did not identify the trusted"):
             _run_smoke(
-                _smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"),
+                _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
                 adapter_targets_images=True,
             )
 
@@ -1046,7 +1046,7 @@ def test_unavailable_adapter_modality_defaults_to_nonblocking_text_smoke(monkeyp
 
     monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
 
-    out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-4B"))
+    out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"))
 
     assert out["verify_kind"] == "fixed_prompt"
     assert calls[0]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
@@ -1074,7 +1074,7 @@ def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(m
     out = _run_smoke(
         _smoke_spec(
             thinking=False,
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             constraint={"json_object": True},
         ),
         adapter_targets_images=True,
@@ -1115,7 +1115,7 @@ def test_image_structured_smoke_requires_attestation_on_second_request(
         _run_smoke(
             _smoke_spec(
                 thinking=False,
-                model="Qwen/Qwen3.5-4B",
+                model="Qwen/Qwen3.5-9B",
                 constraint={"json_object": True},
             ),
             advertised=_ATTESTING if advertised else frozenset(),
@@ -1652,7 +1652,7 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
         lambda **_k: _smoke_response("<think>still reasoning"),
     )
     with pytest.raises(ServingError, match="never closed its reasoning"):
-        _run_smoke(_smoke_spec(thinking=True, model="Qwen/Qwen3.5-4B"))
+        _run_smoke(_smoke_spec(thinking=True, model="Qwen/Qwen3.5-9B"))
 
     monkeypatch.setattr(
         serving._app,
@@ -1726,7 +1726,7 @@ def test_thinking_smoke_accepts_a_tagless_answer_only_for_an_uncataloged_model(m
     """
     monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("4"))
 
-    strict = _smoke_spec(thinking=True, model="Qwen/Qwen3.5-4B")
+    strict = _smoke_spec(thinking=True, model="Qwen/Qwen3.5-9B")
     with pytest.raises(ServingError, match="never closed its reasoning"):
         _run_smoke(strict)
 
@@ -2058,7 +2058,7 @@ def test_thinking_structured_smoke_rejects_invalid_output(
             _smoke_spec(
                 thinking=True,
                 constraint=constraint,
-                model="Qwen/Qwen3.5-4B",
+                model="Qwen/Qwen3.5-9B",
             ),
             adapter_targets_images=True,
         )
@@ -2121,7 +2121,7 @@ def test_alias_thinking_verification_matches_the_smoke_request_shape(monkeypatch
         constraint={"json_object": True},
         max_completion_tokens=40000,
         stop_sequences=("</answer>",),
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
     )
     calls = []
     responses = iter(

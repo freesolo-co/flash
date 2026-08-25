@@ -1480,7 +1480,7 @@ wheels = [
 
 [[package]]
 name = "freesolo-flash"
-version = "1.2.113"
+version = "1.2.115"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1621,10 +1621,10 @@ requires-dist = [
     { name = "tokenizers", marker = "extra == 'dev'", specifier = ">=0.22" },
     { name = "tokenizers", marker = "extra == 'gpu'", specifier = ">=0.22" },
     { name = "torch", marker = "extra == 'gpu'", specifier = "==2.10.0" },
-    { name = "transformers", marker = "extra == 'dev'", specifier = ">=5.6,<5.13" },
-    { name = "transformers", marker = "extra == 'gpu'", specifier = ">=5.6,<5.13" },
-    { name = "transformers", marker = "extra == 'serve-runtime'", specifier = ">=5.6,<5.13" },
-    { name = "transformers", marker = "extra == 'server'", specifier = ">=5.6,<5.13" },
+    { name = "transformers", marker = "extra == 'dev'", specifier = ">=5.8,<5.13" },
+    { name = "transformers", marker = "extra == 'gpu'", specifier = ">=5.8,<5.13" },
+    { name = "transformers", marker = "extra == 'serve-runtime'", specifier = ">=5.8,<5.13" },
+    { name = "transformers", marker = "extra == 'server'", specifier = ">=5.8,<5.13" },
     { name = "uv", marker = "extra == 'gpu'", specifier = ">=0.5" },
     { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.52,<1" },
     { name = "uvicorn", marker = "extra == 'serve-runtime'", specifier = ">=0.52,<1" },

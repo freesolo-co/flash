@@ -159,7 +159,7 @@ def test_train_without_login_fails_fast():
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
             f.write(
-                'model = "Qwen/Qwen3.5-4B"\nproject = "11111111-1111-4111-8111-111111111111"\nalgorithm = "grpo"\n'
+                'model = "Qwen/Qwen3.5-9B"\nproject = "11111111-1111-4111-8111-111111111111"\nalgorithm = "grpo"\n'
                 '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
                 "[train]\nepochs = 1\nmax_examples = 1\n"
             )
@@ -175,7 +175,7 @@ def test_missing_env_id_rejected_client_side():
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
             f.write(
-                'model = "Qwen/Qwen3.5-4B"\nproject = "11111111-1111-4111-8111-111111111111"\n'
+                'model = "Qwen/Qwen3.5-9B"\nproject = "11111111-1111-4111-8111-111111111111"\n'
                 'algorithm = "grpo"\n[environment]\n[train]\n'
             )
         # A config without [environment] id is rejected before any network call.
@@ -192,7 +192,7 @@ def test_dry_run_without_login_fails_fast():
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
             f.write(
-                'model = "Qwen/Qwen3.5-4B"\nproject = "11111111-1111-4111-8111-111111111111"\nalgorithm = "grpo"\n'
+                'model = "Qwen/Qwen3.5-9B"\nproject = "11111111-1111-4111-8111-111111111111"\nalgorithm = "grpo"\n'
                 '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
                 "[train]\nepochs = 1\nmax_examples = 1\n"
             )
@@ -208,7 +208,7 @@ def test_cost_requires_login_for_server_dry_run_preparation():
         cfg = os.path.join(tmp, "run.toml")
         with open(cfg, "w") as f:
             f.write(
-                'model = "Qwen/Qwen3.5-4B"\nproject = "11111111-1111-4111-8111-111111111111"\nalgorithm = "grpo"\n'
+                'model = "Qwen/Qwen3.5-9B"\nproject = "11111111-1111-4111-8111-111111111111"\nalgorithm = "grpo"\n'
                 '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
                 "[train]\nepochs = 1\nmax_examples = 1\n"
             )

@@ -31,7 +31,7 @@ def test_active_params_defaults_to_total_for_dense(model_id):
 def test_catalog_dense_active_params_ignore_revision_without_hf_lookup(monkeypatch):
     import flash.engine.plan.vram as vram
 
-    model_id = "Qwen/Qwen3.5-4B"
+    model_id = "Qwen/Qwen3.5-9B"
 
     def _boom(*_args, **_kwargs):
         raise AssertionError("catalog active params must not query huggingface")
@@ -44,7 +44,7 @@ def test_catalog_dense_active_params_ignore_revision_without_hf_lookup(monkeypat
 @pytest.mark.parametrize(
     ("model_id", "expected"),
     [
-        ("Qwen/Qwen3.5-4B", False),
+        ("Qwen/Qwen3.5-9B", False),
         ("Qwen/Qwen3.6-35B-A3B", True),
     ],
 )
@@ -85,7 +85,7 @@ def test_moe_memory_terms_still_use_total_params():
 
 def test_quant_lookup():
     assert model_quant("Qwen/Qwen3.5-9B") == "bf16"
-    assert model_quant("Qwen/Qwen3.5-4B") == "bf16"
+    assert model_quant("Qwen/Qwen3.5-9B") == "bf16"
 
 
 def test_download_weight_gb_is_total_params_bf16():
@@ -196,7 +196,7 @@ def test_ranking_sizing_and_quote_read_the_same_optimizer_batch_key():
     assert optimizer_batch_key("") == "batch_size"
     assert optimizer_batch_key(None) == "batch_size"
 
-    model = "Qwen/Qwen3.5-4B"
+    model = "Qwen/Qwen3.5-9B"
     authored = {"prompts_per_step": 64, "max_completion_tokens": 512}
 
     # ranking must carry the authored rl batch, not None (which would price the recipe default)

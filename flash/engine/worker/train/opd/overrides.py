@@ -98,7 +98,7 @@ def _data_runtime_overrides(config: dict) -> list[str]:
         # dict, so assigning a whole dict to it is rejected as an unknown sub-key.
         "++data.apply_chat_template_kwargs={enable_thinking:"
         + _hydra_val(config.get("thinking", False))
-        + "}",
+        + ",preserve_thinking:false}",
     ]
 
 
@@ -462,21 +462,21 @@ def _build_opd_child_env(
     return child
 
 
-def _opd_multimodal_parquet_features():
+def _opd_parquet_features(*, multimodal: bool, prompt: dict):
     from datasets import Features, Value
 
-    return Features(
-        {
-            "prompt": [{"role": Value("string"), "content": Value("string")}],
-            "images": [{"image": Value("string")}],
-            "data_source": Value("string"),
-            "reward_model": {
-                "style": Value("string"),
-                "ground_truth": Value("string"),
-            },
-            "extra_info": {"index": Value("int64")},
-        }
-    )
+    features = {
+        "prompt": [prompt],
+        "data_source": Value("string"),
+        "reward_model": {
+            "style": Value("string"),
+            "ground_truth": Value("string"),
+        },
+        "extra_info": {"index": Value("int64")},
+    }
+    if multimodal:
+        features["images"] = [{"image": Value("string")}]
+    return Features(features)
 
 
 # arrow duplicates shared prompt references, so one table scales host ram with the full horizon.
@@ -490,15 +490,15 @@ def _write_opd_parquet(rows: list[dict], path: str) -> None:
 
     if not rows:
         raise ValueError("refusing to write an empty OPD parquet")
-    features = _opd_multimodal_parquet_features() if any("images" in row for row in rows) else None
-    # pin one schema for every batch. multimodal takes it from the declared features exactly as the
-    # single-table write did; text infers it from the first batch so a later batch cannot silently
-    # infer a different type and be rejected mid-file.
-    schema = (
-        features.arrow_schema
-        if features is not None
-        else pa.Table.from_pylist(rows[:_OPD_PARQUET_WRITE_BATCH_ROWS]).schema
-    )
+    from flash.engine.worker.train.core.prompt_rows import prompt_message_features
+
+    multimodal = any("images" in row for row in rows)
+    # derive one explicit schema from the full row set before opening the writer. this keeps optional
+    # reasoning authored after the first batch and the multimodal images struct stable across batches.
+    schema = _opd_parquet_features(
+        multimodal=multimodal,
+        prompt=prompt_message_features(rows),
+    ).arrow_schema
     # write to a sibling temp file and rename only once every batch landed. closing a partially
     # written ParquetWriter still emits a valid footer, so failing in place would leave a READABLE
     # short file at `path` -- a truncated horizon that trains silently instead of raising.

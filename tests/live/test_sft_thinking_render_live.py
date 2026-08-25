@@ -1,7 +1,7 @@
-"""Pin the offline thinking-template fake against the real Qwen3.5 chat template.
+"""Pin the offline thinking-template fake against the immutable Qwen3.8 chat template.
 
 ``tests/test_sft_workload.py`` measures reasoning loss through ``ThinkingTokenizer``, a
-transcription of Qwen3.5's template. A fake is a CLAIM about the real template and the whole warning
+transcription of Flash's prompt contract. A fake is a claim about the real template and the warning
 rests on it, so it is checked against the shipped tokenizer rather than trusted. Downloads a
 tokenizer, so it is opt-in like the other live tests.
 
@@ -15,6 +15,7 @@ import os
 
 import pytest
 
+from flash.content.thinking import messages_for_chat_template
 from flash.engine.profiling.workload_profile import (
     marked_reasoning_end,
     reasoned_assistant_turns,
@@ -26,9 +27,8 @@ from flash.engine.profiling.workload_profile import (
 
 pytestmark = pytest.mark.live
 
-# the smallest catalog model that ships the thinking template; the template is shared across the
-# Qwen3.5 family, so the 0.8B render is the same rule the 4B and 27B students apply.
-MODEL = "Qwen/Qwen3.5-0.8B"
+MODEL = "Qwen/Qwen3.8-27B"
+REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
 
 MULTITURN = [
     {"role": "system", "content": "sys"},
@@ -46,15 +46,16 @@ def tokenizer():
     if not os.environ.get("FLASH_LIVE"):
         pytest.skip("set FLASH_LIVE=1 to download the tokenizer")
     transformers = pytest.importorskip("transformers")
-    return transformers.AutoTokenizer.from_pretrained(MODEL)
+    return transformers.AutoTokenizer.from_pretrained(MODEL, revision=REVISION)
 
 
 def _render(tokenizer, messages):
     return tokenizer.apply_chat_template(
-        messages,
+        messages_for_chat_template(messages),
         tokenize=False,
         add_generation_prompt=False,
         enable_thinking=True,
+        preserve_thinking=False,
     )
 
 

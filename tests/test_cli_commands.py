@@ -54,7 +54,7 @@ class _FakeClient:
     def models(self, include_experimental: bool = False) -> list[dict]:
         rows = [
             {
-                "id": "Qwen/Qwen3.5-0.8B",
+                "id": "Qwen/Qwen3.5-9B",
                 "display_name": "Qwen3 0.6B",
                 "params": "0.6B dense",
                 "algos": ["sft", "grpo"],
@@ -78,7 +78,7 @@ class _FakeClient:
                 "updated_at": 1700000000.0,
                 "spec": {
                     "project": "11111111-1111-4111-8111-111111111111",
-                    "model": "Qwen/Qwen3.5-0.8B",
+                    "model": "Qwen/Qwen3.5-9B",
                     "algorithm": "sft",
                 },
             }
@@ -90,7 +90,7 @@ class _FakeClient:
             "state": "done",
             "cost_usd": 0.25,
             "error": None,
-            "spec": {"model": "Qwen/Qwen3.5-0.8B"},
+            "spec": {"model": "Qwen/Qwen3.5-9B"},
         }
 
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
@@ -481,7 +481,7 @@ def test_blank_backend_url_does_not_count_as_configured(monkeypatch, capsys) -> 
 def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:
     config = tmp_path / "run.toml"
     config.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
         'id = "acme/example-project/example"\n'
@@ -1224,10 +1224,10 @@ def test_models_table(fake_client, capsys) -> None:
     assert _run(["models", "list"]) == 0
     out = capsys.readouterr().out
     # every catalog model is listed (no experimental/hidden tier)
-    assert "Qwen/Qwen3.5-0.8B" in out
     assert "Qwen/Qwen3.5-9B" in out
-    assert "Qwen/Qwen3.6-27B" in out
-    assert "Qwen/Qwen3.5-2B" in out
+    assert "Qwen/Qwen3.5-9B" in out
+    assert "Qwen/Qwen3.8-27B" in out
+    assert "Qwen/Qwen3.5-9B" in out
     # only bare model ids, none of the extra per-model detail columns
     assert "2.3B" not in out
     assert "dense" not in out
@@ -1252,7 +1252,7 @@ def test_gpus_tip_explains_automatic_default_and_type_pin(fake_client, capsys) -
 def _train_config(tmp_path, *, extra_train: str = ""):
     path = tmp_path / "train.toml"
     path.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/project/env"\n'
@@ -1373,7 +1373,7 @@ def test_train_dry_run_keeps_inline_records_off_the_published_environment_note(
     monkeypatch.setattr(fake_client, "create_run", create_run_with_profile)
     config = tmp_path / "inline.toml"
     config.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/project/env"\n'
@@ -1410,7 +1410,7 @@ def test_inline_records_are_not_labelled_a_published_copy_in_cost_rows(monkeypat
         "selected_examples": 9,
     }
     spec = SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         environment=SimpleNamespace(params={"records": [{"input": "x"}]}),
     )
 
@@ -1436,7 +1436,7 @@ def test_published_rows_keep_their_published_labels(monkeypatch) -> None:
         "retained_examples": 8,
         "selected_examples": 9,
     }
-    spec = SimpleNamespace(model="Qwen/Qwen3.5-4B", environment=SimpleNamespace(params={}))
+    spec = SimpleNamespace(model="Qwen/Qwen3.5-9B", environment=SimpleNamespace(params={}))
 
     rows = dict(train_cost._sft_cost_rows(spec, profile))
 
@@ -1450,7 +1450,7 @@ def test_train_dry_run_sends_declared_runtime_secrets(
 ) -> None:
     config = tmp_path / "train.toml"
     config.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/project/env"\nsecrets = ["SERPAPI_API_KEY"]\n'
@@ -1769,7 +1769,7 @@ def test_ctrl_c_while_following_says_the_run_is_still_billing(
     """
     config = tmp_path / "sft.toml"
     config.write_text(
-        "model = 'Qwen/Qwen3.5-0.8B'\nalgorithm = 'sft'\n"
+        "model = 'Qwen/Qwen3.5-9B'\nalgorithm = 'sft'\n"
         "project = '11111111-1111-4111-8111-111111111111'\n"
         "[environment]\nid = 'github:owner/repo@main:env/environment.py'\n"
         "[train]\nepochs = 1\nmax_examples = 8\n"
@@ -1797,7 +1797,7 @@ def test_train_submit_note_warns_that_ctrl_c_keeps_billing(
     """The hand-off note has to carry the same warning, before anyone reaches for ctrl-c."""
     config = tmp_path / "sft.toml"
     config.write_text(
-        "model = 'Qwen/Qwen3.5-0.8B'\nalgorithm = 'sft'\n"
+        "model = 'Qwen/Qwen3.5-9B'\nalgorithm = 'sft'\n"
         "project = '11111111-1111-4111-8111-111111111111'\n"
         "[environment]\nid = 'github:owner/repo@main:env/environment.py'\n"
         "[train]\nepochs = 1\nmax_examples = 8\n"
@@ -2553,10 +2553,10 @@ def test_existing_reasoning_ignores_thinking_text_in_comments(tmp_path) -> None:
     sft = tmp_path / "sft.toml"
     rl = tmp_path / "rl.toml"
     sft.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         "# reasoning is on (thinking = true): gold outputs need think tags\n"
     )
-    rl.write_text('model = "Qwen/Qwen3.5-4B"\n')
+    rl.write_text('model = "Qwen/Qwen3.5-9B"\n')
 
     assert env_setup._existing_reasoning((sft, rl)) is False
 
@@ -2939,7 +2939,7 @@ def test_env_setup_rejects_projectless_or_conflicting_existing_configs(
     monkeypatch.chdir(tmp_path)
     configs = tmp_path / "configs"
     configs.mkdir()
-    (configs / "sft.toml").write_text('model = "Qwen/Qwen3.5-4B"\n')
+    (configs / "sft.toml").write_text('model = "Qwen/Qwen3.5-9B"\n')
     assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
     assert "has no valid top-level project UUID" in capsys.readouterr().err
     assert not (tmp_path / "environment.py").exists()
@@ -2991,7 +2991,7 @@ def test_submit_payload_carries_authored_pip_and_the_worker_appends_it(
     from flash.envs.base import worker_pip_with_extras
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         project="11111111-1111-4111-8111-111111111111",
         environment=EnvironmentSpec(id="owner/project/env", pip=("pymongo>=4.6",)),
     )
@@ -4874,7 +4874,7 @@ def test_runs_listing_flags_a_live_cost_as_an_estimate(fake_client, monkeypatch,
                 "cost_usd": 0.0,
                 "estimated_cost_usd": 2.5,
                 "updated_at": 1700000000.0,
-                "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+                "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"},
             }
         ],
     )

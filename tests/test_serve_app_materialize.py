@@ -48,7 +48,7 @@ def _artifact_bytes(
     config = {
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
-        "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+        "base_model_name_or_path": "Qwen/Qwen3.5-9B",
         "revision": BASE_REVISION,
         "r": 16,
         "lora_alpha": 32,
@@ -778,7 +778,7 @@ def test_convolution_lora_factors_validate(tmp_path: Path) -> None:
     config = {
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
-        "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+        "base_model_name_or_path": "Qwen/Qwen3.5-9B",
         "revision": BASE_REVISION,
         "r": 16,
         "lora_alpha": 32,
@@ -820,7 +820,7 @@ def test_convolution_lora_factors_with_mismatched_rank_are_refused(tmp_path: Pat
     config = {
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
-        "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+        "base_model_name_or_path": "Qwen/Qwen3.5-9B",
         "revision": BASE_REVISION,
         "r": 16,
         "lora_alpha": 32,

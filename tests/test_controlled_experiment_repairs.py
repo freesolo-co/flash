@@ -12,7 +12,7 @@ def _prepared_spec(*, revision: str = "a" * 40):
     from tests._helpers.profile import attach_sft_profile
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         model_revision=revision,
         model_revision_auto=True,
         algorithm="sft",
@@ -56,7 +56,7 @@ def _stub_prepare_dependencies(monkeypatch, spec=None):
 
 def _minimal_spec_dict() -> dict:
     return {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "environment": {"id": "freesolo/example-project/gsm8k"},
         "train": {"epochs": 1, "max_examples": 1},
@@ -130,6 +130,24 @@ def test_prepare_job_retains_runner_forced_sft_revision_and_clears_request(monke
 
 def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(monkeypatch, tmp_path):
     import flash.engine.plan.vram as vram
+    from flash.core.catalog import MODELS, ModelInfo
+
+    model_id = "test/revision-geometry"
+    monkeypatch.setitem(
+        MODELS,
+        model_id,
+        ModelInfo(
+            id=model_id,
+            display_name="synthetic revision geometry",
+            params="0.9B",
+            params_b=0.9,
+            algos=("sft",),
+            min_vram_gb=12,
+            vocab_size=248_320,
+            hidden_size=1024,
+            num_layers=24,
+        ),
+    )
 
     config = tmp_path / "config.json"
     config.write_text(
@@ -151,7 +169,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(mon
             return SimpleNamespace(safetensors=SimpleNamespace(total=int(0.9e9)))
 
     monkeypatch.setattr("huggingface_hub.HfApi", Api)
-    need = vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="d" * 40)
+    need = vram.model_required_vram_gb(model_id, "sft", model_revision="d" * 40)
     assert need > 0
 
     captured = {}
@@ -162,7 +180,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(mon
 
     with monkeypatch.context() as scoped:
         scoped.setattr(vram, "estimate_vram_gb", capture_estimate)
-        vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="d" * 40)
+        vram.model_required_vram_gb(model_id, "sft", model_revision="d" * 40)
     assert captured["model_info"] is None
     assert captured["active_params_b"] == 0.0
 
@@ -172,7 +190,7 @@ def test_revision_specific_sizing_uses_hf_geometry_and_rejects_catalog_drift(mon
 
     monkeypatch.setattr("huggingface_hub.HfApi", DriftApi)
     with pytest.raises(ValueError, match="geometry incompatible"):
-        vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="e" * 40)
+        vram.model_required_vram_gb(model_id, "sft", model_revision="e" * 40)
 
 
 def test_revision_sizing_fails_closed_when_pinned_commit_lacks_param_metadata(
@@ -198,7 +216,7 @@ def test_revision_sizing_fails_closed_when_pinned_commit_lacks_param_metadata(
 
     monkeypatch.setattr("huggingface_hub.HfApi", NoParamApi)
     with pytest.raises(ValueError, match="no parameter-count metadata"):
-        vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft", model_revision="f" * 40)
+        vram.model_required_vram_gb("Qwen/Qwen3.5-9B", "sft", model_revision="f" * 40)
 
 
 def test_pinned_metadata_failure_keeps_sizing_strict(monkeypatch):
@@ -219,13 +237,13 @@ def test_pinned_metadata_failure_keeps_sizing_strict(monkeypatch):
 
     with pytest.raises(RuntimeError, match="metadata unavailable"):
         vram.model_required_vram_gb(
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-9B",
             "sft",
             model_revision="a" * 40,
         )
     # the same model WITHOUT a pin sizes fine from the catalog, so the raise above is the pinned
     # path failing closed rather than sizing being broken for this model.
-    assert vram.model_required_vram_gb("Qwen/Qwen3.5-0.8B", "sft") > 0
+    assert vram.model_required_vram_gb("Qwen/Qwen3.5-9B", "sft") > 0
 
 
 def test_prefetch_error_classification():
@@ -340,7 +358,7 @@ def test_resolve_vocab_size_is_revision_aware_for_open_policy_model(monkeypatch,
     from flash.core.catalog import _DEFAULT_VOCAB_SIZE, resolve_vocab_size
 
     # cataloged model, no revision -> catalog vocab (unchanged default path).
-    assert resolve_vocab_size("Qwen/Qwen3.5-0.8B") == 248320
+    assert resolve_vocab_size("Qwen/Qwen3.5-9B") == 248320
 
     config = tmp_path / "config.json"
     config.write_text(
@@ -387,7 +405,7 @@ def _structured_opd_spec(structured_outputs: str):
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
 
     return JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         model_revision="a" * 40,
         model_revision_auto=True,
         algorithm="opd",

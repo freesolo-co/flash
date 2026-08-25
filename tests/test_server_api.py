@@ -78,7 +78,7 @@ def stub_publish_package(slug: str, *, record: list | None = None):
 
 
 SPEC = {
-    "model": "Qwen/Qwen3.5-4B",
+    "model": "Qwen/Qwen3.5-9B",
     "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
     # A hub slug, because this fixture drives the HOSTED api: the managed plane accepts
@@ -829,7 +829,7 @@ def test_warmstart_dry_run_preserves_context_preflight_error(api) -> None:
     spec = {
         "project": "11111111-1111-4111-8111-111111111111",
         **SPEC,
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "train": {
             **SPEC["train"],
             "init_from_adapter": "source-run",
@@ -1361,7 +1361,7 @@ def test_create_run_preflights_init_adapter_rank_before_submit(api, monkeypatch)
     source = JobSpec.from_dict(
         {
             "run_id": "source-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "sft",
             "train": {"epochs": 1, "hf_repo": "Freesolo-Co/source"},
@@ -1375,7 +1375,7 @@ def test_create_run_preflights_init_adapter_rank_before_submit(api, monkeypatch)
         lambda *a, **k: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "base_model_name_or_path": "Qwen/Qwen3.5-9B",
             "r": 96,
             "lora_alpha": 192,
         },
@@ -1413,7 +1413,7 @@ def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch)
     source = JobSpec.from_dict(
         {
             "run_id": "source-run",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "sft",
             "train": {"epochs": 1, "hf_repo": "Freesolo-Co/source"},
@@ -1427,7 +1427,7 @@ def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch)
         lambda *a, **k: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "base_model_name_or_path": "Qwen/Qwen3.5-9B",
             "r": 96,
             "lora_alpha": 192,
         },
@@ -2932,6 +2932,32 @@ def test_user_key_undeploy_returns_public_persisted_deployment(api, monkeypatch)
     for field in ("disabled_aliases", "disabled_revisions", "serving_deregistered"):
         body.pop(field)
     assert body == api.get(f"/v1/runs/{run_id}/deploy", headers=_bearer(key)).json()
+
+
+@pytest.mark.parametrize(
+    "retired_model",
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"],
+)
+def test_hosted_undeploy_preserves_historical_removed_model_cleanup(
+    api, monkeypatch, retired_model
+):
+    import flash.runner as runner
+    import flash.server.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    status = runner.get_status(run_id)
+    status.spec = {**status.spec, "model": retired_model}
+    status.deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
+    runner._save_status(status)
+    calls = []
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda target: calls.append(target) or {})
+
+    response = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    assert calls == [run_id]
+    assert runner.get_status(run_id).deployment["state"] == "undeployed"
 
 
 def test_internal_org_undeploy_returns_public_persisted_deployment(api, monkeypatch):
@@ -8104,7 +8130,7 @@ def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "run_id": "dep-1",
@@ -8145,7 +8171,7 @@ def test_mark_deployed_expect_state_cas_blocks_undeploy_race(monkeypatch, tmp_pa
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "run_id": "dep-3",
@@ -8177,7 +8203,7 @@ def test_mark_checkpoint_deployed_refuses_dry_run(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "run_id": "dep-dry",
@@ -8224,7 +8250,7 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
     importlib.reload(app_mod)
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
@@ -8330,7 +8356,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
     importlib.reload(app_mod)
     spec = JobSpec(
         run_id="blocked-expired",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         project="11111111-1111-4111-8111-111111111111",
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=120),
@@ -8387,7 +8413,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
     importlib.reload(app_mod)
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
@@ -8448,7 +8474,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     importlib.reload(app_mod)
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
@@ -8505,7 +8531,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
     importlib.reload(app_mod)
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
@@ -8574,7 +8600,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
     importlib.reload(app_mod)
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
@@ -8626,7 +8652,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
     importlib.reload(app_mod)
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
@@ -8689,7 +8715,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
     importlib.reload(app_mod)
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
@@ -8756,7 +8782,7 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
     importlib.reload(app_mod)
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
@@ -8823,7 +8849,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
     importlib.reload(app_mod)
 
     public_spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {
@@ -8876,7 +8902,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
         lambda *a, **k: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "base_model_name_or_path": "Qwen/Qwen3.5-9B",
             "r": 32,
             "lora_alpha": 64,
         },
@@ -8910,7 +8936,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
 
     importlib.reload(app_mod)
     public_spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"init_from_adapter": "source-run", "lora_rank": 8},
@@ -8957,7 +8983,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
         lambda *a, **k: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
-            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "base_model_name_or_path": "Qwen/Qwen3.5-9B",
             "r": 32,
             "lora_alpha": 64,
         },
@@ -9010,7 +9036,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     # Run #1: a malformed spec — local `environment.path` makes from_dict raise.
     bad_spec = {
         "project": "11111111-1111-4111-8111-111111111111",
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"path": "/legacy/local/env"},
         "train": {"epochs": 1, "max_examples": 1},
@@ -9019,7 +9045,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     }
     # Run #2: a valid no-handle spec — must still be recovered (resubmitted) despite run #1.
     good_spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "project": "11111111-1111-4111-8111-111111111111",
         "algorithm": "grpo",
         "train": {"epochs": 1, "max_examples": 1},
@@ -10769,7 +10795,7 @@ def test_record_model_exported_posts_allowlisted_event(monkeypatch):
             self.billing_context = None
             self.spec = {
                 "project": "11111111-1111-4111-8111-111111111111",
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
             }
 
     ok = run_registry.record_model_exported(
@@ -10790,7 +10816,7 @@ def test_record_model_exported_posts_allowlisted_event(monkeypatch):
         "repository": "me/adapters",
         "url": "https://huggingface.co/me/adapters",
         "step": 120,
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
     }
 
     class _NoOrg:
