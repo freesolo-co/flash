@@ -20,7 +20,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from flash.serve.app.openai import OpenAIRequestError, parse_stream_options
 from flash.serving.src.accounting.usage import captured_now, new_request_identity
 from flash.serving.src.accounting.usage_outbox import UsageOutboxError
-from flash.serving.src.admission import AdmissionLease
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.io.multimodal import _prepare_generate_request
 from flash.serving.src.io.provenance import _provenance_headers, _revision_provenance
@@ -33,6 +32,7 @@ from flash.serving.src.io.responses import (
 from flash.serving.src.io.schemas import GenerateRequest
 from flash.serving.src.io.streaming import _close_async_iterator
 from flash.serving.src.io.structured_outputs import StructuredOutputsError
+from flash.serving.src.traffic.admission import AdmissionLease
 
 _FLASH_CHECKPOINT_MODEL_RE = re.compile(
     r"(?P<run_id>flash-[0-9]{1,20}-[0-9a-f]{8})/step-[0-9]{1,18}"

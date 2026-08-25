@@ -16,12 +16,12 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from flash.serving.src.capacity import CapacitySnapshot
 from flash.serving.src.http.adapter_routes import remove_adapter
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.traffic.capacity import CapacitySnapshot
 from tests.serving.conftest import attest
 
 

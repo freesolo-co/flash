@@ -290,13 +290,6 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 # model_config is a pure-stdlib module (no heavy deps), so importing it at module scope is safe for
 # `modal deploy` (which imports modal_app.py locally) — unlike the vllm/transformers imports, which
 # stay lazy inside the engine methods.
-from flash.serving.src.capacity import (  # noqa: E402
-    CAPACITY_POLL_INTERVAL_SECONDS,
-    CAPACITY_REFRESH_TIMEOUT_SECONDS,
-    CAPACITY_SNAPSHOT_MAX_AGE_SECONDS,
-    CapacitySnapshot,
-    fixed_local_active_limit,
-)
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
 from flash.serving.src.engine.model_config import (  # noqa: E402
     HostedTrafficPolicy,
@@ -304,6 +297,13 @@ from flash.serving.src.engine.model_config import (  # noqa: E402
     configured_router_async_capacity,
     gpu_for,
     hosted_traffic_policy_for,
+)
+from flash.serving.src.traffic.capacity import (  # noqa: E402
+    CAPACITY_POLL_INTERVAL_SECONDS,
+    CAPACITY_REFRESH_TIMEOUT_SECONDS,
+    CAPACITY_SNAPSHOT_MAX_AGE_SECONDS,
+    CapacitySnapshot,
+    fixed_local_active_limit,
 )
 
 

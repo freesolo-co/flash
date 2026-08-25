@@ -14,18 +14,18 @@ from flash.serving.src.accounting.usage import (
     principal_for_trusted_internal,
 )
 from flash.serving.src.accounting.usage_outbox import RequestIdentity, UsageStore
-from flash.serving.src.admission import AdmissionController, AdmissionLease
-from flash.serving.src.capacity import (
-    CAPACITY_POLL_INTERVAL_SECONDS,
-    CapacityProvider,
-    ConfiguredCapacityProvider,
-)
 from flash.serving.src.engine.model_config import hosted_traffic_policy_for
 from flash.serving.src.http.headers import _bearer_token, assert_internal, is_trusted_internal
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.streaming import generate_once, openai_chat_stream, prepare_stream
 from flash.serving.src.store.lookup import AdapterLookup
+from flash.serving.src.traffic.admission import AdmissionController, AdmissionLease
+from flash.serving.src.traffic.capacity import (
+    CAPACITY_POLL_INTERVAL_SECONDS,
+    CapacityProvider,
+    ConfiguredCapacityProvider,
+)
 
 APP_STATE_ATTR = "serving_context"
 

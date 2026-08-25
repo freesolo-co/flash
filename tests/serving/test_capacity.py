@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from flash.serving.src.capacity import (
+from flash.serving.src.traffic.capacity import (
     CapacitySnapshot,
     ConfiguredCapacityProvider,
     fixed_local_active_limit,

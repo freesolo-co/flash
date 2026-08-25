@@ -6,12 +6,12 @@ import asyncio
 
 import pytest
 
-from flash.serving.src.admission import (
+from flash.serving.src.engine.model_config import HostedTrafficPolicy
+from flash.serving.src.traffic.admission import (
     AdmissionController,
     ServingCapacityUnavailable,
     ServingOverloaded,
 )
-from flash.serving.src.engine.model_config import HostedTrafficPolicy
 
 _MODEL_A = "model-a"
 _MODEL_B = "model-b"

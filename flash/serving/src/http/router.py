@@ -20,8 +20,6 @@ from fastapi.responses import JSONResponse
 
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
 from flash.serving.src.accounting.usage_outbox import OfflineUsageStore, UsageStore
-from flash.serving.src.admission import ServingCapacityUnavailable, ServingOverloaded
-from flash.serving.src.capacity import CapacityProvider, ConfiguredCapacityProvider
 from flash.serving.src.http.adapter_routes import adapter_router
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
 from flash.serving.src.http.context import APP_STATE_ATTR, ServingContext
@@ -29,6 +27,8 @@ from flash.serving.src.http.inference_routes import inference_router
 from flash.serving.src.http.routing import AdapterRouter, EnginePool, health_body
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.store.lookup import AdapterLookup
+from flash.serving.src.traffic.admission import ServingCapacityUnavailable, ServingOverloaded
+from flash.serving.src.traffic.capacity import CapacityProvider, ConfiguredCapacityProvider
 
 THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 _CLEANUP_TIMEOUT_SECONDS = 10.0

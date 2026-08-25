@@ -14,7 +14,6 @@ from flash.serving.src.accounting.usage import (
     principal_for_external_org,
 )
 from flash.serving.src.accounting.usage_outbox import RequestIdentity
-from flash.serving.src.admission import AdmissionLease
 from flash.serving.src.http import inference_routes
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.http.inference_routes import (
@@ -24,6 +23,7 @@ from flash.serving.src.http.inference_routes import (
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.io.streaming import openai_chat_stream, prepare_stream
+from flash.serving.src.traffic.admission import AdmissionLease
 from tests.serving.conftest import RecordingUsageStore
 
 QWEN = "Qwen/Qwen3.5-9B"

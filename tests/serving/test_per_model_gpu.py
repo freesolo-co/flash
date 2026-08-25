@@ -21,7 +21,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from flash.serving.src.admission import AdmissionController, ServingOverloaded
 from flash.serving.src.engine.model_config import (
     base_models,
     configured_hard_gpu_ceiling,
@@ -30,6 +29,7 @@ from flash.serving.src.engine.model_config import (
     gpu_for,
     hosted_traffic_policy_for,
 )
+from flash.serving.src.traffic.admission import AdmissionController, ServingOverloaded
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
