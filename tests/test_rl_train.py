@@ -37,6 +37,7 @@ from flash.engine.worker.entry import rl
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
 from flash.engine.worker.train.core.child import runtime as child_runtime
 from flash.engine.worker.train.core.child import runtime as verl_child_runtime
+from flash.engine.worker.train.rl import checkpoints as rl_checkpoints
 from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 from flash.engine.worker.train.rl.child import patches as verl_patches
 from flash.engine.worker.train.rl.child import plugin as grpo_plugin
@@ -4489,11 +4490,16 @@ def _patch_stage_and_publish(monkeypatch, staged: list[int], published: list[int
     they are patched as two seams because the production code separates them: staging is bounded by
     verl's checkpoint retention, publication by the terminal validation latch.
     """
-    monkeypatch.setattr(
-        rl_train._VerlResumeUploader,
-        "_stage_deployable",
-        lambda self, step, path: (staged.append(int(step)), f"{path}-adapter")[1],
-    )
+
+    def stage(self, step, path):
+        staged.append(int(step))
+        adapter_dir = f"{path}-adapter"
+        os.makedirs(adapter_dir, exist_ok=True)
+        Path(adapter_dir, "adapter_config.json").write_text("{}")
+        Path(adapter_dir, "adapter_model.safetensors").write_bytes(b"weights")
+        return adapter_dir
+
+    monkeypatch.setattr(rl_train._VerlResumeUploader, "_stage_deployable", stage)
     monkeypatch.setattr(
         rl_train._VerlResumeUploader,
         "_publish_staged",
@@ -4502,6 +4508,342 @@ def _patch_stage_and_publish(monkeypatch, staged: list[int], published: list[int
             self.lifecycle.mark_deployable_published(step),
         )[0],
     )
+
+
+def test_latest_resume_carries_all_withheld_required_adapters_across_retry(tmp_path, monkeypatch):
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    published: list[int] = []
+
+    def write_native_step(local_dir, step):
+        actor = local_dir / f"global_step_{step}" / "actor"
+        actor.mkdir(parents=True)
+        (actor / "fsdp_config.json").write_text('{"FSDP_version": 2, "world_size": 1}')
+        for kind in ("model", "optim", "extra_state"):
+            (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
+        (local_dir / "latest_checkpointed_iteration.txt").write_text(str(step))
+
+    def stage_adapter(self, step, _checkpoint_dir):
+        adapter = tmp_path / f"attempt-{id(self)}" / f"step-{step}"
+        adapter.mkdir(parents=True)
+        (adapter / "adapter_model.safetensors").write_bytes(f"step-{step}".encode())
+        (adapter / "adapter_config.json").write_text(f'{{"step": {step}}}')
+        (adapter / "preprocessor_config.json").write_text("{}")
+        return str(adapter)
+
+    def upload(step, path, **kwargs):
+        destination = remote / f"checkpoint-{step}"
+        shutil.rmtree(destination, ignore_errors=True)
+        shutil.copytree(path, destination)
+        for candidate in remote.glob("checkpoint-*"):
+            if candidate != destination:
+                shutil.rmtree(candidate)
+        callback = kwargs.get("after_upload")
+        if callback is not None:
+            callback()
+        return True
+
+    monkeypatch.setattr(rl_train._VerlResumeUploader, "_stage_deployable", stage_adapter)
+    monkeypatch.setattr(rl_train._w, "upload_resume_checkpoint", upload, raising=False)
+    monkeypatch.setattr(
+        rl_train._VerlResumeUploader,
+        "_publish_staged",
+        lambda self, step, adapter_dir: (
+            published.append(int(step)),
+            self.lifecycle.mark_deployable_published(step),
+        )[0],
+    )
+
+    first = None
+    second = None
+    first_started = False
+    second_started = False
+    try:
+        local_one = tmp_path / "local-one"
+        local_one.mkdir()
+        write_native_step(local_one, 2)
+        first = rl_train._VerlResumeUploader(
+            str(local_one),
+            resume_step=0,
+            required_steps=(2, 4),
+            export_root=str(tmp_path / "exports-one"),
+        )
+        first.start()
+        first_started = True
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not (remote / "checkpoint-2").exists():
+            time.sleep(0.01)
+        write_native_step(local_one, 4)
+        while time.monotonic() < deadline and not (remote / "checkpoint-4").exists():
+            time.sleep(0.01)
+        first.stop()
+
+        bundle = remote / "checkpoint-4" / "_flash_required_adapters"
+        assert sorted(path.name for path in bundle.iterdir()) == ["step-2", "step-4"]
+        assert not (remote / "checkpoint-2").exists()
+        assert published == []
+
+        shutil.rmtree(local_one)
+        shutil.rmtree(tmp_path / "exports-one", ignore_errors=True)
+        monkeypatch.setattr(
+            rl_train._w,
+            "hf_resume_checkpoint",
+            lambda *args, **kwargs: str(remote / "checkpoint-4"),
+        )
+        monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
+        local_two = tmp_path / "local-two"
+        local_two.mkdir()
+        resume_step = rl_train._restore_verl_resume(
+            str(local_two), world_size=1, expected_fsdp_generation=2
+        )
+        assert resume_step == 4
+
+        second = rl_train._VerlResumeUploader(
+            str(local_two),
+            resume_step=resume_step,
+            required_steps=(2, 4),
+            export_root=str(tmp_path / "exports-two"),
+        )
+        second.credit_durable_required_steps(resume_step)
+        second.restore_staged_adapters(resume_step)
+        assert sorted(second.staged_adapters) == [2, 4]
+        second.start()
+        second_started = True
+        assert published == []
+
+        state = rl_train._StepMetricState()
+        rl_train._validate_rl_child(0, state, 4, 4, second)
+        assert published == [2, 4]
+        second.raise_if_incomplete()
+    finally:
+        if second_started:
+            try:
+                second.stop()
+            finally:
+                if first_started:
+                    first.stop()
+        elif first_started:
+            first.stop()
+
+
+def _write_internal_adapter(adapter_dir: Path, *, weights: str = "single") -> None:
+    adapter_dir.mkdir(parents=True)
+    (adapter_dir / "adapter_config.json").write_text("{}")
+    if weights == "single":
+        (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
+    elif weights == "sharded":
+        for index in (1, 2):
+            name = f"adapter_model-{index:05d}-of-00002.safetensors"
+            (adapter_dir / name).write_bytes(f"shard-{index}".encode())
+        (adapter_dir / "adapter_model.safetensors.index.json").write_text("{}")
+    elif weights == "incomplete-sharded":
+        (adapter_dir / "adapter_model-00001-of-00002.safetensors").write_bytes(b"shard-1")
+        (adapter_dir / "adapter_model.safetensors.index.json").write_text("{}")
+    else:
+        raise AssertionError(f"unknown adapter weight shape {weights}")
+
+
+def test_internal_adapter_validation_accepts_complete_sharded_weights(tmp_path):
+    adapter = tmp_path / "adapter"
+    _write_internal_adapter(adapter, weights="sharded")
+
+    rl_checkpoints._validate_internal_adapter_dir(str(adapter), label="step-2")
+
+
+def test_internal_adapter_validation_rejects_incomplete_sharded_weights(tmp_path):
+    adapter = tmp_path / "adapter"
+    _write_internal_adapter(adapter, weights="incomplete-sharded")
+
+    with pytest.raises(RuntimeError, match="missing adapter config or weights"):
+        rl_checkpoints._validate_internal_adapter_dir(str(adapter), label="step-2")
+
+
+@pytest.mark.parametrize("missing", ["config", "weights"])
+def test_internal_adapter_validation_rejects_missing_required_file(tmp_path, missing):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    if missing != "config":
+        (adapter / "adapter_config.json").write_text("{}")
+    if missing != "weights":
+        (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+
+    with pytest.raises(RuntimeError, match="missing adapter config or weights"):
+        rl_checkpoints._validate_internal_adapter_dir(str(adapter), label="step-2")
+
+
+def test_internal_adapter_validation_rejects_nested_symlink(tmp_path):
+    adapter = tmp_path / "adapter"
+    _write_internal_adapter(adapter)
+    nested = adapter / "nested"
+    nested.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    (nested / "escape.json").symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match=r"symlink 'escape.json'"):
+        rl_checkpoints._validate_internal_adapter_dir(str(adapter), label="step-2")
+
+
+def test_published_required_adapter_is_not_restored_or_republished(tmp_path, monkeypatch):
+    local_dir = tmp_path / "ckpt"
+    bundle = local_dir / "global_step_4" / "_flash_required_adapters" / "step-2"
+    bundle.mkdir(parents=True)
+    (bundle / "adapter_config.json").write_text("{}")
+    (bundle / "adapter_model.safetensors").write_bytes(b"weights")
+    published: list[int] = []
+    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: step == 2)
+    monkeypatch.setattr(
+        rl_train._VerlResumeUploader,
+        "_publish_staged",
+        lambda self, step, adapter_dir: published.append(int(step)),
+    )
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
+    )
+    uploader.credit_durable_required_steps(4)
+    uploader.restore_staged_adapters(4)
+    uploader._bundle_staged_adapters(str(local_dir / "global_step_4"))
+    uploader.allow_deployable_publication()
+    uploader._publish_ready()
+
+    assert not (local_dir / "global_step_4" / "_flash_required_adapters").exists()
+    assert uploader.staged_adapters == {}
+    assert published == []
+    assert uploader.lifecycle.deployable_published_steps == {2}
+
+
+def test_missing_required_adapter_bundle_fails_closed(tmp_path, monkeypatch):
+    local_dir = tmp_path / "ckpt"
+    (local_dir / "global_step_4").mkdir(parents=True)
+    published: list[int] = []
+    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
+    monkeypatch.setattr(
+        rl_train._VerlResumeUploader,
+        "_publish_staged",
+        lambda self, step, adapter_dir: published.append(int(step)),
+    )
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
+    )
+    uploader.credit_durable_required_steps(4)
+    with pytest.raises(RuntimeError, match="missing required-adapter bundle"):
+        uploader.restore_staged_adapters(4)
+    uploader.allow_deployable_publication()
+    uploader._publish_ready()
+    assert published == []
+
+
+def test_malformed_required_adapter_bundle_entry_fails_closed(tmp_path, monkeypatch):
+    local_dir = tmp_path / "ckpt"
+    malformed = local_dir / "global_step_4" / "_flash_required_adapters" / "step-two"
+    malformed.mkdir(parents=True)
+    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
+    )
+    uploader.credit_durable_required_steps(4)
+    with pytest.raises(RuntimeError, match="invalid GRPO required-adapter bundle entry"):
+        uploader.restore_staged_adapters(4)
+    assert uploader.staged_adapters == {}
+
+
+def test_canonical_required_adapter_step_collision_fails_closed(tmp_path, monkeypatch):
+    local_dir = tmp_path / "ckpt"
+    bundle_root = local_dir / "global_step_4" / "_flash_required_adapters"
+    _write_internal_adapter(bundle_root / "step-2")
+    _write_internal_adapter(bundle_root / "step-02")
+    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
+    )
+    uploader.credit_durable_required_steps(4)
+
+    with pytest.raises(RuntimeError, match="required-adapter bundle collision 'step-02'"):
+        uploader.restore_staged_adapters(4)
+
+    assert uploader.staged_adapters == {}
+
+
+def test_required_adapter_bundle_root_symlink_fails_closed(tmp_path, monkeypatch):
+    local_dir = tmp_path / "ckpt"
+    checkpoint = local_dir / "global_step_4"
+    checkpoint.mkdir(parents=True)
+    outside = tmp_path / "outside-bundle"
+    _write_internal_adapter(outside / "step-2")
+    (checkpoint / "_flash_required_adapters").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
+    )
+    uploader.credit_durable_required_steps(4)
+
+    with pytest.raises(RuntimeError, match="missing required-adapter bundle"):
+        uploader.restore_staged_adapters(4)
+
+    assert uploader.staged_adapters == {}
+
+
+def test_traversal_required_adapter_bundle_fails_closed(tmp_path, monkeypatch):
+    local_dir = tmp_path / "ckpt"
+    bundle_root = local_dir / "global_step_4" / "_flash_required_adapters"
+    bundle_root.mkdir(parents=True)
+    (bundle_root / "../outside").mkdir()
+    (bundle_root / "step-2").symlink_to(bundle_root / "../outside", target_is_directory=True)
+    published: list[int] = []
+    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
+    monkeypatch.setattr(
+        rl_train._VerlResumeUploader,
+        "_publish_staged",
+        lambda self, step, adapter_dir: published.append(int(step)),
+    )
+    uploader = rl_train._VerlResumeUploader(
+        str(local_dir), resume_step=4, required_steps=(2,), export_root=str(tmp_path / "exports")
+    )
+    uploader.credit_durable_required_steps(4)
+    with pytest.raises(RuntimeError, match="not a real directory"):
+        uploader.restore_staged_adapters(4)
+    uploader.allow_deployable_publication()
+    uploader._publish_ready()
+    assert published == []
+
+
+def test_start_resume_uploader_hydrates_bundle_before_thread_start(tmp_path, monkeypatch):
+    local_dir = tmp_path / "ckpt"
+    bundled = local_dir / "global_step_4" / "_flash_required_adapters" / "step-2"
+    bundled.mkdir(parents=True)
+    (bundled / "adapter_config.json").write_text("{}")
+    (bundled / "adapter_model.safetensors").write_bytes(b"weights")
+    started: list[bool] = []
+    monkeypatch.setattr(rl_train, "_deployable_adapter_on_hf", lambda step: False)
+    monkeypatch.setattr(
+        rl_train._VerlResumeUploader,
+        "start",
+        lambda self: started.append(bool(self.staged_adapters)),
+    )
+    inp = {
+        "save_at_steps": (2,),
+        "model_id": "Qwen/Qwen3.5-9B",
+        "model_revision": "rev",
+        "multimodal": False,
+    }
+    uploader = rl_train._start_resume_uploader(
+        local_dir=str(local_dir),
+        resume_step=4,
+        inp=inp,
+        workdir=str(tmp_path),
+        python_bin="python",
+        preprocessor=object(),
+    )
+    assert started == [True]
+    assert sorted(uploader.staged_adapters) == [2]
+
+
+def test_no_required_saves_add_no_internal_adapter_bundle(tmp_path):
+    checkpoint = tmp_path / "global_step_1"
+    checkpoint.mkdir()
+    uploader = rl_train._VerlResumeUploader(str(tmp_path), resume_step=0, required_steps=())
+    uploader._bundle_staged_adapters(str(checkpoint))
+    assert not (checkpoint / "_flash_required_adapters").exists()
 
 
 def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path, monkeypatch):
@@ -4820,11 +5162,16 @@ def test_checkpoint_appearing_at_stop_is_uploaded_before_the_exit(tmp_path, monk
         lambda step, path, **k: uploaded.append(int(step)),
         raising=False,
     )
-    monkeypatch.setattr(
-        rl_train._VerlResumeUploader,
-        "_stage_deployable",
-        lambda self, step, path: (staged.append(int(step)), f"{path}-adapter")[1],
-    )
+
+    def stage(self, step, path):
+        staged.append(int(step))
+        adapter_dir = f"{path}-adapter"
+        os.makedirs(adapter_dir, exist_ok=True)
+        Path(adapter_dir, "adapter_config.json").write_text("{}")
+        Path(adapter_dir, "adapter_model.safetensors").write_bytes(b"weights")
+        return adapter_dir
+
+    monkeypatch.setattr(rl_train._VerlResumeUploader, "_stage_deployable", stage)
     monkeypatch.setattr(
         rl_train._VerlResumeUploader,
         "_publish_staged",

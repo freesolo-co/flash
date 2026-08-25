@@ -394,6 +394,7 @@ def _start_resume_uploader(*, local_dir, resume_step, inp, workdir, python_bin, 
         preprocessor=preprocessor,
     )
     resume_uploader.credit_durable_required_steps(resume_step)
+    resume_uploader.restore_staged_adapters(resume_step)
     resume_uploader.start()
     return resume_uploader
 

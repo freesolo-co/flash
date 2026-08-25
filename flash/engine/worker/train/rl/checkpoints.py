@@ -16,6 +16,7 @@ import shutil
 import threading
 import time
 
+from flash.adapters.artifacts import has_loadable_adapter_weights
 from flash.engine.verl_checkpoint import FsdpCheckpointInspection
 from flash.engine.verl_policy import FsdpGeneration
 from flash.engine.worker.backend_common import (
@@ -31,6 +32,31 @@ from flash.engine.worker.verl.checkpoints import (
     MergeDiskHeadroomError,
     inspect_resume_checkpoint,
 )
+
+_REQUIRED_ADAPTER_BUNDLE_DIR = "_flash_required_adapters"
+
+
+def _validate_internal_adapter_dir(path: str, *, label: str) -> None:
+    """reject malformed internal adapter trees before copying or publishing them."""
+    if not os.path.isdir(path) or os.path.islink(path):
+        raise RuntimeError(f"invalid GRPO required-adapter bundle {label}: not a real directory")
+    root = os.path.realpath(path)
+    names = set(os.listdir(path))
+    if "adapter_config.json" not in names or not has_loadable_adapter_weights(names):
+        raise RuntimeError(
+            f"invalid GRPO required-adapter bundle {label}: missing adapter config or weights"
+        )
+    for current, dirs, files in os.walk(path):
+        if os.path.commonpath((root, os.path.realpath(current))) != root:
+            raise RuntimeError(f"invalid GRPO required-adapter bundle {label}: path traversal")
+        for name in (*dirs, *files):
+            candidate = os.path.join(current, name)
+            if os.path.islink(candidate):
+                raise RuntimeError(
+                    f"invalid GRPO required-adapter bundle {label}: symlink {name!r}"
+                )
+            if os.path.commonpath((root, os.path.realpath(candidate))) != root:
+                raise RuntimeError(f"invalid GRPO required-adapter bundle {label}: path traversal")
 
 
 def _rl_train():
@@ -104,6 +130,82 @@ class _VerlResumeUploader:
         for step in sorted(self.required_steps):
             if step <= int(resume_step) and _rl_train()._deployable_adapter_on_hf(step):
                 self.lifecycle.mark_deployable_published(step)
+
+    def restore_staged_adapters(self, resume_step: int) -> None:
+        """hydrate unpublished required adapters bundled into the restored native checkpoint."""
+        owed = {
+            step
+            for step in self.required_steps
+            if step <= int(resume_step) and step not in self.lifecycle.deployable_published_steps
+        }
+        if not owed:
+            return
+        bundle_root = os.path.join(
+            self.local_dir, f"global_step_{int(resume_step)}", _REQUIRED_ADAPTER_BUNDLE_DIR
+        )
+        if not os.path.isdir(bundle_root) or os.path.islink(bundle_root):
+            raise RuntimeError(
+                f"GRPO resume checkpoint {resume_step} is missing required-adapter bundle for "
+                f"steps {sorted(owed)}"
+            )
+        sources: dict[int, str] = {}
+        for entry in os.scandir(bundle_root):
+            name = entry.name
+            if not name.startswith("step-") or not name[5:].isdigit():
+                raise RuntimeError(f"invalid GRPO required-adapter bundle entry {name!r}")
+            step = int(name[5:])
+            if name != f"step-{step}" or step in sources:
+                raise RuntimeError(f"invalid GRPO required-adapter bundle collision {name!r}")
+            if step not in self.required_steps or step > int(resume_step):
+                raise RuntimeError(f"invalid GRPO required-adapter bundle step {step}")
+            _validate_internal_adapter_dir(entry.path, label=name)
+            if step not in self.lifecycle.deployable_published_steps:
+                sources[step] = entry.path
+        missing = sorted(owed - sources.keys())
+        if missing:
+            raise RuntimeError(
+                f"GRPO resume checkpoint {resume_step} required-adapter bundle is missing steps "
+                f"{missing}"
+            )
+        os.makedirs(self.export_root, exist_ok=True)
+        restored: dict[int, str] = {}
+        try:
+            for step in sorted(sources):
+                name = f"step-{step}"
+                destination = os.path.join(self.export_root, name)
+                temporary = os.path.join(self.export_root, f".{name}.restoring")
+                shutil.rmtree(temporary, ignore_errors=True)
+                shutil.copytree(sources[step], temporary)
+                shutil.rmtree(destination, ignore_errors=True)
+                os.replace(temporary, destination)
+                restored[step] = destination
+        except BaseException:
+            for path in restored.values():
+                shutil.rmtree(path, ignore_errors=True)
+            for step in sources:
+                temporary = os.path.join(self.export_root, f".step-{step}.restoring")
+                shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        for step, path in restored.items():
+            self.staged_adapters[step] = path
+            self.lifecycle.mark_staged(step)
+
+    def _bundle_staged_adapters(self, checkpoint_dir: str) -> None:
+        """copy every unpublished staged required adapter into this native resume checkpoint."""
+        bundle_root = os.path.join(checkpoint_dir, _REQUIRED_ADAPTER_BUNDLE_DIR)
+        shutil.rmtree(bundle_root, ignore_errors=True)
+        unpublished = {
+            step: path
+            for step, path in self.staged_adapters.items()
+            if step in self.required_steps and step not in self.lifecycle.deployable_published_steps
+        }
+        if not unpublished:
+            return
+        os.makedirs(bundle_root, exist_ok=True)
+        for step in sorted(unpublished):
+            source = unpublished[step]
+            _validate_internal_adapter_dir(source, label=f"step-{step}")
+            shutil.copytree(source, os.path.join(bundle_root, f"step-{step}"))
 
     def start(self) -> None:
         self._thread.start()
@@ -226,6 +328,7 @@ class _VerlResumeUploader:
                     if step not in self._resume_attempted:
                         self._resume_attempted.add(step)
                         try:
+                            self._bundle_staged_adapters(path)
                             _w.upload_resume_checkpoint(
                                 step,
                                 path,
