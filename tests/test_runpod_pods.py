@@ -184,9 +184,9 @@ def test_api_parses_payload_only_env_identity():
     assert reference not in repr(parsed)
 
 
-def test_api_accepts_provider_managed_public_key_without_retaining_it():
+@pytest.mark.parametrize("public_key", ["", "ssh-ed25519 provider-managed-raw-value"])
+def test_api_accepts_provider_managed_public_key_without_retaining_it(public_key):
     reference = "{{ RUNPOD_SECRET_FLASH_PAYLOAD_0123456789abcdef }}"
-    public_key = "ssh-ed25519 provider-managed-raw-value"
     parsed = pod_api._pod_rows(
         [
             _api_pod_row(
@@ -199,7 +199,8 @@ def test_api_accepts_provider_managed_public_key_without_retaining_it():
     )
     assert parsed[0].payload_env_sha256 == hashlib.sha256(reference.encode()).hexdigest()
     assert parsed[0].payload_secret_name == "FLASH_PAYLOAD_0123456789abcdef"
-    assert public_key not in repr(parsed)
+    if public_key:
+        assert public_key not in repr(parsed)
 
 
 def test_api_rejects_unknown_env_key_without_exposing_value():
@@ -221,7 +222,7 @@ def test_api_rejects_unknown_env_key_without_exposing_value():
     assert raw_value not in repr(exc_info.value)
 
 
-@pytest.mark.parametrize("public_key", [None, 1, [], {}, "", " ", " padded"])
+@pytest.mark.parametrize("public_key", [None, 1, [], {}, " ", "\t", " padded", "padded "])
 def test_api_rejects_malformed_provider_managed_public_key(public_key):
     with pytest.raises(api.RunpodApiError, match="environment identity"):
         pod_api._pod_rows(
@@ -244,7 +245,10 @@ def test_api_rejects_malformed_payload_env_identity(env):
         pod_api._pod_rows([_api_pod_row(env)])
 
 
-@pytest.mark.parametrize("env", [None, {}, {"PUBLIC_KEY": "provider-managed-raw-value"}])
+@pytest.mark.parametrize(
+    "env",
+    [None, {}, {"PUBLIC_KEY": ""}, {"PUBLIC_KEY": "provider-managed-raw-value"}],
+)
 def test_api_preserves_pending_pod_with_incomplete_provider_env(env):
     pending = _handle()
     payload = pods._payload_for_handle(pending)
