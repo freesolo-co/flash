@@ -14,7 +14,7 @@ from __future__ import annotations
 import sys
 import time
 
-from flash.cli.ui import heartbeat as heartbeat_ui
+from flash.cli.ui import lifecycle as lifecycle_ui
 from flash.cli.ui import render
 from flash.cli.ui.tty import TtyStatusLine
 from flash.client import ApiError, ClientError, RequestTimeoutError, ServiceUnreachableError
@@ -169,40 +169,25 @@ _FOLLOW_METRIC_FIELDS = (
 
 
 def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
-    """Return unseen heartbeat-backed RL metric rows, deduplicated by attempt and optimizer step."""
-    heartbeat = (status or {}).get("last_heartbeat")
-    if not isinstance(heartbeat, dict):
+    """return one unseen immutable progress row keyed by attempt, fence, and sequence."""
+    progress = (status or {}).get("progress")
+    if not isinstance(progress, dict) or not lifecycle_ui.progress_is_current(status or {}, progress):
         return []
-    # during a retry, status.remote.attempt can already point at the replacement worker while
-    # last_heartbeat still belongs to the prior attempt; don't render that stale attempt's rows
-    if not heartbeat_ui.heartbeat_is_current_attempt(status, heartbeat):
+    key = (progress.get("attempt_id"), progress.get("fence"), progress.get("sequence"))
+    if key in seen_steps:
         return []
-    metrics_last = heartbeat.get("metrics_last")
-    if not isinstance(metrics_last, list):
-        return []
-    rows = []
-    attempt = heartbeat.get("attempt")
-    for metrics in metrics_last:
-        if not isinstance(metrics, dict):
-            continue
-        step = metrics.get("step")
-        if step is None:
-            continue
-        try:
-            step_key = int(step)
-        except (TypeError, ValueError):
-            step_key = str(step)
-        metric_key = (attempt, step_key)
-        if metric_key in seen_steps:
-            continue
-        seen_steps.add(metric_key)
-        parts = [f"step={step_key}"]
-        for key, label in _FOLLOW_METRIC_FIELDS:
-            value = metrics.get(key)
+    seen_steps.add(key)
+    parts = [f"progress_seq={progress.get('sequence')}"]
+    steps = progress.get("completed_steps")
+    if isinstance(steps, int) and not isinstance(steps, bool):
+        parts.append(f"step={steps}")
+    metrics = progress.get("metrics")
+    if isinstance(metrics, dict):
+        for field, label in _FOLLOW_METRIC_FIELDS:
+            value = metrics.get(field)
             if value is None:
                 continue
             if isinstance(value, float):
                 value = f"{value:.6g}"
             parts.append(f"{label}={value}")
-        rows.append(" ".join(parts))
-    return rows
+    return [" ".join(parts)]

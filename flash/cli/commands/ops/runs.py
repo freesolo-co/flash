@@ -24,7 +24,7 @@ from flash.cli.commands.ops.worker_output import (
     live_attempt_of,
 )
 from flash.cli.ui import cost as cost_ui
-from flash.cli.ui import heartbeat as heartbeat_ui
+from flash.cli.ui import lifecycle as lifecycle_ui
 from flash.cli.ui import render, tables
 from flash.client import ApiClient, client_from_config
 from flash.runner.lifecycle.state import TERMINAL_STATES
@@ -38,61 +38,24 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     status = status or {}
     state = str(status.get("state") or fallback_state or "unknown")
     parts = [state]
-    heartbeat = status.get("last_heartbeat") if isinstance(status, dict) else None
-    # retries rewind steps while state remains running, so surface the 0-based attempt identity.
-    # `live_attempt` owns the provenance order (live `remote.attempt` first, heartbeat only when
-    # `remote` is absent rather than cleared at teardown) and is shared with the worker-artifact
-    # labelling below, so the spinner and the appended sections name the same current attempt.
-    attempt = heartbeat_ui.live_attempt(status)
-    if isinstance(heartbeat, dict):
-        heartbeat_age_seconds = heartbeat_ui._heartbeat_age_seconds(heartbeat.get("ts"))
-        # stage and step come from the heartbeat, attempt from `remote` below. during the relaunch
-        # window those are two different attempts, so printing them side by side reads as progress
-        # the replacement worker has not made: `stage=sft_step step=455 attempt=1` attributes the
-        # superseded worker's 455 steps to an attempt that just started from zero -- the exact
-        # rewind the attempt counter was added to explain. mark the heartbeat-sourced fields as the
-        # previous attempt's instead of dropping them: the run really did reach that step, and
-        # suppressing it entirely would read as no progress at all. a cleared `remote` is the same
-        # relaunch window, and the ping is just as superseded there: the worker that produced it has
-        # already been torn down. `heartbeat_is_current_attempt` answers True because it cannot
-        # prove otherwise from the identity alone, so the qualifier has to come from the clear
-        # itself or `step=455` reads as the replacement's progress. `heartbeat_is_superseded` is
-        # exactly that pair of conditions, shared with the status panel so the two surfaces cannot
-        # disagree about whether a run is between attempts.
-        stale_heartbeat = heartbeat_ui.heartbeat_is_superseded(status, heartbeat)
-        stage = heartbeat.get("stage")
-        if stage:
-            parts.append(f"stage={stage}")
-            if state == "running":
-                warmup = heartbeat_ui.warmup_message(
-                    stage,
-                    heartbeat_age_seconds,
-                    not stale_heartbeat,
-                )
-                if warmup:
-                    parts.append(warmup)
-        step = heartbeat.get("step")
-        if step is not None:
-            parts.append(f"step={step}")
-        # live heartbeat age so a long quiet phase reads as "alive, throttled" not "frozen".
-        # minute granularity: the non-TTY follow path prints a line whenever this string changes,
-        # so a seconds-precision age would emit one line per poll.
-        if heartbeat_age_seconds is not None:
-            mins = int(heartbeat_age_seconds // 60)
-            parts.append(f"hb={mins}m" if mins else "hb=<1m")
-        if stale_heartbeat and (stage or step is not None or heartbeat_age_seconds is not None):
-            # one marker for the whole heartbeat-sourced group rather than a suffix on each field:
-            # the staleness is a property of the ping, not of any one value it carried.
-            #
-            # it TRAILS the group, and `attempt=` is appended after it, so the split is positional:
-            # everything before the marker came from the superseded ping, everything after is live.
-            # covering `hb=` matters as much as covering the step -- that age is the old worker's
-            # ping too, so a fresh `hb=<1m` printed outside the marker read as the replacement
-            # worker being alive when nothing had been heard from it at all, the opposite of what
-            # the age is there to say.
-            parts.append("(prev attempt)")
-    if attempt:
-        parts.append(f"attempt={attempt}")
+    identity = lifecycle_ui.live_attempt(status)
+    if identity is not None:
+        parts.append(f"attempt={identity[0]}")
+        parts.append(f"fence={identity[1]}")
+    resource = status.get("resource")
+    if isinstance(resource, dict):
+        parts.append(f"resource={resource.get('state') or 'unknown'}")
+    progress = status.get("progress")
+    if isinstance(progress, dict) and lifecycle_ui.progress_is_current(status, progress):
+        phase = progress.get("phase")
+        if phase:
+            parts.append(f"phase={phase}")
+        steps = progress.get("completed_steps")
+        if isinstance(steps, int) and not isinstance(steps, bool):
+            parts.append(f"steps={steps}")
+        sequence = progress.get("sequence")
+        if isinstance(sequence, int) and not isinstance(sequence, bool):
+            parts.append(f"progress_seq={sequence}")
     # what this run has committed to spend so far. while it is live that is the submit-time quote,
     # since the settled charge is not written until the terminal transition -- following a run for an
     # hour and never seeing a cost is how a user loses track of what it is costing. it sits next to

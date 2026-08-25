@@ -417,35 +417,43 @@ def test_cancelled_charge_usd_falls_back_to_reprice_without_a_quote():
 # --------------------------------------------------------------------------- actual steps
 
 
-def test_actual_steps_run_reads_last_heartbeat_step():
-    def st(hb):
-        return runner_state.RunStatus(run_id="r", state="cancelled", spec={}, last_heartbeat=hb)
+def test_actual_steps_run_reads_current_fence_progress():
+    def status(progress, *, attempt=2, fence=9):
+        return runner_state.RunStatus(
+            run_id="r",
+            state="cancelled",
+            spec={},
+            attempt={"attempt_id": attempt, "fence": fence},
+            progress=progress,
+        )
 
-    assert runner_costs.actual_steps_run(st({"stage": "rl_step", "step": 7})) == 7
-    # no heartbeat / setup stage -> 0 (cancelled during cold-start, no GPU training yet)
-    assert runner_costs.actual_steps_run(st(None)) == 0
-    assert runner_costs.actual_steps_run(st({"stage": "setup"})) == 0
-    # training started but no step completed yet (the ~17-min first GRPO rollout emits no `step`) ->
-    # floor to 1 so real GPU time isn't billed as $0.
-    assert runner_costs.actual_steps_run(st({"stage": "rl_step", "step": 0})) == 1
-    assert runner_costs.actual_steps_run(st({"stage": "rl_step"})) == 1
-    assert runner_costs.actual_steps_run(st({"stage": "sft_step"})) == 1
-    # A completed OPD run's final pre-DONE heartbeats (opd_trained / opd_train_done) are NOT
-    # training stages, so a STEPLESS one floors a cancel-between-publish-and-DONE to 0 -- re-pricing
-    # a fully trained run as $0. opd.py/finalize.py attach step=opt_steps so the true count bills.
-    assert (
-        runner_costs.actual_steps_run(st({"stage": "opd_trained"})) == 0
-    )  # the bug the step guards against
-    assert runner_costs.actual_steps_run(st({"stage": "opd_train_done"})) == 0
-    assert runner_costs.actual_steps_run(st({"stage": "opd_trained", "step": 12})) == 12
-    assert runner_costs.actual_steps_run(st({"stage": "opd_train_done", "step": 12})) == 12
-    # Terminal `done` heartbeat: a cancel racing the DONE upload (done recorded, run not yet
-    # transitioned) reads a STEPLESS done and floors a fully-trained run to 0. _finalize carries
-    # opt_steps onto `done` so the true count bills.
-    assert (
-        runner_costs.actual_steps_run(st({"stage": "done"})) == 0
-    )  # the bug the step guards against
-    assert runner_costs.actual_steps_run(st({"stage": "done", "step": 12})) == 12
+    assert runner_costs.actual_steps_run(
+        status({"attempt_id": 2, "fence": 9, "completed_steps": 7})
+    ) == 7
+    assert runner_costs.actual_steps_run(status(None)) == 0
+    assert runner_costs.actual_steps_run(
+        status({"attempt_id": 1, "fence": 8, "completed_steps": 12})
+    ) == 0
+    assert runner_costs.actual_steps_run(
+        status(
+            {
+                "attempt_id": 2,
+                "fence": 9,
+                "training_entered": True,
+                "completed_steps": 0,
+            }
+        )
+    ) == 1
+    assert runner_costs.actual_steps_run(
+        status(
+            {
+                "attempt_id": 2,
+                "fence": 9,
+                "training_entered": False,
+                "completed_steps": 0,
+            }
+        )
+    ) == 0
 
 
 # --------------------------------------------------------------------------- cancel re-pricing
