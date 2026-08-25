@@ -22,7 +22,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from flash.serving.src.admission import AdmissionController, ServingOverloaded
-from flash.serving.src.model_config import base_models, gpu_for, hosted_traffic_policy_for
+from flash.serving.src.model_config import (
+    base_models,
+    configured_hard_gpu_ceiling,
+    configured_router_async_capacity,
+    configured_warm_container_floor,
+    gpu_for,
+    hosted_traffic_policy_for,
+)
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -894,6 +901,7 @@ def test_changed_hosted_sources_describe_warm_policy() -> None:
         root / "flash/serving/src/context.py",
         root / "flash/serving/src/lora_engine.py",
         root / "flash/serving/src/routing.py",
+        root / "flash/serving/README.md",
     )
     forbidden = (
         "scale" + "-to-zero",
@@ -912,6 +920,16 @@ def test_changed_hosted_sources_describe_warm_policy() -> None:
         if phrase in path.read_text().lower()
     }
     assert hits == {}
+
+    readme = (root / "flash/serving/README.md").read_text(encoding="utf-8")
+    assert len(base_models()) == 2
+    assert "current two-model catalog" in readme
+    assert f"warm floor of {configured_warm_container_floor()} GPU containers" in readme
+    assert f"hard ceiling of {configured_hard_gpu_ceiling()}" in readme
+    assert f"`max_inputs={configured_router_async_capacity()}`" in readme
+    assert f"derived warm floor is {configured_warm_container_floor()} GPU containers" in readme
+    assert f"hard ceiling\nis {configured_hard_gpu_ceiling()}" in readme
+    assert f"router bound of {configured_router_async_capacity()} inputs" in readme
 
 
 def test_health_reports_pinned_gpu_over_derived_tier(modal_app_module):

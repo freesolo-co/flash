@@ -1,27 +1,24 @@
 # Freesolo LoRA Serving Modal App
 
-Multi-LoRA serving on Modal with **demand-driven GPU containers per base model**.
+Multi-LoRA serving on Modal with **one warm exact-model engine class per active base model**.
 
-- `LoraEngine` is a Modal class **parametrized by `base_model`**. Modal runs separate GPU
-  containers per distinct base model, each with a vLLM engine that holds all adapters for that
-  model. Many adapters of the same base model share its GPU capacity.
-- `router` is a CPU web endpoint that tracks adapter to base-model routing and dispatches each
-  request to the correct `LoraEngine`. It keeps one CPU container warm so it can receive the
-  request that starts a scaled-to-zero GPU engine.
+- Each active base model has its own immutable `LoraEngine_<model>_<contract>` Modal class. Its
+  identity covers the exact model and every decorator-affecting traffic policy value. The class's
+  vLLM engine holds all adapters for that model, so many adapters share the model's GPU capacity.
+- `router` is a singleton CPU web endpoint that tracks adapter to base-model routing and dispatches
+  each request to the exact model class. It keeps one CPU container warm.
 
-Adding a LoRA calls `register.remote.aio(...)` on that base model's engine, so adapter deployment
-starts the matching GPU container when none is running. Inference similarly starts the engine
-through its remote generation method. Uncataloged base models are rejected instead of falling
-onto the default L4 tier.
+Adding a LoRA calls `register.remote.aio(...)` on that base model's engine. The existing warm
+container handles registration and inference, and Modal may add the model's second container under
+traffic. Uncataloged base models are rejected instead of falling onto another model or GPU tier.
 
-GPU engines use `MIN_CONTAINERS = 0` and scale down after up to 30 idle minutes. A normal deploy does
-not boot any GPU model; registration or inference starts the matching engine on demand. The product
-chat route allows 30 minutes and gives
-first-party serving a 1,700-second request budget, leaving frontend headroom. Adapter undeploy
-returns after durable routing state is disabled, while
-best-effort gpu eviction continues as response background work. The `start_all` entrypoint (`uv run
-modal run flash/serving/modal_app.py`) remains an explicit manual diagnostic that boots engines and blocks until
-each reports healthy. Pass `--base-model ...` to check one model.
+Each GPU engine class uses `min_containers=1`, `max_containers=2`, and `buffer_containers=0`. The
+current two-model catalog therefore has a warm floor of 2 GPU containers and a hard ceiling of 4.
+The product chat route allows 30 minutes and gives first-party serving a 1,700-second request budget,
+leaving frontend headroom. Adapter undeploy returns after durable routing state is disabled, while
+best-effort GPU eviction continues as response background work. The `start_all` entrypoint (`uv run
+modal run flash/serving/modal_app.py`) remains an explicit manual diagnostic that checks the warm
+engines and blocks until each reports healthy. Pass `--base-model ...` to check one model.
 
 The routing layer (`src/router.py`) carries no `modal`/`vllm` imports and is exhaustively
 unit-tested in `tests/serving/test_router.py` (multi-base-model dispatch, shared-GPU multi-LoRA,
@@ -40,11 +37,12 @@ Modal environment `dev` and that production mode does not. The mode does not cha
 engine behavior.
 
 Both environments keep one warm engine container per advertised model and allow two containers per
-model. The CPU router remains a singleton with a fixed `max_inputs=332`, covering every engine's hard
-application slots plus the two bounded waiters per model. Modal 1.5.4 has no SDK setting that rejects an
-ASGI request before Modal admits it to the router container. The application 429 is therefore prompt only
-after Modal admission; traffic above the router's fixed 332 inputs can wait at Modal ingress before the
-application can classify it. Keep the router bound fixed at 332 until Modal exposes an ingress rejection
+model. For the current two-model catalog, the derived warm floor is 2 GPU containers, the hard ceiling
+is 4, and the singleton CPU router uses `max_inputs=36`: 32 hard engine slots plus two bounded waiters
+per model. Modal 1.5.4 has no SDK setting that rejects an ASGI request before Modal admits it to the
+router container. The application 429 is therefore prompt only after Modal admission; traffic above the
+current derived router bound of 36 inputs can wait at Modal ingress before the application can classify
+it. Keep the router bound derived from the active catalog until Modal exposes an ingress rejection
 setting.
 
 ### Production
@@ -107,7 +105,7 @@ export HF_TOKEN="replace-with-hugging-face-token"
 uv run modal deploy --env dev flash/serving/modal_app.py
 ```
 
-Explicitly warm one development model without changing the zero floor:
+Explicitly check one warm development model:
 
 ```bash
 uv run modal run --env dev flash/serving/modal_app.py --base-model Qwen/Qwen3.5-9B
@@ -122,11 +120,12 @@ GPUs, so there's nothing to tune at deploy time:
 - **On, hardcoded:** FP8 weights on the dense tiers + FP8 KV cache everywhere (see Quantization
   below), prefix caching (~4.7×
   throughput / ~10× lower TTFT for shared prompts), CUDA graphs where the per-model boot canary
-  leaves enough KV headroom, `disable_log_stats`, the prompt-token cache (2048), `MAX_INPUTS=64`
-  packing, multi-LoRA defaults (**16 hot** / **rank 32** / 256 CPU) with per-model rank overrides
-  (**128** for the 9B, **64** for the 27B; the 35B MoE runs rank 64 at only 6 hot slots,
-  every other tier keeps 16), and `VLLM_CACHE_ROOT` on the persistent volume so vLLM's
-  torch.compile cache survives scale-to-zero instead of recompiling on every cold start.
+  leaves enough KV headroom, `disable_log_stats`, the prompt-token cache (2048), per-model
+  `max_inputs=max_num_seqs=8`, multi-LoRA defaults (**16 hot** / **rank 32** / 256 CPU) with
+  per-model rank overrides
+  (**128** for the 9B; the 35B MoE runs rank 64 at only 6 hot slots), and `VLLM_CACHE_ROOT` on
+  the persistent volume so vLLM's torch.compile cache survives container replacement without
+  recompiling from an empty cache.
 - **Deleted (neutral or losing):** speculative decoding / ngram (−13.5% on diverse output),
   bitsandbytes (−49%), `enforce_eager` toggle, the scheduler knobs (`max_num_batched_tokens`,
   `max_num_seqs`, partial-prefill, async-scheduling, scheduling-policy, gdn-backend,
