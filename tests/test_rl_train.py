@@ -4599,13 +4599,18 @@ def _write_internal_adapter(adapter_dir: Path, *, weights: str = "single") -> No
         raise AssertionError(f"unknown adapter weight shape {weights}")
 
 
-def _write_resume_manifest(checkpoint: Path, step: int, required=(), positive=1) -> None:
+def _write_resume_manifest(
+    checkpoint: Path, step: int, required=(), positive=1, *, attempt=0
+) -> None:
     (checkpoint / "_flash_resume_manifest.json").write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "checkpoint_step": step,
-                "required_adapter_steps": list(required),
+                "checkpoint_attempt": attempt,
+                "required_adapters": [
+                    {"step": required_step, "attempt": attempt} for required_step in required
+                ],
                 "first_positive_grad_step": positive,
             },
             sort_keys=True,
@@ -4697,12 +4702,15 @@ def test_internal_required_adapters_upload_once_and_restore_from_latest_manifest
             uploader.stop()
 
     assert internal_uploads == [
-        "checkpoint/required-adapters/step-2/adapter",
-        "checkpoint/required-adapters/step-4/adapter",
+        "checkpoint/required-adapters/attempt-0/step-2/adapter",
+        "checkpoint/required-adapters/attempt-0/step-4/adapter",
     ]
     latest = remote / "checkpoint-4"
     manifest = json.loads((latest / "_flash_resume_manifest.json").read_text())
-    assert manifest["required_adapter_steps"] == [2, 4]
+    assert manifest["required_adapters"] == [
+        {"step": 2, "attempt": 0},
+        {"step": 4, "attempt": 0},
+    ]
     assert manifest["first_positive_grad_step"] == 2
     assert not list(latest.rglob("adapter_model.safetensors"))
 
@@ -4734,17 +4742,102 @@ def test_internal_required_adapters_upload_once_and_restore_from_latest_manifest
     assert published == [2, 4]
 
 
+def test_attempt_scoped_internal_adapter_survives_an_incompatible_retry_window(
+    tmp_path, monkeypatch
+):
+    remote = tmp_path / "remote"
+    checkpoint = remote / "checkpoint" / "checkpoint-2"
+    actor = checkpoint / "actor"
+    actor.mkdir(parents=True)
+    (actor / "fsdp_config.json").write_text('{"FSDP_version": 2, "world_size": 1}')
+    for kind in ("model", "optim", "extra_state"):
+        (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
+    _write_resume_manifest(checkpoint, 2, required=(2,), positive=2, attempt=0)
+    old_adapter = remote / "checkpoint" / "required-adapters" / "attempt-0" / "step-2" / "adapter"
+    _write_internal_adapter(old_adapter)
+    (old_adapter / "adapter_model.safetensors").write_bytes(b"old-trajectory")
+    monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda **kwargs: str(checkpoint))
+
+    incompatible_local = tmp_path / "incompatible"
+    incompatible_local.mkdir()
+    assert (
+        rl_train._restore_verl_resume(
+            str(incompatible_local),
+            world_size=2,
+            expected_fsdp_generation=2,
+            required_steps=(2,),
+        )
+        == 0
+    )
+
+    monkeypatch.setattr(rl_train._w, "ATTEMPT", 1)
+
+    def upload_internal(source, subpath, required=False):
+        assert required is True
+        destination = remote / subpath
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination)
+        return True
+
+    monkeypatch.setattr(rl_train._w, "hf_upload_folder", upload_internal, raising=False)
+    new_adapter = tmp_path / "new-adapter"
+    _write_internal_adapter(new_adapter)
+    (new_adapter / "adapter_model.safetensors").write_bytes(b"new-trajectory")
+    new_attempt = rl_train._VerlResumeUploader(
+        str(incompatible_local),
+        resume_step=0,
+        required_steps=(2,),
+        metric_evidence=_metric_state((1, 0.5), (2, 0.0)),
+    )
+    new_attempt._make_required_adapter_durable(2, str(new_adapter))
+
+    assert (old_adapter / "adapter_model.safetensors").read_bytes() == b"old-trajectory"
+    assert (
+        remote
+        / "checkpoint"
+        / "required-adapters"
+        / "attempt-1"
+        / "step-2"
+        / "adapter"
+        / "adapter_model.safetensors"
+    ).read_bytes() == b"new-trajectory"
+
+    compatible_local = tmp_path / "compatible"
+    compatible_local.mkdir()
+    assert (
+        rl_train._restore_verl_resume(
+            str(compatible_local),
+            world_size=1,
+            expected_fsdp_generation=2,
+            required_steps=(2,),
+        )
+        == 2
+    )
+    restored = compatible_local / "_flash_required_adapter_store" / "step-2" / "adapter"
+    assert (restored / "adapter_model.safetensors").read_bytes() == b"old-trajectory"
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
         lambda manifest: manifest.update(extra=True),
-        lambda manifest: manifest.update(version=2),
-        lambda manifest: manifest.update(version=1.0),
+        lambda manifest: manifest.update(version=3),
+        lambda manifest: manifest.update(version=2.0),
         lambda manifest: manifest.update(checkpoint_step=True),
-        lambda manifest: manifest.update(required_adapter_steps=[2, 2]),
-        lambda manifest: manifest.update(required_adapter_steps=[2, 1]),
-        lambda manifest: manifest.update(required_adapter_steps=[0]),
-        lambda manifest: manifest.update(required_adapter_steps=[5]),
+        lambda manifest: manifest.update(checkpoint_attempt=-1),
+        lambda manifest: manifest.update(checkpoint_attempt=True),
+        lambda manifest: manifest.update(
+            required_adapters=[{"step": 2, "attempt": 0}, {"step": 2, "attempt": 1}]
+        ),
+        lambda manifest: manifest.update(
+            required_adapters=[{"step": 2, "attempt": 0}, {"step": 1, "attempt": 0}]
+        ),
+        lambda manifest: manifest.update(required_adapters=[{"step": 0, "attempt": 0}]),
+        lambda manifest: manifest.update(required_adapters=[{"step": 5, "attempt": 0}]),
+        lambda manifest: manifest.update(required_adapters=[{"step": 2, "attempt": -1}]),
+        lambda manifest: manifest.update(required_adapters=[{"step": 2, "attempt": True}]),
+        lambda manifest: manifest.update(required_adapters=[{"step": 2, "attempt": 1}]),
+        lambda manifest: manifest.update(required_adapters=[{"step": 2}]),
         lambda manifest: manifest.update(first_positive_grad_step=0),
         lambda manifest: manifest.update(first_positive_grad_step=5),
         lambda manifest: manifest.update(first_positive_grad_step=True),
@@ -4754,9 +4847,10 @@ def test_resume_manifest_rejects_unknown_noncanonical_and_out_of_range_facts(tmp
     checkpoint = tmp_path / "checkpoint-4"
     checkpoint.mkdir()
     manifest = {
-        "version": 1,
+        "version": 2,
         "checkpoint_step": 4,
-        "required_adapter_steps": [1, 2],
+        "checkpoint_attempt": 0,
+        "required_adapters": [{"step": 1, "attempt": 0}, {"step": 2, "attempt": 0}],
         "first_positive_grad_step": 1,
     }
     mutate(manifest)
@@ -4771,18 +4865,19 @@ def test_required_adapter_namespace_rejects_canonical_collision_and_step_symlink
     checkpoint = tmp_path / "checkpoint" / "checkpoint-4"
     checkpoint.mkdir(parents=True)
     root = checkpoint.parent / "required-adapters"
-    _write_internal_adapter(root / "step-2" / "adapter")
-    _write_internal_adapter(root / "step-02" / "adapter")
+    attempt = root / "attempt-0"
+    _write_internal_adapter(attempt / "step-2" / "adapter")
+    _write_internal_adapter(attempt / "step-02" / "adapter")
     with pytest.raises(RuntimeError, match="namespace collision"):
-        rl_checkpoints._internal_adapter_sources(str(checkpoint), (2,))
+        rl_checkpoints._internal_adapter_sources(str(checkpoint), ((2, 0),))
 
-    shutil.rmtree(root / "step-02")
+    shutil.rmtree(attempt / "step-02")
     outside = tmp_path / "outside-step"
     _write_internal_adapter(outside / "adapter")
-    shutil.rmtree(root / "step-2")
-    (root / "step-2").symlink_to(outside, target_is_directory=True)
+    shutil.rmtree(attempt / "step-2")
+    (attempt / "step-2").symlink_to(outside, target_is_directory=True)
     with pytest.raises(RuntimeError, match="namespace step"):
-        rl_checkpoints._internal_adapter_sources(str(checkpoint), (2,))
+        rl_checkpoints._internal_adapter_sources(str(checkpoint), ((2, 0),))
 
 
 def test_checkpoint_waits_for_its_own_metric_and_preemption_keeps_previous_remote(
@@ -4938,7 +5033,7 @@ def test_resume_manifest_and_internal_tree_fail_closed(tmp_path, monkeypatch):
     for kind in ("model", "optim", "extra_state"):
         (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
     _write_resume_manifest(checkpoint, 4, required=(2,), positive=2)
-    internal = remote_root / "required-adapters" / "step-2" / "adapter"
+    internal = remote_root / "required-adapters" / "attempt-0" / "step-2" / "adapter"
     _write_internal_adapter(internal, weights="sharded")
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda **kwargs: str(checkpoint))
 
@@ -5083,9 +5178,7 @@ def test_no_required_saves_write_only_the_small_resume_manifest(tmp_path):
         rl_train._w.upload_resume_checkpoint = original
     assert uploaded == [1]
     assert (
-        json.loads((checkpoint / "_flash_resume_manifest.json").read_text())[
-            "required_adapter_steps"
-        ]
+        json.loads((checkpoint / "_flash_resume_manifest.json").read_text())["required_adapters"]
         == []
     )
     assert not (checkpoint / "_flash_required_adapters").exists()

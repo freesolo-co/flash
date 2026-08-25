@@ -10,7 +10,7 @@ import shutil
 import threading
 import time
 
-from flash.adapters.artifacts import has_loadable_adapter_weights
+from flash.adapters.artifacts import MAX_ATTEMPT_ID, has_loadable_adapter_weights
 from flash.engine.verl_checkpoint import FsdpCheckpointInspection
 from flash.engine.verl_policy import FsdpGeneration
 from flash.engine.worker.backend_common import (
@@ -28,7 +28,7 @@ from flash.engine.worker.verl.checkpoints import (
 )
 
 _RESUME_MANIFEST = "_flash_resume_manifest.json"
-_RESUME_MANIFEST_VERSION = 1
+_RESUME_MANIFEST_VERSION = 2
 _LOCAL_REQUIRED_ADAPTER_STORE = "_flash_required_adapter_store"
 _HF_REQUIRED_ADAPTER_ROOT = "required-adapters"
 
@@ -62,12 +62,20 @@ def _strict_positive_step(value, *, field: str, maximum: int) -> int:
     return value
 
 
+def _strict_attempt(value, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > MAX_ATTEMPT_ID:
+        raise RuntimeError(
+            f"invalid GRPO resume manifest {field}: expected an integer in 0..{MAX_ATTEMPT_ID}"
+        )
+    return value
+
+
 def _read_resume_manifest(
     checkpoint_dir: str,
     *,
     checkpoint_step: int,
     required_steps: frozenset[int] | set[int] | tuple[int, ...],
-) -> tuple[tuple[int, ...], int | None]:
+) -> tuple[tuple[tuple[int, int], ...], int | None]:
     """read one exact current-contract resume manifest and reject every ambiguous shape."""
     path = os.path.join(checkpoint_dir, _RESUME_MANIFEST)
     if not os.path.isfile(path) or os.path.islink(path):
@@ -84,7 +92,8 @@ def _read_resume_manifest(
     expected_keys = {
         "version",
         "checkpoint_step",
-        "required_adapter_steps",
+        "checkpoint_attempt",
+        "required_adapters",
         "first_positive_grad_step",
     }
     if not isinstance(manifest, dict) or set(manifest) != expected_keys:
@@ -98,16 +107,31 @@ def _read_resume_manifest(
         raise RuntimeError(
             f"invalid GRPO resume manifest checkpoint_step {declared_step}; expected {checkpoint_step}"
         )
-    raw_required = manifest["required_adapter_steps"]
+    checkpoint_attempt = _strict_attempt(manifest["checkpoint_attempt"], field="checkpoint_attempt")
+    raw_required = manifest["required_adapters"]
     if not isinstance(raw_required, list):
-        raise RuntimeError("invalid GRPO resume manifest required_adapter_steps")
-    parsed_required = tuple(
-        _strict_positive_step(value, field="required_adapter_steps", maximum=checkpoint_step)
-        for value in raw_required
-    )
+        raise RuntimeError("invalid GRPO resume manifest required_adapters")
+    parsed_required = []
+    for value in raw_required:
+        if not isinstance(value, dict) or set(value) != {"step", "attempt"}:
+            raise RuntimeError("invalid GRPO resume manifest required_adapters entry")
+        parsed_required.append(
+            (
+                _strict_positive_step(
+                    value["step"], field="required_adapters.step", maximum=checkpoint_step
+                ),
+                _strict_attempt(value["attempt"], field="required_adapters.attempt"),
+            )
+        )
+    parsed_required = tuple(parsed_required)
     if parsed_required != tuple(sorted(set(parsed_required))):
-        raise RuntimeError("invalid GRPO resume manifest noncanonical required_adapter_steps")
-    unknown = sorted(set(parsed_required) - set(required_steps))
+        raise RuntimeError("invalid GRPO resume manifest noncanonical required_adapters")
+    if any(attempt > checkpoint_attempt for _step, attempt in parsed_required):
+        raise RuntimeError("invalid GRPO resume manifest future required adapter attempt")
+    parsed_steps = tuple(step for step, _attempt in parsed_required)
+    if len(parsed_steps) != len(set(parsed_steps)):
+        raise RuntimeError("invalid GRPO resume manifest duplicate required adapter step")
+    unknown = sorted(set(parsed_steps) - set(required_steps))
     if unknown:
         raise RuntimeError(f"invalid GRPO resume manifest unknown required adapter steps {unknown}")
     positive = manifest["first_positive_grad_step"]
@@ -122,14 +146,18 @@ def _write_resume_manifest(
     checkpoint_dir: str,
     *,
     checkpoint_step: int,
-    required_adapter_steps: tuple[int, ...],
+    checkpoint_attempt: int,
+    required_adapters: tuple[tuple[int, int], ...],
     first_positive_grad_step: int | None,
 ) -> None:
     """atomically write the small durability manifest included in a native checkpoint commit."""
     manifest = {
         "version": _RESUME_MANIFEST_VERSION,
         "checkpoint_step": checkpoint_step,
-        "required_adapter_steps": list(required_adapter_steps),
+        "checkpoint_attempt": checkpoint_attempt,
+        "required_adapters": [
+            {"step": step, "attempt": attempt} for step, attempt in required_adapters
+        ],
         "first_positive_grad_step": first_positive_grad_step,
     }
     path = os.path.join(checkpoint_dir, _RESUME_MANIFEST)
@@ -147,44 +175,52 @@ def _write_resume_manifest(
         raise
 
 
+def _canonical_namespace_dir(root: str, *, prefix: str, value: int, label: str) -> str:
+    canonical = f"{prefix}{value}"
+    for entry in os.scandir(root):
+        name = entry.name
+        suffix = name.removeprefix(prefix)
+        if (
+            name.startswith(prefix)
+            and suffix.isdigit()
+            and int(suffix) == value
+            and name != canonical
+        ):
+            raise RuntimeError(f"invalid GRPO required-adapter namespace collision {name!r}")
+    path = os.path.join(root, canonical)
+    if not os.path.isdir(path) or os.path.islink(path):
+        raise RuntimeError(f"invalid GRPO required-adapter namespace {label} {canonical!r}")
+    return path
+
+
 def _internal_adapter_sources(
-    checkpoint_dir: str, referenced_steps: tuple[int, ...]
+    checkpoint_dir: str, references: tuple[tuple[int, int], ...]
 ) -> dict[int, str]:
-    """resolve referenced singular-namespace adapters beside a downloaded checkpoint."""
-    if not referenced_steps:
+    """resolve immutable attempt-scoped adapters referenced by one native checkpoint."""
+    if not references:
         return {}
     root = os.path.join(os.path.dirname(checkpoint_dir), _HF_REQUIRED_ADAPTER_ROOT)
     if not os.path.isdir(root) or os.path.islink(root):
         raise RuntimeError("GRPO resume is missing the required-adapter internal namespace")
     sources: dict[int, str] = {}
-    referenced = set(referenced_steps)
-    for entry in os.scandir(root):
-        name = entry.name
-        if not name.startswith("step-") or not name[5:].isdigit():
-            continue
-        step = int(name[5:])
-        if step not in referenced:
-            continue
-        if name != f"step-{step}" or step in sources:
-            raise RuntimeError(f"invalid GRPO required-adapter namespace collision {name!r}")
-        if not entry.is_dir(follow_symlinks=False) or entry.is_symlink():
-            raise RuntimeError(f"invalid GRPO required-adapter namespace step {name!r}")
-        adapter = os.path.join(entry.path, "adapter")
-        _validate_internal_adapter_dir(adapter, label=name)
+    for step, attempt in references:
+        attempt_dir = _canonical_namespace_dir(
+            root, prefix="attempt-", value=attempt, label="attempt"
+        )
+        step_dir = _canonical_namespace_dir(attempt_dir, prefix="step-", value=step, label="step")
+        adapter = os.path.join(step_dir, "adapter")
+        _validate_internal_adapter_dir(adapter, label=f"attempt-{attempt}/step-{step}")
         sources[step] = adapter
-    missing = sorted(set(referenced_steps) - sources.keys())
-    if missing:
-        raise RuntimeError(f"GRPO resume required-adapter namespace is missing steps {missing}")
     return sources
 
 
 def _stage_internal_adapters(
     checkpoint_dir: str,
     local_dir: str,
-    referenced_steps: tuple[int, ...],
+    references: tuple[tuple[int, int], ...],
 ) -> None:
     """copy manifest-referenced internal adapters to a deterministic local restore store."""
-    sources = _internal_adapter_sources(checkpoint_dir, referenced_steps)
+    sources = _internal_adapter_sources(checkpoint_dir, references)
     store = os.path.join(local_dir, _LOCAL_REQUIRED_ADAPTER_STORE)
     shutil.rmtree(store, ignore_errors=True)
     if not sources:
@@ -228,7 +264,8 @@ class _VerlResumeUploader:
         self.lifecycle.seed_resumed_step(resume_step, self.required_steps)
         self._resume_attempted: set[int] = {resume_step} if resume_step else set()
         self.staged_adapters: dict[int, str] = {}
-        self._internally_durable_steps: set[int] = set()
+        self._internal_adapter_attempts: dict[int, int] = {}
+        self._attempt = _strict_attempt(_w.ATTEMPT, field="attempt")
         self._reported_required_debt = False
         self._blocked_evidence_step: int | None = None
         self.export_root = export_root
@@ -261,9 +298,9 @@ class _VerlResumeUploader:
             required_steps=self.required_steps,
         )
         self.metric_evidence.set_prior_positive_step(positive, checkpoint_step=resume_step)
-        self._internally_durable_steps.update(referenced)
+        self._internal_adapter_attempts.update(referenced)
         published = self.lifecycle.deployable_published_steps
-        owed = set(referenced) - published
+        owed = set(self._internal_adapter_attempts) - published
         if not owed:
             return
         store = os.path.join(self.local_dir, _LOCAL_REQUIRED_ADAPTER_STORE)
@@ -345,17 +382,17 @@ class _VerlResumeUploader:
 
     def _make_required_adapter_durable(self, step: int, adapter_dir: str) -> None:
         """upload one withheld adapter once under the non-serving singular namespace."""
-        if step in self._internally_durable_steps:
+        if step in self._internal_adapter_attempts:
             return
         _validate_internal_adapter_dir(adapter_dir, label=f"step-{step}")
         uploaded = _w.hf_upload_folder(
             adapter_dir,
-            f"checkpoint/{_HF_REQUIRED_ADAPTER_ROOT}/step-{step}/adapter",
+            f"checkpoint/{_HF_REQUIRED_ADAPTER_ROOT}/attempt-{self._attempt}/step-{step}/adapter",
             required=True,
         )
         if not uploaded:
             raise RuntimeError(f"required internal adapter upload returned false at step {step}")
-        self._internally_durable_steps.add(step)
+        self._internal_adapter_attempts[step] = self._attempt
 
     def _publish_staged(self, step: int, adapter_dir: str) -> None:
         _w.publish_deployable_checkpoint(adapter_dir, step, required=True, _provenance_ready=True)
@@ -366,7 +403,7 @@ class _VerlResumeUploader:
             return
         published = self.lifecycle.deployable_published_steps
         for step in sorted(self.staged_adapters):
-            if step in self._internally_durable_steps and step not in published:
+            if step in self._internal_adapter_attempts and step not in published:
                 self._publish_staged(step, self.staged_adapters[step])
 
     def _required_debt(self, checkpoint_step: int) -> list[int]:
@@ -376,14 +413,14 @@ class _VerlResumeUploader:
             for step in self.required_steps
             if step <= checkpoint_step
             and step not in published
-            and step not in self._internally_durable_steps
+            and step not in self._internal_adapter_attempts
         )
 
-    def _manifest_required_steps(self, checkpoint_step: int) -> tuple[int, ...]:
+    def _manifest_required_adapters(self, checkpoint_step: int) -> tuple[tuple[int, int], ...]:
         published = self.lifecycle.deployable_published_steps
         return tuple(
-            step
-            for step in sorted(self._internally_durable_steps)
+            (step, self._internal_adapter_attempts[step])
+            for step in sorted(self._internal_adapter_attempts)
             if step <= checkpoint_step and step not in published
         )
 
@@ -443,7 +480,8 @@ class _VerlResumeUploader:
                         _write_resume_manifest(
                             path,
                             checkpoint_step=step,
-                            required_adapter_steps=self._manifest_required_steps(step),
+                            checkpoint_attempt=self._attempt,
+                            required_adapters=self._manifest_required_adapters(step),
                             first_positive_grad_step=positive_step,
                         )
                         try:

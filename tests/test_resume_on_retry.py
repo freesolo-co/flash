@@ -369,9 +369,10 @@ def _staged_checkpoint(root, step, *, world_size=None, fsdp_version=2, shards=0,
     (src / "_flash_resume_manifest.json").write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "checkpoint_step": step,
-                "required_adapter_steps": [],
+                "checkpoint_attempt": 0,
+                "required_adapters": [],
                 "first_positive_grad_step": 1,
             }
         )
