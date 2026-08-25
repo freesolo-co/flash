@@ -246,10 +246,10 @@ def build_pod_payload(
         "volumeInGb": 0,
         "volumeMountPath": NETWORK_VOLUME_MOUNT,
     }
-    if data_center_id is not None:
-        payload["dataCenterIds"] = [data_center_id]
     if network_volume_id is not None:
         payload["networkVolumeId"] = network_volume_id
+    elif data_center_id is not None:
+        payload["dataCenterIds"] = [data_center_id]
     registry_id = container_registry_auth_id
     if registry_id is None:
         registry_id = (os.environ.get("RUNPOD_CONTAINER_REGISTRY_AUTH_ID") or "").strip() or None
@@ -324,10 +324,10 @@ def payload_for_handle(handle: RunpodPodHandle) -> dict:
         "volumeInGb": 0,
         "volumeMountPath": NETWORK_VOLUME_MOUNT,
     }
-    if handle.data_center_id is not None:
-        payload["dataCenterIds"] = [handle.data_center_id]
     if handle.network_volume_id is not None:
         payload["networkVolumeId"] = handle.network_volume_id
+    elif handle.data_center_id is not None:
+        payload["dataCenterIds"] = [handle.data_center_id]
     if handle.container_registry_auth_id is not None:
         payload["containerRegistryAuthId"] = handle.container_registry_auth_id
     return payload

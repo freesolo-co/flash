@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import stat
 import subprocess
 import sys
 import time
+import urllib.error
 from dataclasses import replace
 from pathlib import Path
 
@@ -457,6 +459,139 @@ def test_storage_data_center_discovery_uses_account_key_and_graphql(monkeypatch)
     }
 
 
+def _raise_mutation_http_error(
+    monkeypatch,
+    status_code: int,
+    payload: object,
+    *,
+    method: str = "POST",
+    url: str = f"{pod_api.REST_BASE}/pods",
+) -> None:
+    body = json.dumps(payload).encode("utf-8")
+
+    def open_request(_request, *, timeout):
+        raise urllib.error.HTTPError(
+            url,
+            status_code,
+            "provider rejection",
+            None,
+            io.BytesIO(body),
+        )
+
+    monkeypatch.setattr(pod_api._NO_REDIRECT_OPENER, "open", open_request)
+    pod_api._mutation_once(
+        "owner-key",
+        url,
+        method=method,
+        body={"request-only": "must-not-appear"},
+        deadline_at=time.time() + 60,
+    )
+
+
+@pytest.mark.parametrize("status_code", [400, 500])
+def test_exact_pod_create_capacity_scans_all_allowlisted_string_fields(monkeypatch, status_code):
+    with pytest.raises(pod_api.RunpodCapacityError):
+        _raise_mutation_http_error(
+            monkeypatch,
+            status_code,
+            {
+                "message": "Bad Request",
+                "error": "create pod: There are no instances currently available",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("url", "provider_detail"),
+    [
+        (
+            f"{pod_api.REST_BASE}/networkvolumes",
+            "create network volume: insufficient capacity",
+        ),
+        (pod_api._GRAPHQL_URL, "insufficient capacity"),
+    ],
+)
+def test_non_pod_create_5xx_capacity_wording_remains_ambiguous(monkeypatch, url, provider_detail):
+    with pytest.raises(pod_api.RunpodMutationAmbiguous):
+        _raise_mutation_http_error(
+            monkeypatch,
+            500,
+            {"error": provider_detail},
+            url=url,
+        )
+
+
+def test_generic_capacity_wording_does_not_classify_pod_create_5xx(monkeypatch):
+    with pytest.raises(pod_api.RunpodMutationAmbiguous):
+        _raise_mutation_http_error(
+            monkeypatch,
+            500,
+            {"error": "insufficient capacity"},
+        )
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 404, 409, 422])
+def test_request_http_errors_keep_precedence_over_capacity_wording(monkeypatch, status_code):
+    with pytest.raises(pod_api.RunpodRequestError) as exc_info:
+        _raise_mutation_http_error(
+            monkeypatch,
+            status_code,
+            {"error": "insufficient capacity"},
+        )
+    assert exc_info.value.status_code == status_code
+    assert str(exc_info.value) == f"runpod mutation was rejected with HTTP {status_code}"
+
+
+@pytest.mark.parametrize("status_code", [402, 429])
+def test_capacity_http_statuses_do_not_require_provider_wording(monkeypatch, status_code):
+    with pytest.raises(pod_api.RunpodCapacityError):
+        _raise_mutation_http_error(monkeypatch, status_code, {"message": "rejected"})
+
+
+def test_http_400_invalid_data_center_reconstructs_only_safe_detail(monkeypatch):
+    provider_detail = "invalid dataCenterIds value US-NE-1 " + ("x" * 1000)
+    with pytest.raises(pod_api.RunpodRequestError) as exc_info:
+        _raise_mutation_http_error(monkeypatch, 400, {"detail": provider_detail})
+    error = exc_info.value
+    assert error.status_code == 400
+    assert str(error) == (
+        "runpod mutation was rejected with HTTP 400: invalid dataCenterIds value US-NE-1"
+    )
+    assert "must-not-appear" not in str(error)
+
+
+@pytest.mark.parametrize(
+    ("provider_detail", "sensitive_value"),
+    [
+        (
+            "request payload is {'FLASH_CUSTOM_CREDENTIAL':'SUPERSENSITIVE123'}",
+            "SUPERSENSITIVE123",
+        ),
+        ('invalid field {"networkVolumeId":"vol-sensitive"}', "vol-sensitive"),
+        ("arbitrary provider explanation internal-node-123", "internal-node-123"),
+    ],
+)
+def test_unknown_http_error_prose_is_not_exposed(monkeypatch, provider_detail, sensitive_value):
+    with pytest.raises(pod_api.RunpodRequestError) as exc_info:
+        _raise_mutation_http_error(monkeypatch, 400, {"error": provider_detail})
+    rendered = str(exc_info.value)
+    assert rendered == "runpod mutation was rejected with HTTP 400"
+    assert sensitive_value not in rendered
+
+
+def test_allowed_http_error_detail_is_single_line_and_control_neutral(monkeypatch):
+    provider_detail = "invalid dataCenterIds value US-NE-1\n\x1b[31mSUPERSENSITIVE123"
+    with pytest.raises(pod_api.RunpodRequestError) as exc_info:
+        _raise_mutation_http_error(monkeypatch, 400, {"detail": provider_detail})
+    rendered = str(exc_info.value)
+    assert rendered == (
+        "runpod mutation was rejected with HTTP 400: invalid dataCenterIds value US-NE-1"
+    )
+    assert "\n" not in rendered
+    assert "\x1b" not in rendered
+    assert "SUPERSENSITIVE123" not in rendered
+
+
 def test_pending_and_exact_handles_round_trip_with_full_owner_identity():
     pending = _handle()
     exact = _handle(exact=True)
@@ -478,7 +613,7 @@ def test_pod_payload_is_exact_secure_shape_and_secret_reference(monkeypatch):
         _spec(count=2),
         label="flash-runpod-pod-test-s0-a1",
         secret_name="FLASH_PAYLOAD_0123456789abcdef",
-        data_center_id="US-KS-2",
+        data_center_id="US-NE-1",
         network_volume_id="volume123",
     )
     assert payload == {
@@ -486,7 +621,6 @@ def test_pod_payload_is_exact_secure_shape_and_secret_reference(monkeypatch):
         "cloudType": "SECURE",
         "containerDiskInGb": 120,
         "containerRegistryAuthId": "registry123",
-        "dataCenterIds": ["US-KS-2"],
         "dockerStartCmd": ["python", "/opt/flash/runpod_pod_launcher.py"],
         "env": {"FLASH_INSTANCE_PAYLOAD": "{{ RUNPOD_SECRET_FLASH_PAYLOAD_0123456789abcdef }}"},
         "gpuCount": 2,
@@ -500,8 +634,22 @@ def test_pod_payload_is_exact_secure_shape_and_secret_reference(monkeypatch):
         "volumeMountPath": "/runpod-volume",
     }
     encoded = json.dumps(payload)
+    assert "dataCenterIds" not in payload
     assert "owner-key" not in encoded
     assert "hf_" not in encoded
+
+
+def test_volume_free_pod_payload_retains_authored_data_center():
+    payload = pod_identity.build_pod_payload(
+        _spec(),
+        label="flash-runpod-pod-test-s0-a1",
+        secret_name="FLASH_PAYLOAD_0123456789abcdef",
+        data_center_id="US-KS-2",
+        network_volume_id=None,
+        container_registry_auth_id=None,
+    )
+    assert payload["dataCenterIds"] == ["US-KS-2"]
+    assert "networkVolumeId" not in payload
 
 
 def test_payload_secret_name_is_recoverable_from_final_pod_label():
@@ -603,6 +751,8 @@ def test_live_shaped_pod_with_public_ip_fails_closed(monkeypatch):
 def test_exact_volume_identity_proves_placement_when_data_center_is_omitted():
     pending = _handle(count=1, data_center="US-KS-2", volume_id="volume123")
     payload = pods._payload_for_handle(pending)
+    assert payload["networkVolumeId"] == "volume123"
+    assert "dataCenterIds" not in payload
     observed = pod_api._parse_pod(
         _live_api_pod_row(pending, payload, volume_id=pending.network_volume_id)
     )

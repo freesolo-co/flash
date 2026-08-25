@@ -12,6 +12,7 @@ import urllib.request
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
+from flash._internal.diagnostics import neutralize_control_chars, sanitize_diagnostic
 from flash.providers._lifecycle.net.deadline import remaining_seconds
 from flash.providers._lifecycle.net.http import is_not_found
 from flash.providers.runpod.client.api import (
@@ -35,9 +36,22 @@ _MANAGED_PRELOAD_POD_RE = re.compile(r"flash-preload-d[0-9]{10,}(?:-|$)")
 _SECRET_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,127}")
 _SECRET_REFERENCE_RE = re.compile(r"\{\{ RUNPOD_SECRET_([A-Za-z][A-Za-z0-9_]{2,127}) \}\}")
 _CAPACITY_PATTERNS = (
+    "there are no instances currently available",
     "no instances currently available",
     "could not find any pods with required specifications",
     "insufficient capacity",
+)
+_POD_CREATE_5XX_CAPACITY_PATTERNS = (
+    "no instances currently available",
+    "could not find any pods with required specifications",
+)
+_ERROR_DETAIL_FIELDS = ("message", "error", "detail")
+_ERROR_BODY_READ_LIMIT = 4096
+_ERROR_FIELD_SCAN_LIMIT = 1024
+_ERROR_DETAIL_LIMIT = 100
+_INVALID_DATA_CENTER_RE = re.compile(
+    r"(?i)\binvalid[ ]+dataCenterIds[ ]+value"
+    r"(?:[ ]+([A-Z]{2}(?:-[A-Z0-9]{1,8}){1,3}))?\b"
 )
 _DELETE_CONFIRM_POLLS = 4
 _DELETE_CONFIRM_WAIT_S = 0.25
@@ -339,9 +353,40 @@ def get_pod_for_fingerprint(
 
 def _read_error_body(exc: urllib.error.HTTPError) -> str:
     try:
-        return exc.read(4096).decode("utf-8", "replace")
+        return exc.read(_ERROR_BODY_READ_LIMIT).decode("utf-8", "replace")
     except Exception:
         return ""
+
+
+def _provider_error_fields(body_text: str) -> tuple[str, ...]:
+    try:
+        value = json.loads(body_text)
+    except (TypeError, ValueError):
+        return ()
+    if type(value) is not dict:
+        return ()
+    return tuple(
+        raw[:_ERROR_FIELD_SCAN_LIMIT]
+        for field in _ERROR_DETAIL_FIELDS
+        if type(raw := value.get(field)) is str and raw
+    )
+
+
+def _provider_error_has_pattern(fields: tuple[str, ...], patterns: tuple[str, ...]) -> bool:
+    return any(pattern in field.lower() for field in fields for pattern in patterns)
+
+
+def _provider_error_detail(fields: tuple[str, ...]) -> str | None:
+    for raw in fields:
+        match = _INVALID_DATA_CENTER_RE.search(raw)
+        if match is None:
+            continue
+        detail = "invalid dataCenterIds value"
+        if data_center_id := match.group(1):
+            detail = f"{detail} {data_center_id.upper()}"
+        single_line = neutralize_control_chars(detail).replace("\n", " ")
+        return sanitize_diagnostic(single_line, limit=_ERROR_DETAIL_LIMIT)
+    return None
 
 
 def _mutation_once(
@@ -372,15 +417,25 @@ def _mutation_once(
             raw = response.read()
     except urllib.error.HTTPError as exc:
         try:
-            body_text = _read_error_body(exc)
-            lowered = body_text.lower()
-            if exc.code in {402, 429} or any(pattern in lowered for pattern in _CAPACITY_PATTERNS):
+            fields = _provider_error_fields(_read_error_body(exc))
+            is_pod_create = method == "POST" and url == f"{REST_BASE}/pods"
+            request_capacity = (
+                exc.code == 400
+                and is_pod_create
+                and _provider_error_has_pattern(fields, _CAPACITY_PATTERNS)
+            )
+            pod_create_5xx_capacity = (
+                500 <= exc.code < 600
+                and is_pod_create
+                and _provider_error_has_pattern(fields, _POD_CREATE_5XX_CAPACITY_PATTERNS)
+            )
+            if exc.code in {402, 429} or request_capacity or pod_create_5xx_capacity:
                 raise RunpodCapacityError("runpod has no matching Pod capacity") from None
             if exc.code in {400, 401, 403, 404, 409, 422}:
-                raise RunpodRequestError(
-                    f"runpod mutation was rejected with HTTP {exc.code}",
-                    status_code=exc.code,
-                ) from exc
+                message = f"runpod mutation was rejected with HTTP {exc.code}"
+                if detail := _provider_error_detail(fields):
+                    message = f"{message}: {detail}"
+                raise RunpodRequestError(message, status_code=exc.code) from None
             raise RunpodMutationAmbiguous("runpod mutation outcome is unknown") from None
         finally:
             exc.close()
