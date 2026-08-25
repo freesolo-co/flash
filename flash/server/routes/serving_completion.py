@@ -13,26 +13,20 @@ from __future__ import annotations
 import time
 from threading import Event
 
+import flash.runner.supervise.transitions as runner_transitions
 from flash.core.spec import JobSpec
-from flash.runner import (
-    mark_checkpoint_deployed,
-    verified_adapter_revision_generation,
-)
-from flash.serve.deploy import (
+from flash.runner.results.verified_revisions import verified_adapter_revision_generation
+from flash.serve.contract.errors import (
     ActivationOutcomeUnknown,
     AdapterConfigMissing,
     AliasThinkingSilent,
     ServingError,
 )
-from flash.server import app as _app
+from flash.server.asgi import app as _app
 from flash.server.platform import db
 
-# resolved through `serving` rather than imported from `flash.runner`: a serving test patches
-# `serving.mark_deployed` to fail after persistence, and a direct import would bind the original
-# and never see that patch.
-# every name reached through `_serving` below is patched as an attribute of that module by the
-# deploy and recovery tests. a `from ... import` would capture the original at import time, so the
-# patch would rebind the parent's attribute while this module kept calling the real function.
+# route-local callbacks remain resolved through `serving` because deploy and recovery tests patch
+# those attributes there. durable transition ownership is imported directly from runner_transitions.
 from flash.server.routes import serving as _serving
 from flash.server.routes.serving import (
     _deployment_failure_persisted,
@@ -94,7 +88,7 @@ def recover_deployments() -> int:
                 detail=detail,
                 recovered_at=time.time(),
             )
-            marked = _serving.mark_deployment_failed(status.run_id, failed)
+            marked = runner_transitions.mark_deployment_failed(status.run_id, failed)
             _serving._report_persisted_transition(
                 status,
                 marked,
@@ -108,7 +102,7 @@ def recover_deployments() -> int:
 
 def replay_status_reports(stop: Event | None = None) -> int:
     """Sequentially mirror persisted statuses that may have been dropped during shutdown."""
-    from flash.runner import _report_status
+    from flash.runner.lifecycle.reporting import _report_status
 
     replayed = 0
     for row in db.all_runs():
@@ -165,7 +159,7 @@ def _commit_ready_deployment(
     previous = _app.get_status(run_id)
     if is_checkpoint:
         state_guard = prev_state if prev_state in _app._DEPLOYABLE_STATES else None
-        marked = mark_checkpoint_deployed(
+        marked = runner_transitions.mark_checkpoint_deployed(
             run_id,
             current,
             expect_state=state_guard,
@@ -173,7 +167,7 @@ def _commit_ready_deployment(
         )
         persisted = marked.deployment == current
     else:
-        marked = _serving.mark_deployed(
+        marked = runner_transitions.mark_deployed(
             run_id,
             current,
             expect_state=prev_state,
@@ -206,13 +200,13 @@ def _reconcile_ready_commit_miss(
         # guard. retry the write once against the fresh state.
         previous = latest
         if is_checkpoint:
-            marked = mark_checkpoint_deployed(
+            marked = runner_transitions.mark_checkpoint_deployed(
                 run_id,
                 current,
                 verification_generation=verification_generation,
             )
         else:
-            marked = _serving.mark_deployed(
+            marked = runner_transitions.mark_deployed(
                 run_id,
                 current,
                 expect_state=latest.state,
@@ -317,7 +311,7 @@ def _finish_deployment_unlocked(
             activation_outcome_unknown=True,
         )
         previous = _app.get_status(run_id)
-        marked = _serving.mark_deployment_failed(run_id, reconciling)
+        marked = runner_transitions.mark_deployment_failed(run_id, reconciling)
         _serving._report_persisted_transition(
             previous, marked, persisted=marked.deployment == reconciling
         )
@@ -396,7 +390,7 @@ def _record_post_activation_failure(run_id: str, exc: Exception, current: dict) 
     )
     try:
         previous = _app.get_status(run_id)
-        marked = _serving.mark_deployment_failed(run_id, failed)
+        marked = runner_transitions.mark_deployment_failed(run_id, failed)
         _serving._report_persisted_transition(
             previous, marked, persisted=_deployment_failure_persisted(marked, failed)
         )
@@ -467,7 +461,7 @@ def _record_deployment_failure(
         detail="deployment failed; previous working alias was preserved",
     )
     previous = _app.get_status(run_id)
-    marked = _serving.mark_deployment_failed(run_id, failed)
+    marked = runner_transitions.mark_deployment_failed(run_id, failed)
     _serving._report_persisted_transition(
         previous, marked, persisted=_deployment_failure_persisted(marked, failed)
     )

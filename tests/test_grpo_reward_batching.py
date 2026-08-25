@@ -8,17 +8,25 @@ import time
 
 import pytest
 
-from flash.engine.worker import rl_train
-from flash.engine.worker.runtime.pkg_proxy import W
-from flash.engine.worker.score_batcher import ScoreBatcher
+import flash.engine.worker.model.decoding as worker_decoding
+import flash.engine.worker.train.rl.rollout.multi_turn as rl_multi_turn
+import flash.engine.worker.train.rl.rollout.reward_module as rl_reward_module
+import flash.engine.worker.train.rl.rollout.single_turn as rl_single_turn
+from flash.engine.worker.train.entry.score_batcher import ScoreBatcher
 from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
 
 @pytest.fixture
 def _identity_graded(monkeypatch):
-    monkeypatch.setattr(W, "graded_text", lambda text, prompt_opened_thinking=False: text)
-    monkeypatch.setattr(W, "thinking_text", lambda text, prompt_opened_thinking=False: "")
-    monkeypatch.setattr(W, "think_token_count", lambda text, tok, prompt_opened_thinking=False: 3)
+    monkeypatch.setattr(
+        worker_decoding, "graded_text", lambda text, prompt_opened_thinking=False: text
+    )
+    monkeypatch.setattr(
+        worker_decoding, "thinking_text", lambda text, prompt_opened_thinking=False: ""
+    )
+    monkeypatch.setattr(
+        worker_decoding, "think_token_count", lambda text, tok, prompt_opened_thinking=False: 3
+    )
 
 
 def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order(monkeypatch):
@@ -38,7 +46,7 @@ def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order(monk
             live -= 1
         return [float(index) + len(solution) for index, solution in requests]
 
-    server, url = rl_train.start_reward_server(
+    server, url = rl_multi_turn.start_reward_server(
         lambda index, solution: pytest.fail("the scalar scorer should not run"),
         example_count=8,
         score_batch=score_batch,
@@ -47,7 +55,7 @@ def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order(monk
         monkeypatch.setitem(sys.modules, "flash_grpo_multiturn", grpo_multiturn)
         namespace: dict = {}
         exec(
-            compile(rl_train.render_reward_module("TEST_URL"), "<reward>", "exec"),
+            compile(rl_reward_module.render_reward_module("TEST_URL"), "<reward>", "exec"),
             namespace,
         )
         namespace["_URL"] = url
@@ -171,7 +179,7 @@ def test_score_single_turn_batch_preserves_breakdowns_penalties_and_nonfinite_ma
             ]
 
     env = _BatchEnv()
-    results = rl_train.score_single_turn_batch(
+    results = rl_single_turn.score_single_turn_batch(
         env,
         [("good", {"gt": "good"}), ("bad", {"gt": "bad"})],
         tok=object(),
@@ -206,7 +214,7 @@ def test_score_single_turn_batch_falls_back_per_item_without_failing_neighbors()
             return {"success": 1.0, "total": 1.0}
 
     env = _BatchThenScalarEnv()
-    results = rl_train.score_single_turn_batch(
+    results = rl_single_turn.score_single_turn_batch(
         env,
         [("good-a", {}), ("bad", {}), ("good-b", {})],
         tok=None,
@@ -231,8 +239,10 @@ def test_score_single_turn_batch_isolates_a_preprocessing_failure(monkeypatch):
             raise ValueError("malformed reasoning tags")
         return text
 
-    monkeypatch.setattr(W, "graded_text", graded_text)
-    monkeypatch.setattr(W, "thinking_text", lambda text, prompt_opened_thinking=False: "")
+    monkeypatch.setattr(worker_decoding, "graded_text", graded_text)
+    monkeypatch.setattr(
+        worker_decoding, "thinking_text", lambda text, prompt_opened_thinking=False: ""
+    )
 
     class _Env:
         def scores_breakdown_many(self, items):
@@ -241,7 +251,7 @@ def test_score_single_turn_batch_isolates_a_preprocessing_failure(monkeypatch):
         def scores_breakdown(self, graded, ex, state):
             return {"success": 1.0, "total": 1.0}
 
-    results = rl_train.score_single_turn_batch(
+    results = rl_single_turn.score_single_turn_batch(
         _Env(),
         [("good-a", {}), ("bad", {}), ("good-b", {})],
         tok=None,
@@ -282,7 +292,7 @@ def test_score_single_turn_batch_repairs_only_the_unusable_rows():
             return {"success": 1.0, "total": 9.0}
 
     env = _PartiallyBadBatchEnv()
-    results = rl_train.score_single_turn_batch(
+    results = rl_single_turn.score_single_turn_batch(
         env,
         [("good-a", {}), ("bad", {}), ("good-b", {})],
         tok=None,
@@ -311,7 +321,7 @@ def test_score_single_turn_batch_repairs_every_row_on_a_wrong_length_return():
             return {"success": 1.0, "total": 5.0}
 
     env = _ShortBatchEnv()
-    results = rl_train.score_single_turn_batch(
+    results = rl_single_turn.score_single_turn_batch(
         env,
         [("good-a", {}), ("good-b", {}), ("good-c", {})],
         tok=None,

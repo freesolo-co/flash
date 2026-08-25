@@ -1,7 +1,7 @@
 name: Publish serving image
 
 # The customer-owned serving path pins a digest-qualified OCI reference: `ServingImage`
-# (flash/serve/provisioning/_common.py) rejects a tag-only reference, so a deployment cannot
+# (flash/serve/provisioning/common/records.py) rejects a tag-only reference, so a deployment cannot
 # name "whatever :dev points at today". That digest has to come from somewhere, and nothing
 # published `Dockerfile.serve` -- which is why the provisioning code had no reachable caller.
 #
@@ -150,7 +150,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: steps.gate.outputs.publish == 'true'
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Log in to GHCR
         if: steps.gate.outputs.publish == 'true'

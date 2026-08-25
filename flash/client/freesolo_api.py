@@ -21,7 +21,7 @@ from flash.client.http import (
     freesolo_base_url,
 )
 from flash.core.spec import require_project_id
-from flash.serve.urls import displayable_url
+from flash.serve.contract.urls import displayable_url
 
 
 def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:

@@ -8,14 +8,13 @@ billed to the CALLING org — the backend authorizes it and returns the caller's
 
 from __future__ import annotations
 
-import sys
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.http.router import AdapterRouter, build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.conftest import RecordingUsageStore, attest
 
 QWEN = "Qwen/Qwen3.5-9B"
@@ -242,7 +241,7 @@ def test_adapter_record_defaults_serve_base_model_false() -> None:
 
 
 @pytest.fixture
-def modal_app_module():
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
 
     def _passthrough(*_a, **_k):
@@ -259,24 +258,11 @@ def modal_app_module():
         getattr(app_mock, attr).side_effect = _passthrough
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    _MISSING = object()
-    prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.modal_app", _MISSING)
-    sys.modules["modal"] = modal_stub
-    import flash.serving.modal_app as modal_app
-
-    try:
-        yield modal_app
-    finally:
-        for name, prev in (("modal", prev_modal), ("modal_app", prev_modal_app)):
-            if prev is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
+    return load_modal_app_under_stub(modal_stub)
 
 
 def test_base_model_records_seed_one_open_record_per_model(modal_app_module):
-    from flash.serving.src.model_config import base_models
+    from flash.serving.src.engine.model_config import base_models
 
     recs = modal_app_module._base_model_records()
     assert {r.adapter_id for r in recs} == set(base_models())
@@ -289,7 +275,7 @@ def test_base_model_records_seed_one_open_record_per_model(modal_app_module):
 def test_lora_request_returns_no_lora_for_base_model(modal_app_module):
     import asyncio
 
-    from flash.serving.src.registry import AdapterRegistry
+    from flash.serving.src.store.registry import AdapterRegistry
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.base_model = QWEN

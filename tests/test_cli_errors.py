@@ -100,7 +100,7 @@ def test_unexpected_error_suggestion_does_not_replay_a_credential():
     Both argv spellings matter: argparse accepts `--api-key secret` as two entries and
     `--api-key=secret` as one, and only the first is caught by looking at the following element.
     """
-    from flash.cli import _redacted_args
+    from flash.cli.parsing.main import _redacted_args
 
     separate = _redacted_args(
         ["models", "export", "--repository", "alice/model", "--api-key", "hf_SUPERSECRET"]
@@ -136,7 +136,7 @@ def test_unexpected_error_suggestion_redacts_abbreviated_credential_flags():
     parser is asserted here alongside the redaction: the point is that these spellings are real,
     not hypothetical.
     """
-    from flash.cli import _build_parser, _redacted_args
+    from flash.cli.parsing.main import _build_parser, _redacted_args
 
     parser = _build_parser()
     for argv in (["login", "--api-k", "fs_SUPERSECRET"], ["login", "--api-ke=fs_SUPERSECRET"]):

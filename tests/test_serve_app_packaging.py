@@ -225,7 +225,7 @@ def test_modal_wrapper_is_packaged_under_the_image_import_root() -> None:
     assert "UV_PROJECT_ENVIRONMENT=/opt/flash-venv" in source
     assert "PATH=/opt/flash-venv/bin:${PATH}" in source
     assert "--no-editable" not in source
-    assert (ROOT / "flash/serve/provisioning/_modal_wrapper.py").is_file()
+    assert (ROOT / "flash/serve/provisioning/modal/planning/wrapper.py").is_file()
 
     lock = (ROOT / "uv.lock").read_text()
     project_start = lock.index('name = "freesolo-flash"')

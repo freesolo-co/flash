@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.runner.lifecycle.submit as runner_submit
+
 
 def _prepared_spec(*, revision: str = "a" * 40):
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
@@ -25,9 +27,8 @@ def _prepared_spec(*, revision: str = "a" * 40):
 
 def _stub_prepare_dependencies(monkeypatch, spec=None):
     import flash.core.catalog as catalog
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "resolve_model", lambda *args, **kwargs: catalog.MODELS[args[0]])
+    monkeypatch.setattr(catalog, "resolve_model", lambda *args, **kwargs: catalog.MODELS[args[0]])
     if spec is not None:
         # sft preparation profiles the packaged dataset itself, which resolves the environment
         # package over the network. these tests are about revision resolution, so the profile is
@@ -35,7 +36,7 @@ def _stub_prepare_dependencies(monkeypatch, spec=None):
         # which is what preparation re-derives before it profiles.
         from tests._helpers.profile import record_sft_profile
 
-        record_sft_profile(runner, spec, monkeypatch)
+        record_sft_profile(spec, monkeypatch)
     monkeypatch.setattr(
         "flash.cost.spec.estimate_for_spec", lambda _spec: SimpleNamespace(total_usd=1.0)
     )
@@ -49,7 +50,7 @@ def _stub_prepare_dependencies(monkeypatch, spec=None):
         lambda _spec, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
+        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
         lambda _spec: None,
     )
 
@@ -97,7 +98,6 @@ def test_spec_parsers_accept_valid_spec_without_execution_controls():
 def test_prepare_job_retains_runner_forced_sft_revision_and_clears_request(monkeypatch):
     import huggingface_hub
 
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
     exact = "d" * 40
@@ -117,7 +117,7 @@ def test_prepare_job_retains_runner_forced_sft_revision_and_clears_request(monke
     internal = _prepared_spec(revision=exact).to_internal_dict()
     internal.update(model_revision_auto=True, model_revision_force_pin=True)
 
-    prepared = runner.prepare_job(JobSpec.from_dict(internal))
+    prepared = runner_submit.prepare_job(JobSpec.from_dict(internal))
 
     assert seen == [exact]
     for spec in (prepared.public_spec, prepared.worker_spec):
@@ -290,39 +290,45 @@ def test_prefetch_error_classification():
 
 
 def test_prefetch_pinned_revision_does_not_swallow_download_failure(monkeypatch):
-    import flash.engine.worker.io.hf as hf
+    import flash.engine.worker.io.heartbeat as worker_heartbeat
+    import flash.engine.worker.io.hf as worker_hf
+    import flash.engine.worker.io.prefetch as worker_prefetch
+    import flash.engine.worker.perf as worker_perf
 
-    monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: None)
-    monkeypatch.setattr(hf, "_require_hf_deadline_allowance", lambda: None)
-    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(hf._w, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_prefetch, "_shared_weight_cache_dir", lambda: None)
+    monkeypatch.setattr(worker_hf, "_require_hf_deadline_allowance", lambda: None)
+    monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
         lambda **kwargs: (_ for _ in ()).throw(ValueError("revision not found")),
     )
 
     with pytest.raises(ValueError, match="revision not found"):
-        hf.prefetch_model("owner/model", revision="f" * 40)
+        worker_prefetch.prefetch_model("owner/model", revision="f" * 40)
 
 
 def test_prefetch_pinned_revision_wraps_transient_download_failure(monkeypatch):
     from requests.exceptions import Timeout
 
-    import flash.engine.worker.io.hf as hf
+    import flash.engine.worker.io.heartbeat as worker_heartbeat
+    import flash.engine.worker.io.hf as worker_hf
+    import flash.engine.worker.io.prefetch as worker_prefetch
+    import flash.engine.worker.perf as worker_perf
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
 
     transient = Timeout("timed out")
-    monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: None)
-    monkeypatch.setattr(hf, "_require_hf_deadline_allowance", lambda: None)
-    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(hf._w, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_prefetch, "_shared_weight_cache_dir", lambda: None)
+    monkeypatch.setattr(worker_hf, "_require_hf_deadline_allowance", lambda: None)
+    monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
         lambda **kwargs: (_ for _ in ()).throw(transient),
     )
 
     with pytest.raises(RetriableInfraError, match="pinned model prefetch failed") as exc_info:
-        hf.prefetch_model("owner/model", revision="f" * 40)
+        worker_prefetch.prefetch_model("owner/model", revision="f" * 40)
 
     assert exc_info.value.__cause__ is transient
 
@@ -333,8 +339,8 @@ def test_opd_model_revision_is_keyword_only():
     # controlled comparison this file exists to protect. the guard moved from trl's rollout engine
     # (OpdVllmRolloutEngine, deleted) to the verl checkpoint watcher, which is what carries the
     # revision through opd now -- it re-exports each checkpoint adapter under that pin.
-    from flash.engine.worker.opd_train import _OpdVerlCheckpointWatcher
-    from flash.engine.worker.sft_train import _VerlCheckpointWatcher
+    from flash.engine.worker.train.entry.sft_train import _VerlCheckpointWatcher
+    from flash.engine.worker.train.opd.orchestration.failures import _OpdVerlCheckpointWatcher
 
     # the opd subclass forwards **kwargs, so the binding it inherits is what has to be keyword-only.
     assert issubclass(_OpdVerlCheckpointWatcher, _VerlCheckpointWatcher)
@@ -429,8 +435,6 @@ def test_structured_opd_guidance_only_feature_is_rejected_before_allocation(monk
     The generic serving preflight does not catch it: it validates the schema's shape,
     and this schema is perfectly valid.
     """
-    import flash.runner as runner
-
     _stub_prepare_dependencies(monkeypatch)
     _stub_structured_opd_hub(monkeypatch)
     # allocation-side work must not be reached. estimate_for_spec is the last step of preparation
@@ -449,7 +453,7 @@ def test_structured_opd_guidance_only_feature_is_rejected_before_allocation(monk
     spec = _structured_opd_spec(json.dumps({"json": schema}))
 
     with pytest.raises(ValueError, match="guidance fallback"):
-        runner.prepare_job(spec)
+        runner_submit.prepare_job(spec)
 
 
 def test_structured_opd_mistral_tokenizer_model_is_rejected_before_allocation(monkeypatch):
@@ -457,8 +461,6 @@ def test_structured_opd_mistral_tokenizer_model_is_rejected_before_allocation(mo
 
     Decided by the model id alone, so it needs no allocation to judge either.
     """
-    import flash.runner as runner
-
     _stub_prepare_dependencies(monkeypatch)
     _stub_structured_opd_hub(monkeypatch)
     monkeypatch.setattr(
@@ -466,13 +468,13 @@ def test_structured_opd_mistral_tokenizer_model_is_rejected_before_allocation(mo
         lambda _spec: (_ for _ in ()).throw(AssertionError("preparation must reject first")),
     )
     monkeypatch.setattr(
-        "flash.engine.worker.train.opd.validation._resolve_structured_model_metadata",
+        "flash.engine.worker.train.opd.orchestration.validation._resolve_structured_model_metadata",
         lambda _model, _rev: (151936, ("tekken.json",)),
     )
     spec = _structured_opd_spec(json.dumps({"json": {"type": "object"}}))
 
     with pytest.raises(ValueError, match="MistralTokenizer"):
-        runner.prepare_job(spec)
+        runner_submit.prepare_job(spec)
 
 
 def test_a_valid_structured_opd_constraint_still_prepares(monkeypatch):
@@ -481,12 +483,10 @@ def test_a_valid_structured_opd_constraint_still_prepares(monkeypatch):
     A constraint xgrammar can compile has to pass preparation untouched -- otherwise the fix trades
     a paid failure for a submission that refuses valid work, which is worse.
     """
-    import flash.runner as runner
-
     _stub_prepare_dependencies(monkeypatch)
     _stub_structured_opd_hub(monkeypatch)
     monkeypatch.setattr(
-        "flash.engine.worker.train.opd.validation._resolve_structured_model_metadata",
+        "flash.engine.worker.train.opd.orchestration.validation._resolve_structured_model_metadata",
         lambda _model, _rev: (151936, ("tokenizer.json",)),
     )
     schema = {
@@ -497,7 +497,7 @@ def test_a_valid_structured_opd_constraint_still_prepares(monkeypatch):
     }
     spec = _structured_opd_spec(json.dumps({"json": schema}))
 
-    prepared = runner.prepare_job(spec)
+    prepared = runner_submit.prepare_job(spec)
 
     assert prepared.public_spec.algorithm == "opd"
     assert prepared.public_spec.train.structured_outputs

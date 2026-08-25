@@ -22,23 +22,28 @@ class _RawManagedChatResponse:
 
 def _deployed_chat_run(api):
     """A deployed run ready to chat, returned as (key, run_id)."""
-    import flash.runner as runner
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "done"
-    runner._save_status(status)
+    runner_state._save_status(status)
     revision = f"{run_id}@final." + "a" * 40
-    runner.mark_deployed(
+    runner_transitions.mark_deployed(
         run_id,
         {
             "state": "ready",
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
     return key, run_id

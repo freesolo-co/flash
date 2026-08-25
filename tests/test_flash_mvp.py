@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import tempfile
 
 import pytest
+
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as runner_submit
 
 
 def test_catalog_validation():
@@ -58,7 +61,7 @@ def test_config_to_job_spec():
 
 
 def test_environment_registry():
-    from flash.envs.base import load_environment
+    from flash.envs.loading.base import load_environment
 
     # Verifiers-only: there are no builtin envs and no default — an empty id is a hard
     # error (env loading itself is covered in test_envs_coverage).
@@ -68,11 +71,8 @@ def test_environment_registry():
 
 def test_orchestrator_dry_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.runner as runner
-
-        importlib.reload(runner)
         # fixed constant; redirect to tmp via monkeypatch so it's restored after the test.
-        monkeypatch.setattr(runner, "RUNS_DIR", tmp)
+        monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
         from flash.core.spec import JobSpec, TrainSpec
 
         spec = JobSpec(
@@ -81,16 +81,16 @@ def test_orchestrator_dry_run(monkeypatch):
             algorithm="grpo",
             train=TrainSpec(max_examples=8),
         )
-        status = runner.submit_job(spec, dry_run=True)
+        status = runner_submit.submit_job(spec, dry_run=True)
         assert status.state == "dry_run"
-        assert runner.get_status("dry").spec["model"] == "Qwen/Qwen3.5-9B"
+        assert runner_status.get_status("dry").spec["model"] == "Qwen/Qwen3.5-9B"
 
 
 def test_cli_train_dry_run(monkeypatch, capsys):
     # `flash train --dry-run` routes through the server (`create_run(dry_run=True)`) so the control
     # plane runs the real submit-time preflights without allocating a GPU; the CLI renders the
     # returned state=dry_run status. A fake client stands in for the server here.
-    from flash.cli import main
+    from flash.cli.parsing.main import main
 
     with tempfile.TemporaryDirectory() as tmp:
         config = os.path.join(tmp, "run.toml")
@@ -118,7 +118,9 @@ def test_cli_train_dry_run(monkeypatch, capsys):
                 seen["client_train_schema"] = client_train_schema
                 return {"run_id": "flash-dry-1", "state": "dry_run", "spec": spec}
 
-        monkeypatch.setattr("flash.cli.commands.client_from_config", lambda: _FakeClient())
+        monkeypatch.setattr(
+            "flash.cli.commands.ops.train.client_from_config", lambda: _FakeClient()
+        )
 
         rc = main(["train", config, "--dry-run"])
         assert rc == 0

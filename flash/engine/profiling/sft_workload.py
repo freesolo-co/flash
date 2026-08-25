@@ -191,7 +191,7 @@ def _materialize_verl_images(
 def _default_processor_loader(model_id: str, revision: str):
     from transformers import AutoProcessor
 
-    from flash.engine.huggingface import model_revision_kwargs
+    from flash.engine.support.huggingface import model_revision_kwargs
 
     return AutoProcessor.from_pretrained(
         model_id,

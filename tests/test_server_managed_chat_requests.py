@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+import flash.serve.request.transport as serving_transport
 from tests._helpers.chat_provenance import (
     managed_chat_result as _managed_chat_result,
 )
@@ -81,25 +82,30 @@ def test_managed_stream_response_closes_upstream_after_midstream_disconnect() ->
 
 
 def test_chat_streams_deployed_run(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "done"
-    runner._save_status(status)
+    runner_state._save_status(status)
     revision = f"{run_id}@final." + "a" * 40
-    runner.mark_deployed(
+    runner_transitions.mark_deployed(
         run_id,
         {
             "state": "ready",
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
 
     seen = {}
@@ -136,24 +142,26 @@ def test_chat_streams_deployed_run(api, monkeypatch):
 
 
 def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     revision = f"{run_id}@final." + "a" * 40
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "deployed"
     status.deployment = {
         "state": "ready",
         "endpoint_name": "https://serve.example",
         "adapter_revision": revision,
     }
-    runner._save_status(status)
-    generation = runner.verified_adapter_revision_generation(run_id)
-    assert runner.add_verified_adapter_revision(
+    runner_state._save_status(status)
+    generation = runner_verified_revisions.verified_adapter_revision_generation(run_id)
+    assert runner_verified_revisions.add_verified_adapter_revision(
         run_id,
         revision,
         expected_generation=generation,
@@ -192,8 +200,11 @@ def test_chat_streams_verified_immutable_revision_unchanged(api, monkeypatch):
 
 
 def test_chat_forwards_supported_openai_fields_and_enforces_run_contract(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     spec = json.loads(json.dumps(SPEC))
@@ -201,14 +212,16 @@ def test_chat_forwards_supported_openai_fields_and_enforces_run_contract(api, mo
     run_id = api.post(
         "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "done"
-    runner._save_status(status)
+    runner_state._save_status(status)
     revision = f"{run_id}@final." + "a" * 40
-    runner.mark_deployed(
+    runner_transitions.mark_deployed(
         run_id,
         {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
     seen = {}
 
@@ -248,7 +261,7 @@ def test_chat_forwards_supported_openai_fields_and_enforces_run_contract(api, mo
     )
 
     assert response.status_code == 200, response.text
-    deployed_revision = runner.get_status(run_id).deployment["adapter_revision"]
+    deployed_revision = runner_status.get_status(run_id).deployment["adapter_revision"]
     assert seen == {
         "run_id": deployed_revision,
         "messages": [{"role": "user", "content": "hello"}],
@@ -275,7 +288,7 @@ def test_chat_forwards_supported_openai_fields_and_enforces_run_contract(api, mo
 
 
 def test_chat_rejects_success_without_backend_provenance(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
     monkeypatch.setattr(
@@ -295,11 +308,11 @@ def test_chat_rejects_success_without_backend_provenance(api, monkeypatch):
 
 
 def test_chat_rejects_mismatched_backend_provenance(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.status as runner_status
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
-    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    revision = runner_status.get_status(run_id).deployment["adapter_revision"]
     payload = _managed_chat_result(revision)
     payload["flash_provenance"]["source_revision"] = "b" * 40
     monkeypatch.setattr(app_mod, "serve_chat", lambda **_kwargs: payload)
@@ -332,7 +345,7 @@ def test_chat_rejects_mismatched_backend_provenance(api, monkeypatch):
     ],
 )
 def test_chat_rejects_unsupported_top_level_fields(api, monkeypatch, unsupported):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
     monkeypatch.setattr(
@@ -354,7 +367,7 @@ def test_chat_rejects_unsupported_top_level_fields(api, monkeypatch, unsupported
 
 
 def test_chat_rejects_conflicting_structured_forms_and_invalid_stop(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
     monkeypatch.setattr(
@@ -392,11 +405,11 @@ def test_chat_rejects_conflicting_structured_forms_and_invalid_stop(api, monkeyp
 
 @pytest.mark.parametrize("strict", [None, True])
 def test_chat_accepts_strict_json_schema_response_format(api, monkeypatch, strict):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.status as runner_status
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
-    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    revision = runner_status.get_status(run_id).deployment["adapter_revision"]
     seen = {}
 
     def fake_chat(**kwargs):
@@ -425,7 +438,7 @@ def test_chat_accepts_strict_json_schema_response_format(api, monkeypatch, stric
 
 
 def test_chat_rejects_non_strict_json_schema_response_format(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
     monkeypatch.setattr(
@@ -454,11 +467,11 @@ def test_chat_rejects_non_strict_json_schema_response_format(api, monkeypatch):
 
 
 def test_chat_stream_preserves_raw_openai_sse_and_provenance_headers(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.status as runner_status
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
-    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    revision = runner_status.get_status(run_id).deployment["adapter_revision"]
     frames = [
         b'data: {"id":"chatcmpl-1","choices":[{"index":2,"delta":{"content":"hi"},"finish_reason":null}]}\n\n',
         b'data: {"id":"chatcmpl-1","choices":[{"index":2,"delta":{},"finish_reason":"length"}]}\n\n',
@@ -506,7 +519,7 @@ def test_chat_stream_preserves_raw_openai_sse_and_provenance_headers(api, monkey
     ) as response:
         body = response.read()
 
-    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    revision = runner_status.get_status(run_id).deployment["adapter_revision"]
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert response.headers["x-backend-native"] == "preserved"
@@ -522,11 +535,11 @@ def test_chat_stream_preserves_raw_openai_sse_and_provenance_headers(api, monkey
 
 
 def test_chat_stream_strips_hop_by_hop_and_connection_extension_headers(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.status as runner_status
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
-    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    revision = runner_status.get_status(run_id).deployment["adapter_revision"]
     upstream = _RawManagedChatResponse(
         [b"data: [DONE]\n\n"],
         headers={
@@ -571,11 +584,11 @@ def test_chat_stream_strips_hop_by_hop_and_connection_extension_headers(api, mon
 
 @pytest.mark.parametrize("case", ["missing", "mismatch"])
 def test_chat_stream_rejects_missing_or_mismatched_adapter_attestation(api, monkeypatch, case):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.status as runner_status
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
-    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    revision = runner_status.get_status(run_id).deployment["adapter_revision"]
     headers = _managed_stream_headers(revision)
     if case == "missing":
         del headers["x-freesolo-lora-request-adapter"]
@@ -598,11 +611,11 @@ def test_chat_stream_rejects_missing_or_mismatched_adapter_attestation(api, monk
 
 @pytest.mark.parametrize("case", ["missing", "mismatch"])
 def test_chat_stream_rejects_incomplete_backend_provenance(api, monkeypatch, case):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.status as runner_status
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
-    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    revision = runner_status.get_status(run_id).deployment["adapter_revision"]
     headers = _managed_stream_headers(revision)
     if case == "missing":
         del headers["x-flash-source-revision"]
@@ -627,42 +640,78 @@ def test_chat_stream_rejects_incomplete_backend_provenance(api, monkeypatch, cas
     assert upstream.closed
 
 
-def test_chat_stream_preserves_upstream_error_status_and_body(api, monkeypatch):
-    import flash.server.app as app_mod
+def test_chat_stream_rejects_embedded_event_stream_media_type(api, monkeypatch):
+    import flash.runner.lifecycle.status as runner_status
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
+    revision = runner_status.get_status(run_id).deployment["adapter_revision"]
+    upstream = _RawManagedChatResponse(
+        [b"data: [DONE]\n\n"],
+        headers={
+            **_managed_stream_headers(revision),
+            "content-type": "application/x-text/event-stream",
+        },
+    )
+    monkeypatch.setattr(app_mod, "serve_chat_sse", lambda **_kwargs: upstream)
 
-    class RawResponse:
-        status_code = 429
-
-        def __init__(self):
-            self.headers = {"content-type": "application/json", "retry-after": "3"}
-
-        def iter_bytes(self):
-            yield b'{"error":{"message":"rate limited"}}'
-
-        def close(self):
-            return None
-
-    monkeypatch.setattr(app_mod, "serve_chat_sse", lambda **_kwargs: RawResponse())
     response = api.post(
         f"/v1/runs/{run_id}/chat",
         json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
         headers=_bearer(key),
     )
 
-    assert response.status_code == 429
+    assert response.status_code == 502
+    assert "non-sse streaming response" in response.json()["detail"]
+    assert upstream.closed
+
+
+@pytest.mark.parametrize(
+    ("status_code", "headers", "body"),
+    [
+        (302, {"content-type": "application/json", "location": "/moved"}, {"moved": True}),
+        (
+            429,
+            {"content-type": "application/json", "retry-after": "3"},
+            {"error": {"message": "rate limited"}},
+        ),
+    ],
+)
+def test_chat_stream_preserves_upstream_non_success_status_headers_and_body(
+    api, monkeypatch, status_code, headers, body
+):
+    import flash.server.asgi.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    upstream = _RawManagedChatResponse(
+        [json.dumps(body).encode()],
+        status_code=status_code,
+        headers=headers,
+    )
+    monkeypatch.setattr(app_mod, "serve_chat_sse", lambda **_kwargs: upstream)
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        headers=_bearer(key),
+        follow_redirects=False,
+    )
+
+    assert response.status_code == status_code
     assert response.headers["content-type"].startswith("application/json")
-    assert response.headers["retry-after"] == "3"
+    for name, value in headers.items():
+        assert response.headers[name] == value
     assert "x-freesolo-adapter-revision" not in response.headers
     assert "x-freesolo-checkpoint" not in response.headers
     assert "x-freesolo-hf-revision" not in response.headers
-    assert response.json() == {"error": {"message": "rate limited"}}
+    assert response.json() == body
 
 
 def test_chat_internal_key_requires_matching_org_and_project_scope(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
 
     internal = _bearer("fslo-internal-test")
     project = "33333333-3333-4333-8333-333333333333"
@@ -671,16 +720,18 @@ def test_chat_internal_key_requires_matching_org_and_project_scope(api, monkeypa
         json={"spec": {**SPEC, "project": project}, "dry_run": True},
         headers=internal,
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "done"
     status.platform_context = {"org_id": "org-chat"}
     status.billing_context = None
-    runner._save_status(status)
+    runner_state._save_status(status)
     revision = f"{run_id}@final." + "a" * 40
-    runner.mark_deployed(
+    runner_transitions.mark_deployed(
         run_id,
         {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
     calls = []
     monkeypatch.setattr(
@@ -721,7 +772,7 @@ def test_chat_stream_upstream_error_before_first_byte_is_502(api, monkeypatch):
     request and raise_for_status run only once Starlette iterates the body does so after the
     200 has been flushed, so the route's except can never fire and an upstream 502 arrives as
     an empty success."""
-    import flash.serve.deploy as deploy
+    import flash.serve.deployment.deploy as deploy
 
     key, run_id = _deployed_chat_run(api)
 
@@ -744,8 +795,10 @@ def test_chat_stream_upstream_error_before_first_byte_is_502(api, monkeypatch):
         def stream(self, method, url, **kwargs):
             return _ErrorResp()
 
-    monkeypatch.setattr(deploy, "_stream_http_client", lambda: _FakeClient())
-    monkeypatch.setattr(deploy, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(serving_transport, "_chat_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(
+        serving_transport, "serving_openai_base_url", lambda: "https://serve.example/v1"
+    )
 
     resp = api.post(
         f"/v1/runs/{run_id}/chat",
@@ -763,11 +816,11 @@ def test_chat_stream_midstream_failure_aborts_response(api, monkeypatch):
     body: the exception must propagate out of the response iterator (uvicorn then drops the
     connection without the terminating chunk) rather than being swallowed into an eof the
     client would read as a finished answer."""
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.status as runner_status
+    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
-    revision = runner.get_status(run_id).deployment["adapter_revision"]
+    revision = runner_status.get_status(run_id).deployment["adapter_revision"]
 
     def chunks():
         yield b'data: {"choices":[{"index":0,"delta":{"content":"partial "}}]}\n\n'
