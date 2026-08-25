@@ -25,20 +25,21 @@ from typing import TypeVar
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.artifacts import attempt_scoped_artifact_name
-from flash.engine.verl_checkpoint import (
+from flash.engine.support.verl_checkpoint import (
     VERL_FSDP_CONFIG_FILE,
     FsdpCheckpointInspection,
     FsdpManifestFile,
+    expected_native_fsdp_shard_names,
     inspect_fsdp_checkpoint_manifest,
     parse_fsdp_stamp,
 )
-from flash.engine.verl_policy import FsdpGeneration
-from flash.providers._lifecycle.deadline import (
+from flash.engine.support.verl_policy import FsdpGeneration
+from flash.providers._lifecycle.instances.poll import _attempt_int
+from flash.providers._lifecycle.net.deadline import (
     deadline_kwargs,
     remaining_seconds,
     require_deadline_at,
 )
-from flash.providers._lifecycle.poll import _attempt_int
 from flash.teacher.retry_contract import (
     decode_opd_optimizer_start_json,
     opd_optimizer_start_marker_path,
@@ -53,6 +54,28 @@ class _RemoteResumeCheckpoint:
     step: int
     prefix: str
     inspection: FsdpCheckpointInspection
+
+
+def _download_pinned_hf_bytes(
+    hf_repo: str,
+    path: str,
+    *,
+    revision: str,
+    token: str | None,
+) -> bytes:
+    """download one pinned private dataset artifact and return its bytes."""
+    from huggingface_hub import hf_hub_download
+
+    local_path = hf_hub_download(
+        repo_id=hf_repo,
+        repo_type="dataset",
+        filename=path,
+        revision=revision,
+        token=token,
+        force_download=True,
+    )
+    with open(local_path, "rb") as file:
+        return file.read()
 
 
 def _opd_resume_checkpoint(
@@ -97,18 +120,12 @@ def _opd_resume_checkpoint(
     prefix = f"{base}checkpoint-{step}"
     stamp_path = f"{prefix}/actor/{VERL_FSDP_CONFIG_FILE}"
     try:
-        from huggingface_hub import hf_hub_download
-
-        local_path = hf_hub_download(
-            repo_id=hf_repo,
-            repo_type="dataset",
-            filename=stamp_path,
+        stamp_raw = _download_pinned_hf_bytes(
+            hf_repo,
+            stamp_path,
             revision=revision,
             token=token,
-            force_download=True,
         )
-        with open(local_path, "rb") as file:
-            stamp_raw = file.read()
     except Exception:
         stamp_raw = None
     stamp = parse_fsdp_stamp(stamp_raw)
@@ -116,11 +133,7 @@ def _opd_resume_checkpoint(
     names = actor_names.get(step, [])
     if stamp is not None:
         _generation, width = stamp
-        expected_names = [
-            f"{kind}_world_size_{width}_rank_{rank}.pt"
-            for kind in ("model", "optim", "extra_state")
-            for rank in range(width)
-        ]
+        expected_names = expected_native_fsdp_shard_names(width)
         expected_paths = [f"{prefix}/actor/{name}" for name in expected_names]
         try:
             infos = api.get_paths_info(
@@ -168,18 +181,12 @@ def _validate_opd_optimizer_start_markers(
         if path not in present:
             continue
         try:
-            from huggingface_hub import hf_hub_download
-
-            local_path = hf_hub_download(
-                repo_id=hf_repo,
-                repo_type="dataset",
-                filename=path,
+            raw = _download_pinned_hf_bytes(
+                hf_repo,
+                path,
                 revision=revision,
                 token=token,
-                force_download=True,
             )
-            with open(local_path, "rb") as file:
-                raw = file.read()
             decode_opd_optimizer_start_json(
                 raw,
                 run_id=run_id,
@@ -301,18 +308,14 @@ def verify_opd_replacement_safe(
     checkpoint_step = selected.step
     state_path = f"{selected.prefix}/opd_state.json"
     try:
-        from huggingface_hub import hf_hub_download
-
-        local_path = hf_hub_download(
-            repo_id=hf_repo,
-            repo_type="dataset",
-            filename=state_path,
-            revision=revision,
-            token=token,
-            force_download=True,
+        state = json.loads(
+            _download_pinned_hf_bytes(
+                hf_repo,
+                state_path,
+                revision=revision,
+                token=token,
+            )
         )
-        with open(local_path, encoding="utf-8") as file:
-            state = json.load(file)
         validate_opd_resume_state_metadata(
             state,
             expected_seed=seed,

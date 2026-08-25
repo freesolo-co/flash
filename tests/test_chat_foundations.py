@@ -13,16 +13,16 @@ from flash._internal.openai_sse import (
     iter_openai_sse_events,
 )
 from flash.client.http import ClientError
-from flash.serve._chat_transport import OpenAIStreamResponse
-from flash.serve.openai_request import DEFAULT_MAX_TOKENS, OpenAIRequestError, parse_chat_request
-from flash.serve.provenance import (
+from flash.serve.contract.provenance import (
     ImmutableProvenance,
     decode_flash_body,
     decode_flash_headers,
     decode_freesolo_body,
     decode_freesolo_headers,
 )
-from flash.serve.streaming import _complete_sse_frames
+from flash.serve.request.openai import DEFAULT_MAX_TOKENS, OpenAIRequestError, parse_chat_request
+from flash.serve.request.streaming import _complete_sse_frames
+from flash.serve.request.transport import OpenAIStreamResponse
 from flash.server.routes.serving_revisions import _authorized_chat_revision
 
 
@@ -81,8 +81,8 @@ def test_thinking_import_does_not_load_deploy() -> None:
             sys.executable,
             "-c",
             (
-                "import sys; import flash.serve.thinking; "
-                "assert 'flash.serve.deploy' not in sys.modules"
+                "import sys; import flash.serve.request.thinking; "
+                "assert 'flash.serve.deployment.deploy' not in sys.modules"
             ),
         ],
         capture_output=True,

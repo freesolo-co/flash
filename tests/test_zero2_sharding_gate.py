@@ -16,9 +16,9 @@ from __future__ import annotations
 import pytest
 
 from flash.core.catalog import MODELS
-from flash.engine.worker.train.opd.overrides import build_opd_overrides
+from flash.engine.worker.train.opd.orchestration.overrides import build_opd_overrides
 from flash.engine.worker.verl.parallelism import resolve_reshard_after_forward
-from flash.providers.base import (
+from flash.providers.core.sharding import (
     REPLICATED_PER_CARD_GB,
     SHARD_VRAM_EFFICIENCY,
     ZERO2_CHARGED_RESIDENCY,
@@ -177,7 +177,7 @@ def test_the_gate_never_admits_more_than_a_card_physically_holds():
     completed.
     """
     from flash.engine.plan.vram import model_required_vram_gb
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.base import get_gpu_info
 
     impossible = []
     fired = 0
@@ -214,7 +214,7 @@ def test_the_worker_and_the_allocator_cannot_disagree():
     side alone.
     """
     from flash.engine.plan.vram import model_required_vram_gb
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.base import get_gpu_info
 
     checked = 0
     fired = 0

@@ -15,8 +15,8 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
-from flash.serving.src.structured_outputs import (
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.structured_outputs import (
     StructuredOutputsError,
     normalize_structured_outputs,
 )

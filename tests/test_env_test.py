@@ -8,10 +8,10 @@ from typing import ClassVar
 
 import pytest
 
-import flash.cli as cli
-from flash.cli.commands.env.test import cmd_env_test
-from flash.envs.adapter import FreesoloEnvironment
-from flash.envs.base import RolloutReward
+import flash.cli.parsing.main as cli
+from flash.cli.commands.env.testing.test import cmd_env_test
+from flash.envs.loading.adapter import FreesoloEnvironment
+from flash.envs.loading.base import RolloutReward
 
 
 class _SingleTurnEnv:
@@ -275,7 +275,7 @@ def _patch_loader(monkeypatch, env, seen=None):
         seen["kwargs"] = kwargs
         return env
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", load)
+    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", load)
     return seen
 
 
@@ -322,7 +322,7 @@ def test_env_test_without_evaluations_keeps_output_byte_identical(monkeypatch, t
 def test_env_test_validates_evaluation_sidecar_offline(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'held-out'\n"
         "    def cases(self): return [EvalCase(input='what is 2 + 2?', expected='4')]\n"
@@ -343,7 +343,7 @@ def test_env_test_validates_episode_suite_without_executing_its_scorer(
 ):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import EvalCase\n"
+        "from flash.envs.meta.evaluations import EvalCase\n"
         "class Suite:\n"
         "    name = 'episode'\n"
         "    grades_episodes = True\n"
@@ -386,7 +386,7 @@ def test_env_test_validates_episode_suite_without_executing_its_scorer(
 def test_env_test_keeps_uninspectable_episode_scorers_permissive(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import EvalCase\n"
+        "from flash.envs.meta.evaluations import EvalCase\n"
         "class Scorer:\n"
         "    @property\n"
         "    def __signature__(self): raise ValueError('signature unavailable')\n"
@@ -418,7 +418,7 @@ def test_env_test_episode_suite_does_not_require_sft_gold(
 ):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import EvalCase\n"
+        "from flash.envs.meta.evaluations import EvalCase\n"
         "class Suite:\n"
         "    name = 'episode'\n"
         "    grades_episodes = True\n"
@@ -468,7 +468,7 @@ def test_env_test_episode_suite_does_not_require_sft_gold(
 def test_env_test_checks_each_episode_cases_initial_rollout(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import EvalCase\n"
+        "from flash.envs.meta.evaluations import EvalCase\n"
         "class Suite:\n"
         "    name = 'episode'\n"
         "    grades_episodes = True\n"
@@ -519,7 +519,7 @@ def test_env_test_rejects_inspectable_episode_scorers_that_cannot_bind_online_ca
 ):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import EvalCase\n"
+        "from flash.envs.meta.evaluations import EvalCase\n"
         "class Suite:\n"
         "    name = 'episode'\n"
         "    grades_episodes = True\n"
@@ -538,7 +538,7 @@ def test_env_test_rejects_inspectable_episode_scorers_that_cannot_bind_online_ca
 def test_env_test_warns_when_episode_suite_cannot_receive_state(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import EvalCase\n"
+        "from flash.envs.meta.evaluations import EvalCase\n"
         "class Suite:\n"
         "    name = 'last-response'\n"
         "    grades_episodes = True\n"
@@ -562,7 +562,7 @@ def test_env_test_warns_when_episode_suite_cannot_receive_state(monkeypatch, tmp
 def test_env_test_rejects_episode_suite_for_single_turn_environment(monkeypatch, tmp_path, capsys):
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import EvalCase\n"
+        "from flash.envs.meta.evaluations import EvalCase\n"
         "class Suite:\n"
         "    name = 'episode'\n"
         "    grades_episodes = True\n"
@@ -588,7 +588,7 @@ def test_env_test_rejects_an_evaluation_case_whose_image_cannot_be_resolved(
     # prompt-construction failure for a suite this gate had reported `overall: PASS`.
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'held-out'\n"
         "    def cases(self): return [EvalCase(input='what is this?', expected='a cat',\n"
@@ -611,7 +611,7 @@ def test_env_test_rejects_an_empty_evaluation_suite(monkeypatch, tmp_path, capsy
     # to run, so the first online use fails after setup already declared the package valid.
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'empty'\n"
         "    def cases(self): return []\n"
@@ -632,7 +632,7 @@ def test_env_test_fails_when_a_scorer_reports_an_error(monkeypatch, tmp_path, ca
     # online command refuses -- the gate passing is what hides it.
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'judged'\n"
         "    def cases(self): return [EvalCase(id='a', input='what is 2 + 2?', expected='4')]\n"
@@ -660,7 +660,7 @@ def test_env_test_fails_when_a_held_out_case_breaks_prompt_construction(
     """
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'held-out'\n"
         "    def cases(self): return [EvalCase(id='a', input='held-out only', expected='4')]\n"
@@ -959,7 +959,7 @@ def test_env_test_reads_per_turn_rewards_before_calling_the_grader_flat(
     """Read per-turn rewards before judging a grader by its episode scalar.
 
     ``credit_assignment = "per_turn"`` trains through ``rollout_rewards_many`` in
-    flash/envs/adapter.py, so a flat ``env.reward`` can still hide separating turn rewards.
+    flash/envs/loading/adapter.py, so a flat ``env.reward`` can still hide separating turn rewards.
     """
     env_dir = _environment_dir(tmp_path)
     env = _MultiTurnEnv()
@@ -1094,7 +1094,7 @@ def test_env_test_reports_the_text_the_scorer_actually_received(monkeypatch, tmp
         RewardResult,
     )
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     graded: list[str] = []
 
@@ -1142,7 +1142,7 @@ def test_env_test_reports_the_text_the_scorer_actually_received(monkeypatch, tmp
 def test_env_test_reports_an_empty_override_as_the_scored_text(monkeypatch, tmp_path, capsys):
     """An env that overrode the answer to nothing graded an empty string, and must say so.
 
-    `step_episode` propagates its override on `is not None` (flash/envs/adapter.py), so `""` really
+    `step_episode` propagates its override on `is not None` (flash/envs/loading/adapter.py), so `""` really
     does reach the grader. Treating a captured `""` as "never captured" fell back to the replayed
     turns and named text the scorer never saw -- and an empty answer is the very fault a reader
     most needs pointed at, since it explains the zero on its own.
@@ -1155,7 +1155,7 @@ def test_env_test_reports_an_empty_override_as_the_scored_text(monkeypatch, tmp_
         RewardResult,
     )
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     graded: list[str] = []
 
@@ -2104,7 +2104,7 @@ def test_adapter_reward_with_error_exposes_what_reward_discards():
     from freesolo.datasets.types import TaskExample
     from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     class _Env(EnvironmentSingleTurn):
         dataset: ClassVar[list] = [{"input": "find user", "output": "alice"}]
@@ -2133,7 +2133,7 @@ def test_adapter_reward_with_error_is_empty_when_the_scorer_reported_none():
     from freesolo.datasets.types import TaskExample
     from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     class _Env(EnvironmentSingleTurn):
         dataset: ClassVar[list] = [{"input": "what is 2 + 2?", "output": "4"}]
@@ -2161,7 +2161,7 @@ def test_env_test_scores_each_episode_exactly_once():
     from freesolo.datasets.types import TaskExample
     from freesolo.environments import EnvironmentSingleTurn, RewardResult
 
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     calls: list[str] = []
 
@@ -2224,7 +2224,7 @@ def test_scaffolded_environment_documents_the_gold_completion_contract():
 
     A comment outside the template string is read by nobody running `flash env setup`.
     """
-    from flash.cli.commands.env.setup import _STARTER_ENV_PY
+    from flash.cli.commands.env.ops.setup import _STARTER_ENV_PY
 
     assert "gold" in _STARTER_ENV_PY
     assert "sft_completion" in _STARTER_ENV_PY
@@ -2782,7 +2782,7 @@ def test_env_test_ignores_a_turn_vector_the_paid_worker_would_reject(
 ):
     """Only a vector the WORKER would use is evidence that per-turn credit separates.
 
-    `_validated_reward` (flash/engine/worker/train/rl/scoring.py) discards a vector whose length
+    `_validated_reward` (flash/engine/worker/train/rl/rollout/scoring.py) discards a vector whose length
     disagrees with the assistant turns emitted, or that holds a non-finite value, and falls back to
     the flat episode reward. A run like that trains on all-zero rewards, so reading its vector as
     separation suppressed both the blocking gate and the warning on a run that measures nothing.
@@ -3043,7 +3043,7 @@ def test_env_test_still_blocks_a_zero_grader_behind_a_truncated_replay(
 class _FixedLengthEnv(_MultiTurnEnv):
     """A HEALTHY env that ends only by exhausting its budget and never sets `state["done"]`.
 
-    A supported shape, not a defect: the real `rollout_done` (flash/envs/adapter.py) returns True at
+    A supported shape, not a defect: the real `rollout_done` (flash/envs/loading/adapter.py) returns True at
     `turn >= cap` regardless of `done`, so a fixed-length game trains fine. From this command it is
     indistinguishable from an environment no rollout can finish -- both replay every turn and both
     leave `done` unset -- so the warning may report it but must not tell its author their
@@ -3099,7 +3099,7 @@ class _RealRolloutDoneDeadEnv(_DeadEnvWithShortGoldEnv):
 
     Every other multi-turn fixture here overrides `rollout_done` to a bare `False`, which no
     published environment does: the adapter's own implementation returns True from `turn >= cap`
-    ALONE (flash/envs/adapter.py), independently of whether the episode was ever won. Consulting it
+    ALONE (flash/envs/loading/adapter.py), independently of whether the episode was ever won. Consulting it
     to decide the turn-cap warning therefore made the warning unsatisfiable against real
     environments while these fakes kept the tests green -- the warning was dead code that passed.
 
@@ -3159,7 +3159,7 @@ class _PerExampleCapDeadEnv(_MultiTurnEnv):
     """A dead environment whose PER-EXAMPLE budget is well below the dataset-wide cap.
 
     `rollout_done` gives `state["max_episode_turns"]` precedence over `env.max_turns`
-    (flash/envs/adapter.py), so this episode is stopped by its own budget at turn 3 while the
+    (flash/envs/loading/adapter.py), so this episode is stopped by its own budget at turn 3 while the
     dataset-wide ceiling is 12. Deriving the ceiling from `env.max_turns` alone left the exhaustion
     flag False for exactly these episodes, so a board no move can solve reached `overall: PASS`
     with nothing said -- the silent pass this warning exists to catch.
@@ -3421,7 +3421,7 @@ def test_replay_state_rejects_a_state_with_no_prompt_rather_than_using_its_trans
     # when `prompt` is absent therefore records the transcript-so-far as the frozen prefix -- on any
     # state past turn zero that silently includes model turns the prompt never had. every producer
     # sets `prompt`, so its absence is a corrupt state and must be named as one.
-    from flash.cli.commands.env.test import _new_multi_turn_replay_state
+    from flash.cli.commands.env.testing.test import _new_multi_turn_replay_state
 
     class _Env:
         def new_rollout_state(self, _example):

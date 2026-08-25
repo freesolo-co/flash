@@ -6,14 +6,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.serving.src.engine_support import (
+from flash.serving.src.engine.lora_engine import _LoraEngineImpl, _LoraEntry
+from flash.serving.src.engine.support import (
     _adapter_source_cache_dir,
     _adapter_source_ident,
     _load_adapters_for_base,
 )
-from flash.serving.src.lora_engine import _LoraEngineImpl, _LoraEntry
-from flash.serving.src.registry import AdapterRegistry
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.store.registry import AdapterRegistry
 
 BASE_MODEL = "Qwen/Qwen3.5-9B"
 RUN_ID = "flash-1234567890-abcdef12"
@@ -78,7 +78,9 @@ def test_engine_hydration_excludes_aliases_legacy_and_disabled(monkeypatch) -> N
         ),
         _revision("b" * 40, status="disabled"),
     ]
-    monkeypatch.setattr("flash.serving.src.persistence.load_adapters", lambda settings: records)
+    monkeypatch.setattr(
+        "flash.serving.src.store.persistence.load_adapters", lambda settings: records
+    )
     assert _load_adapters_for_base(object(), BASE_MODEL) == [ready]
 
 
@@ -283,7 +285,7 @@ def test_snapshot_download_receives_exact_hub_sha(monkeypatch, tmp_path: Path) -
         return str(local_dir)
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path)
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path)
 
     engine = _LoraEngineImpl()
     engine.registry = AdapterRegistry()
@@ -315,7 +317,7 @@ def test_runtime_containment_rejects_schema_bypass(monkeypatch, tmp_path: Path) 
         return str(tmp_path)
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
-    monkeypatch.setattr("flash.serving.src.settings.ADAPTER_CACHE_DIR", tmp_path)
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path)
 
     engine = _LoraEngineImpl()
     engine.registry = AdapterRegistry()

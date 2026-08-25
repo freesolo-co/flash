@@ -103,7 +103,7 @@ def rl_data_parallel_cards(gpu_count: int, sequences_per_step: int) -> int:
     """
     # local import: `providers.base` reaches back into `engine.plan` (recipe, vram), so binding it at
     # module level here would close that cycle.
-    from flash.providers.base import rentable_gpu_counts
+    from flash.providers.core.base import rentable_gpu_counts
 
     cards = max(1, int(gpu_count))
     sequences = max(1, int(sequences_per_step))

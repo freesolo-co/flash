@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
-from flash.serve.runtime_support import reasoning_compatibility_guard
+from flash.serve.request.runtime_support import reasoning_compatibility_guard
 
 from .adapters import AdapterBinding, AdapterManager
 from .errors import (

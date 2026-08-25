@@ -1,8 +1,4 @@
-"""Run-execution machinery: the submit -> supervised training job -> GC flow.
-
-Sibling helpers are imported function-locally to avoid the flash.runner.__init__ import cycle
-and to keep monkeypatches reachable (``monkeypatch.setattr(runner, ...)`` vs a static copy).
-"""
+"""run-execution machinery for submission, supervision, and cleanup."""
 
 from __future__ import annotations
 
@@ -19,6 +15,25 @@ INFRA_RETRY_FLOOR = 5
 INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_preempted"})
 RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
+
+
+def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
+    """run a supervised job without leaking a daemon-thread traceback."""
+    import logging
+
+    from flash.runner.lifecycle.state import TERMINAL_STATES
+    from flash.runner.lifecycle.status import _update, get_status
+
+    try:
+        _run_job(spec, runtime_secrets=runtime_secrets) if runtime_secrets else _run_job(spec)
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: background run failed"
+        with contextlib.suppress(Exception):
+            if get_status(spec.run_id).state not in TERMINAL_STATES:
+                _update(spec.run_id, "failed", error=detail)
+        logging.getLogger(__name__).warning(
+            "background run %s ended in error: %s", spec.run_id, detail
+        )
 
 
 @dataclass
@@ -61,14 +76,10 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
 
     preflight_validate_image_opd(spec)
 
-    from flash.runner import (
-        RUNS_DIR,
-        TERMINAL_STATES,
-        _gc_run_endpoints,
-        _run_job_inner,
-        _update,
-        get_status,
-    )
+    from flash.runner.lifecycle.state import RUNS_DIR, TERMINAL_STATES
+    from flash.runner.lifecycle.status import _update, get_status
+    from flash.runner.supervise.lifecycle import _run_job_inner
+    from flash.runner.supervise.recovery import _gc_run_endpoints
 
     # Cancel can land before this thread starts; don't overwrite a terminal state with provisioning.
     if get_status(spec.run_id).state in TERMINAL_STATES:
@@ -81,8 +92,8 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
                 _run_job_inner(spec, log_path, runtime_secrets=runtime_secrets)
                 break
             except Exception as exc:
-                from flash.envs.staged import StagedEnvironmentTransientError
-                from flash.runner import _load_run_deadline_at
+                from flash.envs.loading.staged import StagedEnvironmentTransientError
+                from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
                 if not isinstance(exc, StagedEnvironmentTransientError):
                     raise
@@ -142,7 +153,7 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
     Only drops the platform-managed shared cache (WEIGHT_CACHE_VOLUME_NAME); a custom per-org
     network_volume is the user's own choice and is preserved across retries.
     """
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
         return spec
@@ -187,7 +198,7 @@ def _terminal_failure_detail(exc: BaseException) -> str:
     plane-side credential indistinguishable from a bad spec, since both surfaced as a bare
     `RuntimeError: run failed`.
     """
-    from flash.server.domain.teacher_broker import TeacherBrokerConfigurationError
+    from flash.server.domain.teacher.broker import TeacherBrokerConfigurationError
 
     if isinstance(exc, TeacherBrokerConfigurationError):
         return f"{type(exc).__name__}: {exc}"
@@ -199,14 +210,11 @@ def _run_job_inner(
     log_path: str,
     runtime_secrets: dict[str, str] | None = None,
 ) -> None:
-    from flash.runner import (
-        _load_run_deadline_at,
-        _run_training,
-        _RunCancelled,
-        _update,
-        get_status,
-        stage_environment_package,
-    )
+    from flash.runner.accounting.artifacts import stage_environment_package
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.lifecycle.status import _update, get_status
+    from flash.runner.supervise.errors import _RunCancelled
+    from flash.runner.supervise.lifecycle import _run_training
 
     try:
         # dev replaced the explicit code upload with managed source snapshots, so staging only has
@@ -226,7 +234,7 @@ def _run_job_inner(
     except _RunCancelled:
         return  # cancel_run already set the terminal state
     except Exception as exc:
-        from flash.envs.staged import StagedEnvironmentTransientError
+        from flash.envs.loading.staged import StagedEnvironmentTransientError
 
         if isinstance(exc, StagedEnvironmentTransientError):
             raise
@@ -250,21 +258,20 @@ def _run_training(
     checkpoint on a fresh allocation). ``prior_cost`` carries spend already booked before a
     recovery so the total isn't under-reported. ``attempt_start`` preserves globally monotonic
     worker identities while each invocation keeps its own bounded retry budget."""
-    from flash.runner import (
-        TERMINAL_STATES,
+    from flash.runner.accounting.costs import _status_estimated_charge
+    from flash.runner.lifecycle.state import TERMINAL_STATES, artifacts_dir
+    from flash.runner.lifecycle.status import (
         _persist_metrics,
-        _RunCancelled,
-        _status_estimated_charge,
-        _submit_seed_supervised,
         _update,
-        artifacts_dir,
         get_status,
         source_snapshot_from_status,
         validate_terminal_source_metrics,
     )
+    from flash.runner.supervise.errors import _RunCancelled
+    from flash.runner.supervise.lifecycle import _submit_seed_supervised
 
     if spec.algorithm == "opd":
-        from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+        from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
 
         preflight_validate_managed_teacher(spec)
     status = get_status(spec.run_id)

@@ -8,6 +8,14 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.io.hf as worker_hf
+import flash.engine.worker.runtime.state as worker_state
+import flash.runner.lifecycle.attempts as runner_attempts
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.supervise.attach as runner_attach
+import flash.runner.supervise.lifecycle as runner_lifecycle
+import flash.runner.supervise.recovery as runner_recovery
 import flash.teacher.retry_contract as retry_contract
 from flash.teacher.retry_contract import (
     OPD_RESUME_REVISION_ENV,
@@ -26,9 +34,27 @@ _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
+def _patch_worker_marker_context(
+    monkeypatch,
+    *,
+    repo: str,
+    run_id: str,
+    attempt: int,
+    seed: int,
+    api=None,
+    remaining: float | None = None,
+) -> None:
+    monkeypatch.setattr(worker_state, "HF_REPO", repo)
+    monkeypatch.setattr(worker_state, "RUN_ID", run_id)
+    monkeypatch.setattr(worker_state, "ATTEMPT", attempt)
+    monkeypatch.setattr(worker_state, "SEED", seed)
+    monkeypatch.setattr(worker_state, "_remaining_worker_wall_seconds", lambda: remaining)
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: api)
+
+
 @pytest.fixture(autouse=True)
 def _stub_teacher_broker_transport(monkeypatch):
-    import flash.server.domain.teacher_broker as teacher_broker
+    import flash.server.domain.teacher.broker as teacher_broker
 
     monkeypatch.setattr(
         teacher_broker,
@@ -109,7 +135,6 @@ def _opd_spec(run_id: str, *, max_retries: int = 1, seed: int = 42):
 
 
 def _save_status(
-    runner,
     spec,
     *,
     state="running",
@@ -121,45 +146,44 @@ def _save_status(
     kwargs = {"_next_attempt": next_attempt}
     if contracted:
         kwargs["_opd_retry_contract_version"] = OPD_RETRY_CONTRACT_VERSION
-    status = provisioned_status(runner, spec, state=state, remote=remote)
+    status = provisioned_status(spec, state=state, remote=remote)
     status.source_snapshot = source_snapshot
-    runner._save_status(status, **kwargs)
+    runner_state._save_status(status, **kwargs)
 
 
 def test_status_initialization_stamps_opd_contract_only_when_explicit(monkeypatch, tmp_path):
-    import flash.runner as runner
     from flash.core.spec import JobSpec
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     contracted = _opd_spec("contract-opd")
     uncontracted = _opd_spec("uncontracted-opd")
-    _save_status(runner, contracted)
-    _save_status(runner, uncontracted, contracted=False)
+    _save_status(contracted)
+    _save_status(uncontracted, contracted=False)
     for spec in (
         JobSpec(run_id="contract-sft", algorithm="sft"),
         JobSpec(run_id="contract-grpo", algorithm="grpo"),
     ):
-        runner._save_status(
-            runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
+        runner_state._save_status(
+            runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
         )
 
-    opd_raw = runner._load_status_json("contract-opd")
+    opd_raw = runner_status._load_status_json("contract-opd")
     assert opd_raw[OPD_RETRY_CONTRACT_STATUS_KEY] == OPD_RETRY_CONTRACT_VERSION
-    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner.get_status("contract-opd").__dict__
-    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner._load_status_json("uncontracted-opd")
-    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner._load_status_json("contract-sft")
-    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner._load_status_json("contract-grpo")
+    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner_status.get_status("contract-opd").__dict__
+    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner_status._load_status_json("uncontracted-opd")
+    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner_status._load_status_json("contract-sft")
+    assert OPD_RETRY_CONTRACT_STATUS_KEY not in runner_status._load_status_json("contract-grpo")
     with pytest.raises(ValueError, match="cannot be stored for a non-opd run"):
-        runner._save_status(
-            runner.RunStatus(
+        runner_state._save_status(
+            runner_state.RunStatus(
                 run_id="invalid-contract-sft",
                 state="running",
                 spec=JobSpec(run_id="invalid-contract-sft", algorithm="sft").to_dict(),
             ),
             _opd_retry_contract_version=OPD_RETRY_CONTRACT_VERSION,
         )
-    assert runner._reserve_attempt("contract-sft") == 0
-    assert runner._reserve_attempt("contract-grpo") == 0
+    assert runner_attempts._reserve_attempt("contract-sft") == 0
+    assert runner_attempts._reserve_attempt("contract-grpo") == 0
 
 
 def test_marker_path_and_canonical_exact_schema():
@@ -222,17 +246,13 @@ def test_marker_upload_failure_is_retriable_and_attempted_exactly_once(monkeypat
         raise failure
 
     api = SimpleNamespace(upload_file=upload_file)
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(
-            HF_REPO="private/runs",
-            RUN_ID="run-1",
-            ATTEMPT=0,
-            SEED=42,
-            hf_api=lambda: api,
-            _remaining_worker_wall_seconds=lambda: None,
-        ),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="private/runs",
+        run_id="run-1",
+        attempt=0,
+        seed=42,
+        api=api,
     )
 
     with pytest.raises(RetriableInfraError) as caught:
@@ -268,17 +288,13 @@ def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(monkeypatch):
 
     api = CommitThenLoseFirstResponse()
     monkeypatch.setenv("HF_TOKEN", "marker-secret")
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(
-            HF_REPO="private/runs",
-            RUN_ID="run-ambiguous",
-            ATTEMPT=2,
-            SEED=42,
-            hf_api=lambda: api,
-            _remaining_worker_wall_seconds=lambda: None,
-        ),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="private/runs",
+        run_id="run-ambiguous",
+        attempt=2,
+        seed=42,
+        api=api,
     )
     with pytest.raises(RetriableInfraError) as caught:
         hf.publish_opd_optimizer_start_marker()
@@ -298,10 +314,12 @@ def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(monkeypatch):
 def test_worker_marker_rejects_empty_repo(monkeypatch):
     from flash.engine.worker.io import hf
 
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(HF_REPO="", RUN_ID="run-1", ATTEMPT=0, SEED=42),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="",
+        run_id="run-1",
+        attempt=0,
+        seed=42,
     )
     with pytest.raises(RuntimeError, match="requires a private HF repository"):
         hf.publish_opd_optimizer_start_marker()
@@ -312,17 +330,14 @@ def test_worker_marker_starts_no_hf_call_at_deadline(monkeypatch):
     from flash.engine.worker.perf import RetriableInfraError
 
     calls = []
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(
-            HF_REPO="private/runs",
-            RUN_ID="run-1",
-            ATTEMPT=0,
-            SEED=42,
-            hf_api=lambda: calls.append("hf_api"),
-            _remaining_worker_wall_seconds=lambda: 0.0,
-        ),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="private/runs",
+        run_id="run-1",
+        attempt=0,
+        seed=42,
+        api=SimpleNamespace(upload_file=lambda **_kwargs: calls.append("hf_api")),
+        remaining=0.0,
     )
 
     with pytest.raises(RetriableInfraError, match="run wall deadline exceeded"):
@@ -348,17 +363,13 @@ def test_worker_marker_writes_fsync_and_required_upload(monkeypatch):
         )
 
     monkeypatch.setattr(hf.os, "fsync", lambda fd: fsync_calls.append(fd))
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(
-            HF_REPO="private/runs",
-            RUN_ID="run-1",
-            ATTEMPT=4,
-            SEED=42,
-            hf_api=lambda: SimpleNamespace(upload_file=upload_file),
-            _remaining_worker_wall_seconds=lambda: None,
-        ),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="private/runs",
+        run_id="run-1",
+        attempt=4,
+        seed=42,
+        api=SimpleNamespace(upload_file=upload_file),
     )
     hf.publish_opd_optimizer_start_marker()
 
@@ -549,29 +560,26 @@ def test_strict_reader_missing_repo_or_unsupported_contract_blocks(repo, version
 def test_initial_contracted_opd_reservation_skips_empty_attempt_query(monkeypatch, tmp_path):
     import huggingface_hub
 
-    import flash.runner as runner
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("initial-opd")
-    _save_status(runner, spec, next_attempt=0)
+    _save_status(spec, next_attempt=0)
     monkeypatch.setattr(
         huggingface_hub,
         "HfApi",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not query HF")),
     )
 
-    snapshot = runner._verified_opd_next_attempt(spec.run_id)
+    snapshot = runner_attempts._verified_opd_next_attempt(spec.run_id)
     assert snapshot == 0
-    assert runner._reserve_attempt(spec.run_id, expected_next_attempt=snapshot) == 0
+    assert runner_attempts._reserve_attempt(spec.run_id, expected_next_attempt=snapshot) == 0
 
 
 def test_retry_gate_uses_authoritative_jobspec_seed(monkeypatch, tmp_path):
-    import flash.runner as runner
     from flash.providers.artifacts import hf as _hf_artifacts
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("custom-seed-opd", seed=987)
-    _save_status(runner, spec, next_attempt=1)
+    _save_status(spec, next_attempt=1)
     seen = {}
 
     def verify(**kwargs):
@@ -579,50 +587,47 @@ def test_retry_gate_uses_authoritative_jobspec_seed(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_hf_artifacts, "verify_opd_replacement_safe", verify)
 
-    assert runner._verified_opd_retry_state(spec.run_id) == (1, None, None)
+    assert runner_attempts._verified_opd_retry_state(spec.run_id) == (1, None, None)
     assert seen["seed"] == 987
 
 
 def test_precontract_opd_fails_closed(monkeypatch, tmp_path):
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("precontract-opd")
-    _save_status(runner, spec, contracted=False)
+    _save_status(spec, contracted=False)
 
     with pytest.raises(RuntimeError, match="contract is missing or invalid"):
-        runner._verified_opd_next_attempt(spec.run_id)
+        runner_attempts._verified_opd_next_attempt(spec.run_id)
     with pytest.raises(RuntimeError, match="contract is missing or invalid"):
-        runner._reserve_attempt(spec.run_id, expected_next_attempt=0)
+        runner_attempts._reserve_attempt(spec.run_id, expected_next_attempt=0)
 
 
 def test_next_attempt_cas_race_blocks_opd_reservation(monkeypatch, tmp_path):
-    import flash.runner as runner
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("opd-cas")
-    _save_status(runner, spec, next_attempt=0)
-    snapshot = runner._verified_opd_next_attempt(spec.run_id)
-    status = runner.get_status(spec.run_id)
-    runner._save_status(status, _next_attempt=1)
+    _save_status(spec, next_attempt=0)
+    snapshot = runner_attempts._verified_opd_next_attempt(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
+    runner_state._save_status(status, _next_attempt=1)
 
     with pytest.raises(RuntimeError, match="changed after retry verification"):
-        runner._reserve_attempt(spec.run_id, expected_next_attempt=snapshot)
-    assert runner._load_status_json(spec.run_id)[runner._NEXT_ATTEMPT_KEY] == 1
+        runner_attempts._reserve_attempt(spec.run_id, expected_next_attempt=snapshot)
+    assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 1
 
 
 def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypatch, tmp_path):
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
-    from flash.providers.base import Allocation, Candidate, PollResult
+    import flash.providers.core.allocator as allocator
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     private_hf = _FakePrivateHf(tmp_path)
     private_hf.install(monkeypatch)
     spec = _opd_spec("automatic-retry-absent")
-    _save_status(runner, spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
+    _save_status(spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
     monkeypatch.setattr(
         allocator,
@@ -686,17 +691,16 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
 
 
 def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch, tmp_path):
-    import flash.providers as providers
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
-    from flash.providers.base import Allocation, Candidate, PollResult
+    import flash.providers.core.allocator as allocator
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate, PollResult
     from flash.runner.supervise import lifecycle
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     private_hf = _FakePrivateHf(tmp_path)
     private_hf.install(monkeypatch)
     spec = _opd_spec("automatic-retry-pinned")
-    _save_status(runner, spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
+    _save_status(spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
     monkeypatch.setattr(
         allocator,
@@ -719,7 +723,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
             self.worker_envs = []
 
         def submit_run(self, _spec, _seed, *, attempt, on_handle, **kwargs):
-            from flash.providers._lifecycle.worker import build_worker_env
+            from flash.providers._lifecycle.net.worker import build_worker_env
 
             secrets = kwargs.get("runtime_secrets")
             self.runtime_secrets.append(secrets)
@@ -793,12 +797,11 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
 
 
 def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkeypatch, tmp_path):
-    import flash.providers as providers
-    import flash.runner as runner
-    from flash.providers.base import PollResult
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import PollResult
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     spec = _opd_spec("attach-opd-block")
     marker_path = opd_optimizer_start_marker_path(spec.run_id, 0)
     private_hf = _FakePrivateHf(tmp_path)
@@ -807,7 +810,6 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
     )
     private_hf.install(monkeypatch)
     _save_status(
-        runner,
         spec,
         next_attempt=1,
         remote=_remote(attempt=0),
@@ -826,11 +828,13 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
             events.append("destroy")
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     resumed = []
-    monkeypatch.setattr(runner, "_run_training", lambda *_args, **_kwargs: resumed.append(True))
+    monkeypatch.setattr(
+        runner_lifecycle, "_run_training", lambda *_args, **_kwargs: resumed.append(True)
+    )
 
-    status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
 
     assert events == ["cancel", "destroy"]
     assert resumed == []
@@ -847,11 +851,10 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
 
 
 def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_path):
-    import flash.providers as providers
-    import flash.runner as runner
+    from flash.providers.core import registry as providers
     from flash.server.platform import runtime as _runtime
 
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("handleless-opd-block")
     marker_path = opd_optimizer_start_marker_path(spec.run_id, 0)
     private_hf = _FakePrivateHf(tmp_path)
@@ -860,22 +863,23 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
     )
     private_hf.install(monkeypatch)
     _save_status(
-        runner,
         spec,
         state="provisioning",
         next_attempt=1,
         source_snapshot=_SOURCE_SNAPSHOT,
     )
     started = []
-    monkeypatch.setattr(runner, "_run_job_background", lambda *_args: started.append(True))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        runner_lifecycle, "_run_job_background", lambda *_args: started.append(True)
+    )
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(_runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
     monkeypatch.setattr(providers, "configured_providers", list)
 
     _runtime.recover_runs()
 
     assert started == []
-    status = runner.get_status(spec.run_id)
+    status = runner_status.get_status(spec.run_id)
     assert status.state == "failed"
     assert "replacement is blocked" in status.error
     assert [name for name, _kwargs in private_hf.calls] == [
@@ -892,25 +896,20 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
     A lost response cannot prove the commit failed, so the published marker must fail closed before
     another worker allocates a GPU.
     """
-    import flash.providers.allocator as allocator
-    import flash.runner as runner
+    import flash.providers.core.allocator as allocator
     from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
     from flash.runner.supervise import lifecycle
 
     private_hf = _FakePrivateHf(tmp_path, raise_after_upload=True)
     monkeypatch.setattr(hf, "_sleep_with_hf_deadline", lambda _delay: True)
-    monkeypatch.setattr(
-        hf,
-        "_w",
-        SimpleNamespace(
-            HF_REPO="private/runs",
-            RUN_ID="ambiguous-upload",
-            ATTEMPT=0,
-            SEED=42,
-            hf_api=lambda: private_hf,
-            _remaining_worker_wall_seconds=lambda: None,
-        ),
+    _patch_worker_marker_context(
+        monkeypatch,
+        repo="private/runs",
+        run_id="ambiguous-upload",
+        attempt=0,
+        seed=42,
+        api=private_hf,
     )
     with pytest.raises(RetriableInfraError, match="required upload"):
         hf.publish_opd_optimizer_start_marker()
@@ -922,9 +921,9 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
 
     private_hf.raise_after_upload = False
     private_hf.install(monkeypatch)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("ambiguous-upload")
-    _save_status(runner, spec, next_attempt=1, source_snapshot=_SOURCE_SNAPSHOT)
+    _save_status(spec, next_attempt=1, source_snapshot=_SOURCE_SNAPSHOT)
     monkeypatch.setattr(
         allocator,
         "allocate",
@@ -1130,12 +1129,11 @@ def _sharded_ckpt(step: int, world_size: int) -> list[str]:
 
 
 def test_gate_reports_the_width_the_checkpoint_was_written_at(monkeypatch, tmp_path):
-    """The retry has to be allocated at this width, so the gate has to report it.
+    """the retry has to be allocated at the validated native checkpoint width.
 
-    Read from the shard filenames in the listing the gate already fetches: verl loads exactly
-    `model_world_size_W_rank_R.pt`, so the width is recoverable remotely with no extra request and
-    no new field in opd_state.json -- which matters because the control plane picks the retry's
-    card count before any worker exists to open the checkpoint.
+    the gate reads the width from pinned fsdp_config.json, expands the canonical expected shard names,
+    and validates their pinned path metadata before reporting that width. this matters because the
+    control plane picks the retry's card count before any worker exists to open the checkpoint.
     """
     _install_marker_gate(monkeypatch, tmp_path, checkpoint_files=_sharded_ckpt(40, 2))
     assert _run_gate() == ("pinned-sha", 2)
@@ -1250,7 +1248,7 @@ def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
     resume_world_size, survivor_indexes, headline
 ):
     """a pinned resume admits only candidates that execute at the checkpoint width."""
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise.seed_submission import _pinned_to_resume_width
 
     candidates = (
@@ -1288,7 +1286,7 @@ def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
 
 def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
     """a filtered rental reports the incompatible execution width, not its card count."""
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise.seed_submission import (
         _build_candidate_plan,
         _pinned_to_resume_width,
@@ -1334,7 +1332,7 @@ def test_retry_allocation_falls_back_for_unusable_executed_width(
     executed_present, executed_gpu_count, wrong_width
 ):
     """absent and malformed executed widths fall back to the rented card count."""
-    from flash.providers.base import Allocation, Candidate
+    from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise.seed_submission import _pinned_to_resume_width
 
     if executed_present:

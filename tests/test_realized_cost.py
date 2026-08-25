@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import pytest
 
-from flash import runner
-from flash.providers import realized
-from flash.providers.runpod.cost import shape_endpoint_cost
-from flash.server.domain import reconcile
+import flash.runner.accounting.costs as runner_costs
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+from flash.providers.core import realized
+from flash.providers.runpod.client.cost import shape_endpoint_cost
+from flash.server.domain.ops import reconcile
 
 
 # --------------------------------------------------------------------------- RunPod shaping
@@ -36,7 +38,7 @@ def test_runpod_shape_empty_is_zero():
 
 # --------------------------------------------------------------------------- provider dispatch
 def test_dispatch_runpod(monkeypatch):
-    from flash.providers.runpod import api
+    from flash.providers.runpod.client import api
 
     monkeypatch.setattr(
         api, "billing_endpoints", lambda **kw: [{"endpointId": "ep-1", "amount": 3.0}]
@@ -58,12 +60,12 @@ def test_dispatch_none_when_no_handle_or_unknown_provider():
 
 
 # --------------------------------------------------------------------------- reconcile selection
-def _status(**kw) -> runner.RunStatus:
+def _status(**kw) -> runner_state.RunStatus:
     base = {"run_id": "r1", "state": "done", "spec": {}, "created_at": 0.0, "updated_at": 0.0}
     base.update(kw)
     if "finished_at" not in base:
         base["finished_at"] = base["updated_at"]
-    return runner.RunStatus(**base)
+    return runner_state.RunStatus(**base)
 
 
 def test_due_requires_billable_terminal_settled_unreconciled_with_handle():
@@ -134,7 +136,7 @@ def test_reconcile_run_reports_and_persists(monkeypatch):
     monkeypatch.setattr(reconcile, "_report", lambda body: posted.update(body) or True)
     updates: dict = {}
     monkeypatch.setattr(
-        runner,
+        runner_costs,
         "record_realized_cost",
         lambda run_id, **kw: updates.update(run_id=run_id, **kw),
     )
@@ -196,7 +198,7 @@ def test_reconcile_leaves_invalid_instance_launch_unsettled_and_due(monkeypatch)
         lambda _body: pytest.fail("unattributable cost must not be reported"),
     )
     monkeypatch.setattr(
-        runner,
+        runner_costs,
         "record_realized_cost",
         lambda *_args, **_kwargs: pytest.fail("unattributable cost must remain unsettled"),
     )
@@ -221,7 +223,7 @@ def test_reconcile_uses_finished_at_not_deploy_bumped_updated_at_for_instance(mo
 
     monkeypatch.setattr(reconcile, "realized_cost_for_remote", fake_realized)
     monkeypatch.setattr(reconcile, "_report", lambda body: True)
-    monkeypatch.setattr(runner, "record_realized_cost", lambda run_id, **kw: None)
+    monkeypatch.setattr(runner_costs, "record_realized_cost", lambda run_id, **kw: None)
 
     status = _status(
         state="deployed",
@@ -290,7 +292,7 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
     # update ONLY the cost columns and keep the run's CURRENT state -- it must NOT write the
     # stale `done` back and revert the live deployment (the terminal-sticky CAS wouldn't catch
     # it, since `deployed` is non-terminal). Exercises the real on-disk record_realized_cost.
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     now = 1_000_000.0
     created_at = now - 10_000.0
     from flash.schema import spec_from_dict
@@ -314,7 +316,7 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
         "attempt": 0,
         "started_ts": created_at + 100.0,
     }
-    snapshot = runner.RunStatus(
+    snapshot = runner_state.RunStatus(
         run_id="r-adv",
         state="done",
         spec=spec.to_dict(),
@@ -324,8 +326,8 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
         remote=remote,
     )
     # the run has since advanced to `deployed` on disk (serving stood up on the finished run).
-    runner._save_status(
-        runner.RunStatus(
+    runner_state._save_status(
+        runner_state.RunStatus(
             run_id="r-adv",
             state="deployed",
             spec=spec.to_dict(),
@@ -346,7 +348,7 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
     monkeypatch.setattr(reconcile, "_report", lambda body: True)
 
     assert reconcile.reconcile_run(snapshot, now=now) is True
-    persisted = runner.get_status("r-adv")
+    persisted = runner_status.get_status("r-adv")
     # Status preserved (NOT reverted to the stale `done`), cost fields written.
     assert persisted.state == "deployed"
     assert persisted.deployment == {"state": "active"}
@@ -356,7 +358,7 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
 
 def test_reconcile_once_disabled_without_internal_key(monkeypatch):
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
-    monkeypatch.setattr(runner, "list_runs", lambda: [_status(updated_at=0)])
+    monkeypatch.setattr(runner_status, "list_runs", lambda: [_status(updated_at=0)])
     assert reconcile.reconcile_once(now=1_000_000.0) == 0
 
 
@@ -369,7 +371,7 @@ def test_reconcile_once_sweeps_due_runs(monkeypatch):
     not_due = _status(
         run_id="fresh", updated_at=now - 60, remote={"provider": "runpod", "endpoint_id": "e"}
     )
-    monkeypatch.setattr(runner, "list_runs", lambda: [due, not_due])
+    monkeypatch.setattr(runner_status, "list_runs", lambda: [due, not_due])
     seen: list[str] = []
 
     def fake_reconcile_run(status, *, now):
@@ -397,10 +399,10 @@ def _run_reconcile_loop_once(monkeypatch, reconcile_once_impl):
     SYNC callable run via asyncio.to_thread(...), so the stub is a plain sync function."""
     import asyncio
 
-    from flash.server import app as server_app
+    from flash.server.asgi import app as server_app
 
     # reconcile_once is imported function-locally inside the loop
-    # (`from flash.server.domain.reconcile import reconcile_once`), so patch it at the source module.
+    # (`from flash.server.domain.ops.reconcile import reconcile_once`), so patch it at the source module.
     monkeypatch.setattr(reconcile, "reconcile_once", reconcile_once_impl)
 
     calls = {"sleep": 0}

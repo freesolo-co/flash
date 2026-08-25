@@ -22,7 +22,7 @@ from flash.runner.supervise.deploy import (
 from flash.schema import parse_adapter_revision
 
 if TYPE_CHECKING:
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
 
 def _deployment_attempt_is_owned(status: RunStatus, deployment: dict) -> bool:
@@ -82,7 +82,12 @@ def mark_deployed(
     *,
     verification_generation: int | None = None,
 ) -> RunStatus:
-    from flash.runner import _UNDEPLOYABLE_STATES, _save_status_unlocked, _status_guard, get_status
+    from flash.runner.lifecycle.state import (
+        _UNDEPLOYABLE_STATES,
+        _save_status_unlocked,
+        _status_guard,
+    )
+    from flash.runner.lifecycle.status import get_status
 
     with _status_guard(run_id):
         status = get_status(run_id)
@@ -123,7 +128,8 @@ def mark_checkpoint_deployed(
     If training has finished by the time serving registration completes, the run behaves like any
     finished deployed run. Otherwise, keep the training state and only attach the deployment record.
     """
-    from flash.runner import _save_status_unlocked, _status_guard, get_status
+    from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
+    from flash.runner.lifecycle.status import get_status
 
     with _status_guard(run_id):
         status = get_status(run_id)
@@ -163,7 +169,8 @@ def mark_deployment_pending(
     owner_deployment: dict | None = None,
 ) -> RunStatus:
     """Attach an in-progress deployment record without changing the run lifecycle state."""
-    from flash.runner import _save_status_unlocked, _status_guard, get_status
+    from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
+    from flash.runner.lifecycle.status import get_status
 
     with _status_guard(run_id):
         status = get_status(run_id)
@@ -213,7 +220,8 @@ def _restorable_deployment_predecessor(deployment: object, run_id: str) -> bool:
 
 def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
     """Record a failed deployment attempt while preserving the run lifecycle state."""
-    from flash.runner import _save_status_unlocked, _status_guard, get_status
+    from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
+    from flash.runner.lifecycle.status import get_status
 
     with _status_guard(run_id):
         status = get_status(run_id)
@@ -257,7 +265,8 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
 
 def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
     """Revoke local serving authority while retaining retryable backend cleanup state."""
-    from flash.runner import _save_status_unlocked, _status_guard, get_status
+    from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
+    from flash.runner.lifecycle.status import get_status
     from flash.runner.results.verified_revisions import invalidate_verified_adapter_revisions
 
     with _status_guard(run_id):
@@ -281,7 +290,8 @@ def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
 
 def mark_undeployed(run_id: str) -> RunStatus:
     """Record an explicit undeploy; live final-adapter deployments return to `done`."""
-    from flash.runner import _save_status_unlocked, _status_guard, get_status
+    from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
+    from flash.runner.lifecycle.status import get_status
     from flash.runner.results.verified_revisions import invalidate_verified_adapter_revisions
 
     with _status_guard(run_id):
@@ -308,7 +318,8 @@ def mark_deployment_undeployed(run_id: str) -> RunStatus:
     Used by cancel_run, unlike mark_undeployed, never asserts or changes the run state,
     so it works even after a racing mark_undeployed has already written terminal `done`.
     """
-    from flash.runner import _save_status_unlocked, _status_guard, get_status
+    from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
+    from flash.runner.lifecycle.status import get_status
     from flash.runner.results.verified_revisions import invalidate_verified_adapter_revisions
 
     with _status_guard(run_id):

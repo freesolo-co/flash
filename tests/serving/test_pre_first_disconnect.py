@@ -8,18 +8,21 @@ from typing import Any
 import pytest
 from fastapi import Request
 
-from flash.serving.src import inference_routes
-from flash.serving.src.context import ServingContext
-from flash.serving.src.inference_routes import _discard_prepared_stream, _stream_chat_completion
-from flash.serving.src.routing import AdapterRouter
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
-from flash.serving.src.streaming import openai_chat_stream, prepare_stream
-from flash.serving.src.usage import (
+from flash.serving.src.accounting.usage import (
     AuthorizedTraffic,
     build_usage_session,
     principal_for_external_org,
 )
-from flash.serving.src.usage_outbox import RequestIdentity
+from flash.serving.src.accounting.usage_outbox import RequestIdentity
+from flash.serving.src.http import inference_routes
+from flash.serving.src.http.context import ServingContext
+from flash.serving.src.http.inference_routes import (
+    _discard_prepared_stream,
+    _stream_chat_completion,
+)
+from flash.serving.src.http.routing import AdapterRouter
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.streaming import openai_chat_stream, prepare_stream
 from tests.serving.conftest import RecordingUsageStore
 
 QWEN = "Qwen/Qwen3.5-9B"
@@ -199,7 +202,7 @@ def test_non_streaming_disconnect_after_engine_completion_finishes_finalization_
         async def receive():
             return await messages.get()
 
-        monkeypatch.setattr("flash.serving.src.context.generate_once", completed_generation)
+        monkeypatch.setattr("flash.serving.src.http.context.generate_once", completed_generation)
         monkeypatch.setattr(
             inference_routes.ServingContext,
             "of",

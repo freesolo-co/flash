@@ -222,7 +222,7 @@ def load_image_geometry(model_id: str, revision: str = "") -> ImageGeometry:
 
     from huggingface_hub import hf_hub_download
 
-    from flash.engine.huggingface import hub_error_transience, model_revision_kwargs
+    from flash.engine.support.huggingface import hub_error_transience, model_revision_kwargs
 
     try:
         path = hf_hub_download(

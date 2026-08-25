@@ -20,17 +20,18 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Imported only by the control plane (`server` extra) or by the GPU worker (`gpu` extra), never
-# by a client command. flash/serve/deploy.py and preflight.py sit under flash/serve/ but are
-# reached exclusively through function-local imports in flash/runner/ and flash/server/, which is
-# what keeps httpx and jsonschema off the client path.
+# imported only by the control plane (`server` extra) or by the gpu worker (`gpu` extra), never
+# by a client command. deployment/deploy.py and preflight.py are reached exclusively through
+# function-local imports in flash/runner/ and flash/server/, which keeps httpx and jsonschema off
+# the client path. use exact relocated module prefixes: `flash.serve.deploy` would also match every
+# client-reachable module under `flash.serve.deployment`.
 SERVER_ONLY_PREFIXES = (
     "flash.server",
     "flash.engine.worker",
     "flash.serve.app",
-    "flash.serve.deploy",
-    "flash.serve.export",
-    "flash.serve.preflight",
+    "flash.serve.deployment.deploy",
+    "flash.serve.deployment.export",
+    "flash.serve.deployment.preflight",
     # The serving app runs only inside the GPU container built from Dockerfile.serve, which
     # installs the `serving` extra (modal, orjson, pydantic-settings) plus vLLM. Nothing a client
     # imports reaches it, so its fastapi/pydantic/PIL imports stay at module scope.
@@ -136,7 +137,7 @@ def test_chat_transport_boundaries_import_without_httpx():
             sys.executable,
             "-S",
             "-c",
-            "import flash.serve._chat_transport; import flash.serve.streaming",
+            "import flash.serve.request.transport; import flash.serve.request.streaming",
         ],
         capture_output=True,
         text=True,
@@ -195,3 +196,40 @@ def test_probe_detects_a_planted_violation(tmp_path):
         f"the probe did not notice a module-level `import httpx` in flash/cost/__init__.py, so "
         f"it cannot protect the base install. reported: {failures}"
     )
+
+
+def test_implementation_package_markers_import_no_children():
+    markers = (
+        "flash.cli",
+        "flash.cli.commands",
+        "flash.runner",
+        "flash.engine.worker",
+    )
+    code = r"""
+import importlib
+import json
+import sys
+
+markers = tuple(json.loads(sys.argv[1]))
+loaded = {}
+for marker in markers:
+    before = set(sys.modules)
+    importlib.import_module(marker)
+    loaded[marker] = sorted(
+        name for name in set(sys.modules) - before if name.startswith(marker + ".")
+    )
+print(json.dumps(loaded))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", code, json.dumps(markers)],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env={
+            "PYTHONPATH": ":".join(_stdlib_only_path()),
+            "PYTHONNOUSERSITE": "1",
+            "PATH": "/usr/bin:/bin",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {marker: [] for marker in markers}

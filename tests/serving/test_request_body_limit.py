@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from flash.serve.contract import MAX_CHAT_REQUEST_BYTES
-from flash.serving.src.body_limit import RequestBodyLimitMiddleware
-from flash.serving.src.router import AdapterRouter
-from flash.serving.src.router import build_offline_serving_app as build_serving_app
+from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
+from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 
 
 def _scope(
@@ -97,7 +97,7 @@ def test_hosted_healthz_dispatches_without_consuming_chunked_body() -> None:
 
 
 def test_hosted_app_caps_chunked_body_without_reading_past_rejection(monkeypatch) -> None:
-    from flash.serving.src import router as router_module
+    from flash.serving.src.http import router as router_module
 
     monkeypatch.setattr(router_module, "MAX_CHAT_REQUEST_BYTES", 4)
     app = router_module.build_offline_serving_app(

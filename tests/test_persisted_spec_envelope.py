@@ -6,7 +6,8 @@ from dataclasses import replace
 
 import pytest
 
-import flash.runner as runner
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
 from flash.core.spec import JobSpec
 from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 
@@ -41,22 +42,22 @@ def test_persisted_decoder_rejects_unknown_keys() -> None:
 
 
 def test_current_envelope_digest_round_trips_and_detects_tampering() -> None:
-    from flash.runner.submit import _effective_preparation_snapshot
+    from flash.runner.lifecycle.submit import _effective_preparation_snapshot
 
     spec = _current_spec()
     snapshot = _effective_preparation_snapshot(spec, spec, None)
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         state="running",
         run_id=spec.run_id,
         spec=spec.to_dict(),
         effective_preparation=snapshot,
     )
 
-    assert runner.effective_spec_from_status(status) == spec
+    assert runner_status.effective_spec_from_status(status) == spec
 
     snapshot["worker_spec"]["workload_profile_producer_version"] = "tampered"
     with pytest.raises(ValueError, match="failed integrity validation"):
-        runner.effective_spec_from_status(status)
+        runner_status.effective_spec_from_status(status)
 
 
 def test_current_envelope_version_is_validated_but_absence_still_recovers() -> None:
@@ -69,25 +70,25 @@ def test_current_envelope_version_is_validated_but_absence_still_recovers() -> N
     way (`snapshot.get("version", CURRENT_VERSION)`), and its own regression pins a bool rather
     than an absent key.
     """
-    from flash.runner.submit import _effective_preparation_snapshot
+    from flash.runner.lifecycle.submit import _effective_preparation_snapshot
 
     spec = _current_spec()
     snapshot = _effective_preparation_snapshot(spec, spec, None)
     assert snapshot["version"] == PREPARATION_ENVELOPE_VERSION
 
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         state="running",
         run_id=spec.run_id,
         spec=spec.to_dict(),
         effective_preparation={key: value for key, value in snapshot.items() if key != "version"},
     )
-    assert runner.effective_spec_from_status(status) == spec
+    assert runner_status.effective_spec_from_status(status) == spec
 
     # a PRESENT but malformed value is still rejected: absence is a known shape, a bool is not.
     status.effective_preparation = {**snapshot, "version": True}
     with pytest.raises(ValueError, match="version must be a positive integer"):
-        runner.effective_spec_from_status(status)
+        runner_status.effective_spec_from_status(status)
 
     status.effective_preparation = {**snapshot, "version": PREPARATION_ENVELOPE_VERSION + 1}
     with pytest.raises(ValueError, match="unsupported persisted preparation envelope version"):
-        runner.effective_spec_from_status(status)
+        runner_status.effective_spec_from_status(status)

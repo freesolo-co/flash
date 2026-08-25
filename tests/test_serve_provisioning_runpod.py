@@ -25,12 +25,21 @@ from flash.serve.provisioning import (
     InterruptedProvisioning,
     ServingImage,
     ServingRuntimeSecrets,
-    _common,
 )
-from flash.serve.provisioning._common import serving_resource_names
-from flash.serve.provisioning._runpod_plan import build_runpod_create_plan
-from flash.serve.provisioning._runpod_probe import RunPodEndpointProbe, _provenance_matches
-from flash.serve.provisioning._runpod_protocol import (
+from flash.serve.provisioning.common import records as _common
+from flash.serve.provisioning.common.records import serving_resource_names
+from flash.serve.provisioning.runpod.operations import (
+    RunPodDataCenterUnsupported,
+    _delete_tolerating_ambiguity,
+    _observe,
+    _work_deadline,
+    provision_runpod_deployment,
+    reconcile_runpod_deployment,
+    teardown_runpod_deployment,
+)
+from flash.serve.provisioning.runpod.plan import build_runpod_create_plan
+from flash.serve.provisioning.runpod.probe import RunPodEndpointProbe, _provenance_matches
+from flash.serve.provisioning.runpod.protocol import (
     CREATE_SECRET,
     DELETE_SECRET,
     OBSERVE_ACCOUNT,
@@ -40,28 +49,19 @@ from flash.serve.provisioning._runpod_protocol import (
     parse_templates,
     parse_volumes,
 )
-from flash.serve.provisioning._runpod_resources import (
+from flash.serve.provisioning.runpod.resources import (
     RunPodResourceConflict,
     _one,
     complete_resource_set,
     pod_identity_matches,
 )
-from flash.serve.provisioning._runpod_transport import (
+from flash.serve.provisioning.runpod.transport import (
     GRAPHQL_URL,
     REST_BASE_URL,
     USER_AGENT,
     RunPodTransportFailure,
     StdlibRunPodTransport,
     build_no_redirect_opener,
-)
-from flash.serve.provisioning.runpod import (
-    RunPodDataCenterUnsupported,
-    _delete_tolerating_ambiguity,
-    _observe,
-    _work_deadline,
-    provision_runpod_deployment,
-    reconcile_runpod_deployment,
-    teardown_runpod_deployment,
 )
 from tests.test_serve_app_manifest import _spec_and_inputs
 
@@ -2347,7 +2347,7 @@ def test_artifact_absence_deadline_is_definite_and_keeps_the_handle() -> None:
 
 
 def test_post_restart_probe_uses_the_established_user_agent() -> None:
-    from flash.serve.provisioning._modal_probe import _expected_models
+    from flash.serve.provisioning.modal.readiness_checks.probe import _expected_models
 
     bundle = _bundle()
     transport = _FakeTransport()
@@ -2785,7 +2785,7 @@ def test_production_probe_sends_a_non_default_user_agent() -> None:
     is serving correctly burns the whole deadline and the deployment reports `outcome_unknown`.
     """
 
-    from flash.serve.provisioning._modal_probe import _expected_models
+    from flash.serve.provisioning.modal.readiness_checks.probe import _expected_models
 
     bundle = _bundle()
     handle = _seed_exact(_FakeTransport(), bundle)
@@ -2996,11 +2996,11 @@ def test_load_bearing_guards_are_sabotage_sensitive(monkeypatch) -> None:
     assert guarded.error_code == "conflict"
 
     monkeypatch.setattr(
-        "flash.serve.provisioning._runpod_plan.PROXY_PORT_SPEC",
+        "flash.serve.provisioning.runpod.plan.PROXY_PORT_SPEC",
         "22/tcp",
     )
     monkeypatch.setattr(
-        "flash.serve.provisioning._runpod_resources.PROXY_PORT_SPEC",
+        "flash.serve.provisioning.runpod.resources.PROXY_PORT_SPEC",
         "22/tcp",
     )
     transport.templates[0]["ports"] = ["22/tcp"]
@@ -4443,7 +4443,7 @@ def test_confirmed_runpod_interrupt_cleanup_stays_a_plain_interrupt() -> None:
 def _exact_models_payload(bundle: DeploymentBundle) -> dict[str, object]:
     """the payload a correct runpod pod returns: every revision AND every run alias."""
 
-    from flash.serve.provisioning._modal_probe import _expected_models
+    from flash.serve.provisioning.modal.readiness_checks.probe import _expected_models
 
     return {
         "data": [

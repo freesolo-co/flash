@@ -16,8 +16,8 @@ import types
 
 import pytest
 
+from flash.cli.ui import cost, env_panels, heartbeat, render, tables
 from flash.cli.ui import heartbeat as ui_heartbeat
-from flash.cli.ui import render
 
 
 @pytest.fixture
@@ -257,7 +257,7 @@ def test_humanize_age_buckets(monkeypatch) -> None:
     # _humanize_age_seconds buckets it. asserted as that pair rather than through a one-line
     # wrapper, so the bucket edges stay pinned to the composition the panel actually renders.
     def humanize(value: object) -> str | None:
-        return render._humanize_age_seconds(render._heartbeat_age_seconds(value))
+        return heartbeat._humanize_age_seconds(heartbeat._heartbeat_age_seconds(value))
 
     now = 1_000_000.0
     # patch the clock in the module that READS it: both helpers live in `flash.cli.ui.heartbeat`
@@ -276,7 +276,7 @@ def test_humanize_age_buckets(monkeypatch) -> None:
 
 def test_deployments_table_truncates_long_detail(styled_plain) -> None:
     long_err = "E" * 100
-    out = render.deployments_table(
+    out = tables.deployments_table(
         [{"run_id": "r1", "deployment": {"state": "failed", "error": long_err}}]
     )
     assert ("E" * 61 + "...") in out  # 61 chars + ellipsis
@@ -285,7 +285,7 @@ def test_deployments_table_truncates_long_detail(styled_plain) -> None:
 
 
 def test_deployments_table_formats_verified_at_as_utc(styled_plain) -> None:
-    out = render.deployments_table(
+    out = tables.deployments_table(
         [{"run_id": "r1", "deployment": {"state": "ready", "verified_at": 1700000000}}]
     )
     assert "2023-11-14 22:13 UTC" in out  # epoch rendered as UTC, not a raw number
@@ -293,7 +293,7 @@ def test_deployments_table_formats_verified_at_as_utc(styled_plain) -> None:
 
 
 def test_deployments_table_surfaces_base_url_and_handles_missing_value(styled_plain) -> None:
-    out = render.deployments_table(
+    out = tables.deployments_table(
         [
             {
                 "run_id": "r1",
@@ -428,7 +428,7 @@ def test_version_and_chat_label(styled_plain) -> None:
 
 
 def test_env_list_with_local_sources(styled_plain) -> None:
-    out = render.env_list(["envs/one", "envs/two"])
+    out = env_panels.env_list(["envs/one", "envs/two"])
     assert "local sources" in out
     assert "envs/one" in out
     assert "envs/two" in out
@@ -436,7 +436,7 @@ def test_env_list_with_local_sources(styled_plain) -> None:
 
 
 def test_projects_table_lists_name_and_id(styled_plain) -> None:
-    out = render.projects_table(
+    out = tables.projects_table(
         [{"id": "11111111-1111-4111-8111-111111111111", "name": "Test project"}]
     )
     assert "Test project" in out
@@ -469,15 +469,15 @@ def test_settled_cost_states_cover_every_runner_terminal_state() -> None:
     instead of importing them. If the runner ever adds a terminal state, this fails here rather
     than silently showing a settled charge as an estimate forever.
     """
-    from flash.runner import TERMINAL_STATES
+    from flash.runner.lifecycle.state import TERMINAL_STATES
 
-    assert TERMINAL_STATES | {"deployed"} == render.SETTLED_COST_STATES
+    assert TERMINAL_STATES | {"deployed"} == cost.SETTLED_COST_STATES
 
 
 def test_run_cost_prefers_the_quote_while_a_run_is_live() -> None:
     # a running run has cost_usd 0.0 until the terminal transition writes it; showing that as the
     # cost tells the user a billing GPU is free.
-    amount, is_estimate = render.run_cost(
+    amount, is_estimate = cost.run_cost(
         {"state": "running", "cost_usd": 0.0, "estimated_cost_usd": 3.5}
     )
     assert (amount, is_estimate) == (3.5, True)
@@ -485,7 +485,7 @@ def test_run_cost_prefers_the_quote_while_a_run_is_live() -> None:
 
 def test_run_cost_uses_the_settled_charge_once_terminal() -> None:
     for state in ("done", "failed", "cancelled", "dry_run", "deployed"):
-        amount, is_estimate = render.run_cost(
+        amount, is_estimate = cost.run_cost(
             {"state": state, "cost_usd": 1.25, "estimated_cost_usd": 3.5}
         )
         assert (amount, is_estimate) == (1.25, False), state
@@ -494,7 +494,7 @@ def test_run_cost_uses_the_settled_charge_once_terminal() -> None:
 def test_run_cost_prefers_measured_spend_over_the_quote_while_live() -> None:
     # once a live run has accrued a real number, that beats the submit-time guess -- but it is
     # still not the settled charge, so it stays flagged as an estimate.
-    amount, is_estimate = render.run_cost(
+    amount, is_estimate = cost.run_cost(
         {"state": "running", "cost_usd": 0.75, "estimated_cost_usd": 3.5}
     )
     assert (amount, is_estimate) == (0.75, True)
@@ -502,8 +502,8 @@ def test_run_cost_prefers_measured_spend_over_the_quote_while_live() -> None:
 
 def test_run_cost_without_a_quote_reports_zero_unflagged() -> None:
     # nothing to show is not the same as an estimate of zero; don't decorate a bare 0.0.
-    assert render.run_cost({"state": "queued", "cost_usd": 0.0}) == (0.0, False)
-    assert render.run_cost({"state": "queued", "estimated_cost_usd": None}) == (0.0, False)
+    assert cost.run_cost({"state": "queued", "cost_usd": 0.0}) == (0.0, False)
+    assert cost.run_cost({"state": "queued", "estimated_cost_usd": None}) == (0.0, False)
 
 
 def test_a_failed_run_that_never_measured_a_charge_is_not_reported_as_settled_zero() -> None:
@@ -514,7 +514,7 @@ def test_a_failed_run_that_never_measured_a_charge_is_not_reported_as_settled_ze
     hardware over and over. one historical failure rented 47 instances, failed to confirm teardown
     on 44, and printed $0.0000 with no estimate marker, which reads as "this cost nothing".
     """
-    amount, is_estimate = render.run_cost(
+    amount, is_estimate = cost.run_cost(
         {"state": "failed", "cost_usd": 0.0, "estimated_cost_usd": 3.5}
     )
     assert (amount, is_estimate) == (3.5, True)
@@ -523,12 +523,12 @@ def test_a_failed_run_that_never_measured_a_charge_is_not_reported_as_settled_ze
 def test_realized_cogs_is_never_shown_as_the_customers_cost() -> None:
     """``realized_cost_usd`` is provider COGS, not what the customer is charged.
 
-    ``runner.RunStatus`` says so directly: it is pulled from the provider's billing API by
+    ``runner_state.RunStatus`` says so directly: it is pulled from the provider's billing API by
     reconciliation and is "distinct from ``cost_usd`` (the flash.cost ESTIMATE we charge the
     customer)". Promoting it into the cost slot would bill the user our internal spend, and
     ``run_status`` already prints it on its own dedicated ``realized`` row.
     """
-    amount, _ = render.run_cost(
+    amount, _ = cost.run_cost(
         {
             "state": "failed",
             "cost_usd": 0.0,
@@ -541,7 +541,7 @@ def test_realized_cogs_is_never_shown_as_the_customers_cost() -> None:
 
 def test_a_failed_run_with_no_evidence_at_all_still_reports_a_bare_zero() -> None:
     """Without a quote there is nothing to show; do not invent a number."""
-    assert render.run_cost({"state": "failed", "cost_usd": 0.0}) == (0.0, False)
+    assert cost.run_cost({"state": "failed", "cost_usd": 0.0}) == (0.0, False)
 
 
 def test_a_settled_zero_that_is_not_a_failure_keeps_its_zero() -> None:
@@ -552,7 +552,7 @@ def test_a_settled_zero_that_is_not_a_failure_keeps_its_zero() -> None:
     incurred -- the mirror image of the bug this fix is for.
     """
     for state in ("dry_run", "cancelled", "done", "deployed"):
-        assert render.run_cost({"state": state, "cost_usd": 0.0, "estimated_cost_usd": 3.5}) == (
+        assert cost.run_cost({"state": state, "cost_usd": 0.0, "estimated_cost_usd": 3.5}) == (
             0.0,
             False,
         ), state
@@ -588,7 +588,7 @@ def test_run_status_marks_a_live_cost_as_an_estimate(styled_plain) -> None:
 
 
 def test_runs_table_marks_live_rows_with_a_tilde(styled_plain) -> None:
-    out = render.runs_table(
+    out = tables.runs_table(
         [
             {
                 "run_id": "flash-live",
@@ -615,7 +615,7 @@ def test_runs_table_marks_live_rows_with_a_tilde(styled_plain) -> None:
 
 def test_runs_table_renders_an_ordered_gpu_pin_that_has_not_allocated_yet(styled_plain) -> None:
     """An unallocated ordered pin renders as a label without breaking the table."""
-    out = render.runs_table(
+    out = tables.runs_table(
         [
             {
                 "run_id": "flash-ordered",

@@ -7,8 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from flash.serve.openai_request import OpenAIRequestError, parse_stream_options  # noqa: F401
-from flash.serve.openai_request import (
+from flash.serve.request.openai import OpenAIRequestError, parse_stream_options  # noqa: F401
+from flash.serve.request.openai import (
     parse_chat_request as parse_normalized_chat_request,
 )
 from flash.serve.runtime import GenerationRequest, GenerationResult, StreamFinished

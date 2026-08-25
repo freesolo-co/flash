@@ -12,24 +12,14 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.inference_routes import _discard_prepared_stream
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
-from flash.serving.src.serving_io import _sse
-from flash.serving.src.settings import Settings
-from flash.serving.src.streaming import (
-    _produce_openai_chat_stream,
-    _StreamOutput,
-    openai_chat_stream,
-)
-from flash.serving.src.usage import (
+from flash.serving.src.accounting.usage import (
     _FREESOLO_USD_PER_MTOK,
     build_usage_session,
     freesolo_price,
     new_generation_id,
 )
-from flash.serving.src.usage_facts import usage_facts
-from flash.serving.src.usage_outbox import (
+from flash.serving.src.accounting.usage_facts import usage_facts
+from flash.serving.src.accounting.usage_outbox import (
     AcceptedPriceSnapshot,
     AuthoritativeProviderDay,
     DurableUsageOutbox,
@@ -44,6 +34,16 @@ from flash.serving.src.usage_outbox import (
     UsageEvent,
     UsageOutboxError,
 )
+from flash.serving.src.http.inference_routes import _discard_prepared_stream
+from flash.serving.src.http.router import AdapterRouter, build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.io.streaming import (
+    _produce_openai_chat_stream,
+    _sse,
+    _StreamOutput,
+    openai_chat_stream,
+)
+from flash.serving.src.store.settings import Settings
 from tests.serving.conftest import attest
 
 BASE_MODEL = "Qwen/Qwen3.5-9B"
@@ -1014,7 +1014,7 @@ def test_heartbeat_ignores_generation_terminalized_before_terminal_rpc_returns(
 
 
 def test_shutdown_timeout_is_observable_without_erasing_generation(monkeypatch) -> None:
-    import flash.serving.src.usage_outbox as usage_outbox_module
+    import flash.serving.src.accounting.usage_outbox as usage_outbox_module
 
     event = _usage_event()
     entered = asyncio.Event()

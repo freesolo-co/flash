@@ -8,9 +8,9 @@ from argparse import Namespace
 
 import pytest
 
-from flash.cli.commands.env.push import cmd_env_pull
-from flash.envs import loader as adapter
-from flash.envs.pull import (
+from flash.cli.commands.env.ops.push import cmd_env_pull
+from flash.envs.loading import loader as adapter
+from flash.envs.loading.pull import (
     download_environment_file_from_archive,
     pull_environment_package_from_archive,
 )

@@ -17,28 +17,33 @@ pytest_plugins = ("tests._helpers.server_api_plugin",)
 
 
 def test_chat_step_selector_prefers_current_revision_for_redeployed_step(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "done"
-    runner._save_status(status)
+    runner_state._save_status(status)
     revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-20." + "b" * 40]
     for revision in revisions:
-        runner.mark_checkpoint_deployed(
+        runner_transitions.mark_checkpoint_deployed(
             run_id,
             {
                 "state": "ready",
                 "endpoint_name": "https://serve.example",
                 "adapter_revision": revision,
             },
-            verification_generation=runner.verified_adapter_revision_generation(run_id),
+            verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+                run_id
+            ),
         )
-    assert runner.get_status(run_id).deployment["adapter_revision"] == revisions[1]
+    assert runner_status.get_status(run_id).deployment["adapter_revision"] == revisions[1]
     seen = {}
 
     def fake_chat(**kwargs):
@@ -58,15 +63,15 @@ def test_chat_step_selector_prefers_current_revision_for_redeployed_step(api, mo
 
 
 def test_chat_step_selector_rejects_multiple_verified_revisions(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
     revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-20." + "c" * 40]
     for revision in revisions:
-        generation = runner.verified_adapter_revision_generation(run_id)
-        assert runner.add_verified_adapter_revision(
+        generation = runner_verified_revisions.verified_adapter_revision_generation(run_id)
+        assert runner_verified_revisions.add_verified_adapter_revision(
             run_id,
             revision,
             expected_generation=generation,
@@ -90,7 +95,7 @@ def test_chat_step_selector_rejects_multiple_verified_revisions(api, monkeypatch
 
 
 def test_chat_rejects_missing_messages_before_invalid_explicit_revision(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -111,15 +116,15 @@ def test_chat_rejects_missing_messages_before_invalid_explicit_revision(api, mon
 
 
 def test_chat_rejects_malformed_messages_before_ambiguous_step(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
     revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-20." + "c" * 40]
     for revision in revisions:
-        generation = runner.verified_adapter_revision_generation(run_id)
-        assert runner.add_verified_adapter_revision(
+        generation = runner_verified_revisions.verified_adapter_revision_generation(run_id)
+        assert runner_verified_revisions.add_verified_adapter_revision(
             run_id,
             revision,
             expected_generation=generation,
@@ -141,15 +146,15 @@ def test_chat_rejects_malformed_messages_before_ambiguous_step(api, monkeypatch)
 
 
 def test_chat_step_selector_requires_a_verified_deployment(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
     revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@final." + "b" * 40]
     for revision in revisions:
-        generation = runner.verified_adapter_revision_generation(run_id)
-        assert runner.add_verified_adapter_revision(
+        generation = runner_verified_revisions.verified_adapter_revision_generation(run_id)
+        assert runner_verified_revisions.add_verified_adapter_revision(
             run_id,
             revision,
             expected_generation=generation,
@@ -174,7 +179,7 @@ def test_chat_step_selector_requires_a_verified_deployment(api, monkeypatch):
 
 
 def test_chat_rejects_adapter_revision_and_step_together(api, monkeypatch):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -200,7 +205,7 @@ def test_chat_rejects_adapter_revision_and_step_together(api, monkeypatch):
 
 @pytest.mark.parametrize("step", ["abc", 1.5, -1, True])
 def test_chat_rejects_invalid_step_selector(api, monkeypatch, step):
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -221,25 +226,27 @@ def test_chat_rejects_invalid_step_selector(api, monkeypatch, step):
 
 
 def test_chat_ready_record_without_ledger_membership_rejects_revision(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     revision = f"{run_id}@final." + "b" * 40
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "deployed"
     status.deployment = {
         "state": "ready",
         "endpoint_name": "https://serve.example",
         "adapter_revision": revision,
     }
-    runner._save_status(status)
+    runner_state._save_status(status)
 
-    assert "verification_generation" not in runner.get_status(run_id).deployment
-    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+    assert "verification_generation" not in runner_status.get_status(run_id).deployment
+    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
     monkeypatch.setattr(
         app_mod,
         "serve_chat",
@@ -260,15 +267,17 @@ def test_chat_ready_record_without_ledger_membership_rejects_revision(api, monke
 
 
 def test_chat_bare_alias_rejects_status_only_ready_record(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
-    runner._save_status(status)
-    assert runner.read_verified_adapter_revisions(run_id) == frozenset()
+    runner_state._save_status(status)
+    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
     monkeypatch.setattr(
         app_mod,
         "serve_chat",
@@ -286,25 +295,27 @@ def test_chat_bare_alias_rejects_status_only_ready_record(api, monkeypatch):
 
 
 def test_chat_bare_alias_rejects_confirmed_active_failed_record(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
     revision = f"{run_id}@final." + "a" * 40
-    runner.add_verified_adapter_revision(
+    runner_verified_revisions.add_verified_adapter_revision(
         run_id,
         revision,
-        expected_generation=runner.verified_adapter_revision_generation(run_id),
+        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
     )
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.deployment = {
         "state": "failed",
         "adapter_revision": revision,
         "alias_activation_confirmed": True,
         "error": "post-activation verification failed",
     }
-    runner._save_status(status)
+    runner_state._save_status(status)
     monkeypatch.setattr(
         app_mod,
         "serve_chat",
@@ -322,8 +333,9 @@ def test_chat_bare_alias_rejects_confirmed_active_failed_record(api, monkeypatch
 
 
 def test_chat_reconciling_alias_rejects_bare_and_allows_verified_revision(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -333,12 +345,14 @@ def test_chat_reconciling_alias_rejects_bare_and_allows_verified_revision(api, m
         "endpoint_name": "https://old.example",
         "adapter_revision": previous_revision,
     }
-    runner.mark_deployed(
+    runner_transitions.mark_deployed(
         run_id,
         previous,
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
-    runner.mark_deployment_pending(
+    runner_transitions.mark_deployment_pending(
         run_id,
         {
             "state": "reconciling",
@@ -377,32 +391,39 @@ def test_chat_reconciling_alias_rejects_bare_and_allows_verified_revision(api, m
 
     assert explicit.status_code == 200, explicit.text
     assert served_revisions == [previous_revision]
-    assert runner.read_verified_adapter_revisions(run_id) == frozenset({previous_revision})
+    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
+        {previous_revision}
+    )
 
 
 def test_chat_selects_immutable_revisions_independently(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "done"
-    runner._save_status(status)
+    runner_state._save_status(status)
     revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-40." + "b" * 40]
     for revision in revisions:
-        runner.mark_checkpoint_deployed(
+        runner_transitions.mark_checkpoint_deployed(
             run_id,
             {
                 "state": "ready",
                 "endpoint_name": "https://serve.example",
                 "adapter_revision": revision,
             },
-            verification_generation=runner.verified_adapter_revision_generation(run_id),
+            verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+                run_id
+            ),
         )
-    assert runner.read_verified_adapter_revisions(run_id) == frozenset(revisions)
+    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(revisions)
     seen = []
 
     def fake_chat(**kwargs):
@@ -426,25 +447,30 @@ def test_chat_selects_immutable_revisions_independently(api, monkeypatch):
 
 
 def test_chat_rejects_cross_run_immutable_revision(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "done"
-    runner._save_status(status)
+    runner_state._save_status(status)
     revision = f"{run_id}@final." + "a" * 40
-    runner.mark_deployed(
+    runner_transitions.mark_deployed(
         run_id,
         {
             "state": "ready",
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
     monkeypatch.setattr(
         app_mod,
@@ -466,8 +492,11 @@ def test_chat_rejects_cross_run_immutable_revision(api, monkeypatch):
 
 
 def test_chat_uses_saved_thinking_flag_not_payload_override(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
@@ -475,18 +504,20 @@ def test_chat_uses_saved_thinking_flag_not_payload_override(api, monkeypatch):
         json={"spec": {**SPEC, "thinking": True}, "dry_run": True},
         headers=_bearer(key),
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "done"
-    runner._save_status(status)
+    runner_state._save_status(status)
     revision = f"{run_id}@final." + "a" * 40
-    runner.mark_deployed(
+    runner_transitions.mark_deployed(
         run_id,
         {
             "state": "ready",
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
 
     seen = {}
@@ -512,25 +543,30 @@ def test_chat_uses_saved_thinking_flag_not_payload_override(api, monkeypatch):
 
 
 def test_chat_forwards_user_supplied_system_prompt(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "done"
-    runner._save_status(status)
+    runner_state._save_status(status)
     revision = f"{run_id}@final." + "a" * 40
-    runner.mark_deployed(
+    runner_transitions.mark_deployed(
         run_id,
         {
             "state": "ready",
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
 
     seen = {}
@@ -563,25 +599,30 @@ def test_chat_forwards_user_supplied_system_prompt(api, monkeypatch):
 def test_chat_serves_cancelled_run_with_active_checkpoint_deployment(api, monkeypatch):
     """A run cancelled mid-RL can deploy a per-step checkpoint (stays `cancelled`, listed active by
     /v1/deployments). The chat route must SERVE that live adapter, not 409 on the cancelled state."""
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "cancelled"
-    runner._save_status(status)
+    runner_state._save_status(status)
     revision = f"{run_id}@step-40." + "a" * 40
-    runner.mark_checkpoint_deployed(
+    runner_transitions.mark_checkpoint_deployed(
         run_id,
         {
             "state": "ready",
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
 
     monkeypatch.setattr(
@@ -610,15 +651,16 @@ def test_chat_serves_cancelled_run_with_active_checkpoint_deployment(api, monkey
 
 def test_chat_cancelled_run_without_deployment_is_409(api):
     """A cancelled run with no active deployment still 409s, pointing the user at `flash deploy`."""
-    import flash.runner as runner
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "cancelled"
-    runner._save_status(status)
+    runner_state._save_status(status)
 
     r = api.post(
         f"/v1/runs/{run_id}/chat",
@@ -630,20 +672,21 @@ def test_chat_cancelled_run_without_deployment_is_409(api):
 
 
 def test_chat_rejects_undeployed_record_with_previous_ready_deployment(api, monkeypatch):
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "done"
     status.deployment = {
         "state": "undeployed",
         "previous_deployment": {"state": "ready", "endpoint_name": "https://old.example"},
     }
-    runner._save_status(status)
+    runner_state._save_status(status)
     monkeypatch.setattr(
         app_mod,
         "serve_chat",
@@ -665,25 +708,30 @@ def test_chat_rejects_non_finite_sampling_params_with_400(api, monkeypatch):
 
     OverflowError is ArithmeticError, not TypeError or ValueError, so the guard must include it.
     """
-    import flash.runner as runner
-    import flash.server.app as app_mod
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    status = runner.get_status(run_id)
+    status = runner_status.get_status(run_id)
     status.state = "done"
-    runner._save_status(status)
+    runner_state._save_status(status)
     revision = f"{run_id}@final." + "a" * 40
-    runner.mark_deployed(
+    runner_transitions.mark_deployed(
         run_id,
         {
             "state": "ready",
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
-        verification_generation=runner.verified_adapter_revision_generation(run_id),
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
     )
     monkeypatch.setattr(app_mod, "serve_chat_stream", lambda **k: iter(["hi"]))
 

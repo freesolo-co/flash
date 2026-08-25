@@ -2,19 +2,32 @@ from __future__ import annotations
 
 import pytest
 
+import flash.serve.request.transport as transport
+from flash.serve.contract.errors import RetryableServingUnavailable
 from tests._helpers.chat_transport import StreamClient, StreamContext, StreamResponse
 
 
 @pytest.fixture(autouse=True)
 def _reset_chat_clients(monkeypatch):
-    import flash.serve.deploy as deploy
+    monkeypatch.setattr(transport, "_CHAT_HTTP_CLIENT", None)
 
-    monkeypatch.setattr(deploy, "_CHAT_HTTP_CLIENT", None)
-    monkeypatch.setattr(deploy, "_STREAM_HTTP_CLIENT", None)
+
+@pytest.mark.parametrize(
+    ("content_type", "expected"),
+    [
+        ("text/event-stream", True),
+        ("Text/Event-Stream; Charset=UTF-8", True),
+        ("application/x-text/event-stream", False),
+        ("text/event-stream-extra", False),
+        ("", False),
+    ],
+)
+def test_event_stream_content_type_requires_exact_media_type(content_type, expected):
+    assert transport.is_event_stream_content_type(content_type) is expected
 
 
 def test_chat_classifies_retryable_alias_smoke_503_for_the_expected_revision(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     run_id = "run-1"
     revision = f"{run_id}@final." + "a" * 40
@@ -53,7 +66,7 @@ def test_chat_classifies_retryable_alias_smoke_503_for_the_expected_revision(mon
 
     monkeypatch.setattr(d.httpx, "Client", Client)
 
-    with pytest.raises(d.RetryableServingUnavailable) as exc_info:
+    with pytest.raises(RetryableServingUnavailable) as exc_info:
         d.chat(
             run_id,
             [{"role": "user", "content": "hello"}],
@@ -82,7 +95,7 @@ def test_chat_classifies_retryable_alias_smoke_503_for_the_expected_revision(mon
     ],
 )
 def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     revision = "run-1@final." + "a" * 40
 
@@ -131,7 +144,7 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
 
 def test_chat_posts_to_freesolo_serving(monkeypatch):
     """A terminal /v1 override produces one OpenAI path for direct chat."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -153,7 +166,7 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
             return completion
 
     class _FakeClient:
-        # chat() uses an explicit httpx.Client (context manager) so it can follow Modal's 303
+        # chat() uses an explicit httpx client context manager so it can follow modal's 303
         # async-result redirects; the fake records the call and the client kwargs.
         def __init__(self, *args, **kwargs):
             seen["client_kwargs"] = kwargs
@@ -179,24 +192,24 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
         thinking=True,
     )
     assert seen["url"] == "https://serve.example/v1/chat/completions"
-    # Modal 303-redirects slow ASGI requests to an async-result poll URL, so the chat client
-    # MUST follow redirects (else httpx raises on the 303 mid cold-start).
+    # modal 303-redirects slow asgi requests to an async-result poll url, so the chat client
+    # must follow redirects (else httpx raises on the 303 mid cold-start).
     assert seen["client_kwargs"]["follow_redirects"] is True
     assert seen["json"]["model"] == "flash-7-abcd"
     assert seen["json"]["max_tokens"] == 8
     assert seen["json"]["messages"] == [{"role": "user", "content": "2+2?"}]
-    # Per-run thinking parity: the thinking flag is forwarded to the chat template so a
+    # per-run thinking parity: the thinking flag is forwarded to the chat template so a
     # thinking-trained adapter serves with thinking (not silently dropped).
     assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
-    # The OpenAI shape is preserved so resp["choices"][0]["message"]["content"] works.
+    # the openai shape is preserved so resp["choices"][0]["message"]["content"] works.
     assert out["choices"][0]["message"]["content"] == "hi there"
-    # The control plane is a trusted serving caller, so it presents the internal key — this is
+    # the control plane is a trusted serving caller, so it presents the internal key; this is
     # what lets `flash chat` keep working when the serving app enforces external chat auth.
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
 
 
 def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -214,7 +227,7 @@ def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkey
             requests.append((url, kwargs))
             return Response()
 
-    monkeypatch.setattr(d, "_chat_http_client", Client)
+    monkeypatch.setattr(transport, "_chat_http_client", Client)
 
     messages = [{"role": "user", "content": "hello"}]
     d.chat("run-1", messages, structured_outputs={})
@@ -230,7 +243,7 @@ def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkey
 
 
 def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     seen = {}
     exits = []
@@ -247,8 +260,8 @@ def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch
         },
     )
     client = StreamClient(StreamContext(upstream, exits), seen)
-    monkeypatch.setattr(d, "_stream_http_client", lambda: client)
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
     response = d.chat_sse(
         "run-1",
         [{"role": "user", "content": "hi"}],
@@ -285,14 +298,14 @@ def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch
 
 
 def test_chat_sse_stops_at_done_and_ignores_trailing_incomplete_bytes(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     terminal = b"data: [DONE]\r\n\r\n"
     exits = []
     upstream = StreamResponse(byte_chunks=(terminal + b"trailing incomplete bytes",))
     client = StreamClient(StreamContext(upstream, exits))
-    monkeypatch.setattr(d, "_stream_http_client", lambda: client)
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
 
     frames = list(d.chat_sse("run-1", [{"role": "user", "content": "hi"}]).iter_bytes())
 
@@ -301,7 +314,7 @@ def test_chat_sse_stops_at_done_and_ignores_trailing_incomplete_bytes(monkeypatc
 
 
 def test_chat_sse_stops_at_error_without_reading_trailing_bytes(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     terminal = b'data: {"error":{"message":"engine failed"}}\n\n'
     trailing_reads = []
@@ -314,8 +327,8 @@ def test_chat_sse_stops_at_error_without_reading_trailing_bytes(monkeypatch):
 
     upstream = StreamResponse(byte_chunks=chunks())
     client = StreamClient(StreamContext(upstream, exits))
-    monkeypatch.setattr(d, "_stream_http_client", lambda: client)
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
 
     frames = list(d.chat_sse("run-1", [{"role": "user", "content": "hi"}]).iter_bytes())
 
@@ -325,14 +338,14 @@ def test_chat_sse_stops_at_error_without_reading_trailing_bytes(monkeypatch):
 
 
 def test_chat_sse_close_before_first_byte_releases_upstream(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     exits = []
 
     upstream = StreamResponse(byte_chunks=(b"data: [DONE]\n\n",))
     client = StreamClient(StreamContext(upstream, exits))
-    monkeypatch.setattr(d, "_stream_http_client", lambda: client)
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
     response = d.chat_sse("run-1", [{"role": "user", "content": "hi"}])
     body = response.iter_bytes()
 
@@ -342,14 +355,14 @@ def test_chat_sse_close_before_first_byte_releases_upstream(monkeypatch):
 
 
 def test_chat_sse_close_without_exhaustion_releases_upstream(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     exits = []
 
     upstream = StreamResponse(byte_chunks=(b'data: {"choices":[]}\n\n', b"data: [DONE]\n\n"))
     client = StreamClient(StreamContext(upstream, exits))
-    monkeypatch.setattr(d, "_stream_http_client", lambda: client)
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
     response = d.chat_sse("run-1", [{"role": "user", "content": "hi"}])
     body = response.iter_bytes()
 
@@ -359,15 +372,15 @@ def test_chat_sse_close_without_exhaustion_releases_upstream(monkeypatch):
 
 
 def test_chat_sse_complete_frame_without_done_raises_after_preserving_bytes(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
     from flash.client.http import ClientError
 
     frame = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
 
     upstream = StreamResponse(byte_chunks=(frame,))
     client = StreamClient(StreamContext(upstream))
-    monkeypatch.setattr(d, "_stream_http_client", lambda: client)
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
     stream = d.chat_sse("run-1", [{"role": "user", "content": "hi"}]).iter_bytes()
 
     assert next(stream) == frame
@@ -376,7 +389,7 @@ def test_chat_sse_complete_frame_without_done_raises_after_preserving_bytes(monk
 
 
 def test_chat_preserves_pre_managed_parity_positional_order(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     seen = {}
 
@@ -395,8 +408,8 @@ def test_chat_preserves_pre_managed_parity_positional_order(monkeypatch):
             seen.update({"url": url, **kwargs})
             return Response()
 
-    monkeypatch.setattr(d, "_chat_http_client", lambda: Client())
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: Client())
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
     d.chat(
         "run-1",
         [{"role": "user", "content": "hi"}],
@@ -425,7 +438,7 @@ def test_chat_preserves_pre_managed_parity_positional_order(monkeypatch):
 
 
 def test_chat_posts_supported_managed_fields(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     seen = {}
 
@@ -444,8 +457,8 @@ def test_chat_posts_supported_managed_fields(monkeypatch):
             seen.update({"url": url, **kwargs})
             return _Response()
 
-    monkeypatch.setattr(d, "_chat_http_client", lambda: _Client())
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: _Client())
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
     d.chat(
         "run-1",
         [{"role": "user", "content": "hi"}],
@@ -469,7 +482,7 @@ def test_chat_posts_supported_managed_fields(monkeypatch):
 
 def test_chat_stream_yields_openai_sse_content(monkeypatch):
     """A terminal /v1 override produces one OpenAI path for streaming chat."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
@@ -536,7 +549,7 @@ def test_chat_stream_yields_openai_sse_content(monkeypatch):
     assert chunks == ["hi", " there"]
     assert seen["client_kwargs"]["follow_redirects"] is True
     assert seen["method"] == "POST"
-    # Trusted-caller bypass: chat_stream presents the internal key, like the non-streaming chat.
+    # trusted-caller bypass: chat_stream presents the internal key, like the non-streaming chat.
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
     assert seen["url"] == "https://serve.example/v1/chat/completions"
     assert seen["json"]["stream"] is True
@@ -544,11 +557,12 @@ def test_chat_stream_yields_openai_sse_content(monkeypatch):
     assert seen["json"]["chat_template_kwargs"] == {"enable_thinking": True}
 
 
-def test_chat_stream_uses_the_deploy_delimiter_patch_seam(monkeypatch):
-    import flash.serve.deploy as d
+def test_chat_stream_uses_the_thinking_delimiter_patch_seam(monkeypatch):
+    import flash.serve.deployment.deploy as d
+    import flash.serve.request.thinking as thinking
 
     calls = []
-    real_find_delimiter = d._find_delimiter
+    real_find_delimiter = thinking._find_delimiter
 
     def counting_find(buffer: str, start: int) -> int:
         calls.append((buffer, start))
@@ -569,9 +583,9 @@ def test_chat_stream_uses_the_deploy_delimiter_patch_seam(monkeypatch):
         )
     )
     client = StreamClient(StreamContext(upstream))
-    monkeypatch.setattr(d, "_stream_http_client", lambda: client)
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
-    monkeypatch.setattr(d, "_find_delimiter", counting_find)
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(thinking, "_find_delimiter", counting_find)
 
     assert (
         "".join(d.chat_stream("run-1", [{"role": "user", "content": "hi"}], thinking=True))
@@ -581,7 +595,7 @@ def test_chat_stream_uses_the_deploy_delimiter_patch_seam(monkeypatch):
 
 
 def test_chat_stream_rejects_sse_eof_without_done(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
     from flash.client.http import ClientError
 
     class _StreamResp:
@@ -622,7 +636,7 @@ def test_chat_stream_accepts_json_fallback(monkeypatch, content_type):
     """
     import httpx
 
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
 
@@ -648,7 +662,7 @@ def test_chat_stream_accepts_json_fallback(monkeypatch, content_type):
 
 
 def test_chat_stream_does_not_treat_a_non_json_media_type_as_json(monkeypatch):
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     upstream = StreamResponse(
         headers={"content-type": "text/application/json"},
@@ -660,22 +674,21 @@ def test_chat_stream_does_not_treat_a_non_json_media_type_as_json(monkeypatch):
         ),
     )
     client = StreamClient(StreamContext(upstream))
-    monkeypatch.setattr(d, "_stream_http_client", lambda: client)
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
 
     assert list(d.chat_stream("run-1", [{"role": "user", "content": "hi"}])) == ["streamed"]
 
 
 def _erroring_stream_seams(monkeypatch, resp):
     """Point the chat_stream seams at a fake client whose stream() yields ``resp``."""
-    import flash.serve.deploy as d
 
     class _FakeClient:
         def stream(self, method, url, **kwargs):
             return resp
 
-    monkeypatch.setattr(d, "_stream_http_client", lambda: _FakeClient())
-    monkeypatch.setattr(d, "serving_openai_base_url", lambda: "https://serve.example/v1")
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: _FakeClient())
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
 
 
 def test_chat_stream_upstream_error_raises_before_first_chunk(monkeypatch):
@@ -688,7 +701,7 @@ def test_chat_stream_upstream_error_raises_before_first_chunk(monkeypatch):
     """
     import httpx
 
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     exits = []
 
@@ -741,7 +754,7 @@ def test_chat_stream_midstream_failure_raises_and_closes_upstream(monkeypatch):
 
     The propagating exception is what makes the serving route abort the chunked body, so the
     client sees a truncated transfer rather than a clean eof."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     resp = _MidstreamFailureResp()
     _erroring_stream_seams(monkeypatch, resp)
@@ -759,7 +772,7 @@ def test_chat_stream_close_without_iterating_closes_upstream(monkeypatch):
     chat_stream opens the upstream connection eagerly, so the returned generator must already
     be running: close() on a never-started generator skips the finally that exits the httpx
     stream context."""
-    import flash.serve.deploy as d
+    import flash.serve.deployment.deploy as d
 
     resp = _MidstreamFailureResp()
     _erroring_stream_seams(monkeypatch, resp)

@@ -4,7 +4,7 @@ verl writes a full training checkpoint per save step, in a layout that differs b
 ppo trainers. These helpers find the right directory inside it, work out which steps are already
 complete, and export the one flash actually deploys.
 
-Split out of `flash.engine.worker.backend_common` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.backend_common` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
@@ -31,13 +31,13 @@ from flash.adapters.lora_rank import (
     lora_tensor_rank_disagrees,
     strict_declared_lora_ranks,
 )
-from flash.engine.verl_checkpoint import (
+from flash.engine.support.verl_checkpoint import (
     VERL_FSDP_CONFIG_FILE,
     FsdpCheckpointInspection,
     FsdpManifestFile,
     inspect_fsdp_checkpoint_manifest,
 )
-from flash.engine.verl_policy import FsdpGeneration
+from flash.engine.support.verl_policy import FsdpGeneration
 from flash.engine.worker.model.lora import (
     _open_safetensors_numpy,
     _read_adapter_tensor_metadata,
@@ -115,7 +115,7 @@ def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
 
 def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
     """stream merger output and prefer direct disk evidence over a short-write marker."""
-    from flash.engine.worker import backend_common
+    from flash.engine.worker.train.entry import backend_common
 
     disk_line = ""
     short_write_line = ""
@@ -318,6 +318,47 @@ def inspect_resume_checkpoint(
     )
 
 
+def restore_verl_resume(
+    local_dir: str,
+    *,
+    world_size: int,
+    expected_fsdp_generation: FsdpGeneration,
+    job_label: str,
+) -> int:
+    """select, inspect once, and stage the newest loadable streamed checkpoint.
+
+    the artifact fetch prefers a lower loadable checkpoint over a higher incompatible one, so a
+    repeated discard cannot starve compatible state uploaded after the rejected checkpoint. the
+    cached inspection is passed into staging so selection and diagnostics share one verdict.
+    """
+    import flash.engine.worker.io.hf as worker_hf
+
+    inspections: dict[str, FsdpCheckpointInspection] = {}
+
+    def prefer(path: str) -> bool:
+        inspection = inspections.get(path)
+        if inspection is None:
+            inspection = inspect_resume_checkpoint(
+                path,
+                world_size=world_size,
+                expected_fsdp_generation=expected_fsdp_generation,
+            )
+            inspections[path] = inspection
+        return inspection.loadable
+
+    resume = worker_hf.hf_resume_checkpoint(prefer=prefer)
+    if not resume:
+        return 0
+    return stage_verl_resume(
+        resume,
+        local_dir,
+        job_label=job_label,
+        world_size=world_size,
+        expected_fsdp_generation=expected_fsdp_generation,
+        inspection=inspections.get(resume),
+    )
+
+
 def resume_topology_matches(
     resume_dir: str,
     *,
@@ -326,7 +367,7 @@ def resume_topology_matches(
     job_label: str,
     inspection: FsdpCheckpointInspection | None = None,
 ) -> bool:
-    """Inspect one native checkpoint and report why it is discarded."""
+    """inspect one native checkpoint and report why it is discarded."""
     if inspection is None:
         inspection = inspect_resume_checkpoint(
             resume_dir,

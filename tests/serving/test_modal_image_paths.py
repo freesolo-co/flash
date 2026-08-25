@@ -16,8 +16,8 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-MODAL_APP = ROOT / "flash" / "serving" / "modal_app.py"
-SERVING_README = ROOT / "flash" / "serving" / "README.md"
+MODAL_APP = ROOT / "flash" / "serving" / "app" / "modal_app.py"
+SERVING_README = ROOT / "flash" / "serving" / "app" / "README.md"
 DEPLOY_WORKFLOWS = ("deploy-modal.yml", "deploy-modal-dev.yml")
 
 
@@ -35,14 +35,17 @@ def _assigned_value(name: str) -> ast.expr:
 
 
 def test_repo_dir_walks_up_to_the_actual_repo_root() -> None:
-    # SERVING_DIR is flash/serving/, so the repo root is two parents up, not one. a single .parent
-    # resolves to flash/, where load_dotenv finds no .env and silently returns -- a production deploy
-    # then runs with none of its secrets and fails at request time rather than at deploy time.
-    assert MODAL_APP.parent.parent.parent == ROOT
+    # SERVING_DIR is flash/serving/app/, so the repo root is three parents up. too few resolves
+    # inside the flash package, where load_dotenv finds no .env and silently returns -- a production
+    # deploy then runs with none of its secrets and fails at request time, not at deploy time.
+    assert MODAL_APP.parent.parent.parent.parent == ROOT
     assert (ROOT / "pyproject.toml").is_file()
 
+    # derived from the file's real depth rather than hardcoded, so a later move of the app updates
+    # the expectation with it instead of leaving this passing against a stale literal.
+    depth = len(MODAL_APP.parent.relative_to(ROOT).parts)
     source = ast.unparse(_assigned_value("REPO_DIR"))
-    assert source == "SERVING_DIR.parent.parent", source
+    assert source == "SERVING_DIR" + ".parent" * depth, source
 
 
 def test_image_installs_from_a_pyproject_that_exists() -> None:
@@ -85,8 +88,8 @@ def test_hosted_deploy_docs_and_workflows_point_at_paths_that_exist() -> None:
     readme = SERVING_README.read_text(encoding="utf-8")
     assert "cd serving" not in readme
     # both documented deploys must name the app by its repo-root-relative path.
-    assert readme.count("modal deploy flash/serving/modal_app.py") == 1
-    assert readme.count("modal deploy --env dev flash/serving/modal_app.py") == 1
+    assert readme.count("modal deploy flash/serving/app/modal_app.py") == 1
+    assert readme.count("modal deploy --env dev flash/serving/app/modal_app.py") == 1
     assert readme.count('export FREESOLO_DEPLOYMENT_ID="manual-production-') == 1
     assert readme.count('export FREESOLO_DEPLOYMENT_ID="manual-development-') == 1
 

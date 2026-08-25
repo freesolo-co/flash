@@ -18,12 +18,16 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.entry.worker as worker_entry
+import flash.engine.worker.io.hf as worker_hf
+import flash.engine.worker.train.opd.orchestration.failures as opd_failures
 from flash.content.multimodal import message_content_text
 from flash.engine.profiling.sft_image_rows import _serialize_multimodal_inputs
-from flash.engine.worker.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.entry.sft import _pretokenize_completion_only
 from flash.engine.worker.runtime.kernel_warmup import KERNEL_CACHE_ENV_SUBDIRS
-from flash.engine.worker.sft_train import (
+from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
+from flash.engine.worker.train.entry.backend_common import parse_verl_metric, verl_step_number
+from flash.engine.worker.train.entry.sft_train import (
     _CHILD_ENV_PREFIXES,
     _LORAPLUS_READY_MARKER,
     _MAX_ZERO_GRAD_STEPS,
@@ -34,7 +38,6 @@ from flash.engine.worker.sft_train import (
     _write_sft_parquet,
     build_sft_overrides,
 )
-from flash.engine.worker.train.core.checkpoint_lifecycle import CheckpointLedger
 from flash.engine.worker.train.sft.child import plugin as sft_plugin
 
 # distinct from `flash.__version__` on purpose: the worker resolves that to "0+unknown" (no flash
@@ -244,7 +247,7 @@ def test_sft_pins_ulysses_off_because_sequence_parallelism_breaks_gdn():
     """
     import inspect
 
-    from flash.engine.worker import sft_train_runner
+    from flash.engine.worker.train.entry import sft_train_runner
     from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
     src = inspect.getsource(sft_train_runner._prepare_sft_child)
@@ -267,7 +270,7 @@ def test_sft_card_count_never_starves_a_rank_of_its_batch():
     exact-unpacked run, which is exactly what a GDN model without the boundary-reset contract
     gets -- so a 2-card allocation would otherwise compute 1 // 2 == 0 and die before step 1.
     """
-    from flash.engine.worker.sft_train_runner import sft_data_parallel_cards
+    from flash.engine.worker.train.entry.sft_train_runner import sft_data_parallel_cards
 
     # unpacked: one example cannot be split, so extra cards have nothing to hold.
     for cards in (1, 2, 4, 8):
@@ -304,7 +307,7 @@ def test_sft_warns_while_the_run_is_live_when_it_leaves_cards_idle(monkeypatch, 
     The notes record the executed width, and those are read afterwards -- the warning is what makes
     the waste visible in `flash runs log` in time to cancel and resubmit.
     """
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)
 
@@ -371,7 +374,7 @@ def test_sft_idle_card_warning_names_a_remedy_that_can_actually_work():
     an odd rank count as an allocation buys the next one DOWN -- "allocate 3" gets 2 cards, which
     can leave a run that only fit on 4 unplaceable.
     """
-    from flash.engine.worker.sft_train_runner import _resolve_sft_world_size
+    from flash.engine.worker.train.entry.sft_train_runner import _resolve_sft_world_size
 
     unpacked = io.StringIO()
     with contextlib.redirect_stdout(unpacked):
@@ -419,7 +422,7 @@ def test_sft_quote_credits_only_the_ranks_that_will_execute():
 
 def test_sft_stays_quiet_when_every_allocated_card_is_used(monkeypatch, capsys):
     """The warning must not fire on the normal path, or it trains readers to ignore it."""
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     spec, _ = _stub_sft_run(monkeypatch)
 
@@ -448,7 +451,7 @@ def test_sft_launches_the_resolved_width_not_the_allocated_cards():
     """
     import inspect
 
-    from flash.engine.worker import sft_train_runner
+    from flash.engine.worker.train.entry import sft_train_runner
 
     src = inspect.getsource(sft_train_runner._prepare_sft_child)
     # the ARGUMENT line, not a comment that happens to name the flag -- match on the f-string so a
@@ -498,7 +501,7 @@ def test_remove_padding_is_unconditional():
     """
     import inspect
 
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     src = inspect.getsource(sft_train.run_sft_train)
     line = next(
@@ -1857,7 +1860,7 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
 
 
 def test_sft_plugin_config_carries_the_canonical_loraplus_marker(tmp_path):
-    from flash.engine.worker import sft_train_runner
+    from flash.engine.worker.train.entry import sft_train_runner
 
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()
@@ -1981,7 +1984,7 @@ def test_shipped_shim_carries_the_exact_dataloader_patch(monkeypatch):
     """
     import pathlib
 
-    import flash.engine.worker.sft_train as sft_train_module
+    import flash.engine.worker.train.entry.sft_train as sft_train_module
 
     plugin_source = pathlib.Path(sft_plugin.__file__).read_text()
     runner_source = (
@@ -2074,7 +2077,7 @@ def test_sft_plugin_config_carries_multimodal_for_the_vision_hook():
     """the child cannot see the workload, so the parent must ship the multimodal flag."""
     import inspect
 
-    from flash.engine.worker import sft_train_runner
+    from flash.engine.worker.train.entry import sft_train_runner
 
     writer = inspect.getsource(sft_train_runner._write_sft_child_shims)
     assert '"multimodal": bool(multimodal),' in writer
@@ -2135,7 +2138,7 @@ def test_zero_grad_norm_fails_the_run(monkeypatch, lines):
     lands on the shipped guard -- this test used to define its own copy of the guard body and
     assert against that, which meant it could not fail no matter what the worker did.
     """
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
 
@@ -2175,7 +2178,7 @@ def test_zero_grad_norm_fails_the_run(monkeypatch, lines):
 )
 def test_healthy_grad_norms_do_not_trip_the_guard(monkeypatch, lines):
     """the guard must not fail a run that is training: any nonzero norm resets the count."""
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     spec, _ = _stub_sft_run(monkeypatch)
 
@@ -2345,8 +2348,8 @@ def test_child_env_carries_every_baked_kernel_cache_dir(monkeypatch, tmp_path):
 
 
 def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_path):
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
 
     checkpoint_dir = tmp_path / "checkpoints" / "global_step_5"
     actor_dir = checkpoint_dir / "actor"
@@ -2404,8 +2407,8 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
 def test_checkpoint_watcher_exports_the_sft_layout(monkeypatch, tmp_path):
     # this is the layout verl's sft trainer actually writes: shards + huggingface/ directly under
     # global_step_N. exporting <dir>/actor here hands the merger a path that does not exist.
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
 
     checkpoint_dir = tmp_path / "checkpoints" / "global_step_5"
     (checkpoint_dir / "huggingface").mkdir(parents=True)
@@ -2454,8 +2457,8 @@ def test_a_required_save_survives_verl_pruning_it_mid_publish(monkeypatch, tmp_p
     deletes verl's directory the way verl would, then reads the source it was handed. before staging,
     that read fails and takes the whole paid run down with a required-save error.
     """
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
     checkpoint_dir = local_dir / "global_step_2"
@@ -2506,16 +2509,16 @@ def test_a_required_save_survives_verl_pruning_it_mid_publish(monkeypatch, tmp_p
 
 
 def test_resume_credits_only_required_saves_that_are_durable(monkeypatch):
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
 
     class Api:
         def file_exists(self, *, filename, **kwargs):
             return "/step-3/" in filename
 
-    monkeypatch.setattr(worker, "HF_REPO", "owner/artifacts")
+    monkeypatch.setattr(worker._worker_state, "HF_REPO", "owner/artifacts")
     monkeypatch.setattr(worker, "hf_prefix", lambda: "sft/run")
-    monkeypatch.setattr(worker, "hf_api", Api)
+    monkeypatch.setattr(worker_hf, "hf_api", Api)
 
     assert sft_train._durable_required_save_steps((3, 5, 9), 5) == {3}
 
@@ -2546,9 +2549,9 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
     ``verl.model_merger`` and re-uploads multi-GB state hf already holds, holding the single
     resume-upload lock while the first genuinely new checkpoint waits behind it.
     """
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
-    from flash.engine.worker.backend_common import stage_verl_resume
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
+    from flash.engine.worker.train.entry.backend_common import stage_verl_resume
 
     local_dir = tmp_path / "checkpoints"
     local_dir.mkdir()
@@ -2632,8 +2635,15 @@ def _stub_sft_run(
     """
     import flash.core.catalog as catalog
     import flash.engine.plan.vram as vram
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.heartbeat as worker_heartbeat
+    import flash.engine.worker.io.hf as worker_hf
+    import flash.engine.worker.io.wandb_log as worker_wandb
+    import flash.engine.worker.model.adapter as worker_adapter
+    import flash.engine.worker.perf as worker_perf
+    import flash.engine.worker.runtime.rng as worker_rng
+    import flash.engine.worker.runtime.state as worker_state
+    import flash.engine.worker.train.core.lifecycle.finalize as worker_finalize
+    from flash.engine.worker.train.entry import sft_train
 
     monkeypatch.setattr(catalog, "resolve_vocab_size", lambda *_args, **_kwargs: 151936)
 
@@ -2848,36 +2858,36 @@ def _stub_sft_run(
         ),
     )
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
-    monkeypatch.setattr(worker, "SEED", 7)
-    monkeypatch.setattr(worker, "RUN_ID", "test-sft-verl-orchestration")
-    monkeypatch.setattr(worker, "THINKING", False)
-    monkeypatch.setattr(worker, "JOB_SPEC", spec)
-    monkeypatch.setattr(worker, "require_active_env", EnvClass)
+    monkeypatch.setattr(worker_state, "SEED", 7)
+    monkeypatch.setattr(worker_state, "RUN_ID", "test-sft-verl-orchestration")
+    monkeypatch.setattr(worker_state, "THINKING", False)
+    monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
+    monkeypatch.setattr(worker_state, "require_active_env", EnvClass)
     monkeypatch.setattr(
-        worker,
+        worker_heartbeat,
         "heartbeat",
         lambda stage, **fields: captured["heartbeats"].append((stage, fields)),
     )
-    monkeypatch.setattr(worker, "gpu_diagnostics", lambda **kwargs: {})
-    monkeypatch.setattr(worker, "prefetch_model", lambda *args, **kwargs: 1.25)
-    monkeypatch.setattr(worker, "load_tokenizer", lambda *args, **kwargs: Tokenizer())
-    monkeypatch.setattr(worker, "make_lora", lambda model_id: LoraConfig())
-    monkeypatch.setattr(worker, "grad_checkpointing_on", capture_grad_checkpointing)
-    monkeypatch.setattr(worker, "grpo_use_reentrant", lambda model_id: False)
-    monkeypatch.setattr(worker, "backend_seed", lambda seed: seed)
-    monkeypatch.setattr(worker, "wandb_run_name", lambda: "flash-sft-test")
+    monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **kwargs: {})
+    monkeypatch.setattr(worker_hf, "prefetch_model", lambda *args, **kwargs: 1.25)
+    monkeypatch.setattr(worker_hf, "load_tokenizer", lambda *args, **kwargs: Tokenizer())
+    monkeypatch.setattr(worker_adapter, "make_lora", lambda model_id: LoraConfig())
+    monkeypatch.setattr(worker_perf, "grad_checkpointing_on", capture_grad_checkpointing)
+    monkeypatch.setattr(worker_perf, "grpo_use_reentrant", lambda model_id: False)
+    monkeypatch.setattr(worker_rng, "backend_seed", lambda seed: seed)
+    monkeypatch.setattr(worker_wandb, "wandb_run_name", lambda: "flash-sft-test")
     monkeypatch.setattr(
-        worker,
+        worker_hf,
         "hf_upload_folder",
         lambda local, remote, required=False: captured["uploads"].append((local, remote, required)),
     )
     monkeypatch.setattr(
-        worker,
+        worker_hf,
         "publish_deployable_checkpoint",
         lambda adapter, step, **kwargs: captured["published"].append((adapter, step)),
     )
     monkeypatch.setattr(
-        worker,
+        worker_finalize,
         "write_train_meta",
         lambda **kwargs: captured.__setitem__("meta", kwargs),
     )
@@ -2934,7 +2944,7 @@ def _stub_sft_run(
 
 
 def test_sft_warns_when_every_selected_row_is_a_coerced_singleturn_target(monkeypatch, capsys):
-    from flash.engine.worker import sft_train, sft_train_runner
+    from flash.engine.worker.train.entry import sft_train, sft_train_runner
 
     spec, _captured = _stub_sft_run(monkeypatch, raw_output_fallback=True)
     monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
@@ -2950,7 +2960,7 @@ def test_sft_warns_when_every_selected_row_is_a_coerced_singleturn_target(monkey
 def test_sft_collapse_warning_stays_quiet_when_environment_hook_handles_raw_rows(
     monkeypatch, capsys
 ):
-    from flash.engine.worker import sft_train, sft_train_runner
+    from flash.engine.worker.train.entry import sft_train, sft_train_runner
 
     spec, _captured = _stub_sft_run(monkeypatch, missing_output=True)
     monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
@@ -2963,7 +2973,7 @@ def test_sft_collapse_warning_stays_quiet_when_environment_hook_handles_raw_rows
 
 
 def test_sft_collapse_warning_stays_quiet_for_structured_multiturn_targets(monkeypatch, capsys):
-    from flash.engine.worker import sft_train, sft_train_runner
+    from flash.engine.worker.train.entry import sft_train, sft_train_runner
 
     spec, _captured = _stub_sft_run(monkeypatch, structured_targets=True)
     monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
@@ -2978,7 +2988,7 @@ def test_sft_collapse_warning_stays_quiet_for_structured_multiturn_targets(monke
 
 
 def test_sft_runner_logs_role_aware_and_fallback_multiturn_counts_separately(monkeypatch, capsys):
-    from flash.engine.worker import sft_train, sft_train_runner
+    from flash.engine.worker.train.entry import sft_train, sft_train_runner
 
     spec, _captured = _stub_sft_run(monkeypatch)
     real_prepare = sft_train.prepare_sft_workload
@@ -3013,7 +3023,7 @@ def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monk
     like a stringified scalar, so only provenance keeps the warning quiet -- and firing here would
     tell users to encode message lists they have already encoded.
     """
-    from flash.engine.worker import sft_train, sft_train_runner
+    from flash.engine.worker.train.entry import sft_train, sft_train_runner
 
     spec, _captured = _stub_sft_run(monkeypatch, structured_singleturn=True)
     monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
@@ -3027,7 +3037,7 @@ def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monk
 
 def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     monkeypatch.setenv("PYTHONPATH", "synthetic-sft-parent-path")
     monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PYTHONPATH")
@@ -3087,7 +3097,7 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
 
 def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monkeypatch):
     """the final export must carry the same text-only policy as both step checkpoints."""
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     exports = []
 
@@ -3191,7 +3201,7 @@ def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monke
 
 @pytest.mark.parametrize("multimodal", [True, False])
 def test_sft_runner_carries_the_prepared_processor_to_every_export(monkeypatch, multimodal):
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     captured = {}
 
@@ -3239,7 +3249,7 @@ def test_sft_runner_carries_the_prepared_processor_to_every_export(monkeypatch, 
 
 def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypatch):
     """the seed has to happen in the runner, before the watcher's thread takes its first sweep."""
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     seeded = {}
 
@@ -3282,7 +3292,7 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     the previous attempt's per-step deployable publish is best-effort (``required=False``) while
     its resume upload is not, so hf can hold the resumable state without the servable adapter.
     """
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)
     # max_steps is 2, so resuming at 2 means the watcher never runs and finalization is the only
@@ -3305,7 +3315,7 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
 
 def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
     from flash.engine.plan import vram
-    from flash.engine.worker import sft_train_runner
+    from flash.engine.worker.train.entry import sft_train_runner
 
     class LoraConfig:
         r = 16
@@ -3337,10 +3347,14 @@ def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
         realized_max_length=128,
         train_file="/train.parquet",
     )
-    monkeypatch.setattr(sft_train_runner._w, "prefetch_model", lambda *_args, **_kwargs: 0.0)
-    monkeypatch.setattr(sft_train_runner._w, "heartbeat", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(sft_train_runner._w, "gpu_diagnostics", lambda **_kwargs: {})
-    monkeypatch.setattr(sft_train_runner._w, "make_lora", lambda _model: LoraConfig())
+    monkeypatch.setattr(
+        sft_train_runner._worker_hf, "prefetch_model", lambda *_args, **_kwargs: 0.0
+    )
+    monkeypatch.setattr(
+        sft_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(sft_train_runner._worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
+    monkeypatch.setattr(sft_train_runner._worker_adapter, "make_lora", lambda _model: LoraConfig())
     monkeypatch.setattr(sft_train_runner._sft_train, "_warmstart_adapter_path", lambda *_args: None)
     monkeypatch.setattr(sft_train_runner._sft_train, "_resolve_sft_vocab_size", lambda *_args: 100)
     monkeypatch.setattr(
@@ -3389,7 +3403,7 @@ def test_worker_uses_the_accepted_unpacked_quote_when_its_stack_can_pack(monkeyp
     worker recomputation, but the child batch and update horizon must remain the quoted shape.
     """
     from flash.engine.profiling import sft_workload
-    from flash.engine.worker import sft_train, sft_train_runner
+    from flash.engine.worker.train.entry import sft_train, sft_train_runner
 
     spec, _captured = _stub_sft_run(monkeypatch)
     monkeypatch.setattr(sft_workload, "probe_is_gdn_hybrid", lambda _m, revision="": True)
@@ -3426,7 +3440,7 @@ def test_the_child_caps_at_the_quoted_horizon_without_an_authored_max_steps(monk
     the rows makes the realized epoch longer than the quote assumed. verl stops at
     total_training_steps, so leaving it unset would run past the horizon the run was priced for.
     """
-    from flash.engine.worker import sft_train, sft_train_runner
+    from flash.engine.worker.train.entry import sft_train, sft_train_runner
 
     spec, _captured = _stub_sft_run(monkeypatch)
     # the shared fixture authors max_steps; this test is about the path where the user did not.
@@ -3453,7 +3467,7 @@ def test_the_child_caps_at_the_quoted_horizon_without_an_authored_max_steps(monk
 
 
 def test_text_sft_keeps_export_policy_out_of_the_frozen_verl_runtime_config(monkeypatch):
-    from flash.engine.worker import sft_train, sft_train_runner
+    from flash.engine.worker.train.entry import sft_train, sft_train_runner
 
     spec, _captured = _stub_sft_run(monkeypatch)
     monkeypatch.setattr(sft_train, "_write_sft_parquet", lambda _rows, _path: None)
@@ -3476,7 +3490,7 @@ def test_a_packed_quote_fails_closed_when_environment_filtering_leaves_less_than
 ):
     """the worker must not silently shrink the accepted batch and change the billed contract."""
     from flash.engine.profiling.workload_profile import SftWorkloadProfile
-    from flash.engine.worker import sft_train, sft_train_runner
+    from flash.engine.worker.train.entry import sft_train, sft_train_runner
 
     spec, _captured = _stub_sft_run(monkeypatch)
     quoted = SftWorkloadProfile.from_dict(spec.workload_profile)
@@ -3509,7 +3523,7 @@ def test_a_packed_quote_fails_closed_when_environment_filtering_leaves_less_than
 def test_a_packed_quote_fails_closed_when_the_worker_cannot_pack_safely(monkeypatch):
     """a worker without boundary resets must never execute a packed accepted quote."""
     from flash.engine.profiling.workload_profile import SftWorkloadProfile
-    from flash.engine.worker import sft_train, sft_train_runner
+    from flash.engine.worker.train.entry import sft_train, sft_train_runner
 
     spec, _captured = _stub_sft_run(monkeypatch)
     quoted = SftWorkloadProfile.from_dict(spec.workload_profile)
@@ -3537,7 +3551,7 @@ def test_environment_processing_may_change_the_static_estimate_without_repricing
     accepted quote remains on the spec, and the worker uses its recomputed rows for training.
     """
     from flash.engine.profiling import sft_workload
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     spec, _captured = _stub_sft_run(monkeypatch)
     frozen_quote = dict(spec.workload_profile)
@@ -3581,7 +3595,7 @@ def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monke
     published" would unwind out of the finally in place of the real cause -- turning the one
     error GRAD-001 exists to surface into a checkpointing red herring.
     """
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     stopped: list[bool] = []
 
@@ -3640,7 +3654,7 @@ def test_zero_grad_guard_survives_an_lr_that_decays_to_zero(monkeypatch):
     schedule. driven through run_sft_train rather than a local copy of the guard, so the assertion
     is about the shipped code and not about the test's own reimplementation of it.
     """
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
 
@@ -3669,7 +3683,7 @@ def test_zero_grad_guard_clears_on_a_recovered_step(monkeypatch):
     must be discarded. without this, one isolated zero-grad step early plus another much later
     would fail a run that is training normally in between.
     """
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)
 
@@ -3701,7 +3715,7 @@ def test_a_single_step_run_with_no_gradient_is_rejected(monkeypatch):
     one horizon it could not see. driven through run_sft_train so the assertion is about the shipped
     code path, not a local reimplementation of the check.
     """
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
     # a fresh run, not a resume: the guard abstains on a resume because the restored weights carry
@@ -3736,7 +3750,7 @@ def test_a_fresh_run_with_any_real_gradient_still_completes(monkeypatch, grads):
     over-broad spelling (`not all`, i.e. reject on any zero at all) fails a run that demonstrably
     trained. an isolated zero inside a longer run stays tolerated by contract.
     """
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)
     monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
@@ -3780,7 +3794,7 @@ def test_sft_line_handler_reads_metrics_through_the_shared_parser():
     import inspect
     import textwrap
 
-    import flash.engine.worker.sft_train as sv
+    import flash.engine.worker.train.entry.sft_train as sv
 
     source = textwrap.dedent(inspect.getsource(sv.run_sft_train))
     handler = next(
@@ -3802,7 +3816,7 @@ def test_sft_line_handler_reads_metrics_through_the_shared_parser():
 
 def test_sft_drops_a_non_finite_loss_instead_of_poisoning_the_heartbeat():
     """a nan loss serializes as bare NaN, which strict json consumers reject."""
-    import flash.engine.worker.sft_train as sv
+    import flash.engine.worker.train.entry.sft_train as sv
 
     assert sv.parse_verl_metric("step:2 - train/loss:nan - train/lr:1e-05", "train/loss") is None
     assert sv.parse_verl_metric("step:2 - train/loss:inf", "train/loss") is None
@@ -3823,7 +3837,7 @@ def test_sft_never_enables_liger_because_it_zeroes_the_lora_gradient():
     this asserts the RENDERED override rather than the config literal, so re-enabling liger
     anywhere between the dict and the command line fails the test.
     """
-    from flash.engine.worker.sft_train import build_sft_overrides
+    from flash.engine.worker.train.entry.sft_train import build_sft_overrides
 
     base = {
         "fused_ce_backend": "torch",
@@ -3891,7 +3905,7 @@ def test_drain_join_waits_out_a_slow_upload_until_the_run_deadline(monkeypatch):
     # FUNCTION, so `import ... as hb` yields that function rather than this module.
     # import_module returns the real module object.
     hb = importlib.import_module("flash.engine.worker.io.heartbeat")
-    from flash.engine.worker.runtime.pkg_proxy import W as _w
+    from flash.engine.worker.runtime import state as worker_state
 
     # virtual clock: the test must not actually take an hour.
     now = [0.0]
@@ -3913,7 +3927,9 @@ def test_drain_join_waits_out_a_slow_upload_until_the_run_deadline(monkeypatch):
 
     # the run still has budget left, so the drain must be allowed to finish. this raised under the
     # old fixed 600s join, which is exactly the reported failure.
-    monkeypatch.setattr(_w, "_remaining_worker_wall_seconds", lambda: 7200.0, raising=False)
+    monkeypatch.setattr(
+        worker_state, "_remaining_worker_wall_seconds", lambda: 7200.0, raising=False
+    )
     hb.join_while_draining(_SlowUpload(), "slow uploader")
 
     # and the converse: once the RUN is out of time the drain must be cut off, or a wedged upload
@@ -3930,12 +3946,16 @@ def test_drain_join_waits_out_a_slow_upload_until_the_run_deadline(monkeypatch):
             now[0] += step
             budget[0] -= step
 
-    monkeypatch.setattr(_w, "_remaining_worker_wall_seconds", lambda: budget[0], raising=False)
+    monkeypatch.setattr(
+        worker_state, "_remaining_worker_wall_seconds", lambda: budget[0], raising=False
+    )
     with pytest.raises(RuntimeError, match="wall deadline expired"):
         hb.join_while_draining(_Wedged(), "wedged uploader")
 
     # a real finished thread returns immediately rather than waiting out a window.
-    monkeypatch.setattr(_w, "_remaining_worker_wall_seconds", lambda: 7200.0, raising=False)
+    monkeypatch.setattr(
+        worker_state, "_remaining_worker_wall_seconds", lambda: 7200.0, raising=False
+    )
     done = threading.Thread(target=lambda: None)
     done.start()
     done.join()
@@ -3962,7 +3982,7 @@ def test_sft_ships_no_val_file_so_the_child_cannot_validate():
     """
     import inspect
 
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     # the override is unconditional: no fixture value can change it.
     assert "data.val_files=null" in build_sft_overrides(_cfg())
@@ -3992,7 +4012,7 @@ def test_sft_hardware_ranking_prices_the_profiled_batch_not_the_authored_one(mon
     # a profile that reduces the authored batch of 8 to a single example per update.
     import flash.cost.spec as cost_spec
     from flash.core.spec import TrainSpec
-    from flash.providers.base import run_config_for_ranking
+    from flash.providers.core.base import run_config_for_ranking
 
     monkeypatch.setattr(
         cost_spec,
@@ -4055,7 +4075,7 @@ def test_sft_vram_sizing_uses_the_profiled_batch_not_the_authored_one(monkeypatc
     not the call site uses it, so a version that sizes off the authored `train` still passes.
     """
     from flash.core.spec import TrainSpec
-    from flash.providers import allocator
+    from flash.providers.core import allocator
 
     authored = {"batch_size": 8, "max_context_tokens": 4096}
     overrides = {"batch_size": 1, "seq_len": 1404, "sft_retained_examples": 10}
@@ -4117,8 +4137,8 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
     import re
 
     from flash.engine.plan.steps import sft_data_parallel_cards
-    from flash.engine.worker.sft_train_runner import _resolve_sft_world_size
-    from flash.providers.base import rentable_gpu_counts
+    from flash.engine.worker.train.entry.sft_train_runner import _resolve_sft_world_size
+    from flash.providers.core.base import rentable_gpu_counts
 
     def warn(cards, batch, rows):
         buf = io.StringIO()
@@ -4208,7 +4228,7 @@ def test_sft_idle_card_advice_does_not_shrink_the_memory_the_run_is_running_on()
     import io
     import re
 
-    from flash.engine.worker.sft_train_runner import _resolve_sft_world_size
+    from flash.engine.worker.train.entry.sft_train_runner import _resolve_sft_world_size
 
     def warn(cards, batch, rows):
         buf = io.StringIO()
@@ -4290,7 +4310,7 @@ def test_sft_resume_guard_checks_the_launched_width_not_the_allocation():
     """
     import inspect
 
-    from flash.engine.worker import sft_train_runner
+    from flash.engine.worker.train.entry import sft_train_runner
 
     src = inspect.getsource(sft_train_runner._prepare_sft_child)
     assert "world_size=world_size" in src
@@ -4341,8 +4361,8 @@ def test_publish_does_not_leave_every_step_adapter_on_the_container_disk(monkeyp
     asserts the directory is gone AFTER publish rather than counting bytes: the leak is one
     undeleted directory per save, and its size is a property of the model, not of this bug.
     """
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
     export_root = tmp_path / "exports"
@@ -4393,8 +4413,8 @@ def test_a_failed_upload_still_frees_the_exported_adapter(monkeypatch, tmp_path)
     retrying uploads is exactly the run that is short on space -- so once the adapter is durable on
     hf, a LATER failure in the same publish must not strand the now-redundant local copy.
     """
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
     export_root = tmp_path / "exports"
@@ -4476,8 +4496,8 @@ def test_an_adapter_is_freed_even_when_before_upload_never_ran(monkeypatch, tmp_
     on EVERY step once an upload is slow enough to hold the slot, which is exactly the busy-disk case
     this PR exists for, so that is the one simulated below.
     """
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
     export_root = tmp_path / "exports"
@@ -4533,7 +4553,8 @@ def test_importing_the_worker_package_does_not_freeze_the_xet_default(monkeypatc
         "    'huggingface_hub was imported during flash.engine.worker import; '\n"
         "    'the xet default is frozen before the worker can disable it'\n"
         ")\n"
-        "flash.engine.worker._disable_xet_upload_staging()\n"
+        "from flash.engine.worker.io.hf import _disable_xet_upload_staging\n"
+        "_disable_xet_upload_staging()\n"
         "from huggingface_hub.utils._runtime import is_xet_available\n"
         "assert not is_xet_available(), 'xet is still selected for uploads'\n"
     )
@@ -4562,8 +4583,8 @@ def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypa
     once": I mutated the cleanup to skip exactly one step and a single-step version still passed,
     while this one caught it.
     """
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
     export_root = tmp_path / "exports"
@@ -4604,8 +4625,8 @@ def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(monkeypa
 
 def _publishing_watcher(monkeypatch, tmp_path, *, steps, required_steps):
     """an sft watcher over `steps` completed checkpoints that records what it publishes."""
-    from flash.engine.worker import sft_train
-    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+    from flash.engine.worker.train.entry import sft_train
+    from flash.engine.worker.train.sft.setup import checkpoints as sft_checkpoints
 
     local_dir = tmp_path / "ckpts"
     local_dir.mkdir()
@@ -4620,7 +4641,7 @@ def _publishing_watcher(monkeypatch, tmp_path, *, steps, required_steps):
         lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
     )
     monkeypatch.setattr(
-        sft_checkpoints._w,
+        sft_checkpoints._worker_hf,
         "upload_resume_checkpoint",
         lambda step, ckpt, **kwargs: (
             published.append(step),
@@ -4632,7 +4653,7 @@ def _publishing_watcher(monkeypatch, tmp_path, *, steps, required_steps):
     # returns the published subfolder the way the real transport does: it returns None for a
     # best-effort publish that failed or found no adapter, and the watcher must not credit those.
     monkeypatch.setattr(
-        sft_checkpoints._w,
+        sft_checkpoints._worker_hf,
         "publish_deployable_checkpoint",
         lambda adapter, step, **kw: f"sft/run/checkpoints/step-{step}/adapter",
     )
@@ -4665,8 +4686,8 @@ def test_a_failed_optional_publish_is_not_credited_as_a_durable_deployable(monke
     guard is never exercised with a falsy return. Verified by mutation: deleting the `if published:`
     guard leaves the whole sft/grpo/opd suite green and fails only this test.
     """
-    from flash.engine.worker import sft_train
-    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+    from flash.engine.worker.train.entry import sft_train
+    from flash.engine.worker.train.sft.setup import checkpoints as sft_checkpoints
 
     local_dir = tmp_path / "ckpt"
     checkpoint_dir = local_dir / "global_step_7"
@@ -4679,10 +4700,12 @@ def test_a_failed_optional_publish_is_not_credited_as_a_durable_deployable(monke
     )
     # the best-effort failure shape: swallowed the error and published nothing.
     monkeypatch.setattr(
-        sft_checkpoints._w, "publish_deployable_checkpoint", lambda adapter, step, **kw: None
+        sft_checkpoints._worker_hf,
+        "publish_deployable_checkpoint",
+        lambda adapter, step, **kw: None,
     )
     monkeypatch.setattr(
-        sft_checkpoints._w,
+        sft_checkpoints._worker_hf,
         "upload_resume_checkpoint",
         lambda step, ckpt, **kwargs: (
             kwargs["before_upload"](),
@@ -4734,13 +4757,13 @@ def test_a_required_save_without_an_artifact_repo_fails_instead_of_passing_silen
 ):
     """a required save is owed a servable adapter, so no repository means the run failed.
 
-    upload_resume_checkpoint returns True at `if not _w.HF_REPO` BEFORE running before_upload, so
+    upload_resume_checkpoint returns True at `if not _worker_state.HF_REPO` before running before_upload, so
     the required publish that would have raised is never reached. checking completeness against the
     steps this watcher handled therefore passed a run that published nothing at all. the completeness
     check reads the published-adapter fact instead, which no-repo can never set.
     """
-    from flash.engine.worker import sft_train
-    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+    from flash.engine.worker.train.entry import sft_train
+    from flash.engine.worker.train.sft.setup import checkpoints as sft_checkpoints
 
     local_dir = tmp_path / "ckpts"
     (local_dir / "global_step_5" / "huggingface").mkdir(parents=True)
@@ -4753,10 +4776,10 @@ def test_a_required_save_without_an_artifact_repo_fails_instead_of_passing_silen
     )
     # the real no-repo path: returns True without running either callback.
     monkeypatch.setattr(
-        sft_checkpoints._w, "upload_resume_checkpoint", lambda step, ckpt, **kwargs: True
+        sft_checkpoints._worker_hf, "upload_resume_checkpoint", lambda step, ckpt, **kwargs: True
     )
     monkeypatch.setattr(
-        sft_checkpoints._w,
+        sft_checkpoints._worker_hf,
         "publish_deployable_checkpoint",
         lambda *a, **kw: pytest.fail("no repository, so nothing can be published"),
     )
@@ -4836,7 +4859,6 @@ def test_a_required_backlog_still_drops_its_superseded_optional_saves(monkeypatc
 
 def test_the_opd_watcher_publishes_every_step_despite_the_sft_bound(monkeypatch, tmp_path):
     """opd keeps all pending retry states."""
-    from flash.engine.worker.train.opd import failures as opd_failures
 
     watcher = opd_failures._OpdVerlCheckpointWatcher(
         local_dir=str(tmp_path / "ckpts"),
@@ -4876,8 +4898,7 @@ def test_the_opd_watcher_still_keeps_its_export(monkeypatch, tmp_path):
     substring, so the adapter could be destroyed with the assertion still green. Source text is not
     the contract; the surviving directory is.
     """
-    from flash.engine.worker.train.opd import failures as opd_failures
-    from flash.engine.worker.train.sft import checkpoints as sft_checkpoints
+    from flash.engine.worker.train.sft.setup import checkpoints as sft_checkpoints
 
     assert (
         opd_failures._OpdVerlCheckpointWatcher._publish
@@ -4896,10 +4917,12 @@ def test_the_opd_watcher_still_keeps_its_export(monkeypatch, tmp_path):
         lambda checkpoint_dir, **kwargs: staged.update(kwargs),
     )
     monkeypatch.setattr(
-        opd_failures._w, "publish_deployable_checkpoint", lambda adapter, step, **kw: f"step-{step}"
+        opd_failures._worker_hf,
+        "publish_deployable_checkpoint",
+        lambda adapter, step, **kw: f"step-{step}",
     )
     monkeypatch.setattr(
-        opd_failures._w,
+        opd_failures._worker_hf,
         "upload_resume_checkpoint",
         lambda step, ckpt, **kwargs: (kwargs["before_upload"](), True)[1],
     )
@@ -4947,7 +4970,7 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
     caught that. Here the gate starts shut and the checkpoint is discovered through `_pending`, so
     the retention window is the real one.
     """
-    from flash.engine.worker.train.rl import checkpoints as rl_checkpoints
+    from flash.engine.worker.train.rl.launch import checkpoints as rl_checkpoints
 
     published: list[str] = []
 
@@ -4956,19 +4979,20 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
         with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "wb") as fh:
             fh.write(b"w" * 2048)
 
-    rl_train_module = rl_checkpoints._rl_train()
-    monkeypatch.setattr(rl_train_module, "export_peft_adapter", fake_export)
+    monkeypatch.setattr(rl_checkpoints, "export_peft_adapter", fake_export)
+    monkeypatch.setattr(rl_checkpoints, "stamp_adapter_dir_provenance", lambda *a, **kw: None)
     monkeypatch.setattr(
-        rl_train_module, "stamp_adapter_dir_provenance", lambda *a, **kw: None, raising=False
+        rl_checkpoints._worker_hf, "write_base_model_provenance", lambda *a, **kw: None
     )
-    monkeypatch.setattr(rl_checkpoints._w, "write_base_model_provenance", lambda *a, **kw: None)
     monkeypatch.setattr(
-        rl_checkpoints._w,
+        rl_checkpoints._worker_hf,
         "publish_deployable_checkpoint",
         lambda adapter_dir, step, **kw: published.append(adapter_dir),
     )
 
-    monkeypatch.setattr(rl_checkpoints._w, "upload_resume_checkpoint", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        rl_checkpoints._worker_hf, "upload_resume_checkpoint", lambda *a, **kw: True
+    )
 
     local_dir = tmp_path / "ckpts"
     export_root = tmp_path / "rl-exports"
@@ -5029,8 +5053,8 @@ def test_a_failed_export_does_not_strand_a_partial_adapter(monkeypatch, tmp_path
     run whose exports keep failing that is one partial adapter per save -- the accumulation this
     class exists to bound, reached through the failure path instead of the success one.
     """
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
     export_root = tmp_path / "exports"
@@ -5087,9 +5111,7 @@ def test_the_worker_disables_xet_as_its_very_first_action():
     import inspect
     import textwrap
 
-    import flash.engine.worker as worker
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(worker._run_worker_mode)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(worker_entry._run_worker_mode)))
     body = ast.get_docstring(tree.body[0], clean=False) and tree.body[0].body[1:]
     first = (body or tree.body[0].body)[0]
 
@@ -5120,7 +5142,7 @@ def test_sft_micro_batch_never_exceeds_a_ranks_share_of_the_batch():
     """
     from types import SimpleNamespace
 
-    from flash.engine.worker import sft_train_runner as runner
+    from flash.engine.worker.train.entry import sft_train_runner as runner
 
     def capped(train_batch_size, micro_batch, gpu_count, rows):
         _world, mb = runner._resolve_sft_width_and_micro_batch(
@@ -5157,7 +5179,7 @@ def test_sft_result_records_the_micro_batch_that_ran_not_the_one_requested():
     """
     import inspect
 
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     src = inspect.getsource(sft_train._write_sft_result)
     assert '"per_device_train_batch_size": child.micro_batch,' in src
@@ -5171,7 +5193,7 @@ def test_sft_result_records_the_micro_batch_that_ran_not_the_one_requested():
     assert "math.ceil(model.train_batch_size / model.micro_batch)" not in src
 
     # and the child must actually carry it, or the writer above cannot read it.
-    from flash.engine.worker import sft_train_runner
+    from flash.engine.worker.train.entry import sft_train_runner
 
     assert "micro_batch" in sft_train_runner._SftChild.__dataclass_fields__
 
@@ -5190,8 +5212,8 @@ def test_an_unuploadable_resume_checkpoint_does_not_fail_a_published_required_sa
     `uploaded=False` with `before_upload` having run is exactly that shape: the deployable landed,
     the full-state member did not.
     """
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
     export_root = tmp_path / "exports"
@@ -5241,8 +5263,8 @@ def test_a_required_save_whose_adapter_never_published_still_fails_the_run(monke
     other half -- a required step that never became servable must still raise -- so that relaxation
     can never be widened into "required saves are best effort" without turning this red.
     """
-    import flash.engine.worker as worker
-    from flash.engine.worker import sft_train
+    import flash.engine.worker.io.hf as worker
+    from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
     checkpoint_dir = local_dir / "global_step_1"

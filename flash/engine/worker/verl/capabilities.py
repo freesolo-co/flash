@@ -5,7 +5,7 @@ at the same time; everything below either runs that probe or reads its result to
 child gets launched -- which interpreter, which attention backend, whether the rollout can sleep,
 whether GDN boundary resets are available.
 
-Split out of `flash.engine.worker.backend_common` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.backend_common` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ import shutil
 import subprocess
 from collections.abc import Sequence
 
-from flash.engine.verl_policy import FsdpGeneration
-from flash.engine.worker.backend_common import (
+from flash.engine.support.verl_policy import FsdpGeneration
+from flash.engine.worker.train.entry.backend_common import (
     CAUSAL_CONV1D_REQUIREMENT,
     FLA_REQUIREMENT,
     FLASH_QLA_REQUIREMENT,

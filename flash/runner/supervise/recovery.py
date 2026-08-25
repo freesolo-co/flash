@@ -42,12 +42,12 @@ class _CompletedAttemptPending(RuntimeError):
 
 def _canonical_provider_handle(handle):
     """Validate and canonicalize one complete provider-specific persisted handle."""
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
 
     data = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
     provider = data.get("provider")
     if provider == "runpod":
-        from flash.providers.runpod.jobs import JobHandle as RunpodJobHandle
+        from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
 
         return JobHandle.from_dict(RunpodJobHandle.from_dict(data).to_dict())
     if provider == "lambda":
@@ -69,8 +69,8 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
         data = canonical.to_dict()
         if canonical.provider != "runpod" or not data.get("job_id"):
             return None
-        from flash.providers.runpod import api as runpod_api
-        from flash.providers.runpod.jobs import TERMINAL_OK, decode_output
+        from flash.providers.runpod.client import api as runpod_api
+        from flash.providers.runpod.execution.jobs import TERMINAL_OK, decode_output
 
         # a status probe must fail fast: cap it at a short fresh timeout regardless of how far
         # the run wall deadline is. handing job_status the wall+grace deadline (which can be
@@ -146,7 +146,7 @@ def _runpod_completed_metrics(handle, *, deadline_at: float | None = None) -> di
 
 def _worker_provably_gone(run_id: str, handle) -> bool:
     """Return true only when the captured attempt cannot still have a live worker."""
-    from flash.providers import INSTANCE_PROVIDERS, get_provider
+    from flash.providers.core.registry import INSTANCE_PROVIDERS, get_provider
 
     try:
         handle = _canonical_provider_handle(handle)
@@ -158,8 +158,8 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
         if not job_id:
             return False
         try:
-            from flash.providers.runpod import api as runpod_api
-            from flash.providers.runpod.jobs import TERMINAL_FAIL, TERMINAL_OK
+            from flash.providers.runpod.client import api as runpod_api
+            from flash.providers.runpod.execution.jobs import TERMINAL_FAIL, TERMINAL_OK
 
             job = runpod_api.job_status(
                 data["endpoint_id"],
@@ -180,7 +180,7 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
 
 def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
     """Delete one exact RunPod endpoint without trusting the persisted handle's own metadata."""
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     endpoint_id = data.get("endpoint_id")
     if not isinstance(endpoint_id, str) or not endpoint_id:
@@ -188,7 +188,7 @@ def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
 
     fingerprint = data.get("key_fingerprint")
     if canonical is not None:
-        from flash.providers import get_provider
+        from flash.providers.core.registry import get_provider
 
         get_provider("runpod").destroy(canonical)
         return
@@ -257,7 +257,7 @@ def _strict_teardown_handle(handle, run_id: str) -> bool:
     RunPod job proven terminal while its endpoint deletion remains unconfirmed; callers must persist
     that exact endpoint in cleanup_remotes before clearing the active remote.
     """
-    from flash.providers import INSTANCE_PROVIDERS, get_provider
+    from flash.providers.core.registry import INSTANCE_PROVIDERS, get_provider
 
     raw = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
     if raw.get("provider") == "runpod":
@@ -309,12 +309,12 @@ def _completed_attempt_metrics(
     """Read a strict successful instance marker plus its run-scoped metrics."""
     if provider not in {"vast", "lambda"} or not spec.train.hf_repo:
         return None
-    from flash.providers._lifecycle.poll import make_say
-    from flash.providers._lifecycle.poll_instance import (
+    from flash.providers._lifecycle.instances.poll import make_say
+    from flash.providers._lifecycle.instances.poll_instance import (
         _TERMINAL_REREAD_RETRIES,
         _TERMINAL_REREAD_WAIT_S,
     )
-    from flash.providers._lifecycle.terminal_artifacts import (
+    from flash.providers._lifecycle.instances.terminal_artifacts import (
         INVALID_MARKER_DETAIL,
         AttemptIdentity,
         ProbeBudget,
@@ -373,7 +373,7 @@ def _adopt_completed_attempt(
     log,
 ) -> bool:
     """Finalize a phantom-completed attempt through the expected-remote CAS."""
-    from flash.runner import _compare_and_complete_remote
+    from flash.runner.accounting.reconciliation import _compare_and_complete_remote
 
     applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
     if applied:
@@ -451,7 +451,7 @@ def _candidate_usable_vram_gb(candidate) -> float:
     can launch fewer ranks than it rents; the allocator stamps that run-specific width, while an
     unstamped candidate preserves the historical all-rented-cards behavior.
     """
-    from flash.providers.base import combined_vram_gb
+    from flash.providers.core.sharding import combined_vram_gb
 
     rented = int(getattr(candidate, "gpu_count", 1) or 1)
     executed = getattr(candidate, "executed_gpu_count", None)
@@ -503,10 +503,10 @@ def _await_runpod_completed_metrics(
 
 def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
     """Mirror a finished run's per-step checkpoints to the backend store (best-effort)."""
-    from flash.runner import get_status
+    from flash.runner.lifecycle.status import get_status
 
     try:
-        from flash.server.domain.checkpoints import register_checkpoints_best_effort
+        from flash.server.domain.registry.checkpoints import register_checkpoints_best_effort
 
         register_checkpoints_best_effort(get_status(spec.run_id), log=log)
     except Exception as exc:  # never let checkpoint bookkeeping disturb a run
@@ -545,7 +545,8 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
     dict. Reading org/cost from the
     persisted ``RunStatus`` (never a reparsed spec) is what lets a legacy/stale spec still be charged.
     """
-    from flash.runner import get_status, record_billing_state
+    from flash.runner.accounting.costs import record_billing_state
+    from flash.runner.lifecycle.status import get_status
     from flash.server.billing.charges import BillingError
     from flash.server.platform.auth import INTERNAL_KEY_ENV, standalone
     from flash.server.platform.internal_client import internal_key as operator_internal_key
@@ -601,12 +602,11 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
 
 def _gc_run_endpoints(spec: JobSpec) -> None:
     """Best-effort teardown of every endpoint a run may have registered."""
-    from flash.runner import (
+    from flash.runner.accounting.reconciliation import (
         _drain_cleanup_remotes,
         _remote_resource_identity,
-        effective_spec_from_status,
-        get_status,
     )
+    from flash.runner.lifecycle.status import effective_spec_from_status, get_status
 
     attempted_cleanup = set()
     with contextlib.suppress(Exception):
@@ -625,12 +625,12 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
         try:
             resource_deleted = _lifecycle()._strict_teardown_handle(status.remote, spec.run_id)
             if status.remote.get("provider") == "runpod" and not resource_deleted:
-                from flash.runner import _record_cleanup_remote
+                from flash.runner.accounting.reconciliation import _record_cleanup_remote
 
                 _record_cleanup_remote(spec.run_id, status.remote)
         except Exception:
             pass
-    from flash.providers import available_providers, get_provider
+    from flash.providers.core.registry import available_providers, get_provider
 
     # Sweep every CONFIGURED provider, including RunPod (whose gc also reaps the rN-suffixed
     # endpoints the persisted handle cannot name). Gating on available_providers() is what makes

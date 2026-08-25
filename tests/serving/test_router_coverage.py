@@ -10,25 +10,21 @@ Targets branches the existing suites miss:
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.responses import (
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.http.router import build_serving_app as build_durable_serving_app
+from flash.serving.src.io.responses import (
     _openai_structured_outputs,
     _response_format_to_spec,
     _usage_block,
 )
-from flash.serving.src.router import (
-    AdapterRouter,
-)
-from flash.serving.src.router import (
-    build_offline_serving_app as build_serving_app,
-)
-from flash.serving.src.router import (
-    build_serving_app as build_durable_serving_app,
-)
-from flash.serving.src.schemas import AdapterRecord
-from flash.serving.src.structured_outputs import StructuredOutputsError
+from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.io.structured_outputs import StructuredOutputsError
 
 QWEN = "Qwen/Qwen3.5-9B"
 
@@ -205,8 +201,41 @@ class FakePool:
 # --------------------------------------------------------------------------------------------
 
 
+def test_exceptional_lifespan_exit_closes_usage_and_authorizer():
+    from flash.serving.src.accounting.usage_outbox import OfflineUsageStore
+
+    closed = []
+
+    class Store(OfflineUsageStore):
+        async def aclose(self):
+            closed.append("usage")
+
+    class Authorizer:
+        async def __call__(self, _token, _adapter_id):
+            return "org-1"
+
+        async def aclose(self):
+            closed.append("authorizer")
+
+    app = build_durable_serving_app(
+        FakePool(),
+        AdapterRouter([_rec("qa")]),
+        usage_store=Store(),
+        chat_authorizer=Authorizer(),
+    )
+
+    async def fail_inside_lifespan():
+        async with app.router.lifespan_context(app):
+            raise RuntimeError("app failed")
+
+    with pytest.raises(RuntimeError, match="app failed"):
+        asyncio.run(fail_inside_lifespan())
+
+    assert closed == ["usage", "authorizer"]
+
+
 def test_shutdown_propagates_usage_store_close_failure():
-    from flash.serving.src.usage_outbox import OfflineUsageStore, UsageOutboxError
+    from flash.serving.src.accounting.usage_outbox import OfflineUsageStore, UsageOutboxError
 
     class Store(OfflineUsageStore):
         enabled = True
@@ -214,21 +243,33 @@ def test_shutdown_propagates_usage_store_close_failure():
         async def aclose(self):
             raise UsageOutboxError("durable_close_failed")
 
+    class Authorizer:
+        def __init__(self):
+            self.closed = False
+
+        async def __call__(self, _token, _adapter_id):
+            return "org-1"
+
+        async def aclose(self):
+            self.closed = True
+
+    authorizer = Authorizer()
     app = build_durable_serving_app(
         FakePool(),
         AdapterRouter([_rec("qa")]),
         usage_store=Store(),
-        chat_authorizer=_allow,
+        chat_authorizer=authorizer,
     )
     with (
         pytest.raises(UsageOutboxError, match="durable_close_failed"),
         TestClient(app) as client,
     ):
         assert client.get("/healthz").status_code == 200
+    assert authorizer.closed is True
 
 
 def test_shutdown_swallows_authorizer_aclose_errors():
-    from flash.serving.src.usage_outbox import OfflineUsageStore
+    from flash.serving.src.accounting.usage_outbox import OfflineUsageStore
 
     class Authorizer:
         def __init__(self):
