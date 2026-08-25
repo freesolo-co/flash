@@ -1,11 +1,4 @@
-"""Serving->backend usage reporter gating: a serving deployment must only post metered usage to
-the billing API it was EXPLICITLY pointed at. Regression guard for the bug where backend_url
-defaulted to production and reporting turned on as soon as FREESOLO_INTERNAL_KEY was present, so a
-non-prod deployment that merely had that key could silently bill real orgs for dev traffic.
-
-modal_app imports the `modal` SDK at module top (decorators run at import), which isn't installed
-in the offline test env, so we stub it just enough to import and reach _build_usage_reporter.
-"""
+"""Engine-side token telemetry, adapter cache, and Modal construction regressions."""
 
 from __future__ import annotations
 
@@ -18,6 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from flash.serving.src.accounting.usage_outbox import DurableUsageOutbox, UsageOutboxError
 from flash.serving.src.engine import support as engine_support
 from flash.serving.src.store.settings import Settings
 
@@ -48,16 +42,52 @@ def modal_app_module(load_modal_app_under_stub):
     return load_modal_app_under_stub(modal_stub)
 
 
-def _settings(*, backend_url: str | None = None, internal_key: str | None = None) -> Settings:
-    # Build Settings without reading a stray on-disk .env. The fields use validation_alias, so we
-    # set them via their env-var aliases (which is also the real configuration path). Omit an alias
-    # entirely to exercise its field default.
-    kwargs: dict[str, Any] = {"_env_file": None}
-    if backend_url is not None:
-        kwargs["PLATFORM_BACKEND_URL"] = backend_url
-    if internal_key is not None:
-        kwargs["FREESOLO_INTERNAL_KEY"] = internal_key
-    return Settings(**kwargs)
+def test_hosted_usage_outbox_fails_closed_on_partial_configuration(modal_app_module):
+    settings = Settings(
+        _env_file=None,
+        PLATFORM_BACKEND_URL="https://api.example.com",
+        FREESOLO_INTERNAL_KEY="internal-key",
+        FREESOLO_DEPLOYMENT_ID="deployment-1",
+    )
+
+    with pytest.raises(UsageOutboxError, match="durable_usage_outbox_not_configured"):
+        modal_app_module._build_usage_outbox(settings)
+
+
+def test_hosted_usage_outbox_builds_only_with_complete_configuration(modal_app_module):
+    settings = Settings(
+        _env_file=None,
+        PLATFORM_BACKEND_URL="https://api.example.com",
+        FREESOLO_INTERNAL_KEY="internal-key",
+        FREESOLO_DEPLOYMENT_ID="deployment-1",
+        SUPABASE_URL="https://project.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="service-role",
+    )
+
+    outbox = modal_app_module._build_usage_outbox(settings)
+
+    assert isinstance(outbox, DurableUsageOutbox)
+    asyncio.run(outbox.aclose())
+
+
+def test_hosted_usage_outbox_worker_id_is_unique_per_instance(modal_app_module):
+    settings = Settings(
+        _env_file=None,
+        PLATFORM_BACKEND_URL="https://api.example.com",
+        FREESOLO_INTERNAL_KEY="internal-key",
+        FREESOLO_DEPLOYMENT_ID="deployment-1",
+        SUPABASE_URL="https://project.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="service-role",
+    )
+
+    first = modal_app_module._build_usage_outbox(settings)
+    second = modal_app_module._build_usage_outbox(settings)
+
+    assert first._worker_id != second._worker_id
+    assert first._generation_owner_id == second._generation_owner_id
+    assert first._generation_owner_epoch != second._generation_owner_epoch
+    asyncio.run(first.aclose())
+    asyncio.run(second.aclose())
 
 
 def test_stream_text_delta_keeps_native_delta_chunks(modal_app_module):
@@ -904,215 +934,3 @@ def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_modu
 
     assert engine.engine.removed == []
     assert "tenant-b" in engine._lora_entries
-
-
-def test_reporter_disabled_when_only_internal_key_is_set(modal_app_module):
-    # The exact bug: a non-prod deployment has FREESOLO_INTERNAL_KEY but never set
-    # PLATFORM_BACKEND_URL. With the prod default gone, reporting must be DISABLED (None), not
-    # silently pointed at production billing.
-    s = _settings(internal_key="secret-key")
-    assert s.backend_url == ""
-    assert modal_app_module._build_usage_reporter(s) is None
-
-
-def test_reporter_disabled_when_key_unset_even_with_url(modal_app_module):
-    s = _settings(backend_url="https://staging.example.com")
-    assert modal_app_module._build_usage_reporter(s) is None
-
-
-def test_reporter_enabled_only_when_both_url_and_key_set_explicitly(modal_app_module):
-    # Reporting turns on only when BOTH are explicitly configured -> a real reporter callable.
-    s = _settings(
-        backend_url="https://staging.example.com",
-        internal_key="secret-key",
-    )
-    reporter = modal_app_module._build_usage_reporter(s)
-    assert reporter is not None
-    assert callable(reporter)
-
-
-def test_reporter_posts_to_the_configured_backend(modal_app_module, monkeypatch):
-    # When enabled, it POSTs usage to {backend_url}/api/billing/serving-usage with the internal key
-    # -- and to the configured backend, never a hardcoded prod fallback.
-    # The reporter now uses a single persistent httpx.AsyncClient (headers set at init time,
-    # not per call) to avoid TCP/TLS handshake overhead across bursts of usage reports.
-    import asyncio
-
-    captured: dict[str, Any] = {}
-
-    class _FakeResp:
-        def raise_for_status(self) -> None:
-            return None
-
-    class _FakeClient:
-        def __init__(self, *_a: Any, **_k: Any) -> None:
-            # Headers are set at client construction time (not per-call) in the persistent client.
-            captured["init_headers"] = _k.get("headers", {})
-
-        async def post(self, url: str, json: Any) -> _FakeResp:
-            captured["url"] = url
-            captured["json"] = json
-            return _FakeResp()
-
-        async def aclose(self) -> None:
-            captured["closed"] = True
-
-    import httpx
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-
-    s = _settings(
-        backend_url="https://staging.example.com/",  # trailing slash must be normalized
-        internal_key="secret-key",
-    )
-    reporter = modal_app_module._build_usage_reporter(s)
-    assert reporter is not None
-
-    usage = {"adapter_id": "a1", "base_model": "Qwen/Qwen3.5-9B", "promptTokens": 1}
-    asyncio.run(reporter(usage))
-
-    assert captured["url"] == "https://staging.example.com/api/billing/serving-usage"
-    assert captured["json"] == usage
-    assert captured["init_headers"]["Authorization"] == "Bearer secret-key"
-
-
-def test_reporter_reuses_single_client_across_calls(modal_app_module, monkeypatch):
-    # The persistent client must be created ONCE per reporter, not once per report() call —
-    # otherwise the TCP/TLS handshake cost is paid on every generation.
-    import asyncio
-
-    init_count = {"n": 0}
-
-    class _FakeResp:
-        def raise_for_status(self) -> None:
-            return None
-
-    class _FakeClient:
-        def __init__(self, *_a: Any, **_k: Any) -> None:
-            init_count["n"] += 1
-
-        async def post(self, url: str, json: Any) -> _FakeResp:
-            return _FakeResp()
-
-        async def aclose(self) -> None:
-            return None
-
-    import httpx
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-
-    s = _settings(backend_url="https://staging.example.com", internal_key="secret-key")
-    reporter = modal_app_module._build_usage_reporter(s)
-    assert reporter is not None
-
-    async def _run():
-        for _ in range(5):
-            await reporter({"adapter_id": "a", "promptTokens": 1})
-
-    asyncio.run(_run())
-    assert init_count["n"] == 1  # one client for all five calls
-
-
-@pytest.mark.parametrize("status_code", [408, 429, 500])
-def test_reporter_retries_retryable_statuses_three_times(
-    modal_app_module, monkeypatch, status_code: int
-):
-    import httpx
-
-    calls: list[dict[str, Any]] = []
-
-    class _FakeClient:
-        def __init__(self, *_a: Any, **_k: Any) -> None:
-            pass
-
-        async def post(self, url: str, json: Any) -> httpx.Response:
-            calls.append(json)
-            response_status = status_code if len(calls) <= 3 else 204
-            return httpx.Response(response_status, request=httpx.Request("POST", url))
-
-        async def aclose(self) -> None:
-            pass
-
-    async def _no_sleep(_delay: float) -> None:
-        pass
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-    monkeypatch.setattr(modal_app_module.asyncio, "sleep", _no_sleep)
-    reporter = modal_app_module._build_usage_reporter(
-        _settings(backend_url="https://staging.example.com", internal_key="secret-key")
-    )
-    usage = {"requestId": "generation-1", "promptTokens": 1}
-
-    asyncio.run(reporter(usage))
-
-    assert calls == [usage, usage, usage, usage]
-
-
-def test_reporter_retries_transport_failures_three_times(modal_app_module, monkeypatch):
-    import httpx
-
-    calls = 0
-
-    class _FakeClient:
-        def __init__(self, *_a: Any, **_k: Any) -> None:
-            pass
-
-        async def post(self, url: str, json: Any) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            if calls <= 3:
-                raise httpx.ConnectError("backend unavailable")
-            return httpx.Response(204, request=httpx.Request("POST", url))
-
-        async def aclose(self) -> None:
-            pass
-
-    async def _no_sleep(_delay: float) -> None:
-        pass
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-    monkeypatch.setattr(modal_app_module.asyncio, "sleep", _no_sleep)
-    reporter = modal_app_module._build_usage_reporter(
-        _settings(backend_url="https://staging.example.com", internal_key="secret-key")
-    )
-
-    asyncio.run(reporter({"requestId": "generation-1", "promptTokens": 1}))
-
-    assert calls == 4
-
-
-@pytest.mark.parametrize(
-    ("usage", "status_code"),
-    [
-        ({"requestId": "generation-1", "promptTokens": 1}, 402),
-        ({"promptTokens": 1}, 500),
-    ],
-)
-def test_reporter_does_not_retry_non_idempotent_or_non_retryable_failures(
-    modal_app_module, monkeypatch, usage: dict[str, Any], status_code: int
-):
-    import httpx
-
-    calls = 0
-
-    class _FakeClient:
-        def __init__(self, *_a: Any, **_k: Any) -> None:
-            pass
-
-        async def post(self, url: str, json: Any) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            return httpx.Response(status_code, request=httpx.Request("POST", url))
-
-        async def aclose(self) -> None:
-            pass
-
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-    reporter = modal_app_module._build_usage_reporter(
-        _settings(backend_url="https://staging.example.com", internal_key="secret-key")
-    )
-
-    with pytest.raises(httpx.HTTPStatusError):
-        asyncio.run(reporter(usage))
-
-    assert calls == 1

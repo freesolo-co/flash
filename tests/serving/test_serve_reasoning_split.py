@@ -17,7 +17,8 @@ import orjson
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.http.router import AdapterRouter, build_serving_app
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.io.responses import _ReasoningStreamSplitter, _split_reasoning
 from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.conftest import attest
@@ -25,8 +26,8 @@ from tests.serving.conftest import attest
 QWEN = "Qwen/Qwen3.5-9B"
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
-    return None
+async def _allow(_token: str, _adapter_id: str) -> str:
+    return "org-1"
 
 
 def _rec(run_id: str, *, thinking: bool = True) -> AdapterRecord:

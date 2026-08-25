@@ -12,7 +12,8 @@ from fastapi.testclient import TestClient
 
 from flash.serving.src.http import adapter_routes
 from flash.serving.src.http.adapter_routes import remove_adapter
-from flash.serving.src.http.router import AdapterRouter, build_serving_app
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.io.schemas import (
     AdapterRecord,
     ImmutableAdapterRegistration,

@@ -8,7 +8,6 @@ billed to the CALLING org — the backend authorizes it and returns the caller's
 
 from __future__ import annotations
 
-from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -16,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
-from tests.serving.conftest import attest
+from tests.serving.conftest import RecordingUsageStore, attest
 
 QWEN = "Qwen/Qwen3.5-9B"
 INTERNAL_KEY = "fs-internal"
@@ -32,7 +31,7 @@ def _lora_rec(run_id: str = "qa") -> AdapterRecord:
             "org_id": "org-A",
             "checkpoint": run_id,
             "status": "ready",
-            "thinking": True,
+            "thinking": False,
             "metadata": {
                 "record_type": "revision",
                 "run_id": run_id,
@@ -65,7 +64,7 @@ def _base_rec(base_model: str = QWEN) -> AdapterRecord:
         repo_id=base_model,
         base_model=base_model,
         serve_base_model=True,
-        thinking=True,
+        thinking=False,
         org_id=None,
         status="ready",
     )
@@ -80,6 +79,9 @@ class FakePool:
                 "finish_reason": "stop",
                 "prompt_tokens": 3,
                 "completion_tokens": 2,
+                "cached_tokens_reported": False,
+                "reasoning_tokens": 0,
+                "request_id": payload.generation_id,
                 "checkpoint": "",
             },
         )
@@ -107,19 +109,15 @@ class FakeAuthorizer:
 
 
 def _build(records, *, authorizer=None):
-    reports: list[dict[str, Any]] = []
-
-    async def _capture(usage):
-        reports.append(usage)
-
+    store = RecordingUsageStore()
     app = build_serving_app(
         FakePool(),
         AdapterRouter(records),
         internal_key=INTERNAL_KEY,
         chat_authorizer=authorizer,
-        usage_reporter=_capture,
+        usage_store=store,
     )
-    return TestClient(app), reports
+    return TestClient(app), store
 
 
 def _chat(client, model, **headers):
@@ -139,35 +137,100 @@ def test_base_model_requires_a_valid_api_key() -> None:
     assert auth.calls == [("k", QWEN)]  # the key + base model id are handed to the backend
 
 
-def test_base_model_serve_is_billed_to_the_caller_org() -> None:
-    client, reports = _build([_base_rec()], authorizer=FakeAuthorizer(org="caller-org"))
+def test_base_model_serve_records_the_authorized_org_principal() -> None:
+    client, store = _build([_base_rec()], authorizer=FakeAuthorizer(org="caller-org"))
     assert _chat(client, QWEN, Authorization="Bearer k").status_code == 200
-    assert len(reports) == 1
-    usage = reports[0]
-    assert usage["orgId"] == "caller-org"  # billed to the caller (no adapter owner)
-    assert "adapterId" not in usage
-    assert usage["baseModel"] == QWEN
+    assert len(store.finalized) == 1
+    event = store.finalized[0]
+    assert event.principal.kind == "freesolo_org"
+    assert event.principal.orgId == "caller-org"
+    assert event.target.requested_adapter_id == QWEN
+    assert event.target.base_model == QWEN
 
 
-def test_base_model_via_internal_key_drops_unattributable_usage() -> None:
-    # A trusted internal caller bypasses user auth, so no caller org is known; a base serve has no
-    # owner either -> the usage report is dropped rather than misbilled.
-    client, reports = _build([_base_rec()], authorizer=FakeAuthorizer())
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/generate", {"adapter_id": QWEN, "prompt": "hi"}),
+        (
+            "/v1/chat/completions",
+            {"model": QWEN, "messages": [{"role": "user", "content": "hi"}]},
+        ),
+    ],
+)
+def test_default_base_model_request_shapes_are_settleable(path, payload) -> None:
+    client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
+
+    response = client.post(path, json=payload, headers={"Authorization": "Bearer k"})
+
+    assert response.status_code == 200
+    assert len(store.finalized) == 1
+    assert store.finalized[0].facts.reasoning_tokens == 0
+
+
+def test_explicit_base_model_thinking_remains_rejected_before_settlement() -> None:
+    client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
+
+    response = client.post(
+        "/generate",
+        json={
+            "adapter_id": QWEN,
+            "prompt": "hi",
+            "chat_template_kwargs": {"enable_thinking": True},
+        },
+        headers={"Authorization": "Bearer k"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "thinking generation accounting is unavailable"}
+    assert store.finalized == []
+
+
+def test_base_model_via_internal_key_is_durably_unattributed() -> None:
+    client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
     resp = _chat(client, QWEN, **{"X-Freesolo-Internal-Key": INTERNAL_KEY})
     assert resp.status_code == 200
-    assert reports == []
+    assert len(store.finalized) == 1
+    event = store.finalized[0]
+    assert event.principal.kind == "trusted_internal"
+    assert event.principal.orgId is None
+    assert event.target.requested_adapter_id == QWEN
 
 
-def test_lora_adapter_still_requires_a_key_and_bills_by_adapter_id() -> None:
+def test_internal_lora_is_explicitly_attributed_to_immutable_owner() -> None:
+    revision = _lora_rec("qa")
+    client, store = _build([revision, _lora_alias(revision)], authorizer=FakeAuthorizer())
+
+    response = _chat(client, "qa", **{"X-Freesolo-Internal-Key": INTERNAL_KEY})
+
+    assert response.status_code == 200
+    assert len(store.finalized) == 1
+    principal = store.finalized[0].principal
+    assert principal.kind == "trusted_internal"
+    assert principal.orgId == "org-A"
+    assert principal.billingAttributionExplicit is True
+
+
+def test_external_authorizer_none_fails_closed_before_dispatch() -> None:
+    client, store = _build([_base_rec()], authorizer=FakeAuthorizer(org=None))
+
+    response = _chat(client, QWEN, Authorization="Bearer k")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "serving auth did not return an attributable principal"}
+    assert store.finalized == []
+
+
+def test_lora_adapter_still_requires_a_key_and_records_requested_identity() -> None:
     auth = FakeAuthorizer()
     revision = _lora_rec("qa")
-    client, reports = _build([revision, _lora_alias(revision)], authorizer=auth)
-    assert _chat(client, "qa").status_code == 401  # still gated
+    client, store = _build([revision, _lora_alias(revision)], authorizer=auth)
+    assert _chat(client, "qa").status_code == 401
     assert _chat(client, "qa", Authorization="Bearer k").status_code == 200
     assert auth.calls == [("k", "qa")]
-    assert reports
-    assert reports[0]["adapterId"] == "qa"
-    assert "orgId" not in reports[0]  # LoRA bills by adapterId (owner resolved by backend)
+    assert len(store.finalized) == 1
+    assert store.finalized[0].target.requested_adapter_id == "qa"
+    assert store.finalized[0].principal.orgId == "caller-org"
 
 
 def test_adapter_record_defaults_serve_base_model_false() -> None:
@@ -204,7 +267,8 @@ def test_base_model_records_seed_one_open_record_per_model(modal_app_module):
     recs = modal_app_module._base_model_records()
     assert {r.adapter_id for r in recs} == set(base_models())
     assert all(
-        r.serve_base_model and r.org_id is None and r.adapter_id == r.base_model for r in recs
+        r.serve_base_model and not r.thinking and r.org_id is None and r.adapter_id == r.base_model
+        for r in recs
     )
 
 
