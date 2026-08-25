@@ -16,6 +16,8 @@ import threading
 import time
 from collections.abc import Callable
 
+from flash.engine.verl_checkpoint import FsdpCheckpointInspection
+from flash.engine.verl_policy import FsdpGeneration
 from flash.engine.worker.backend_common import (
     completed_checkpoint_step,
     stage_verl_resume,
@@ -27,7 +29,7 @@ from flash.engine.worker.train.core.checkpoint_lifecycle import CheckpointLedger
 from flash.engine.worker.verl.checkpoints import (
     MergeDiskExhaustedError,
     MergeDiskHeadroomError,
-    resume_checkpoint_is_loadable,
+    inspect_resume_checkpoint,
 )
 
 
@@ -258,7 +260,12 @@ class _VerlResumeUploader:
             self._error = error
 
 
-def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
+def _restore_verl_resume(
+    local_dir: str,
+    *,
+    world_size: int,
+    expected_fsdp_generation: FsdpGeneration,
+) -> int:
     """stage this run's streamed resume checkpoint into local_dir; return the step it resumes at.
 
     returns 0 when there is nothing to resume, which is the ordinary fresh-run path, and also when
@@ -267,12 +274,30 @@ def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
     incompatible one also streamed -- without it, a repeated discard would starve the compatible one
     every retry (the remote max-step pick never advances past the checkpoint this attempt rejects).
     """
-    resume = _w.hf_resume_checkpoint(
-        prefer=lambda path: resume_checkpoint_is_loadable(path, world_size=world_size)
-    )
+    inspections: dict[str, FsdpCheckpointInspection] = {}
+
+    def prefer(path: str) -> bool:
+        inspection = inspections.get(path)
+        if inspection is None:
+            inspection = inspect_resume_checkpoint(
+                path,
+                world_size=world_size,
+                expected_fsdp_generation=expected_fsdp_generation,
+            )
+            inspections[path] = inspection
+        return inspection.loadable
+
+    resume = _w.hf_resume_checkpoint(prefer=prefer)
     if not resume:
         return 0
-    return stage_verl_resume(resume, local_dir, job_label="GRPO", world_size=world_size)
+    return stage_verl_resume(
+        resume,
+        local_dir,
+        job_label="GRPO",
+        world_size=world_size,
+        expected_fsdp_generation=expected_fsdp_generation,
+        inspection=inspections.get(resume),
+    )
 
 
 def _check_grpo_had_a_gradient(

@@ -393,7 +393,11 @@ class _FakePrivateHf:
 
     def get_paths_info(self, **kwargs):
         self.calls.append(("get_paths_info", kwargs))
-        return [SimpleNamespace(path=path) for path in kwargs["paths"] if path in self.files]
+        return [
+            SimpleNamespace(path=path, size=len(self.files[path]))
+            for path in kwargs["paths"]
+            if path in self.files
+        ]
 
     def upload_file(self, **kwargs):
         path = kwargs["path_in_repo"]
@@ -449,6 +453,7 @@ def test_strict_reader_pins_one_sha_and_any_present_marker_blocks(monkeypatch, t
             next_attempt=2,
             contract_version=1,
             phase="opd",
+            expected_fsdp_generation=1,
         )
 
     assert [name for name, _kwargs in calls] == ["repo_info", "get_paths_info", "download"]
@@ -483,6 +488,7 @@ def test_strict_reader_all_absent_is_safe(monkeypatch):
         next_attempt=2,
         contract_version=1,
         phase="opd",
+        expected_fsdp_generation=1,
     )
 
 
@@ -517,6 +523,7 @@ def test_strict_reader_malformed_or_outage_blocks(monkeypatch, tmp_path, mode):
             next_attempt=1,
             contract_version=1,
             phase="opd",
+            expected_fsdp_generation=1,
         )
 
 
@@ -535,6 +542,7 @@ def test_strict_reader_missing_repo_or_unsupported_contract_blocks(repo, version
             next_attempt=1,
             contract_version=version,
             phase="opd",
+            expected_fsdp_generation=1,
         )
 
 
@@ -722,12 +730,21 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
                 private_hf.files[marker_path] = canonical_opd_optimizer_start_json(
                     run_id=spec.run_id, attempt=0, seed=42
                 )
-                for path in _ckpt_files("opd", spec.run_id, 20, _COMPLETE_CKPT):
-                    private_hf.files[path] = (
-                        json.dumps(_valid_resume_state(20)).encode()
-                        if path.endswith("/opd_state.json")
-                        else b"checkpoint"
-                    )
+                checkpoint_names = (
+                    *_COMPLETE_CKPT[:6],
+                    "actor/fsdp_config.json",
+                    "actor/model_world_size_1_rank_0.pt",
+                    "actor/optim_world_size_1_rank_0.pt",
+                    "actor/extra_state_world_size_1_rank_0.pt",
+                )
+                for path in _ckpt_files("opd", spec.run_id, 20, checkpoint_names):
+                    if path.endswith("/opd_state.json"):
+                        payload = json.dumps(_valid_resume_state(20)).encode()
+                    elif path.endswith("/actor/fsdp_config.json"):
+                        payload = json.dumps({"FSDP_version": 1, "world_size": 1}).encode()
+                    else:
+                        payload = b"checkpoint"
+                    private_hf.files[path] = payload
                 return PollResult(False, failure="poll_error", detail="transient")
             return PollResult(True, metrics={"train_tokens": 1})
 
@@ -926,6 +943,7 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
 # full-state resume checkpoint at the same pinned revision. these drive verify_opd_replacement_safe
 # directly with a validated attempt-1 marker present, varying only the checkpoint listing.
 
+_MISSING_SIZE = object()
 _COMPLETE_CKPT = (
     "adapter_config.json",
     "adapter_model.safetensors",
@@ -933,6 +951,13 @@ _COMPLETE_CKPT = (
     "rng_state.pth",
     "opd_state.json",
     "tokenizer.json",
+    "actor/fsdp_config.json",
+    "actor/model_world_size_2_rank_0.pt",
+    "actor/model_world_size_2_rank_1.pt",
+    "actor/optim_world_size_2_rank_0.pt",
+    "actor/optim_world_size_2_rank_1.pt",
+    "actor/extra_state_world_size_2_rank_0.pt",
+    "actor/extra_state_world_size_2_rank_1.pt",
 )
 # adapter written but optimizer.pt missing: a torn/partial upload, not resumable.
 _INCOMPLETE_CKPT = (
@@ -954,17 +979,37 @@ def _install_marker_gate(
     checkpoint_files,
     checkpoint_state=None,
     state_download_error=None,
+    fsdp_generation=1,
+    fsdp_world_size=2,
+    shard_size_overrides=None,
 ):
     """Install one validated marker plus pinned checkpoint listing and metadata reads."""
     present_path = opd_optimizer_start_marker_path("run-1", 1)
-    seen = {"list_revision": None, "downloads": []}
+    seen = {"list_revision": None, "downloads": [], "path_info_requests": []}
 
     class Api:
         def repo_info(self, **_kwargs):
             return SimpleNamespace(sha="pinned-sha")
 
-        def get_paths_info(self, **_kwargs):
-            return [SimpleNamespace(path=present_path)]
+        def get_paths_info(self, **kwargs):
+            requested = kwargs.get("paths", [])
+            seen["path_info_requests"].append(requested)
+            if present_path in requested:
+                return [SimpleNamespace(path=present_path, size=1)]
+            available = (
+                set(checkpoint_files) if not isinstance(checkpoint_files, Exception) else set()
+            )
+            infos = []
+            for path in requested:
+                if path not in available:
+                    continue
+                size = (shard_size_overrides or {}).get(path, 1)
+                infos.append(
+                    SimpleNamespace(path=path)
+                    if size is _MISSING_SIZE
+                    else SimpleNamespace(path=path, size=size)
+                )
+            return infos
 
         def list_repo_files(self, **kwargs):
             seen["list_revision"] = kwargs.get("revision")
@@ -977,6 +1022,12 @@ def _install_marker_gate(
         if kwargs["filename"] == present_path:
             path = tmp_path / "marker.json"
             path.write_bytes(canonical_opd_optimizer_start_json(run_id="run-1", attempt=1, seed=42))
+            return str(path)
+        if kwargs["filename"].endswith("/actor/fsdp_config.json"):
+            path = tmp_path / "fsdp_config.json"
+            path.write_text(
+                json.dumps({"FSDP_version": fsdp_generation, "world_size": fsdp_world_size})
+            )
             return str(path)
         if state_download_error is not None:
             raise state_download_error
@@ -999,6 +1050,7 @@ def _run_gate():
         next_attempt=2,
         contract_version=1,
         phase="opd",
+        expected_fsdp_generation=1,
     )
 
 
@@ -1006,9 +1058,7 @@ def test_gate_allows_replacement_when_marker_paired_with_valid_metadata(monkeypa
     seen = _install_marker_gate(
         monkeypatch, tmp_path, checkpoint_files=_ckpt_files("opd", "run-1", 40, _COMPLETE_CKPT)
     )
-    # no fsdp shards in this listing, so the width is unreadable and reported as None rather than
-    # guessed -- the caller then leaves the retry's shape unconstrained.
-    assert _run_gate() == ("pinned-sha", None)
+    assert _run_gate() == ("pinned-sha", 2)
     assert seen["list_revision"] == "pinned-sha"
     metadata_download = seen["downloads"][-1]
     assert metadata_download["revision"] == "pinned-sha"
@@ -1061,13 +1111,22 @@ def test_gate_blocks_pinned_checkpoint_metadata_download_failure(monkeypatch, tm
 
 
 def _sharded_ckpt(step: int, world_size: int) -> list[str]:
-    """A complete checkpoint listing plus the fsdp shards one world size writes."""
-    return _ckpt_files("opd", "run-1", step, _COMPLETE_CKPT) + _ckpt_files(
-        "opd",
-        "run-1",
-        step,
-        tuple(f"actor/model_world_size_{world_size}_rank_{rank}.pt" for rank in range(world_size)),
+    """A complete checkpoint listing with the canonical native shard set."""
+    names = (
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "optimizer.pt",
+        "rng_state.pth",
+        "opd_state.json",
+        "tokenizer.json",
+        "actor/fsdp_config.json",
+        *(
+            f"actor/{kind}_world_size_{world_size}_rank_{rank}.pt"
+            for kind in ("model", "optim", "extra_state")
+            for rank in range(world_size)
+        ),
     )
+    return _ckpt_files("opd", "run-1", step, names)
 
 
 def test_gate_reports_the_width_the_checkpoint_was_written_at(monkeypatch, tmp_path):
@@ -1082,19 +1141,85 @@ def test_gate_reports_the_width_the_checkpoint_was_written_at(monkeypatch, tmp_p
     assert _run_gate() == ("pinned-sha", 2)
 
 
-def test_gate_reports_no_width_for_torn_shards(monkeypatch, tmp_path):
-    """Two widths in one directory is a torn or merged save, not a topology to pin a retry to.
-
-    Reporting either number would pin the retry to a shape half the shards cannot be loaded on.
-    None means "do not constrain", which leaves the retry ranking exactly as it is today.
-    """
+def test_gate_blocks_torn_shards_instead_of_guessing_a_width(monkeypatch, tmp_path):
     _install_marker_gate(
         monkeypatch,
         tmp_path,
         checkpoint_files=_sharded_ckpt(40, 2)
         + _ckpt_files("opd", "run-1", 40, ("actor/model_world_size_4_rank_0.pt",)),
     )
-    assert _run_gate() == ("pinned-sha", None)
+    with pytest.raises(RuntimeError, match="malformed shard name"):
+        _run_gate()
+
+
+@pytest.mark.parametrize("missing_kind", ["optim", "extra_state"])
+def test_gate_blocks_missing_native_state_class(monkeypatch, tmp_path, missing_kind):
+    files = [
+        path for path in _sharded_ckpt(40, 2) if f"/actor/{missing_kind}_world_size_" not in path
+    ]
+    _install_marker_gate(monkeypatch, tmp_path, checkpoint_files=files)
+
+    with pytest.raises(RuntimeError, match=rf"missing shard.*{missing_kind}_world_size_2_rank_0"):
+        _run_gate()
+
+
+def test_gate_blocks_wrong_private_fsdp_generation(monkeypatch, tmp_path):
+    _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_sharded_ckpt(40, 2),
+        fsdp_generation=2,
+    )
+
+    with pytest.raises(RuntimeError, match="fsdp generation mismatch"):
+        _run_gate()
+
+
+def test_gate_rejects_oversized_fsdp_width_before_expanding_shard_paths(monkeypatch, tmp_path):
+    seen = _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_sharded_ckpt(40, 2),
+        fsdp_world_size=9,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid or missing fsdp stamp"):
+        _run_gate()
+
+    assert len(seen["path_info_requests"]) == 1
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "actor/model_world_size_2_rank_00.pt",
+        "actor/model_world_size_02_rank_0.pt",
+    ],
+)
+def test_gate_blocks_noncanonical_native_rank_alias(monkeypatch, tmp_path, bad_name):
+    files = _sharded_ckpt(40, 2) + _ckpt_files("opd", "run-1", 40, (bad_name,))
+    _install_marker_gate(monkeypatch, tmp_path, checkpoint_files=files)
+
+    with pytest.raises(RuntimeError, match="malformed shard name"):
+        _run_gate()
+
+
+@pytest.mark.parametrize(
+    "invalid_size",
+    [_MISSING_SIZE, True, "1", 1.5, 0, -1],
+    ids=["missing", "boolean", "string", "float", "zero", "negative"],
+)
+def test_gate_blocks_invalid_expected_native_file_size(monkeypatch, tmp_path, invalid_size):
+    invalid_path = "opd/run-1/checkpoint/checkpoint-40/actor/optim_world_size_2_rank_1.pt"
+    _install_marker_gate(
+        monkeypatch,
+        tmp_path,
+        checkpoint_files=_sharded_ckpt(40, 2),
+        shard_size_overrides={invalid_path: invalid_size},
+    )
+
+    with pytest.raises(RuntimeError, match=r"empty or unreadable shard.*optim_world_size_2_rank_1"):
+        _run_gate()
 
 
 def test_nested_shards_do_not_count_toward_checkpoint_completeness(monkeypatch, tmp_path):

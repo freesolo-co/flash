@@ -16,9 +16,11 @@ import time
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.adapters.lora_rank import alpha_from_adapter_config, rank_from_adapter_config
+from flash.engine.verl_checkpoint import FsdpCheckpointInspection
+from flash.engine.verl_policy import FsdpGeneration
 from flash.engine.worker.runtime.kernel_warmup import KERNEL_CACHE_ENV_SUBDIRS
 from flash.engine.worker.runtime.pkg_proxy import W as _w
-from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
+from flash.engine.worker.verl.checkpoints import inspect_resume_checkpoint
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
@@ -126,7 +128,12 @@ def _verl_image_message_content(content) -> str:
     return "".join(parts)
 
 
-def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
+def _restore_verl_resume(
+    local_dir: str,
+    *,
+    world_size: int,
+    expected_fsdp_generation: FsdpGeneration,
+) -> int:
     """stage this run's streamed resume checkpoint; 0 when there is nothing usable to resume from.
 
     ``world_size`` is the rank count this attempt launches verl at; a checkpoint written at a
@@ -134,12 +141,30 @@ def _restore_verl_resume(local_dir: str, *, world_size: int) -> int:
     prefers a lower loadable checkpoint over a higher incompatible one, so a repeated discard cannot
     starve a compatible checkpoint uploaded after the one this attempt already rejected.
     """
-    resume = _w.hf_resume_checkpoint(
-        prefer=lambda path: resume_checkpoint_is_loadable(path, world_size=world_size)
-    )
+    inspections: dict[str, FsdpCheckpointInspection] = {}
+
+    def prefer(path: str) -> bool:
+        inspection = inspections.get(path)
+        if inspection is None:
+            inspection = inspect_resume_checkpoint(
+                path,
+                world_size=world_size,
+                expected_fsdp_generation=expected_fsdp_generation,
+            )
+            inspections[path] = inspection
+        return inspection.loadable
+
+    resume = _w.hf_resume_checkpoint(prefer=prefer)
     if not resume:
         return 0
-    return stage_verl_resume(resume, local_dir, job_label="SFT", world_size=world_size)
+    return stage_verl_resume(
+        resume,
+        local_dir,
+        job_label="SFT",
+        world_size=world_size,
+        expected_fsdp_generation=expected_fsdp_generation,
+        inspection=inspections.get(resume),
+    )
 
 
 def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:

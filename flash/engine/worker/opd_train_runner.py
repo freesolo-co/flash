@@ -14,6 +14,7 @@ from typing import Any
 from flash.adapters.targets import resolve_lora_targeting
 from flash.core.catalog import get_model
 from flash.engine.plan.steps import rl_data_parallel_cards
+from flash.engine.verl_policy import _resolve_fsdp_generation
 from flash.engine.worker import opd_train as _opd_train
 from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.train.core.prompt_rows import canonical_prompt_messages
@@ -171,6 +172,8 @@ def _prepare_workload(
     target_modules = targeting.target_modules
     if isinstance(target_modules, set | frozenset):
         target_modules = sorted(target_modules)
+    target_parameters = tuple(targeting.target_parameters) if targeting.target_parameters else None
+    fsdp_generation = _resolve_fsdp_generation("opd", target_parameters)
     lora_rank = int(lora_config.r)
     return _WorkloadState(
         prompts_per_step,
@@ -191,6 +194,8 @@ def _prepare_workload(
         lora_rank,
         int(lora_config.lora_alpha),
         target_modules,
+        target_parameters,
+        fsdp_generation,
         targeting.exclude_modules,
         _opd_train._warmstart_adapter_path(
             request.model_id,
@@ -238,9 +243,11 @@ def _materialize_child_files(
         workload.local_dir,
         prompt_pool_fingerprint=workload.prompt_pool_fingerprint,
         update_horizon=workload.update_horizon,
-        # the same count this attempt hands verl as n_gpus_per_node, which is the DATA-parallel
+        # the same count this attempt hands verl as n_gpus_per_node, which is the data-parallel
         # width: ulysses is pinned to 1, so every rank is a dp rank.
         world_size=gpu_count,
+        # native state is generation-specific, so use the same resolved policy as the child config.
+        expected_fsdp_generation=workload.fsdp_generation,
     )
     bridge = _opd_train._TeacherAlignmentBridge(
         prompts=prompt_state.prompts,
@@ -384,7 +391,8 @@ def _build_base_config(
         "lora_alpha": workload.lora_alpha,
         "target_modules": workload.target_modules,
         "exclude_modules": None,
-        "target_parameters": _opd_train._w.lora_target_parameters(request.model_id),
+        "target_parameters": workload.target_parameters,
+        "fsdp_generation": workload.fsdp_generation,
         "lora_adapter_path": workload.warmstart_adapter,
         "learning_rate": knobs.learning_rate,
         "local_dir": workload.local_dir,

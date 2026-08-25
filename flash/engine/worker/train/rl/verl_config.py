@@ -301,9 +301,9 @@ def _actor_overrides(cfg: dict) -> list[str]:
         # absent -> True, verl's own default: a cfg built without the gate must render the
         # lower-memory strategy, never fall into zero-2 by omission.
         f"actor_rollout_ref.actor.fsdp_config.reshard_after_forward={_hydra_val(bool(cfg.get('reshard_after_forward', True)))}",
-        # fused-expert lora is a parametrization on a named tensor, which only fsdp2 can host.
-        # shared with the opd driver; sft has always been on fsdp2 for the same reason.
-        *actor_fsdp_strategy_overrides(cfg.get("target_parameters")),
+        # grpo requires fsdp2 for dense and fused-expert actors. reshard_after_forward above still
+        # independently selects zero-2 or zero-3, so the allocator's memory decision is unchanged.
+        *actor_fsdp_strategy_overrides(cfg["fsdp_generation"]),
         # store the frozen base in bf16, not verl's fp32 yaml default. shared with the opd driver.
         *trainer_dtype_overrides(),
     ]
@@ -639,6 +639,7 @@ def _build_verl_training_cfg(
         # the catalog id, never model_path: fused routed-expert parameters are part of the same
         # resolved target surface and must not be derived from the local snapshot path.
         "target_parameters": targeting.target_parameters,
+        "fsdp_generation": inp["fsdp_generation"],
         "multimodal": bool(inp.get("multimodal")),
         "lr": inp["lr"],
         "group_size": inp["group_size"],

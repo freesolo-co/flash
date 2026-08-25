@@ -4858,31 +4858,33 @@ def test_rollout_layered_summon_uses_a_bare_override_not_an_append():
     assert override.startswith("actor_rollout_ref.rollout.layered_summon=")
 
 
-def test_fused_expert_targets_select_fsdp2():
-    # the regression this exists for: PEFT applies `target_parameters` by registering a torch
-    # parametrization onto a NAMED TENSOR at forward time (peft/tuners/lora/layer.py:2463), and
-    # register_parametrization does `delattr` then asserts the name is gone (parametrize.py:387).
-    # fsdp1 fails that on both settings of use_orig_params -- False flattens the tensor away
-    # (raise at parametrize.py:639), True leaves FSDP.__getattr__ resolving it from the wrapped
-    # module so `hasattr` stays True and the bare assert fires (parametrize.py:634). only fsdp2's
-    # fully_shard keeps the parameter under its own name with no wrapper indirection.
+@pytest.mark.parametrize(
+    ("fsdp_generation", "expected"),
+    [(1, "fsdp"), (2, "fsdp2")],
+)
+def test_actor_fsdp_strategy_renders_the_resolved_generation(fsdp_generation, expected):
     from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
 
-    assert actor_fsdp_strategy_overrides(["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]) == [
-        "actor_rollout_ref.actor.strategy=fsdp2"
+    assert actor_fsdp_strategy_overrides(fsdp_generation) == [
+        f"actor_rollout_ref.actor.strategy={expected}"
     ]
 
 
-@pytest.mark.parametrize("empty", [None, []])
-def test_dense_models_stay_on_fsdp1(empty):
-    # a dense model's lora lives on wrapper MODULES swapped in at injection, so no parametrization
-    # is ever registered and fsdp1 is fine. the key is still written rather than omitted, so the
-    # dense default is stated once here instead of being inherited from verl's yaml.
-    # only None and [] are exercised: resolve_lora_targeting hands back a list or None, so a bare
-    # string or tuple is not a shape this boundary can produce.
-    from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
+@pytest.mark.parametrize(
+    ("algorithm", "target_parameters", "expected"),
+    [
+        ("sft", None, 2),
+        ("sft", ["mlp.experts.gate_up_proj"], 2),
+        ("grpo", None, 2),
+        ("grpo", ["mlp.experts.gate_up_proj"], 2),
+        ("opd", None, 1),
+        ("opd", ["mlp.experts.gate_up_proj"], 2),
+    ],
+)
+def test_private_fsdp_policy_matrix(algorithm, target_parameters, expected):
+    from flash.engine.verl_policy import _resolve_fsdp_generation
 
-    assert actor_fsdp_strategy_overrides(empty) == ["actor_rollout_ref.actor.strategy=fsdp"]
+    assert _resolve_fsdp_generation(algorithm, target_parameters) == expected
 
 
 def test_actor_fsdp_strategy_uses_a_bare_override_not_an_append():
@@ -4890,7 +4892,7 @@ def test_actor_fsdp_strategy_uses_a_bare_override_not_an_append():
     # prefix would be an append to an existing key and fail the config merge.
     from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
 
-    (override,) = actor_fsdp_strategy_overrides(["mlp.experts.gate_up_proj"])
+    (override,) = actor_fsdp_strategy_overrides(2)
     assert not override.startswith("+")
     assert override.startswith("actor_rollout_ref.actor.strategy=")
 

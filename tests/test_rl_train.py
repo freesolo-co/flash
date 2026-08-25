@@ -1299,6 +1299,7 @@ def _overrides_cfg(**over):
         "lora_alpha": 64,
         "target_modules": "all-linear",
         "exclude_modules": None,
+        "fsdp_generation": 2,
         "lr": 1e-5,
         "group_size": 8,
         "prompts_per_step": 16,
@@ -1358,23 +1359,35 @@ def test_build_verl_overrides_omits_layered_summon_for_dense_models():
     assert not [x for x in o if "layered_summon" in x]
 
 
-def test_build_verl_overrides_puts_fused_expert_lora_on_fsdp2():
-    # end-to-end through the real builder. PEFT's forward-time parametrization needs
-    # `mlp.experts.down_proj` reachable by name AND its slot free after `delattr`; fsdp1 cannot
-    # give both, because FSDP.__getattr__ keeps resolving the name from the wrapped module. the
-    # sft driver has always pinned fsdp2 for this reason (train/sft/config.py:138).
-    o = rl_train.build_verl_overrides(
-        _overrides_cfg(target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
-    )
+@pytest.mark.parametrize(
+    "target_parameters",
+    [None, ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]],
+)
+def test_build_verl_overrides_puts_every_actor_on_fsdp2(target_parameters):
+    o = rl_train.build_verl_overrides(_overrides_cfg(target_parameters=target_parameters))
     assert "actor_rollout_ref.actor.strategy=fsdp2" in o
-    # exactly one writer of the key, so the value cannot be ambiguous at merge time
-    assert len([x for x in o if x.startswith("actor_rollout_ref.actor.strategy=")]) == 1
+    # exactly one bare writer of the key, so the value cannot be ambiguous at merge time
+    strategy_overrides = [x for x in o if "actor_rollout_ref.actor.strategy=" in x]
+    assert strategy_overrides == ["actor_rollout_ref.actor.strategy=fsdp2"]
 
 
-def test_build_verl_overrides_keeps_dense_models_on_fsdp1():
-    o = rl_train.build_verl_overrides(_overrides_cfg(target_parameters=None))
-    assert "actor_rollout_ref.actor.strategy=fsdp" in o
-    assert len([x for x in o if x.startswith("actor_rollout_ref.actor.strategy=")]) == 1
+@pytest.mark.parametrize("reshard_after_forward", [False, True])
+def test_grpo_fsdp2_does_not_change_zero2_or_zero3(reshard_after_forward):
+    for target_parameters in (None, ["mlp.experts.gate_up_proj"]):
+        overrides = dict(
+            value.split("=", 1)
+            for value in rl_train.build_verl_overrides(
+                _overrides_cfg(
+                    target_parameters=target_parameters,
+                    reshard_after_forward=reshard_after_forward,
+                )
+            )
+        )
+        assert overrides["actor_rollout_ref.actor.strategy"] == "fsdp2"
+        assert (
+            overrides["actor_rollout_ref.actor.fsdp_config.reshard_after_forward"]
+            == str(reshard_after_forward).lower()
+        )
 
 
 def test_build_verl_overrides_carries_dr_grpo_recipe():
@@ -1478,6 +1491,7 @@ def test_build_verl_training_cfg_resolves_expert_targets_from_the_catalog_id():
             "ppo_epochs": 1,
             "steps": 60,
             "warmstart_adapter": "",
+            "fsdp_generation": 2,
             "verl_total_epochs": 1,
             "save_freq": 20,
             "ckpt_to_keep": 1,
@@ -1806,6 +1820,7 @@ def _mem_util_inp(**over):
         "model_revision": "",
         "engine_len": 2048,
         "group_size": 8,
+        "fsdp_generation": 2,
         "lora_rank": 32,
     }
     inp.update(over)
@@ -1885,6 +1900,7 @@ def test_gpu_mem_util_sizing_reaches_the_launch_config():
             "ppo_epochs": 1,
             "steps": 60,
             "warmstart_adapter": "",
+            "fsdp_generation": 2,
             "verl_total_epochs": 1,
             "save_freq": 20,
             "ckpt_to_keep": 1,
@@ -2143,6 +2159,7 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
             "ppo_epochs": 1,
             "steps": 60,
             "warmstart_adapter": "",
+            "fsdp_generation": 2,
             "model_id": model_id,
             "verl_total_epochs": 2,
             "save_freq": 20,
@@ -2208,6 +2225,7 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "ppo_epochs": 1,
         "steps": 60,
         "warmstart_adapter": "",
+        "fsdp_generation": 2,
         "model_id": "Qwen/Qwen3.5-9B",
         "verl_total_epochs": 2,
         "save_freq": 20,
@@ -4207,7 +4225,9 @@ def test_build_verl_overrides_enables_resume_mode():
 
 def test_restore_verl_resume_is_a_noop_without_a_checkpoint(tmp_path, monkeypatch):
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: None)
-    assert rl_train._restore_verl_resume(str(tmp_path), world_size=1) == 0
+    assert (
+        rl_train._restore_verl_resume(str(tmp_path), world_size=1, expected_fsdp_generation=2) == 0
+    )
     assert not (tmp_path / "latest_checkpointed_iteration.txt").exists()
 
 
@@ -4215,14 +4235,19 @@ def test_restore_verl_resume_stages_the_checkpoint_where_verl_looks(tmp_path, mo
     src = tmp_path / "checkpoint-7"
     (src / "actor").mkdir(parents=True)
     (src / "actor" / "model.safetensors").write_text("weights")
-    # this test is about the staging mechanics, not topology matching; stamp a world_size that
-    # legitimately matches world_size=1 below rather than relying on unreadable-topology behaviour.
-    (src / "actor" / "fsdp_config.json").write_text(json.dumps({"world_size": 1}))
+    # this test is about staging mechanics, so provide one complete native fsdp2 rank.
+    (src / "actor" / "fsdp_config.json").write_text(
+        json.dumps({"FSDP_version": 2, "world_size": 1})
+    )
+    for kind in ("model", "optim", "extra_state"):
+        (src / "actor" / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(src))
 
-    assert rl_train._restore_verl_resume(str(local_dir), world_size=1) == 7
+    assert (
+        rl_train._restore_verl_resume(str(local_dir), world_size=1, expected_fsdp_generation=2) == 7
+    )
     # verl discovers the checkpoint through this marker plus the global_step_N layout.
     assert (local_dir / "latest_checkpointed_iteration.txt").read_text().strip() == "7"
     assert (local_dir / "global_step_7" / "actor" / "model.safetensors").read_text() == "weights"
@@ -4233,7 +4258,9 @@ def test_restore_verl_resume_rejects_an_unparseable_checkpoint_path(tmp_path, mo
     bad.mkdir()
     monkeypatch.setattr(rl_train._w, "hf_resume_checkpoint", lambda *a, **k: str(bad))
     with pytest.raises(RuntimeError, match="invalid GRPO resume checkpoint path"):
-        rl_train._restore_verl_resume(str(tmp_path / "ckpt"), world_size=1)
+        rl_train._restore_verl_resume(
+            str(tmp_path / "ckpt"), world_size=1, expected_fsdp_generation=2
+        )
 
 
 def _write_step(local_dir, step):
