@@ -36,13 +36,13 @@ def test_dependency_light_health_parser_normalizes_the_serving_contract():
         {
             "ok": True,
             "requires_key": False,
-            "base_models": ["Qwen/Qwen3.5-4B"],
+            "base_models": ["Qwen/Qwen3.5-9B"],
             "capabilities": sorted(REQUIRED_SERVING_CAPABILITIES | PREFERRED_SERVING_CAPABILITIES),
         }
     )
     assert health.ok is True
     assert health.requires_key is False
-    assert health.base_models == ("Qwen/Qwen3.5-4B",)
+    assert health.base_models == ("Qwen/Qwen3.5-9B",)
     assert set(health.capabilities) >= REQUIRED_SERVING_CAPABILITIES
 
 
@@ -80,7 +80,7 @@ def test_serving_base_url_default_and_override(monkeypatch):
 
 
 def test_deploy_dry_run_has_no_user_facing_mode():
-    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
+    dep = deploy_adapter("r1", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0", dry_run=True)
     data = dep.to_dict()
     assert data["state"] == "dry_run"
     assert "gpu" not in data
@@ -147,7 +147,7 @@ def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch):
     monkeypatch.setattr(serving_transport.httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0")
     assert ei.value.status_code == 500
     assert "500" in str(ei.value)
     assert "no base-model engines loaded" in str(ei.value)
@@ -167,7 +167,7 @@ def test_real_deploy_4xx_hint_points_at_client_not_serving_outage(monkeypatch):
     monkeypatch.setattr(serving_transport.httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0")
     msg = str(ei.value)
     assert ei.value.status_code == 401
     assert "401" in msg
@@ -245,7 +245,7 @@ def test_real_deploy_translates_unreachable_serving_to_serving_error(monkeypatch
     _stub_deploy_preconditions(monkeypatch, deploy_mod)
     monkeypatch.setattr(serving_transport.httpx, "post", fake_post)
     with pytest.raises(ServingError) as ei:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0")
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0")
     assert ei.value.status_code is None
     assert "could not reach" in str(ei.value)
 
@@ -332,7 +332,7 @@ def test_resolve_deploy_step_rejects_malformed_step_as_400():
 
 def test_deployment_dict_carries_openai_v1_url(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
+    dep = deploy_adapter("r1", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0", dry_run=True)
     data = dep.to_dict()
     assert data["endpoint_name"] == "https://serve.example"
     assert data["openai_base_url"] == "https://serve.example/v1"
@@ -413,7 +413,7 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
         assert adapter_revision == revision
         assert expected_identity["metadata"]["hf_revision"] == sha
         # the readiness wait is funded from the base model's own budget, never the bare default
-        assert budget_s == deploy.revision_ready_budget_seconds("Qwen/Qwen3.5-0.8B")
+        assert budget_s == deploy.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
         events.append("ready")
         return {}
 
@@ -438,7 +438,7 @@ def test_deploy_registers_pinned_revision_then_smokes_then_cas(monkeypatch):
     previous = "flash-1-abc@step-10." + "c3" * 20
     result = deploy.deploy_adapter(
         "flash-1-abc",
-        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-9B",
         "org/repo",
         "sft/flash-1-abc/checkpoints/step_20",
         checkpoint_step=20,
@@ -481,7 +481,7 @@ def test_registration_conflict_is_not_masked_by_existing_revision(monkeypatch):
     with pytest.raises(serving_errors.ServingError, match="revision conflict"):
         deploy.deploy_adapter(
             "flash-1",
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-9B",
             "org/repo",
             "sft/flash-1/seed0",
         )
@@ -504,7 +504,7 @@ def test_ambiguous_registration_requires_matching_immutable_identity(monkeypatch
             "repo_id": "other/repo",
             "repo_type": "dataset",
             "subfolder": "sft/flash-1/seed0/adapter",
-            "base_model": "Qwen/Qwen3.5-0.8B",
+            "base_model": "Qwen/Qwen3.5-9B",
             "checkpoint": "flash-1",
             "thinking": False,
             "metadata": {
@@ -519,7 +519,7 @@ def test_ambiguous_registration_requires_matching_immutable_identity(monkeypatch
     with pytest.raises(serving_errors.ServingError, match="timeout"):
         deploy.deploy_adapter(
             "flash-1",
-            "Qwen/Qwen3.5-0.8B",
+            "Qwen/Qwen3.5-9B",
             "org/repo",
             "sft/flash-1/seed0",
         )
@@ -534,7 +534,7 @@ def test_revision_poll_rejects_mismatched_immutable_identity(monkeypatch):
         "repo_id": "org/repo",
         "repo_type": "dataset",
         "subfolder": "sft/flash-1/seed0/adapter",
-        "base_model": "Qwen/Qwen3.5-0.8B",
+        "base_model": "Qwen/Qwen3.5-9B",
         "checkpoint": "flash-1",
         "thinking": False,
         "metadata": {
@@ -568,7 +568,7 @@ def test_revision_poll_tolerates_absent_provenance_when_not_advertised(monkeypat
         "repo_id": "org/repo",
         "repo_type": "dataset",
         "subfolder": "sft/flash-1/seed0/adapter",
-        "base_model": "Qwen/Qwen3.5-0.8B",
+        "base_model": "Qwen/Qwen3.5-9B",
         "checkpoint": "flash-1",
         "thinking": False,
         "metadata": {
@@ -958,7 +958,7 @@ def test_activation_conflict_preserves_expected_alias(monkeypatch):
 
 def test_new_deployment_does_not_duplicate_existing_v1_suffix(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example/v1/")
-    dep = deploy_adapter("r1", "Qwen/Qwen3.5-0.8B", "repo", "rl/r1/seed0", dry_run=True)
+    dep = deploy_adapter("r1", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0", dry_run=True)
     data = dep.to_dict()
     assert data["endpoint_name"] == "https://serve.example"
     assert data["openai_base_url"] == "https://serve.example/v1"

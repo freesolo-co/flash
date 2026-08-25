@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-BASE_MODEL = "Qwen/Qwen3.5-0.8B"
+BASE_MODEL = "Qwen/Qwen3.5-9B"
 _PLAIN_CONFIG = json.dumps({"r": 1})
 
 

@@ -1136,7 +1136,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
             run_id="flash-1",
             state="running",
             spec={
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "phase": "rl",
                 "environment": {"id": "acme/checkout-bot/my-env"},
@@ -1172,7 +1172,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     assert body["environmentSlug"] == "acme/checkout-bot/my-env"
     # the exact canonical project uuid is persisted with every managed training run.
     assert body["projectId"] == "11111111-1111-4111-8111-111111111111"
-    assert body["model"] == "Qwen/Qwen3.5-4B"
+    assert body["model"] == "Qwen/Qwen3.5-9B"
     assert body["lastHeartbeat"] == {"attempt": 0, "stage": "sft_step"}
     assert "source_snapshot" not in json.dumps(body)
     assert "source_provenance" not in json.dumps(body)
@@ -1202,7 +1202,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
     monkeypatch.setattr(runs.urllib.request, "urlopen", fake_urlopen)
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "environment": {"id": "acme/checkout-bot/my-env"},
         "project": "11111111-1111-4111-8111-111111111111",
@@ -1263,7 +1263,7 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
     spec = JobSpec.from_dict(
         {
             "run_id": "flash-1",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "project": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "algorithm": "grpo",
             "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/flashrun-flash-1"},
@@ -1315,7 +1315,7 @@ def test_record_training_checkpoint_rejects_invalid_persisted_project(
     spec = JobSpec.from_dict(
         {
             "run_id": "flash-1",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "grpo",
             "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/flashrun-flash-1"},

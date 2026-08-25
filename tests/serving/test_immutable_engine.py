@@ -15,7 +15,7 @@ from flash.serving.src.engine.support import (
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.store.registry import AdapterRegistry
 
-BASE_MODEL = "Qwen/Qwen3.5-0.8B"
+BASE_MODEL = "Qwen/Qwen3.5-9B"
 RUN_ID = "flash-1234567890-abcdef12"
 
 

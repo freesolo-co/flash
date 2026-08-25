@@ -17,7 +17,7 @@ _MANIFEST = "d" * 64
 def _staged_spec() -> JobSpec:
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "seed": 0,
             "run_id": "flash-staged-pin-test",

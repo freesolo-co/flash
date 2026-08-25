@@ -349,7 +349,7 @@ def _validate_top_level(
     # an unhashable model (toml array / `[model]` table) would typeerror on models.get() downstream,
     # escaping the callers' configerror/valueerror guards -> 500; type-check like the other scalars.
     if not isinstance(model, str) or not model.strip():
-        raise ConfigError('config `model` must be a model id string (e.g. "Qwen/Qwen3.5-4B")')
+        raise ConfigError('config `model` must be a model id string (e.g. "Qwen/Qwen3.5-9B")')
     model_revision = ""
     project_raw = raw.get("project", "")
     try:

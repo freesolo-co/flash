@@ -18,7 +18,7 @@ _FAILED = pytest.fail.Exception
 _COMPLETE = {
     "--conformance-repo": "acme/artifacts",
     "--conformance-subfolder": "sft/run-abc/adapter",
-    "--conformance-base-model": "Qwen/Qwen3.5-4B",
+    "--conformance-base-model": "Qwen/Qwen3.5-9B",
     "--conformance-hf-revision": "8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f",
     "--conformance-repo-type": "dataset",
 }
@@ -80,7 +80,7 @@ _READY_TIMEOUT = gate.ready_timeout._get_wrapped_function()
 def test_the_readiness_default_tracks_the_clients_own_budget(monkeypatch):
     from flash.serve.deployment.deploy import revision_ready_budget_seconds
 
-    for base_model in ("Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-35B-A3B"):
+    for base_model in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-35B-A3B"):
         source = {"base_model": base_model}
         request = _request({"--conformance-ready-timeout": None}, monkeypatch)
         assert _READY_TIMEOUT(request, source) == revision_ready_budget_seconds(base_model)
@@ -88,4 +88,4 @@ def test_the_readiness_default_tracks_the_clients_own_budget(monkeypatch):
 
 def test_an_explicit_readiness_override_still_wins(monkeypatch):
     request = _request({"--conformance-ready-timeout": 42.0}, monkeypatch)
-    assert _READY_TIMEOUT(request, {"base_model": "Qwen/Qwen3.5-4B"}) == 42.0
+    assert _READY_TIMEOUT(request, {"base_model": "Qwen/Qwen3.5-9B"}) == 42.0

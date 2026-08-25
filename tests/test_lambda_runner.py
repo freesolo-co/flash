@@ -59,7 +59,7 @@ def _spec(gpu_type="A10", **gpu_kw) -> JobSpec:
     gpu = {"type": gpu_type, "max_wall_seconds": 3600, **gpu_kw}
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "run_id": "flash-1700000000-abcd1234",
             "seed": 0,
@@ -3100,21 +3100,25 @@ def test_allocator_capacity_aware(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_.jobs.builders import LambdaInstance
 
-    monkeypatch.setenv("LAMBDA_API_KEY", "lk")  # make lambda "available"
-    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: {"gpu_1x_a10": {}})
+    monkeypatch.setenv("LAMBDA_API_KEY", "lk")  # make lambda available
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: {"gpu_1x_h100_pcie": {}})
 
     def fake_usable(gpu, force=False, *, gpu_count=1, **_k):
-        # A10 has capacity; A100 SXM 40GB does not (excluded from candidates).
+        # h100 has capacity; b200 does not and is excluded from candidates.
         # a signature that rejected gpu_count would raise inside the provider, and the allocator
-        # swallows that as a capacity blip -- so the class would vanish for the wrong reason.
-        if gpu == "A10":
-            return [LambdaInstance("A10", "gpu_1x_a10", "us-east-1", 24, 1.29, gpu_count=gpu_count)]
+        # swallows that as a capacity blip, so the class would vanish for the wrong reason.
+        if gpu == "H100":
+            return [
+                LambdaInstance(
+                    "H100", "gpu_1x_h100_pcie", "us-east-1", 80, 3.29, gpu_count=gpu_count
+                )
+            ]
         return []
 
     monkeypatch.setattr("flash.providers.lambda_.jobs.usable_instances", fake_usable)
-    a = allocator.allocate("Qwen/Qwen3.5-0.8B", "sft")
+    a = allocator.allocate("Qwen/Qwen3.5-9B", "sft")
     lam = {c.gpu for c in a.candidates if c.provider == "lambda"}
-    assert lam == {"A10"}  # only the in-capacity class
+    assert lam == {"H100"}  # only the fitting in-capacity class
     # RunPod still wins on price (cheaper static rates), so it's the chosen provider.
     assert a.provider == "runpod"
 

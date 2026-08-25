@@ -20,7 +20,7 @@ MODAL_APP = Path(__file__).resolve().parents[2] / "flash" / "serving" / "app" / 
 
 # Every catalog model currently ships a pre-quantized serve_model_id, so the online-quantization
 # default is exercised by clearing it rather than by picking a different model.
-MODEL = "Qwen/Qwen3.5-4B"
+MODEL = "Qwen/Qwen3.5-9B"
 
 
 @pytest.fixture
@@ -57,7 +57,7 @@ def test_prequantized_base_passes_no_quantization(engine_args) -> None:
     # A pre-quantized serve_model_id checkpoint is served directly and vLLM auto-detects its FP8, so
     # passing quantization on top would re-quantize an already-quantized checkpoint.
     kwargs = engine_args(MODEL)
-    assert kwargs["model"] == "Freesolo-Co/Qwen3.5-4B-FP8"
+    assert kwargs["model"] == "Freesolo-Co/Qwen3.5-9B-FP8"
     assert kwargs["quantization"] is None
 
 

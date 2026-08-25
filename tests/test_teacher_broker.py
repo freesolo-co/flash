@@ -193,7 +193,7 @@ def test_exact_24_hour_capability_deadline_is_accepted(broker_db, monkeypatch):
     issued_at = 1_000.0
     deadline_at = issued_at + teacher_broker.MAX_CAPABILITY_LIFETIME_S
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-1",
@@ -221,7 +221,7 @@ def test_48_hour_opd_wall_is_rejected_before_allocation(monkeypatch):
 
     monkeypatch.setattr(allocator, "allocate", unexpected_allocation)
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         gpu=GpuSpec(max_wall_seconds=48 * 60 * 60),
         train=TrainSpec(max_examples=8, max_steps=1),
@@ -241,7 +241,7 @@ def test_broker_accepts_every_catalog_teacher(monkeypatch):
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     for alias in TEACHER_MODELS:
         spec = JobSpec(
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="opd",
             train=TrainSpec(max_examples=8, max_steps=1, teacher_model=alias),
             run_id=f"run-teacher-{alias}",
@@ -253,7 +253,7 @@ def test_deadline_contract_over_24_hours_is_rejected(monkeypatch):
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-over-capability-deadline",
@@ -1826,7 +1826,7 @@ def test_current_nonterminal_attempt_is_checked_on_every_admission(monkeypatch):
         "scoring_mode": teacher_broker.PARASAIL_SCORING_MODE,
     }
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(teacher_model="glm-5.2"),
         run_id="run-1",
@@ -1942,7 +1942,7 @@ def test_legacy_teacher_broker_url_does_not_configure_the_plane(monkeypatch):
     monkeypatch.setenv("FLASH_TEACHER_BROKER_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-legacy-control-panel-url",
@@ -1966,7 +1966,7 @@ def test_missing_broker_configuration_fails_before_allocation(monkeypatch, missi
 
     monkeypatch.setattr(allocator, "allocate", unexpected_allocation)
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-preflight",
@@ -1980,7 +1980,7 @@ def test_failed_submission_scope_revokes_attempt_capability(broker_db, monkeypat
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-1",
@@ -2005,7 +2005,7 @@ def test_old_attempt_context_exit_does_not_revoke_new_attempt_token(broker_db, m
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-1",
@@ -2079,7 +2079,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     from flash.providers.vast.jobs.builders import build_payload as build_vast_payload
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         environment=EnvironmentSpec(id="org/env"),
         train=TrainSpec(max_examples=8, hf_repo="owner/runs"),
@@ -2144,7 +2144,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     assert serialized.count("capability-worker-canary") == 3
 
     invalid_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         environment=EnvironmentSpec(id="org/env", secrets=("PARASAIL_API_KEY",)),
         train=TrainSpec(max_examples=8, hf_repo="owner/runs"),
@@ -2156,7 +2156,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
 
 def test_capability_policy_is_run_bounded_and_rejects_excessive_shapes(monkeypatch):
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1, batch_size=8, group_size=1),
         run_id="run-1",
@@ -2175,7 +2175,7 @@ def test_capability_policy_is_run_bounded_and_rejects_excessive_shapes(monkeypat
 @pytest.mark.parametrize(("max_turns", "multiplier"), [(24, 72), (64, 192)])
 def test_multiturn_capability_quota_covers_turns_and_no_signal_attempts(max_turns, multiplier):
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         environment=EnvironmentSpec(params={"multi_turn": True, "max_turns": max_turns}),
         train=TrainSpec(max_examples=8, max_steps=1, batch_size=8, group_size=1),
@@ -2196,7 +2196,7 @@ def test_unknown_external_environment_uses_identical_ceiling_for_quota_and_cost(
     from flash.teacher.limits import opd_teacher_request_multiplier
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         environment=EnvironmentSpec(id="owner/external"),
         train=TrainSpec(max_examples=8, max_steps=1, batch_size=8, group_size=1),
@@ -2239,7 +2239,7 @@ def test_broker_gate_reason_survives_into_the_persisted_run_error(tmp_path, monk
 
     monkeypatch.setattr(allocator, "allocate", unexpected_allocation)
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-gate-detail",
@@ -2277,7 +2277,7 @@ def test_unrelated_run_failures_keep_their_message_redacted(tmp_path, monkeypatc
 
     monkeypatch.setattr(runner_lifecycle, "_run_training", boom)
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-generic-failure",
@@ -2310,7 +2310,7 @@ def test_dry_run_rejects_an_unservable_opd_spec_before_creating_a_run(
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     (tmp_path / "runs").mkdir()
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-dry-gate",
@@ -2334,7 +2334,7 @@ def test_dry_run_still_previews_a_servable_opd_spec(tmp_path, monkeypatch):
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     (tmp_path / "runs").mkdir()
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(max_examples=8, max_steps=1),
         run_id="run-dry-ok",
@@ -2349,7 +2349,7 @@ def test_preflight_is_a_noop_for_non_opd_algorithms(monkeypatch):
     monkeypatch.delenv("PARASAIL_API_KEY", raising=False)
     for algorithm in ("sft", "grpo"):
         spec = JobSpec(
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm=algorithm,
             train=TrainSpec(max_examples=8, max_steps=1),
             run_id=f"run-{algorithm}-noop",

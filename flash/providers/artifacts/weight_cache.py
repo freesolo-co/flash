@@ -222,7 +222,7 @@ def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
 
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "run_id": run_id,
             "train": {

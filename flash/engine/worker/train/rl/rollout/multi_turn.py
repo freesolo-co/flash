@@ -662,6 +662,10 @@ class MultiTurnBridge:
 # single-turn runs keeps the bundle shape invariant while the plugin decides whether to register it.
 GRPO_CHILD_MODULES = (
     (os.path.join("train", "core", "child", "runtime.py"), "flash_verl_runtime.py"),
+    (
+        os.path.join("..", "..", "content", "reasoning_normalization.py"),
+        "flash_reasoning_normalization.py",
+    ),
     (os.path.join("train", "core", "child", "glue.py"), "flash_multiturn_glue.py"),
     (os.path.join("train", "rl", "child", "patches.py"), "flash_grpo_patches.py"),
     (os.path.join("train", "rl", "child", "multiturn.py"), "flash_grpo_multiturn.py"),

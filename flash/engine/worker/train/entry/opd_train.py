@@ -29,10 +29,8 @@ from flash.engine.worker.train.entry.opd_train_runner import (
     _build_train_note_sections,
     _export_and_upload_adapter,
     _materialize_child_files,
-    _prepare_prompts,
     _prepare_request,
     _prepare_workload,
-    _render_prompt_rows,
     _report_training_complete,
     _resolve_opd_gpu_mem_util,
     _run_child,
@@ -44,6 +42,10 @@ from flash.engine.worker.train.entry.sft_train import _probe_gpu_in_subprocess
 from flash.engine.worker.train.opd.orchestration.failures import _failure_accounting_metadata
 from flash.engine.worker.train.opd.orchestration.gkd import (
     generation_eos_from_cached_config,
+)
+from flash.engine.worker.train.opd.orchestration.prompt_preparation import (
+    prepare_prompts,
+    render_prompt_rows,
 )
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 
@@ -110,7 +112,7 @@ def run_opd_train(spec=None) -> None:
         model_revision=model_revision,
     )
     request = _with_structured_validation(request, structured_validation)
-    prompt_rows, multimodal = _render_prompt_rows(request)
+    prompt_rows, multimodal = render_prompt_rows(request)
     if multimodal:
         _validate_multimodal_opd(request, spec, model_id)
     started_at = time.time()
@@ -120,7 +122,7 @@ def run_opd_train(spec=None) -> None:
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
-    prompt_state = _prepare_prompts(request, prompt_rows, multimodal, capability, control_panel_url)
+    prompt_state = prepare_prompts(request, prompt_rows, multimodal, capability, control_panel_url)
     multi_turn, max_model_len = request.multi_turn, prompt_state.max_model_len
     if not prompt_state.prompts:
         raise RuntimeError("every OPD prompt exceeds the configured prompt budget")

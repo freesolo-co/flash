@@ -28,8 +28,8 @@ from flash.engine.profiling.sft_image_rows import (
     process_sft_image_row,
 )
 
-MODEL_ID = "Qwen/Qwen3.5-0.8B"
-MODEL_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
+MODEL_ID = "Qwen/Qwen3.5-9B"
+MODEL_REVISION = "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
 ORACLE_PATH = Path(__file__).parent / "fixtures" / "image_sft_processor_oracle.json"
 BASE_GEOMETRY = {
     "patch_size": 16,

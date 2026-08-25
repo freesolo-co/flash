@@ -486,7 +486,7 @@ def test_opd_selects_only_managed_parasail_aliases():
     def _spec(teacher):
         return spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"epochs": 1, "max_examples": 5, "teacher_model": teacher},
@@ -525,7 +525,7 @@ def test_opd_rejects_prompt_budget_at_parse_time_before_provisioning():
     def _spec(train_extra):
         return spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"epochs": 1, "max_examples": 5, **train_extra},
@@ -549,7 +549,7 @@ def test_opd_rejects_zero_kl_penalty_at_parse_time():
     def _spec(algorithm, train_extra):
         return spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": algorithm,
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"epochs": 1, "max_examples": 5, **train_extra},
@@ -777,102 +777,167 @@ def test_teacher_prompt_text_reads_content_blocks_rather_than_their_repr():
     assert opd_gkd._teacher_prompt_text([{"role": "user", "content": "hi"}]).startswith("User: hi")
 
 
-def test_thinking_prefill_text_is_template_delta(monkeypatch):
-    """Regression (opd.py): the thinking prefill is the DELTA a thinking-mode chat template
-    opens after the generation prompt (enable_thinking True vs False). Empty when thinking is off (the
-    plain teacher prompt already matches) or the template ignores enable_thinking."""
-    from flash.engine.worker.entry import opd as opd_mod
+def _normalized_teacher_history(later_reasoning):
+    from flash.content.thinking import messages_for_chat_template
 
-    class _Tok:
-        def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt, enable_thinking
-        ):
-            return "<|im_start|>assistant\n" + ("<think>\n" if enable_thinking else "")
-
-    monkeypatch.setattr(worker_state, "THINKING", False)
-    assert opd_mod._thinking_prefill_text(_Tok()) == ""  # thinking off -> no prefill
-    monkeypatch.setattr(worker_state, "THINKING", True)
-    assert opd_mod._thinking_prefill_text(_Tok()) == "<think>\n"  # exact opened delta
-
-    class _NoThinkTok:  # template that ignores enable_thinking -> renders identically -> empty delta
-        def apply_chat_template(self, messages, **kw):
-            return "<|im_start|>assistant\n"
-
-    assert opd_mod._thinking_prefill_text(_NoThinkTok()) == ""
+    later_content = (
+        f"<think>{later_reasoning}</think>later answer"
+        if later_reasoning is not None
+        else "later answer"
+    )
+    messages = messages_for_chat_template(
+        [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "assistant", "content": later_content},
+        ]
+    )
+    if later_reasoning is not None:
+        assert messages[-1]["reasoning_content"] == later_reasoning
+    else:
+        assert "reasoning_content" not in messages[-1]
+    return messages
 
 
-def test_thinking_prefill_derives_opener_from_hybrid_template(monkeypatch):
-    """Regression (opd.py): _thinking_prefill_text must handle a HYBRID template where the
-    thinking render is NOT a prefix-extension of the non-thinking render — the opener is inserted BEFORE
-    shared trailing template text, so base is not a prefix of think. The old think.startswith(base) test
-    returned "", dropping the opener the student pre-fills so the teacher scored reasoning tokens against
-    the wrong prefix. The common prefix/suffix derivation must recover the opener from think's unique
-    middle."""
-    from flash.engine.worker.entry import opd as opd_mod
-
-    class _HybridTok:
-        # non-thinking: no opener; thinking: inserts "<think>\n" BEFORE the shared "END" suffix, so
-        # "A:\nEND" is NOT a prefix of "A:\n<think>\nEND".
-        def apply_chat_template(self, messages, *, enable_thinking, **kw):
-            return "A:\n<think>\nEND" if enable_thinking else "A:\nEND"
-
-    monkeypatch.setattr(worker_state, "THINKING", True)
-    assert opd_mod._thinking_prefill_text(_HybridTok()) == "<think>\n"
-
-
-def test_thinking_prefill_recovers_opener_from_closed_block_hybrid(monkeypatch):
-    """Regression (opd.py): a HYBRID template that disables thinking by force-CLOSING
-    the block — enable_thinking=False -> '...<think></think>\\n', enable_thinking=True -> '...<think>\\n'
-    — shares '<think>' in BOTH renders, so the common-prefix delta eats it and the previous fix returned
-    only '\\n'. The student still pre-fills '<think>\\n', so the teacher must condition on the full
-    opener; recover it from base's closing tag."""
-    from flash.engine.worker.entry import opd as opd_mod
-
-    class _ClosedBlockTok:
-        def apply_chat_template(self, messages, *, enable_thinking, **kw):
-            # both open <think>; non-thinking force-closes it with </think>.
-            return "A:\n<think>\n" if enable_thinking else "A:\n<think></think>\n"
-
-    monkeypatch.setattr(worker_state, "THINKING", True)
-    assert opd_mod._thinking_prefill_text(_ClosedBlockTok()) == "<think>\n"
-
-
-def test_thinking_prefill_recovers_opener_from_whitespace_empty_block_hybrid(monkeypatch):
-    """Regression (opd.py): a hybrid whose disabled render is an EMPTY block WITH whitespace
-    (enable_thinking=False -> '...<think>\\n\\n</think>\\n', True -> '...<think>\\n') shares '<think>\\n'
-    in the common prefix, so base's unique middle is '\\n</think>\\n' -- the closer behind a newline. The
-    closed-block recovery must lstrip that intra-block whitespace before the '</' test, else it returns ''
-    and thinking-mode OPD scores the student's reasoning against a teacher prompt that never opened
-    <think>. The opener returned is still the thinking-side '<think>\\n'."""
-    from flash.engine.worker.entry import opd as opd_mod
-
-    class _WhitespaceEmptyBlockTok:
-        def apply_chat_template(self, messages, *, enable_thinking, **kw):
-            # both open <think>\n; non-thinking force-closes with a whitespace-only empty block.
-            return "A:\n<think>\n" if enable_thinking else "A:\n<think>\n\n</think>\n"
-
-    monkeypatch.setattr(worker_state, "THINKING", True)
-    assert opd_mod._thinking_prefill_text(_WhitespaceEmptyBlockTok()) == "<think>\n"
-
-
-def test_thinking_prefill_recovers_opener_when_closed_block_leaves_whitespace_remainder(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("later_reasoning", "later_content"),
+    [
+        ("later reasoning", "<think>\nlater reasoning\n</think>\n\nlater answer"),
+        (None, "<think>\n\n</think>\n\nlater answer"),
+    ],
+)
+def test_text_teacher_payload_matches_preserve_false_reasoning_history(
+    later_reasoning, later_content
 ):
-    """Regression (opd.py:134): a closed-block hybrid whose disabled render closes IMMEDIATELY
-    after the opener (enable_thinking=False -> '...<think></think>', True -> '...<think>\\n') shares only
-    '<think>' in the common prefix, so think_mid is the NON-EMPTY whitespace remainder '\\n'. The old
-    `if think_mid: return think_mid` early-return handed back '\\n' and skipped the closed-block recovery,
-    conditioning the teacher on a prompt that opened but never continued <think>. The recovery must run
-    FIRST and return the real thinking-side opener '<think>\\n'."""
+    from flash.engine.worker.train.opd.orchestration.gkd import _teacher_prompt_text
+
+    messages = _normalized_teacher_history(later_reasoning)
+
+    assert _teacher_prompt_text(messages) == (
+        "User: question\n"
+        "Assistant: <think>\n\n</think>\n\nfirst answer\n"
+        f"Assistant: {later_content}\n"
+        "Assistant: "
+    )
+
+
+@pytest.mark.parametrize(
+    ("later_reasoning", "later_content"),
+    [
+        ("later reasoning", "<think>\nlater reasoning\n</think>\n\nlater answer"),
+        (None, "<think>\n\n</think>\n\nlater answer"),
+    ],
+)
+def test_multimodal_teacher_payload_matches_preserve_false_reasoning_history(
+    later_reasoning, later_content
+):
+    from flash.content.multimodal import image_teacher_prompt_messages
+    from flash.engine.worker.teacher.client import _chat_messages
+
+    messages = _normalized_teacher_history(later_reasoning)
+    messages[0]["content"] = [
+        {"type": "image"},
+        {"type": "text", "text": "question"},
+    ]
+    teacher_messages = image_teacher_prompt_messages(messages, 1)
+
+    assert _chat_messages(
+        teacher_messages,
+        "completion",
+        ["data:image/png;base64,aW1hZ2U="],
+    ) == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+                },
+                {"type": "text", "text": "question"},
+            ],
+        },
+        {"role": "assistant", "content": "<think>\n\n</think>\n\nfirst answer"},
+        {"role": "assistant", "content": later_content},
+        {"role": "assistant", "content": "completion"},
+    ]
+
+
+class _ThinkingRenderTok:
+    def __init__(self, disabled, enabled):
+        self.disabled = disabled
+        self.enabled = enabled
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        enable_thinking,
+        preserve_thinking,
+    ):
+        assert preserve_thinking is False
+        return self.enabled if enable_thinking else self.disabled
+
+
+def test_thinking_prefill_accepts_terminal_opener_at_shared_boundary(monkeypatch):
     from flash.engine.worker.entry import opd as opd_mod
 
-    class _ClosedImmediatelyTok:
-        def apply_chat_template(self, messages, *, enable_thinking, **kw):
-            # thinking opens "<think>\n"; non-thinking force-closes right after the opener.
-            return "A:\n<think>\n" if enable_thinking else "A:\n<think></think>"
+    tok = _ThinkingRenderTok("A:\n", "A:\n<think>\n")
+    monkeypatch.setattr(worker_state, "THINKING", False)
+    assert opd_mod._thinking_prefill_text(tok) == ""
+    monkeypatch.setattr(worker_state, "THINKING", True)
+    assert opd_mod._thinking_prefill_text(tok) == "<think>\n"
+
+
+@pytest.mark.parametrize("disabled", ["A:\n<think></think>", "A:\n<think>\n\n</think>\n\n"])
+def test_thinking_prefill_accepts_one_terminal_whitespace_only_closed_block(monkeypatch, disabled):
+    from flash.engine.worker.entry import opd as opd_mod
 
     monkeypatch.setattr(worker_state, "THINKING", True)
-    assert opd_mod._thinking_prefill_text(_ClosedImmediatelyTok()) == "<think>\n"
+    assert (
+        opd_mod._thinking_prefill_text(_ThinkingRenderTok(disabled, "A:\n<think>\n")) == "<think>\n"
+    )
+
+
+def test_thinking_prefill_accepts_pinned_qwen38_render_with_system_difference(monkeypatch):
+    """the pinned qwen3.8 template adds a thinking-only system instruction before the shared turn."""
+    from flash.engine.worker.entry import opd as opd_mod
+
+    disabled = "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    enabled = (
+        "<|im_start|>system\n"
+        "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
+        "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
+        "clarity in the final answer.<|im_end|>\n"
+        "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    )
+    monkeypatch.setattr(worker_state, "THINKING", True)
+    assert opd_mod._thinking_prefill_text(_ThinkingRenderTok(disabled, enabled)) == "<think>\n"
+
+
+@pytest.mark.parametrize(
+    ("disabled", "enabled"),
+    [
+        ("A:\n", "A:\n"),
+        ("A:\n", "A:\n<think>\nEND"),
+        ("A:\nEND", "A:\n<think>\nEND"),
+        ("A:\n<think>not empty</think>\n", "A:\n<think>\n"),
+        ("unrelated base\n", "unrelated thinking\n<think>\n"),
+    ],
+    ids=[
+        "template-ignores-thinking",
+        "nonterminal-opener",
+        "shared-suffix-insertion",
+        "malformed-disabled-block",
+        "no-nonwhitespace-shared-suffix",
+    ],
+)
+def test_thinking_prefill_fails_closed_for_unsafe_template_shapes(monkeypatch, disabled, enabled):
+    from flash.engine.worker.entry import opd as opd_mod
+
+    monkeypatch.setattr(worker_state, "THINKING", True)
+    assert opd_mod._thinking_prefill_text(_ThinkingRenderTok(disabled, enabled)) == ""
 
 
 def test_student_tokens_absorb_dropped_leading_space_sentencepiece():
@@ -1051,12 +1116,12 @@ def test_model_required_vram_uses_opd_group_default_not_grpo_default():
     from flash.engine.plan.vram import model_required_vram_gb
 
     train = {"max_length": 8192, "max_tokens": 512, "batch_size": 8, "lora_rank": 16}
-    default_group = model_required_vram_gb("Qwen/Qwen3.5-4B", "opd", train=train, headroom=1.0)
+    default_group = model_required_vram_gb("Qwen/Qwen3.5-9B", "opd", train=train, headroom=1.0)
     explicit_opd_default = model_required_vram_gb(
-        "Qwen/Qwen3.5-4B", "opd", train={**train, "group_size": 1}, headroom=1.0
+        "Qwen/Qwen3.5-9B", "opd", train={**train, "group_size": 1}, headroom=1.0
     )
     grpo_default_group = model_required_vram_gb(
-        "Qwen/Qwen3.5-4B", "opd", train={**train, "group_size": 8}, headroom=1.0
+        "Qwen/Qwen3.5-9B", "opd", train={**train, "group_size": 8}, headroom=1.0
     )
 
     assert default_group == explicit_opd_default
@@ -1145,7 +1210,7 @@ def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
     )
 
     train = {"max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
-    need = model_required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train, headroom=1.1)
+    need = model_required_vram_gb("Qwen/Qwen3.5-9B", "opd", train=train, headroom=1.1)
     assert need <= max_non_fp8_kv_vram_gb()  # stays within the non-fp8 (<= 80 GB) band...
     # ...on the A100 (sm80), which does NOT use fp8 KV
     routed_capability = _sm_capability(get_gpu_info(cheapest_gpu(need)).sm)
@@ -1338,7 +1403,7 @@ def test_rollout_fp8_kv_admits_a_gdn_hybrid_only_when_its_engine_stays_resident(
 
     # the hardware floor dominates: cc<8.9 is bf16 regardless of architecture or catalog flag.
     for gdn in (False, True):
-        for model_id in ("Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-35B-A3B", ""):
+        for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-35B-A3B", ""):
             assert not rollout_fp8_kv(False, gdn, model_id)
 
     # non-gdn on capable hardware is unconditional fp8 and must not consult the catalog at all,
@@ -1584,7 +1649,7 @@ def test_resolve_opd_knobs_trains_the_authored_prompts_per_step(monkeypatch):
     def _knobs(**train):
         spec = spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "opd",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "gpu": {},
@@ -1661,7 +1726,7 @@ def test_opd_spec_json_round_trip():
 
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {
@@ -1689,7 +1754,7 @@ def test_opd_worker_resolves_the_authored_prompt_batch(monkeypatch):
     authored = int(RECIPE.opd.prompts_per_step) * 4
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "gpu": {},
@@ -1710,7 +1775,7 @@ def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
     # 240 prompts at the opd default batch of 8 is 8 steps per epoch, 30 epochs -> 240 steps.
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"epochs": 30, "max_examples": 240},
@@ -1801,7 +1866,7 @@ def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
         "JOB_SPEC",
         SimpleNamespace(
             train=train,
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             model_revision="",
             gpu=SimpleNamespace(type=None),
         ),

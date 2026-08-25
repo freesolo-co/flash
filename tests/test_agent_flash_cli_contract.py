@@ -104,7 +104,7 @@ def test_train_dry_run_emits_run_id_and_state(tmp_path: Path, capsys, monkeypatc
     """
     config = tmp_path / "rl.toml"
     config.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
@@ -232,7 +232,7 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
             "run_id": rid,
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "sft",
-            "model": "Qwen/Qwen3.5-2B",
+            "model": "Qwen/Qwen3.5-9B",
             "train": {
                 "epochs": 1,
                 "max_examples": 8,

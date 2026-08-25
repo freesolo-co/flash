@@ -83,7 +83,7 @@ def _engine(modal_app_module: Any, *, thinking: bool) -> Any:
         AdapterRecord(
             adapter_id="r1",
             repo_id="org/repo",
-            base_model="Qwen/Qwen3.5-0.8B",
+            base_model="Qwen/Qwen3.5-9B",
             thinking=thinking,
         )
     )

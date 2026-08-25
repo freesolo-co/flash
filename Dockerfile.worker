@@ -161,7 +161,7 @@ RUN set -eu; \
 # example boundaries. Together with fla's ``cu_seqlens`` (which resets the DeltaNet recurrence) it
 # lets the GatedDeltaNet hybrids (Qwen3.5/3.6) PACK boundary-correctly — a 4D block-diagonal mask
 # alone only fixes the full-attention layers (the verl child's capability probe gates the
-# SFT packing path on this import). GPU-validated (RTX 5090, Qwen3.5-0.8B): a packed example's output
+# sft packing path on this import). gpu-validated on the qwen3.5 hybrid architecture: a packed example's output
 # is byte-identical regardless of its neighbors' content (zero cross-example leakage).
 # Arch-bounded to the catalog GPUs to cap build time. PINNED (compiled CUDA extension) for
 # reproducible image builds — an unpinned upstream release could silently change behavior or break
@@ -270,7 +270,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
 # That deliberately exceeds verl's declared vllm<=0.12.0 ceiling. The metadata-clean alternative
 # (0.11.2, which satisfies the ceiling and makes `uv pip check` green) was rejected on a model-
-# contract fact: Qwen/Qwen3.5-4B is flash's DEFAULT_MODEL and enables GRPO+OPD, both of which set
+# contract fact: Qwen/Qwen3.5-9B is flash's DEFAULT_MODEL and enables GRPO+OPD, both of which set
 # rollout.name=vllm, and 0.11.2 registers neither Qwen3_5ForConditionalGeneration nor
 # Qwen3_5MoeForConditionalGeneration, so it cannot run rollouts for the default model at all.
 # The ceiling is stale for the async rollout path regardless: verl 0.8.0's own stable Dockerfile

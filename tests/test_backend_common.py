@@ -858,7 +858,7 @@ def test_the_verified_arch_round_trips_for_the_dense_module_too(monkeypatch):
     import flash.engine.worker.model.packing as _packing
 
     monkeypatch.setattr(_packing, "gdn_model_type", lambda *a, **k: "qwen3_5")
-    gdn_module = vc.gdn_probe_module("Qwen/Qwen3.5-4B")
+    gdn_module = vc.gdn_probe_module("Qwen/Qwen3.5-9B")
     assert vc.gdn_reset_arch_from_caps({"gdn_boundary_resets": True}, gdn_module) == "qwen3_5"
 
 

@@ -22,7 +22,7 @@ from flash.serving.src.io.responses import _ReasoningStreamSplitter, _split_reas
 from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.conftest import attest
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 
 
 async def _allow(_token: str, _adapter_id: str) -> None:

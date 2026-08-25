@@ -318,7 +318,7 @@ def test_background_submit_keeps_environment_staging_off_creation_path(monkeypat
 
     spec = JobSpec(
         run_id="flash-bg-resolve",
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=1),
         gpu=GpuSpec(type=""),

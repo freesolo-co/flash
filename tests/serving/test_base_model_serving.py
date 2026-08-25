@@ -18,7 +18,7 @@ from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.conftest import attest
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 INTERNAL_KEY = "fs-internal"
 
 

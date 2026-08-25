@@ -59,7 +59,7 @@ def test_sft_context_length_resolves_the_authored_window_or_the_mode_cap():
         recipe_cap = RECIPE.sft.max_seq_len_thinking if thinking else RECIPE.sft.max_seq_len
         for mct in (None, 2048, 3072):
             spec = JobSpec(
-                model="Qwen/Qwen3.5-4B",
+                model="Qwen/Qwen3.5-9B",
                 algorithm="sft",
                 thinking=thinking,
                 environment=EnvironmentSpec(id="team/example", resolved_sha="b" * 40),
@@ -87,7 +87,7 @@ def test_trainer_and_quote_read_the_one_measured_window():
 
     spec = attach_sft_profile(
         JobSpec(
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_context_tokens=3072, max_examples=8),
         )

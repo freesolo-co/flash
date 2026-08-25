@@ -174,7 +174,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
     # GRPO knobs live in [train]/TrainSpec, NOT [environment.params].
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {**train_knobs},
@@ -185,7 +185,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
     # A leftover grpo_config in environment.params must NOT be read by the worker.
     poisoned = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "environment": {
                 "id": "github:owner/repo@main:env/environment.py",
@@ -202,7 +202,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
         "JOB_SPEC",
         JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"group_size": 2},
@@ -214,7 +214,7 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
     monkeypatch.setattr(
         worker_state,
         "JOB_SPEC",
-        JobSpec.from_dict({"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"}),
+        JobSpec.from_dict({"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"}),
     )
     assert worker_grpo_config.grpo_overrides() == {}
     monkeypatch.setattr(worker_state, "JOB_SPEC", None)
@@ -225,7 +225,7 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
     from flash.schema import spec_from_dict
 
     raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {},
@@ -263,7 +263,7 @@ def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypa
     config.write_text(
         "\n".join(
             [
-                'model = "Qwen/Qwen3.5-0.8B"',
+                'model = "Qwen/Qwen3.5-9B"',
                 'algorithm = "grpo"',
                 "",
                 "[environment]",
@@ -309,7 +309,7 @@ def test_opt_int_float_reject_bools() -> None:
     with pytest.raises(TypeError):
         JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},
                 "train": {"epochs": 1, "max_examples": 10, "group_size": True},
@@ -319,7 +319,7 @@ def test_opt_int_float_reject_bools() -> None:
 
 def _spec_raw(ref: str) -> dict:
     return {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {},
@@ -391,7 +391,7 @@ def test_init_from_adapter_accepts_only_the_two_canonical_shapes() -> None:
 )
 def test_init_from_adapter_rejects_non_string_value(bad_ref: object) -> None:
     raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {},
@@ -410,7 +410,7 @@ def test_hf_repo_is_managed_not_user_set() -> None:
     # it server-side at submit (see runner_submit.submit_job). It is not a user config key -- the schema
     # rejects a user-supplied value outright rather than silently ignoring it.
     raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "train": {"epochs": 1, "max_examples": 10},
@@ -435,7 +435,7 @@ def test_optimizer_and_batching_knobs_roundtrip() -> None:
     # (server validation) AND the worker's JobSpec.from_dict, or the worker would silently
     # train with recipe defaults while W&B reports the user's values.
     raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {},
@@ -515,7 +515,7 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
     from flash.schema import ConfigError
 
     base = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {},
@@ -556,7 +556,7 @@ def test_grpo_rejects_single_generation_group_before_paid_worker() -> None:
     from flash.schema import ConfigError
 
     base = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
     }
@@ -581,7 +581,7 @@ def test_opd_allows_single_generation_group() -> None:
     """OPD distils individual completions, so group_size=1 remains a valid smoke/test setting."""
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"epochs": 1, "max_examples": 8, "group_size": 1},
@@ -598,7 +598,7 @@ def test_epochs_reject_non_integer_at_parse() -> None:
     from flash.schema import ConfigError
 
     base = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {},
@@ -655,7 +655,7 @@ def test_grpo_masks_truncated_completions_by_default() -> None:
     # No stop_sequences (the common case) -> masking ON.
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "environment": {"id": "owner/project/env"},
             "train": {},
@@ -673,7 +673,7 @@ def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "environment": {"id": "owner/project/env"},
             "train": {"stop_sequences": ["</answer>"]},
@@ -715,7 +715,7 @@ def test_grpo_rejects_prompt_budget_at_parse_time_before_provisioning() -> None:
     def _spec(train_extra, thinking=False):
         return spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "thinking": thinking,
                 "environment": {"id": "github:owner/repo@main:env/environment.py"},

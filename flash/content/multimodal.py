@@ -325,6 +325,9 @@ def _reject_literal_image_placeholder(
 
 def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -> list[dict]:
     """Render normalized image blocks as Kimi media placeholders without changing text order."""
+    from flash.content.thinking import _messages_for_content_only_serialization
+
+    messages = _messages_for_content_only_serialization(messages)
     rendered: list[dict] = []
     image_count = 0
     for message_index, message in enumerate(messages):

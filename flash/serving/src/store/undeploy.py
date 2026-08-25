@@ -239,8 +239,10 @@ def undeploy_body(
     base_model: str,
     disabled_aliases: list[str],
     disabled_revisions: list[str],
+    *,
+    gpu_cleanup: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    body = {
         "ok": True,
         "removed": adapter_id,
         "base_model": base_model,
@@ -248,6 +250,9 @@ def undeploy_body(
         "disabled_aliases": sorted(disabled_aliases),
         "disabled_revisions": sorted(disabled_revisions),
     }
+    if gpu_cleanup is not None:
+        body["gpu_cleanup"] = gpu_cleanup
+    return body
 
 
 def undeploy_conflict_detail(

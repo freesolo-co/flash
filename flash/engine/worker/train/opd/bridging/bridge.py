@@ -20,7 +20,6 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler
-from typing import TYPE_CHECKING
 
 import flash.engine.worker.perf as _worker_perf
 from flash.content.multimodal import normalize_environment_reply
@@ -60,11 +59,9 @@ from flash.engine.worker.train.opd.orchestration.gkd import (
     _teacher_prompt_text,
     student_tokens_with_offsets,
 )
+from flash.engine.worker.train.opd.orchestration.state import _BridgePrompt
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
-
-if TYPE_CHECKING:
-    from flash.engine.worker.train.opd.orchestration.state import _BridgePrompt
 
 
 class _TeacherAlignmentBridge(TeacherFailureRecording):

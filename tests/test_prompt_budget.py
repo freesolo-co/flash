@@ -24,7 +24,7 @@ from flash.schema import ConfigError, spec_from_dict
 def _budget_spec(algorithm: str, train: dict | None = None, *, thinking: bool = False) -> JobSpec:
     return spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": algorithm,
             "thinking": thinking,
@@ -53,7 +53,7 @@ def _train_config(tmp_path, *, init_from_adapter: str = ""):
     config = tmp_path / "train.toml"
     warm_start = f'init_from_adapter = "{init_from_adapter}"\n' if init_from_adapter else ""
     config.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "grpo"\n'
         '[environment]\nid = "owner/project/env"\n'
@@ -133,10 +133,8 @@ def test_grpo_worker_keeps_clamp_and_value_error_contract(monkeypatch, capsys) -
 
 def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int = 32768):
     import flash.engine.worker.teacher.client as teacher_client
-    import flash.engine.worker.train.entry.opd_train_runner as opd_train_runner
-    from flash.engine.worker.entry import opd as opd_entry
     from flash.engine.worker.entry.opd import OpdKnobs
-    from flash.engine.worker.train.entry.opd_train_runner import _prepare_prompts
+    from flash.engine.worker.train.opd.orchestration import prompt_preparation
     from flash.engine.worker.train.opd.orchestration.state import _OpdRequest
 
     class Tokenizer:
@@ -146,19 +144,20 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
         def apply_chat_template(self, *_args, **_kwargs):
             return list(range(100))
 
-    import flash.engine.worker.io.hf as worker_hf
-    import flash.engine.worker.runtime.state as worker_state
-
-    monkeypatch.setattr(worker_state, "THINKING", False)
-    monkeypatch.setattr(worker_hf, "load_tokenizer", lambda *_args, **_kwargs: Tokenizer())
-    monkeypatch.setattr(opd_entry, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(prompt_preparation._worker_state, "THINKING", False)
     monkeypatch.setattr(
-        opd_train_runner._backend,
+        prompt_preparation._worker_hf,
+        "load_tokenizer",
+        lambda *_args, **_kwargs: Tokenizer(),
+    )
+    monkeypatch.setattr(prompt_preparation, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(
+        prompt_preparation._backend,
         "model_max_position_embeddings",
         lambda *_args: architecture_limit,
     )
     monkeypatch.setattr(
-        opd_train_runner._worker_heartbeat,
+        prompt_preparation,
         "liveness_heartbeat",
         lambda *_args, **_kwargs: nullcontext(),
     )
@@ -169,10 +168,10 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
         multi_turn=False,
         max_turns=0,
         knobs=OpdKnobs(max_completion=512, max_length=max_length),
-        model_id="Qwen/Qwen3.5-4B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="",
     )
-    state = _prepare_prompts(
+    state = prompt_preparation.prepare_prompts(
         request,
         [({}, [{"role": "user", "content": "question"}])],
         False,

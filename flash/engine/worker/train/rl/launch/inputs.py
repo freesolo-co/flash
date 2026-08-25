@@ -27,6 +27,7 @@ from flash.content.structured_outputs import (
     describe_structured_outputs,
     parse_structured_outputs,
 )
+from flash.content.thinking import messages_for_chat_template
 from flash.core.spec import DEFAULT_CREDIT_ASSIGNMENT, gpu_count_of
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import (
@@ -262,9 +263,10 @@ def _build_grpo_prompts(
         # child; tokenizer-only counts miss image expansion by hundreds of tokens.
         for ex, messages in zip(train, message_prompts, strict=True):
             normalized = normalize_prompt_images(ex, messages, package_root)
+            template_messages = messages_for_chat_template(normalized.messages)
             expanded, rendered = _processor_expanded_prompt(
                 processor,
-                normalized.messages,
+                template_messages,
                 tuple(normalized.descriptors),
                 package_root,
                 enable_thinking=bool(_worker_state.THINKING),
@@ -272,10 +274,10 @@ def _build_grpo_prompts(
             if 0 < len(expanded) <= prompt_budget:
                 prompts.append(
                     {
-                        "prompt": normalized.messages,
+                        "prompt": template_messages,
                         # use the same canonical message shape the processor and child authenticate.
                         # this also carries top-level record images that were absent from `messages`.
-                        "env_prompt": normalized.messages,
+                        "env_prompt": template_messages,
                         "images": list(normalized.descriptors),
                         "rendered": rendered,
                         "prompt_ids": list(expanded),
@@ -285,22 +287,24 @@ def _build_grpo_prompts(
                 )
     else:
         for ex, messages in zip(train, message_prompts, strict=True):
+            template_messages = messages_for_chat_template(messages)
             rendered = tok.apply_chat_template(
-                messages,
+                template_messages,
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=_worker_state.THINKING,
+                preserve_thinking=False,
             )
             prompt_ids = list(tok(rendered, add_special_tokens=False).input_ids)
             prompt_len = len(prompt_ids)
             if 0 < prompt_len <= prompt_budget:
                 prompts.append(
                     {
-                        "prompt": messages,
+                        "prompt": template_messages,
                         # reuse the messages that built this prompt. calling start_episode again can randomize
                         # a different episode, making the bridge score different state from the generated
                         # transcript.
-                        "env_prompt": messages,
+                        "env_prompt": template_messages,
                         "rendered": rendered,
                         "prompt_ids": prompt_ids,
                         "example": ex,

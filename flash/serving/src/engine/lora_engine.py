@@ -18,17 +18,19 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+# Adapter-cache paths and token accounting live in engine_support.py, alongside
+# _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
+# the vllm build probes engine_boot uses.
+from flash.content.thinking import messages_for_chat_template
 from flash.serving.src.engine.lora_entries import _LoraEntry, cached_lora_request, entries_for
 from flash.serving.src.engine.model_config import (
     engine_overrides_for,
     gpu_for,
     image_limit_for,
+    immutable_serving_revisions,
     supports_image_input,
+    tokenizer_model_for,
 )
-
-# Adapter-cache paths and token accounting live in engine_support.py, alongside
-# _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
-# the vllm build probes engine_boot uses.
 from flash.serving.src.engine.support import (
     _adapter_cache_path,
     _adapter_cache_ready,
@@ -91,12 +93,7 @@ class _LoraEngineImpl:
         # to a loop that's then closed, breaking generate() on the real serving loop.
         from vllm import AsyncEngineArgs, AsyncLLMEngine
 
-        from flash.serving.src.engine.boot import (
-            engine_args_for,
-            load_tokenizer,
-            pin_loras_default,
-        )
-        from flash.serving.src.engine.model_config import engine_overrides_for
+        from flash.serving.src.engine.boot import load_engine_config, pin_loras_default
         from flash.serving.src.store import settings as cfg
         from flash.serving.src.store.registry import AdapterRegistry
         from flash.serving.src.store.settings import ADAPTER_CACHE_DIR, Settings
@@ -116,13 +113,12 @@ class _LoraEngineImpl:
         self.registry.hydrate(base_model_adapters)
         ADAPTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.processor, self.tokenizer = load_tokenizer(self.base_model, self.settings, cfg)
-
-        # Per-base-model engine-arg overrides. Larger pre-quantized tiers use real-GPU-validated
-        # rank-32 LoRA sizing and, where needed, tighter scheduler/memory caps.
-        overrides = engine_overrides_for(self.base_model)
+        self.processor, self.tokenizer, overrides, kwargs = load_engine_config(
+            self.base_model,
+            self.settings,
+            cfg,
+        )
         self._pin_loras = pin_loras_default(overrides, cfg)
-        kwargs = engine_args_for(self.base_model, overrides, cfg)
         self.reasoning_parser = kwargs.get("reasoning_parser")
         self.engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**kwargs))
         # No in-engine kernel-patching hook runs here (2026-07-05 35B outage post-mortem): under
@@ -456,7 +452,11 @@ class _LoraEngineImpl:
         ctk = _safe_chat_template_kwargs(getattr(payload, "chat_template_kwargs", None))
         if not isinstance(thinking_default, bool):
             raise ValueError("adapter thinking default is required")
-        return {**ctk, "enable_thinking": thinking_default}
+        return {
+            **ctk,
+            "enable_thinking": thinking_default,
+            "preserve_thinking": False,
+        }
 
     def _prompt_cache_key(
         self, payload: Any, thinking_default: bool | None = None
@@ -535,7 +535,7 @@ class _LoraEngineImpl:
             # with. Reserved/return-shape kwargs are dropped before rendering to avoid 500s.
             ctk = self._effective_chat_template_kwargs(payload, thinking_default)
             prompt_token_ids = self.tokenizer.apply_chat_template(
-                payload.messages,
+                messages_for_chat_template(payload.messages),
                 tokenize=True,
                 add_generation_prompt=True,
                 return_dict=False,
@@ -578,7 +578,7 @@ class _LoraEngineImpl:
             # over the message list, and its sibling image decode above already runs off-loop.
             rendered = await asyncio.to_thread(
                 lambda: processor.apply_chat_template(
-                    template_messages,
+                    messages_for_chat_template(template_messages),
                     tokenize=False,
                     add_generation_prompt=True,
                     **ctk,
@@ -923,6 +923,31 @@ class _LoraEngineImpl:
 
         _ov = engine_overrides_for(self.base_model)
         _served_model = _ov.get("serve_model_id") or self.base_model
+        _revisions = immutable_serving_revisions(self.base_model)
+        _tokenizer_model = tokenizer_model_for(self.base_model)
+        _processor_model = _tokenizer_model if supports_image_input(self.base_model) else None
+        _immutable_identity = (
+            {
+                "model": {
+                    "repo": _served_model,
+                    "revision": _revisions.get("model_revision"),
+                },
+                "tokenizer": {
+                    "repo": _tokenizer_model,
+                    "revision": _revisions.get("tokenizer_revision"),
+                },
+                "processor": (
+                    {
+                        "repo": _processor_model,
+                        "revision": _revisions.get("processor_revision"),
+                    }
+                    if _processor_model is not None
+                    else None
+                ),
+            }
+            if _revisions
+            else None
+        )
         # Report real EngineCore liveness, not a static True: a V1 engine whose worker process died
         # still runs this container, so an unconditional ok:True masked the dead 35B tier during the
         # 2026-07-06 outage. ``start_all``/monitoring can now see the death, and the liveness monitor
@@ -936,7 +961,8 @@ class _LoraEngineImpl:
             # The checkpoint this engine actually loaded: the pre-quantized serve_model_id (owned FP8,
             # or the official 35B FP8). Surfaced so ops can confirm which weights came up.
             "served_model": _served_model,
-            # Effective weight quantization of the served checkpoint. Every base now serves a
+            "immutable_identity": _immutable_identity,
+            # effective weight quantization of the served checkpoint. every base now serves a
             # pre-quantized FP8 checkpoint (vLLM auto-detects, so the engine arg is None).
             "quantization": (
                 "fp8" if _ov.get("serve_model_id") else _ov.get("quantization", cfg.QUANTIZATION)

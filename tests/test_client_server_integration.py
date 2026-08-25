@@ -44,7 +44,7 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 # A representative managed-run spec -- the shape the freesolo bridge / SDK
 # submits: catalog model, Freesolo environment id, and an HF repo for artifacts.
 SPEC = {
-    "model": "Qwen/Qwen3.5-4B",
+    "model": "Qwen/Qwen3.5-9B",
     "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
     "environment": {"id": "freesolo/example-project/gsm8k", "params": {"max_examples": 8}},

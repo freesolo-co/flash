@@ -31,7 +31,7 @@ from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.io.streaming import openai_chat_stream
 from flash.serving.src.store.registry import AdapterRegistry
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}
 
 
@@ -316,7 +316,7 @@ def test_reasoning_state_matches_effective_thinking_mode(modal_app_module):
     _generate(non_thinking, structured_outputs={"json": SCHEMA})
     assert non_thinking.engine.reasoning_ended[-1] is True
     assert non_thinking.engine.reasoning_parser_kwargs[-1] == {
-        "chat_template_kwargs": {"enable_thinking": False}
+        "chat_template_kwargs": {"enable_thinking": False, "preserve_thinking": False}
     }
 
     thinking = _engine(modal_app_module, thinking=False, default={"json": SCHEMA})
@@ -327,7 +327,11 @@ def test_reasoning_state_matches_effective_thinking_mode(modal_app_module):
     )
     assert thinking.engine.reasoning_ended[-1] is False
     assert thinking.engine.reasoning_parser_kwargs[-1] == {
-        "chat_template_kwargs": {"tools": ["search"], "enable_thinking": True}
+        "chat_template_kwargs": {
+            "tools": ["search"],
+            "enable_thinking": True,
+            "preserve_thinking": False,
+        }
     }
 
 
@@ -591,8 +595,18 @@ def test_streaming_and_non_streaming_reasoning_state_match(modal_app_module):
     assert events[-1]["type"] == "final"
     assert eng.engine.reasoning_ended == [False, False]
     assert eng.engine.reasoning_parser_kwargs == [
-        {"chat_template_kwargs": {"enable_thinking": True}},
-        {"chat_template_kwargs": {"enable_thinking": True}},
+        {
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "preserve_thinking": False,
+            }
+        },
+        {
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "preserve_thinking": False,
+            }
+        },
     ]
     assert (
         eng.engine.sampling_params[0].structured_outputs

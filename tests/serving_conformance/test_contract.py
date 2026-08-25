@@ -3,8 +3,8 @@ Skipped unless `--serving-url` names one:
     uv run pytest tests/serving_conformance --serving-url http://localhost:8100 \\
         --conformance-repo acme/artifacts \\
         --conformance-subfolder sft/run-abc/adapter \\
-        --conformance-base-model Qwen/Qwen3.5-4B
-Every assertion here mirrors something `flash/serve/deployment/deploy.py` genuinely checks, so a backend that
+        --conformance-base-model Qwen/Qwen3.5-9B
+Every assertion here mirrors something `flash/serve/deploy.py` genuinely checks, so a backend that
 passes works with `flash models deploy` / `chat` / `undeploy` unchanged. Where the client accepts
 two shapes (a bare record or `{"adapter": ...}`), so does this suite -- it tests the contract, not
 one implementation of it.
@@ -761,7 +761,7 @@ def test_a_corrected_identity_still_fails_the_readiness_wait():
         "repo_id": "acme/artifacts",
         "repo_type": "model",
         "subfolder": "sft/run-abc/adapter",
-        "base_model": "Qwen/Qwen3.5-4B",
+        "base_model": "Qwen/Qwen3.5-9B",
         "checkpoint": "run-abc/step-10",
         "thinking": False,
         "org_id": "conformance-org",

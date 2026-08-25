@@ -149,7 +149,7 @@ def test_cancel_run_revocation_failure_defers_until_after_fence_and_teardown(
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "gpu": {"type": "RTX 5090"},
             "run_id": f"flash-revoke-failure-{failed_revocation_call}",
@@ -197,7 +197,7 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "gpu": {"type": "RTX 5090"},
             "run_id": "flash-9-feedface",
@@ -230,7 +230,7 @@ def test_cancel_tears_down_every_acceptable_class_of_an_ordered_pin(tmp_path, mo
 
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "gpu": {"type": ["A100 PCIe", "A100 SXM"]},
             "run_id": "flash-9-feedface",
@@ -1840,7 +1840,13 @@ def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
     assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
 
 
-def test_cancel_active_deployment_with_malformed_spec_still_revokes(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "retired_model",
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
+)
+def test_cancel_active_removed_model_still_cleans_up_and_revokes(
+    tmp_path, monkeypatch, retired_model
+):
     import flash.serve.deployment.deploy as deploy
     import flash.server.platform.locks as locks
 
@@ -1856,7 +1862,7 @@ def test_cancel_active_deployment_with_malformed_spec_still_revokes(tmp_path, mo
         )
     )
     raw = runner_status._load_status_json(run_id)
-    raw["spec"] = ["malformed-spec"]
+    raw["spec"]["model"] = retired_model
     with open(runner_state.runs_file_path(run_id, ".json"), "w") as file:
         json.dump(raw, file)
 
@@ -1881,7 +1887,7 @@ def test_cancel_active_deployment_with_malformed_spec_still_revokes(tmp_path, mo
 
     out = runner_deploy.cancel_run(run_id)
 
-    assert gc_calls == []
+    assert [spec.model for spec in gc_calls] == [retired_model]
     assert backend_calls == [run_id]
     assert out.state == "cancelled"
     assert out.deployment["state"] == "undeployed"

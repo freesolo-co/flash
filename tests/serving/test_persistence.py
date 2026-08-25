@@ -39,7 +39,7 @@ def _row(**overrides: object) -> dict[str, object]:
         "repo_id": "org/run",
         "org_id": "org-1",
         "url": "https://huggingface.co/org/run",
-        "base_model": "Qwen/Qwen3.5-0.8B",
+        "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "checkpoints/step-20",
         "repo_type": "model",
         "checkpoint": f"{RUN_ID}/step-20",

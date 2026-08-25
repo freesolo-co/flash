@@ -321,7 +321,12 @@ def _engine_class_name(gpu: str, max_inputs: int) -> str:
     return f"{base}_c{max_inputs}"
 
 
-def _build_engine(gpu: str, class_name: str, max_inputs: int, target_inputs: int) -> Any:
+def _build_engine(
+    gpu: str,
+    class_name: str,
+    max_inputs: int,
+    target_inputs: int,
+) -> Any:
     """Register one Modal ``@app.cls`` LoraEngine pinned to ``gpu``.
 
     Modal fixes a class's GPU at decoration time, so the A100-80GB 35B model and the L4 models need

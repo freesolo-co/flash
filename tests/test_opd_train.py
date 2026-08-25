@@ -12,6 +12,7 @@ import json
 import math
 import multiprocessing
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -28,6 +29,7 @@ import flash.engine.worker.io.hf as worker_hf
 import flash.engine.worker.train.entry.opd_train_runner as opd_train_runner
 import flash.engine.worker.train.opd.bridging.batching as opd_batching
 import flash.engine.worker.train.opd.orchestration.failures as opd_failures
+import flash.engine.worker.train.opd.orchestration.prompt_preparation as opd_prompt_preparation
 import flash.engine.worker.train.opd.orchestration.protocol as opd_protocol
 import flash.engine.worker.train.rl.launch.verl_config as rl_verl_config
 from flash.engine.worker.teacher.client import TeacherScore
@@ -38,10 +40,6 @@ from flash.engine.worker.train.core.child.glue import (
 )
 from flash.engine.worker.train.core.child.runtime import install_checkpoint_handler_filter
 from flash.engine.worker.train.entry import backend_common, opd_train, rl_train, score_batcher
-from flash.engine.worker.train.entry.opd_train_runner import (
-    _prepare_prompt_messages,
-    _render_prompt_rows,
-)
 from flash.engine.worker.train.entry.sft_train import _seed_resume_lifecycle
 from flash.engine.worker.train.opd.bridging.batching import _TextTeacherBatcher
 from flash.engine.worker.train.opd.bridging.bridge import _TeacherAlignmentBridge
@@ -90,10 +88,36 @@ from flash.engine.worker.train.opd.orchestration.overrides import (
     build_opd_overrides,
 )
 from flash.engine.worker.train.opd.orchestration.progress import _OpdProgressState
-from flash.engine.worker.train.opd.orchestration.state import _BridgePrompt
+from flash.engine.worker.train.opd.orchestration.prompt_preparation import (
+    _prepare_prompt_messages,
+)
+from flash.engine.worker.train.opd.orchestration.prompt_preparation import (
+    render_prompt_rows as _render_prompt_rows,
+)
+from flash.engine.worker.train.opd.orchestration.state import _BridgePrompt, _OpdRequest
 from flash.engine.worker.train.opd.orchestration.validation import validate_opd_structured_outputs
 from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 from flash.teacher.retry_contract import OPD_RESUME_STATE_VERSION
+
+
+def test_prompt_preparation_does_not_import_opd_train_entry_in_fresh_process():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "assert 'flash.engine.worker.train.entry.opd_train' not in sys.modules; "
+                "import flash.engine.worker.train.opd.orchestration.prompt_preparation; "
+                "assert 'flash.engine.worker.train.entry.opd_train' not in sys.modules"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.fixture(autouse=True)
@@ -640,7 +664,7 @@ def test_xgrammar_replay_uses_real_qwen_padded_model_vocab(spec, text):
     pytest.importorskip("xgrammar")
     from transformers import AutoConfig, AutoTokenizer
 
-    model_id = "Qwen/Qwen3.5-0.8B"
+    model_id = "Qwen/Qwen3.5-9B"
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     assert len(tokenizer.get_vocab()) == 248077
@@ -668,6 +692,42 @@ def test_image_prompt_positions_remain_outside_alignment_groups():
     )
     assert teacher_ids[: len(prompt_ids) - 1] == [-1, -1, -1]
     assert teacher_ids[len(prompt_ids) - 1] == 0
+
+
+def test_opd_prompt_rows_flatten_text_blocks_and_preserve_reasoning():
+    from flash.engine.worker.train.entry.prompt_rows import canonical_prompt_messages
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "hello "},
+                {"type": "text", "text": "world"},
+            ],
+        },
+        {"role": "assistant", "content": "answer", "reasoning_content": "later"},
+    ]
+
+    assert canonical_prompt_messages(messages, multimodal=False) == [
+        {"role": "user", "content": "hello world"},
+        {"role": "assistant", "content": "answer", "reasoning_content": "later"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "user", "content": None},
+        {"role": "assistant", "content": None},
+        {"role": "assistant", "content": {"text": "invalid"}},
+        {"role": "assistant", "content": 7},
+    ],
+)
+def test_opd_prompt_rows_reject_other_non_text_content(message):
+    from flash.engine.worker.train.entry.prompt_rows import canonical_prompt_messages
+
+    with pytest.raises(ValueError, match="content must be text or content blocks"):
+        canonical_prompt_messages([message], multimodal=False)
 
 
 @pytest.mark.parametrize("image_first", [False, True])
@@ -842,6 +902,88 @@ def test_verl_0_8_rlhf_dataset_builds_one_structured_block_per_image(
     ]
 
 
+def test_opd_reasoning_only_assistant_round_trips_with_empty_content(tmp_path):
+    from flash.engine.worker.train.entry.prompt_rows import canonical_prompt_messages
+
+    row = _opd_row(0, multimodal=False)
+    row["prompt"] = canonical_prompt_messages(
+        [{"role": "assistant", "content": None, "reasoning_content": "working"}],
+        multimodal=False,
+    )
+    path = tmp_path / "reasoning-only.parquet"
+
+    _write_opd_parquet([row], str(path))
+
+    datasets = pytest.importorskip("datasets")
+    restored = datasets.Dataset.from_parquet(str(path))
+    assert restored[0]["prompt"] == [
+        {"role": "assistant", "content": "", "reasoning_content": "working"}
+    ]
+
+
+def test_opd_multimodal_parquet_preserves_reasoning_content_for_child(tmp_path):
+    datasets = pytest.importorskip("datasets")
+    rows = [
+        {
+            "prompt": [
+                {"role": "user", "content": "first"},
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "old",
+                },
+                {"role": "user", "content": "look<image>"},
+            ],
+            "images": [{"image": "file:///tmp/only.png"}],
+            "data_source": "flash_opd",
+            "reward_model": {"style": "rule", "ground_truth": ""},
+            "extra_info": {"index": 0},
+        }
+    ]
+    path = tmp_path / "reasoning.parquet"
+
+    _write_opd_parquet(rows, str(path))
+    restored = datasets.Dataset.from_parquet(str(path))[0]["prompt"]
+
+    assert restored[1] == {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "old",
+    }
+
+
+def test_text_opd_parquet_preserves_reasoning_first_authored_after_initial_batch(tmp_path):
+    datasets = pytest.importorskip("datasets")
+    rows = [_opd_row(index, multimodal=False) for index in range(_OPD_PARQUET_WRITE_BATCH_ROWS + 1)]
+    rows[-1]["prompt"][0]["reasoning_content"] = "late reasoning"
+    path = tmp_path / "late-reasoning.parquet"
+
+    _write_opd_parquet(rows, str(path))
+
+    restored = datasets.Dataset.from_parquet(str(path))
+    assert restored[-1]["prompt"][0]["reasoning_content"] == "late reasoning"
+    assert "reasoning_content" in restored.features["prompt"].feature
+
+
+def test_text_opd_parquet_omits_reasoning_when_unauthored(tmp_path):
+    datasets = pytest.importorskip("datasets")
+    path = tmp_path / "no-reasoning.parquet"
+
+    _write_opd_parquet([_opd_row(0, multimodal=False)], str(path))
+
+    restored = datasets.Dataset.from_parquet(str(path))
+    assert "reasoning_content" not in restored.features["prompt"].feature
+    assert restored[0]["prompt"] == [{"role": "user", "content": "prompt 0"}]
+
+
+def test_opd_parquet_rejects_non_string_authored_reasoning(tmp_path):
+    row = _opd_row(0, multimodal=False)
+    row["prompt"][0]["reasoning_content"] = {"text": "not canonical"}
+
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        _write_opd_parquet([row], str(tmp_path / "invalid-reasoning.parquet"))
+
+
 class _MockMultimodalProcessor:
     image_token_id = 151655
 
@@ -855,6 +997,7 @@ class _MockMultimodalProcessor:
             "tokenize": False,
             "add_generation_prompt": True,
             "enable_thinking": False,
+            "preserve_thinking": False,
         }
         self.rendered = messages
         return "<vision>describe"
@@ -881,8 +1024,12 @@ def test_image_observation_env_text_prompt_omits_empty_processor_images(monkeypa
         def prompt_messages(self, _example):
             return [{"role": "user", "content": "describe"}]
 
-    monkeypatch.setattr(opd_train_runner._worker_rng, "seed_training_rngs", lambda _seed: None)
-    monkeypatch.setattr(opd_train, "liveness_heartbeat", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(opd_prompt_preparation, "seed_training_rngs", lambda _seed: None)
+    monkeypatch.setattr(
+        opd_prompt_preparation,
+        "liveness_heartbeat",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
     prompt_rows, multimodal = _render_prompt_rows(
         SimpleNamespace(env=_DynamicImageEnv(), spec=None)
     )
@@ -1013,7 +1160,7 @@ def test_parent_preparation_orders_image_normalization_before_block_validation(m
         return [{"role": "user", "content": "q"}]
 
     monkeypatch.setattr(multimodal, "normalize_prompt_images", normalize)
-    monkeypatch.setattr(opd_train_runner._glue, "validate_transcript_messages", validate)
+    monkeypatch.setattr(opd_prompt_preparation, "validate_transcript_messages", validate)
 
     result = _prepare_prompt_messages(
         {"image": _IMAGE_DATA_URI},
@@ -2794,12 +2941,13 @@ class _MultiTurnProcessor:
         return {"input_ids": [[ord(character) % 64 for character in text[0]]]}
 
 
-def _multiturn_bridge(env, *, max_turns=4, processor=None, teacher=None):
+def _multiturn_bridge(env, *, max_turns=4, processor=None, teacher=None, student_messages=None):
+    student_messages = student_messages or [{"role": "user", "content": "q"}]
     return _TeacherAlignmentBridge(
         prompts=[
             _BridgePrompt(
-                student_messages=[{"role": "user", "content": "q"}],
-                teacher_messages=[{"role": "user", "content": "q"}],
+                student_messages=student_messages,
+                teacher_messages=student_messages,
                 prompt_ids=(10, 11),
                 image_descriptors=(),
                 package_root=None,
@@ -2817,6 +2965,67 @@ def _multiturn_bridge(env, *, max_turns=4, processor=None, teacher=None):
         multi_turn=True,
         max_turns=max_turns,
     )
+
+
+def test_opd_multiturn_start_preserves_reasoning_content_and_rejects_metadata():
+    prompt = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+        {"role": "user", "content": "question"},
+    ]
+
+    class _ReasoningEnv(_RecordingEnv):
+        def new_rollout_state(self, _example):
+            return {
+                "messages": [dict(message) for message in prompt],
+                "prompt": [dict(message) for message in prompt],
+            }
+
+    bridge = _multiturn_bridge(_ReasoningEnv(), student_messages=prompt)
+
+    assert bridge.start_multiturn(
+        index=0,
+        session_id="reasoning",
+        prompt_ids=[10, 11],
+        raw_prompt=prompt,
+        image_count=0,
+        image_digests=[],
+    ) == {"max_turns": 4}
+    assert bridge._sessions["reasoning"]["messages"] == prompt
+
+    with pytest.raises(ValueError, match="does not match the frozen environment prompt"):
+        _multiturn_bridge(_ReasoningEnv(), student_messages=prompt).start_multiturn(
+            index=0,
+            session_id="wrong-reasoning",
+            prompt_ids=[10, 11],
+            raw_prompt=[
+                *prompt[:1],
+                {**prompt[1], "reasoning_content": "different"},
+                *prompt[2:],
+            ],
+            image_count=0,
+            image_digests=[],
+        )
+
+    malformed = [*prompt[:1], {**prompt[1], "reasoning_content": {"text": "old"}}, *prompt[2:]]
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        _multiturn_bridge(_ReasoningEnv(), student_messages=prompt).start_multiturn(
+            index=0,
+            session_id="bad-reasoning",
+            prompt_ids=[10, 11],
+            raw_prompt=malformed,
+            image_count=0,
+            image_digests=[],
+        )
+    with pytest.raises(ValueError, match="unsupported transcript metadata"):
+        _multiturn_bridge(_ReasoningEnv(), student_messages=prompt).start_multiturn(
+            index=0,
+            session_id="bad-metadata",
+            prompt_ids=[10, 11],
+            raw_prompt=[{**prompt[0], "name": None}, *prompt[1:]],
+            image_count=0,
+            image_digests=[],
+        )
 
 
 def test_an_unusable_opd_turn_is_never_shown_to_the_environment():
@@ -6275,7 +6484,7 @@ def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horiz
     )
     request = SimpleNamespace(
         knobs=knobs,
-        model_id="Qwen/Qwen3.5-4B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="revision",
         spec=SimpleNamespace(
             gpu=SimpleNamespace(count=1),
@@ -6467,6 +6676,10 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["data.image_key"] == "images"
     assert overrides["data.return_raw_chat"] == "true"
     assert overrides["data.return_multi_modal_inputs"] == "false"
+    assert (
+        overrides["++data.apply_chat_template_kwargs"]
+        == "{enable_thinking:false,preserve_thinking:false}"
+    )
     # `++`-prefixed: these keys are absent from the composed node, so a bare assignment would abort
     # the run at hydra composition. see build_opd_overrides for the per-key reasoning.
     assert overrides["++actor_rollout_ref.rollout.limit_images"] == "4"
@@ -6505,7 +6718,7 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
         request=SimpleNamespace(
             multi_turn=False,
             structured_outputs=None,
-            model_id="Qwen/Qwen3.5-4B",
+            model_id="Qwen/Qwen3.5-9B",
             knobs=SimpleNamespace(
                 max_completion=512,
                 learning_rate=1e-5,
@@ -6579,7 +6792,7 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
             request=SimpleNamespace(
                 multi_turn=False,
                 structured_outputs=None,
-                model_id="Qwen/Qwen3.5-4B",
+                model_id="Qwen/Qwen3.5-9B",
                 model_revision="",
                 spec=spec,
                 knobs=SimpleNamespace(
@@ -7309,7 +7522,7 @@ def test_unstructured_validator_does_not_resolve_model_metadata(monkeypatch):
 
     result = validate_opd_structured_outputs(
         None,
-        model_id="Qwen/Qwen3.5-4B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="d" * 40,
     )
 
@@ -7641,7 +7854,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             {
                 "run_id": "r-alloc",
                 "algorithm": "opd",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "environment": {"id": "org/env"},
                 "train": {
                     "hf_repo": "a/b",
@@ -7671,7 +7884,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
         {
             "run_id": "r-sft",
             "algorithm": "sft",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "environment": {"id": "org/env"},
             "train": {
                 "hf_repo": "a/b",
@@ -8019,18 +8232,9 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
         "JOB_SPEC",
         SimpleNamespace(
             train=train,
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             model_revision="",
             gpu=SimpleNamespace(type=None),
-        ),
-    )
-    monkeypatch.setattr(opd_mod._worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(opd_mod._worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
-    monkeypatch.setattr(
-        opd_mod._worker_hf,
-        "prefetch_model",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("model prefetch must not be reached")
         ),
     )
     monkeypatch.setattr(
@@ -8041,7 +8245,7 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
         ),
     )
     # torch is not installed in this test env; the real seeding is covered in test_training_controls.
-    monkeypatch.setattr(opd_train_runner._worker_rng, "seed_training_rngs", lambda seed: None)
+    monkeypatch.setattr(opd_prompt_preparation, "seed_training_rngs", lambda seed: None)
     monkeypatch.delenv("FLASH_PUBLIC_URL", raising=False)
     monkeypatch.delenv("FLASH_TEACHER_CAPABILITY", raising=False)
 
@@ -8062,17 +8266,21 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
     monkeypatch, thinking, rendered_prompt, expected_opened
 ):
     from flash.engine.worker.model.decoding import prompt_opens_thinking
-    from flash.engine.worker.train.entry import opd_train_runner
-    from flash.engine.worker.train.opd.orchestration.state import _OpdRequest
+    from flash.engine.worker.train.opd.orchestration import prompt_preparation
 
     class _Tokenizer:
         pad_token = "<pad>"
         eos_token = "<eos>"
 
         def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking, preserve_thinking
         ):
-            assert messages == [{"role": "user", "content": "question"}]
+            assert preserve_thinking is False
+            assert messages == [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+                {"role": "user", "content": "question"},
+            ]
             assert add_generation_prompt is True
             assert enable_thinking is thinking
             return [10, 11] if tokenize else rendered_prompt
@@ -8087,27 +8295,31 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
 
     env = SimpleNamespace(thinking=None, prompt_opens_thinking=None, package_root=None)
     tokenizer = _Tokenizer()
-    monkeypatch.setattr(opd_train_runner._worker_state, "THINKING", thinking)
+    monkeypatch.setattr(prompt_preparation._worker_state, "THINKING", thinking)
     monkeypatch.setattr(
-        opd_train_runner._worker_hf,
+        prompt_preparation._worker_hf,
         "load_tokenizer",
         lambda model_id, revision: tokenizer,
     )
-    monkeypatch.setattr(opd_train_runner, "prompt_opens_thinking", prompt_opens_thinking)
+    monkeypatch.setattr(prompt_preparation, "prompt_opens_thinking", prompt_opens_thinking)
+    monkeypatch.setattr(prompt_preparation, "_thinking_prefill_text", lambda _tokenizer: "")
     monkeypatch.setattr(
-        opd_train_runner._opd_entry, "_thinking_prefill_text", lambda _tokenizer: ""
+        prompt_preparation._backend,
+        "clamp_engine_len",
+        lambda requested, _limit: requested,
     )
     monkeypatch.setattr(
-        opd_train_runner._backend, "clamp_engine_len", lambda requested, _limit: requested
+        prompt_preparation._backend,
+        "model_max_position_embeddings",
+        lambda *_args: None,
     )
     monkeypatch.setattr(
-        opd_train_runner._backend, "model_max_position_embeddings", lambda *_args: None
+        prompt_preparation,
+        "validate_glue_template",
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        opd_train_runner._glue, "validate_glue_template", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(
-        opd_train_runner._worker_heartbeat,
+        prompt_preparation,
         "liveness_heartbeat",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
@@ -8128,15 +8340,29 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
         model_revision="revision",
     )
 
-    state = opd_train_runner._prepare_prompts(
+    state = prompt_preparation.prepare_prompts(
         request,
-        [({}, [{"role": "user", "content": "question"}])],
+        [
+            (
+                {},
+                [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "<think>old</think>answer"},
+                    {"role": "user", "content": "question"},
+                ],
+            )
+        ],
         False,
         "capability",
         "https://control.invalid",
     )
 
     assert len(state.prompts) == 1
+    assert state.prompts[0].student_messages[1] == {
+        "role": "assistant",
+        "reasoning_content": "old",
+        "content": "answer",
+    }
     assert env.thinking is thinking
     assert env.prompt_opens_thinking is expected_opened
 
@@ -8150,8 +8376,7 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
     from the first RETAINED prompt (`_build_grpo_prompts`); opd must match.
     """
     from flash.engine.worker.model.decoding import prompt_opens_thinking
-    from flash.engine.worker.train.entry import opd_train_runner
-    from flash.engine.worker.train.opd.orchestration.state import _OpdRequest
+    from flash.engine.worker.train.opd.orchestration import prompt_preparation
 
     # row 0 renders WITHOUT an open think tag and is over budget; row 1 renders WITH one and fits.
     rows = {
@@ -8164,8 +8389,9 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
         eos_token = "<eos>"
 
         def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking, preserve_thinking
         ):
+            assert preserve_thinking is False
             rendered, ids = rows[messages[0]["content"]]
             return ids if tokenize else rendered
 
@@ -8174,27 +8400,31 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
             pass
 
     env = SimpleNamespace(thinking=None, prompt_opens_thinking=None, package_root=None)
-    monkeypatch.setattr(opd_train_runner._worker_state, "THINKING", True)
+    monkeypatch.setattr(prompt_preparation._worker_state, "THINKING", True)
     monkeypatch.setattr(
-        opd_train_runner._worker_hf,
+        prompt_preparation._worker_hf,
         "load_tokenizer",
         lambda model_id, revision: _Tokenizer(),
     )
-    monkeypatch.setattr(opd_train_runner, "prompt_opens_thinking", prompt_opens_thinking)
+    monkeypatch.setattr(prompt_preparation, "prompt_opens_thinking", prompt_opens_thinking)
+    monkeypatch.setattr(prompt_preparation, "_thinking_prefill_text", lambda _tokenizer: "")
     monkeypatch.setattr(
-        opd_train_runner._opd_entry, "_thinking_prefill_text", lambda _tokenizer: ""
+        prompt_preparation._backend,
+        "clamp_engine_len",
+        lambda requested, _limit: requested,
     )
     monkeypatch.setattr(
-        opd_train_runner._backend, "clamp_engine_len", lambda requested, _limit: requested
+        prompt_preparation._backend,
+        "model_max_position_embeddings",
+        lambda *_args: None,
     )
     monkeypatch.setattr(
-        opd_train_runner._backend, "model_max_position_embeddings", lambda *_args: None
+        prompt_preparation,
+        "validate_glue_template",
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        opd_train_runner._glue, "validate_glue_template", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(
-        opd_train_runner._worker_heartbeat,
+        prompt_preparation,
         "liveness_heartbeat",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
@@ -8211,7 +8441,7 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
         model_revision="revision",
     )
 
-    state = opd_train_runner._prepare_prompts(
+    state = prompt_preparation.prepare_prompts(
         request,
         [
             ({}, [{"role": "user", "content": "too-long"}]),
@@ -8237,9 +8467,9 @@ def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice
     import ast
     import textwrap
 
-    from flash.engine.worker.train.entry import opd_train_runner
+    from flash.engine.worker.train.opd.orchestration import prompt_preparation
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(opd_train_runner._render_prompt_rows)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(prompt_preparation.render_prompt_rows)))
     renders = [
         node
         for node in ast.walk(tree)

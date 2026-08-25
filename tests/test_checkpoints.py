@@ -21,7 +21,7 @@ from flash.runner.results.checkpoints import (
 _PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 
 SPEC_DICT = {
-    "model": "Qwen/Qwen3.5-4B",
+    "model": "Qwen/Qwen3.5-9B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
@@ -473,7 +473,7 @@ def test_register_run_checkpoints_body_shape(monkeypatch):
     body = captured["body"]
     assert body["orgId"] == "org-xyz"
     assert body["runId"] == "flash-ckpt-1"
-    assert body["baseModel"] == "Qwen/Qwen3.5-4B"
+    assert body["baseModel"] == "Qwen/Qwen3.5-9B"
     assert body["repoId"] == "org/test-runs"
     assert body["repoType"] == "dataset"
     # the receiver requires an explicit project and 422s the batch without one.

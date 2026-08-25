@@ -95,7 +95,7 @@ def test_gdn_hybrid_detected_by_layer_types(monkeypatch):
     _patch_cfg(
         monkeypatch, types.SimpleNamespace(layer_types=["linear_attention", "full_attention"])
     )
-    assert model_is_gdn_hybrid("Qwen/Qwen3.5-4B") is True
+    assert model_is_gdn_hybrid("Qwen/Qwen3.5-9B") is True
 
 
 def test_gdn_hybrid_detected_by_linear_dims(monkeypatch):

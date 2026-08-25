@@ -126,7 +126,7 @@ def _opd_spec(run_id: str, *, max_retries: int = 1, seed: int = 42):
 
     return JobSpec(
         run_id=run_id,
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         seed=seed,
         train=TrainSpec(hf_repo="private/runs", max_examples=1, epochs=1),

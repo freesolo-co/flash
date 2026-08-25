@@ -28,7 +28,7 @@ def _spec(gpu_type="RTX 4090", **gpu_kw) -> JobSpec:
     gpu = {"type": gpu_type, "max_wall_seconds": 3600, **gpu_kw}
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             # authoritative seed 0 matches the literal seed threaded into every provider call below.
             "seed": 0,

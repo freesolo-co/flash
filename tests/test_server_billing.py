@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 SPEC = {
-    "model": "Qwen/Qwen3.5-4B",
+    "model": "Qwen/Qwen3.5-9B",
     "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
     # A hub slug, because this fixture drives the HOSTED api: the managed plane accepts
@@ -140,7 +140,7 @@ def test_charge_posts_completed_run_cost_and_parses_response(monkeypatch):
     assert body["gpu"] == "RTX 5090"
     assert body["provider"] == "runpod"
     assert body["method"] == "grpo"
-    assert body["model"] == "Qwen/Qwen3.5-4B"
+    assert body["model"] == "Qwen/Qwen3.5-9B"
     assert body["estimate"] == {
         "totalUsd": 12.345,
         "costBasis": "estimate",

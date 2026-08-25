@@ -37,7 +37,7 @@ class _PromptState:
     thinking_prefill: str
     max_model_len: int
     prompt_budget: int
-    prompts: list[Any]
+    prompts: list[_BridgePrompt]
     dropped_long: int
     processor: Any = None
 

@@ -73,7 +73,7 @@ def test_large_grpo_plugin_config_uses_a_file_and_launches_the_child(tmp_path):
         "plugin_config_path": str(tmp_path / "flash_grpo_plugin_config.json"),
     }
     inp = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "dp_cards": 1,
         "reentrant_checkpointing": False,
         "multimodal": False,
@@ -116,6 +116,31 @@ print("config-loaded")
     )
     assert result.returncode == 0, result.stderr
     assert "config-loaded" in result.stdout.splitlines()
+
+
+def test_staged_child_glue_imports_the_copied_reasoning_normalizer(tmp_path):
+    rl_multi_turn.copy_grpo_child_modules(str(tmp_path))
+    normalizer = tmp_path / "flash_reasoning_normalization.py"
+    normalizer.write_text(
+        normalizer.read_text()
+        + "\n\ndef messages_for_chat_template(messages):\n    return [{'role': 'assistant', 'content': 'staged'}]\n",
+        encoding="utf-8",
+    )
+    script = """
+import flash_multiturn_glue as glue
+assert glue._messages_for_chat_template([]) == [{'role': 'assistant', 'content': 'staged'}]
+print('staged-normalizer-used')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "staged-normalizer-used" in result.stdout
 
 
 def test_grpo_external_plugin_arms_without_importing_cuda_sensitive_targets(tmp_path):

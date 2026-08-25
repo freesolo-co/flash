@@ -582,7 +582,7 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
     gpu.update(gpu_kw)
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             # authoritative seed 0 matches the literal seed threaded into _submit_seed_supervised below.
             "seed": 0,

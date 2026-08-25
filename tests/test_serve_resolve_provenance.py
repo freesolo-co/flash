@@ -24,7 +24,7 @@ from flash.serve.deployment.resolve import (
     resolve_adapter,
 )
 
-BASE = "Qwen/Qwen3.5-4B"
+BASE = "Qwen/Qwen3.5-9B"
 BASE_REVISION = "b" * 40
 ARTIFACT_REVISION = "a" * 40
 
@@ -98,7 +98,7 @@ def test_a_base_model_that_disagrees_with_the_config_is_rejected(monkeypatch, tm
     _install_hub(
         monkeypatch,
         tmp_path,
-        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": "Qwen/Qwen3.5-9B"},
+        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": "Qwen/Qwen3.8-27B"},
     )
 
     with pytest.raises(ResolveError, match="trained against"):

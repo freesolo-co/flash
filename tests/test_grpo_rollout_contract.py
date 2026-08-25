@@ -35,7 +35,7 @@ def _unsupported_group_message() -> str:
 
 def _public_grpo_train(**train):
     return {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "owner/project/env"},
         "train": {"epochs": 1, **train},
@@ -44,7 +44,7 @@ def _public_grpo_train(**train):
 
 def _internal_grpo_train(**train):
     return {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "owner/project/env"},
         "train": {"epochs": 1, **train},
@@ -216,14 +216,14 @@ def test_direct_jobspec_omitted_shape_keeps_serialized_fields_omitted():
 
 
 def test_runconfig_normalizes_defaults_and_preserves_persisted_grpo_shapes():
-    config = RunConfig("Qwen/Qwen3.5-4B", "grpo", 1)
+    config = RunConfig("Qwen/Qwen3.5-9B", "grpo", 1)
     normalized = config.normalized()
     assert normalized.batch_size == DEFAULT_GRPO_PROMPTS_PER_STEP
     assert normalized.group_size == DEFAULT_GRPO_GROUP_SIZE
 
     for prompts_per_step, group_size in ((4, 3), (65, 8)):
         legacy = RunConfig(
-            "Qwen/Qwen3.5-4B",
+            "Qwen/Qwen3.5-9B",
             "grpo",
             10,
             batch_size=prompts_per_step,
@@ -268,16 +268,16 @@ def test_supported_grpo_shape_pricing_is_numerically_unchanged():
     from flash.cost import estimate_cost
 
     expected = {
-        2: 0.22565183513227507,
-        4: 0.2578620035978836,
-        8: 0.3222823405291006,
-        16: 0.4511230143915344,
+        2: 0.2334652531216931,
+        4: 0.2734888395767196,
+        8: 0.35353601248677247,
+        16: 0.5136303583068783,
     }
 
     actual = {
         group_size: estimate_cost(
             RunConfig(
-                "Qwen/Qwen3.5-4B",
+                "Qwen/Qwen3.5-9B",
                 "grpo",
                 10,
                 batch_size=4,
@@ -355,6 +355,7 @@ def test_persisted_legacy_shapes_reach_allocation(prompts_per_step, group_size):
         train=spec.train,
         providers=("runpod",),
         gpu_type="H100",
+        max_gpu_count=2,
     )
 
     assert allocation.provider == "runpod"

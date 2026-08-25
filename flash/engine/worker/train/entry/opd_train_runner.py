@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import math
 import os
-import random
 import shutil
 import time
-from pathlib import Path
 from typing import Any
 
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
@@ -31,16 +29,13 @@ from flash.engine.plan import steps as _steps
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.profiling.sft_workload import _materialize_verl_images
-from flash.engine.support.huggingface import model_revision_kwargs
 from flash.engine.worker.entry import opd as _opd_entry
-from flash.engine.worker.model.decoding import prompt_opens_thinking
-from flash.engine.worker.train.core.child import glue as _glue
 from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
+from flash.engine.worker.train.entry.prompt_rows import canonical_prompt_messages
 from flash.engine.worker.train.opd.orchestration.reporting import (
     _build_train_note_sections as _build_train_note_sections,
 )
 from flash.engine.worker.train.opd.orchestration.state import (
-    _BridgePrompt,
     _ChildCallbacks,
     _ChildResult,
     _OpdRequest,
@@ -101,37 +96,6 @@ def _with_structured_validation(request: _OpdRequest, validation: Any) -> _OpdRe
     )
 
 
-def _render_prompt_rows(request: _OpdRequest) -> tuple[list[tuple[Any, Any]], bool]:
-    from flash.content.multimodal import record_has_images
-
-    # the child trainer is seeded through its own config, but the environment's dataset /
-    # prompt_messages calls run here in the parent. an unseeded parent can build a different prompt
-    # pool across attempts whose fingerprint rejects a valid resume checkpoint. seed before the
-    # first env call that can consume randomness, so the cheap fail-closed guards above
-    # still raise without paying for the torch import.
-    _worker_rng.seed_training_rngs(_worker_state.SEED)
-    train = list(request.env.dataset())
-    if not train:
-        raise RuntimeError("opd environment dataset is empty")
-    max_examples = int(getattr(request.spec.train, "max_examples", 0) or 0) if request.spec else 0
-    if max_examples > 0:
-        train = train[:max_examples]
-    scanned = [0]
-    with _worker_heartbeat.liveness_heartbeat("opd_prompt_scan", progress=lambda: scanned[0]):
-        # rendering prompts for a large dataset can outlast the heartbeat window; keep the worker
-        # alive while scanning (the scan is O(dataset) tokenizer/template work).
-        prompt_rows = []
-        for example in train:
-            prompt_rows.append((example, request.env.prompt_messages(example)))
-            scanned[0] += 1
-    multimodal = bool(getattr(request.env, "image_observations", False)) or any(
-        record_has_images(example, messages) for example, messages in prompt_rows
-    )
-    # shuffle rendered rows so stateful prompt rendering stays stable across resumes.
-    random.Random(_worker_state.SEED).shuffle(prompt_rows)
-    return prompt_rows, multimodal
-
-
 def _validate_teacher_transport() -> tuple[str, str]:
     # validate the control-panel broker transport before the gpu probe and model prefetch so a malformed
     # attempt fails before any additional paid setup. raw managed-teacher provider credentials never
@@ -145,177 +109,6 @@ def _validate_teacher_transport() -> tuple[str, str]:
             "managed teacher control-panel transport is missing from the OPD parent worker"
         )
     return capability, control_panel_url
-
-
-def _prepare_prompt_messages(
-    example: dict,
-    messages: list[dict],
-    *,
-    multi_turn: bool,
-    package_root: str | None,
-) -> tuple[list[dict], tuple[str, ...]]:
-    from flash.content.multimodal import normalize_prompt_images, record_has_images
-
-    if record_has_images(example, messages):
-        normalized = normalize_prompt_images(example, messages, package_root)
-        if multi_turn:
-            _glue.validate_transcript_messages(
-                normalized.messages,
-                source="environment initial prompt",
-                allow_content_blocks=True,
-            )
-        return normalized.messages, tuple(normalized.descriptors)
-    if multi_turn:
-        messages = _glue.validate_transcript_messages(messages, source="environment initial prompt")
-    return messages, ()
-
-
-def _prepare_prompts(
-    request: _OpdRequest,
-    prompt_rows: list[tuple[Any, Any]],
-    multimodal: bool,
-    capability: str,
-    control_panel_url: str,
-) -> _PromptState:
-    from flash.content.multimodal import image_teacher_prompt_messages
-    from flash.engine.worker.teacher.client import TeacherClient
-    from flash.engine.worker.train.core.child.glue import parent_image_digests
-
-    teacher = TeacherClient(capability, control_panel_url, request.knobs.teacher_model)
-    processor = None
-    if multimodal:
-        from transformers import AutoProcessor
-
-        processor = AutoProcessor.from_pretrained(
-            request.model_id,
-            trust_remote_code=True,
-            **model_revision_kwargs(request.model_revision),
-        )
-        tokenizer = processor.tokenizer
-    else:
-        tokenizer = _worker_hf.load_tokenizer(request.model_id, revision=request.model_revision)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    thinking_prefill = _opd_entry._thinking_prefill_text(tokenizer)
-    from flash.engine.plan.vram import opd_rollout_seq_len
-
-    requested_len = opd_rollout_seq_len(
-        request.knobs.max_length,
-        request.knobs.max_completion,
-        bool(_worker_state.THINKING),
-    )
-    # clamp to the architecture BEFORE deriving the prompt budget, so every downstream length agrees.
-    # clamping only the engine would admit prompts sized against the unclamped budget and then fail
-    # them at rollout instead of training on the shorter context.
-    max_model_len = _backend.clamp_engine_len(
-        requested_len,
-        _backend.model_max_position_embeddings(request.model_id, request.model_revision),
-    )
-    if max_model_len < requested_len:
-        print(
-            f"[opd-verl] max_context_tokens {requested_len} exceeds the {request.model_id} context limit; "
-            f"training at {max_model_len}",
-            flush=True,
-        )
-    prompt_budget = max_model_len - request.knobs.max_completion
-    if prompt_budget < 1:
-        raise RuntimeError("opd max_context_tokens leaves no room for a prompt")
-    if request.multi_turn:
-        _glue.validate_glue_template(tokenizer, thinking=bool(_worker_state.THINKING))
-    prompts: list[Any] = []
-    dropped_long = 0
-    package_root_value = getattr(request.env, "package_root", None)
-    package_root = str(Path(package_root_value).resolve()) if package_root_value else None
-    prepped = [0]
-    thinking_semantics_set = False
-    with _worker_heartbeat.liveness_heartbeat("opd_image_prep", progress=lambda: prepped[0]):
-        for example, messages in prompt_rows:
-            prepped[0] += 1
-            student_messages, image_descriptors = _prepare_prompt_messages(
-                example,
-                messages,
-                multi_turn=request.multi_turn,
-                package_root=package_root,
-            )
-            if image_descriptors:
-                assert processor is not None
-                teacher_messages = image_teacher_prompt_messages(
-                    student_messages, len(image_descriptors)
-                )
-                prompt_ids, rendered_prompt = _opd_prompts._processor_expanded_prompt(
-                    processor,
-                    student_messages,
-                    image_descriptors,
-                    package_root,
-                    enable_thinking=bool(_worker_state.THINKING),
-                )
-            else:
-                teacher_messages = student_messages
-                if processor is not None:
-                    # mixed job: the verl child tokenizes every row through the multimodal dataset
-                    # path (the processor), so text-only rows must freeze via the same path or the
-                    # bridge's exact prompt-id check trips on tokenizer-vs-processor differences.
-                    prompt_ids, rendered_prompt = _opd_prompts._processor_expanded_prompt(
-                        processor,
-                        student_messages,
-                        (),
-                        package_root,
-                        enable_thinking=bool(_worker_state.THINKING),
-                    )
-                else:
-                    rendered_prompt = tokenizer.apply_chat_template(
-                        student_messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        enable_thinking=_worker_state.THINKING,
-                    )
-                    prompt_ids = _opd_prompts._normalize_prompt_ids(
-                        tokenizer.apply_chat_template(
-                            student_messages,
-                            tokenize=True,
-                            add_generation_prompt=True,
-                            enable_thinking=_worker_state.THINKING,
-                        )
-                    )
-            if len(prompt_ids) > prompt_budget:
-                dropped_long += 1
-                continue
-            # derive the run-level flag from the first RETAINED prompt, as grpo does. a row dropped
-            # for length never reaches the student, so latching on it can describe the run by a
-            # prompt no rollout ever sees: a retained prompt that does open thinking would then be
-            # graded as if it did not, and `strip_think` would return the reasoning as the answer.
-            if not thinking_semantics_set:
-                thinking = bool(_worker_state.THINKING)
-                if hasattr(request.env, "thinking"):
-                    request.env.thinking = thinking
-                if hasattr(request.env, "prompt_opens_thinking"):
-                    request.env.prompt_opens_thinking = thinking and prompt_opens_thinking(
-                        rendered_prompt
-                    )
-                thinking_semantics_set = True
-            prompts.append(
-                _BridgePrompt(
-                    student_messages=student_messages,
-                    teacher_messages=teacher_messages,
-                    prompt_ids=prompt_ids,
-                    image_descriptors=image_descriptors,
-                    package_root=package_root,
-                    example=example if request.multi_turn else None,
-                    image_digests=tuple(
-                        parent_image_digests(processor, image_descriptors, package_root)
-                    ),
-                )
-            )
-    return _PromptState(
-        teacher,
-        tokenizer,
-        thinking_prefill,
-        max_model_len,
-        prompt_budget,
-        prompts,
-        dropped_long,
-        processor,
-    )
 
 
 def _reset_workdir(workdir: str) -> None:
@@ -373,16 +166,9 @@ def _prepare_workload(
         index = ordinal % len(prompts)
         prompt = prompts[index]
         row = {
-            "prompt": (
-                [
-                    {
-                        "role": str(message.get("role") or ""),
-                        "content": _sft._verl_image_message_content(message.get("content")),
-                    }
-                    for message in prompt.student_messages
-                ]
-                if multimodal
-                else prompt.student_messages
+            "prompt": canonical_prompt_messages(
+                prompt.student_messages,
+                multimodal=multimodal,
             ),
             "data_source": "flash_opd",
             "reward_model": {"style": "rule", "ground_truth": ""},
@@ -517,6 +303,10 @@ def _write_child_shims(
     parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     copies = (
         ("train/core/child/runtime.py", "flash_verl_runtime.py"),
+        (
+            "../../content/reasoning_normalization.py",
+            "flash_reasoning_normalization.py",
+        ),
         ("train/core/child/glue.py", "flash_multiturn_glue.py"),
         ("train/opd/child/runtime.py", "flash_opd_runtime.py"),
         ("train/opd/child/plugin.py", "flash_opd_plugin.py"),

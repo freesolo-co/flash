@@ -102,11 +102,11 @@ def test_pinned_revision_is_sized_on_the_revisions_own_geometry(monkeypatch):
 
     monkeypatch.setattr(vram_mod, "_validated_revision_geometry", _capture)
 
-    pinned = vram_mod.model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo", model_revision="a" * 40)
+    pinned = vram_mod.model_required_vram_gb("Qwen/Qwen3.5-9B", "grpo", model_revision="a" * 40)
     assert seen["revision"] == "a" * 40, "the pinned revision never reached the sizing path"
     # and the substituted geometry actually moved the answer -- otherwise the assert above would
     # pass even if the result were computed from the catalog numbers regardless.
-    assert pinned > vram_mod.model_required_vram_gb("Qwen/Qwen3.5-4B", "grpo")
+    assert pinned > vram_mod.model_required_vram_gb("Qwen/Qwen3.5-9B", "grpo")
 
 
 def test_moe_grpo_resident_estimate_sizes_compute_on_active_params():

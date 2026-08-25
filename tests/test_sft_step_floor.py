@@ -17,7 +17,7 @@ from flash.cost.types import RunConfig
 
 def _sft(**overrides):
     base = {
-        "model_id": "Qwen/Qwen3.5-2B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "method": "sft",
         "steps": 32,
         "seq_len": 1024,
@@ -36,13 +36,13 @@ def test_sft_step_floor_has_no_one_time_startup_block():
 
 
 def test_sft_step_floor_is_independent_of_model_size():
-    assert sft_step_floor_seconds(_sft(model_id="Qwen/Qwen3.5-0.8B").steps) == (
-        sft_step_floor_seconds(_sft(model_id="Qwen/Qwen3.5-4B").steps)
+    assert sft_step_floor_seconds(_sft(model_id="Qwen/Qwen3.5-9B").steps) == (
+        sft_step_floor_seconds(_sft(model_id="Qwen/Qwen3.6-35B-A3B").steps)
     )
 
 
 def test_sft_quote_is_exactly_training_work_without_framework_setup():
-    config = _sft(model_id="Qwen/Qwen3.5-4B", steps=2)
+    config = _sft(model_id="Qwen/Qwen3.5-9B", steps=2)
     quote = estimate_cost(config)
     expected = (
         compile_seconds(config, quote.gpu)
@@ -75,14 +75,14 @@ def test_rollout_quotes_do_not_pay_the_sft_step_floor(method, monkeypatch):
     import flash.cost.analytical as analytical
 
     config = RunConfig(
-        model_id="Qwen/Qwen3.5-2B",
+        model_id="Qwen/Qwen3.5-9B",
         method=method,
         steps=8,
         seq_len=1024,
         completion_len=512,
         batch_size=8,
         group_size=4,
-        gpu_type="H100",
+        gpu_type="B200",
         provider="runpod",
     )
     before = estimate_cost(config).train_seconds

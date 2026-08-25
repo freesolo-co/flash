@@ -106,7 +106,7 @@ def test_control_plane_packing_uses_the_fixed_worker_image_contract_without_gpu_
         lambda name: (_ for _ in ()).throw(AssertionError(f"unexpected plane import: {name}")),
     )
 
-    assert packing.worker_image_packing_support("Qwen/Qwen3.5-4B") == ("gdn-hybrid", True)
+    assert packing.worker_image_packing_support("Qwen/Qwen3.5-9B") == ("gdn-hybrid", True)
 
 
 def test_the_packing_contract_gate_never_consults_the_device() -> None:

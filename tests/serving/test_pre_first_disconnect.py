@@ -16,7 +16,7 @@ from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.io.streaming import _sse, openai_chat_stream, prepare_stream
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 
 
 def _record() -> AdapterRecord:

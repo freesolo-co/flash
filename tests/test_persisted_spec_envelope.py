@@ -16,7 +16,7 @@ def _current_spec() -> JobSpec:
     return replace(
         JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "run_id": "persisted-envelope",
                 "project": "11111111-1111-4111-8111-111111111111",

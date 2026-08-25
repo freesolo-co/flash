@@ -26,8 +26,8 @@ from flash.serving.src.store.persistence import (
 )
 from tests.serving.conftest import attest
 
-QWEN = "Qwen/Qwen3.5-0.8B"
-QWEN_2B = "Qwen/Qwen3.5-2B"
+QWEN = "Qwen/Qwen3.5-9B"
+QWEN_35B = "Qwen/Qwen3.6-35B-A3B"
 RUN_ID = "flash-1234567890-abcdef12"
 SHA_A = "a" * 40
 SHA_B = "b" * 40
@@ -251,6 +251,35 @@ def setup(monkeypatch):
 
 def _register(client: TestClient, payload: dict[str, object]) -> Any:
     return client.post("/adapters", json=payload)
+
+
+def test_pending_qwen38_hosted_candidate_registration_fails_without_write(setup) -> None:
+    client, pool, _, persistence = setup
+
+    response = _register(client, _registration(base_model="Qwen/Qwen3.8-27B"))
+
+    assert response.status_code == 400
+    assert "Unsupported base model" in response.json()["detail"]
+    assert persistence.rows == {}
+    assert pool.registered == []
+
+
+def test_retired_model_undeploy_disables_without_gpu_start(setup) -> None:
+    client, pool, router, persistence = setup
+    retired = ImmutableAdapterRegistration.model_validate(
+        _final_registration(base_model="Qwen/Qwen3.6-27B")
+    ).to_record()
+    retired = persistence._stamp(retired.model_copy(update={"status": "ready"}))
+    persistence.rows[retired.adapter_id] = retired
+    router.upsert(retired, revive=True)
+
+    response = client.delete(f"/adapters/{retired.adapter_id}")
+
+    assert response.status_code == 200
+    assert response.json()["gpu_cleanup"] == "not_applicable_retired_model"
+    assert persistence.rows[retired.adapter_id].status == "disabled"
+    assert retired.adapter_id not in {record.adapter_id for record in router.ready_records()}
+    assert pool.unregistered == []
 
 
 def test_legacy_and_direct_alias_registration_fail_without_write(setup) -> None:
@@ -741,7 +770,7 @@ def test_exact_duplicate_is_idempotent_and_disabled_repost_retriggers_load(setup
     ("field", "value"),
     [
         ("repo_id", "org/other"),
-        ("base_model", QWEN_2B),
+        ("base_model", QWEN_35B),
         ("subfolder", "other/path"),
         ("repo_type", "dataset"),
         ("url", "https://huggingface.co/org/other"),
@@ -1423,9 +1452,9 @@ def test_generate_base_model_response_carries_no_revision_provenance(setup) -> N
     client, _, router, _ = setup
     base = AdapterRecord.model_validate(
         {
-            "adapter_id": QWEN_2B,
-            "repo_id": QWEN_2B,
-            "base_model": QWEN_2B,
+            "adapter_id": QWEN_35B,
+            "repo_id": QWEN_35B,
+            "base_model": QWEN_35B,
             "serve_base_model": True,
             "thinking": True,
             "org_id": None,
@@ -1433,7 +1462,7 @@ def test_generate_base_model_response_carries_no_revision_provenance(setup) -> N
         }
     )
     router.upsert(base)
-    response = client.post("/generate", json={"adapter_id": QWEN_2B, "prompt": "hi"})
+    response = client.post("/generate", json={"adapter_id": QWEN_35B, "prompt": "hi"})
     assert response.status_code == 200
     assert "freesolo" not in response.json()
     assert "X-Freesolo-Adapter-Revision" not in response.headers

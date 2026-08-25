@@ -27,7 +27,7 @@ def _persisted_revision(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "adapter_id": REVISION_ID,
         "repo_id": "org/run",
-        "base_model": "Qwen/Qwen3.5-0.8B",
+        "base_model": "Qwen/Qwen3.5-9B",
         "org_id": "org-1",
         "checkpoint": f"{RUN_ID}/step-20",
         "thinking": False,
@@ -50,7 +50,7 @@ def test_required_record_field_rejects_whitespace_only() -> None:
             {
                 "adapter_id": "   ",
                 "repo_id": "org/run",
-                "base_model": "Qwen/Qwen3.5-0.8B",
+                "base_model": "Qwen/Qwen3.5-9B",
                 "thinking": False,
             }
         )

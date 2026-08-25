@@ -112,7 +112,7 @@ def test_required_save_density_adds_wall_time_and_cost_without_changing_steps():
 
     for method in ("sft", "grpo"):
         common = {
-            "model_id": "Qwen/Qwen3.5-4B",
+            "model_id": "Qwen/Qwen3.5-9B",
             "method": method,
             "steps": 10,
             "seq_len": 1024,
@@ -142,7 +142,7 @@ def test_required_save_overhead_uses_contractual_commit_counts():
     )
     from flash.cost.facts import total_params_b
 
-    model_id = "Qwen/Qwen3.5-4B"
+    model_id = "Qwen/Qwen3.5-9B"
     save_at_steps = (2, 4, 6)
     common = {
         "model_id": model_id,
@@ -166,7 +166,7 @@ def test_opd_required_saves_add_overhead_without_changing_steps():
     from flash.cost.analytical import estimate_cost
 
     common = {
-        "model_id": "Qwen/Qwen3.5-4B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "method": "opd",
         "steps": 10,
         "seq_len": 1024,
@@ -223,7 +223,7 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
 
     def _opd(teacher=None):
         raw = copy.deepcopy(GRPO_RAW)
-        raw["model"] = "Qwen/Qwen3.5-4B"
+        raw["model"] = "Qwen/Qwen3.5-9B"
         raw["algorithm"] = "opd"
         raw["train"].update(
             {"epochs": 1, "max_examples": 40, "prompts_per_step": 8, "group_size": 1}
@@ -252,7 +252,7 @@ def test_sft_cost_requires_the_measured_workload_rather_than_deriving_one():
     """
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
             "train": {"max_examples": 320, "batch_size": 16, "epochs": 2},
@@ -278,7 +278,7 @@ def test_sft_cost_reads_the_horizon_and_tokens_the_profile_measured():
     spec = attach_sft_profile(
         spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
                 "train": {"max_examples": 320, "batch_size": 16, "epochs": 2},
@@ -307,7 +307,7 @@ def test_sft_cost_rejects_a_profile_keyed_to_a_different_workload():
     spec = attach_sft_profile(
         spec_from_dict(
             {
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "environment": {"id": "github:acme/envs@main:sft-data/environment.py"},
                 "train": {"max_examples": 320, "batch_size": 16, "epochs": 2},
@@ -322,7 +322,7 @@ def test_sft_cost_rejects_a_profile_keyed_to_a_different_workload():
 
 
 def test_runconfig_preserves_positional_seq_len_compatibility():
-    cfg = RunConfig("Qwen/Qwen3.5-4B", "sft", 10, 2048)
+    cfg = RunConfig("Qwen/Qwen3.5-9B", "sft", 10, 2048)
     assert cfg.seq_len == 2048
     assert cfg.train_tokens is None
 
@@ -363,7 +363,7 @@ def test_cmd_train_cost_prints_server_quote_without_submitting(tmp_path, monkeyp
 
 
 SFT_TOML = (
-    'model = "Qwen/Qwen3.5-4B"\n'
+    'model = "Qwen/Qwen3.5-9B"\n'
     'project = "11111111-1111-4111-8111-111111111111"\n'
     'algorithm = "sft"\n'
     "[environment]\n"
@@ -1119,7 +1119,7 @@ def test_warm_start_exact_card_cost_uses_the_server_prepared_quote(tmp_path, cap
         'init_from_adapter = "source-run"\n',
     )
     # sft_toml ends with an empty `[gpu]`, so the pin is appended into that section.
-    body = body.replace('model = "Qwen/Qwen3.5-4B"', 'model = "Qwen/Qwen3.6-35B-A3B"')
+    body = body.replace('model = "Qwen/Qwen3.5-9B"', 'model = "Qwen/Qwen3.6-35B-A3B"')
     body += 'type = "B200"\ncount = 1\n'
 
     assert cmd_train(_sft_args(tmp_path, body)) == 0
@@ -1188,7 +1188,7 @@ def test_higher_warm_start_rank_can_select_cheaper_hardware(monkeypatch):
 def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
     cfg = tmp_path / "run.toml"
     cfg.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
         "[environment]\n"
@@ -1204,7 +1204,7 @@ def test_cmd_train_cost_rejects_context_above_serving_cap(tmp_path):
 
     with pytest.raises(
         ValueError,
-        match=r"train\.max_context_tokens=33000 exceeds Qwen/Qwen3\.5-4B's serving max_model_len=32768",
+        match=r"train\.max_context_tokens=33000 exceeds Qwen/Qwen3\.5-9B's serving max_model_len=32768",
     ):
         cmd_train(args)
 

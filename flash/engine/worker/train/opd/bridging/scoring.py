@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from flash.engine.worker.train.opd.orchestration.gkd import _teacher_prompt_text
 
-if TYPE_CHECKING:  # annotation-only: the prompt record lives in the orchestrator
+if TYPE_CHECKING:
     from flash.engine.worker.train.opd.orchestration.state import _BridgePrompt
 
 

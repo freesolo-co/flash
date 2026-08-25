@@ -72,7 +72,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         spec = JobSpec(
             run_id="flash-run",
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=2),
             gpu=GpuSpec(type=""),
@@ -107,7 +107,7 @@ def test_source_publication_failure_is_generic_at_submission_and_api_boundary(mo
 
     spec = JobSpec(
         run_id="source-publication-failure",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(hf_repo="private-org/private-run-repo"),
     )
