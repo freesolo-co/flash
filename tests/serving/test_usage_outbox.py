@@ -1554,8 +1554,13 @@ def test_stream_finalizes_before_successful_terminal_usage_event() -> None:
     assert len(session.finalized) == 1
     assert session.finalized[0]["type"] == "final"
     assert session.captured == []
-    terminal_index = next(i for i, chunk in enumerate(chunks) if b'"usage"' in chunk)
-    assert chunks[terminal_index + 1] == _sse("[DONE]")
+    finish = json.loads(chunks[-3][6:-2])
+    usage = json.loads(chunks[-2][6:-2])
+    assert finish["choices"] == [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    assert "usage" not in finish
+    assert usage["choices"] == []
+    assert usage["usage"]["completion_tokens"] == 1
+    assert chunks[-1] == _sse("[DONE]")
 
 
 def test_final_event_wins_same_tick_disconnect_and_emits_one_terminal_pair() -> None:
@@ -1616,7 +1621,9 @@ def test_final_event_wins_same_tick_disconnect_and_emits_one_terminal_pair() -> 
     assert len(session.finalized) == 1
     assert session.finalized[0]["type"] == "final"
     assert session.failed == []
+    assert sum(b'"finish_reason":"stop"' in chunk for chunk in chunks) == 1
     assert sum(b'"usage"' in chunk for chunk in chunks) == 1
+    assert json.loads(chunks[-2][6:-2])["choices"] == []
     assert chunks.count(_sse("[DONE]")) == 1
     assert chunks[-1] == _sse("[DONE]")
 
@@ -1644,7 +1651,10 @@ def test_stream_finalization_failure_emits_terminal_sse_error_and_snapshot() -> 
     chunks = asyncio.run(run())
 
     assert not any(b'"usage"' in chunk for chunk in chunks)
-    assert any(b'"type":"accounting_error"' in chunk for chunk in chunks)
+    assert not any(b'"finish_reason":"stop"' in chunk for chunk in chunks)
+    error = json.loads(chunks[-2][6:-2])
+    assert error["choices"] == [{"index": 0, "delta": {}, "finish_reason": "error"}]
+    assert error["error"]["type"] == "accounting_error"
     assert chunks[-1] == _sse("[DONE]")
     assert session.captured[-1]["type"] == "final"
     assert session.relinquished == 1
@@ -1740,6 +1750,25 @@ def test_pre_response_disconnect_persists_ready_snapshot_and_closes_iterator() -
     assert session.failed[-1][0]["type"] == "ready"
     assert session.failed[-1][1] == "client_disconnected"
     assert session.finalized == []
+
+
+def test_stream_output_emits_one_terminal_sequence() -> None:
+    output: asyncio.Queue[tuple[bytes | None, Exception | None]] = asyncio.Queue()
+    stream_output = _StreamOutput(
+        output,
+        asyncio.Event(),
+        completion_id="chatcmpl-terminal",
+        created=123,
+        adapter_id="adapter-1",
+    )
+
+    async def run() -> list[bytes | None]:
+        await stream_output.terminal(b"finish", b"usage")
+        await stream_output.terminal(b"duplicate-error")
+        await stream_output.finish()
+        return [output.get_nowait()[0] for _ in range(output.qsize())]
+
+    assert asyncio.run(run()) == [b"finish", b"usage", _sse("[DONE]"), None]
 
 
 def test_finish_makes_sentinel_space_after_blocked_terminal_refills_queue() -> None:
@@ -1926,9 +1955,15 @@ def test_stream_engine_error_persists_latest_valid_snapshot() -> None:
             )
         ]
 
-    asyncio.run(run())
+    chunks = asyncio.run(run())
 
     assert session.finalized == []
     assert session.failed[-1][0]["type"] == "delta"
     assert session.failed[-1][0]["completion_tokens"] == 1
     assert session.failed[-1][1] == "engine_failed"
+    error = json.loads(chunks[-2][6:-2])
+    assert error["choices"] == [{"index": 0, "delta": {}, "finish_reason": "error"}]
+    assert error["error"]["code"] == 400
+    assert "usage" not in error
+    assert chunks.count(_sse("[DONE]")) == 1
+    assert chunks[-1] == _sse("[DONE]")

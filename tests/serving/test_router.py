@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 import threading
 import time
@@ -833,7 +834,13 @@ def test_openai_chat_completions_streams_sse_chunks(app_setup):
     assert f"{QWEN_35B}] " in text
     assert '"delta":{"content":"reply"}' in text
     assert '"finish_reason":"stop"' in text
-    assert "data: [DONE]" in text
+    frames = [
+        line.removeprefix("data: ") for line in text.splitlines() if line.startswith("data: ")
+    ]
+    finish = json.loads(frames[-2])
+    assert finish["choices"] == [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    assert "usage" not in finish
+    assert frames[-1] == "[DONE]"
     assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
 
 
@@ -899,7 +906,20 @@ def test_openai_chat_completions_stream_can_include_usage(app_setup):
         assert resp.status_code == 200
         text = resp.read().decode("utf-8")
 
-    assert '"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}' in text
+    frames = [
+        line.removeprefix("data: ") for line in text.splitlines() if line.startswith("data: ")
+    ]
+    finish = json.loads(frames[-3])
+    usage = json.loads(frames[-2])
+    assert finish["choices"] == [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    assert "usage" not in finish
+    assert usage["choices"] == []
+    assert usage["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 2,
+        "total_tokens": 4,
+    }
+    assert frames[-1] == "[DONE]"
     assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
 
 

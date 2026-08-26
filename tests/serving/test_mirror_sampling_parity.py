@@ -391,6 +391,15 @@ def test_hosted_sse_has_independent_reasoning_and_post_settlement_terminals() ->
         if choice["index"] == 1
     )
     assert reasoning == "reason-1"
-    terminal_payload = next(payload for payload in payloads if "usage" in payload)
-    assert terminal_payload["usage"]["completion_tokens"] == 3
+    finish_payloads = [
+        payload
+        for payload in payloads
+        if any(choice.get("finish_reason") is not None for choice in payload.get("choices", []))
+    ]
+    assert [payload["choices"][0]["index"] for payload in finish_payloads] == [0, 1]
+    assert all("usage" not in payload for payload in finish_payloads)
+    usage_payload = next(payload for payload in payloads if "usage" in payload)
+    assert usage_payload["choices"] == []
+    assert usage_payload["usage"]["completion_tokens"] == 3
+    assert payloads[-3:] == [*finish_payloads, usage_payload]
     assert chunks[-1] == b"data: [DONE]\n\n"
