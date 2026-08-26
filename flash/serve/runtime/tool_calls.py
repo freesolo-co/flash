@@ -1,7 +1,4 @@
-"""strict tool declarations, history, and qwen3 coder output parsing.
-
-adapted from vllm 0.23.0's qwen3 coder parser under apache-2.0.
-"""
+"""strict tool parsing adapted from vllm 0.23.0's qwen3 coder parser under apache-2.0."""
 
 from __future__ import annotations
 
@@ -551,6 +548,9 @@ def _validate_tool_result(
         raise error_type(
             f"message {message_index} tool result content must be a string or text blocks"
         )
+    texts = (content,) if type(content) is str else (block["text"] for block in content)
+    if any(_contains_unpaired_surrogate(text) for text in texts):
+        raise error_type("tool result content cannot contain an unpaired surrogate")
     resolved.add(call_id)
 
 

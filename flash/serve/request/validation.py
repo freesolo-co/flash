@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import copy
 import io
 import json
 import re
@@ -21,6 +20,7 @@ MAX_DIMENSION = 8192
 MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_CHARS = len("data:image/webp;base64,") + 4 * ((MAX_COMPRESSED_BYTES + 2) // 3)
 MAX_MESSAGE_NODES = 4096
+MAX_MESSAGE_DEPTH = 256
 IMAGE_TYPES = frozenset({"image_url", "input_image", "image"})
 TEXT_TYPES = frozenset({"text", "input_text"})
 ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
@@ -70,6 +70,7 @@ ALLOWED_KEYS_HINT = (
 )
 
 ErrorType = type[Exception]
+_COPYABLE_MESSAGE_SCALARS = (bool, float, int, str, type(None))
 
 
 def detached_messages(
@@ -81,45 +82,78 @@ def detached_messages(
 ) -> list[dict[str, Any]]:
     if not isinstance(messages, sequence_types):
         raise error_type(sequence_error)
-    coerced: list[dict[str, Any]] = []
-    for index, message in enumerate(messages):
-        if not isinstance(message, Mapping):
-            raise error_type(f"message {index} must be an object")
-        try:
-            coerced.append(dict(message))
-        except Exception as exc:
-            raise error_type(f"message {index} must be an object") from exc
-    active: set[int] = set()
-    stack: list[tuple[Any, int | None]] = [(iter((coerced,)), None)]
-    nodes = 0
+    detached: list[dict[str, Any]] = []
+    try:
+        iterator = iter(messages)
+    except Exception as exc:
+        raise error_type("messages contain an unsupported value") from exc
+    stack: list[tuple[Any, Any, int | None, bool]] = [(iterator, detached, None, True)]
+    active: set[int] = {id(messages)}
+    nodes = 1
     while stack:
-        iterator, identity = stack[-1]
+        iterator, target, identity, top_level = stack[-1]
         try:
-            value = next(iterator)
+            entry = next(iterator)
         except StopIteration:
             stack.pop()
-            if identity is not None:
-                active.remove(identity)
+            active.discard(identity)
             continue
         except Exception as exc:
             raise error_type("messages contain an unsupported value") from exc
+        key = None
+        item = entry
+        if isinstance(target, dict):
+            try:
+                key, item = entry
+            except Exception as exc:
+                raise error_type("messages contain an unsupported value") from exc
+            if type(key) is not str:
+                raise error_type("messages contain an unsupported value")
         nodes += 1
         if nodes > MAX_MESSAGE_NODES:
             raise error_type("messages exceed the supported complexity")
-        if isinstance(value, Mapping | list | tuple):
-            identity = id(value)
-            if identity in active:
-                raise error_type("messages must not contain recursive containers")
-            active.add(identity)
-            try:
-                nested = value.values() if isinstance(value, Mapping) else value
-                stack.append((iter(nested), identity))
-            except Exception as exc:
-                raise error_type("messages contain an unsupported value") from exc
+        if top_level and not isinstance(item, Mapping):
+            raise error_type(f"message {len(target)} must be an object")
+        if isinstance(item, Mapping):
+            if len(stack) > MAX_MESSAGE_DEPTH:
+                raise error_type("messages exceed the supported complexity")
+            copied: dict[str, Any] = {}
+            _append_detached(target, key, copied)
+            nested = _message_items(item)
+        elif isinstance(item, list | tuple):
+            if len(stack) > MAX_MESSAGE_DEPTH:
+                raise error_type("messages exceed the supported complexity")
+            copied = []
+            _append_detached(target, key, copied)
+            nested = _message_values(item, error_type)
+        elif type(item) in _COPYABLE_MESSAGE_SCALARS:
+            _append_detached(target, key, item)
+            continue
+        else:
+            raise error_type("messages contain an unsupported value")
+        identity = id(item)
+        if identity in active:
+            raise error_type("messages must not contain recursive containers")
+        active.add(identity)
+        stack.append((nested, copied, identity, False))
+    return detached
+
+
+def _append_detached(target: Any, key: str | None, value: Any) -> None:
+    if isinstance(target, list):
+        target.append(value)
+    else:
+        target[key] = value
+
+
+def _message_items(value: Mapping[Any, Any]) -> Any:
+    for key in value:
+        yield key, value[key]
+
+
+def _message_values(value: list[Any] | tuple[Any, ...], error_type: ErrorType) -> Any:
     try:
-        return copy.deepcopy(coerced)
-    except RecursionError as exc:
-        raise error_type("messages exceed the supported complexity") from exc
+        return iter(value)
     except Exception as exc:
         raise error_type("messages contain an unsupported value") from exc
 

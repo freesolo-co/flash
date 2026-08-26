@@ -511,21 +511,62 @@ def test_message_copy_complexity_is_controlled_and_caller_values_stay_detached()
     assert request.messages[0]["metadata"] == {"nested": {"value": 1}}
 
 
-def test_canonical_message_mapping_copy_failures_are_request_errors() -> None:
-    with pytest.raises(OpenAIRequestError, match="messages contain an unsupported value"):
+def test_canonical_message_mapping_proxy_is_detached() -> None:
+    metadata = {"value": 1}
+    request = parse_chat_request(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "hello",
+                    "metadata": MappingProxyType(metadata),
+                }
+            ]
+        },
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    metadata["value"] = 2
+    assert request.messages[0]["metadata"] == {"value": 1}
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["bad\ud800", [{"type": "text", "text": "bad\ud800"}]],
+    ids=["string", "text-block"],
+)
+def test_tool_result_content_rejects_unpaired_surrogates(content) -> None:
+    messages = _historical_tool_messages("{}")
+    messages[1]["content"] = content
+
+    with pytest.raises(
+        OpenAIRequestError, match="tool result content cannot contain an unpaired surrogate"
+    ):
         parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+def test_tool_result_content_accepts_non_bmp_text() -> None:
+    for content in ("sunny ☀", [{"type": "text", "text": "sunny ☀"}]):
+        request = parse_chat_request(
             {
                 "messages": [
+                    *_historical_tool_messages("{}")[:1],
                     {
-                        "role": "user",
-                        "content": "hello",
-                        "metadata": MappingProxyType({"value": 1}),
-                    }
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": content,
+                    },
                 ]
             },
             require_model=False,
             allow_managed_selectors=True,
         )
+        assert request.messages[1]["content"] == content
 
 
 def test_tool_history_is_strict_and_does_not_mutate_caller_messages() -> None:

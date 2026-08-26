@@ -8,7 +8,7 @@ import json
 import subprocess
 import sys
 from collections import UserDict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -640,10 +640,62 @@ class _BrokenMetadata(Mapping):
         return iter(("value",))
 
     def __getitem__(self, key):
-        return 1
+        raise TypeError("broken value access")
 
-    def values(self):
-        raise TypeError("broken values")
+
+class _CountedSequence(Sequence):
+    def __init__(self, values) -> None:
+        self.values = values
+        self.yielded = 0
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __getitem__(self, index):
+        return self.values[index]
+
+    def __iter__(self):
+        for value in self.values:
+            self.yielded += 1
+            yield value
+
+
+class _FailingSequence(_CountedSequence):
+    def __iter__(self):
+        raise TypeError("broken sequence")
+        yield
+
+
+class _WideList(list):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.width = width
+        self.yielded = 0
+
+    def __iter__(self):
+        for value in range(self.width):
+            self.yielded += 1
+            yield value
+
+
+class _WideMessage(Mapping):
+    def __init__(self, width: int) -> None:
+        self.width = width
+        self.yielded = 0
+
+    def __len__(self) -> int:
+        return self.width + 2
+
+    def __iter__(self):
+        for key in ("role", "content"):
+            self.yielded += 1
+            yield key
+        for index in range(self.width):
+            self.yielded += 1
+            yield str(index)
+
+    def __getitem__(self, key):
+        return "user" if key == "role" else "hello" if key == "content" else key
 
 
 class _WideMetadata(Mapping):
@@ -655,15 +707,12 @@ class _WideMetadata(Mapping):
         return self.width
 
     def __iter__(self):
-        return iter(range(self.width))
+        for key in range(self.width):
+            self.yielded += 1
+            yield str(key)
 
     def __getitem__(self, key):
         return key
-
-    def values(self):
-        for value in range(self.width):
-            self.yielded += 1
-            yield value
 
 
 def test_generation_request_wide_metadata_stops_at_the_complexity_bound() -> None:
@@ -673,6 +722,33 @@ def test_generation_request_wide_metadata_stops_at_the_complexity_bound() -> Non
         GenerationRequest(messages=[{"role": "user", "content": "hello", "metadata": metadata}])
 
     assert metadata.yielded <= MAX_MESSAGE_NODES
+
+
+def test_generation_request_wide_message_stops_at_the_complexity_bound() -> None:
+    message = _WideMessage(100_000)
+
+    with pytest.raises(RuntimeConfigurationError, match="messages exceed the supported complexity"):
+        GenerationRequest(messages=[message])
+
+    assert message.yielded <= MAX_MESSAGE_NODES
+
+
+def test_generation_request_wide_message_sequence_stops_at_the_bound() -> None:
+    messages = _CountedSequence([{"role": "user", "content": "hello"}] * 100_000)
+
+    with pytest.raises(RuntimeConfigurationError, match="messages exceed the supported complexity"):
+        GenerationRequest(messages=messages)
+
+    assert messages.yielded <= MAX_MESSAGE_NODES
+
+
+def test_generation_request_wide_content_stops_at_the_complexity_bound() -> None:
+    content = _WideList(100_000)
+
+    with pytest.raises(RuntimeConfigurationError, match="messages exceed the supported complexity"):
+        GenerationRequest(messages=[{"role": "user", "content": content}])
+
+    assert content.yielded <= MAX_MESSAGE_NODES
 
 
 def test_generation_request_accepts_and_detaches_mapping_messages() -> None:
@@ -685,8 +761,13 @@ def test_generation_request_accepts_and_detaches_mapping_messages() -> None:
         authored["metadata"]["value"] = 1
 
 
+def test_generation_request_translates_failing_message_sequence() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="messages contain an unsupported value"):
+        GenerationRequest(messages=_FailingSequence([]))
+
+
 def test_generation_request_translates_mapping_copy_failures() -> None:
-    with pytest.raises(RuntimeConfigurationError, match="message 0 must be an object"):
+    with pytest.raises(RuntimeConfigurationError, match="messages contain an unsupported value"):
         GenerationRequest(messages=[_BrokenMessage()])
     with pytest.raises(RuntimeConfigurationError, match="messages contain an unsupported value"):
         GenerationRequest(
@@ -733,6 +814,28 @@ def test_generation_request_accepts_and_detaches_normal_tool_history() -> None:
 
     assert request.messages[1]["tool_calls"][0]["function"]["name"] == "weather"
     assert request.messages[2]["tool_call_id"] == "call_1"
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["bad\ud800", [{"type": "text", "text": "bad\ud800"}]],
+    ids=["string", "text-block"],
+)
+def test_packaged_tool_result_surrogates_are_rejected_before_cache(content) -> None:
+    messages = _runtime_tool_history("call_1")
+    messages[2]["content"] = content
+
+    with pytest.raises(RuntimeConfigurationError, match="tool result content cannot contain"):
+        GenerationRequest(messages=messages)
+
+
+def test_packaged_prompt_cache_accepts_non_bmp_tool_result_text() -> None:
+    messages = _runtime_tool_history("call_1")
+    messages[2]["content"] = [{"type": "text", "text": "sunny ☀"}]
+    request = GenerationRequest(messages=messages)
+    preparer = PromptPreparer(EngineConfig(model="model", prompt_cache_size=1), _Tokenizer(), None)
+
+    assert preparer._cache_key(request, request.messages, False) is not None
 
 
 def test_packaged_prompt_cache_key_accepts_non_bmp_tool_call_ids() -> None:

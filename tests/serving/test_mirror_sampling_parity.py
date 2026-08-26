@@ -510,6 +510,29 @@ def test_hosted_tool_history_rejects_surrogate_call_ids_before_cache(field: str)
         OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
 
 
+@pytest.mark.parametrize(
+    "content",
+    ["bad\ud800", [{"type": "text", "text": "bad\ud800"}]],
+    ids=["string", "text-block"],
+)
+def test_hosted_tool_result_surrogates_are_rejected_before_cache(content) -> None:
+    messages = _historical_tool_messages("{}")
+    messages[1]["content"] = content
+
+    with pytest.raises(ValidationError, match="tool result content cannot contain"):
+        OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+
+
+def test_hosted_tool_result_non_bmp_text_reaches_prompt_cache() -> None:
+    messages = _historical_tool_messages("{}")
+    messages[1]["content"] = [{"type": "text", "text": "sunny ☀"}]
+    request = OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+    engine = _engine(_BufferedChoiceEngine())
+    engine._prompt_cache_size = 1
+
+    assert engine._prompt_cache_key(request, thinking_default=False) is not None
+
+
 def test_hosted_tool_history_accepts_non_bmp_call_ids_and_serializes() -> None:
     messages = _historical_tool_messages("{}", call_id="call_🌦")
 

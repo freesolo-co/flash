@@ -281,9 +281,15 @@ def _top_p(value: object) -> float:
 def _messages(value: object) -> list[dict[str, Any]]:
     if type(value) is not list or not value:
         raise OpenAIRequestError("messages must be a nonempty array of objects")
+    detached = detached_messages(
+        value,
+        sequence_types=list,
+        sequence_error="messages must be a nonempty array of objects",
+        error_type=OpenAIRequestError,
+    )
     try:
         normalize_messages(
-            value,
+            detached,
             sequence_types=list,
             sequence_error="messages must be a nonempty array of objects",
             error_type=OpenAIRequestError,
@@ -295,12 +301,7 @@ def _messages(value: object) -> list[dict[str, Any]]:
                 f"image source exceeds the {MAX_COMPRESSED_BYTES}-byte limit"
             ) from exc
         raise
-    return detached_messages(
-        value,
-        sequence_types=list,
-        sequence_error="messages must be a nonempty array of objects",
-        error_type=OpenAIRequestError,
-    )
+    return detached
 
 
 def _stop_values(value: object) -> tuple[str, ...]:
