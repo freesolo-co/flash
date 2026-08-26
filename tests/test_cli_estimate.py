@@ -1056,7 +1056,7 @@ def test_warm_start_non_sft_cost_uses_the_authoritative_server_quote(
         .replace(
             "batch_size = 8\n",
             "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
-            'init_from_adapter = "source-run"\n',
+            'init_from_adapter = "source-run/final"\n',
         )
     )
 
@@ -1066,8 +1066,8 @@ def test_warm_start_non_sft_cost_uses_the_authoritative_server_quote(
     assert len(client.calls) == 1
     call = client.calls[0]
     assert call["dry_run"] is True
-    assert call["spec"]["train"]["init_from_adapter"] == "source-run"
-    assert call["runtime_secrets"] == {"WARM_START_TOKEN": "server-only-secret"}
+    assert call["spec"]["train"]["init_from_adapter"] == "source-run/final"
+    assert call["runtime_secrets"]["WARM_START_TOKEN"] == "server-only-secret"
     assert call["client_train_schema"]["version"]
     assert "init_from_adapter" in call["client_train_schema"]["authored_keys"]
     assert f"{1.005:.2f}" == "1.00", "the fixture must expose half-even formatting"
@@ -1116,7 +1116,7 @@ def test_warm_start_exact_card_cost_uses_the_server_prepared_quote(tmp_path, cap
     body = SFT_TOML.replace('algorithm = "sft"', 'algorithm = "grpo"').replace(
         "batch_size = 8\n",
         "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
-        'init_from_adapter = "source-run"\n',
+        'init_from_adapter = "source-run/final"\n',
     )
     # sft_toml ends with an empty `[gpu]`, so the pin is appended into that section.
     body = body.replace('model = "Qwen/Qwen3.5-9B"', 'model = "Qwen/Qwen3.6-35B-A3B"')
