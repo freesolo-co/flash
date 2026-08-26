@@ -53,14 +53,18 @@ def test_submit_context_preserves_controller_staged_identity_without_resolving(m
         lambda _spec: (_ for _ in ()).throw(AssertionError("worker retry must not resolve github")),
     )
     spec = _staged_spec()
+    monkeypatch.setattr(
+        seed_submission,
+        "load_retry_state",
+        lambda _run_id, _spec: RetryState.initial_for_spec(spec),
+    )
     context = seed_submission._build_context(
         spec,
         spec.seed,
         io.StringIO(),
         None,
         valid_source_snapshot(),
-        0,
-        RetryState.initial_for_spec(spec),
+        None,
     )
     assert context.spec.environment.package == spec.environment.package
     assert context.spec.environment.resolved_sha == _SHA

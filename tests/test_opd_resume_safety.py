@@ -1300,10 +1300,8 @@ def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
     rented_two_executes_one = Candidate("runpod", "h100", 1.0, 80, 2, 1)
     allocation = Allocation("runpod", "h100", 1.0, 80, (rented_two_executes_one,), gpu_count=2)
     filtered = _pinned_to_resume_width(allocation, 2)
-    from flash.runner.supervise.retry_decision import RetryState
 
     ctx = SimpleNamespace(
-        retry_state=RetryState(1, 1, 0),
         last_detail=None,
         seed=42,
         log=io.StringIO(),
@@ -1316,9 +1314,7 @@ def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
         "no candidate executing at checkpoint world size 2 is available, and this retry must "
         "preserve that executed rank width"
     )
-    assert ctx.log.getvalue() == (
-        "seed=42 no candidate executes at pinned OPD checkpoint world size 2; not retrying\n"
-    )
+    assert ctx.log.getvalue() == ""
 
 
 class _IntSubclass(int):

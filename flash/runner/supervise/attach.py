@@ -54,7 +54,6 @@ def _resume_after_confirmed_teardown(
     log,
     *,
     failure: str,
-    retry_state=None,
 ) -> RunStatus:
     """CAS-clear one captured remote, then resume its next attempt exactly once."""
     from flash.runner.accounting.artifacts import stage_environment_package
@@ -74,22 +73,12 @@ def _resume_after_confirmed_teardown(
     from flash.runner.lifecycle.submit import _persist_effective_worker_spec
     from flash.runner.supervise.errors import _RunCancelled
     from flash.runner.supervise.lifecycle import _run_training
+    from flash.runner.supervise.retry_decision import (
+        _drop_weight_cache,
+        require_retry_authorization,
+    )
 
-    if retry_state is None:
-        from flash.runner.supervise.retry_decision import load_retry_state
-
-        retry_state = load_retry_state(run_id, worker_spec)
-    if retry_state.last_decision_retry is False:
-        _compare_and_fail_remote(run_id, persisted_remote, failure)
-        print(f"attach: {run_id} retry policy rejected replacement", file=log)
-        return get_status(run_id)
-    if int(worker_spec.gpu.max_retries) == 0:
-        _compare_and_fail_remote(run_id, persisted_remote, failure)
-        print(
-            f"attach: {run_id} exhausted its one-shot retry budget; not resubmitting",
-            file=log,
-        )
-        return get_status(run_id)
+    retry_state = require_retry_authorization(run_id, worker_spec, next_attempt)
     try:
         from flash.snapshot.archive import parse_descriptor
 
@@ -115,8 +104,6 @@ def _resume_after_confirmed_teardown(
         return get_status(run_id)
     worker_spec = reallocation_spec_from_status(get_status(run_id), verify_source=True)
     if retry_state.drop_weight_cache:
-        from flash.runner.supervise.retry_decision import _drop_weight_cache
-
         worker_spec = _drop_weight_cache(worker_spec)
     if worker_spec.run_id != run_id:
         worker_spec = replace(worker_spec, run_id=run_id)
@@ -144,8 +131,6 @@ def _resume_after_confirmed_teardown(
             log,
             prior_cost=float(get_status(run_id).cost_usd or 0.0),
             source_snapshot=source_snapshot,
-            attempt_start=next_attempt,
-            retry_state=retry_state,
         )
     except _RunCancelled:
         raise
@@ -517,7 +502,7 @@ class _AttachContext:
     recovered_attempt: int
     next_attempt: int
     source_snapshot: dict | None
-    retry_state: object = None
+    retry_snapshot: dict | None = None
 
 
 def _build_attach_context(
@@ -526,15 +511,19 @@ def _build_attach_context(
 ) -> _AttachContext:
     """Validate the persisted handle and collect the inputs needed to poll it."""
     from flash.providers.core.base import JobHandle
-    from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
-    from flash.runner.supervise.retry_decision import load_retry_state
+    from flash.runner.lifecycle import state as lifecycle_state
+    from flash.runner.lifecycle.status import (
+        _load_status_json,
+        get_status,
+        source_snapshot_from_status,
+    )
 
     remote = dict(persisted_remote)
     seed = int(remote.pop("seed", worker_spec.seed))
     remote.pop("code_prefix", None)
     status = get_status(worker_spec.run_id)
     source_snapshot = source_snapshot_from_status(status)
-    retry_state = load_retry_state(worker_spec.run_id, worker_spec)
+    retry_snapshot = _load_status_json(worker_spec.run_id)[lifecycle_state._RETRY_STATE_KEY]
     provider_name = remote.get("provider")
     if not isinstance(provider_name, str) or not provider_name:
         raise ValueError("persisted provider identity is missing or invalid")
@@ -555,7 +544,7 @@ def _build_attach_context(
         recovered_attempt=recovered_attempt,
         next_attempt=recovered_attempt + 1,
         source_snapshot=source_snapshot,
-        retry_state=retry_state,
+        retry_snapshot=retry_snapshot,
     )
 
 
@@ -684,7 +673,6 @@ def _handle_failed_attach_poll(
 ) -> RunStatus:
     """Adopt completed work or safely recover from an unsuccessful provider poll."""
     from flash.runner.accounting.reconciliation import _record_cleanup_remote
-    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
@@ -694,7 +682,7 @@ def _handle_failed_attach_poll(
         _worker_provably_gone,
     )
     from flash.runner.supervise.retry_decision import (
-        decide_attached_failure_atomically,
+        decide_failure_atomically,
         retry_candidate_from_remote,
     )
 
@@ -738,25 +726,19 @@ def _handle_failed_attach_poll(
         )
         return get_status(run_id)
     chosen = retry_candidate_from_remote(context.persisted_remote)
-    managed_cache_mounted = (
-        context.retry_state.started_with_shared_cache
-        and not context.retry_state.drop_weight_cache
-        and context.worker_spec.gpu.network_volume == WEIGHT_CACHE_VOLUME_NAME
-    )
-    decision = decide_attached_failure_atomically(
+    decision = decide_failure_atomically(
         run_id,
         context.worker_spec,
         expected_remote=context.persisted_remote,
-        expected_retry_snapshot=context.retry_state.to_snapshot(),
+        expected_retry_snapshot=context.retry_snapshot,
         failure=result.failure,
         chosen=chosen,
-        managed_cache_mounted=managed_cache_mounted,
+        candidates=None,
         attempt=context.recovered_attempt,
     )
     if decision is None:
         return get_status(run_id)
-    retry_state, plan = decision
-    context = replace(context, retry_state=retry_state)
+    plan = decision.plan
     print(f"attach: {run_id} {plan.action}", file=log)
     try:
         resource_deleted = _strict_teardown_handle(context.handle, run_id)
@@ -785,7 +767,6 @@ def _handle_failed_attach_poll(
             context.source_snapshot,
             log,
             failure=failure,
-            retry_state=context.retry_state,
         )
     if not plan.retry:
         print(

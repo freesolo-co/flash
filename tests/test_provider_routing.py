@@ -528,14 +528,13 @@ def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch,
     first.start()
     assert resource_created.wait(timeout=5)
     second.start()
-    second.join(timeout=0.1)
-    assert second.is_alive()
+    second.join(timeout=5)
+    assert not second.is_alive()
+    assert isinstance(results["second"], RuntimeError)
+    assert "lacks exact persisted retry authorization" in str(results["second"])
 
     allow_handle.set()
     assert polling.wait(timeout=5)
-    second.join(timeout=5)
-    assert not second.is_alive()
-    assert isinstance(results["second"], runner_errors._RunCancelled)
     assert provider_gpus == ["RTX 4090"]
 
     status = runner_status.get_status(spec.run_id)
@@ -1306,96 +1305,109 @@ def _retry_candidate(provider, gpu, vram, count=1):
     return Candidate(provider, gpu, 1.0, vram, count)
 
 
+def _atomic_retry_decision(monkeypatch, tmp_path, spec, failure, chosen, candidates, *, attempt=0):
+    from flash.runner.lifecycle import attempts as runner_attempts
+    from flash.runner.lifecycle import state as runner_state
+    from flash.runner.lifecycle import status as runner_status
+    from flash.runner.supervise.retry_decision import decide_failure_atomically
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    try:
+        raw = runner_status._load_status_json(spec.run_id)
+    except FileNotFoundError:
+        runner_state._save_status(
+            runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+            _next_attempt=1,
+        )
+        raw = runner_status._load_status_json(spec.run_id)
+    while raw[runner_state._NEXT_ATTEMPT_KEY] <= attempt:
+        runner_attempts._reserve_attempt(spec.run_id)
+        raw = runner_status._load_status_json(spec.run_id)
+    decision = decide_failure_atomically(
+        spec.run_id,
+        spec,
+        expected_remote=None,
+        expected_retry_snapshot=raw[runner_state._RETRY_STATE_KEY],
+        failure=failure,
+        chosen=chosen,
+        candidates=candidates,
+        attempt=attempt,
+    )
+    assert decision is not None
+    return decision
+
+
 @pytest.mark.parametrize(
     "failure",
     ["stalled", "job_preempted", "poll_error", "no_capacity", "oom"],
 )
-def test_candidate_bound_failures_skip_equal_cross_provider_and_select_strictly_larger(failure):
-    from flash.runner.supervise.retry_decision import RetryState
-
+def test_candidate_bound_failures_skip_equal_cross_provider_and_select_strictly_larger(
+    failure, monkeypatch, tmp_path
+):
+    spec = _spec(run_id=f"atomic-{failure}")
     small = _retry_candidate("runpod", "A100 PCIe", 80)
     equal = _retry_candidate("lambda", "H100", 80)
     larger = _retry_candidate("vast", "RTX Pro 6000", 96)
-    state = RetryState(infra_retries=5, oom_retries=1, cache_retries=0)
 
-    plan = state.decide_failure(
-        failure,
-        chosen=small,
-        candidates=(small, equal, larger),
-        managed_cache_mounted=False,
+    decision = _atomic_retry_decision(
+        monkeypatch, tmp_path, spec, failure, small, (small, equal, larger)
     )
-    survivors, chosen = state.select_candidate((equal, larger))
+    survivors, chosen = decision.state.select_candidate((equal, larger))
 
-    assert plan.retry
+    assert decision.plan.retry
     assert survivors == (larger,)
     assert chosen is larger
 
 
-def test_candidate_bound_failure_stops_when_only_equal_vram_remains():
-    from flash.runner.supervise.retry_decision import RetryState
-
+def test_candidate_bound_failure_stops_when_only_equal_vram_remains(monkeypatch, tmp_path):
+    spec = _spec(run_id="atomic-equal-stop")
     failed = _retry_candidate("runpod", "A100 PCIe", 80)
     equal = _retry_candidate("lambda", "H100", 80)
-    state = RetryState(infra_retries=5, oom_retries=1, cache_retries=0)
 
-    plan = state.decide_failure(
-        "stalled",
-        chosen=failed,
-        candidates=(failed, equal),
-        managed_cache_mounted=False,
+    decision = _atomic_retry_decision(
+        monkeypatch, tmp_path, spec, "stalled", failed, (failed, equal)
     )
 
-    assert not plan.retry
-    assert state.select_candidate((equal,))[1] is None
+    assert not decision.plan.retry
+    assert decision.state.select_candidate((equal,))[1] is None
 
 
-def test_retry_selection_preserves_allocator_order_among_larger_candidates():
-    from flash.runner.supervise.retry_decision import RetryState
-
+def test_retry_selection_preserves_allocator_order_among_larger_candidates(monkeypatch, tmp_path):
+    spec = _spec(run_id="atomic-order")
     failed = _retry_candidate("runpod", "RTX 4090", 24)
     first = _retry_candidate("vast", "H100", 80)
     second = _retry_candidate("lambda", "RTX Pro 6000", 96)
-    state = RetryState(infra_retries=5, oom_retries=1, cache_retries=0)
-    state.decide_failure(
-        "stalled",
-        chosen=failed,
-        candidates=(failed, first, second),
-        managed_cache_mounted=False,
+    decision = _atomic_retry_decision(
+        monkeypatch, tmp_path, spec, "stalled", failed, (failed, first, second)
     )
 
-    survivors, chosen = state.select_candidate((first, second))
+    survivors, chosen = decision.state.select_candidate((first, second))
 
     assert survivors == (first, second)
     assert chosen is first
 
 
-def test_mixed_infra_and_oom_budgets_share_one_monotonic_floor():
-    from flash.runner.supervise.retry_decision import RetryState
-
+def test_mixed_infra_and_oom_budgets_share_one_monotonic_floor(monkeypatch, tmp_path):
+    spec = _spec(run_id="atomic-mixed", max_retries=1)
     small = _retry_candidate("runpod", "RTX 4090", 24)
     medium = _retry_candidate("runpod", "H100", 80)
     large = _retry_candidate("runpod", "B200", 180)
-    state = RetryState(infra_retries=1, oom_retries=1, cache_retries=0)
 
-    first = state.decide_failure(
-        "stalled",
-        chosen=small,
-        candidates=(small, medium, large),
-        managed_cache_mounted=False,
+    first = _atomic_retry_decision(
+        monkeypatch, tmp_path, spec, "stalled", small, (small, medium, large)
     )
-    assert first.retry
-    assert state.select_candidate((small, medium, large))[1] is medium
+    assert first.plan.retry
+    assert first.state.select_candidate((small, medium, large))[1] is medium
+    from flash.runner.lifecycle import attempts as runner_attempts
 
-    second = state.decide_failure(
-        "oom",
-        chosen=medium,
-        candidates=(medium, large),
-        managed_cache_mounted=False,
+    assert runner_attempts._reserve_attempt(spec.run_id) == 1
+    second = _atomic_retry_decision(
+        monkeypatch, tmp_path, spec, "oom", medium, (medium, large), attempt=1
     )
-    assert second.retry
-    assert state.select_candidate((small, medium, large))[1] is large
-    assert state.infra_used == 1
-    assert state.oom_used == 1
+    assert second.plan.retry
+    assert second.state.select_candidate((small, medium, large))[1] is large
+    assert second.state.infra_used == 1
+    assert second.state.oom_used == 1
 
 
 @pytest.mark.parametrize("first_failure", ["no_capacity", "poll_error"])
@@ -1451,6 +1463,48 @@ def test_shared_cache_fallback_is_exact_one_shot_then_walks_larger(
         ("H100", 2, WEIGHT_CACHE_VOLUME_NAME),
         ("H100", 2, None),
         ("B200", 1, None),
+    ]
+
+
+def test_lambda_cacheless_attempt_requires_atomic_cache_authorization(orch, monkeypatch):
+    from flash.providers.core import allocator
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Candidate, PollResult
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
+
+    candidate = Candidate("lambda", "H100", 1.0, 80)
+    monkeypatch.setattr(allocator, "allocate", lambda *a, **k: _alloc(candidates=(candidate,)))
+    seen = []
+
+    class Provider:
+        supports_weight_cache = True
+
+        def submit_run(self, run_spec, _seed, *, attempt, **_kwargs):
+            snapshot = runner_status._load_status_json(run_spec.run_id)[
+                runner_state._RETRY_STATE_KEY
+            ]
+            seen.append((attempt, run_spec.gpu.network_volume, snapshot["cache_used"]))
+            if attempt == 0:
+                raise RuntimeError("cached lambda launch rejected")
+            return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    spec = _spec(
+        run_id="flash-lambda-atomic-cache",
+        max_retries=1,
+        network_volume=WEIGHT_CACHE_VOLUME_NAME,
+        network_volume_gb=100,
+    )
+    _seed_status(orch, spec)
+
+    metrics = runner_lifecycle._submit_seed_supervised(
+        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
+
+    assert metrics["train_tokens"] == 4096
+    assert seen == [
+        (0, WEIGHT_CACHE_VOLUME_NAME, 0),
+        (1, None, 1),
     ]
 
 
@@ -1642,11 +1696,15 @@ def _submit_failure(provider_obj):
             log=io.StringIO(),
             runtime_secrets={},
             source_snapshot=_SOURCE_SNAPSHOT,
-            attempt_start=0,
             retry_state=RetryState(1, 1, 0),
         )
+        state = RetryState(1, 1, 0)
         prepared = _ss._PreparedAttempt(
-            local_attempt=0, attempt=0, attempt_spec=spec, runtime_secrets={}
+            attempt=0,
+            attempt_spec=spec,
+            runtime_secrets={},
+            retry_state=state,
+            retry_snapshot=state.to_snapshot(),
         )
         plan = _ss._CandidatePlan(
             allocation=None,
@@ -1722,7 +1780,7 @@ def test_generic_provider_exception_text_still_never_reaches_the_run_record():
     assert result.detail == "provider submit failed (VastApiError)", result.detail
 
 
-def test_candidate_less_allocation_poll_error_retries_without_advancing_floor(orch, monkeypatch):
+def test_candidate_less_allocation_poll_error_uses_infrastructure_backoff(orch, monkeypatch):
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, CapacityLookupError, PollResult
     from flash.providers.runpod.execution import job_execution as rp_jobs
@@ -1733,7 +1791,7 @@ def test_candidate_less_allocation_poll_error_retries_without_advancing_floor(or
     def allocate(*args, **kwargs):
         nonlocal calls
         calls += 1
-        if calls == 1:
+        if calls <= 2:
             raise CapacityLookupError("lookup failed")
         return _alloc(candidates=(candidate,))
 
@@ -1743,6 +1801,8 @@ def test_candidate_less_allocation_poll_error_retries_without_advancing_floor(or
         "submit_run",
         lambda *a, **k: PollResult(True, metrics={"train_tokens": 4096}),
     )
+    sleeps = []
+    monkeypatch.setattr(runner_lifecycle.time, "sleep", sleeps.append)
     spec = _spec(run_id="flash-allocation-poll-error")
     _seed_status(orch, spec)
 
@@ -1751,7 +1811,8 @@ def test_candidate_less_allocation_poll_error_retries_without_advancing_floor(or
     )
 
     assert metrics["train_tokens"] == 4096
-    assert calls == 2
+    assert calls == 3
+    assert sleeps == [10, 20]
 
 
 def test_candidate_less_allocation_no_capacity_stops_immediately(orch, monkeypatch):
@@ -1775,6 +1836,120 @@ def test_candidate_less_allocation_no_capacity_stops_immediately(orch, monkeypat
         )
 
     assert calls == 1
+
+
+def test_stale_reserved_attempt_cannot_reach_provider_submit(orch, monkeypatch):
+    from flash.providers.core import registry as providers
+    from flash.runner.lifecycle import attempts as runner_attempts
+    from flash.runner.supervise import seed_submission as submission
+    from flash.runner.supervise.retry_decision import decide_failure_atomically
+
+    spec = _spec(run_id="flash-stale-reserved-launch")
+    _seed_status(orch, spec)
+    assert runner_attempts._reserve_attempt(spec.run_id) == 0
+    raw = runner_status._load_status_json(spec.run_id)
+    snapshot = raw[runner_state._RETRY_STATE_KEY]
+    prepared = submission._PreparedAttempt(
+        0, spec, {}, submission.RetryState.from_snapshot(spec, snapshot), snapshot
+    )
+    candidate = _retry_candidate("runpod", "H100", 80)
+    plan = submission._CandidatePlan(None, (candidate,), candidate, True, spec, spec)
+    ctx = submission._SubmitContext(
+        spec=spec,
+        seed=spec.seed,
+        log=io.StringIO(),
+        runtime_secrets={},
+        source_snapshot=_SOURCE_SNAPSHOT,
+        retry_state=prepared.retry_state,
+    )
+    decision = decide_failure_atomically(
+        spec.run_id,
+        spec,
+        expected_remote=None,
+        expected_retry_snapshot=snapshot,
+        failure="poll_error",
+        chosen=None,
+        candidates=None,
+        attempt=0,
+    )
+    assert decision is not None
+    assert decision.plan.retry
+    assert runner_attempts._reserve_attempt(spec.run_id) == 1
+
+    class Provider:
+        def submit_run(self, *_args, **_kwargs):
+            pytest.fail("stale reserved attempt reached provider submit")
+
+    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    with pytest.raises(runner_errors._RunCancelled, match="lost provider launch authorization"):
+        submission._submit_candidate(ctx, prepared, plan)
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "floor", "resume_world_size"),
+    [("sft", 80.0, None), ("opd", 0.0, 2)],
+)
+def test_interrupted_candidate_exhaustion_blocks_handleless_recovery(
+    orch, monkeypatch, algorithm, floor, resume_world_size
+):
+    import flash.server.platform.runtime as runtime
+    from flash.providers.core.base import Allocation, Candidate
+    from flash.runner.supervise import seed_submission as submission
+    from flash.runner.supervise.retry_decision import RetryState
+
+    spec = _spec(run_id=f"flash-exhausted-{algorithm}", algorithm=algorithm)
+    state = replace(RetryState.initial_for_spec(spec), usable_vram_floor=floor)
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict()),
+        _next_attempt=1,
+        _retry_state=state.to_snapshot(),
+    )
+    snapshot = state.to_snapshot()
+    prepared = submission._PreparedAttempt(
+        0,
+        spec,
+        {},
+        state,
+        snapshot,
+        resume_world_size=resume_world_size,
+    )
+    candidate = Candidate("runpod", "RTX 4090", 1.0, 24)
+    allocation = Allocation("runpod", "RTX 4090", 1.0, 12, (candidate,))
+    if resume_world_size:
+        allocation = replace(allocation, candidates=())
+    ctx = submission._SubmitContext(
+        spec=spec,
+        seed=spec.seed,
+        log=io.StringIO(),
+        runtime_secrets={},
+        source_snapshot=_SOURCE_SNAPSHOT,
+        retry_state=state,
+    )
+    monkeypatch.setattr(submission, "_allocate_attempt", lambda *_args: (allocation, None))
+
+    outcome = submission._run_attempt(ctx, prepared)
+    assert outcome.result.failure == "no_capacity"
+    assert outcome.failure_decision is not None
+    assert outcome.failure_decision.plan.retry is False
+    persisted = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
+    assert persisted["last_decision_attempt"] == 0
+    assert persisted["last_decision_failure"] == "no_capacity"
+    assert persisted["last_decision_retry"] is False
+
+    monkeypatch.setattr(runtime, "_fail_blocked_recovery", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        runtime,
+        "_start_resubmit",
+        lambda *_args, **_kwargs: pytest.fail("terminal exhaustion became retryable"),
+    )
+    assert runtime._start_handleless_resubmit(spec, "provisioning") is False
+
+    monkeypatch.setattr(
+        submission,
+        "decide_failure_atomically",
+        lambda *_args, **_kwargs: pytest.fail("persisted exhaustion was decided twice"),
+    )
+    assert submission._handle_failure(ctx, prepared, outcome).retry is False
 
 
 def test_mixed_cache_oom_and_infra_retries_back_off_only_by_infra_ordinal(orch, monkeypatch):
@@ -1870,43 +2045,58 @@ def test_retry_state_snapshot_rejects_counters_above_current_spec_maxima():
         RetryState.from_snapshot(spec, snapshot)
 
 
-def test_restored_retry_state_counts_only_remaining_attempts():
+def test_retry_state_is_frozen_and_restores_original_action():
+    from dataclasses import FrozenInstanceError
+
     from flash.runner.supervise.retry_decision import RetryState
 
     spec = _spec(max_retries=2)
-    state = RetryState.initial_for_spec(spec)
-    original = state.max_attempts
-    state.infra_used = 3
-    state.oom_used = 1
-    state.last_decision_attempt = 3
-    state.last_decision_failure = "oom"
-    state.last_decision_retry = True
+    snapshot = RetryState.initial_for_spec(spec).to_snapshot()
+    snapshot.update(
+        last_decision_attempt=0,
+        last_decision_failure="job_failed",
+        last_decision_retry=False,
+        last_decision_action="not retrying",
+    )
+    restored = RetryState.from_snapshot(spec, snapshot)
 
-    restored = RetryState.from_snapshot(spec, state.to_snapshot())
-
-    assert restored.max_attempts == original - 4
+    assert restored.persisted_plan(0).action == "not retrying"
+    with pytest.raises(FrozenInstanceError):
+        restored.infra_used = 1
 
 
 def test_handleless_restart_rejects_persisted_terminal_decision_before_allocation(
     orch, monkeypatch
 ):
     from flash.providers.core import allocator
-    from flash.runner.supervise.retry_decision import RetryState, persist_retry_state
+    from flash.runner.lifecycle import attempts as runner_attempts
+    from flash.runner.lifecycle import state as runner_state
+    from flash.runner.lifecycle import status as runner_status
+    from flash.runner.supervise.retry_decision import decide_failure_atomically
 
     spec = _spec(run_id="flash-terminal-restart", max_retries=2)
     _seed_status(orch, spec)
-    state = RetryState.initial_for_spec(spec)
-    state.last_decision_attempt = 0
-    state.last_decision_failure = "job_failed"
-    state.last_decision_retry = False
-    assert persist_retry_state(spec.run_id, state)
+    assert runner_attempts._reserve_attempt(spec.run_id) == 0
+    raw = runner_status._load_status_json(spec.run_id)
+    decision = decide_failure_atomically(
+        spec.run_id,
+        spec,
+        expected_remote=None,
+        expected_retry_snapshot=raw[runner_state._RETRY_STATE_KEY],
+        failure="job_failed",
+        chosen=None,
+        candidates=None,
+        attempt=0,
+    )
+    assert decision is not None
+    assert decision.plan.retry is False
     monkeypatch.setattr(
         allocator,
         "allocate",
         lambda *_args, **_kwargs: pytest.fail("terminal restart allocated a provider"),
     )
 
-    with pytest.raises(RuntimeError, match="retry policy rejected replacement"):
+    with pytest.raises(RuntimeError, match="lacks exact persisted retry authorization"):
         runner_lifecycle._submit_seed_supervised(
             spec,
             spec.seed,

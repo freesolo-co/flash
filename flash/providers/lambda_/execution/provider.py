@@ -23,6 +23,7 @@ class LambdaProvider(InstanceProvider):
     """``base.Provider`` for the Lambda Cloud substrate."""
 
     name = "lambda"
+    supports_weight_cache = True
     _gpu_identity_attr = "lambda_name"
 
     @property

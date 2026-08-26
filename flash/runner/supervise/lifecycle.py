@@ -11,7 +11,11 @@ from flash.core.spec import JobSpec, gpu_count_of, require_matching_seed
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
 
 
-def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
+def _run_job_background(
+    spec: JobSpec,
+    runtime_secrets: dict[str, str] | None = None,
+    reserved_retry: tuple[int, str | None, int | None, dict] | None = None,
+) -> None:
     """run a supervised job without leaking a daemon-thread traceback."""
     import logging
 
@@ -19,7 +23,11 @@ def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = 
     from flash.runner.lifecycle.status import _update, get_status
 
     try:
-        _run_job(spec, runtime_secrets=runtime_secrets) if runtime_secrets else _run_job(spec)
+        recovery = {"reserved_retry": reserved_retry} if reserved_retry is not None else {}
+        if runtime_secrets is not None:
+            _run_job(spec, runtime_secrets=runtime_secrets, **recovery)
+        else:
+            _run_job(spec, **recovery)
     except Exception as exc:
         detail = f"{type(exc).__name__}: background run failed"
         with contextlib.suppress(Exception):
@@ -30,7 +38,11 @@ def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = 
         )
 
 
-def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
+def _run_job(
+    spec: JobSpec,
+    runtime_secrets: dict[str, str] | None = None,
+    reserved_retry: tuple[int, str | None, int | None, dict] | None = None,
+) -> None:
     from flash.content.multimodal import preflight_validate_image_opd
 
     preflight_validate_image_opd(spec)
@@ -48,7 +60,12 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
     try:
         while True:
             try:
-                _run_job_inner(spec, log_path, runtime_secrets=runtime_secrets)
+                _run_job_inner(
+                    spec,
+                    log_path,
+                    runtime_secrets=runtime_secrets,
+                    reserved_retry=reserved_retry,
+                )
                 break
             except Exception as exc:
                 from flash.envs.loading.staged import StagedEnvironmentTransientError
@@ -112,14 +129,9 @@ def _submit_seed_supervised(
     log,
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
-    attempt_start: int = 0,
-    retry_state=None,
+    reserved_retry: tuple[int, str | None, int | None, dict] | None = None,
 ) -> dict:
-    """Run one seed with bounded auto-retry on infra-shaped failures.
-
-    Retries resume from the latest HF checkpoint on a fresh host. Genuine worker errors fail fast.
-    ``attempt_start`` offsets persisted identities without expanding this invocation's retry budget.
-    """
+    """Run one seed with persisted authorization for every replacement attempt."""
     seed = require_matching_seed(spec, seed)
     from flash.runner.supervise.seed_submission import submit_seed_supervised
 
@@ -129,8 +141,7 @@ def _submit_seed_supervised(
         log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
-        attempt_start=attempt_start,
-        retry_state=retry_state,
+        reserved_retry=reserved_retry,
     )
 
 
@@ -155,6 +166,7 @@ def _run_job_inner(
     spec: JobSpec,
     log_path: str,
     runtime_secrets: dict[str, str] | None = None,
+    reserved_retry: tuple[int, str | None, int | None, dict] | None = None,
 ) -> None:
     from flash.runner.accounting.artifacts import stage_environment_package
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
@@ -176,6 +188,7 @@ def _run_job_inner(
                 log,
                 prior_cost=0.0,
                 runtime_secrets=runtime_secrets,
+                reserved_retry=reserved_retry,
             )
     except _RunCancelled:
         return  # cancel_run already set the terminal state
@@ -196,15 +209,9 @@ def _run_training(
     prior_cost: float,
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
-    attempt_start: int = 0,
-    retry_state=None,
+    reserved_retry: tuple[int, str | None, int | None, dict] | None = None,
 ) -> None:
-    """Train the run's single adapter under supervision; finalize the run.
-
-    Shared by a fresh submit and post-restart recovery (the worker resumes from its last HF
-    checkpoint on a fresh allocation). ``prior_cost`` carries spend already booked before a
-    recovery so the total isn't under-reported. ``attempt_start`` preserves globally monotonic
-    worker identities while each invocation keeps its own bounded retry budget."""
+    """Train one adapter while preserving run-global attempt authorization and cost."""
     from flash.runner.accounting.costs import _status_estimated_charge
     from flash.runner.lifecycle.state import TERMINAL_STATES, artifacts_dir
     from flash.runner.lifecycle.status import (
@@ -247,8 +254,7 @@ def _run_training(
         log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
-        attempt_start=attempt_start,
-        retry_state=retry_state,
+        reserved_retry=reserved_retry,
     )
     metrics, verified_attempt = validate_terminal_source_metrics(get_status(spec.run_id), metrics)
     # measured wall x $/hr is recorded in metrics.json for analytics, but is not what we charge.

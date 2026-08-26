@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import time
 
+from flash.adapters.artifacts import MAX_ATTEMPT_ID
 from flash.core.spec import JobSpec
 from flash.runner.accounting import costs
 from flash.runner.lifecycle import attempts, reporting, state
@@ -95,6 +96,8 @@ def _compare_and_prepare_resubmit(
     expected_remote: dict | None,
     *,
     expected_state: str | None = None,
+    expected_retry_snapshot: dict,
+    next_attempt: int,
 ) -> bool:
     """Claim a nonterminal recovery launch only while its expected remote still owns the run."""
     report_status: RunStatus | None = None
@@ -106,9 +109,18 @@ def _compare_and_prepare_resubmit(
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
+        raw = status_ops._load_status_json(run_id)
+        if raw.get(state._RETRY_STATE_KEY) != expected_retry_snapshot:
+            return False
+        if attempts._infer_next_attempt(raw) != next_attempt:
+            return False
+        spec = state._internal_spec_from_status(status)
+        attempts._validate_attempt_reservation_from_raw(spec, raw, next_attempt)
+        if next_attempt >= MAX_ATTEMPT_ID:
+            raise RuntimeError("run attempt identity is exhausted")
         status.state = "provisioning"
         status.updated_at = time.time()
-        state._save_status_unlocked(status)
+        state._save_status_unlocked(status, _next_attempt=next_attempt + 1)
         report_status = status
     if report_status is not None:
         reporting._report_status(report_status)

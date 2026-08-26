@@ -339,7 +339,7 @@ def test_non_sft_oom_escalation_still_uses_every_rented_card():
 def test_retry_floor_and_filter_use_one_executed_width_scale():
     from flash.providers.core.allocator import _executed_width, _fitting_candidates
     from flash.providers.core.base import Candidate
-    from flash.runner.supervise.retry_decision import RetryState
+    from flash.runner.supervise.retry_decision import RetryState, _transition_failure
 
     failed = _fitting_candidates(
         [Candidate("runpod", "RTX 4090", 0.69, 24, 4)],
@@ -349,11 +349,13 @@ def test_retry_floor_and_filter_use_one_executed_width_scale():
     larger = Candidate("runpod", "A100 SXM 40GB", 1.0, 40, 1)
     state = RetryState(infra_retries=0, oom_retries=1, cache_retries=0)
 
-    decision = state.decide_failure(
+    state, decision = _transition_failure(
+        state,
         "oom",
         chosen=failed,
         candidates=(failed, larger),
         managed_cache_mounted=False,
+        attempt=0,
     )
 
     assert decision.retry

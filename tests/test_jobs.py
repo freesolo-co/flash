@@ -3939,7 +3939,8 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
                         public_spec, worker_spec, identity.to_dict()
                     ),
                 },
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(
             rank_mod, "load_hf_adapter_config", lambda *a, **k: _adapter_config(rank=64)
@@ -4031,7 +4032,8 @@ def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
                         public_spec, worker_spec, original_identity
                     ),
                 },
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: _adapter_config())
         monkeypatch.setattr(
@@ -5184,7 +5186,7 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
             remote=stale_remote,
         )
         status.source_snapshot = _SOURCE_SNAPSHOT
-        runner_state._save_status(status)
+        runner_state._save_status(status, _next_attempt=1)
         monkeypatch.setattr(
             polling,
             "poll_job",
@@ -5319,7 +5321,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
             },
         )
         status.source_snapshot = _SOURCE_SNAPSHOT
-        runner_state._save_status(status)
+        runner_state._save_status(status, _next_attempt=1)
         # Poll reports a dead/abandoned job (the common redeploy-window outcome).
         monkeypatch.setattr(
             polling,
@@ -5336,8 +5338,6 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
             prior_cost,
             runtime_secrets=None,
             source_snapshot=None,
-            attempt_start,
-            retry_state=None,
         ):
             seen["remote"] = runner_status.get_status(spec.run_id).remote
             seen["source_snapshot"] = source_snapshot
@@ -5381,7 +5381,8 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
                     "allocated_gpu_count": 1,
                     "allocated_usable_vram_gb": 24.0,
                 },
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(
             polling,
@@ -5428,7 +5429,7 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
             },
         )
         status.source_snapshot = _SOURCE_SNAPSHOT
-        runner_state._save_status(status)
+        runner_state._save_status(status, _next_attempt=1)
         monkeypatch.setattr(
             polling,
             "poll_job",
@@ -5444,12 +5445,9 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
             prior_cost,
             runtime_secrets=None,
             source_snapshot=None,
-            attempt_start,
-            retry_state=None,
         ):
             seen["prior_cost"] = prior_cost
             seen["source_snapshot"] = source_snapshot
-            seen["attempt_start"] = attempt_start
             runner_status._update(spec.run_id, "done", cost_usd=prior_cost)
 
         monkeypatch.setattr(runner_lifecycle, "_run_training", fake_training)
@@ -5460,7 +5458,6 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
         assert seen == {
             "prior_cost": 0.25,
             "source_snapshot": _SOURCE_SNAPSHOT,
-            "attempt_start": 1,
         }
 
 
@@ -5485,7 +5482,7 @@ def test_attach_worker_error_fails_without_replacement(monkeypatch):
         }
         status = provisioned_status(_spec("g1"), state="running", remote=remote)
         status.source_snapshot = _SOURCE_SNAPSHOT
-        runner_state._save_status(status)
+        runner_state._save_status(status, _next_attempt=1)
         monkeypatch.setattr(
             polling,
             "poll_job",
@@ -5540,7 +5537,8 @@ def test_attach_does_not_resume_over_unconfirmed_runpod_teardown(
                 _spec("runpod-unconfirmed"),
                 state="running",
                 remote=remote,
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(
             polling,
@@ -5627,7 +5625,8 @@ def test_attach_preserves_newer_remote_before_compare_and_clear(monkeypatch):
                 _spec("attach-newer-remote"),
                 state="running",
                 remote=old_remote,
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(
             polling,
@@ -5692,7 +5691,8 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch, rema
                     "allocated_gpu_count": 1,
                     "allocated_usable_vram_gb": 24.0,
                 },
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
@@ -5896,7 +5896,7 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
         monkeypatch.setattr(
             runner_lifecycle,
             "_run_training",
-            lambda *args, **kwargs: resumed.append(kwargs["attempt_start"]),
+            lambda *args, **kwargs: resumed.append(1),
         )
 
         attach_mod._reconcile_attached_remote(

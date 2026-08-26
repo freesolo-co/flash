@@ -274,9 +274,11 @@ def _start_resubmit(
     *,
     expected_remote: dict | None = None,
     expected_state: str | None = None,
+    expected_retry_snapshot: dict,
+    next_attempt: int,
 ) -> bool:
     from flash.runner.accounting.reconciliation import _compare_and_prepare_resubmit
-    from flash.runner.lifecycle.attempts import _verified_opd_next_attempt
+    from flash.runner.lifecycle.attempts import _verified_opd_retry_state
     from flash.runner.lifecycle.status import source_snapshot_from_status
     from flash.runner.supervise.lifecycle import _run_job_background
 
@@ -291,9 +293,15 @@ def _start_resubmit(
             return False
         _fail_blocked_recovery(spec, reason, expected_remote=expected_remote)
         return False
+    opd_resume_revision = None
+    opd_resume_world_size = None
     if spec.algorithm == "opd":
         try:
-            _verified_opd_next_attempt(spec.run_id)
+            verified_attempt, opd_resume_revision, opd_resume_world_size = (
+                _verified_opd_retry_state(spec.run_id)
+            )
+            if verified_attempt != next_attempt:
+                raise RuntimeError("opd recovery attempt identity changed")
         except Exception as exc:
             _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
             return False
@@ -301,6 +309,8 @@ def _start_resubmit(
         spec.run_id,
         expected_remote,
         expected_state=expected_state,
+        expected_retry_snapshot=expected_retry_snapshot,
+        next_attempt=next_attempt,
     ):
         return False
     with contextlib.suppress(Exception):
@@ -308,8 +318,66 @@ def _start_resubmit(
             spec.run_id,
             "control plane restarted without a durable handle; resubmitting",
         )
-    threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+    threading.Thread(
+        target=_run_job_background,
+        args=(
+            spec,
+            None,
+            (
+                next_attempt,
+                opd_resume_revision,
+                opd_resume_world_size,
+                dict(expected_retry_snapshot),
+            ),
+        ),
+        daemon=True,
+    ).start()
     return True
+
+
+def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
+    """Authorize and claim one handleless initial or replacement launch."""
+    from flash.runner.lifecycle import state as lifecycle_state
+    from flash.runner.lifecycle.attempts import _infer_next_attempt
+    from flash.runner.lifecycle.status import _load_status_json
+    from flash.runner.supervise.retry_decision import RetryState, decide_failure_atomically
+    from flash.server.platform.locks import _deploy_lock
+
+    with _deploy_lock(spec.run_id):
+        raw = _load_status_json(spec.run_id)
+        next_attempt = _infer_next_attempt(raw)
+        snapshot = raw[lifecycle_state._RETRY_STATE_KEY]
+        if next_attempt:
+            retry_state = RetryState.from_snapshot(spec, snapshot)
+            plan = retry_state.persisted_plan(next_attempt - 1)
+            if plan is None:
+                decision = decide_failure_atomically(
+                    spec.run_id,
+                    spec,
+                    expected_remote=None,
+                    expected_retry_snapshot=snapshot,
+                    failure="poll_error",
+                    chosen=None,
+                    candidates=None,
+                    attempt=next_attempt - 1,
+                )
+                if decision is None:
+                    return None
+                snapshot, plan = decision.snapshot, decision.plan
+            if not plan.retry:
+                _fail_blocked_recovery(
+                    spec,
+                    "retry policy rejected handleless replacement",
+                    expected_remote=None,
+                )
+                return False
+        return _start_resubmit(
+            spec,
+            expected_remote=None,
+            expected_state=expected_state,
+            expected_retry_snapshot=snapshot,
+            next_attempt=next_attempt,
+        )
 
 
 def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
@@ -399,11 +467,10 @@ def _deferred_resubmit_loop(spec) -> None:
             clear = False
         if clear:
             try:
-                started = _start_resubmit(
-                    spec,
-                    expected_remote=None,
-                    expected_state=status.state,
-                )
+                started = _start_handleless_resubmit(spec, status.state)
+                if started is None:
+                    time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                    continue
             except Exception:
                 time.sleep(_DEFERRED_RECOVERY_RETRY_S)
                 continue
@@ -775,7 +842,7 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
         # fail closed in _confirm_run_clear (unenumerable recorded Vast) and defer forever. The guard
         # still runs for `provisioning`/`running`, the states that could have attempted a create.
         if prior_state == "queued" or _confirm_run_clear(spec):
-            if _start_resubmit(spec, expected_remote=None, expected_state=prior_state):
+            if _start_handleless_resubmit(spec, prior_state):
                 continue
             try:
                 current = get_status(spec.run_id)

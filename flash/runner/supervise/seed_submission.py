@@ -12,11 +12,13 @@ from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
 from flash.runner.supervise import lifecycle as _lifecycle
 from flash.runner.supervise.retry_decision import (
+    AtomicRetryDecision,
     RetryState,
     _candidate_usable_vram_gb,
     _drop_weight_cache,
+    _managed_cache_mounted,
+    decide_failure_atomically,
     load_retry_state,
-    persist_retry_state,
 )
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
@@ -28,8 +30,8 @@ class _SubmitContext:
     log: object
     runtime_secrets: dict[str, str] | None
     source_snapshot: dict
-    attempt_start: int
     retry_state: RetryState
+    reserved_retry: tuple[int, str | None, int | None, dict] | None = None
     last_handle: dict = field(default_factory=dict)
     current_gpu: dict = field(default_factory=dict)
     current_usable_vram_gb: float = 0.0
@@ -56,8 +58,6 @@ class _SubmitContext:
                 raise RuntimeError("provider handle identity does not match the selected provider")
             if canonical_handle["attempt"] != self.current_attempt:
                 raise RuntimeError("provider handle attempt does not match the reserved attempt")
-            self.last_handle.clear()
-            self.last_handle.update(canonical_handle)
             if canonical_handle.get("endpoint_id"):
                 self.seen_endpoints[canonical_handle["endpoint_id"]] = dict(canonical_handle)
             persisted_handle = {
@@ -73,6 +73,8 @@ class _SubmitContext:
                 "on_last_gpu": bool(self.current_on_last_gpu),
             }
             if _update(self.spec.run_id, "running", remote=persisted_handle):
+                self.last_handle.clear()
+                self.last_handle.update(persisted_handle)
                 return
             resource_deleted = False
             with contextlib.suppress(Exception):
@@ -140,10 +142,11 @@ class _SubmitContext:
 
 @dataclass(frozen=True)
 class _PreparedAttempt:
-    local_attempt: int
     attempt: int
     attempt_spec: JobSpec
     runtime_secrets: dict[str, str]
+    retry_state: RetryState
+    retry_snapshot: dict
     # the rank count a pinned opd resume checkpoint was written at, or None when this attempt
     # resumes from nothing. allocation is pinned to it: the worker refuses a pinned checkpoint
     # whose fsdp width differs from the attempt's, so re-ranking onto another shape would strand
@@ -174,7 +177,8 @@ class _AttemptOutcome:
     candidates: tuple = ()
     run_spec: JobSpec | None = None
     candidate_not_started: bool = False
-    stop: bool = False
+    failure_decision: AtomicRetryDecision | None = None
+    failure_decision_attempted: bool = False
 
 
 @dataclass(frozen=True)
@@ -182,6 +186,7 @@ class _FailureDecision:
     metrics: dict | None
     retry: bool
     retry_delay: float = 0.0
+    lost_ownership: bool = False
 
 
 def _build_context(
@@ -190,54 +195,33 @@ def _build_context(
     log,
     runtime_secrets: dict[str, str] | None,
     source_snapshot: dict | None,
-    attempt_start: int,
-    retry_state: RetryState | None = None,
+    reserved_retry: tuple[int, str | None, int | None] | None,
 ) -> _SubmitContext:
-    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
     from flash.snapshot.archive import parse_descriptor
 
     source_snapshot = parse_descriptor(
         source_snapshot or source_snapshot_from_status(get_status(spec.run_id), required=True)
     ).to_dict()
-    attempt_start = max(0, int(attempt_start))
-    retry_state = retry_state or load_retry_state(spec.run_id, spec)
-    started_with_shared_cache = (
-        getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
-    )
-    if (
-        retry_state.started_with_shared_cache != started_with_shared_cache
-        and retry_state.infra_used == 0
-        and retry_state.oom_used == 0
-        and retry_state.cache_used == 0
-        and retry_state.last_decision_attempt is None
+    retry_state = load_retry_state(spec.run_id, spec)
+    if reserved_retry is not None and (
+        not isinstance(reserved_retry, tuple)
+        or len(reserved_retry) != 4
+        or isinstance(reserved_retry[0], bool)
+        or not isinstance(reserved_retry[0], int)
+        or reserved_retry[0] < 0
+        or not isinstance(reserved_retry[3], dict)
     ):
-        retry_state = RetryState.for_spec(
-            spec,
-            started_with_shared_cache=started_with_shared_cache,
-        )
-        if not persist_retry_state(spec.run_id, retry_state):
-            raise RuntimeError("initial retry state could not be persisted")
-    expected = RetryState.for_spec(
-        spec,
-        started_with_shared_cache=retry_state.started_with_shared_cache,
-    )
-    if (
-        retry_state.infra_retries != expected.infra_retries
-        or retry_state.oom_retries != expected.oom_retries
-        or retry_state.cache_retries != expected.cache_retries
-    ):
-        raise RuntimeError("persisted retry state does not match the current run spec")
-    # environment transport is already pinned and staged by the controller before allocation.
+        raise RuntimeError("reserved attempt identity or retry snapshot is invalid")
     return _SubmitContext(
         spec=spec,
         seed=seed,
         log=log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
-        attempt_start=attempt_start,
         retry_state=retry_state,
-        current_attempt=attempt_start,
+        reserved_retry=reserved_retry,
+        current_attempt=reserved_retry[0] if reserved_retry else 0,
     )
 
 
@@ -359,14 +343,15 @@ def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
         )
 
 
-def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOutcome:
+def _prepare_attempt(ctx: _SubmitContext) -> _PreparationOutcome:
+    from flash.runner.lifecycle import state as lifecycle_state
     from flash.runner.lifecycle.attempts import _reserve_attempt, _verified_opd_retry_state
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
+    from flash.runner.lifecycle.status import _load_status_json
 
-    attempt = ctx.attempt_start + local_attempt
     ctx.raise_if_cancelled()
-    if local_attempt > 0:
-        completed_metrics = _cleanup_previous_attempt(ctx, attempt)
+    if ctx.last_handle:
+        completed_metrics = _cleanup_previous_attempt(ctx, ctx.current_attempt + 1)
         if completed_metrics is not None:
             return _PreparationOutcome(completed_metrics=completed_metrics)
     try:
@@ -374,17 +359,27 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
     except RuntimeError:
         ctx.gc_seen_endpoints()
         raise
-    if ctx.spec.algorithm == "opd":
-        expected_next_attempt, opd_resume_revision, resume_world_size = _verified_opd_retry_state(
-            ctx.spec.run_id
-        )
+    claimed_retry_snapshot = None
+    if ctx.reserved_retry is not None:
+        attempt, opd_resume_revision, resume_world_size, claimed_retry_snapshot = ctx.reserved_retry
+        ctx.reserved_retry = None
     else:
-        expected_next_attempt, opd_resume_revision, resume_world_size = None, None, None
-    attempt = _reserve_attempt(
-        ctx.spec.run_id,
-        minimum_attempt=ctx.attempt_start if local_attempt == 0 else 0,
-        expected_next_attempt=expected_next_attempt,
-    )
+        if ctx.spec.algorithm == "opd":
+            expected_next_attempt, opd_resume_revision, resume_world_size = (
+                _verified_opd_retry_state(ctx.spec.run_id)
+            )
+        else:
+            expected_next_attempt, opd_resume_revision, resume_world_size = None, None, None
+        attempt = _reserve_attempt(
+            ctx.spec.run_id,
+            expected_next_attempt=expected_next_attempt,
+        )
+    raw = _load_status_json(ctx.spec.run_id)
+    retry_snapshot = raw[lifecycle_state._RETRY_STATE_KEY]
+    if claimed_retry_snapshot is not None and retry_snapshot != claimed_retry_snapshot:
+        raise RuntimeError("reserved recovery retry snapshot changed before attempt preparation")
+    retry_state = RetryState.from_snapshot(ctx.spec, retry_snapshot)
+    ctx.retry_state = retry_state
     ctx.current_attempt = attempt
     _mark_attempt_boundary(ctx, attempt)
     attempt_runtime_secrets = dict(ctx.runtime_secrets or {})
@@ -393,10 +388,11 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
         attempt_runtime_secrets[OPD_RESUME_REVISION_ENV] = opd_resume_revision
     return _PreparationOutcome(
         prepared=_PreparedAttempt(
-            local_attempt,
             attempt,
             attempt_spec,
             attempt_runtime_secrets,
+            retry_state,
+            retry_snapshot,
             # only a pinned resume constrains the shape; without one the retry re-ranks freely.
             resume_world_size=resume_world_size if opd_resume_revision is not None else None,
         )
@@ -521,7 +517,6 @@ def _build_candidate_plan(
     ctx: _SubmitContext, prepared: _PreparedAttempt, allocation
 ) -> _CandidatePlan | None:
     from flash.providers.core.allocator import allocation_summary
-    from flash.providers.core.registry import get_provider
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
     from flash.runner.supervise.lifecycle import _spec_with_gpu
 
@@ -531,32 +526,19 @@ def _build_candidate_plan(
             f"no candidate executing at checkpoint world size {width} is available, and this "
             "retry must preserve that executed rank width"
         )
-        print(
-            f"seed={ctx.seed} no candidate executes at pinned OPD checkpoint world size "
-            f"{width}; not retrying",
-            file=ctx.log,
-            flush=True,
-        )
         return None
 
-    candidates, chosen = ctx.retry_state.select_candidate(allocation.candidates)
+    candidates, chosen = prepared.retry_state.select_candidate(allocation.candidates)
     if chosen is None:
-        floor = ctx.retry_state.usable_vram_floor
+        floor = prepared.retry_state.usable_vram_floor
         ctx.last_detail = f"no candidate has more than {floor:g} GB usable vram"
-        print(
-            f"seed={ctx.seed} no candidate is strictly larger than {floor:g} GB usable vram; "
-            "not retrying",
-            file=ctx.log,
-            flush=True,
-        )
         return None
 
     cache_fallback_available = (
-        ctx.retry_state.cache_used < ctx.retry_state.cache_retries
-        and not ctx.retry_state.drop_weight_cache
-        and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
+        prepared.retry_state.cache_used < prepared.retry_state.cache_retries
+        and _managed_cache_mounted(prepared.attempt_spec, prepared.retry_state, chosen)
     )
-    on_last_gpu = ctx.retry_state.on_last_gpu(
+    on_last_gpu = prepared.retry_state.on_last_gpu(
         chosen,
         candidates,
         cache_fallback_available=cache_fallback_available,
@@ -575,7 +557,7 @@ def _build_candidate_plan(
             flush=True,
         )
     effective_spec = _spec_with_gpu(ctx.spec, chosen.gpu, getattr(chosen, "gpu_count", 1))
-    if ctx.retry_state.drop_weight_cache:
+    if prepared.retry_state.drop_weight_cache:
         effective_spec = _drop_weight_cache(effective_spec)
     try:
         run_spec = _spec_with_remaining_wall(effective_spec, require_provider_minimum=True)
@@ -683,6 +665,7 @@ def _submit_candidate(
     prepared: _PreparedAttempt,
     plan: _CandidatePlan,
 ):
+    from flash.runner.lifecycle.attempts import _require_attempt_launch_current
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import get_status
     from flash.runner.lifecycle.submit import _persist_effective_worker_spec
@@ -693,13 +676,17 @@ def _submit_candidate(
     ctx.submission_lock = _deploy_lock(ctx.spec.run_id)
     ctx.submission_lock.acquire()
     try:
-        latest = get_status(ctx.spec.run_id)
-        if latest.state in TERMINAL_STATES:
-            raise ctx.cancel()
-        if latest.remote:
-            raise _RunCancelled(
-                f"run {ctx.spec.run_id} already has a durable provider handle; not resubmitting"
+        try:
+            _require_attempt_launch_current(
+                ctx.spec.run_id,
+                ctx.spec,
+                prepared.attempt,
+                prepared.retry_snapshot,
             )
+        except RuntimeError as exc:
+            raise _RunCancelled(
+                f"run {ctx.spec.run_id} attempt {prepared.attempt} lost provider launch authorization"
+            ) from exc
         # the accepted customer quote was frozen during preparation and is exactly the amount shown
         # by `flash train --cost`. allocation persists only the effective worker spec; live provider
         # rates and topology must never rewrite estimated_cost_usd after submission.
@@ -717,13 +704,34 @@ def _submit_candidate(
 
 
 def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOutcome:
+    from flash.providers.core.base import PollResult
+
     allocation, result = _allocate_attempt(ctx, prepared)
     if allocation is None:
-        return _AttemptOutcome(result=result)
+        return _AttemptOutcome(result=result, candidate_not_started=True)
     ctx.raise_if_cancelled()
     plan = _build_candidate_plan(ctx, prepared, allocation)
     if plan is None:
-        return _AttemptOutcome(stop=True)
+        result = PollResult(
+            False, failure="no_capacity", detail=ctx.last_detail or "no eligible candidate"
+        )
+        decision = decide_failure_atomically(
+            ctx.spec.run_id,
+            ctx.spec,
+            expected_remote=dict(ctx.last_handle) if ctx.last_handle else None,
+            expected_retry_snapshot=prepared.retry_snapshot,
+            failure=result.failure,
+            chosen=None,
+            candidates=allocation.candidates,
+            attempt=prepared.attempt,
+        )
+        return _AttemptOutcome(
+            result=result,
+            candidates=allocation.candidates,
+            candidate_not_started=True,
+            failure_decision=decision,
+            failure_decision_attempted=True,
+        )
     result, candidate_not_started = _submit_candidate(ctx, prepared, plan)
     return _AttemptOutcome(
         result=result,
@@ -757,8 +765,6 @@ def _handle_failure(
     prepared: _PreparedAttempt,
     outcome: _AttemptOutcome,
 ) -> _FailureDecision:
-    from flash.providers.core.registry import get_provider
-    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
     ctx.raise_if_cancelled()
@@ -772,21 +778,22 @@ def _handle_failure(
 
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
-    managed_cache_mounted = bool(
-        outcome.chosen is not None
-        and outcome.run_spec is not None
-        and getattr(get_provider(outcome.chosen.provider), "supports_weight_cache", False)
-        and getattr(outcome.run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
-    )
-    plan = ctx.retry_state.decide_failure(
-        result.failure,
-        chosen=outcome.chosen,
-        candidates=outcome.candidates,
-        managed_cache_mounted=managed_cache_mounted,
-        attempt=prepared.attempt,
-    )
-    if not persist_retry_state(ctx.spec.run_id, ctx.retry_state):
-        raise RuntimeError("retry state could not be persisted")
+    decision = outcome.failure_decision
+    if not outcome.failure_decision_attempted:
+        decision = decide_failure_atomically(
+            ctx.spec.run_id,
+            ctx.spec,
+            expected_remote=dict(ctx.last_handle) if ctx.last_handle else None,
+            expected_retry_snapshot=prepared.retry_snapshot,
+            failure=result.failure,
+            chosen=outcome.chosen,
+            candidates=outcome.candidates,
+            attempt=prepared.attempt,
+        )
+    if decision is None:
+        return _FailureDecision(None, False, lost_ownership=True)
+    ctx.retry_state = decision.state
+    plan = decision.plan
     retry_delay = (
         _retry_delay(ctx, plan.infra_retry_ordinal)
         if plan.retry and outcome.candidate_not_started
@@ -807,8 +814,7 @@ def submit_seed_supervised(
     log,
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
-    attempt_start: int = 0,
-    retry_state: RetryState | None = None,
+    reserved_retry: tuple[int, str | None, int | None] | None = None,
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures."""
     if spec.algorithm == "opd":
@@ -823,25 +829,22 @@ def submit_seed_supervised(
         log,
         runtime_secrets,
         source_snapshot,
-        attempt_start,
-        retry_state,
+        reserved_retry,
     )
     _require_opd_configuration(ctx)
-    if ctx.retry_state.last_decision_retry is False:
-        raise RuntimeError(f"seed {seed} retry policy rejected replacement after restart")
-    for local_attempt in range(ctx.retry_state.max_attempts):
-        preparation = _prepare_attempt(ctx, local_attempt)
+    while True:
+        preparation = _prepare_attempt(ctx)
         if preparation.completed_metrics is not None:
             return ctx.return_completed_runpod_metrics(preparation.completed_metrics)
         prepared = preparation.prepared
         outcome = _run_attempt(ctx, prepared)
-        if outcome.stop:
-            break
         if outcome.result.ok:
             return _return_success_metrics(ctx, outcome)
         decision = _handle_failure(ctx, prepared, outcome)
         if decision.metrics is not None:
             return decision.metrics
+        if decision.lost_ownership:
+            raise RuntimeError(f"seed {seed} lost retry decision ownership")
         if not decision.retry:
             break
         if decision.retry_delay:

@@ -99,16 +99,52 @@ def _verified_opd_next_attempt(run_id: str) -> int:
     return _verified_opd_retry_state(run_id)[0]
 
 
+def _validate_attempt_reservation_from_raw(spec: JobSpec, raw: dict, attempt: int) -> None:
+    """Validate shared retry and opd gates for one locked reservation."""
+    from flash.runner.supervise.retry_decision import _require_retry_authorization_from_raw
+
+    _require_retry_authorization_from_raw(spec, raw, attempt)
+    if spec.algorithm != "opd":
+        return
+    try:
+        require_opd_retry_contract_version(raw.get(state._OPD_RETRY_CONTRACT_KEY))
+    except ValueError as exc:
+        raise RuntimeError(
+            "opd retry contract is missing or invalid; replacement is blocked"
+        ) from exc
+
+
+def _require_attempt_launch_current(
+    run_id: str,
+    spec: JobSpec,
+    attempt: int,
+    expected_retry_snapshot: dict,
+) -> None:
+    """Fence provider launch to the newest undecided reserved attempt."""
+    from flash.runner.supervise.retry_decision import RetryState
+
+    with state._status_guard(run_id):
+        raw = status_ops._load_status_json(run_id)
+        if raw.get("state") in state.TERMINAL_STATES:
+            raise RuntimeError("run became terminal before provider launch")
+        if raw.get("remote") is not None:
+            raise RuntimeError("run already has a durable provider handle")
+        if raw.get(state._RETRY_STATE_KEY) != expected_retry_snapshot:
+            raise RuntimeError("reserved attempt retry snapshot changed before provider launch")
+        if _infer_next_attempt(raw) - 1 != attempt:
+            raise RuntimeError("reserved attempt is no longer the newest provider launch")
+        _validate_attempt_reservation_from_raw(spec, raw, attempt)
+        retry_state = RetryState.from_snapshot(spec, expected_retry_snapshot)
+        if retry_state.persisted_plan(attempt) is not None:
+            raise RuntimeError("reserved attempt already has an immutable retry decision")
+
+
 def _reserve_attempt(
     run_id: str,
     *,
-    minimum_attempt: int = 0,
     expected_next_attempt: int | None = None,
 ) -> int:
-    """Durably consume one run-global attempt identity before provider creation."""
-    minimum = _attempt_int(minimum_attempt)
-    if minimum is None:
-        raise RuntimeError("minimum attempt identity is invalid")
+    """Durably reserve attempt zero or an exactly authorized replacement."""
     expected = None
     if expected_next_attempt is not None:
         expected = _attempt_int(expected_next_attempt)
@@ -117,24 +153,16 @@ def _reserve_attempt(
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
         status = status_ops._runstatus_from_json(raw)
+        if raw.get("remote") is not None:
+            raise RuntimeError("run already has a durable provider handle")
         current = _infer_next_attempt(raw)
         if expected is not None and current != expected:
             raise RuntimeError("stored next attempt identity changed after retry verification")
-        spec = JobSpec.from_dict(status.spec)
-        if spec.algorithm == "opd":
-            try:
-                require_opd_retry_contract_version(raw.get(state._OPD_RETRY_CONTRACT_KEY))
-            except ValueError as exc:
-                raise RuntimeError(
-                    "opd retry contract is missing or invalid; replacement is blocked"
-                ) from exc
-            if expected is None:
-                raise RuntimeError("opd attempt reservation requires verified retry evidence")
-            if minimum > expected:
-                raise RuntimeError("minimum opd attempt exceeds the verified retry snapshot")
-            attempt = expected
-        else:
-            attempt = max(current, minimum)
+        spec = state._internal_spec_from_status(status)
+        attempt = current
+        _validate_attempt_reservation_from_raw(spec, raw, attempt)
+        if spec.algorithm == "opd" and expected is None:
+            raise RuntimeError("opd attempt reservation requires verified retry evidence")
         if attempt >= MAX_ATTEMPT_ID:
             raise RuntimeError("run attempt identity is exhausted")
         state._save_status_unlocked(status, _next_attempt=attempt + 1)
