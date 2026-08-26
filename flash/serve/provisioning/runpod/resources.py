@@ -207,12 +207,15 @@ def pod_identity_matches(
             (pod.data_center_id, plan.placement.data_center_id),
         )
     )
+    # runpod may omit the optional mount field from responses. a present wrong path contradicts
+    # ownership, while readiness separately requires the exact path before probing a running pod.
     return (
         pod.name == plan.names.app_or_pod
         and pod.image_name == plan.bundle.image.reference
         and not placement_contradicts
         and pod.gpu_count == plan.placement.gpu_count
         and pod.container_disk_gb == plan.placement.container_disk_gb
+        and pod.volume_mount_path in {None, NETWORK_VOLUME_MOUNT}
         and not attachments_contradict
         and pod.ports == (PROXY_PORT_SPEC,)
     )

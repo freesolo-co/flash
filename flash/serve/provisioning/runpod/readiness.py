@@ -28,6 +28,7 @@ from flash.serve.provisioning.common.records import (
 )
 from flash.serve.provisioning.runpod.plan import RunPodCreatePlan
 from flash.serve.provisioning.runpod.protocol import (
+    NETWORK_VOLUME_MOUNT,
     RunPodObservation,
     RunPodPodObservation,
     RunPodSecretObservation,
@@ -218,6 +219,12 @@ def read_only_reconcile(
                 LifecycleFailure("conflict", reason="readiness_status_invalid"),
                 handle=last_handle,
             )
+        if state == "running" and pod.volume_mount_path != NETWORK_VOLUME_MOUNT:
+            return failure_result(
+                plan,
+                LifecycleFailure("conflict", reason="readiness_resource_conflict"),
+                handle=last_handle,
+            )
         if state == "failed":
             # same reasoning as the unproven case below: a terminal pod is only *definitely*
             # failed to a caller that can undo what it made. adoption and the read-only
@@ -311,7 +318,9 @@ def confirm_artifact_absence(
         try:
             observation = observe(plan)
             ensure_unique_resources(observation)
-            exact_core_resources(plan, observation)
+            _secret, _template, _volume, pod = exact_core_resources(plan, observation)
+            if pod.volume_mount_path != NETWORK_VOLUME_MOUNT:
+                return _Confirmation.CONFLICT
         except RunPodTransportFailure:
             if not sleep_until_poll(deadline_at, clock, sleep):
                 return _Confirmation.OBSERVATION_FAILED
@@ -361,6 +370,10 @@ def _await_stripped_resources(
         # exact template and pod whose artifact reference was present before the transition.
         if template.id != template_id or pod.id != pod_id:
             return _Confirmation.IDENTITY_DRIFT
+        if readiness_state(pod.desired_status) == "running" and (
+            pod.volume_mount_path != NETWORK_VOLUME_MOUNT
+        ):
+            return _Confirmation.CONFLICT
         resources_are_stripped = (
             template.environment == plan.environment_without_artifact
             and _pod_environment_is_stripped(plan, pod)

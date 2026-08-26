@@ -111,6 +111,9 @@ class RunPodPodObservation:
     gpu_count: int
     data_center_id: str | None
     container_disk_gb: int
+    # none when the provider omits the effective network volume mount path. ownership matching
+    # permits absence, while running readiness requires the exact authored path.
+    volume_mount_path: str | None
     # None when the selected pod has no nested network volume id. identity matching requires the
     # exact id while the pod is running and permits absence only after it releases its attachments.
     network_volume_id: str | None
@@ -409,6 +412,11 @@ def parse_pods(value: object, *, keep_name: str | None = None) -> tuple[RunPodPo
                 ),
                 container_disk_gb=_positive_int(
                     row.get("containerDiskInGb"), "pod containerDiskInGb"
+                ),
+                volume_mount_path=(
+                    None
+                    if row.get("volumeMountPath") is None
+                    else _string(row.get("volumeMountPath"), "pod volumeMountPath")
                 ),
                 network_volume_id=(
                     None

@@ -72,6 +72,14 @@ INFERENCE_SECRET = "inference-secret-sentinel"
 ARTIFACT_SECRET = "artifact-secret-sentinel"
 PROVIDER_PUBLIC_KEY = "ssh-rsa provider-managed"
 POD_ID = "abc123def4567"
+_MISSING_MOUNT_PATH = object()
+
+
+def _set_pod_mount_path(row: dict[str, object], value: object) -> None:
+    if value is _MISSING_MOUNT_PATH:
+        row.pop("volumeMountPath", None)
+    else:
+        row["volumeMountPath"] = value
 
 
 def _bundle() -> DeploymentBundle:
@@ -152,6 +160,7 @@ def test_profile_runpod_plan_preserves_exact_engine_storage_and_image(model_id: 
     assert pod["containerDiskInGb"] == profile.runpod_gpu.container_disk_gb
     assert pod["imageName"] == bundle.image.reference
     assert pod["networkVolumeId"] == "volume-01"
+    assert pod["volumeMountPath"] == NETWORK_VOLUME_MOUNT
     assert pod["templateId"] == "template-01"
     rendered = json.dumps((volume, template, pod), sort_keys=True)
     assert PROVIDER_SECRET not in rendered
@@ -541,6 +550,7 @@ class _FakeTransport:
                 },
                 "gpuCount": payload["gpuCount"],
                 "containerDiskInGb": payload["containerDiskInGb"],
+                "volumeMountPath": payload["volumeMountPath"],
                 "networkVolume": {"id": payload["networkVolumeId"]},
                 "templateId": payload["templateId"],
                 "ports": payload["ports"],
@@ -663,6 +673,30 @@ class _AmbiguousAbortDeleteTransport(_FakeTransport):
                 super()._delete(path)
             raise RunPodTransportFailure("resource_ambiguous", outcome_unknown=True)
         super()._delete(path)
+
+
+class _PostReadyMountOmissionTransport(_FakeTransport):
+    def rest(
+        self,
+        method,
+        path,
+        payload,
+        *,
+        mutation: bool,
+        deadline_at: float,
+        query=None,
+    ):
+        response = super().rest(
+            method,
+            path,
+            payload,
+            mutation=mutation,
+            deadline_at=deadline_at,
+            query=query,
+        )
+        if method == "PATCH" and path == f"/pods/{POD_ID}":
+            self.pods[0].pop("volumeMountPath", None)
+        return response
 
 
 class _IgnoredPostReadyPodPatchTransport(_FakeTransport):
@@ -915,6 +949,7 @@ def _seed_exact(
         },
         "gpuCount": pod_request["gpuCount"],
         "containerDiskInGb": pod_request["containerDiskInGb"],
+        "volumeMountPath": pod_request["volumeMountPath"],
         "networkVolume": {"id": pod_request["networkVolumeId"]},
         "templateId": pod_request["templateId"],
         "ports": pod_request["ports"],
@@ -1147,6 +1182,12 @@ def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:
     ]
     assert transport.pods[0]["ports"] == [PROXY_PORT_SPEC]
     assert transport.pods[0]["imageName"] == bundle.image.reference
+    pod_create = next(
+        payload
+        for kind, operation, mutation, payload in transport.calls
+        if (kind, operation, mutation) == ("rest", "POST /pods", True)
+    )
+    assert pod_create["volumeMountPath"] == NETWORK_VOLUME_MOUNT
     assert transport.templates[0]["imageName"] == bundle.image.reference
     # argv, not a joined string: runpod types dockerStartCmd as array<string> in its rest schema
     # and returns it that way, and env as an object rather than a list of {key, value} rows.
@@ -1178,6 +1219,59 @@ def test_exact_happy_create_uses_one_pod_digest_volume_and_proxy_url() -> None:
         ("rest", f"PATCH /pods/{POD_ID}"),
         ("graphql", "secretDelete"),
     ]
+
+
+@pytest.mark.parametrize(
+    "returned_mount_path",
+    [
+        pytest.param(_MISSING_MOUNT_PATH, id="omitted"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_create_preserves_the_pod_id_and_cleans_up_when_mount_path_is_unreported(
+    returned_mount_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    original_create = transport._create
+
+    def create(path: str, payload: dict[str, object]) -> dict[str, object]:
+        response = original_create(path, payload)
+        if path == "/pods":
+            _set_pod_mount_path(response, returned_mount_path)
+            _set_pod_mount_path(transport.pods[0], returned_mount_path)
+        return response
+
+    monkeypatch.setattr(transport, "_create", create)
+
+    result, _factory, probe = _provision(bundle, transport)
+
+    assert result.status == "failed"
+    assert result.error_code == "conflict"
+    assert result.error_reason == "readiness_resource_conflict"
+    assert probe.calls == []
+    assert transport.pods == []
+    assert transport.templates == []
+    assert transport.volumes == []
+    assert transport.secrets == []
+    mutations = [call[1] for call in _mutation_calls(transport)]
+    assert "POST /pods" in mutations
+    assert f"DELETE /pods/{POD_ID}" in mutations
+
+
+def test_post_patch_probe_requires_the_exact_mount_path() -> None:
+    bundle = _bundle()
+    transport = _PostReadyMountOmissionTransport()
+    probe = _Probe(True)
+
+    result, _factory, _probe = _provision(bundle, transport, probe=probe)
+
+    assert result.status == "outcome_unknown"
+    assert result.error_code == "resource_ambiguous"
+    assert result.error_reason == "artifact_cleanup_conflict"
+    assert len(probe.calls) == 1
+    assert transport.pods
 
 
 def test_secret_sentinels_are_confined_to_exact_request_sinks() -> None:
@@ -1529,6 +1623,41 @@ def test_identity_reclaim_complete_set_uses_fast_path_without_waiting() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "observed_mount_path",
+    [
+        pytest.param(_MISSING_MOUNT_PATH, id="omitted"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_identity_reclaim_tears_down_a_released_pod_with_unreported_mount_path(
+    observed_mount_path: object,
+) -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    _seed_exact(transport, bundle, status="EXITED", artifact_secret=True)
+    _set_pod_mount_path(transport.pods[0], observed_mount_path)
+    transport.pods[0].pop("networkVolume", None)
+    transport.pods[0].pop("templateId", None)
+    transport.calls.clear()
+
+    result = teardown_runpod_deployment(
+        bundle,
+        None,
+        RunPodCredentials(PROVIDER_SECRET),
+        deadline_at=100.0,
+        transport_factory=_Factory(transport),
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert result.status == "absent"
+    assert transport.pods == []
+    assert transport.volumes == []
+    assert transport.templates == []
+    assert transport.secrets == []
+
+
 def test_identity_reclaim_deletes_an_incomplete_late_visible_volume() -> None:
     bundle = _bundle()
     transport = _LateVisibleAmbiguousVolumeTransport()
@@ -1774,6 +1903,7 @@ def test_reconcile_is_read_only_and_reports_ready_or_absent() -> None:
     )
     assert ready.status == "ready"
     assert ready.handle == handle
+    assert transport.pods[0]["volumeMountPath"] == NETWORK_VOLUME_MOUNT
     assert _mutation_calls(transport) == []
 
     transport.secrets.clear()
@@ -1792,6 +1922,86 @@ def test_reconcile_is_read_only_and_reports_ready_or_absent() -> None:
         sleep=clock.sleep,
     )
     assert absent.status == "absent"
+    assert _mutation_calls(transport) == []
+
+
+@pytest.mark.parametrize(
+    ("observed_mount_path", "expected_status", "recognizes_owner"),
+    [
+        pytest.param(_MISSING_MOUNT_PATH, "failed", True, id="omitted"),
+        pytest.param(None, "failed", True, id="null"),
+        pytest.param("/workspace", "failed", False, id="workspace"),
+        pytest.param("/wrong-volume-path", "failed", False, id="wrong"),
+        pytest.param(NETWORK_VOLUME_MOUNT, "ready", True, id="exact"),
+    ],
+)
+def test_running_reconcile_requires_the_exact_pod_network_volume_mount_path(
+    observed_mount_path: object,
+    expected_status: str,
+    recognizes_owner: bool,
+) -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle)
+    _set_pod_mount_path(transport.pods[0], observed_mount_path)
+    transport.calls.clear()
+    probe = _Probe(True)
+
+    result = reconcile_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        ServingRuntimeSecrets(INFERENCE_SECRET),
+        deadline_at=100.0,
+        transport_factory=_Factory(transport),
+        probe=probe,
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert result.status == expected_status
+    assert result.error_code == (None if expected_status == "ready" else "conflict")
+    assert result.error_reason == (
+        None if expected_status == "ready" else "readiness_resource_conflict"
+    )
+    assert result.handle == (handle if recognizes_owner else None)
+    assert len(probe.calls) == int(expected_status == "ready")
+    assert _mutation_calls(transport) == []
+
+
+@pytest.mark.parametrize(
+    "observed_mount_path",
+    [
+        pytest.param(_MISSING_MOUNT_PATH, id="omitted"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_pending_reconcile_recognizes_an_unreported_mount_path(
+    observed_mount_path: object,
+) -> None:
+    bundle = _bundle()
+    transport = _FakeTransport()
+    handle = _seed_exact(transport, bundle, status="PENDING")
+    _set_pod_mount_path(transport.pods[0], observed_mount_path)
+    transport.pods[0].pop("machine", None)
+    transport.pods[0].pop("networkVolume", None)
+    transport.pods[0].pop("templateId", None)
+    transport.calls.clear()
+    probe = _Probe(True)
+
+    result = reconcile_runpod_deployment(
+        bundle,
+        RunPodCredentials(PROVIDER_SECRET),
+        None,
+        deadline_at=100.0,
+        transport_factory=_Factory(transport),
+        probe=probe,
+        clock=transport.clock,
+        sleep=transport.clock.sleep,
+    )
+
+    assert result.status == "provisioning"
+    assert result.handle == handle
+    assert probe.calls == []
     assert _mutation_calls(transport) == []
 
 
@@ -3035,11 +3245,22 @@ def test_teardown_that_cannot_prove_the_pod_is_gone_is_unknown_not_failed() -> N
     assert transport.pods != []
 
 
-@pytest.mark.parametrize("status", ["STOPPED", "FAILED"])
-def test_teardown_accepts_exact_pods_in_nonready_statuses(status: str) -> None:
+@pytest.mark.parametrize("status", ["RUNNING", "STOPPED", "FAILED"])
+@pytest.mark.parametrize(
+    "observed_mount_path",
+    [
+        pytest.param(_MISSING_MOUNT_PATH, id="omitted"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_exact_handle_teardown_accepts_running_and_terminal_pods_with_unreported_mount_path(
+    status: str,
+    observed_mount_path: object,
+) -> None:
     bundle = _bundle()
     transport = _FakeTransport()
     handle = _seed_exact(transport, bundle, status=status)
+    _set_pod_mount_path(transport.pods[0], observed_mount_path)
     factory = _Factory(transport)
     clock = transport.clock
     transport.calls.clear()
@@ -3056,6 +3277,12 @@ def test_teardown_accepts_exact_pods_in_nonready_statuses(status: str) -> None:
     assert result.status == "absent"
     assert transport.pods == []
     assert transport.volumes == []
+    assert [call[1] for call in _mutation_calls(transport)] == [
+        f"DELETE /pods/{POD_ID}",
+        "DELETE /templates/template01",
+        "DELETE /networkvolumes/volume01",
+        "secretDelete",
+    ]
 
 
 def test_teardown_rejects_wrong_generation_handle_before_client() -> None:
@@ -3473,6 +3700,7 @@ def test_pod_observation_reads_the_nested_shape_runpods_rest_api_returns() -> No
                 "imageName": "ghcr.io/org/image@sha256:" + "0" * 64,
                 "gpuCount": 1,
                 "containerDiskInGb": 60,
+                "volumeMountPath": NETWORK_VOLUME_MOUNT,
                 "ports": ["8000/http"],
                 "env": {"B": "2", "A": "1"},
                 "templateId": "tpl0000001",
@@ -3483,6 +3711,7 @@ def test_pod_observation_reads_the_nested_shape_runpods_rest_api_returns() -> No
     )
     assert nested[0].gpu_type_id == "NVIDIA L4"
     assert nested[0].data_center_id == "US-KS-2"
+    assert nested[0].volume_mount_path == NETWORK_VOLUME_MOUNT
     assert nested[0].network_volume_id == "vol0000001"
     assert nested[0].environment == (("A", "1"), ("B", "2"))
 
@@ -3503,9 +3732,29 @@ def test_pod_observation_reads_the_nested_shape_runpods_rest_api_returns() -> No
             }
         ]
     )
+    assert bare[0].volume_mount_path is None
     assert bare[0].network_volume_id is None
     assert bare[0].template_id is None
     assert bare[0].environment == ()
+
+
+@pytest.mark.parametrize("mount_path", ["", " ", " /runpod-volume", "/runpod-volume ", 7, True])
+def test_pod_observation_rejects_malformed_present_mount_paths(mount_path: object) -> None:
+    with pytest.raises(ValueError, match="pod volumeMountPath must be a nonempty unpadded string"):
+        parse_pods(
+            [
+                {
+                    "id": "abc123def45679",
+                    "name": "malformed-mount",
+                    "desiredStatus": "PENDING",
+                    "imageName": "pytorch/pytorch:2.6.0",
+                    "gpuCount": 1,
+                    "containerDiskInGb": 300,
+                    "volumeMountPath": mount_path,
+                    "ports": ["8000/http"],
+                }
+            ]
+        )
 
 
 def test_a_pod_awaiting_placement_is_still_recognized_as_ours() -> None:
@@ -3529,6 +3778,7 @@ def test_a_pod_awaiting_placement_is_still_recognized_as_ours() -> None:
         "imageName": plan.bundle.image.reference,
         "gpuCount": plan.placement.gpu_count,
         "containerDiskInGb": plan.placement.container_disk_gb,
+        "volumeMountPath": NETWORK_VOLUME_MOUNT,
         "ports": ["8000/http"],
         "templateId": "tpl0000001",
         "networkVolume": {"id": "vol0000001"},
@@ -3595,6 +3845,7 @@ def test_a_pod_that_has_released_its_machine_still_matches_for_teardown() -> Non
         "imageName": plan.bundle.image.reference,
         "gpuCount": plan.placement.gpu_count,
         "containerDiskInGb": plan.placement.container_disk_gb,
+        "volumeMountPath": NETWORK_VOLUME_MOUNT,
         "ports": ["8000/http"],
         "machine": {
             "gpuTypeId": plan.placement.gpu_type_id,
@@ -3627,6 +3878,42 @@ def test_a_pod_that_has_released_its_machine_still_matches_for_teardown() -> Non
     assert not _matches(
         desiredStatus="EXITED",
         **{**attached, "networkVolume": {"id": "vol0000002"}},
+    )
+
+
+@pytest.mark.parametrize("status", ["PENDING", "RUNNING", "EXITED"])
+@pytest.mark.parametrize("mount_path", ["/workspace", "/wrong-volume-path"])
+def test_a_present_wrong_mount_path_conflicts_in_every_lifecycle_state(
+    status: str,
+    mount_path: str,
+) -> None:
+    plan = build_runpod_create_plan(_bundle())
+    pod = parse_pods(
+        [
+            {
+                "id": "abc123def45682",
+                "name": plan.names.app_or_pod,
+                "desiredStatus": status,
+                "imageName": plan.bundle.image.reference,
+                "gpuCount": plan.placement.gpu_count,
+                "containerDiskInGb": plan.placement.container_disk_gb,
+                "volumeMountPath": mount_path,
+                "ports": [PROXY_PORT_SPEC],
+                "machine": {
+                    "gpuTypeId": plan.placement.gpu_type_id,
+                    "dataCenterId": plan.placement.data_center_id,
+                },
+                "templateId": "tpl0000001",
+                "networkVolume": {"id": "vol0000001"},
+            }
+        ]
+    )[0]
+
+    assert not pod_identity_matches(
+        plan,
+        pod,
+        template_id="tpl0000001",
+        volume_id="vol0000001",
     )
 
 

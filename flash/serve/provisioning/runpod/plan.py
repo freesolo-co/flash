@@ -202,6 +202,7 @@ def build_runpod_create_plan(bundle: DeploymentBundle) -> RunPodCreatePlan:
         "imageName": bundle.image.reference,
         "name": names.app_or_pod,
         "ports": [PROXY_PORT_SPEC],
+        "volumeMountPath": NETWORK_VOLUME_MOUNT,
     }
     return RunPodCreatePlan(
         bundle=bundle,
