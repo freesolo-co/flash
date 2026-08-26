@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import builtins
 import copyreg
+import dis
 import email.message
 import functools
 import gc
+import http.cookiejar
 import io
 import os
 import ssl
@@ -150,7 +152,7 @@ def test_installed_https_handler_copy_preserves_context_and_state() -> None:
 
     class RecordingHttpsHandler(urllib.request.HTTPSHandler):
         def https_open(self, request):
-            observed.append((self, self._context, self.debuglevel))
+            observed.append((self.parent, self._context, self.debuglevel))
             return _response(request.full_url)
 
     handler = RecordingHttpsHandler(context=context)
@@ -251,6 +253,36 @@ def test_default_opener_discovers_proxy_environment_on_first_request(monkeypatch
         assert response.read() == b"ok"
 
     assert observed == [("late-proxy.invalid:8080", "source.invalid")]
+
+
+def test_installed_cookie_processor_with_rlock_state_is_supported() -> None:
+    cookie_jar = http.cookiejar.CookieJar()
+    observed: list[object] = []
+
+    class TerminalHandler(urllib.request.BaseHandler):
+        handler_order = 1000
+
+        def custom_open(self, request):
+            copied_cookie = next(
+                item
+                for item in self.parent.handlers
+                if isinstance(item, urllib.request.HTTPCookieProcessor)
+            )
+            observed.append(copied_cookie.cookiejar)
+            return _response(request.full_url)
+
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cookie_jar),
+        TerminalHandler(),
+    )
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+
+    assert observed == [cookie_jar]
 
 
 def test_installed_addheaders_are_copied_and_isolated() -> None:
@@ -664,7 +696,13 @@ def test_installed_digest_handler_state_survives_across_requests() -> None:
         def https_open(self, request):
             authorization = request.get_header("Authorization")
             if authorization:
-                seen_nonce_counts.append(digest_copy(self).nonce_count)
+                seen_nonce_counts.append(
+                    next(
+                        item
+                        for item in self.parent.handlers
+                        if isinstance(item, urllib.request.HTTPDigestAuthHandler)
+                    ).nonce_count
+                )
                 return _response(request.full_url)
             headers = email.message.Message()
             headers["WWW-Authenticate"] = (
@@ -675,13 +713,6 @@ def test_installed_digest_handler_state_survives_across_requests() -> None:
             )
             response.msg = "unauthorized"
             return response
-
-    def digest_copy(handler):
-        return next(
-            item
-            for item in handler.parent.handlers
-            if isinstance(item, urllib.request.HTTPDigestAuthHandler)
-        )
 
     opener = urllib.request.build_opener(DigestSource(), slot_configuration, digest)
     urllib.request.install_opener(opener)
@@ -1125,6 +1156,63 @@ def test_resetting_installed_opener_releases_cached_original() -> None:
     assert opener_ref() is None
 
 
+def test_non_none_install_releases_cached_openers_immediately() -> None:
+    class TerminalHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            return _response(request.full_url)
+
+    first = urllib.request.build_opener(TerminalHandler())
+    urllib.request.install_opener(first)
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/first"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    first_ref = weakref.ref(first)
+    first_private_ref = weakref.ref(first_private)
+
+    urllib.request.install_opener(urllib.request.build_opener(TerminalHandler()))
+    del first
+    del first_private
+    gc.collect()
+
+    assert http_transport._INSTALLED_OPENER_CACHE is None
+    assert first_ref() is None
+    assert first_private_ref() is None
+
+
+def test_saved_install_alias_replacement_does_not_reuse_stale_cache() -> None:
+    observed: list[str] = []
+
+    class TerminalHandler(urllib.request.BaseHandler):
+        def __init__(self, name: str):
+            self.name = name
+
+        def custom_open(self, request):
+            observed.append(self.name)
+            return _response(request.full_url)
+
+    saved_install_opener = http_transport._STDLIB_INSTALL_OPENER
+    first = urllib.request.build_opener(TerminalHandler("first"))
+    second = urllib.request.build_opener(TerminalHandler("second"))
+    urllib.request.install_opener(first)
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/first"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+
+    saved_install_opener(second)
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/second"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+
+    assert observed == ["first", "second"]
+    assert http_transport._INSTALLED_OPENER_CACHE.installed is second
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
+
+
 def test_replaced_installed_opener_is_observed() -> None:
     observed: list[str] = []
 
@@ -1372,6 +1460,31 @@ def test_explicit_global_urlopen_is_compared_against_one_snapshot(monkeypatch) -
 
     assert reads == 1
     assert calls == ["opener"]
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+def test_builtin_bound_method_retaining_target_fails_before_transport(target_kind: str) -> None:
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener(handler)
+    target = handler if target_kind == "handler" else opener
+    holder = [target]
+    handler.callback = holder.append
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+    assert holder == [target]
 
 
 def test_copied_handler_callback_bound_to_original_fails_before_transport() -> None:
@@ -2563,6 +2676,33 @@ def test_handler_snapshot_global_budget_fails_before_transport(monkeypatch) -> N
     assert contacted == []
 
 
+def test_handler_state_snapshot_limit_fails_before_transport() -> None:
+    contacted: list[str] = []
+
+    class BroadHolder:
+        pass
+
+    class BroadHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    holder = BroadHolder()
+    for index in range(257):
+        holder.__dict__[f"state_{index}"] = index
+    handler = BroadHandler()
+    handler.holder = holder
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
 def test_unsnapshotable_installed_handler_fails_before_transport() -> None:
     contacted: list[str] = []
 
@@ -2714,6 +2854,505 @@ def test_class_registered_callback_retaining_target_fails_before_transport(
     assert contacted == []
 
 
+def test_saved_install_alias_reset_rediscovers_https_proxy(monkeypatch) -> None:
+    observed: list[tuple[str, str | None]] = []
+
+    def fake_https_open(self, request):
+        observed.append((request.host, request._tunnel_host))
+        return _response(request.full_url)
+
+    saved_install_opener = http_transport._STDLIB_INSTALL_OPENER
+    monkeypatch.setattr(urllib.request.HTTPSHandler, "https_open", fake_https_open)
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("HTTPS_PROXY", "http://first-proxy.invalid:8080")
+    with _urlopen_no_redirect(urllib.request.Request("https://source.invalid/first"), timeout=1.0):
+        pass
+
+    saved_install_opener(None)
+    monkeypatch.setenv("HTTPS_PROXY", "http://second-proxy.invalid:8080")
+    with _urlopen_no_redirect(urllib.request.Request("https://source.invalid/second"), timeout=1.0):
+        pass
+
+    assert observed == [
+        ("first-proxy.invalid:8080", "source.invalid"),
+        ("second-proxy.invalid:8080", "source.invalid"),
+    ]
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+@pytest.mark.parametrize("state_kind", ["direct", "inherited", "mangled"])
+def test_class_callback_bound_self_state_retaining_target_fails_before_transport(
+    target_kind: str,
+    state_kind: str,
+) -> None:
+    contacted: list[str] = []
+
+    class CallbackBase(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            retained = self.retry_state
+            contacted.append(request.full_url)
+            raise AssertionError(retained)
+
+        def privateopen(self, request):
+            retained = self.__retry_state
+            contacted.append(request.full_url)
+            raise AssertionError(retained)
+
+    class CallbackHandler(CallbackBase):
+        pass
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener()
+    target = handler if target_kind == "handler" else opener
+    if state_kind == "direct":
+        type.__setattr__(CallbackHandler, "retry_state", target)
+    elif state_kind == "inherited":
+        type.__setattr__(CallbackBase, "retry_state", target)
+    else:
+        type.__setattr__(CallbackBase, "_CallbackBase__retry_state", target)
+        type.__setattr__(CallbackBase, "custom_open", CallbackBase.privateopen)
+    opener.add_handler(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+def test_class_callback_direct_self_attribute_is_supported() -> None:
+    class CallbackHandler(urllib.request.BaseHandler):
+        token = b"safe"
+
+        def custom_open(self, request):
+            return _response(request.full_url, self.token)
+
+    opener = urllib.request.build_opener(CallbackHandler())
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"safe"
+
+
+def test_class_callback_instance_state_shadows_non_data_descriptor() -> None:
+    descriptor_calls: list[str] = []
+
+    class ShadowedDescriptor:
+        def __get__(self, instance, owner=None):
+            descriptor_calls.append("get")
+            return b"unsafe"
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        token = ShadowedDescriptor()
+
+        def custom_open(self, request):
+            return _response(request.full_url, self.token)
+
+    handler = CallbackHandler()
+    object.__getattribute__(handler, "__dict__")["token"] = b"safe"
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"safe"
+
+    assert descriptor_calls == []
+
+
+def test_class_callback_direct_self_parent_is_supported() -> None:
+    observed: list[object] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            observed.append(self.parent)
+            return _response(request.full_url)
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+
+    assert observed == [http_transport._INSTALLED_OPENER_CACHE.private]
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+def test_class_callback_parent_data_descriptor_fails_without_execution(
+    target_kind: str,
+) -> None:
+    descriptor_calls: list[str] = []
+    callback_calls: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            callback_calls.append(request.full_url)
+            return self.parent
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener(handler)
+    target = handler if target_kind == "handler" else opener
+
+    class ParentTrap:
+        def __get__(self, instance, owner=None):
+            descriptor_calls.append("get")
+            return target
+
+        def __set__(self, instance, value):
+            descriptor_calls.append("set")
+
+    type.__setattr__(CallbackHandler, "parent", ParentTrap())
+    descriptor_calls.clear()
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert descriptor_calls == []
+    assert callback_calls == []
+
+
+@pytest.mark.parametrize("callback_kind", ["bare", "attribute"])
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+def test_class_callback_conditional_delete_bound_self_fails_before_transport(
+    callback_kind: str,
+    target_kind: str,
+) -> None:
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        if callback_kind == "bare":
+
+            def custom_open(self, request):
+                if request is None:
+                    del self
+                contacted.append(request.full_url)
+                return self
+
+        else:
+
+            def custom_open(self, request):
+                if request is None:
+                    del self
+                contacted.append(request.full_url)
+                return self.retry_state
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener()
+    target = handler if target_kind == "handler" else opener
+    type.__setattr__(CallbackHandler, "retry_state", target)
+    opener.add_handler(handler)
+    urllib.request.install_opener(opener)
+
+    if sys.version_info >= (3, 12):
+        assert "LOAD_FAST_CHECK" in {
+            instruction.opname for instruction in dis.get_instructions(CallbackHandler.custom_open)
+        }
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_class_callback_bound_self_alias_retaining_target_fails_before_transport(
+    target_kind: str,
+    nested: bool,
+) -> None:
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        if nested:
+
+            def custom_open(self, request):
+                alias = self
+
+                def read_state():
+                    return alias.retry_state
+
+                contacted.append(request.full_url)
+                return read_state()
+
+        else:
+
+            def custom_open(self, request):
+                alias = self
+                contacted.append(request.full_url)
+                return alias.retry_state
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener()
+    target = handler if target_kind == "handler" else opener
+    type.__setattr__(CallbackHandler, "retry_state", target)
+    opener.add_handler(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+def test_class_callback_bound_self_chained_alias_fails_before_transport(
+    target_kind: str,
+) -> None:
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            first = second = self
+            contacted.append(request.full_url)
+            return (first, second)[0].retry_state
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener()
+    target = handler if target_kind == "handler" else opener
+    type.__setattr__(CallbackHandler, "retry_state", target)
+    opener.add_handler(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+def test_class_callback_bound_self_nested_positional_default_fails_before_transport(
+    target_kind: str,
+) -> None:
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            def read_state(bound=self):
+                return bound.retry_state
+
+            contacted.append(request.full_url)
+            return read_state()
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener()
+    target = handler if target_kind == "handler" else opener
+    type.__setattr__(CallbackHandler, "retry_state", target)
+    opener.add_handler(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+def test_class_callback_bound_self_alias_loop_backedge_fails_before_transport(
+    target_kind: str,
+) -> None:
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            initial = object()
+            alias = initial
+            for alias in (initial, self):
+                if alias is initial:
+                    continue
+            contacted.append(request.full_url)
+            return alias.retry_state
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener()
+    target = handler if target_kind == "handler" else opener
+    type.__setattr__(CallbackHandler, "retry_state", target)
+    opener.add_handler(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+@pytest.mark.parametrize("loop_position", ["inside", "after"])
+def test_class_callback_bound_self_loop_alias_with_exception_fails_before_transport(
+    target_kind: str,
+    loop_position: str,
+) -> None:
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        if loop_position == "inside":
+
+            def custom_open(self, request):
+                try:
+                    for alias in (object(), self):
+                        marker = alias
+                finally:
+                    marker = None
+                contacted.append(request.full_url)
+                return (alias, marker)[0].retry_state
+
+        else:
+
+            def custom_open(self, request):
+                try:
+                    marker = None
+                except Exception:
+                    marker = object()
+                for alias in (object(), self):
+                    marker = alias
+                contacted.append(request.full_url)
+                return (alias, marker)[0].retry_state
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener()
+    target = handler if target_kind == "handler" else opener
+    type.__setattr__(CallbackHandler, "retry_state", target)
+    opener.add_handler(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+def test_class_callback_bound_self_nested_kwdefault_fails_before_transport(
+    target_kind: str,
+) -> None:
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            def read_state(*, bound=self):
+                return bound.retry_state
+
+            contacted.append(request.full_url)
+            return read_state()
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener()
+    target = handler if target_kind == "handler" else opener
+    type.__setattr__(CallbackHandler, "retry_state", target)
+    opener.add_handler(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+def test_class_callback_bound_self_alias_descriptor_fails_without_execution(
+    target_kind: str,
+) -> None:
+    descriptor_calls: list[str] = []
+    contacted: list[str] = []
+
+    class TrapDescriptor:
+        def __get__(self, instance, owner=None):
+            descriptor_calls.append("get")
+            return handler if target_kind == "handler" else opener
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        retry_state = TrapDescriptor()
+
+        def custom_open(self, request):
+            alias = self
+            contacted.append(request.full_url)
+            return alias.retry_state
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert descriptor_calls == []
+    assert contacted == []
+
+
+def test_class_callback_bound_self_descriptor_fails_without_execution() -> None:
+    descriptor_calls: list[str] = []
+    contacted: list[str] = []
+
+    class TrapDescriptor:
+        def __get__(self, instance, owner=None):
+            descriptor_calls.append("get")
+            return instance
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        retry_state = TrapDescriptor()
+
+        def custom_open(self, request):
+            contacted.append(request.full_url)
+            return self.retry_state
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert descriptor_calls == []
+    assert contacted == []
+
+
+def test_non_none_install_releases_active_default_private_opener() -> None:
+    urllib.request.install_opener(None)
+    with _urlopen_no_redirect(
+        urllib.request.Request("data:text/plain,default-private"), timeout=1.0
+    ) as response:
+        assert response.read() == b"default-private"
+    default_private = http_transport._DEFAULT_NO_REDIRECT_OPENER
+    default_private_ref = weakref.ref(default_private)
+
+    replacement = urllib.request.build_opener()
+    urllib.request.install_opener(replacement)
+    del default_private
+    gc.collect()
+
+    assert default_private_ref() is None
+    assert http_transport._DEFAULT_NO_REDIRECT_OPENER is None
+    assert http_transport._INSTALLED_OPENER_CACHE is None
+
+
 def test_default_opener_reset_rediscovers_environment_and_releases_identity(monkeypatch) -> None:
     observed: list[tuple[str, str | None]] = []
 
@@ -2745,6 +3384,312 @@ def test_default_opener_reset_rediscovers_environment_and_releases_identity(monk
     assert second is not first_ref()
     assert first_ref() is None
     assert http_transport._INSTALLED_OPENER_CACHE is None
+
+
+@pytest.mark.parametrize("declaration_type", [set, frozenset])
+def test_set_declared_slot_holder_safe_state_is_supported(declaration_type) -> None:
+    class SlotHolder:
+        __slots__ = declaration_type({"token"})
+
+    class HolderHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            return _response(request.full_url, self.holder.token.encode())
+
+    holder = SlotHolder()
+    holder.token = "safe"
+    handler = HolderHandler()
+    handler.holder = holder
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"safe"
+
+
+@pytest.mark.parametrize("declaration_type", [set, frozenset])
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+def test_set_declared_slot_holder_retaining_target_fails_before_transport(
+    declaration_type,
+    target_kind: str,
+) -> None:
+    contacted: list[str] = []
+
+    class SlotHolder:
+        __slots__ = declaration_type({"target"})
+
+    class HolderHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = HolderHandler()
+    opener = urllib.request.build_opener(handler)
+    holder = SlotHolder()
+    holder.target = handler if target_kind == "handler" else opener
+    handler.holder = holder
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+def test_all_underscore_owner_private_slot_retaining_target_fails_before_transport(
+    target_kind: str,
+) -> None:
+    contacted: list[str] = []
+
+    holder_type = type("_", (), {"__slots__": ("__target",)})
+
+    class HolderHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = HolderHandler()
+    opener = urllib.request.build_opener(handler)
+    holder = holder_type()
+    holder.__target = handler if target_kind == "handler" else opener
+    handler.holder = holder
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+def test_all_underscore_owner_private_slot_safe_state_is_supported() -> None:
+    holder_type = type("_", (), {"__slots__": ("__token",)})
+
+    class HolderHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            return _response(request.full_url, b"safe")
+
+    handler = HolderHandler()
+    holder = holder_type()
+    holder.__token = "safe"
+    handler.holder = holder
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"safe"
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_slot_only_holder_state_retaining_target_fails_before_transport(
+    target_kind: str,
+    nested: bool,
+) -> None:
+    contacted: list[str] = []
+
+    class SlotBase:
+        __slots__ = ("__target",)
+
+        def __init__(self, target):
+            self.__target = target
+
+    class SlotHolder(SlotBase):
+        __slots__ = ()
+
+    class NestedHolder:
+        __slots__ = ("state",)
+
+    class HolderHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = HolderHandler()
+    opener = urllib.request.build_opener(handler)
+    target = handler if target_kind == "handler" else opener
+    retained = SlotHolder(target)
+    if nested:
+        holder = NestedHolder()
+        holder.state = {"nested": [retained]}
+    else:
+        holder = retained
+    handler.holder = holder
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+def test_slot_only_holder_bound_method_retaining_target_fails_before_transport(
+    target_kind: str,
+) -> None:
+    hook_calls: list[str] = []
+
+    class SlotHolder:
+        __slots__ = ("target",)
+
+        def callback(self, request):
+            hook_calls.append(request.full_url)
+            return _response(request.full_url)
+
+    class HolderHandler(urllib.request.BaseHandler):
+        pass
+
+    handler = HolderHandler()
+    opener = urllib.request.build_opener()
+    holder = SlotHolder()
+    holder.target = handler if target_kind == "handler" else opener
+    handler.custom_open = holder.callback
+    opener.add_handler(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert hook_calls == []
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+@pytest.mark.parametrize("capture_kind", ["global", "default", "closure"])
+def test_function_slot_only_holder_retaining_target_fails_before_transport(
+    target_kind: str,
+    capture_kind: str,
+) -> None:
+    contacted: list[str] = []
+
+    class SlotHolder:
+        __slots__ = ("target",)
+
+    class HolderHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = HolderHandler()
+    opener = urllib.request.build_opener(handler)
+    holder = SlotHolder()
+    holder.target = handler if target_kind == "handler" else opener
+    if capture_kind == "global":
+        module_code = compile(
+            "def callback():\n    return retained_holder\n",
+            "<handler-global-slot-holder-callback>",
+            "exec",
+        )
+        callback_code = next(item for item in module_code.co_consts if type(item) is types.CodeType)
+        callback = types.FunctionType(
+            callback_code,
+            {"retained_holder": holder},
+            "callback",
+        )
+    elif capture_kind == "default":
+
+        def callback(retained_holder=holder):
+            return retained_holder
+
+    else:
+        retained_holder = holder
+
+        def callback():
+            return retained_holder
+
+    handler.callback = callback
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("hook_name", ["__getattribute__", "__getattr__"])
+def test_slot_only_holder_lookup_hooks_fail_closed_without_execution(hook_name: str) -> None:
+    contacted: list[str] = []
+    hook_calls: list[str] = []
+
+    def lookup_hook(self, name):
+        hook_calls.append(name)
+        if hook_name == "__getattribute__":
+            return object.__getattribute__(self, name)
+        raise AttributeError(name)
+
+    class SlotHolder:
+        __slots__ = ("target",)
+
+    type.__setattr__(SlotHolder, hook_name, lookup_hook)
+
+    class HolderHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = HolderHandler()
+    opener = urllib.request.build_opener(handler)
+    holder = SlotHolder()
+    holder.target = handler
+    handler.holder = holder
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert hook_calls == []
+    assert contacted == []
+
+
+def test_shadowed_slot_descriptor_fails_closed_without_execution() -> None:
+    contacted: list[str] = []
+    descriptor_calls: list[str] = []
+
+    class TrapDescriptor:
+        def __get__(self, instance, owner=None):
+            descriptor_calls.append("get")
+            return instance
+
+        def __set__(self, instance, value):
+            descriptor_calls.append("set")
+
+    class SlotHolder:
+        __slots__ = ("target",)
+
+    class HolderHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = HolderHandler()
+    opener = urllib.request.build_opener(handler)
+    holder = SlotHolder()
+    holder.target = handler
+    type.__setattr__(SlotHolder, "target", TrapDescriptor())
+    handler.holder = holder
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert descriptor_calls == []
+    assert contacted == []
 
 
 def test_uncopyable_installed_handler_fails_before_transport() -> None:

@@ -17,6 +17,7 @@ from typing import Any
 from .http_refs import (
     _SNAPSHOT_ITEMS_MAX,
     _TRAVERSAL_NODES_MAX,
+    _function_reference_values,
     _getattr_type_static,
 )
 from .http_refs import (
@@ -182,9 +183,8 @@ def _install_opener_with_cache_reset(opener) -> None:
 
     with _OPENER_LOCK:
         _STDLIB_INSTALL_OPENER(opener)
-        if opener is None:
-            _DEFAULT_NO_REDIRECT_OPENER = None
-            _INSTALLED_OPENER_CACHE = None
+        _DEFAULT_NO_REDIRECT_OPENER = None
+        _INSTALLED_OPENER_CACHE = None
 
 
 urllib.request.install_opener = _install_opener_with_cache_reset
@@ -512,7 +512,11 @@ def _copy_installed_handler(
                 for _owner_id, _slot_name, value in _slot_values(copied)
                 if value is not _ABSENT_SLOT
             )
-            + _registered_class_callbacks(copied, copied_state)
+            + tuple(
+                reference
+                for callback in _registered_class_callbacks(copied, copied_state)
+                for reference in _function_reference_values(callback, copied)
+            )
         )
         reference_seen: set[int] = set()
         reference_active: set[int] = set()
@@ -624,8 +628,7 @@ def _clone_installed_opener(
 def _default_no_redirect_opener() -> urllib.request.OpenerDirector:
     global _DEFAULT_NO_REDIRECT_OPENER
 
-    if _DEFAULT_NO_REDIRECT_OPENER is None:
-        _DEFAULT_NO_REDIRECT_OPENER = _build_no_redirect_opener()
+    _DEFAULT_NO_REDIRECT_OPENER = _build_no_redirect_opener()
     return _DEFAULT_NO_REDIRECT_OPENER
 
 
