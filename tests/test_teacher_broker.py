@@ -2094,18 +2094,34 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     monkeypatch.setenv("PARASAIL_API_KEY", "parasail-control-plane-canary")
     deadline = time.time() + 3600
 
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    attempt_record = AttemptRecord(
+        attempt_id=0,
+        fence=1,
+        state="active",
+        reserved_at=deadline - 3600,
+        grant_deadline_at=deadline - 3500,
+        work_deadline_at=deadline - 100,
+        run_deadline_at=deadline,
+        result_deadline_at=deadline + 60,
+    )
+    monkeypatch.setattr(
+        "flash.runner.lifecycle.status.get_status",
+        lambda _run_id: SimpleNamespace(attempt=attempt_record.to_dict()),
+    )
     lambda_payload = build_lambda_payload(
         spec,
-        42,
         0,
+        1,
         runtime_secrets=runtime,
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=deadline,
     )
     vast_payload = build_vast_payload(
         spec,
-        42,
         0,
+        1,
         runtime_secrets=runtime,
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=deadline,
@@ -2130,6 +2146,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     runpod_job_execution.submit_attempt(
         spec,
         attempt=0,
+        fence=1,
         runtime_secrets=runtime,
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=deadline,

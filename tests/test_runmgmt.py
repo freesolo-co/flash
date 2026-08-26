@@ -1961,6 +1961,102 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     assert "adopted a completed attempt at the wall deadline" in log.getvalue()
 
 
+@pytest.mark.parametrize("lookup_error", [None, OSError("temporary artifact read")])
+def test_attach_expired_work_waits_for_open_result_visibility(monkeypatch, tmp_path, lookup_error):
+    import io
+
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-result-visible",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_wall_seconds=120),
+    )
+    remote = _runpod_remote("endpoint-old", "job-old", attempt=0, fence=1)
+    monkeypatch.setattr(runner_attempts.time, "time", lambda: 101.0)
+    _persist_active_attempt(
+        provisioned_status(spec, state="running", created_at=100.0),
+        remote,
+        _run_deadline_at=220.0,
+        _next_attempt=0,
+    )
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
+
+    def lookup(*_args, **_kwargs):
+        if lookup_error is not None:
+            raise lookup_error
+        return
+
+    monkeypatch.setattr(lifecycle, "_attempt_result_metrics", lookup)
+    scheduled = []
+    monkeypatch.setattr(
+        runner_attach,
+        "_schedule_attach_reconciliation",
+        lambda *args, **kwargs: scheduled.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: pytest.fail("open result visibility must not tear down"),
+    )
+
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert status.state == "running"
+    assert status.remote == remote
+    assert len(scheduled) == 1
+
+
+def test_attach_expired_work_honors_authoritative_terminal_failure(monkeypatch, tmp_path):
+    import io
+
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import PollResult
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-terminal-failure",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_wall_seconds=120),
+    )
+    remote = _runpod_remote("endpoint-old", "job-old", attempt=0, fence=1)
+    monkeypatch.setattr(runner_attempts.time, "time", lambda: 101.0)
+    _persist_active_attempt(
+        provisioned_status(spec, state="running", created_at=100.0),
+        remote,
+        _run_deadline_at=220.0,
+        _next_attempt=0,
+    )
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
+    status = runner_status.get_status(spec.run_id)
+    status.result = {"attempt_id": 0, "fence": 1}
+    runner_state._save_status(status)
+    monkeypatch.setattr(lifecycle, "_attempt_result_metrics", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "flash.providers.artifacts.attempts.poll_result_from_manifest",
+        lambda _projection: PollResult(
+            False, failure="job_failed", detail="worker reported failure"
+        ),
+    )
+    monkeypatch.setattr(
+        runner_attach,
+        "_schedule_attach_reconciliation",
+        lambda *_args, **_kwargs: pytest.fail("terminal failure must not wait for visibility"),
+    )
+    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert status.state == "failed"
+    assert "worker reported failure" in (status.error or "")
+
+
 def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp_path):
     # attach strips the allocation stamp from the polling handle, so result adoption must carry the
     # persisted provider, gpu, and card count back into metrics before pricing.
@@ -2092,7 +2188,7 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
         _run_deadline_at=220.0,
         _next_attempt=0,
     )
-    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 341.0)
     polled = []
     resumed = []
     teardown = []
@@ -2157,7 +2253,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
         _run_deadline_at=220.0,
         _next_attempt=0,
     )
-    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 341.0)
     monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_args: None)
 
     class Provider:
@@ -2263,6 +2359,48 @@ def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, 
     assert status.error is None
 
 
+def test_blocked_handleless_success_rejects_attempt_reserved_after_absence(monkeypatch, tmp_path):
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(run_id="blocked-stale-success", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            created_at=100.0,
+        ),
+        _run_deadline_at=100.0 + spec.gpu.max_wall_seconds,
+        _next_attempt=0,
+    )
+    monkeypatch.setattr(runner_attempts.time, "time", lambda: 101.0)
+    replacement = None
+
+    def reserve_before_returning_metrics(*_args, **_kwargs):
+        nonlocal replacement
+        replacement = runner_attempts._reserve_attempt_record(spec.run_id)
+        return {"wall_seconds": 5.0}
+
+    monkeypatch.setattr(
+        runtime,
+        "_handleless_completed_metrics",
+        reserve_before_returning_metrics,
+    )
+
+    assert runtime._fail_blocked_recovery(spec, "recovery blocked") is False
+
+    status = runner_status.get_status(spec.run_id)
+    assert replacement is not None
+    assert replacement.attempt_id == 0
+    assert status.state == "provisioning"
+    assert status.finished_at is None
+    assert status.error is None
+    assert status.attempt == replacement.to_dict()
+
+
 def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch, tmp_path):
     import flash.server.platform.runtime as runtime
     from flash.core.spec import GpuSpec, JobSpec
@@ -2298,6 +2436,188 @@ def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch
     assert status.state == "done"
     assert status.remote is None
     assert status.error is None
+
+
+def test_recovered_handleless_run_adopts_result_before_phantom_check(monkeypatch, tmp_path):
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="recover-result-first", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            created_at=100.0,
+        ),
+        _run_deadline_at=100.0 + spec.gpu.max_wall_seconds,
+        _next_attempt=0,
+    )
+    monkeypatch.setattr(runner_attempts.time, "time", lambda: 101.0)
+    runner_attempts._reserve_attempt_record(spec.run_id)
+    from flash.providers.core.base import PollResult
+
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(True, metrics={"wall_seconds": 5.0}),
+    )
+    adopted = []
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_adopt_completed_attempt",
+        lambda *args, **kwargs: adopted.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_confirm_run_clear",
+        lambda _spec: pytest.fail("result authority must precede phantom cleanup"),
+    )
+
+    runtime._resubmit_recovered_runs([(spec, "provisioning")])
+
+    assert len(adopted) == 1
+
+
+def test_handleless_success_rejects_result_after_attempt_replacement(monkeypatch, tmp_path):
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+    from flash.providers.core.base import PollResult
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(run_id="handleless-success-race", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            created_at=100.0,
+        ),
+        _run_deadline_at=100.0 + spec.gpu.max_wall_seconds,
+        _next_attempt=0,
+    )
+    monkeypatch.setattr(runner_attempts.time, "time", lambda: 101.0)
+    observed = runner_attempts._reserve_attempt_record(spec.run_id)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(True, metrics={"wall_seconds": 5.0}),
+    )
+    replacement = None
+
+    def persist_after_replacement(*_args, **_kwargs):
+        nonlocal replacement
+        replacement = runner_attempts._reserve_attempt_record(spec.run_id)
+        return 0.0
+
+    monkeypatch.setattr(runner_status, "_persist_metrics", persist_after_replacement)
+
+    assert runtime._adopt_handleless_result(spec) is None
+
+    status = runner_status.get_status(spec.run_id)
+    assert replacement is not None
+    assert (replacement.attempt_id, replacement.fence) != (observed.attempt_id, observed.fence)
+    assert status.state == "provisioning"
+    assert status.finished_at is None
+    assert status.error is None
+    assert status.attempt == replacement.to_dict()
+
+
+def test_handleless_failure_rejects_result_after_attempt_replacement(monkeypatch, tmp_path):
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+    from flash.providers.core.base import PollResult
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="handleless-failure-race", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            created_at=100.0,
+        ),
+        _run_deadline_at=100.0 + spec.gpu.max_wall_seconds,
+        _next_attempt=0,
+    )
+    monkeypatch.setattr(runner_attempts.time, "time", lambda: 101.0)
+    observed = runner_attempts._reserve_attempt_record(spec.run_id)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(
+            False,
+            failure="job_failed",
+            detail="stale worker failure",
+        ),
+    )
+    real_fail = runner_reconciliation._compare_and_fail_remote
+    replacement = None
+
+    def reserve_then_fail(*args, **kwargs):
+        nonlocal replacement
+        replacement = runner_attempts._reserve_attempt_record(spec.run_id)
+        return real_fail(*args, **kwargs)
+
+    monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", reserve_then_fail)
+
+    assert runtime._adopt_handleless_result(spec) is None
+
+    status = runner_status.get_status(spec.run_id)
+    assert replacement is not None
+    assert (replacement.attempt_id, replacement.fence) != (observed.attempt_id, observed.fence)
+    assert status.state == "provisioning"
+    assert status.finished_at is None
+    assert status.error is None
+    assert status.attempt == replacement.to_dict()
+
+
+def test_recovered_handleless_run_defers_transient_result_read_before_phantom_check(
+    monkeypatch, tmp_path
+):
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="recover-result-transient", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            created_at=100.0,
+        ),
+        _run_deadline_at=100.0 + spec.gpu.max_wall_seconds,
+        _next_attempt=0,
+    )
+    monkeypatch.setattr(runner_attempts.time, "time", lambda: 101.0)
+    runner_attempts._reserve_attempt_record(spec.run_id)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("temporary artifact read")),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_confirm_run_clear",
+        lambda _spec: pytest.fail("transient result reads must defer phantom cleanup"),
+    )
+    started = []
+
+    class Thread:
+        def __init__(self, *, target, args, daemon):
+            started.append((target, args, daemon))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime._resubmit_recovered_runs([(spec, "provisioning")])
+
+    assert started == [(runtime._deferred_resubmit_loop, (spec,), True)]
 
 
 @pytest.mark.parametrize("status_read_fails", [False, True])
@@ -2677,6 +2997,56 @@ def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch
             "expected_state": "provisioning",
         }
     )
+
+
+def test_deferred_handleless_deadline_rejects_attempt_reserved_after_absence(monkeypatch, tmp_path):
+    import time as time_mod
+
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="deferred-stale-deadline",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+    )
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            created_at=10.0,
+        ),
+        _run_deadline_at=10.0 + spec.gpu.max_wall_seconds,
+        _next_attempt=0,
+    )
+    clock = {"now": 11.0 + spec.gpu.max_wall_seconds}
+    monkeypatch.setattr(time_mod, "time", lambda: clock["now"])
+    monkeypatch.setattr(runtime, "_adopt_handleless_result", lambda _spec: False)
+    replacement = None
+
+    def reserve_before_deadline_failure(*_args, **_kwargs):
+        nonlocal replacement
+        clock["now"] = 12.0
+        replacement = runner_attempts._reserve_attempt_record(spec.run_id)
+        clock["now"] = 11.0 + spec.gpu.max_wall_seconds
+
+    monkeypatch.setattr(
+        runtime,
+        "_handleless_completed_metrics",
+        reserve_before_deadline_failure,
+    )
+
+    runtime._deferred_resubmit_loop(spec)
+
+    status = runner_status.get_status(spec.run_id)
+    assert replacement is not None
+    assert replacement.attempt_id == 0
+    assert status.state == "provisioning"
+    assert status.finished_at is None
+    assert status.error is None
+    assert status.attempt == replacement.to_dict()
 
 
 def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp_path):

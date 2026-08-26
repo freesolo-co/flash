@@ -543,7 +543,7 @@ def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
     assert out == {"KEEP": "v", "HF_TOKEN": "t"}  # non-/runpod-volume vars preserved
 
 
-def test_instance_payload_strips_runpod_volume_redirect():
+def test_instance_payload_strips_runpod_volume_redirect(monkeypatch):
     # The RunPod weight-cache base-model redirect must NOT leak into a Lambda payload —
     # those instances never mount /runpod-volume. (build_worker_env DOES set it; the instance strips.)
     from flash.providers._lifecycle.instances import instance as _instance
@@ -557,11 +557,25 @@ def test_instance_payload_strips_runpod_volume_redirect():
     assert build_worker_env(spec)["FLASH_WEIGHT_CACHE_DIR"].startswith(
         "/runpod-volume"
     )  # leak source
+    from tests.test_lambda_runner import _instance_attempt
+
+    attempt = _instance_attempt(
+        provider="lambda",
+        grant=10_000_000_000.0 - 120.0,
+        work=10_000_000_000.0 - 60.0,
+        result=10_000_000_000.0,
+        attempt_id=0,
+        fence=1,
+    )
+    monkeypatch.setattr(
+        "flash.runner.lifecycle.status.get_status",
+        lambda _run_id: types.SimpleNamespace(attempt=attempt.to_dict()),
+    )
     for arm in ("lambda",):
         env = _instance.build_payload(
             spec,
-            seed=0,
-            attempt=0,
+            0,
+            1,
             arm=arm,
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=10_000_000_000.0,
@@ -1635,6 +1649,7 @@ def test_instance_build_payload_preload_mode():
     p = _instance.build_payload(
         spec,
         0,
+        1,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=10_000_000_000.0,
@@ -1644,6 +1659,10 @@ def test_instance_build_payload_preload_mode():
     )
     assert p["mode"] == "preload"
     assert p["models"] == ["a/b", "c/d"]
+    assert p["attempt"] == 0
+    assert p["fence"] == 1
+    assert p["work_deadline_at"] == 10_000_000_000.0
+    assert p["result_deadline_at"] == 10_000_000_000.0
     # The base-model prefetch (FLASH_WEIGHT_CACHE_DIR) points at the bind-mounted cache so the download
     # persists across runs in the region. It is NOT a process-global HF_HOME (issue #252): env/reward
     # downloads stay on ephemeral disk, off the shared per-region cache.
@@ -1651,13 +1670,27 @@ def test_instance_build_payload_preload_mode():
     assert "HF_HOME" not in p["env"]
 
 
-def test_instance_build_payload_no_mode_by_default():
+def test_instance_build_payload_no_mode_by_default(monkeypatch):
     from flash.providers._lifecycle.instances import instance as _instance
+    from tests.test_lambda_runner import _instance_attempt
 
     spec = _preload_spec()
+    attempt = _instance_attempt(
+        provider="lambda",
+        grant=10_000_000_000.0 - 120.0,
+        work=10_000_000_000.0 - 60.0,
+        result=10_000_000_000.0,
+        attempt_id=0,
+        fence=1,
+    )
+    monkeypatch.setattr(
+        "flash.runner.lifecycle.status.get_status",
+        lambda _run_id: types.SimpleNamespace(attempt=attempt.to_dict()),
+    )
     p = _instance.build_payload(
         spec,
         0,
+        1,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=10_000_000_000.0,
@@ -1816,6 +1849,7 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
     p = _instance.build_payload(
         spec,
         0,
+        1,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=10_000_000_000.0,
@@ -1873,9 +1907,9 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     spec = _preload_spec()
     jobs.launch_and_submit(
         spec,
-        seed=spec.seed,
         instances=[_inst()],
         attempt=0,
+        fence=1,
         mode="preload",
         models=["Qwen/Qwen3.5-9B"],
         deadline_at=10_000_000_000.0,

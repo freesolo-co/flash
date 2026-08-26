@@ -112,12 +112,39 @@ def _observe_artifacts(context: _PollContext) -> PollResult | None:
 def _queue_failure(
     context: _PollContext, state: _PollState, status: str, now: float
 ) -> PollResult | None:
-    if status != "IN_QUEUE" or state.granted:
+    if status != "IN_QUEUE":
         state.queued.expired(False, now, context.queue_grace_s)
         state.unhealthy.expired(False, now, context.unhealthy_grace_s)
         state.throttled.expired(False, now, context.throttled_grace_s)
         return None
-    if state.queued.expired(True, now, context.queue_grace_s):
+    workers = {}
+    health_observed = False
+    try:
+        health = runpod_api.endpoint_health_for_fingerprint(
+            context.handle.endpoint_id,
+            context.handle.key_fingerprint,
+        )
+        workers = health.get("workers") or {}
+        health_observed = True
+    except Exception:
+        state.unhealthy.unknown(now)
+        state.throttled.unknown(now)
+    usable = workers.get("running") or workers.get("ready") or workers.get("idle")
+    initializing = workers.get("initializing")
+    throttled = bool(workers.get("throttled"))
+    observed_unhealthy = bool(workers.get("unhealthy"))
+    unhealthy = observed_unhealthy and not (throttled or usable or initializing)
+    if usable or initializing:
+        state.granted = True
+        state.unhealthy.expired(False, now, context.unhealthy_grace_s)
+        state.throttled.expired(False, now, context.throttled_grace_s)
+        state.queued.expired(False, now, context.queue_grace_s)
+        return None
+    if observed_unhealthy or throttled:
+        state.granted = True
+    if state.granted:
+        state.queued.expired(False, now, context.queue_grace_s)
+    elif state.queued.expired(True, now, context.queue_grace_s):
         return PollResult(
             False,
             failure="no_capacity",
@@ -126,23 +153,15 @@ def _queue_failure(
                 f"{capacity_escalation_note(context.on_last_gpu)}"
             ),
         )
-    try:
-        health = runpod_api.endpoint_health_for_fingerprint(
-            context.handle.endpoint_id,
-            context.handle.key_fingerprint,
-        )
-    except Exception:
-        return None
-    workers = health.get("workers") or {}
-    usable = workers.get("running") or workers.get("ready") or workers.get("idle")
-    initializing = workers.get("initializing")
-    if usable or initializing or workers.get("unhealthy"):
-        state.granted = True
-        return None
-    if state.unhealthy.expired(bool(workers.get("unhealthy")), now, context.unhealthy_grace_s):
-        return PollResult(False, failure="job_preempted", detail="RunPod worker remained unhealthy")
-    if state.throttled.expired(bool(workers.get("throttled")), now, context.throttled_grace_s):
-        return PollResult(False, failure="no_capacity", detail="RunPod worker remained throttled")
+    if health_observed:
+        if state.unhealthy.expired(unhealthy, now, context.unhealthy_grace_s):
+            return PollResult(
+                False, failure="job_preempted", detail="RunPod worker remained unhealthy"
+            )
+        if state.throttled.expired(throttled, now, context.throttled_grace_s):
+            return PollResult(
+                False, failure="no_capacity", detail="RunPod worker remained throttled"
+            )
     return None
 
 

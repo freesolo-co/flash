@@ -217,13 +217,6 @@ def read_attempt_artifacts(
     prefix = attempt_prefix(phase, run_id, attempt_id, fence)
     revision, paths = _repo_snapshot(hf_repo)
     observed_at = time.time()
-    progress = _decode_progress(
-        hf_repo,
-        paths,
-        prefix=prefix,
-        revision=revision,
-        observed_at=observed_at,
-    )
     result = _decode_result(
         hf_repo,
         paths,
@@ -232,4 +225,13 @@ def read_attempt_artifacts(
         observed_at=observed_at,
         source_snapshot=source_snapshot,
     )
-    return AttemptArtifacts(revision, observed_at, progress, result)
+    if result is not None:
+        return AttemptArtifacts(revision, observed_at, None, result)
+    progress = _decode_progress(
+        hf_repo,
+        paths,
+        prefix=prefix,
+        revision=revision,
+        observed_at=observed_at,
+    )
+    return AttemptArtifacts(revision, observed_at, progress, None)

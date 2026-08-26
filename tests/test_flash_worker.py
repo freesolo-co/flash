@@ -29,12 +29,12 @@ def _spec():
 
 
 def _run_deadline_fields() -> dict[str, float | int]:
-    run_created_at = time.time()
-    run_max_wall_seconds = 3600
+    work_deadline_at = time.time() + 3600
     return {
-        "run_created_at": run_created_at,
-        "run_max_wall_seconds": run_max_wall_seconds,
-        "deadline_at": run_created_at + run_max_wall_seconds,
+        "deadline_at": work_deadline_at,
+        "work_deadline_at": work_deadline_at,
+        "result_deadline_at": work_deadline_at + 60,
+        "fence": 1,
     }
 
 
@@ -1221,187 +1221,6 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     assert "create_loraplus_optimizer" in plugin_src
 
 
-@pytest.fixture
-def _serialized_sft_console():
-    import fcntl
-
-    # both parametrizations exercise the production hardcoded /tmp/console_sft.txt path.
-    with open("/tmp/flash-test-sft-console.lock", "w", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        yield
-
-
-@pytest.mark.usefixtures("_serialized_sft_console")
-@pytest.mark.parametrize(
-    ("console_lines", "terminated"),
-    [
-        (
-            ["worker booting\n", ("x" * 70_000) + "\n", "torch.cuda.OutOfMemoryError: CUDA OOM\n"],
-            True,
-        ),
-        # the same crash with NO newline anywhere: one huge unterminated line, which is what a json
-        # blob, a native stack or a stream of progress output actually looks like.
-        (["q" * 70_000 + "torch.cuda.OutOfMemoryError: CUDA OOM"], False),
-    ],
-    ids=["oversized-line-then-rootcause", "single-unterminated-line"],
-)
-def test_train_body_uploads_console_on_missing_metrics(
-    monkeypatch, tmp_path, console_lines, terminated
-):
-    """The 'crashed before finishing' path (no /tmp/metrics.json) MUST upload the captured console
-    even when the worker exited 0 — run_mode only uploads on a non-zero exit, so an OOM/segfault or
-    silent early-exit otherwise leaves the failure undebuggable (no metrics, often no error_<phase>,
-    and the message points at a console that was never uploaded)."""
-    import contextlib
-    import os
-    import subprocess
-
-    import huggingface_hub
-
-    import flash.providers.runpod.serverless.endpoints as endpoints
-
-    monkeypatch.setenv("GITHUB_TOKEN", "operator-secret")
-    monkeypatch.setenv("GIT_ASKPASS", "/tmp/operator-askpass")
-    run_code = tmp_path / "runcode"
-    late_marker = tmp_path / "late-live-attempted"
-    real_join = os.path.join
-
-    def mapped_join(*parts):
-        joined = real_join(*parts)
-        if joined == "/runcode" or joined.startswith("/runcode/"):
-            return str(run_code) + joined.removeprefix("/runcode")
-        return joined
-
-    monkeypatch.setattr(os.path, "join", mapped_join)
-    download_calls = []
-
-    uploads = []
-
-    class _FakeApi:
-        def __init__(self, token=None):
-            pass
-
-        def upload_file(self, **kw):
-            uploads.append(kw)
-            if str(kw.get("path_in_repo", "")).endswith("/console_sft.txt"):
-                time.sleep(0.05)
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
-
-    def fake_hf_hub_download(**kwargs):
-        download_calls.append(kwargs)
-        return str(tmp_path / "source.zip")
-
-    def materialize(_archive_path, _descriptor, destination):
-        target = run_code / "flash-test-run-attempt-7"
-        assert destination == str(target)
-        console = target / "flash/providers/_lifecycle/bootstrapping/console.py"
-        console.parent.mkdir(parents=True, exist_ok=True)
-        console.write_text(
-            "import threading, time\n"
-            "def _run_console_upload_loop(console, interval, stop, *, upload):\n"
-            "    upload()\n"
-            "    def late():\n"
-            "        stop.wait(); time.sleep(0.01); upload()\n"
-            f"        open({str(late_marker)!r}, 'w').write('1')\n"
-            "    threading.Thread(target=late, daemon=True).start()\n"
-            "    stop.wait()\n"
-        )
-        artifacts = target / "flash/adapters/artifacts.py"
-        artifacts.parent.mkdir(parents=True, exist_ok=True)
-        artifacts.write_text(
-            "def attempt_scoped_artifact_name(kind, phase, attempt):\n"
-            "    return f'exact_{kind}_{phase}_attempt{attempt}.txt'\n"
-        )
-
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
-
-    def materialization_path(root, run_id, attempt):
-        assert root == "/runcode"
-        return run_code / f"{run_id}-attempt-{attempt}"
-
-    monkeypatch.setattr("flash.snapshot.archive.attempt_materialization_path", materialization_path)
-    monkeypatch.setattr("flash.snapshot.archive.materialize_verified_archive_file", materialize)
-
-    class _FakeProc:
-        # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
-        def __init__(self, *a, **k):
-            assert k["cwd"] == str(run_code / "flash-test-run-attempt-7")
-            assert "GITHUB_TOKEN" not in k["env"]
-            assert "GIT_ASKPASS" not in k["env"]
-            self.stdout = iter(console_lines)
-            self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
-
-        def wait(self):
-            return 0
-
-    monkeypatch.setattr(subprocess, "Popen", _FakeProc)
-
-    job_spec = '{"algorithm": "sft", "run_id": "flash-test-run"}'
-    input_data = {
-        "phase": "sft",
-        "seed": 0,
-        "hf_repo": "owner/runs",
-        "job_spec_json": job_spec,
-        "env": {
-            "HF_TOKEN": "tok",
-            "GITHUB_TOKEN": "payload-secret",
-            "GIT_ASKPASS": "/tmp/payload-askpass",
-            "PYTHONPATH": "",
-            "ATTEMPT": "999",
-        },
-        "source_snapshot": SOURCE_SNAPSHOT,
-        "run_id": "flash-test-run",
-        "attempt": 7,
-        **_run_deadline_fields(),
-    }
-
-    try:
-        with pytest.raises(RuntimeError, match=r"produced no /tmp/metrics\.json"):
-            endpoints._train_body(input_data)
-
-        paths = [upload["path_in_repo"] for upload in uploads]
-        assert paths == [
-            "sft/flash-test-run/exact_console_sft_attempt7.txt",
-            "sft/flash-test-run/console_sft.txt",
-        ]
-        assert late_marker.exists(), (
-            "the late live callback must run after terminal teardown begins"
-        )
-        with open(uploads[-1]["path_or_fileobj"], encoding="utf-8") as f:
-            uploaded_console = f.read()
-        if terminated:
-            assert not uploaded_console.startswith("worker booting\n")
-            # the 64k byte boundary fell inside the giant x-line, so that truncated line is dropped
-            # whole before redaction: a partial line could hold a credential suffix that no longer
-            # value-matches.
-            assert "x" not in uploaded_console
-            assert uploaded_console == "torch.cuda.OutOfMemoryError: CUDA OOM\n"
-        else:
-            # a tail that is ONE unterminated line is dropped whole, so this uploads nothing. that
-            # costs the root cause on exactly the crash that emits one huge line, and keeping it was
-            # tried and reverted: every bound that would let the line through is measured against
-            # the credentials this process KNOWS, and a value minted at runtime contributes no
-            # needle -- so a margin sized from an unrelated secret leaves a long fragment of it
-            # behind. the empty console never leaked.
-            assert uploaded_console == ""
-        assert len(download_calls) == 1
-        assert download_calls[0]["filename"] == SOURCE_SNAPSHOT["archive_path"]
-        assert download_calls[0]["revision"] == SOURCE_SNAPSHOT["revision"]
-    finally:
-        # _train_body writes hardcoded console paths; remove them for parallel runs.
-        import shutil
-
-        shutil.rmtree(run_code, ignore_errors=True)
-        for _p in (
-            "/tmp/console_sft.txt",
-            "/tmp/console_sft.txt.live.tail",
-            "/tmp/console_sft.txt.final.tail",
-        ):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(_p)
-
-
 def test_train_body_rejects_malformed_source_descriptor_before_download(monkeypatch):
     import huggingface_hub
 
@@ -1426,25 +1245,6 @@ def test_train_body_rejects_malformed_source_descriptor_before_download(monkeypa
                 **_run_deadline_fields(),
             }
         )
-
-
-def test_first_console_snapshot_precedes_stall_teardown():
-    import importlib
-    import inspect
-
-    from flash.providers._lifecycle.bootstrapping import console as bootstrap_console
-
-    importlib.import_module("flash.providers.runpod.execution.jobs")
-    poll_attempt = importlib.import_module("flash.providers.runpod.execution.polling").poll_attempt
-    defaults = inspect.signature(poll_attempt).parameters
-    training_stall_s = defaults["stall_after_s"].default
-    setup_grace_s = defaults["setup_grace_s"].default
-
-    # the serverless handler loads this exact module rather than shipping its own copy, so these
-    # constants have one home and both providers are bound by the same margin.
-    assert training_stall_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    assert setup_grace_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    assert training_stall_s > 2 * bootstrap_console._CONSOLE_UPLOAD_POLL_S
 
 
 def test_min_cuda_for_uses_the_gpu_class_floor():

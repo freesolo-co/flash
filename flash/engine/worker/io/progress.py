@@ -32,6 +32,7 @@ _PROGRESS_TRAINING_ENTERED = False
 _PROGRESS_COMPLETED_STEPS = 0
 _PROGRESS_PENDING_CHECKPOINT_FAILURE: dict[str, int | str] | None = None
 _PROGRESS_PENDING_UPLOAD: tuple[ProgressRecord, str, str, bool] | None = None
+_PROGRESS_BLOCKED_OBSERVATION: tuple[str, bool, dict] | None = None
 LATEST_GRPO_METRICS: list = []
 GRPO_METRIC_HISTORY_LIMIT = 1024
 
@@ -144,11 +145,50 @@ def _upload_record(
     return hf_io.hf_upload_absolute(local, remote, required=required)
 
 
+def _observe_progress(stage: str, fields: dict) -> dict:
+    """update cumulative state and return one bounded observation."""
+    global _PROGRESS_COMPLETED_STEPS, _PROGRESS_PENDING_CHECKPOINT_FAILURE
+    global _PROGRESS_TRAINING_ENTERED
+
+    observed = dict(fields)
+    step = observed.get("step")
+    if isinstance(step, (int, float)) and not isinstance(step, bool) and step >= 0:
+        _PROGRESS_COMPLETED_STEPS = max(_PROGRESS_COMPLETED_STEPS, int(step))
+    if stage in {"rl_step", "sft_step", "opd_step"}:
+        _PROGRESS_TRAINING_ENTERED = True
+    if stage == "checkpoint_upload_failed":
+        failure = observed.get("checkpoint_failure")
+        if isinstance(failure, dict):
+            _PROGRESS_PENDING_CHECKPOINT_FAILURE = dict(failure)
+    elif stage == "checkpoint_uploaded":
+        _PROGRESS_PENDING_CHECKPOINT_FAILURE = None
+        observed.pop("checkpoint_failure", None)
+    if _PROGRESS_PENDING_CHECKPOINT_FAILURE and "checkpoint_failure" not in observed:
+        observed["checkpoint_failure"] = dict(_PROGRESS_PENDING_CHECKPOINT_FAILURE)
+    bounded = bounded_json(observed)
+    return bounded if isinstance(bounded, dict) else {}
+
+
+def _merge_blocked_progress(stage: str, initial: bool, fields: dict) -> tuple[str, bool, dict]:
+    """retain bounded cumulative observations behind one immutable pending record."""
+    global _PROGRESS_BLOCKED_OBSERVATION
+
+    observed = _observe_progress(stage, fields)
+    if _PROGRESS_BLOCKED_OBSERVATION is not None:
+        _prior_stage, prior_initial, prior_fields = _PROGRESS_BLOCKED_OBSERVATION
+        observed = bounded_json({**prior_fields, **observed})
+        initial = initial or prior_initial
+    if stage == "checkpoint_uploaded":
+        observed.pop("checkpoint_failure", None)
+    merged = (stage, initial, observed)
+    _PROGRESS_BLOCKED_OBSERVATION = merged
+    return merged
+
+
 def publish_progress(stage: str, *, initial: bool = False, **fields):
     """Publish one immutable cumulative progress record for observed work only."""
-    global _PROGRESS_COMPLETED_STEPS, _PROGRESS_PENDING_CHECKPOINT_FAILURE
-    global _PROGRESS_PENDING_UPLOAD, _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE
-    global _PROGRESS_TRAINING_ENTERED
+    global _PROGRESS_BLOCKED_OBSERVATION, _PROGRESS_PENDING_UPLOAD
+    global _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE
     with _PROGRESS_LOCK:
         if _PROGRESS_PENDING_UPLOAD is not None:
             record, local_path, remote_path, required = _PROGRESS_PENDING_UPLOAD
@@ -164,20 +204,16 @@ def publish_progress(stage: str, *, initial: bool = False, **fields):
                 _PROGRESS_PENDING_UPLOAD = None
             print("PROGRESS", json.dumps(record.to_dict(), allow_nan=False, sort_keys=True))
             if not committed:
+                _merge_blocked_progress(stage, initial, fields)
                 return False
-        step = fields.get("step")
-        if isinstance(step, (int, float)) and not isinstance(step, bool) and step >= 0:
-            _PROGRESS_COMPLETED_STEPS = max(_PROGRESS_COMPLETED_STEPS, int(step))
-        if stage in {"rl_step", "sft_step", "opd_step"}:
-            _PROGRESS_TRAINING_ENTERED = True
-        if stage == "checkpoint_upload_failed":
-            failure = fields.get("checkpoint_failure")
-            if isinstance(failure, dict):
-                _PROGRESS_PENDING_CHECKPOINT_FAILURE = dict(failure)
-        elif stage == "checkpoint_uploaded":
-            _PROGRESS_PENDING_CHECKPOINT_FAILURE = None
-        if _PROGRESS_PENDING_CHECKPOINT_FAILURE and "checkpoint_failure" not in fields:
-            fields["checkpoint_failure"] = dict(_PROGRESS_PENDING_CHECKPOINT_FAILURE)
+        if _PROGRESS_BLOCKED_OBSERVATION is not None:
+            _, blocked_initial, blocked_fields = _PROGRESS_BLOCKED_OBSERVATION
+            fields = {**blocked_fields, **fields}
+            initial = initial or blocked_initial
+            _PROGRESS_BLOCKED_OBSERVATION = None
+            if stage == "checkpoint_uploaded":
+                fields.pop("checkpoint_failure", None)
+        fields = _observe_progress(stage, fields)
         sequence = _PROGRESS_SEQUENCE + 1
         metrics, samples, timing, checkpoint, gpu, diagnostics = _progress_sections(fields)
         record = ProgressRecord(

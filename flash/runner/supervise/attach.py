@@ -216,89 +216,6 @@ def _reconcile_completed_remote(
     return False
 
 
-def _reconcile_expired_remote(
-    run_id: str,
-    worker_spec: JobSpec,
-    expected_remote: dict,
-    handle: JobHandle,
-    next_attempt: int,
-    deadline_at: float,
-    log,
-    failure: str,
-) -> bool:
-    """Adopt late metrics or fail an attempt whose wall deadline has elapsed."""
-    from flash.runner.accounting.reconciliation import (
-        _compare_and_fail_remote,
-        _record_cleanup_remote,
-    )
-    from flash.runner.supervise.lifecycle import (
-        _adopt_completed_attempt,
-        _attempt_result_metrics,
-    )
-
-    try:
-        metrics = _attempt_result_metrics(run_id, expected_remote)
-    except Exception:
-        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-        return False
-    if metrics is not None:
-        _carry_allocation_stamp(metrics, expected_remote)
-        try:
-            cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
-            adopted = cleanup_preserved and _adopt_completed_attempt(
-                run_id,
-                worker_spec,
-                expected_remote,
-                metrics,
-                log=log,
-            )
-        except Exception:
-            time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-            return False
-        if adopted:
-            return True
-        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-        return False
-    try:
-        cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
-    except Exception:
-        cleanup_preserved = False
-    if not cleanup_preserved:
-        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-        return False
-    try:
-        if _compare_and_fail_remote(run_id, expected_remote, failure):
-            return True
-    except Exception:
-        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-        return False
-    return True
-
-
-def _wait_for_replacement_window(worker_spec: JobSpec, deadline_at: float) -> bool:
-    """Wait within the wall deadline and decide whether teardown should be deferred."""
-    from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
-
-    delay = min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, deadline_at - time.time()))
-    if delay > 0:
-        time.sleep(delay)
-        if time.time() >= deadline_at:
-            return True
-    if time.time() < deadline_at:
-        # if a replacement cannot meet the 60-second provider minimum yet the run
-        # wall deadline is still open, keep reconciling (probe for completion) rather
-        # than tearing down and failing early - mirror handle-less recovery, which
-        # waits until the wall deadline.
-        try:
-            _spec_with_remaining_wall(worker_spec, require_provider_minimum=True)
-        except RuntimeError:
-            # cap the reconcile wait at the wall deadline so a near-deadline wake does
-            # not overshoot the run's wall deadline by a full interval.
-            time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, deadline_at - time.time())))
-            return True
-    return False
-
-
 def _reconcile_attached_remote(
     run_id: str,
     expected_remote: dict,
@@ -320,7 +237,7 @@ def _reconcile_attached_remote(
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
-        _attempt_result_metrics,
+        _attempt_result,
         _strict_teardown_handle,
         _worker_provably_gone,
     )
@@ -350,35 +267,37 @@ def _reconcile_attached_remote(
         attempt_record = AttemptRecord.from_dict(status.attempt)
         result_deadline_at = attempt_record.result_deadline_at
         try:
-            completed_metrics = _attempt_result_metrics(run_id, expected_remote)
+            terminal_result = _attempt_result(run_id, expected_remote)
         except Exception:
-            completed_metrics = None
-        if completed_metrics is not None:
-            _carry_allocation_stamp(completed_metrics, expected_remote)
-            if _reconcile_completed_remote(
-                run_id,
-                worker_spec,
-                expected_remote,
-                completed_metrics,
-                deadline_at,
-                log,
-            ):
-                return
-            continue
-        if time.time() >= result_deadline_at:
-            if _reconcile_expired_remote(
-                run_id,
-                worker_spec,
-                expected_remote,
-                handle,
-                next_attempt,
-                deadline_at,
-                log,
-                failure,
-            ):
-                return
-            continue
-        if _wait_for_replacement_window(worker_spec, deadline_at):
+            terminal_result = None
+        if terminal_result is not None:
+            if terminal_result.ok:
+                completed_metrics = terminal_result.metrics
+                _carry_allocation_stamp(completed_metrics, expected_remote)
+                if _reconcile_completed_remote(
+                    run_id,
+                    worker_spec,
+                    expected_remote,
+                    completed_metrics,
+                    deadline_at,
+                    log,
+                ):
+                    return
+                continue
+            terminal_failure = (
+                f"{terminal_result.failure or 'job_failed'}: "
+                f"{terminal_result.detail or 'worker attempt failed'}"
+            )
+            try:
+                if _compare_and_fail_remote(run_id, expected_remote, terminal_failure):
+                    return
+            except Exception:
+                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+                continue
+            return
+        now = time.time()
+        if now < result_deadline_at:
+            time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, result_deadline_at - now))
             continue
         try:
             resource_deleted = _strict_teardown_handle(handle, run_id)
@@ -560,11 +479,16 @@ def _handle_attach_wall_deadline(
     exc: RuntimeError,
 ) -> RunStatus:
     """Adopt finished work or fail and tear down an attempt whose wall time is exhausted."""
+    from flash.providers.artifacts.attempts import (
+        AttemptArtifactError,
+        poll_result_from_manifest,
+    )
     from flash.runner.accounting.reconciliation import (
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.lifecycle.protocol import AttemptRecord
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
         _adopt_completed_attempt,
@@ -573,7 +497,26 @@ def _handle_attach_wall_deadline(
     )
 
     _load_run_deadline_at(run_id)
-    metrics = _attempt_result_metrics(run_id, context.persisted_remote)
+    status = get_status(run_id)
+    attempt = AttemptRecord.from_dict(status.attempt)
+    result_deadline_at = attempt.result_deadline_at
+    try:
+        metrics = _attempt_result_metrics(run_id, context.persisted_remote)
+    except AttemptArtifactError:
+        raise
+    except Exception:
+        metrics = None
+        if time.time() < result_deadline_at:
+            _schedule_attach_reconciliation(
+                run_id,
+                context.persisted_remote,
+                context.worker_spec,
+                context.next_attempt,
+                context.source_snapshot,
+                log,
+                str(exc),
+            )
+            return get_status(run_id)
     if metrics is not None:
         _carry_allocation_stamp(metrics, context.persisted_remote)
         try:
@@ -592,9 +535,6 @@ def _handle_attach_wall_deadline(
                 file=log,
             )
             return get_status(run_id)
-        # completed work whose adoption is a transient defer (e.g. a cleanup blip) must NEVER be
-        # torn down at the wall deadline; defer to background reconciliation, which retries
-        # adoption until the deadline like the in-loop completion path.
         _schedule_attach_reconciliation(
             run_id,
             context.persisted_remote,
@@ -610,14 +550,46 @@ def _handle_attach_wall_deadline(
             file=log,
         )
         return get_status(run_id)
+    status = get_status(run_id)
+    persisted_result = status.result if isinstance(status.result, dict) else None
+    terminal_result = None
+    if persisted_result is not None:
+        if (
+            persisted_result.get("attempt_id") != attempt.attempt_id
+            or persisted_result.get("fence") != attempt.fence
+        ):
+            raise AttemptArtifactError("persisted result does not match the current fenced attempt")
+        terminal_result = poll_result_from_manifest(persisted_result)
+    terminal_failure = terminal_result is not None and not terminal_result.ok
+    failure = (
+        f"{terminal_result.failure or 'job_failed'}: "
+        f"{terminal_result.detail or 'worker attempt failed'}"
+        if terminal_failure
+        else str(exc)
+    )
+    if not terminal_failure and time.time() < result_deadline_at:
+        _schedule_attach_reconciliation(
+            run_id,
+            context.persisted_remote,
+            context.worker_spec,
+            context.next_attempt,
+            context.source_snapshot,
+            log,
+            str(exc),
+        )
+        print(
+            f"attach: {run_id} work deadline passed; awaiting terminal result visibility",
+            file=log,
+        )
+        return get_status(run_id)
     try:
         resource_deleted = _strict_teardown_handle(context.handle, run_id)
     except Exception:
         resource_deleted = False
     if not resource_deleted:
         _record_cleanup_remote(run_id, context.persisted_remote)
-    _compare_and_fail_remote(run_id, context.persisted_remote, str(exc))
-    print(f"attach: {run_id} {exc}", file=log)
+    _compare_and_fail_remote(run_id, context.persisted_remote, failure)
+    print(f"attach: {run_id} {failure}", file=log)
     return get_status(run_id)
 
 

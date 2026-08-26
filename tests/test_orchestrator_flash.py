@@ -62,6 +62,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
                     SOURCE_SNAPSHOT,
                     run_id=spec.run_id,
                     attempt=attempt,
+                    fence=runner_status.get_status(spec.run_id).attempt["fence"],
                 ),
             }
 

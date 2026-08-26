@@ -910,6 +910,10 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
     assert "replacement is blocked" in status.error
     assert [name for name, _kwargs in private_hf.calls] == [
         "repo_info",
+        "list_repo_files",
+        "repo_info",
+        "list_repo_files",
+        "repo_info",
         "get_paths_info",
         "download",
         "list_repo_files",

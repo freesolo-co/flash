@@ -637,6 +637,100 @@ def test_poll_attempt_preserves_provider_health_observations(
     assert result.failure == failure
 
 
+def test_queue_unhealthy_worker_arms_grace_without_capacity_timeout(monkeypatch):
+    from flash.providers.runpod.execution import jobs, polling
+
+    context = polling._PollContext(
+        handle=_runpod_handle(jobs),
+        spec=_poll_spec(),
+        say=lambda _message: None,
+        interval_s=0,
+        attempt=_attempt_record(),
+        source_snapshot={},
+        on_last_gpu=False,
+        queue_grace_s=1.0,
+        unhealthy_grace_s=5.0,
+        throttled_grace_s=10.0,
+    )
+    state = polling._PollState(None, False, jobs.GraceTimer(), jobs.GraceTimer(), jobs.GraceTimer())
+
+    monkeypatch.setattr(
+        polling.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *_args, **_kwargs: {"workers": {"unhealthy": 1}},
+    )
+
+    assert polling._queue_failure(context, state, "IN_QUEUE", 10.0) is None
+    assert state.granted is True
+    assert state.queued.since is None
+    assert state.unhealthy.since == 10.0
+    assert polling._queue_failure(context, state, "IN_QUEUE", 15.0) is None
+    failure = polling._queue_failure(context, state, "IN_QUEUE", 15.1)
+    assert failure is not None
+    assert failure.failure == "job_preempted"
+
+
+def test_queue_mixed_unhealthy_throttled_uses_throttled_grace(monkeypatch):
+    from flash.providers.runpod.execution import jobs, polling
+
+    context = polling._PollContext(
+        handle=_runpod_handle(jobs),
+        spec=_poll_spec(),
+        say=lambda _message: None,
+        interval_s=0,
+        attempt=_attempt_record(),
+        source_snapshot={},
+        on_last_gpu=False,
+        queue_grace_s=1.0,
+        unhealthy_grace_s=5.0,
+        throttled_grace_s=10.0,
+    )
+    state = polling._PollState(None, False, jobs.GraceTimer(), jobs.GraceTimer(), jobs.GraceTimer())
+    monkeypatch.setattr(
+        polling.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *_args, **_kwargs: {"workers": {"unhealthy": 1, "throttled": 1}},
+    )
+
+    assert polling._queue_failure(context, state, "IN_QUEUE", 10.0) is None
+    assert state.granted is True
+    assert state.unhealthy.since is None
+    assert state.throttled.since == 10.0
+    assert polling._queue_failure(context, state, "IN_QUEUE", 15.1) is None
+    failure = polling._queue_failure(context, state, "IN_QUEUE", 20.1)
+    assert failure is not None
+    assert failure.failure == "no_capacity"
+
+
+def test_queue_granted_healthy_worker_resets_unhealthy_timer(monkeypatch):
+    from flash.providers.runpod.execution import jobs, polling
+
+    context = polling._PollContext(
+        handle=_runpod_handle(jobs),
+        spec=_poll_spec(),
+        say=lambda _message: None,
+        interval_s=0,
+        attempt=_attempt_record(),
+        source_snapshot={},
+        on_last_gpu=False,
+        queue_grace_s=1.0,
+        unhealthy_grace_s=5.0,
+        throttled_grace_s=10.0,
+    )
+    state = polling._PollState(
+        None, True, jobs.GraceTimer(), jobs.GraceTimer(10.0), jobs.GraceTimer()
+    )
+    monkeypatch.setattr(
+        polling.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *_args, **_kwargs: {"workers": {"idle": 1}},
+    )
+
+    assert polling._queue_failure(context, state, "IN_QUEUE", 20.0) is None
+    assert state.unhealthy.since is None
+    assert state.queued.since is None
+
+
 def test_poll_attempt_recovers_transient_result_download_to_current_fenced_success(monkeypatch):
     from flash.providers.core.base import PollResult
     from flash.providers.runpod.client import api as runpod_api
@@ -2569,6 +2663,7 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         status = provisioned_status(
             _spec("walked"),
             state="running",
+            attempt=_attempt_record(attempt_id=2).to_dict(),
             remote={
                 "provider": "runpod",
                 "endpoint_id": "epW",
@@ -2829,6 +2924,7 @@ def test_attach_completes_run(monkeypatch):
         status = provisioned_status(
             _spec("a1"),
             state="running",
+            attempt=_attempt_record().to_dict(),
             remote={
                 "provider": "runpod",
                 "endpoint_id": "epA",
@@ -2874,6 +2970,7 @@ def test_attach_cleanup_survives_unreadable_final_status(monkeypatch):
             provisioned_status(
                 _spec(run_id),
                 state="running",
+                attempt=_attempt_record().to_dict(),
                 remote={
                     "provider": "runpod",
                     "endpoint_id": "ep-finally",
@@ -3100,7 +3197,11 @@ def test_attach_unparseable_spec_fails_closed_and_tears_down(monkeypatch):
         spec = replace(spec, gpu=replace(spec.gpu, type="RTX 5090"))
         runner_state._save_status(
             runner_state.RunStatus(
-                run_id="bad", state="running", spec=spec.to_dict(), remote=remote
+                run_id="bad",
+                state="running",
+                spec=spec.to_dict(),
+                attempt=_attempt_record().to_dict(),
+                remote=remote,
             )
         )
         # Rewrite the spec on disk: the plane can no longer WRITE this record, so go around the
@@ -3367,7 +3468,12 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             # _run_attempts_supervised raising after a non-infra failure with no retries left).
             resumed["called"] = True
             resumed["attempt_start"] = attempt_start
-            runner_status._update(spec.run_id, "running", remote=replacement_remote)
+            runner_status._update(
+                spec.run_id,
+                "running",
+                attempt=_attempt_record(attempt_id=1).to_dict(),
+                remote=replacement_remote,
+            )
             raise RuntimeError("run failed after retries: worker_error: bad reward fn")
 
         monkeypatch.setattr(runner_lifecycle, "_run_training", fake_training)
@@ -3775,9 +3881,9 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
                 state="running",
                 spec=spec.to_dict(),
                 attempt=_attempt_record(
-                    grant_deadline_at=time.time() + 60.0,
-                    work_deadline_at=time.time() + 600.0,
-                    result_deadline_at=time.time() + 660.0,
+                    grant_deadline_at=2.0,
+                    work_deadline_at=3.0,
+                    result_deadline_at=4.0,
                 ).to_dict(),
                 remote=remote,
                 source_snapshot=_SOURCE_SNAPSHOT,
@@ -3792,6 +3898,10 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
                 return []
 
         monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            runner_lifecycle, "_attempt_result_metrics", lambda *_args, **_kwargs: None
+        )
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
         resumed = []
         monkeypatch.setattr(
@@ -3815,7 +3925,7 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
         assert runner_status.get_status(spec.run_id).remote is None
 
 
-def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
+def test_attach_reconciler_retries_verified_failure_persistence(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         import flash.runner.supervise.attach as attach_mod
@@ -3834,9 +3944,15 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
             )
         )
         deadline = runner_deadlines._load_run_deadline_at(spec.run_id)
+        from flash.providers.core.base import PollResult
+
         monkeypatch.setattr(attach_mod.time, "time", lambda: deadline + 1.0)
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
-        monkeypatch.setattr(lifecycle_mod, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_attempt_result",
+            lambda *a, **k: PollResult(False, failure="job_failed", detail="worker failed"),
+        )
         real_fail = runner_reconciliation._compare_and_fail_remote
         calls = []
 
@@ -3862,9 +3978,7 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
         assert len(calls) == 2
         assert status.state == "failed"
         assert status.remote == remote
-        assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
-            remote
-        ]
+        assert runner_state._CLEANUP_REMOTES_KEY not in runner_status._load_status_json(spec.run_id)
 
 
 def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
@@ -3886,12 +4000,14 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
             )
         )
         deadline = runner_deadlines._load_run_deadline_at(spec.run_id)
+        from flash.providers.core.base import PollResult
+
         monkeypatch.setattr(attach_mod.time, "time", lambda: deadline + 1.0)
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
         monkeypatch.setattr(
             lifecycle_mod,
-            "_attempt_result_metrics",
-            lambda *a, **k: {"wall_seconds": 5.0},
+            "_attempt_result",
+            lambda *a, **k: PollResult(True, metrics={"wall_seconds": 5.0}),
         )
 
         def adopt(run_id, _spec, expected_remote, _metrics, **_kwargs):
@@ -3955,11 +4071,13 @@ def test_attach_reconciler_caps_completed_adoption_retry_to_result_deadline(monk
             sleeps.append(seconds)
             clock["now"] += seconds
 
+        from flash.providers.core.base import PollResult
+
         monkeypatch.setattr(attach_mod.time, "sleep", advance)
         monkeypatch.setattr(
             lifecycle_mod,
-            "_attempt_result_metrics",
-            lambda *_args, **_kwargs: {"wall_seconds": 60.0},
+            "_attempt_result",
+            lambda *_args, **_kwargs: PollResult(True, metrics={"wall_seconds": 60.0}),
         )
         monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: False)
 
@@ -3978,7 +4096,7 @@ def test_attach_reconciler_caps_completed_adoption_retry_to_result_deadline(monk
         assert "could not be adopted" in runner_status.get_status(spec.run_id).error
 
 
-def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monkeypatch):
+def test_attach_reconciler_adopts_result_visible_before_result_deadline(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.execution.jobs as jobs
@@ -4007,6 +4125,7 @@ def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monke
         clock = {"now": deadline - 1.0}
         probes = []
         monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: deadline)
+        monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 1.0)
         monkeypatch.setattr(attach_mod.time, "time", lambda: clock["now"])
         monkeypatch.setattr(
             attach_mod.time,
@@ -4014,18 +4133,25 @@ def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monke
             lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
         )
 
-        def completed_metrics(*_args, **_kwargs):
+        from flash.providers.core.base import PollResult
+
+        def terminal_result(*_args, **_kwargs):
             probes.append(clock["now"])
             if clock["now"] >= deadline:
-                return {"wall_seconds": 60.0}
+                return PollResult(True, metrics={"wall_seconds": 60.0})
             return None
 
-        monkeypatch.setattr(lifecycle_mod, "_attempt_result_metrics", completed_metrics)
+        monkeypatch.setattr(lifecycle_mod, "_attempt_result", terminal_result)
         monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: True)
         monkeypatch.setattr(
             lifecycle_mod,
             "_strict_teardown_handle",
-            lambda *_args, **_kwargs: pytest.fail("completed attempt must not be torn down"),
+            lambda *_args, **_kwargs: pytest.fail("visible result must not be torn down"),
+        )
+        monkeypatch.setattr(
+            attach_mod,
+            "_resume_after_confirmed_teardown",
+            lambda *_args, **_kwargs: pytest.fail("visible result must not be replaced"),
         )
 
         attach_mod._reconcile_attached_remote(
@@ -4039,6 +4165,68 @@ def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monke
         )
 
         assert probes == [deadline - 1.0, deadline]
+
+
+def test_attach_reconciler_fails_visible_terminal_result_without_teardown(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.execution.jobs as jobs
+        import flash.runner.supervise.attach as attach_mod
+        import flash.runner.supervise.lifecycle as lifecycle_mod
+        from flash.providers.core.base import PollResult
+
+        remote = _runpod_handle_dict(jobs, started_ts=1.0)
+        spec = _spec("runpod-reconcile-visible-failure")
+        deadline = 1_000.0
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                attempt=_attempt_record(
+                    grant_deadline_at=900.0,
+                    work_deadline_at=deadline,
+                    result_deadline_at=deadline + 60.0,
+                ).to_dict(),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: deadline)
+        monkeypatch.setattr(attach_mod.time, "time", lambda: deadline + 1.0)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_attempt_result",
+            lambda *_args, **_kwargs: PollResult(
+                False,
+                failure="job_failed",
+                detail="verified worker failure",
+            ),
+        )
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_strict_teardown_handle",
+            lambda *_args, **_kwargs: pytest.fail("verified failure must not be torn down"),
+        )
+        monkeypatch.setattr(
+            attach_mod,
+            "_resume_after_confirmed_teardown",
+            lambda *_args, **_kwargs: pytest.fail("verified failure must not be replaced"),
+        )
+
+        attach_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            _SOURCE_SNAPSHOT,
+            io.StringIO(),
+            "job_preempted: host vanished",
+        )
+
+        status = runner_status.get_status(spec.run_id)
+        assert status.state == "failed"
+        assert status.error == "job_failed: verified worker failure"
+        assert status.remote == remote
 
 
 def test_attach_reconciler_rate_limits_failed_terminal_cas_past_result_deadline(monkeypatch):
@@ -4081,11 +4269,13 @@ def test_attach_reconciler_rate_limits_failed_terminal_cas_past_result_deadline(
             sleeps.append(seconds)
             clock["now"] += seconds
 
+        from flash.providers.core.base import PollResult
+
         monkeypatch.setattr(attach_mod.time, "sleep", advance)
         monkeypatch.setattr(
             lifecycle_mod,
-            "_attempt_result_metrics",
-            lambda *_args, **_kwargs: {"wall_seconds": 60.0},
+            "_attempt_result",
+            lambda *_args, **_kwargs: PollResult(True, metrics={"wall_seconds": 60.0}),
         )
         monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: False)
         # the reconciler imports _compare_and_fail_remote / _record_cleanup_remote from
@@ -4149,14 +4339,15 @@ def test_an_adopted_instance_run_is_still_priced_for_every_card_it_occupied(monk
         )
         deadline = 1_000.0
         monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: deadline)
+        from flash.providers.core.base import PollResult
+
         monkeypatch.setattr(attach_mod.time, "time", lambda: deadline)
         monkeypatch.setattr(attach_mod.time, "sleep", lambda _seconds: None)
-        monkeypatch.setattr(lifecycle_mod, "_attempt_result_metrics", lambda *_a, **_k: None)
         # what the worker actually wrote: a wall, and nothing about the allocation.
         monkeypatch.setattr(
             lifecycle_mod,
-            "_attempt_result_metrics",
-            lambda *_a, **_k: {"wall_seconds": 3600.0},
+            "_attempt_result",
+            lambda *_a, **_k: PollResult(True, metrics={"wall_seconds": 3600.0}),
         )
         monkeypatch.setattr(runner_reconciliation, "_record_cleanup_remote", lambda *_a, **_k: True)
 

@@ -54,6 +54,21 @@ def _fake_lambda_types() -> dict:
     }
 
 
+def _active_attempt(*, attempt_id: int = 0, fence: int = 1) -> dict:
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    return AttemptRecord(
+        attempt_id=attempt_id,
+        fence=fence,
+        state="active",
+        reserved_at=9_999_999_000.0,
+        grant_deadline_at=9_999_999_100.0,
+        work_deadline_at=9_999_999_900.0,
+        run_deadline_at=9_999_999_999.0,
+        result_deadline_at=10_000_000_060.0,
+    ).to_dict()
+
+
 def _fake_vast_row(cards: int) -> dict:
     """One verified-datacenter H100 offer carrying ``cards`` GPUs, priced for the WHOLE box."""
     return {
@@ -543,9 +558,14 @@ def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
         monkey.setattr(lj, "resolve_ssh_key_names", lambda **_k: ["jk"])
         monkey.setattr(lambda_api, "launch_instance", fake_launch)
         monkey.setattr(lj, "usable_instances", fake_usable)
+        monkey.setattr(
+            "flash.runner.lifecycle.status.get_status",
+            lambda _run_id: SimpleNamespace(attempt=_active_attempt()),
+        )
         handle = lj.launch_and_submit(
             spec,
-            seed=spec.seed,
+            attempt=0,
+            fence=1,
             instances=[_inst("us-east-1")],
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=9_999_999_999.0,
@@ -595,9 +615,14 @@ def test_vast_capacity_refresh_keeps_the_allocated_card_count():
     try:
         monkey.setattr(vast_api, "create_instance", fake_create)
         monkey.setattr(vj, "usable_offers", fake_usable)
+        monkey.setattr(
+            "flash.runner.lifecycle.status.get_status",
+            lambda _run_id: SimpleNamespace(attempt=_active_attempt()),
+        )
         handle = vj.deploy_and_submit(
             spec,
-            seed=spec.seed,
+            attempt=0,
+            fence=1,
             offers=[_offer(1)],
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=9_999_999_999.0,
@@ -638,9 +663,14 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
         try:
             monkey.setattr(lj, "resolve_ssh_key_names", lambda **_k: ["jk"])
             monkey.setattr(lambda_api, "launch_instance", lambda **_kw: "i-1")
+            monkey.setattr(
+                "flash.runner.lifecycle.status.get_status",
+                lambda _run_id: SimpleNamespace(attempt=_active_attempt()),
+            )
             handle = lj.launch_and_submit(
                 spec,
-                seed=spec.seed,
+                attempt=0,
+                fence=1,
                 instances=[inst],
                 source_snapshot=_SOURCE_SNAPSHOT,
                 deadline_at=9_999_999_999.0,
@@ -669,9 +699,14 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
         monkey = pytest.MonkeyPatch()
         try:
             monkey.setattr(vast_api, "create_instance", lambda *_a, **_kw: 4242)
+            monkey.setattr(
+                "flash.runner.lifecycle.status.get_status",
+                lambda _run_id: SimpleNamespace(attempt=_active_attempt()),
+            )
             handle = vj.deploy_and_submit(
                 spec,
-                seed=spec.seed,
+                attempt=0,
+                fence=1,
                 offers=[offer],
                 source_snapshot=_SOURCE_SNAPSHOT,
                 deadline_at=9_999_999_999.0,

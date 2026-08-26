@@ -244,12 +244,18 @@ def build_payload(
         raise ValueError("instance attempt identity is invalid")
     if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
         raise ValueError("instance fence identity is invalid")
-    from flash.runner.lifecycle.protocol import AttemptRecord
-    from flash.runner.lifecycle.status import get_status
+    if mode == "preload":
+        work_deadline_at = absolute_deadline
+        result_deadline_at = absolute_deadline
+    else:
+        from flash.runner.lifecycle.protocol import AttemptRecord
+        from flash.runner.lifecycle.status import get_status
 
-    attempt_record = AttemptRecord.from_dict(get_status(spec.run_id).attempt)
-    if attempt_record.attempt_id != attempt_id or attempt_record.fence != fence:
-        raise RuntimeError("instance payload does not match the current fenced attempt")
+        attempt_record = AttemptRecord.from_dict(get_status(spec.run_id).attempt)
+        if attempt_record.attempt_id != attempt_id or attempt_record.fence != fence:
+            raise RuntimeError("instance payload does not match the current fenced attempt")
+        work_deadline_at = attempt_record.work_deadline_at
+        result_deadline_at = attempt_record.result_deadline_at
     max_wall_seconds = float(spec.gpu.max_wall_seconds)
     payload = {
         "hf_repo": spec.train.hf_repo,
@@ -264,8 +270,8 @@ def build_payload(
         "extra_pip": worker_pip_with_extras(spec.environment.id, spec.environment.pip),
         "hf_prefix": f"{spec.phase}/{spec.run_id}",
         "deadline_at": absolute_deadline,
-        "work_deadline_at": attempt_record.work_deadline_at,
-        "result_deadline_at": attempt_record.result_deadline_at,
+        "work_deadline_at": work_deadline_at,
+        "result_deadline_at": result_deadline_at,
         "run_created_at": absolute_deadline - max_wall_seconds,
         "run_max_wall_seconds": max_wall_seconds,
         "attempt": attempt_id,

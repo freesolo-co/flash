@@ -2252,7 +2252,12 @@ def _private_lifecycle_projections() -> dict[str, dict]:
             "source_provenance": provenance,
         },
         "resource": {**identity, "state": "running", "source_provenance": provenance},
-        "result": {**identity, "outcome": "done", "source_provenance": provenance},
+        "result": {
+            **identity,
+            "outcome": "done",
+            "source_provenance": provenance,
+            "source_attestation": {"repository": "private/source", "sha256": "a" * 64},
+        },
     }
 
 
@@ -2262,17 +2267,25 @@ def test_run_status_to_dict_sanitizes_every_lifecycle_projection() -> None:
         run_id="projection-sanitize",
         state="done",
         spec={"project": "11111111-1111-4111-8111-111111111111"},
+        source_snapshot=_SOURCE_SNAPSHOT,
+        source_verified_attempt=2,
         **projections,
     )
 
     public = status.to_dict()
 
-    assert "source_provenance" not in json.dumps(public)
+    assert public["source_provenance"]
+    assert "source_attestation" not in json.dumps(public)
+    assert all(
+        "source_provenance" not in public[field]
+        for field in ("attempt", "progress", "resource", "result")
+    )
     assert public["attempt"] == {"attempt_id": 2, "fence": 7, "state": "settled"}
     assert public["progress"]["sequence"] == 3
     assert public["resource"]["state"] == "running"
     assert public["result"]["outcome"] == "done"
     assert all("source_provenance" in value for value in projections.values())
+    assert "source_attestation" in projections["result"]
 
 
 def test_run_status_api_reports_terminal_attempt_settled(api) -> None:
@@ -2334,6 +2347,7 @@ def test_status_list_and_logs_sanitize_every_lifecycle_projection(api) -> None:
 
     for projection in (direct, listed, logs):
         assert "source_provenance" not in json.dumps(projection)
+        assert "source_attestation" not in json.dumps(projection)
         assert projection["attempt"]["attempt_id"] == 2
         assert projection["progress"]["sequence"] == 3
         assert projection["resource"]["state"] == "running"

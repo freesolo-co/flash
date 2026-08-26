@@ -337,6 +337,7 @@ from flash.runner.supervise.recovery import (  # noqa: E402,F401
     _RUNPOD_STATUS_PROBE_TIMEOUT_S,
     _adopt_completed_attempt,
     _apply_charge_with_state,
+    _attempt_result,
     _attempt_result_metrics,
     _candidate_usable_vram_gb,
     _canonical_provider_handle,

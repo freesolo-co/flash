@@ -235,6 +235,7 @@ def test_strict_handle_rejects_truncated_owner_identity(monkeypatch):
         "endpoint_name": "flash-test",
         "key_fingerprint": "rpk-" + "a" * 12,
         "attempt": 0,
+        "fence": 1,
         "started_ts": 1.0,
     }
     with pytest.raises(ValueError, match="key fingerprint is invalid"):

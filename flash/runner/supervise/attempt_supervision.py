@@ -103,10 +103,13 @@ class _SubmitContext:
                 f"run {self.spec.run_id} became terminal while its provider handle was being persisted"
             )
         finally:
-            lock = self.submission_lock
-            self.submission_lock = None
-            if lock is not None:
-                lock.release()
+            self.release_submission_lock()
+
+    def release_submission_lock(self) -> None:
+        lock = self.submission_lock
+        self.submission_lock = None
+        if lock is not None:
+            lock.release()
 
     def gc_seen_endpoints(self) -> None:
         # only runpod handles carry an endpoint_id, so this set is empty on a plane without it.
@@ -354,6 +357,10 @@ def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
 def _prepare_attempt(ctx: _SubmitContext, invocation_ordinal: int) -> _PreparationOutcome:
     from flash.runner.lifecycle.attempts import _reserve_attempt_record, _verified_opd_retry_state
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
+    from flash.runner.lifecycle.state import TERMINAL_STATES
+    from flash.runner.lifecycle.status import get_status
+    from flash.runner.supervise.errors import _RunCancelled
+    from flash.server.platform.locks import _deploy_lock
 
     attempt = ctx.attempt_start + invocation_ordinal
     ctx.raise_if_cancelled()
@@ -372,29 +379,42 @@ def _prepare_attempt(ctx: _SubmitContext, invocation_ordinal: int) -> _Preparati
         )
     else:
         expected_next_attempt, opd_resume_revision, resume_world_size = None, None, None
-    attempt_record = _reserve_attempt_record(
-        ctx.spec.run_id,
-        minimum_attempt=ctx.attempt_start if invocation_ordinal == 0 else 0,
-        expected_next_attempt=expected_next_attempt,
-    )
-    attempt = attempt_record.attempt_id
-    ctx.current_attempt = attempt
-    _mark_attempt_boundary(ctx, attempt)
-    attempt_runtime_secrets = dict(ctx.runtime_secrets or {})
-    attempt_runtime_secrets.pop(OPD_RESUME_REVISION_ENV, None)
-    if opd_resume_revision is not None:
-        attempt_runtime_secrets[OPD_RESUME_REVISION_ENV] = opd_resume_revision
-    return _PreparationOutcome(
-        prepared=_PreparedAttempt(
-            invocation_ordinal,
-            attempt,
-            attempt_record.fence,
-            attempt_spec,
-            attempt_runtime_secrets,
-            # only a pinned resume constrains the shape; without one the retry re-ranks freely.
-            resume_world_size=resume_world_size if opd_resume_revision is not None else None,
+    ctx.submission_lock = _deploy_lock(ctx.spec.run_id)
+    ctx.submission_lock.acquire()
+    try:
+        latest = get_status(ctx.spec.run_id)
+        if latest.state in TERMINAL_STATES:
+            raise ctx.cancel()
+        if latest.remote:
+            raise _RunCancelled(
+                f"run {ctx.spec.run_id} already has a durable provider handle; not resubmitting"
+            )
+        attempt_record = _reserve_attempt_record(
+            ctx.spec.run_id,
+            minimum_attempt=ctx.attempt_start if invocation_ordinal == 0 else 0,
+            expected_next_attempt=expected_next_attempt,
         )
-    )
+        attempt = attempt_record.attempt_id
+        ctx.current_attempt = attempt
+        _mark_attempt_boundary(ctx, attempt)
+        attempt_runtime_secrets = dict(ctx.runtime_secrets or {})
+        attempt_runtime_secrets.pop(OPD_RESUME_REVISION_ENV, None)
+        if opd_resume_revision is not None:
+            attempt_runtime_secrets[OPD_RESUME_REVISION_ENV] = opd_resume_revision
+        return _PreparationOutcome(
+            prepared=_PreparedAttempt(
+                invocation_ordinal,
+                attempt,
+                attempt_record.fence,
+                attempt_spec,
+                attempt_runtime_secrets,
+                # only a pinned resume constrains the shape; without one the retry re-ranks freely.
+                resume_world_size=resume_world_size if opd_resume_revision is not None else None,
+            )
+        )
+    except BaseException:
+        ctx.release_submission_lock()
+        raise
 
 
 def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
@@ -692,12 +712,9 @@ def _submit_candidate(
     from flash.runner.lifecycle.status import get_status
     from flash.runner.lifecycle.submit import _persist_effective_worker_spec
     from flash.runner.supervise.errors import _RunCancelled
-    from flash.server.platform.locks import _deploy_lock
 
     retry_delay = 0.0
     candidate_not_started = False
-    ctx.submission_lock = _deploy_lock(ctx.spec.run_id)
-    ctx.submission_lock.acquire()
     try:
         latest = get_status(ctx.spec.run_id)
         if latest.state in TERMINAL_STATES:
@@ -717,30 +734,30 @@ def _submit_candidate(
         if candidate_not_started:
             retry_delay = _retry_delay(ctx, prepared.invocation_ordinal)
     finally:
-        lock = ctx.submission_lock
-        ctx.submission_lock = None
-        if lock is not None:
-            lock.release()
+        ctx.release_submission_lock()
     if retry_delay:
         _lifecycle.time.sleep(retry_delay)  # let the transient clear
     return result
 
 
 def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOutcome:
-    allocation, result = _allocate_attempt(ctx, prepared)
-    if allocation is None:
-        return _AttemptOutcome(result=result)
-    ctx.raise_if_cancelled()
-    plan = _build_candidate_plan(ctx, prepared, allocation)
-    if plan is None:
-        return _AttemptOutcome(stop=True)
-    result = _submit_candidate(ctx, prepared, plan)
-    return _AttemptOutcome(
-        result=result,
-        chosen=plan.chosen,
-        candidates=plan.candidates,
-        run_spec=plan.run_spec,
-    )
+    try:
+        allocation, result = _allocate_attempt(ctx, prepared)
+        if allocation is None:
+            return _AttemptOutcome(result=result)
+        ctx.raise_if_cancelled()
+        plan = _build_candidate_plan(ctx, prepared, allocation)
+        if plan is None:
+            return _AttemptOutcome(stop=True)
+        result = _submit_candidate(ctx, prepared, plan)
+        return _AttemptOutcome(
+            result=result,
+            chosen=plan.chosen,
+            candidates=plan.candidates,
+            run_spec=plan.run_spec,
+        )
+    finally:
+        ctx.release_submission_lock()
 
 
 def _return_success_metrics(ctx: _SubmitContext, outcome: _AttemptOutcome) -> dict:

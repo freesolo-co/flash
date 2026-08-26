@@ -54,7 +54,6 @@ def test_submit_context_preserves_controller_staged_identity_without_resolving(m
     spec = _staged_spec()
     context = attempt_supervision._build_context(
         spec,
-        spec.seed,
         io.StringIO(),
         None,
         valid_source_snapshot(),

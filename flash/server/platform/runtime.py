@@ -237,6 +237,8 @@ def _fail_blocked_recovery(
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
     status = get_status(spec.run_id)
+    expected_attempt = _status_attempt_identity(status) if status.remote is None else None
+    expected_no_attempt = status.remote is None and expected_attempt is None
     if status.remote is None:
         try:
             deadline_at = _load_run_deadline_at(spec.run_id)
@@ -250,6 +252,8 @@ def _fail_blocked_recovery(
                 None,
                 metrics,
                 log=None,
+                expected_attempt=expected_attempt,
+                expected_no_attempt=expected_no_attempt,
             )
             if applied:
                 with contextlib.suppress(Exception):
@@ -259,7 +263,13 @@ def _fail_blocked_recovery(
                     )
             return applied
 
-    applied = _compare_and_fail_remote(spec.run_id, expected_remote, reason)
+    applied = _compare_and_fail_remote(
+        spec.run_id,
+        expected_remote,
+        reason,
+        expected_attempt=expected_attempt,
+        expected_no_attempt=expected_no_attempt,
+    )
     if applied:
         with contextlib.suppress(Exception):
             _append_run_log(spec.run_id, reason)
@@ -277,6 +287,9 @@ def _start_resubmit(
     from flash.runner.lifecycle.status import source_snapshot_from_status
     from flash.runner.supervise.lifecycle import _run_job_background
 
+    result_state = _adopt_handleless_result(spec)
+    if result_state is not False:
+        return False
     try:
         source_snapshot_from_status(get_status(spec.run_id), required=True)
     except Exception as exc:
@@ -309,6 +322,59 @@ def _start_resubmit(
     return True
 
 
+def _status_attempt_identity(status) -> tuple[int, int] | None:
+    if not status.attempt:
+        return None
+
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    attempt = AttemptRecord.from_dict(status.attempt)
+    return attempt.attempt_id, attempt.fence
+
+
+def _adopt_handleless_result(spec) -> bool | None:
+    """adopt current fenced result, report absence, or defer an unavailable read."""
+    from flash.runner.accounting.reconciliation import _compare_and_fail_remote
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.supervise.lifecycle import _adopt_completed_attempt, _attempt_result
+
+    try:
+        status = get_status(spec.run_id)
+    except Exception:
+        return None
+    if not status.attempt:
+        return False
+    try:
+        expected_attempt = _status_attempt_identity(status)
+        _load_run_deadline_at(spec.run_id)
+        result = _attempt_result(spec.run_id)
+    except Exception:
+        return None
+    if result is None:
+        return False
+    try:
+        if result.ok:
+            applied = _adopt_completed_attempt(
+                spec.run_id,
+                spec,
+                None,
+                result.metrics,
+                log=None,
+                expected_attempt=expected_attempt,
+            )
+        else:
+            reason = f"{result.failure or 'job_failed'}: {result.detail or 'worker attempt failed'}"
+            applied = _compare_and_fail_remote(
+                spec.run_id,
+                None,
+                reason,
+                expected_attempt=expected_attempt,
+            )
+    except Exception:
+        return None
+    return True if applied else None
+
+
 def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
     del deadline_at
     if not status.attempt:
@@ -337,10 +403,28 @@ def _deferred_resubmit_loop(spec) -> None:
         if status.state in TERMINAL_STATES or status.remote is not None:
             return
         try:
+            expected_attempt = _status_attempt_identity(status)
+            expected_no_attempt = expected_attempt is None
+        except Exception:
+            time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+            continue
+        result_state = _adopt_handleless_result(spec)
+        if result_state is True:
+            return
+        if result_state is None:
+            time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+            continue
+        try:
             deadline_at = _load_run_deadline_at(spec.run_id)
         except Exception as exc:
             try:
-                if _compare_and_fail_remote(spec.run_id, None, str(exc)):
+                if _compare_and_fail_remote(
+                    spec.run_id,
+                    None,
+                    str(exc),
+                    expected_attempt=expected_attempt,
+                    expected_no_attempt=expected_no_attempt,
+                ):
                     return
             except Exception:
                 time.sleep(_DEFERRED_RECOVERY_RETRY_S)
@@ -360,6 +444,8 @@ def _deferred_resubmit_loop(spec) -> None:
                         None,
                         metrics,
                         log=None,
+                        expected_attempt=expected_attempt,
+                        expected_no_attempt=expected_no_attempt,
                     )
                 except Exception:
                     time.sleep(_DEFERRED_RECOVERY_RETRY_S)
@@ -367,7 +453,13 @@ def _deferred_resubmit_loop(spec) -> None:
                 return
             reason = "run wall deadline exhausted while provider teardown remained unconfirmed"
             try:
-                if _compare_and_fail_remote(spec.run_id, None, reason):
+                if _compare_and_fail_remote(
+                    spec.run_id,
+                    None,
+                    reason,
+                    expected_attempt=expected_attempt,
+                    expected_no_attempt=expected_no_attempt,
+                ):
                     with contextlib.suppress(Exception):
                         _append_run_log(spec.run_id, reason)
                     return
@@ -722,6 +814,11 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
     from flash.runner.lifecycle.status import get_status
 
     for spec, prior_state in resubmit:
+        result_state = _adopt_handleless_result(spec)
+        if result_state is not False:
+            if result_state is None:
+                threading.Thread(target=_deferred_resubmit_loop, args=(spec,), daemon=True).start()
+            continue
         reason = _recovery_block_reason(spec)
         if reason is not None:
             applied = False

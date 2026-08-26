@@ -97,10 +97,73 @@ def test_reads_latest_verified_progress_and_single_result(monkeypatch) -> None:
         source_snapshot=SOURCE,
     )
 
-    assert observed.progress["sequence"] == 2
-    assert observed.progress["observed_at"] == 130.0
+    assert observed.progress is None
     assert observed.result["outcome"] == "succeeded"
     assert observed.result["receipt"]["path"] == result_path(result)
+
+
+def test_repeated_polls_download_result_before_progress(monkeypatch) -> None:
+    first = _progress(1)
+    second = _progress(2, first)
+    result = _result()
+    payloads = {
+        progress_path(first): canonical_bytes(first.to_dict()),
+        progress_path(second): canonical_bytes(second.to_dict()),
+        result_path(result): canonical_bytes(result.to_dict()),
+    }
+    paths = list(payloads)
+    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, paths))
+    downloads = []
+
+    def download(_repo, path, *, revision):
+        downloads.append(path)
+        return payloads[path]
+
+    monkeypatch.setattr(attempts, "_download_bytes", download)
+
+    for _ in range(2):
+        observed = attempts.read_attempt_artifacts(
+            "org/repo",
+            phase="rl",
+            run_id="run-1",
+            attempt_id=2,
+            fence=9,
+            source_snapshot=SOURCE,
+        )
+        assert observed.progress is None
+        assert observed.result["outcome"] == "succeeded"
+
+    assert downloads == [result_path(result), result_path(result)]
+
+
+def test_poll_without_result_replays_strict_progress_chain(monkeypatch) -> None:
+    first = _progress(1)
+    second = _progress(2, first)
+    payloads = {
+        progress_path(first): canonical_bytes(first.to_dict()),
+        progress_path(second): canonical_bytes(second.to_dict()),
+    }
+    downloads = []
+    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, list(payloads)))
+
+    def download(_repo, path, *, revision):
+        downloads.append(path)
+        return payloads[path]
+
+    monkeypatch.setattr(attempts, "_download_bytes", download)
+
+    observed = attempts.read_attempt_artifacts(
+        "org/repo",
+        phase="rl",
+        run_id="run-1",
+        attempt_id=2,
+        fence=9,
+        source_snapshot=SOURCE,
+    )
+
+    assert downloads == [progress_path(first), progress_path(second)]
+    assert observed.progress["sequence"] == 2
+    assert observed.result is None
 
 
 def test_result_download_transport_error_remains_retriable(monkeypatch) -> None:
@@ -125,10 +188,18 @@ def test_result_download_transport_error_remains_retriable(monkeypatch) -> None:
 
 
 def test_downloaded_malformed_result_is_attempt_artifact_error(monkeypatch) -> None:
+    progress = _progress(1)
     result = _result()
     path = result_path(result)
-    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, [path]))
-    monkeypatch.setattr(attempts, "_download_bytes", lambda *_args, **_kwargs: b"not-json")
+    payloads = {progress_path(progress): canonical_bytes(progress.to_dict()), path: b"not-json"}
+    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, list(payloads)))
+    downloads = []
+
+    def download(_repo, artifact_path, *, revision):
+        downloads.append(artifact_path)
+        return payloads[artifact_path]
+
+    monkeypatch.setattr(attempts, "_download_bytes", download)
 
     with pytest.raises(attempts.AttemptArtifactError, match="invalid or unverifiable"):
         attempts.read_attempt_artifacts(
@@ -139,6 +210,7 @@ def test_downloaded_malformed_result_is_attempt_artifact_error(monkeypatch) -> N
             fence=9,
             source_snapshot=SOURCE,
         )
+    assert downloads == [path]
 
 
 def test_rejects_conflicting_results(monkeypatch) -> None:

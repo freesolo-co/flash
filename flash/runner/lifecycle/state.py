@@ -178,6 +178,8 @@ class RunStatus:
             projection = data.get(lifecycle_field)
             if isinstance(projection, dict):
                 projection.pop("source_provenance", None)
+                if lifecycle_field == "result":
+                    projection.pop("source_attestation", None)
         if source_snapshot is not None:
             from flash.snapshot.archive import safe_public_projection
 

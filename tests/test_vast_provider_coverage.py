@@ -100,6 +100,7 @@ def _generic_handle() -> JobHandle:
             "gpu": "H100",
             "hourly_usd": 1.5,
             "attempt": 0,
+            "fence": 1,
             "started_ts": 1.0,
         }
     )

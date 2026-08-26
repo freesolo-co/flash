@@ -19,6 +19,7 @@ def _reset(monkeypatch) -> None:
     monkeypatch.setattr(progress_io, "_PROGRESS_COMPLETED_STEPS", 0)
     monkeypatch.setattr(progress_io, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
     monkeypatch.setattr(progress_io, "_PROGRESS_PENDING_UPLOAD", None, raising=False)
+    monkeypatch.setattr(progress_io, "_PROGRESS_BLOCKED_OBSERVATION", None, raising=False)
 
 
 def test_progress_api_exposes_only_initial_and_observed_fields() -> None:
@@ -59,6 +60,48 @@ def test_failed_upload_retries_the_identical_record_and_path(monkeypatch) -> Non
     assert attempts[2][1] != attempts[1][1]
     assert progress_io._PROGRESS_SEQUENCE == 2
     assert progress_io._PROGRESS_PENDING_UPLOAD is None
+
+
+def test_consecutive_retry_failures_retain_blocked_cumulative_observation(monkeypatch) -> None:
+    _reset(monkeypatch)
+    attempted = []
+    outcomes = iter([False, False, True, True])
+
+    def upload(record, **_kwargs):
+        attempted.append(record)
+        return next(outcomes)
+
+    monkeypatch.setattr(progress_io, "_upload_record", upload)
+    checkpoint_failure = {"step": 2, "operation": "save", "error": "quota denied"}
+
+    assert progress_io.publish_progress("boot", gpu={"used_mb": 1}) is False
+    assert (
+        progress_io.publish_progress(
+            "rl_step",
+            step=2,
+            reward=0.75,
+            metrics_last=[{"step": 2, "reward": 0.75, "grad_norm": 1.25}],
+        )
+        is False
+    )
+    assert (
+        progress_io.publish_progress(
+            "checkpoint_upload_failed",
+            step=2,
+            checkpoint_failure=checkpoint_failure,
+        )
+        is True
+    )
+
+    published = attempted[-1]
+    assert [record.sequence for record in attempted] == [1, 1, 1, 2]
+    assert canonical_bytes(attempted[0].to_dict()) == canonical_bytes(attempted[2].to_dict())
+    assert published.training_entered is True
+    assert published.completed_steps == 2
+    assert published.metrics == {"reward": 0.75, "grad_norm": 1.25}
+    assert published.checkpoint == checkpoint_failure
+    assert progress_io._PROGRESS_PENDING_UPLOAD is None
+    assert progress_io._PROGRESS_BLOCKED_OBSERVATION is None
 
 
 def test_commit_landed_response_failed_retries_without_breaking_reader(monkeypatch) -> None:

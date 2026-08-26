@@ -45,8 +45,8 @@ def _canonical_provider_handle(handle):
     raise ValueError("persisted provider identity is missing or unsupported")
 
 
-def _attempt_result_metrics(run_id: str, handle=None) -> dict | None:
-    """return metrics only from the current verified fenced success result."""
+def _attempt_result(run_id: str, handle=None):
+    """return the current verified fenced terminal result, if visible."""
     from flash.providers.artifacts.attempts import (
         persist_attempt_artifacts,
         poll_result_from_manifest,
@@ -79,8 +79,13 @@ def _attempt_result_metrics(run_id: str, handle=None) -> dict | None:
     persist_attempt_artifacts(run_id, artifacts)
     if artifacts.result is None:
         return None
-    result = poll_result_from_manifest(artifacts.result)
-    return result.metrics if result.ok else None
+    return poll_result_from_manifest(artifacts.result)
+
+
+def _attempt_result_metrics(run_id: str, handle=None) -> dict | None:
+    """return metrics only from the current verified fenced success result."""
+    result = _attempt_result(run_id, handle)
+    return result.metrics if result is not None and result.ok else None
 
 
 def _worker_provably_gone(run_id: str, handle) -> bool:
@@ -243,11 +248,20 @@ def _adopt_completed_attempt(
     metrics: dict,
     *,
     log,
+    expected_attempt: tuple[int, int] | None = None,
+    expected_no_attempt: bool = False,
 ) -> bool:
     """Finalize a phantom-completed attempt through the expected-remote CAS."""
     from flash.runner.accounting.reconciliation import _compare_and_complete_remote
 
-    applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
+    applied = _compare_and_complete_remote(
+        run_id,
+        expected_remote,
+        spec,
+        metrics,
+        expected_attempt=expected_attempt,
+        expected_no_attempt=expected_no_attempt,
+    )
     if applied:
         _charge_completed_run_by_id(spec.run_id, log)
         _lifecycle()._register_checkpoints_best_effort(spec, log)

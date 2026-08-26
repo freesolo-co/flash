@@ -142,6 +142,22 @@ def _disable_github(monkeypatch) -> None:
         monkeypatch.setattr(loader, name, boom)
 
 
+def _active_attempt() -> dict:
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    now = time.time()
+    return AttemptRecord(
+        attempt_id=0,
+        fence=1,
+        state="active",
+        reserved_at=now,
+        grant_deadline_at=now + 60,
+        work_deadline_at=now + 120,
+        run_deadline_at=now + 180,
+        result_deadline_at=now + 240,
+    ).to_dict()
+
+
 def _prepared_status(public: JobSpec, worker: JobSpec, *, state: str = "provisioning"):
 
     return runner_state.RunStatus(
@@ -715,12 +731,14 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
         "provider": "runpod",
         "endpoint_id": "ep",
         "job_id": "job",
-        "key_fingerprint": "rpk-0123456789ab",
+        "key_fingerprint": "rpk-" + "0" * 64,
         "attempt": 0,
+        "fence": 1,
         "started_ts": time.time(),
     }
     status = _prepared_status(public, worker, state="running")
     status.remote = remote
+    status.attempt = _active_attempt()
     runner_state._save_status(
         status,
         _run_deadline_at=status.created_at + worker.gpu.max_wall_seconds,
@@ -741,7 +759,7 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
     monkeypatch.setattr(
         "flash.providers.core.registry.get_provider",
         lambda _name: SimpleNamespace(
-            poll=lambda *_args, **_kwargs: PollResult(
+            poll_attempt=lambda *_args, **_kwargs: PollResult(
                 False, failure="job_preempted", detail="resource lost"
             )
         ),
@@ -780,12 +798,14 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
         "provider": "runpod",
         "endpoint_id": "ep",
         "job_id": "job",
-        "key_fingerprint": "rpk-0123456789ab",
+        "key_fingerprint": "rpk-" + "0" * 64,
         "attempt": 0,
+        "fence": 1,
         "started_ts": time.time(),
     }
     status = _prepared_status(public, worker, state="running")
     status.remote = remote
+    status.attempt = _active_attempt()
     deadline_at = status.created_at + worker.gpu.max_wall_seconds
     runner_state._save_status(status, _run_deadline_at=deadline_at)
     context = SimpleNamespace(
@@ -831,7 +851,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
     monkeypatch.setattr(
         "flash.providers.core.registry.get_provider",
         lambda _name: SimpleNamespace(
-            poll=lambda *_args, **_kwargs: PollResult(
+            poll_attempt=lambda *_args, **_kwargs: PollResult(
                 False, failure="job_preempted", detail="resource lost"
             )
         ),
