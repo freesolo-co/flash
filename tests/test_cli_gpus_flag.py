@@ -251,18 +251,8 @@ def test_a_pinned_class_can_need_a_wider_ceiling_for_grpo_and_opd():
         )
 
 
-def test_the_allocation_log_line_carries_the_count_that_status_does_not():
-    """TRAINING.md points at the run log for the allocated count, so that line must carry it.
-
-    The doc previously pointed at gpu_status.device_count, which is a real worker observation but
-    an unreliable place to look: mid-run heartbeats collect diagnostics with include_torch=False
-    and record_heartbeat REPLACES gpu_status per heartbeat, so the field is normally absent while
-    a run is live. The runner's allocation line has neither problem -- it is written once at
-    placement, before any worker exists, into an append-only log.
-
-    Both spellings are asserted because the doc states both: multi-card carries the Nx prefix and
-    single-card does not, so a user grepping for "1x" on a one-card run would find nothing.
-    """
+def test_the_allocation_log_line_carries_the_selected_count():
+    """the allocation log records the selected count before a worker exists."""
     from flash.providers.core.allocator import Allocation, allocation_summary
 
     def summarize(count: int) -> str:
