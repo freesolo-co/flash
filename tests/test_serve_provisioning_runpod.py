@@ -159,6 +159,40 @@ def test_profile_runpod_plan_preserves_exact_engine_storage_and_image(model_id: 
     assert ARTIFACT_SECRET not in rendered
 
 
+def test_27b_runpod_plan_uses_h200_in_ap_jp_1() -> None:
+    model_id = "Qwen/Qwen3.8-27B"
+    spec, inputs = _profile_spec_and_inputs(model_id)
+    profile = get_profile(model_id)
+    placement = placement_for(
+        profile,
+        "runpod",
+        account_id="account-01",
+        data_center_id="AP-JP-1",
+    )
+    runpod_spec = replace(spec, provider="runpod", placement=placement)
+    bundle = DeploymentBundle(
+        spec=runpod_spec,
+        manifest=build_serving_manifest(runpod_spec, inputs),
+        image=ServingImage(
+            reference=f"registry.example/flash/serve@{runpod_spec.engine.image_digest}",
+            digest=runpod_spec.engine.image_digest,
+        ),
+    )
+
+    plan = build_runpod_create_plan(bundle)
+    volume = plan.volume_payload()
+    pod = plan.pod_payload(template_id="template-01", volume_id="volume-01")
+
+    assert plan.placement.gpu_type_id == "NVIDIA H200"
+    assert plan.placement.container_disk_gb == 150
+    assert plan.placement.volume_size_gb == 300
+    assert volume["dataCenterId"] == "AP-JP-1"
+    assert volume["size"] == 300
+    assert pod["gpuTypeIds"] == ["NVIDIA H200"]
+    assert pod["dataCenterIds"] == ["AP-JP-1"]
+    assert pod["containerDiskInGb"] == 150
+
+
 def _oversized_bundle() -> DeploymentBundle:
     modal_spec, inputs = _spec_and_inputs()
     oversized_default = json.dumps(

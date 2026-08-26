@@ -283,6 +283,11 @@ def test_model_specific_checkpoint_and_scheduler_choices() -> None:
     assert twenty_seven.tokenizer_model == "Qwen/Qwen3.8-27B"
     assert twenty_seven.modal_gpu == "H100"
     assert twenty_seven.modal_gpu_request == "H100!"
+    assert twenty_seven.runpod_gpu.gpu_type_id == "NVIDIA H200"
+    assert twenty_seven.runpod_gpu.container_disk_gb == 150
+    assert twenty_seven.runpod_gpu.volume_size_gb == 300
+    assert twenty_seven.modal_live_qualified is False
+    assert twenty_seven.runpod_live_qualified is False
     assert thirty_five.served_model == "Qwen/Qwen3.6-35B-A3B"
     assert thirty_five.modal_gpu_request == "H200"
     assert thirty_five.quantization is None

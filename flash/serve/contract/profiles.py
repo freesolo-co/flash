@@ -75,9 +75,6 @@ _RUNPOD_L40S = RunPodGpu(gpu_type_id="NVIDIA L40S", container_disk_gb=100, volum
 # these gpu ids already exist in the runpod-backed source, but the storage values are deliberately
 # oversized construction values, not measured claims. the new profiles remain blocked from real
 # deployment until live qualification replaces these values and marks each provider qualified.
-_PROVISIONAL_RUNPOD_H100 = RunPodGpu(
-    gpu_type_id="NVIDIA H100 80GB HBM3", container_disk_gb=150, volume_size_gb=250
-)
 _PROVISIONAL_RUNPOD_H200 = RunPodGpu(
     gpu_type_id="NVIDIA H200", container_disk_gb=150, volume_size_gb=300
 )
@@ -260,7 +257,7 @@ _PROFILES: dict[str, ServingProfile] = {
         modal_gpu="H100",
         # modal's trailing `!` forbids automatic h200 substitution for an h100 request.
         modal_gpu_request="H100!",
-        runpod_gpu=_PROVISIONAL_RUNPOD_H100,
+        runpod_gpu=_PROVISIONAL_RUNPOD_H200,
         modal_live_qualified=False,
         runpod_live_qualified=False,
     ),

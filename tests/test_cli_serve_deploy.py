@@ -460,6 +460,28 @@ def test_every_catalog_profile_builds_a_provider_free_dry_run(
     assert "engine_id" in output
 
 
+def test_27b_runpod_dry_run_uses_h200_in_ap_jp_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stub_resolution(monkeypatch)
+
+    args = _args(
+        model="Qwen/Qwen3.8-27B",
+        provider="runpod",
+        runpod_data_center="AP-JP-1",
+        dry_run=True,
+    )
+
+    assert cmd_serve_deploy(args) == 0
+    output = capsys.readouterr().out
+    assert "provider_gpu       NVIDIA H200" in output
+    assert "runpod_data_center AP-JP-1" in output
+    assert "runpod_container_disk_gb 150" in output
+    assert "runpod_volume_size_gb 300" in output
+    assert "dry run: no provider was contacted" in output
+
+
 @pytest.mark.parametrize(
     ("model", "expected_calls", "expected_model_revision", "expected_tokenizer_revision"),
     [
