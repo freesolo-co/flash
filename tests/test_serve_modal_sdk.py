@@ -10,10 +10,14 @@ from types import SimpleNamespace
 import pytest
 from synchronicity import Synchronizer
 
+from flash.serve.app.manifest import build_serving_manifest
 from flash.serve.control import ModalCredentials
+from flash.serve.deployment.profiles import get_profile, placement_for
+from flash.serve.provisioning import DeploymentBundle, ServingImage
 from flash.serve.provisioning.modal.execution.sdk import ModalSdkFailure, PinnedModalSdk
 from flash.serve.provisioning.modal.planning.plan import MODAL_VOLUME_MOUNT, build_modal_create_plan
 from flash.serve.provisioning.modal.planning.wrapper import launch_modal_server
+from tests.test_serve_app_manifest import _profile_spec_and_inputs
 from tests.test_serve_provisioning_modal import (
     APP_ID,
     ARTIFACT_SECRET,
@@ -768,6 +772,51 @@ def test_client_close_interruption_does_not_escape_cleanup() -> None:
     sdk.close()
 
     assert modal.client.close_count == 1
+
+
+def _profile_modal_bundle(model_id: str) -> DeploymentBundle:
+    spec, inputs = _profile_spec_and_inputs(model_id)
+    profile = get_profile(model_id)
+    placement = placement_for(
+        profile,
+        "modal",
+        workspace_name="workspace",
+        environment="main",
+        region="us-east",
+    )
+    spec = replace(spec, placement=placement)
+    manifest = build_serving_manifest(spec, inputs)
+    return DeploymentBundle(
+        spec=spec,
+        manifest=manifest,
+        image=ServingImage(
+            reference=f"registry.example/flash/serve@{spec.engine.image_digest}",
+            digest=spec.engine.image_digest,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected_gpu"),
+    [
+        ("Qwen/Qwen3.5-9B", "L40S:1"),
+        ("Qwen/Qwen3.8-27B", "H100!:1"),
+        ("Qwen/Qwen3.6-35B-A3B", "H200:1"),
+    ],
+)
+def test_profile_gpu_request_reaches_the_literal_modal_function_payload(
+    model_id: str, expected_gpu: str
+) -> None:
+    plan = build_modal_create_plan(_profile_modal_bundle(model_id), phase="bootstrap")
+    modal = _ModalModule(plan)
+    sdk = _sdk(plan, modal)
+    sdk.create_inference_secret(plan, INFERENCE_SECRET)
+    sdk.create_artifact_secret(plan, ARTIFACT_SECRET)
+    sdk.create_volume(plan)
+
+    sdk.deploy_app(plan)
+
+    assert modal.calls["function"]["gpu"] == expected_gpu
 
 
 def test_pinned_sdk_deploys_exact_image_without_local_source_overlays() -> None:
