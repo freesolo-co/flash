@@ -208,11 +208,11 @@ class _LeaseWatch:
             raise
         if operation_task in done:
             return await operation_task
-        settled = await stop_operation()
+        await stop_operation()
         exception = self._task.exception()
         if exception is None:
             exception = StreamChannelError(ChannelErrorCode.CHANNEL_FAULT, "lease watcher stopped")
-        if require_settled and not settled:
+        if require_settled:
             raise _UnsettledGuardedOperation(exception) from exception
         raise exception
 

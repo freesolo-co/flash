@@ -936,6 +936,80 @@ def test_unsettled_data_write_does_not_publish_a_competing_terminal_error(
     assert values[0]["terminal"] is True
 
 
+def test_data_write_settled_during_abort_does_not_publish_competing_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> list[dict[str, Any]]:
+        queue = _FakeQueue()
+        _patch_modal(monkeypatch, queue)
+        await queue.control(_control(0, call_id=None))
+        await queue.control(_control(1))
+        data_put_started = asyncio.Event()
+        data_put_cancelled = asyncio.Event()
+        release_data_put = asyncio.Event()
+        data_put_committed = asyncio.Event()
+        original_put = queue.put.aio
+
+        async def settling_put(
+            value: Any,
+            block: bool = True,
+            timeout: float | None = None,  # noqa: ASYNC109
+            *,
+            partition: str | None = None,
+            partition_ttl: int = 86400,
+        ) -> None:
+            if partition == DATA_PARTITION:
+                data_put_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    data_put_cancelled.set()
+                    await release_data_put.wait()
+            await original_put(
+                value,
+                block=block,
+                timeout=timeout,
+                partition=partition,
+                partition_ttl=partition_ttl,
+            )
+            if partition == DATA_PARTITION:
+                data_put_committed.set()
+
+        queue.put.aio = settling_put
+        owner = _Owner([{"type": "final", "ok": True}])
+
+        async def abort(generation_id: str) -> None:
+            owner.abort_ids.append(generation_id)
+            await data_put_cancelled.wait()
+            release_data_put.set()
+            await data_put_committed.wait()
+
+        owner.engine.abort = abort
+        task = asyncio.create_task(
+            stream_generate_call(
+                owner,
+                {},
+                None,
+                None,
+                "generation-1",
+                time.time() + 5,
+                queue.object_id,
+                "nonce-1",
+            )
+        )
+        await data_put_started.wait()
+        await queue.control(_control(2, kind="cancel"))
+        with pytest.raises(StreamChannelError, match="cancelled"):
+            await asyncio.wait_for(task, timeout=0.2)
+        return list(queue._partitions[DATA_PARTITION]._queue)
+
+    values = asyncio.run(scenario())
+    assert len(values) == 1
+    assert values[0]["kind"] == "event"
+    assert values[0]["sequence"] == 0
+    assert values[0]["terminal"] is True
+
+
 def test_backpressure_does_not_starve_control_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> _Owner:
         queue = _FakeQueue(data_capacity=1)
@@ -969,7 +1043,7 @@ def test_backpressure_does_not_starve_control_watchdog(monkeypatch: pytest.Monke
         )
         await owner.start_event.wait()
         await queue.control(_control(2, kind="cancel"))
-        with pytest.raises(StreamChannelError, match="publish terminal"):
+        with pytest.raises(StreamChannelError, match="cancelled"):
             await asyncio.wait_for(task, timeout=1)
         return owner
 
@@ -978,12 +1052,10 @@ def test_backpressure_does_not_starve_control_watchdog(monkeypatch: pytest.Monke
     assert owner.finally_count == 1
 
 
-def test_terminal_error_publication_retains_noncooperative_write(
+def test_watcher_won_data_write_skips_terminal_error_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def scenario() -> tuple[_Owner, bool, bool]:
-        monkeypatch.setattr(channel_engine, "CONTROL_POLL_SECONDS", 0.01)
-        monkeypatch.setattr(channel_engine, "CLEANUP_SECONDS", 0.01)
+    async def scenario() -> tuple[_Owner, bool]:
         queue = _FakeQueue(data_capacity=1)
         _patch_modal(monkeypatch, queue)
         await queue.data(
@@ -1000,18 +1072,13 @@ def test_terminal_error_publication_retains_noncooperative_write(
         )
         await queue.control(_control(0, call_id=None))
         await queue.control(_control(1))
-        cancellation_received = asyncio.Event()
-        release = asyncio.Event()
+        terminal_error_attempted = False
         original_put = queue.put.aio
 
         async def put(value: Any, **options: Any) -> None:
+            nonlocal terminal_error_attempted
             if options.get("partition") == DATA_PARTITION and value.get("kind") == "error":
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    cancellation_received.set()
-                    await release.wait()
-                return
+                terminal_error_attempted = True
             await original_put(value, **options)
 
         queue.put.aio = put
@@ -1030,21 +1097,14 @@ def test_terminal_error_publication_retains_noncooperative_write(
         )
         await owner.start_event.wait()
         await queue.control(_control(2, kind="cancel"))
-        with pytest.raises(StreamChannelError, match="publish terminal"):
-            await asyncio.wait_for(task, timeout=0.2)
-        await cancellation_received.wait()
-        retained = bool(channel_engine._BACKGROUND_TASKS)
-        release.set()
-        for retained_task in tuple(channel_engine._BACKGROUND_TASKS):
-            await retained_task
-        await asyncio.sleep(0)
-        return owner, retained, not channel_engine._BACKGROUND_TASKS
+        with pytest.raises(StreamChannelError, match="cancelled"):
+            await asyncio.wait_for(task, timeout=1)
+        return owner, terminal_error_attempted
 
-    owner, retained, drained = asyncio.run(scenario())
+    owner, terminal_error_attempted = asyncio.run(scenario())
     assert owner.abort_ids == ["generation-1"]
     assert owner.finally_count == 1
-    assert retained
-    assert drained
+    assert not terminal_error_attempted
 
 
 def test_engine_cleanup_timeout_retains_noncooperative_task(
