@@ -9,6 +9,12 @@ import operator
 import types
 import zipimport
 
+from flash._http_support.analysis import (
+    has_ambiguous_control_flow,
+    is_direct_namespace_global,
+    namespace_origins,
+)
+
 _SNAPSHOT_ITEMS_MAX = 256
 _TRAVERSAL_NODES_MAX = 1024
 _DYNAMIC_NAMESPACE_NAMES = frozenset(
@@ -187,36 +193,6 @@ def _static_constant(value: object) -> tuple[object, ...]:
     return (_STATIC_UNKNOWN,)
 
 
-def _has_ambiguous_default_control_flow(
-    instructions: tuple[dis.Instruction, ...],
-    start: int,
-    end: int,
-    origins: dict[str, tuple[str, str]],
-    *,
-    local_only: bool = False,
-) -> bool:
-    offset_indices = {instruction.offset: index for index, instruction in enumerate(instructions)}
-    origin_loads = _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}
-    if not local_only:
-        origin_loads |= {"LOAD_GLOBAL", "LOAD_NAME"}
-    for index, instruction in enumerate(instructions[:end]):
-        if instruction.opcode not in _BRANCH_OPCODES:
-            continue
-        target = instruction.argval
-        target_index = offset_indices.get(target) if type(target) is int else None
-        if target_index is None or not start <= target_index <= end:
-            continue
-        branch_start = _stack_expression_start(instructions, index)
-        while instructions[branch_start].opname == "COPY":
-            branch_start = _stack_expression_start(instructions, branch_start)
-        if any(
-            candidate.opname in origin_loads and _loaded_origin(candidate, origins) is not None
-            for candidate in instructions[branch_start:end]
-        ):
-            return True
-    return False
-
-
 def _static_default_origin(
     instructions: tuple[dis.Instruction, ...],
     span: tuple[int, int],
@@ -225,8 +201,14 @@ def _static_default_origin(
     fail_on_unsupported: bool = True,
 ) -> tuple[str, str] | None:
     start, end = span
-    if fail_on_unsupported and _has_ambiguous_default_control_flow(
-        instructions, start, end, origins
+    if fail_on_unsupported and has_ambiguous_control_flow(
+        instructions,
+        start,
+        end,
+        origins,
+        _BRANCH_OPCODES,
+        _FAST_LOAD_OPNAMES,
+        _stack_expression_start,
     ):
         raise ValueError
     expression = instructions[start:end]
@@ -395,6 +377,7 @@ def _loaded_reference_paths(
     code: types.CodeType,
     root_origins: dict[str, tuple[str, str]],
     safe_parent_offsets: frozenset[tuple[int, int]] = frozenset(),
+    namespace_origins: frozenset[tuple[str, str]] = frozenset(),
 ) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
     pending = [(code, root_origins)]
     seen: set[int] = set()
@@ -409,7 +392,9 @@ def _loaded_reference_paths(
             raise ValueError
         instructions = tuple(dis.get_instructions(current))
         current_origins = dict(origins)
-        propagated_names: set[str] = set()
+        propagated_names = {
+            name for name, origin in current_origins.items() if origin in namespace_origins
+        }
         changed = True
         while changed:
             changed = False
@@ -426,11 +411,23 @@ def _loaded_reference_paths(
                 expression = instructions[start:index]
                 strict_origins = {name: current_origins[name] for name in propagated_names}
                 strict = any(
-                    candidate.opname in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}
-                    and _loaded_origin(candidate, strict_origins) is not None
-                    for candidate in expression
-                ) or _has_ambiguous_default_control_flow(
-                    instructions, start, index, strict_origins, local_only=True
+                    is_direct_namespace_global(instructions, candidate_index, namespace_origins)
+                    or (
+                        candidate.opname in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}
+                        and _loaded_origin(candidate, strict_origins) is not None
+                    )
+                    for candidate_index, candidate in enumerate(expression, start)
+                ) or has_ambiguous_control_flow(
+                    instructions,
+                    start,
+                    index,
+                    strict_origins,
+                    _BRANCH_OPCODES,
+                    _FAST_LOAD_OPNAMES,
+                    _stack_expression_start,
+                    strict_globals=frozenset(
+                        name for kind, name in namespace_origins if kind == "global"
+                    ),
                 )
                 try:
                     origin = _static_default_origin(
@@ -443,10 +440,12 @@ def _loaded_reference_paths(
                     if strict:
                         raise
                     continue
-                if origin is not None and current_origins.get(target_name) != origin:
-                    current_origins[target_name] = origin
-                    propagated_names.add(target_name)
-                    changed = True
+                if origin is not None:
+                    if origin in namespace_origins:
+                        propagated_names.add(target_name)
+                    if current_origins.get(target_name) != origin:
+                        current_origins[target_name] = origin
+                        changed = True
         for index, instruction in enumerate(instructions):
             if instruction.opname in {"IMPORT_NAME", "IMPORT_FROM", "IMPORT_STAR"}:
                 raise ValueError
@@ -691,7 +690,9 @@ def _function_global_reference_values(function: types.FunctionType) -> tuple[obj
     code = object.__getattribute__(function, "__code__")
     roots = _function_reference_roots(function)
     values = []
-    for root_kind, name, attributes in _loaded_reference_paths(code, {}):
+    for root_kind, name, attributes in _loaded_reference_paths(
+        code, {}, namespace_origins=namespace_origins(roots)
+    ):
         if root_kind != "global":
             continue
         if name in _DYNAMIC_NAMESPACE_NAMES:
@@ -712,7 +713,10 @@ def _function_bound_reference_values(
     safe_parent_offsets = frozenset()
     values = []
     for root_kind, name, attributes in _loaded_reference_paths(
-        code, root_origins, safe_parent_offsets
+        code,
+        root_origins,
+        safe_parent_offsets,
+        namespace_origins(roots),
     ):
         if root_kind != "bound":
             continue
@@ -739,7 +743,10 @@ def _function_reference_values(
     safe_parent_offsets = frozenset()
     values = [*roots["default"].values(), *roots["binding"].values()]
     for root_kind, name, attributes in _loaded_reference_paths(
-        code, root_origins, safe_parent_offsets
+        code,
+        root_origins,
+        safe_parent_offsets,
+        namespace_origins(roots),
     ):
         if root_kind == "global" and name in _DYNAMIC_NAMESPACE_NAMES:
             raise ValueError

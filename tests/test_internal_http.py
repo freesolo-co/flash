@@ -1866,6 +1866,7 @@ def test_mutated_instance_callback_holder_fails_before_cached_transport() -> Non
 
 
 @pytest.mark.parametrize("root_kind", ["module", "type"])
+@pytest.mark.parametrize("initial_alias", [True, False])
 @pytest.mark.parametrize(
     "alias_expression",
     [
@@ -1880,6 +1881,7 @@ def test_mutated_instance_callback_holder_fails_before_cached_transport() -> Non
 )
 def test_local_alias_of_global_namespace_fails_before_transport(
     root_kind: str,
+    initial_alias: bool,
     alias_expression: str,
 ) -> None:
     source = "custom://source.invalid/data"
@@ -1900,17 +1902,21 @@ def test_local_alias_of_global_namespace_fails_before_transport(
         "urllib": urllib,
         "response": _response,
     }
-    exec(
+    source_expression = (
+        alias_expression if initial_alias else alias_expression.replace("alias", "namespace")
+    )
+    alias_statement = "    alias = namespace\n" if initial_alias else ""
+    callback_source = (
         "def custom_open(self, request):\n"
         "    contacted.append(request.full_url)\n"
         "    if request.full_url == sink:\n"
         "        return response(request.full_url)\n"
-        "    alias = namespace\n"
-        f"    hidden = {alias_expression}\n"
-        "    redirected = urllib.request.Request(sink)\n"
-        "    return hidden.target.open(redirected, timeout=request.timeout)\n",
-        callback_globals,
+        + alias_statement
+        + f"    hidden = {source_expression}\n"
+        + "    redirected = urllib.request.Request(sink)\n"
+        + "    return hidden.target.open(redirected, timeout=request.timeout)\n"
     )
+    exec(callback_source, callback_globals)
 
     class CallbackHandler(urllib.request.BaseHandler):
         pass
@@ -1929,6 +1935,36 @@ def test_local_alias_of_global_namespace_fails_before_transport(
         )
 
     assert contacted == []
+
+
+def test_transformed_scalar_global_local_is_supported() -> None:
+    contacted: list[str] = []
+    callback_globals = {
+        "contacted": contacted,
+        "identity": lambda value: value,
+        "response": _response,
+        "token": "ok",
+    }
+    exec(
+        "def custom_open(self, request):\n"
+        "    hidden = identity(token)\n"
+        "    contacted.append(hidden)\n"
+        "    return response(request.full_url, hidden.encode())\n",
+        callback_globals,
+    )
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        pass
+
+    type.__setattr__(CallbackHandler, "custom_open", callback_globals["custom_open"])
+    urllib.request.install_opener(urllib.request.build_opener(CallbackHandler()))
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+
+    assert contacted == ["ok"]
 
 
 @pytest.mark.parametrize("root_kind", ["module", "type"])
