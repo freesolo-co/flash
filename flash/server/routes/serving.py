@@ -456,7 +456,7 @@ def undeploy(
                     "message": str(exc),
                 },
             ) from exc
-        marked = mark_undeployed(run_id)
+        marked = mark_undeployed(run_id, checkpoint_id)
         persisted = isinstance(marked.deployment, dict) and (
             marked.deployment.get("state") == "undeployed"
         )
@@ -515,7 +515,12 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 ),
             )
         checkpoint_step, is_checkpoint, prefix = _resolve_deployable_target(
-            run_id, effective_spec, status, payload.get("step"), action="export", enforce_state=True
+            run_id,
+            effective_spec,
+            status,
+            payload.get("checkpoint_id"),
+            action="export",
+            enforce_state=True,
         )
         subfolder = f"{prefix}/adapter"
         try:
