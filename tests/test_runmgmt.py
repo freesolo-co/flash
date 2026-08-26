@@ -23,6 +23,7 @@ import flash.runner.supervise.errors as runner_errors
 import flash.runner.supervise.lifecycle as runner_lifecycle
 import flash.runner.supervise.recovery as runner_recovery
 from flash.providers._lifecycle.net import worker as provider_worker
+from flash.providers.core.base import PollResult
 from tests._helpers.runner import provisioned_status as base_provisioned_status
 from tests._helpers.source_snapshot import valid_source_snapshot
 
@@ -535,6 +536,59 @@ def test_resource_projection_rejects_older_observations_in_both_delivery_orders(
         projected = runner_status.get_status(run_id).resource
         assert projected["state"] == "terminal"
         assert projected["observed_at"] == 20.0
+
+
+def test_result_projection_updates_matching_attempt_receipt_atomically(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="result-receipt", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-result", "job-result", attempt=2, fence=9)
+    status = provisioned_status(spec, remote=remote, created_at=100.0)
+    runner_state._save_status(status)
+    receipt = {"path": "attempt/result.json", "digest": "a" * 64, "revision": "rev"}
+    result = {
+        "attempt_id": 2,
+        "fence": 9,
+        "outcome": "failed",
+        "receipt": receipt,
+    }
+
+    assert runner_status.record_result(spec.run_id, result, attempt_id=2, fence=9)
+
+    persisted = runner_status.get_status(spec.run_id)
+    attempt = runner_status._current_attempt(persisted)
+    assert persisted.result == result
+    assert attempt.state == "result_pending"
+    assert attempt.result_receipt == receipt
+
+
+@pytest.mark.parametrize(("attempt_id", "fence"), [(1, 9), (2, 8)])
+def test_result_projection_rejects_stale_attempt_or_fence(monkeypatch, tmp_path, attempt_id, fence):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id=f"stale-result-{attempt_id}-{fence}", model="Qwen/Qwen3.5-9B")
+    remote = _runpod_remote("endpoint-result", "job-result", attempt=2, fence=9)
+    status = provisioned_status(spec, remote=remote, created_at=100.0)
+    runner_state._save_status(status)
+    before = runner_status.get_status(spec.run_id)
+    result = {
+        "attempt_id": attempt_id,
+        "fence": fence,
+        "receipt": {"path": "attempt/result.json", "digest": "b" * 64},
+    }
+
+    assert not runner_status.record_result(
+        spec.run_id,
+        result,
+        attempt_id=attempt_id,
+        fence=fence,
+    )
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.result is None
+    assert persisted.attempt == before.attempt
 
 
 def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
@@ -1415,10 +1469,9 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     spec = JobSpec(run_id=f"recovered-{terminal_state}", model="Qwen/Qwen3.5-9B", algorithm="sft")
     remote = _runpod_remote("endpoint-cost", "job-cost", attempt=0, started_ts=100.0)
     runner_state._save_status(
-        runner_state.RunStatus(
-            run_id=spec.run_id,
+        provisioned_status(
+            spec,
             state="running",
-            spec=spec.to_dict(),
             created_at=90.0,
             remote=remote,
         )
@@ -1438,6 +1491,7 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     status = runner_status.get_status(spec.run_id)
     assert status.state == terminal_state
     assert status.remote == remote
+    assert runner_status._current_attempt(status).state == "settled"
     assert reconcile._due(status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0)
 
 
@@ -1871,7 +1925,7 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
             return None
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: FailedProvider())
-    monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *a, **k: None)
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     resumed = []
 
@@ -1916,9 +1970,9 @@ def test_attach_expired_run_adopts_current_fenced_result_at_deadline(monkeypatch
 
     def current_result(run_id, handle):
         result_checks.append((run_id, handle))
-        return _fenced_success_metrics(spec)
+        return PollResult(True, metrics=_fenced_success_metrics(spec))
 
-    monkeypatch.setattr(lifecycle, "_attempt_result_metrics", current_result)
+    monkeypatch.setattr(lifecycle, "_attempt_result", current_result)
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(lifecycle, "_charge_completed_run_by_id", lambda *_args: None)
     monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *_args: None)
@@ -1941,6 +1995,51 @@ def test_attach_expired_run_adopts_current_fenced_result_at_deadline(monkeypatch
         remote
     ]
     assert "adopted a completed attempt at the wall deadline" in log.getvalue()
+
+
+def test_attach_failed_current_fence_result_is_terminal_without_teardown(monkeypatch, tmp_path):
+    import io
+
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-fenced-failure",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        train=TrainSpec(hf_repo="org/repo"),
+        gpu=GpuSpec(max_wall_seconds=120),
+    )
+    remote = _vast_remote(instance_id=7, attempt=0, started_ts=101.0)
+    status = provisioned_status(spec, state="running", created_at=100.0, remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status, _run_deadline_at=220.0, _next_attempt=1)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
+    monkeypatch.setattr(
+        lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(
+            False,
+            failure="oom",
+            detail="cuda out of memory",
+        ),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: pytest.fail(
+            "authoritative failed result must not be treated as absent"
+        ),
+    )
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+
+    observed = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert observed.state == "failed"
+    assert observed.error == "oom: cuda out of memory"
+    assert observed.remote == remote
+    assert runner_status._current_attempt(observed).state == "settled"
 
 
 def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp_path):
@@ -1977,8 +2076,11 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
     monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
     monkeypatch.setattr(
         lifecycle,
-        "_attempt_result_metrics",
-        lambda *_args, **_kwargs: _fenced_success_metrics(spec, wall_seconds=3600.0),
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(
+            True,
+            metrics=_fenced_success_metrics(spec, wall_seconds=3600.0),
+        ),
     )
     adopted = {}
     real_adopt = lifecycle._adopt_completed_attempt
@@ -2077,7 +2179,7 @@ def test_attach_transient_current_fence_result_read_stays_pending(monkeypatch, t
     monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
     monkeypatch.setattr(
         lifecycle,
-        "_attempt_result_metrics",
+        "_attempt_result",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("temporary artifact outage")),
     )
     scheduled = []
@@ -2115,7 +2217,7 @@ def test_failed_attach_poll_defers_transient_result_transport(monkeypatch):
     current = SimpleNamespace(state="running", remote=remote)
     monkeypatch.setattr(
         lifecycle,
-        "_attempt_result_metrics",
+        "_attempt_result",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("temporary result outage")),
     )
     monkeypatch.setattr(runner_status, "get_status", lambda _run_id: current)
@@ -2173,7 +2275,7 @@ def test_attach_invalid_current_fence_result_fails_closed(monkeypatch, tmp_path)
     monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
     monkeypatch.setattr(
         lifecycle,
-        "_attempt_result_metrics",
+        "_attempt_result",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AttemptArtifactError("result manifest is invalid or unverifiable")
         ),
@@ -2224,7 +2326,7 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     result_checks = []
     monkeypatch.setattr(
         lifecycle,
-        "_attempt_result_metrics",
+        "_attempt_result",
         lambda *args, **kwargs: result_checks.append((args, kwargs)) or None,
     )
 
@@ -2281,7 +2383,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
         _next_attempt=1,
     )
     monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
-    monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_args: None)
+    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args: None)
     monkeypatch.setattr(
         runner_lifecycle,
         "_strict_teardown_handle",
@@ -2382,8 +2484,8 @@ def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, 
     )
     monkeypatch.setattr(
         runtime,
-        "_handleless_completed_metrics",
-        lambda *_args, **_kwargs: _fenced_success_metrics(spec),
+        "_handleless_attempt_result",
+        lambda *_args, **_kwargs: PollResult(True, metrics=_fenced_success_metrics(spec)),
     )
 
     assert runtime._fail_blocked_recovery(spec, "recovery blocked") is True
@@ -2406,7 +2508,7 @@ def test_fail_blocked_recovery_keeps_transient_result_read_pending(monkeypatch, 
     )
     monkeypatch.setattr(
         runtime,
-        "_handleless_completed_metrics",
+        "_handleless_attempt_result",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("temporary artifact outage")),
     )
 
@@ -2437,8 +2539,8 @@ def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch
     monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
     monkeypatch.setattr(
         runtime,
-        "_handleless_completed_metrics",
-        lambda *_args, **_kwargs: _fenced_success_metrics(spec),
+        "_handleless_attempt_result",
+        lambda *_args, **_kwargs: PollResult(True, metrics=_fenced_success_metrics(spec)),
     )
 
     assert runtime._start_resubmit(spec, expected_remote=None) is False
@@ -2461,8 +2563,8 @@ def test_start_resubmit_adopts_handleless_result_before_open_deadline(monkeypatc
     monkeypatch.setattr(runtime.time, "time", lambda: 200.0)
     monkeypatch.setattr(
         runtime,
-        "_handleless_completed_metrics",
-        lambda *_args, **_kwargs: _fenced_success_metrics(spec),
+        "_handleless_attempt_result",
+        lambda *_args, **_kwargs: PollResult(True, metrics=_fenced_success_metrics(spec)),
     )
     monkeypatch.setattr(
         runner_reconciliation,
@@ -2482,6 +2584,49 @@ def test_start_resubmit_adopts_handleless_result_before_open_deadline(monkeypatc
     adopted = runner_status.get_status(spec.run_id)
     assert adopted.state == "done"
     assert adopted.remote is None
+
+
+def test_start_resubmit_fails_authoritative_handleless_result_without_replacement(
+    monkeypatch, tmp_path
+):
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="handleless-failure", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        _handleless_status(spec, created_at=100.0),
+        _run_deadline_at=86500.0,
+        _next_attempt=1,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_handleless_attempt_result",
+        lambda *_args, **_kwargs: PollResult(
+            False,
+            failure="job_failed",
+            detail="checkpoint write failed",
+        ),
+    )
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_compare_and_prepare_resubmit",
+        lambda *_args, **_kwargs: pytest.fail(
+            "authoritative failed result must prevent replacement"
+        ),
+    )
+
+    assert not runtime._start_resubmit(
+        spec,
+        expected_remote=None,
+        expected_state="provisioning",
+    )
+
+    status = runner_status.get_status(spec.run_id)
+    assert status.state == "failed"
+    assert status.error == "job_failed: checkpoint write failed"
+    assert status.remote is None
+    assert runner_status._current_attempt(status).state == "settled"
 
 
 @pytest.mark.parametrize("status_read_fails", [False, True])
@@ -2814,7 +2959,7 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
     clock = {"now": 100.0}
     monkeypatch.setattr(time_mod, "time", lambda: clock["now"])
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
-    monkeypatch.setattr(runtime, "_handleless_completed_metrics", lambda *a, **k: None)
+    monkeypatch.setattr(runtime, "_handleless_attempt_result", lambda *a, **k: None)
     failures = []
     real_fail = runner_reconciliation._compare_and_fail_remote
 
@@ -2896,7 +3041,7 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
     monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 100.0)
     monkeypatch.setattr(time_mod, "time", lambda: 101.0)
     monkeypatch.setattr(time_mod, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runtime, "_handleless_completed_metrics", lambda *a, **k: None)
+    monkeypatch.setattr(runtime, "_handleless_attempt_result", lambda *a, **k: None)
     real_fail = runner_reconciliation._compare_and_fail_remote
     attempts = []
 
@@ -2934,7 +3079,7 @@ def test_deferred_handleless_permanent_result_artifact_fails_without_retry(monke
     monkeypatch.setattr(time_mod, "time", lambda: 86501.0)
     monkeypatch.setattr(
         runtime,
-        "_handleless_completed_metrics",
+        "_handleless_attempt_result",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AttemptArtifactError("result manifest is invalid or unverifiable")
         ),

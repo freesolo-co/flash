@@ -80,7 +80,9 @@ def _progress_kind(stage: str) -> str:
     return "progressed"
 
 
-def _progress_sections(fields: dict) -> tuple[dict, list, dict, dict, dict, dict]:
+def _progress_sections(
+    fields: dict, *, stage: str | None = None
+) -> tuple[dict, list, dict, dict, dict, dict]:
     metrics_keys = {
         "epoch",
         "discarded_rollouts",
@@ -109,8 +111,13 @@ def _progress_sections(fields: dict) -> tuple[dict, list, dict, dict, dict, dict
     if isinstance(reward_metrics, dict):
         metrics["reward_metrics"] = reward_metrics
     timing = {key: fields[key] for key in timing_keys if key in fields}
-    checkpoint = fields.get("checkpoint_failure")
-    checkpoint = dict(checkpoint) if isinstance(checkpoint, dict) else {}
+    checkpoint_failure = fields.get("checkpoint_failure")
+    checkpoint = dict(checkpoint_failure) if isinstance(checkpoint_failure, dict) else {}
+    if stage in {"checkpoint_uploaded", "checkpoint_deployable"}:
+        step = fields.get("step")
+        checkpoint = {"step": step} if isinstance(step, int) and not isinstance(step, bool) else {}
+        if stage == "checkpoint_deployable" and isinstance(fields.get("subfolder"), str):
+            checkpoint["subfolder"] = fields["subfolder"]
     gpu = fields.get("gpu")
     gpu = dict(gpu) if isinstance(gpu, dict) else {}
     samples = fields.get("sampled_completions")
@@ -124,6 +131,7 @@ def _progress_sections(fields: dict) -> tuple[dict, list, dict, dict, dict, dict
             "reward_metrics",
             "sampled_completions",
             "step",
+            "subfolder",
         }
     )
     diagnostics = {key: value for key, value in fields.items() if key not in known}
@@ -171,10 +179,12 @@ def supervisor_snapshot_path(run_id: str, phase: str, attempt: int, fence: int) 
     )
 
 
-def _persist_supervisor_snapshot(fields: dict) -> None:
+def _persist_supervisor_snapshot(fields: dict, *, stage: str | None = None) -> None:
     global _PROGRESS_LATEST_METRICS
 
-    metrics, _samples, _timing, checkpoint, _gpu, _diagnostics = _progress_sections(fields)
+    metrics, _samples, _timing, checkpoint, _gpu, _diagnostics = _progress_sections(
+        fields, stage=stage
+    )
     if metrics:
         _PROGRESS_LATEST_METRICS = bounded_json(metrics)
     if _PROGRESS_PENDING_CHECKPOINT_FAILURE and not checkpoint:
@@ -293,7 +303,7 @@ def _observe_cumulative_progress(pending: _PendingProgress) -> None:
         _PROGRESS_COMPLETED_STEPS = max(_PROGRESS_COMPLETED_STEPS, int(step))
     if pending.stage in _STEP_PROGRESS_STAGES:
         _PROGRESS_TRAINING_ENTERED = True
-    _persist_supervisor_snapshot(pending.fields)
+    _persist_supervisor_snapshot(pending.fields, stage=pending.stage)
 
 
 def _build_pending_record(pending: _PendingProgress) -> ProgressRecord:
@@ -305,12 +315,14 @@ def _build_pending_record(pending: _PendingProgress) -> ProgressRecord:
         failure = fields.get("checkpoint_failure")
         if isinstance(failure, dict):
             _PROGRESS_PENDING_CHECKPOINT_FAILURE = dict(failure)
-    elif pending.stage == "checkpoint_uploaded":
+    elif pending.stage in {"checkpoint_uploaded", "checkpoint_deployable"}:
         _PROGRESS_PENDING_CHECKPOINT_FAILURE = None
     if _PROGRESS_PENDING_CHECKPOINT_FAILURE and "checkpoint_failure" not in fields:
         fields["checkpoint_failure"] = dict(_PROGRESS_PENDING_CHECKPOINT_FAILURE)
-    _persist_supervisor_snapshot(fields)
-    metrics, samples, timing, checkpoint, gpu, diagnostics = _progress_sections(fields)
+    _persist_supervisor_snapshot(fields, stage=pending.stage)
+    metrics, samples, timing, checkpoint, gpu, diagnostics = _progress_sections(
+        fields, stage=pending.stage
+    )
     return ProgressRecord(
         run_id=worker_state.RUN_ID,
         phase_namespace=worker_state.PHASE,

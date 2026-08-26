@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import time
+from typing import TYPE_CHECKING
 
 from flash.core.spec import JobSpec
+
+if TYPE_CHECKING:
+    from flash.providers.core.base import PollResult
 
 
 def _lifecycle():
@@ -45,8 +49,8 @@ def _canonical_provider_handle(handle):
     raise ValueError("persisted provider identity is missing or unsupported")
 
 
-def _attempt_result_metrics(run_id: str, handle=None) -> dict | None:
-    """return metrics only from the current verified fenced success result."""
+def _attempt_result(run_id: str, handle=None) -> PollResult | None:
+    """return the full current verified fenced result, including terminal failures."""
     from flash.providers.artifacts.attempts import (
         persist_attempt_artifacts,
         poll_result_from_manifest,
@@ -79,8 +83,14 @@ def _attempt_result_metrics(run_id: str, handle=None) -> dict | None:
     persist_attempt_artifacts(run_id, artifacts)
     if artifacts.result is None:
         return None
-    result = poll_result_from_manifest(artifacts.result)
-    return result.metrics if result.ok else None
+    return poll_result_from_manifest(artifacts.result)
+
+
+def _result_failure_detail(result) -> str:
+    """preserve the verified failure class and diagnostic in terminal status."""
+    failure = result.failure or "job_failed"
+    detail = result.detail or "worker attempt failed"
+    return f"{failure}: {detail}"
 
 
 def _worker_provably_gone(run_id: str, handle) -> bool:

@@ -359,7 +359,7 @@ def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
         candidates=(failed,),
         run_spec=types.SimpleNamespace(gpu=types.SimpleNamespace(network_volume=None)),
     )
-    monkeypatch.setattr(seed_submission._lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+    monkeypatch.setattr(seed_submission._lifecycle, "_attempt_result", lambda *a, **k: None)
     monkeypatch.setattr(
         "flash.runner.lifecycle.deadlines._load_run_deadline_at", lambda _run_id: None
     )

@@ -32,6 +32,7 @@ import flash.runner.supervise.lifecycle as runner_lifecycle
 import flash.runner.supervise.recovery as runner_recovery
 from flash.core import catalog
 from flash.providers._lifecycle.net import worker as provider_worker
+from flash.providers.core.base import PollResult
 from tests._helpers.runner import provisioned_status
 from tests._helpers.source_snapshot import valid_source_snapshot
 
@@ -742,6 +743,64 @@ def test_runpod_terminal_manifest_inside_visibility_window_wins(monkeypatch):
     assert clock["now"] == 120.0
 
 
+def test_poll_job_passes_exact_work_deadline_to_status_request(monkeypatch):
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    work_deadline_at = 25.0
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(work_deadline_at=work_deadline_at, result_deadline_at=45.0),
+        results=[None, None, None],
+    )
+    monkeypatch.setattr(polling.time, "time", _stepped_clock())
+    deadlines = []
+
+    def status(*_args, **kwargs):
+        deadlines.append(kwargs.get("deadline_at"))
+        return {"status": "IN_PROGRESS"}
+
+    monkeypatch.setattr(runpod_api, "job_status", status)
+
+    result = polling.poll_job(_runpod_handle(jobs), _poll_spec(), interval_s=0)
+
+    assert deadlines
+    assert set(deadlines) == {work_deadline_at}
+    assert result.failure == "job_preempted"
+
+
+def test_poll_job_near_deadline_bounds_http_status_retry(monkeypatch):
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    work_deadline_at = 101.0
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(
+            work_deadline_at=work_deadline_at,
+            result_deadline_at=120.0,
+        ),
+        results=[None, None],
+    )
+    clock = {"now": 100.0}
+    monkeypatch.setattr(polling.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", lambda _fingerprint: "key")
+    timeouts = []
+
+    def request(_target, *, timeout, **_kwargs):
+        timeouts.append(timeout)
+        clock["now"] += timeout
+        raise OSError("status transport unavailable")
+
+    monkeypatch.setattr(runpod_api._CLIENT, "request", request)
+
+    result = polling.poll_job(_runpod_handle(jobs), _poll_spec(), interval_s=0)
+
+    assert timeouts == [1.0]
+    assert clock["now"] == work_deadline_at
+    assert result.failure == "poll_error"
+
+
 def test_poll_job_running_without_progress_uses_fixed_attempt_deadline(monkeypatch):
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs
@@ -1206,9 +1265,12 @@ def test_supervisor_adopts_provider_completion_before_retry(monkeypatch, cancel_
         def completed_metrics(*_args, **_kwargs):
             if cancel_during_status:
                 runner_status._update(spec.run_id, "cancelled")
-            return {"wall_seconds": 5.0, "trained_eval_acc": 0.9}
+            return PollResult(
+                True,
+                metrics={"wall_seconds": 5.0, "trained_eval_acc": 0.9},
+            )
 
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", completed_metrics)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", completed_metrics)
 
         if cancel_during_status:
             with pytest.raises(runner_errors._RunCancelled):
@@ -1230,6 +1292,29 @@ def test_supervisor_adopts_provider_completion_before_retry(monkeypatch, cancel_
             assert metrics["allocated_gpu"] == "H100 SXM"
             assert metrics["allocated_gpu_count"] == 4
         assert calls["n"] == 1
+
+
+def test_supervisor_does_not_retry_authoritative_failed_result(monkeypatch):
+    from flash.runner.supervise import seed_submission
+
+    ctx = SimpleNamespace(
+        spec=SimpleNamespace(run_id="failed-before-retry"),
+        last_handle={"provider": "runpod"},
+        last_detail=None,
+        raise_if_cancelled=lambda: None,
+    )
+    observed = PollResult(False, failure="oom", detail="cuda out of memory")
+    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args: observed)
+    outcome = seed_submission._AttemptOutcome(
+        result=PollResult(False, failure="poll_error", detail="status unavailable")
+    )
+    prepared = SimpleNamespace(attempt=0)
+
+    decision = seed_submission._handle_failure(ctx, prepared, outcome)
+
+    assert decision.metrics is None
+    assert not decision.retry
+    assert ctx.last_detail == "oom: cuda out of memory"
 
 
 def test_supervisor_retries_on_provider_loss_then_succeeds(monkeypatch):
@@ -1935,7 +2020,7 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
                 detail="provider resource was lost",
             ),
         )
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *a, **k: None)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda *a, **k: None)
         monkeypatch.setattr(
@@ -2041,7 +2126,7 @@ def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
                 )
             ),
         )
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *a, **k: None)
         monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda *a, **k: None)
         monkeypatch.setattr(
             runner_lifecycle,
@@ -2884,8 +2969,8 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
         )
         monkeypatch.setattr(
             runner_lifecycle,
-            "_attempt_result_metrics",
-            lambda *a, **k: {"wall_seconds": 3600.0},
+            "_attempt_result",
+            lambda *a, **k: PollResult(True, metrics={"wall_seconds": 3600.0}),
         )
         monkeypatch.setattr(
             runner_status,
@@ -2949,6 +3034,7 @@ def test_cancellation_billing_prefers_newer_verified_current_fence_result(monkey
             "fence": 1,
             "completed_steps": 7,
             "training_entered": True,
+            "receipt": {"path": "attempt/result.json", "digest": "a" * 64},
         }
         observations = iter((result,))
 
@@ -3374,7 +3460,7 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
             "poll_job",
             lambda *a, **k: jobs.PollResult(False, failure="job_preempted", detail="redeploy"),
         )
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *a, **k: None)
 
         real_get_status = runner_status.get_status
         status_failures = {"remaining": 0}
@@ -3510,7 +3596,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
             "poll_job",
             lambda *a, **k: jobs.PollResult(False, failure="job_preempted", detail="host vanished"),
         )
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *a, **k: None)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         seen = {}
 
@@ -3571,7 +3657,7 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
             "poll_job",
             lambda *a, **k: jobs.PollResult(False, failure="job_preempted", detail="host vanished"),
         )
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *a, **k: None)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         training_calls = []
         monkeypatch.setattr(
@@ -3617,7 +3703,7 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
             "poll_job",
             lambda *a, **k: jobs.PollResult(False, failure="job_preempted", detail="host vanished"),
         )
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *a, **k: None)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         seen = {}
 
@@ -3682,7 +3768,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
                 False, failure="job_failed", detail="Traceback ...\nRuntimeError: bad reward fn"
             ),
         )
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *a, **k: None)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
         resumed = {"called": False}
@@ -3712,7 +3798,12 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             # _submit_seed_supervised raising after a non-infra failure with no retries left).
             resumed["called"] = True
             resumed["attempt_start"] = attempt_start
-            runner_status._update(spec.run_id, "running", remote=replacement_remote)
+            current = runner_status.get_status(spec.run_id)
+            replacement_attempt = dict(current.attempt)
+            replacement_attempt.update(attempt_id=1, fence=1, state="active")
+            current.attempt = replacement_attempt
+            current.remote = replacement_remote
+            runner_state._save_status(current)
             raise RuntimeError("run failed after retries: worker_error: bad reward fn")
 
         monkeypatch.setattr(runner_lifecycle, "_run_training", fake_training)
@@ -3782,7 +3873,7 @@ def test_attach_does_not_resume_over_unconfirmed_runpod_teardown(
                 detail="provider resource was lost",
             ),
         )
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *a, **k: None)
         teardown_events = []
 
         def cancel_job(endpoint_id, job_id, **_kw):
@@ -3873,7 +3964,7 @@ def test_attach_preserves_newer_remote_before_compare_and_clear(monkeypatch):
                 detail="provider resource was lost",
             ),
         )
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *a, **k: None)
         import flash.runner.supervise.lifecycle as lifecycle_mod
 
         real_teardown = lifecycle_mod._strict_teardown_handle
@@ -3933,7 +4024,7 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch, rema
             )
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *a, **k: None)
 
         class _RaisingVast:
             def poll(self, handle, spec, seed, *, log=None, _deadline_at=None):
@@ -4138,7 +4229,7 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
 
         monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_a, **_k: None)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_a, **_k: None)
         resumed = []
         monkeypatch.setattr(
             runner_lifecycle,
@@ -4182,7 +4273,7 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
         deadline = runner_deadlines._load_run_deadline_at(spec.run_id)
         monkeypatch.setattr(attach_mod.time, "time", lambda: deadline + 1.0)
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
-        monkeypatch.setattr(lifecycle_mod, "_attempt_result_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(lifecycle_mod, "_attempt_result", lambda *a, **k: None)
         real_fail = runner_reconciliation._compare_and_fail_remote
         calls = []
 
@@ -4244,7 +4335,7 @@ def test_attach_reconciler_fails_permanent_result_artifact_without_retry(monkeyp
         )
         monkeypatch.setattr(
             lifecycle_mod,
-            "_attempt_result_metrics",
+            "_attempt_result",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(
                 AttemptArtifactError("result manifest is invalid or unverifiable")
             ),
@@ -4292,8 +4383,8 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
         monkeypatch.setattr(
             lifecycle_mod,
-            "_attempt_result_metrics",
-            lambda *a, **k: {"wall_seconds": 5.0},
+            "_attempt_result",
+            lambda *a, **k: PollResult(True, metrics={"wall_seconds": 5.0}),
         )
 
         def adopt(run_id, _spec, expected_remote, _metrics, **_kwargs):
@@ -4360,8 +4451,8 @@ def test_attach_reconciler_caps_completed_adoption_retry_to_result_deadline(monk
         monkeypatch.setattr(attach_mod.time, "sleep", advance)
         monkeypatch.setattr(
             lifecycle_mod,
-            "_attempt_result_metrics",
-            lambda *_args, **_kwargs: {"wall_seconds": 60.0},
+            "_attempt_result",
+            lambda *_args, **_kwargs: PollResult(True, metrics={"wall_seconds": 60.0}),
         )
         monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: False)
 
@@ -4419,10 +4510,10 @@ def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monke
         def completed_metrics(*_args, **_kwargs):
             probes.append(clock["now"])
             if clock["now"] >= deadline:
-                return {"wall_seconds": 60.0}
+                return PollResult(True, metrics={"wall_seconds": 60.0})
             return None
 
-        monkeypatch.setattr(lifecycle_mod, "_attempt_result_metrics", completed_metrics)
+        monkeypatch.setattr(lifecycle_mod, "_attempt_result", completed_metrics)
         monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: True)
         monkeypatch.setattr(
             lifecycle_mod,
@@ -4486,8 +4577,8 @@ def test_attach_reconciler_rate_limits_failed_terminal_cas_past_result_deadline(
         monkeypatch.setattr(attach_mod.time, "sleep", advance)
         monkeypatch.setattr(
             lifecycle_mod,
-            "_attempt_result_metrics",
-            lambda *_args, **_kwargs: {"wall_seconds": 60.0},
+            "_attempt_result",
+            lambda *_args, **_kwargs: PollResult(True, metrics={"wall_seconds": 60.0}),
         )
         monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: False)
         # the reconciler imports _compare_and_fail_remote / _record_cleanup_remote from
@@ -4553,12 +4644,12 @@ def test_an_adopted_instance_run_is_still_priced_for_every_card_it_occupied(monk
         monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: deadline)
         monkeypatch.setattr(attach_mod.time, "time", lambda: deadline)
         monkeypatch.setattr(attach_mod.time, "sleep", lambda _seconds: None)
-        monkeypatch.setattr(lifecycle_mod, "_attempt_result_metrics", lambda *_a, **_k: None)
+        monkeypatch.setattr(lifecycle_mod, "_attempt_result", lambda *_a, **_k: None)
         # what the worker actually wrote: a wall, and nothing about the allocation.
         monkeypatch.setattr(
             lifecycle_mod,
-            "_attempt_result_metrics",
-            lambda *_a, **_k: {"wall_seconds": 3600.0},
+            "_attempt_result",
+            lambda *_a, **_k: PollResult(True, metrics={"wall_seconds": 3600.0}),
         )
         monkeypatch.setattr(runner_reconciliation, "_record_cleanup_remote", lambda *_a, **_k: True)
 

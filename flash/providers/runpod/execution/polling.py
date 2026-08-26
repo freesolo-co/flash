@@ -247,6 +247,7 @@ def poll_job(
                 handle.endpoint_id,
                 handle.job_id,
                 key_fingerprint=handle.key_fingerprint,
+                deadline_at=attempt.work_deadline_at,
             )
             poll_errors.reset()
             status = str(provider_status.get("status") or "UNKNOWN")

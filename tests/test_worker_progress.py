@@ -8,6 +8,8 @@ import os
 import threading
 import time
 
+import pytest
+
 from flash.engine.worker.io import progress as progress_io
 from flash.runner.lifecycle.protocol import digest_record
 
@@ -299,6 +301,35 @@ def test_step_progress_coalesces_by_window_and_terminal_stays_dedicated(monkeypa
     assert [record.sequence for record, _required in records] == [1, 2, 3]
 
 
+@pytest.mark.parametrize(
+    ("stage", "fields", "expected_checkpoint"),
+    [
+        ("checkpoint_uploaded", {"step": 50}, {"step": 50}),
+        (
+            "checkpoint_deployable",
+            {"step": 75, "subfolder": "checkpoint-75"},
+            {"step": 75, "subfolder": "checkpoint-75"},
+        ),
+    ],
+)
+def test_successful_checkpoint_progress_projects_metadata(
+    monkeypatch, stage, fields, expected_checkpoint
+) -> None:
+    _reset(monkeypatch)
+    records = []
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda record, *, required: records.append(record) or True,
+    )
+
+    progress_io.publish_progress(stage, **fields)
+
+    assert records[-1].kind == "checkpoint_saved"
+    assert records[-1].checkpoint == expected_checkpoint
+    assert records[-1].diagnostics == {}
+
+
 def test_checkpoint_failure_is_sticky_until_a_successful_checkpoint(monkeypatch) -> None:
     _reset(monkeypatch)
     records = []
@@ -310,12 +341,16 @@ def test_checkpoint_failure_is_sticky_until_a_successful_checkpoint(monkeypatch)
     failure = {"step": 50, "operation": "resume", "error": "quota denied"}
 
     progress_io.publish_progress("checkpoint_upload_failed", step=50, checkpoint_failure=failure)
+    assert records[-1].kind == "checkpoint_failed"
+    assert records[-1].checkpoint == failure
+    assert records[-1].diagnostics == {}
     progress_io.publish_progress("sft_step", step=60)
     assert records[-1].checkpoint == failure
 
     progress_io.publish_progress("checkpoint_uploaded", step=75)
     assert progress_io.pending_checkpoint_failure() is None
     progress_io.publish_progress("sft_step", step=80)
+    progress_io.flush_progress()
     assert records[-1].checkpoint == {}
 
 

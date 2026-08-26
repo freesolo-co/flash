@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from flash.providers.artifacts.attempts import AttemptArtifacts
+from flash.providers.core.base import PollResult
 from flash.runner.supervise import recovery
 
 ATTEMPT = {
@@ -63,16 +64,36 @@ def _install_seams(monkeypatch, *, handle: dict, result: dict | None) -> None:
     monkeypatch.setattr(
         attempt_artifacts,
         "poll_result_from_manifest",
-        lambda projection: SimpleNamespace(ok=True, metrics=projection["metrics"]),
+        lambda projection: PollResult(
+            projection["ok"],
+            metrics=projection.get("metrics"),
+            failure=projection.get("failure"),
+            detail=projection.get("detail"),
+        ),
     )
 
 
 def test_recovery_reads_only_current_fenced_result(monkeypatch) -> None:
-    projection = {"metrics": {"step": 3}}
+    projection = {"ok": True, "metrics": {"step": 3}}
     handle = {"attempt": 2, "fence": 9}
     _install_seams(monkeypatch, handle=handle, result=projection)
 
-    assert recovery._attempt_result_metrics("run-1", handle) == {"step": 3}
+    result = recovery._attempt_result("run-1", handle)
+
+    assert result.ok
+    assert result.metrics == {"step": 3}
+
+
+def test_recovery_preserves_current_fenced_failure(monkeypatch) -> None:
+    projection = {"ok": False, "failure": "oom", "detail": "cuda out of memory"}
+    handle = {"attempt": 2, "fence": 9}
+    _install_seams(monkeypatch, handle=handle, result=projection)
+
+    result = recovery._attempt_result("run-1", handle)
+
+    assert not result.ok
+    assert result.failure == "oom"
+    assert result.detail == "cuda out of memory"
 
 
 def test_recovery_rejects_stale_fence_before_artifact_read(monkeypatch) -> None:
@@ -80,4 +101,4 @@ def test_recovery_rejects_stale_fence_before_artifact_read(monkeypatch) -> None:
     _install_seams(monkeypatch, handle=handle, result=None)
 
     with pytest.raises(RuntimeError, match="current fenced attempt"):
-        recovery._attempt_result_metrics("run-1", handle)
+        recovery._attempt_result("run-1", handle)

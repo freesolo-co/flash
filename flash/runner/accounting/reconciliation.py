@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import time
+from dataclasses import replace
 
 from flash.core.spec import JobSpec
 from flash.runner.accounting import costs
@@ -115,6 +116,23 @@ def _compare_and_prepare_resubmit(
     return True
 
 
+def _settled_attempt(status: RunStatus, expected_remote: dict | None) -> tuple[bool, dict | None]:
+    """return the settled current attempt only when the expected fence still matches."""
+    if status.attempt is None:
+        return True, None
+    attempt = status_ops._current_attempt(status)
+    if expected_remote is not None and (
+        expected_remote.get("attempt") != attempt.attempt_id
+        or expected_remote.get("fence") != attempt.fence
+    ):
+        return False, None
+    return True, replace(attempt, state="settled").to_dict()
+
+
+def _attempt_is_settled(status: RunStatus) -> bool:
+    return status.attempt is None or status_ops._current_attempt(status).state == "settled"
+
+
 def _compare_and_fail_remote(
     run_id: str,
     expected_remote: dict | None,
@@ -128,8 +146,12 @@ def _compare_and_fail_remote(
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
+        attempt_matches, settled_attempt = _settled_attempt(status, expected_remote)
+        if not attempt_matches:
+            return False
         status.state = "failed"
         status.error = error
+        status.attempt = settled_attempt
         status.updated_at = time.time()
         if status.finished_at is None:
             status.finished_at = status.updated_at
@@ -141,6 +163,7 @@ def _compare_and_fail_remote(
         confirmed.state != "failed"
         or not _expected_remote_matches(confirmed.remote, expected_after)
         or confirmed.error != error
+        or not _attempt_is_settled(confirmed)
     ):
         raise RuntimeError("terminal recovery failure was not durably confirmed")
     if report_status is not None:
@@ -179,9 +202,13 @@ def _compare_and_complete_remote(
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
+        attempt_matches, settled_attempt = _settled_attempt(status, expected_remote)
+        if not attempt_matches:
+            return False
         measured = float(status.cost_usd or 0.0) + recovered_cost
         charge_usd = costs._status_estimated_charge(status, spec, fallback=measured)
         status.state = "done"
+        status.attempt = settled_attempt
         status.cost_usd = charge_usd
         status.artifacts_dir = state.artifacts_dir(spec)
         status.source_verified_attempt = verified_attempt
@@ -191,7 +218,11 @@ def _compare_and_complete_remote(
         state._save_status_unlocked(status)
         report_status = status
     confirmed = status_ops.get_status(run_id)
-    if confirmed.state != "done" or not _expected_remote_matches(confirmed.remote, expected_remote):
+    if (
+        confirmed.state != "done"
+        or not _expected_remote_matches(confirmed.remote, expected_remote)
+        or not _attempt_is_settled(confirmed)
+    ):
         raise RuntimeError("terminal recovery completion was not durably confirmed")
     if report_status is not None:
         reporting._report_status(report_status)

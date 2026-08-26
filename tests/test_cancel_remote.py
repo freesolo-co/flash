@@ -800,7 +800,7 @@ def _make_poll_provider(monkeypatch, *, on_poll):
     from flash.providers.runpod.client import api as runpod_api
 
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda *a, **k: None)
-    monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_args: None)
+    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args: None)
     monkeypatch.setattr(
         runpod_api,
         "delete_endpoint_for_fingerprint",

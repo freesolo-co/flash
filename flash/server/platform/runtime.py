@@ -238,15 +238,23 @@ def _fail_blocked_recovery(
 
     status = get_status(spec.run_id)
     if status.remote is None:
-        metrics, pending, _attempt = _handleless_attempt_resolution(spec, status)
+        result, pending, _attempt = _handleless_attempt_resolution(spec, status)
         if pending:
             return False
-        if metrics is not None:
+        if result is not None:
+            if not result.ok:
+                from flash.runner.supervise.lifecycle import _result_failure_detail
+
+                return _compare_and_fail_remote(
+                    spec.run_id,
+                    None,
+                    _result_failure_detail(result),
+                )
             applied = _adopt_completed_attempt(
                 spec.run_id,
                 spec,
                 None,
-                metrics,
+                result.metrics,
                 log=None,
             )
             if applied:
@@ -315,15 +323,15 @@ def _start_resubmit(
     return True
 
 
-def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
+def _handleless_attempt_result(spec, status, deadline_at: float):
     del status, deadline_at
-    from flash.runner.supervise.lifecycle import _attempt_result_metrics
+    from flash.runner.supervise.lifecycle import _attempt_result
 
-    return _attempt_result_metrics(spec.run_id)
+    return _attempt_result(spec.run_id)
 
 
 def _handleless_attempt_resolution(spec, status):
-    """resolve current-fence success or report that authoritative observation is pending."""
+    """resolve the current-fence result or report that authoritative observation is pending."""
     from flash.runner.lifecycle.protocol import AttemptRecord
 
     try:
@@ -333,15 +341,15 @@ def _handleless_attempt_resolution(spec, status):
     if not isinstance(status.source_snapshot, dict):
         return None, False, attempt
     try:
-        metrics = _handleless_completed_metrics(spec, status, attempt.result_deadline_at)
+        result = _handleless_attempt_result(spec, status, attempt.result_deadline_at)
     except Exception as exc:
         from flash.runner.supervise.attach import _result_transport_is_transient
 
         if _result_transport_is_transient(exc):
             return None, True, attempt
         raise
-    if metrics is not None:
-        return metrics, False, attempt
+    if result is not None:
+        return result, False, attempt
     return None, time.time() < attempt.result_deadline_at, attempt
 
 
@@ -356,15 +364,20 @@ def _resolve_handleless_before_resubmit(spec, status) -> bool:
         return True
     try:
         attempt = AttemptRecord.from_dict(status.attempt)
-        metrics = _handleless_completed_metrics(spec, status, attempt.result_deadline_at)
+        result = _handleless_attempt_result(spec, status, attempt.result_deadline_at)
     except Exception as exc:
         if _result_transport_is_transient(exc):
             return False
         _compare_and_fail_remote(spec.run_id, None, str(exc))
         return False
-    if metrics is None:
+    if result is None:
         return True
-    _adopt_completed_attempt(spec.run_id, spec, None, metrics, log=None)
+    if not result.ok:
+        from flash.runner.supervise.lifecycle import _result_failure_detail
+
+        _compare_and_fail_remote(spec.run_id, None, _result_failure_detail(result))
+        return False
+    _adopt_completed_attempt(spec.run_id, spec, None, result.metrics, log=None)
     return False
 
 
@@ -397,7 +410,7 @@ def _deferred_resubmit_loop(spec) -> None:
             return
         if time.time() >= deadline_at:
             try:
-                metrics, pending, _attempt = _handleless_attempt_resolution(spec, status)
+                result, pending, _attempt = _handleless_attempt_resolution(spec, status)
             except Exception as exc:
                 from flash.runner.supervise.attach import _result_transport_is_transient
 
@@ -414,15 +427,25 @@ def _deferred_resubmit_loop(spec) -> None:
             if pending:
                 time.sleep(_DEFERRED_RECOVERY_RETRY_S)
                 continue
-            if metrics is not None:
+            if result is not None:
                 try:
-                    _adopt_completed_attempt(
-                        spec.run_id,
-                        spec,
-                        None,
-                        metrics,
-                        log=None,
-                    )
+                    if not result.ok:
+                        from flash.runner.supervise.lifecycle import _result_failure_detail
+
+                        if not _compare_and_fail_remote(
+                            spec.run_id,
+                            None,
+                            _result_failure_detail(result),
+                        ):
+                            return
+                    else:
+                        _adopt_completed_attempt(
+                            spec.run_id,
+                            spec,
+                            None,
+                            result.metrics,
+                            log=None,
+                        )
                 except Exception:
                     time.sleep(_DEFERRED_RECOVERY_RETRY_S)
                     continue

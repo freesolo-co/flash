@@ -216,6 +216,14 @@ def _reconcile_completed_remote(
     return False
 
 
+def _fail_verified_result(run_id: str, expected_remote: dict, result: PollResult) -> bool:
+    """persist one authoritative current-fence worker failure without retrying it."""
+    from flash.runner.accounting.reconciliation import _compare_and_fail_remote
+    from flash.runner.supervise.lifecycle import _result_failure_detail
+
+    return _compare_and_fail_remote(run_id, expected_remote, _result_failure_detail(result))
+
+
 def _fail_permanent_result_artifact(
     run_id: str, expected_remote: dict, error: BaseException
 ) -> bool:
@@ -248,17 +256,20 @@ def _reconcile_expired_remote(
     )
     from flash.runner.supervise.lifecycle import (
         _adopt_completed_attempt,
-        _attempt_result_metrics,
+        _attempt_result,
     )
 
     try:
-        metrics = _attempt_result_metrics(run_id, expected_remote)
+        result = _attempt_result(run_id, expected_remote)
     except Exception as exc:
         if _result_transport_is_transient(exc):
             time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
             return False
         return _fail_permanent_result_artifact(run_id, expected_remote, exc)
-    if metrics is not None:
+    if result is not None and not result.ok:
+        return _fail_verified_result(run_id, expected_remote, result)
+    if result is not None:
+        metrics = result.metrics
         _carry_allocation_stamp(metrics, expected_remote)
         try:
             cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
@@ -337,7 +348,7 @@ def _reconcile_attached_remote(
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
-        _attempt_result_metrics,
+        _attempt_result,
         _strict_teardown_handle,
         _worker_provably_gone,
     )
@@ -367,7 +378,7 @@ def _reconcile_attached_remote(
         attempt_record = AttemptRecord.from_dict(status.attempt)
         result_deadline_at = attempt_record.result_deadline_at
         try:
-            completed_metrics = _attempt_result_metrics(run_id, expected_remote)
+            observed_result = _attempt_result(run_id, expected_remote)
         except Exception as exc:
             if _result_transport_is_transient(exc):
                 time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
@@ -375,7 +386,15 @@ def _reconcile_attached_remote(
             if _fail_permanent_result_artifact(run_id, expected_remote, exc):
                 return
             continue
-        if completed_metrics is not None:
+        if observed_result is not None and not observed_result.ok:
+            try:
+                if _fail_verified_result(run_id, expected_remote, observed_result):
+                    return
+            except Exception:
+                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+            continue
+        if observed_result is not None:
+            completed_metrics = observed_result.metrics
             _carry_allocation_stamp(completed_metrics, expected_remote)
             if _reconcile_completed_remote(
                 run_id,
@@ -599,13 +618,13 @@ def _handle_attach_wall_deadline(
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
         _adopt_completed_attempt,
-        _attempt_result_metrics,
+        _attempt_result,
         _strict_teardown_handle,
     )
 
     _load_run_deadline_at(run_id)
     try:
-        metrics = _attempt_result_metrics(run_id, context.persisted_remote)
+        observed_result = _attempt_result(run_id, context.persisted_remote)
     except Exception as artifact_error:
         if not _result_transport_is_transient(artifact_error):
             raise
@@ -624,7 +643,11 @@ def _handle_attach_wall_deadline(
             file=log,
         )
         return get_status(run_id)
-    if metrics is not None:
+    if observed_result is not None and not observed_result.ok:
+        _fail_verified_result(run_id, context.persisted_remote, observed_result)
+        return get_status(run_id)
+    if observed_result is not None:
+        metrics = observed_result.metrics
         _carry_allocation_stamp(metrics, context.persisted_remote)
         try:
             adopted = _adopt_completed_attempt(
@@ -682,7 +705,7 @@ def _handle_failed_attach_poll(
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
         _adopt_completed_attempt,
-        _attempt_result_metrics,
+        _attempt_result,
         _strict_teardown_handle,
         _worker_provably_gone,
     )
@@ -690,7 +713,7 @@ def _handle_failed_attach_poll(
     failure = f"{result.failure or 'job_failed'}: {result.detail or 'provider attempt failed'}"
     print(f"attach: {run_id} ended ({result.failure}); evaluating recovery", file=log)
     try:
-        completed_metrics = _attempt_result_metrics(run_id, context.persisted_remote)
+        observed_result = _attempt_result(run_id, context.persisted_remote)
     except Exception as artifact_error:
         if not _result_transport_is_transient(artifact_error):
             raise
@@ -709,7 +732,11 @@ def _handle_failed_attach_poll(
             file=log,
         )
         return get_status(run_id)
-    if completed_metrics is not None:
+    if observed_result is not None and not observed_result.ok:
+        _fail_verified_result(run_id, context.persisted_remote, observed_result)
+        return get_status(run_id)
+    if observed_result is not None:
+        completed_metrics = observed_result.metrics
         _carry_allocation_stamp(completed_metrics, context.persisted_remote)
         # the job completed. adoption may return False (a transient defer, e.g. a
         # cleanup-remote CAS lost) OR raise (e.g. a durable-confirmation exception);

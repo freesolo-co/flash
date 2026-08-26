@@ -175,6 +175,7 @@ class _PreparedAttempt:
 class _PreparationOutcome:
     prepared: _PreparedAttempt | None = None
     completed_metrics: dict | None = None
+    failed_result: object | None = None
 
 
 @dataclass(frozen=True)
@@ -256,13 +257,15 @@ def _require_opd_configuration(ctx: _SubmitContext) -> None:
     )
 
 
-def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
+def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int):
     if not ctx.last_handle:
         return None
-    with contextlib.suppress(Exception):
-        metrics = _lifecycle._attempt_result_metrics(ctx.spec.run_id, ctx.last_handle)
-        if metrics is not None:
-            return metrics
+    try:
+        observed_result = _lifecycle._attempt_result(ctx.spec.run_id, ctx.last_handle)
+    except Exception:
+        observed_result = None
+    if observed_result is not None:
+        return observed_result
     from flash.providers.core.base import JobHandle
     from flash.providers.core.registry import get_provider
     from flash.runner.accounting.reconciliation import (
@@ -363,9 +366,11 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
     attempt = ctx.attempt_start + local_attempt
     ctx.raise_if_cancelled()
     if local_attempt > 0:
-        completed_metrics = _cleanup_previous_attempt(ctx, attempt)
-        if completed_metrics is not None:
-            return _PreparationOutcome(completed_metrics=completed_metrics)
+        observed_result = _cleanup_previous_attempt(ctx, attempt)
+        if observed_result is not None:
+            if observed_result.ok:
+                return _PreparationOutcome(completed_metrics=observed_result.metrics)
+            return _PreparationOutcome(failed_result=observed_result)
     try:
         attempt_spec = _spec_with_remaining_wall(ctx.spec, require_provider_minimum=True)
     except RuntimeError:
@@ -804,16 +809,14 @@ def _handle_failure(
     ctx.raise_if_cancelled()
     if ctx.last_handle:
         try:
-            completed_metrics = _lifecycle._attempt_result_metrics(ctx.spec.run_id, ctx.last_handle)
+            observed_result = _lifecycle._attempt_result(ctx.spec.run_id, ctx.last_handle)
         except Exception:
-            completed_metrics = None
-        if completed_metrics is not None:
-            from flash.providers.core.base import PollResult
-
-            recovered = replace(
-                outcome,
-                result=PollResult(True, metrics=completed_metrics),
-            )
+            observed_result = None
+        if observed_result is not None:
+            if not observed_result.ok:
+                ctx.last_detail = _lifecycle._result_failure_detail(observed_result)
+                return _FailureDecision(None, False)
+            recovered = replace(outcome, result=observed_result)
             return _FailureDecision(_return_success_metrics(ctx, recovered), False)
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
@@ -921,6 +924,9 @@ def submit_seed_supervised(
         preparation = _prepare_attempt(ctx, local_attempt)
         if preparation.completed_metrics is not None:
             return ctx.return_completed_runpod_metrics(preparation.completed_metrics)
+        if preparation.failed_result is not None:
+            ctx.last_detail = _lifecycle._result_failure_detail(preparation.failed_result)
+            break
         prepared = preparation.prepared
         outcome = _run_attempt(ctx, prepared)
         if outcome.stop:
