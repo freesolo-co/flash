@@ -288,6 +288,8 @@ def validate_tool_history(
 def detached_template_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """clone history and decode assistant argument strings only for chat templates."""
 
+    from flash.serve.request.validation import TEXT_TYPES
+
     detached: list[dict[str, Any]] = []
     for message in messages:
         copied = dict(message)
@@ -301,7 +303,7 @@ def detached_template_messages(messages: Sequence[Mapping[str, Any]]) -> list[di
                 if copied.get("role") == "tool"
                 and all(
                     isinstance(block, dict)
-                    and block.get("type") == "text"
+                    and block.get("type") in TEXT_TYPES
                     and isinstance(block.get("text"), str)
                     for block in detached_content
                 )

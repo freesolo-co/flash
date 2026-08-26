@@ -1055,7 +1055,7 @@ def test_multimodal_template_detaches_and_decodes_historical_tool_arguments(monk
         {
             "role": "tool",
             "content": [
-                {"type": "text", "text": "sun"},
+                {"type": "input_text", "text": "sun"},
                 {"type": "text", "text": "ny"},
             ],
             "tool_call_id": "call_1",

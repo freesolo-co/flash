@@ -892,7 +892,7 @@ def test_detached_history_arguments_are_objects_without_caller_mutation() -> Non
 
 def test_detached_tool_result_text_parts_flatten_only_for_templates() -> None:
     content = [
-        {"type": "text", "text": "sun"},
+        {"type": "input_text", "text": "sun"},
         {"type": "text", "text": "ny"},
     ]
     messages = [{"role": "tool", "tool_call_id": "call_1", "content": content}]
