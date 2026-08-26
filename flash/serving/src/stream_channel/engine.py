@@ -55,6 +55,22 @@ async def _stop_task(task: asyncio.Task[Any]) -> None:
     _consume_task_result(task)
 
 
+async def _bounded_operation(
+    operation: Awaitable[_T],
+    timeout_seconds: float,
+) -> _T:
+    task = asyncio.ensure_future(operation)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
+    except asyncio.CancelledError:
+        await _stop_task(task)
+        raise
+    if not done:
+        await _stop_task(task)
+        raise TimeoutError
+    return await task
+
+
 class _LeaseWatch:
     def __init__(
         self,
@@ -145,7 +161,7 @@ class _LeaseWatch:
         async def stop_operation() -> None:
             if abort is not None:
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(abort(), timeout=CLEANUP_SECONDS)
+                    await _bounded_operation(abort(), CLEANUP_SECONDS)
             await _stop_task(operation_task)
 
         try:
@@ -330,7 +346,10 @@ async def stream_generate_call(
             error_code=code,
         )
         try:
-            await asyncio.wait_for(_put_data(queue, envelope), timeout=CONTROL_POLL_SECONDS)
+            await _bounded_operation(
+                _put_data(queue, envelope),
+                CONTROL_POLL_SECONDS,
+            )
         except Exception:
             raise StreamChannelError(
                 ChannelErrorCode.CHANNEL_FAULT,

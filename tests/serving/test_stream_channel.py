@@ -738,6 +738,58 @@ def test_guarded_aborts_before_bounded_join_of_noncooperative_operation(
     assert asyncio.run(scenario()) == (True, False)
 
 
+def test_guarded_abort_timeout_retains_noncooperative_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[bool, bool]:
+        monkeypatch.setattr(channel_engine, "CLEANUP_SECONDS", 0.01)
+        queue = _FakeQueue()
+        await queue.control(_control(0, call_id=None))
+        await queue.control(_control(1))
+        watch = channel_engine._LeaseWatch(
+            queue,
+            generation_id="generation-1",
+            invocation_nonce="nonce-1",
+            function_call_id="fc-1",
+        )
+        await watch.admit()
+        assert watch._task is not None
+        await watch.close()
+        fail_watchdog = asyncio.Event()
+        release_abort = asyncio.Event()
+        abort_cancelled = asyncio.Event()
+
+        async def failed_watchdog() -> None:
+            await fail_watchdog.wait()
+            raise StreamChannelError(ChannelErrorCode.CANCELLED, "stream cancelled")
+
+        async def operation() -> None:
+            await asyncio.Event().wait()
+
+        async def abort() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                abort_cancelled.set()
+                await release_abort.wait()
+
+        watch._task = asyncio.create_task(failed_watchdog())
+        task = asyncio.create_task(watch.guarded(operation(), abort=abort))
+        fail_watchdog.set()
+        with pytest.raises(StreamChannelError, match="stream cancelled"):
+            await asyncio.wait_for(task, timeout=0.1)
+        await abort_cancelled.wait()
+        retained = bool(channel_engine._BACKGROUND_TASKS)
+        release_abort.set()
+        for retained_task in tuple(channel_engine._BACKGROUND_TASKS):
+            await retained_task
+        await asyncio.sleep(0)
+        await watch.close()
+        return retained, not channel_engine._BACKGROUND_TASKS
+
+    assert asyncio.run(scenario()) == (True, True)
+
+
 def test_backpressure_does_not_starve_control_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> _Owner:
         queue = _FakeQueue(data_capacity=1)
@@ -778,6 +830,75 @@ def test_backpressure_does_not_starve_control_watchdog(monkeypatch: pytest.Monke
     owner = asyncio.run(scenario())
     assert owner.abort_ids == ["generation-1"]
     assert owner.finally_count == 1
+
+
+def test_terminal_error_publication_retains_noncooperative_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[_Owner, bool, bool]:
+        monkeypatch.setattr(channel_engine, "CONTROL_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(channel_engine, "CLEANUP_SECONDS", 0.01)
+        queue = _FakeQueue(data_capacity=1)
+        _patch_modal(monkeypatch, queue)
+        await queue.data(
+            DataEnvelope(
+                kind="event",
+                generation_id="fill",
+                invocation_nonce="fill",
+                function_call_id="fill",
+                engine_replica_id="fill",
+                sequence=0,
+                terminal=False,
+                event={"type": "delta"},
+            )
+        )
+        await queue.control(_control(0, call_id=None))
+        await queue.control(_control(1))
+        cancellation_received = asyncio.Event()
+        release = asyncio.Event()
+        original_put = queue.put.aio
+
+        async def put(value: Any, **options: Any) -> None:
+            if options.get("partition") == DATA_PARTITION and value.get("kind") == "error":
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancellation_received.set()
+                    await release.wait()
+                return
+            await original_put(value, **options)
+
+        queue.put.aio = put
+        owner = _Owner([{"type": "ready"}], block_after_ready=True)
+        task = asyncio.create_task(
+            stream_generate_call(
+                owner,
+                {},
+                None,
+                None,
+                "generation-1",
+                time.time() + 5,
+                queue.object_id,
+                "nonce-1",
+            )
+        )
+        await owner.start_event.wait()
+        await queue.control(_control(2, kind="cancel"))
+        with pytest.raises(StreamChannelError, match="publish terminal"):
+            await asyncio.wait_for(task, timeout=0.2)
+        await cancellation_received.wait()
+        retained = bool(channel_engine._BACKGROUND_TASKS)
+        release.set()
+        for retained_task in tuple(channel_engine._BACKGROUND_TASKS):
+            await retained_task
+        await asyncio.sleep(0)
+        return owner, retained, not channel_engine._BACKGROUND_TASKS
+
+    owner, retained, drained = asyncio.run(scenario())
+    assert owner.abort_ids == ["generation-1"]
+    assert owner.finally_count == 1
+    assert retained
+    assert drained
 
 
 def test_engine_cleanup_timeout_retains_noncooperative_task(
@@ -1853,6 +1974,112 @@ def test_iterator_close_sends_tombstone_and_exact_call_cancel() -> None:
     cancel_count, clear_calls = asyncio.run(scenario())
     assert cancel_count == 1
     assert clear_calls == [DATA_PARTITION, CONTROL_PARTITION]
+
+
+def test_dispatch_deadline_bounds_channel_setup_and_closes_late_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[bool, bool]:
+        monkeypatch.setattr(client, "CLEANUP_SECONDS", 0.01)
+        queue = _FakeQueue()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        exited = asyncio.Event()
+
+        class SlowContext:
+            async def __aenter__(self) -> _FakeQueue:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    entered.set()
+                    await release.wait()
+                    return queue
+
+            async def __aexit__(self, *_args: object) -> None:
+                exited.set()
+
+        method = _FakeSpawnMethod(None)
+        channel = client.CancellableStreamChannel(
+            spawn_method=method,
+            payload_dict={},
+            record_dict=None,
+            expected_checkpoint=None,
+            generation_id="generation-1",
+            dispatch_deadline_unix=time.time() + 0.01,
+            invocation_nonce="nonce-1",
+            queue_context=SlowContext,
+        )
+        with pytest.raises(StreamChannelError) as exc_info:
+            await asyncio.wait_for(anext(channel), timeout=0.2)
+        await entered.wait()
+        release.set()
+        await asyncio.wait_for(exited.wait(), timeout=0.2)
+        return exc_info.value.code == ChannelErrorCode.DISPATCH_DEADLINE, method.spawn_count == 0
+
+    assert asyncio.run(scenario()) == (True, True)
+
+
+def test_dispatch_deadline_bounds_initial_lease_before_spawn() -> None:
+    async def scenario() -> tuple[ChannelErrorCode, int]:
+        queue = _FakeQueue()
+        put_started = asyncio.Event()
+
+        async def stalled_put(*_args: Any, **_options: Any) -> None:
+            put_started.set()
+            await asyncio.Event().wait()
+
+        queue.put.aio = stalled_put
+        method = _FakeSpawnMethod(None)
+        channel = client.CancellableStreamChannel(
+            spawn_method=method,
+            payload_dict={},
+            record_dict=None,
+            expected_checkpoint=None,
+            generation_id="generation-1",
+            dispatch_deadline_unix=time.time() + 0.01,
+            invocation_nonce="nonce-1",
+            queue_context=lambda: _QueueContext(queue),
+        )
+        task = asyncio.create_task(anext(channel))
+        await put_started.wait()
+        with pytest.raises(StreamChannelError) as exc_info:
+            await asyncio.wait_for(task, timeout=0.2)
+        return exc_info.value.code, method.spawn_count
+
+    assert asyncio.run(scenario()) == (ChannelErrorCode.DISPATCH_DEADLINE, 0)
+
+
+def test_router_partition_clear_retains_noncooperative_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[bool, bool]:
+        monkeypatch.setattr(client, "CLEANUP_SECONDS", 0.01)
+        queue = _FakeQueue()
+        cancellation_received = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stalled_clear(*, partition: str | None = None) -> None:
+            del partition
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_received.set()
+                await release.wait()
+
+        queue.clear.aio = stalled_clear
+        await asyncio.wait_for(
+            client._clear_partition(queue, DATA_PARTITION),
+            timeout=0.1,
+        )
+        await cancellation_received.wait()
+        retained = bool(client._BACKGROUND_TASKS)
+        release.set()
+        for task in tuple(client._BACKGROUND_TASKS):
+            await task
+        await asyncio.sleep(0)
+        return retained, not client._BACKGROUND_TASKS
+
+    assert asyncio.run(scenario()) == (True, True)
 
 
 def test_channel_writes_only_protocol_envelopes_without_credentials() -> None:

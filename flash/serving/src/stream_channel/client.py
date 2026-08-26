@@ -73,13 +73,76 @@ def _schedule_spawn_result_cancel(
     _retain_background_task(cleanup)
 
 
-async def _bounded_shield(operation: Awaitable[Any], deadline_seconds: float) -> None:
+async def _bounded_shield(operation: Awaitable[Any], deadline_seconds: float) -> Any:
     task = asyncio.ensure_future(operation)
     try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=deadline_seconds)
+        return await asyncio.wait_for(asyncio.shield(task), timeout=deadline_seconds)
     except (TimeoutError, asyncio.CancelledError):
         await _stop_task(task)
         raise
+
+
+async def _dispatch_bounded(
+    operation: Awaitable[Any],
+    dispatch_deadline_unix: float,
+    phase: str,
+) -> Any:
+    remaining = max(0.0, dispatch_deadline_unix - time.time())
+    try:
+        return await _bounded_shield(operation, remaining)
+    except TimeoutError as exc:
+        raise StreamChannelError(
+            ChannelErrorCode.DISPATCH_DEADLINE,
+            f"dispatch deadline expired during {phase}",
+        ) from exc
+
+
+class _DispatchDeadlineContext:
+    def __init__(self, context: Any, dispatch_deadline_unix: float) -> None:
+        self._context = context
+        self._dispatch_deadline_unix = dispatch_deadline_unix
+        self._entered = False
+
+    async def _exit_late_entry(self, task: asyncio.Task[Any]) -> None:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            return
+        with contextlib.suppress(Exception):
+            await _bounded_shield(
+                self._context.__aexit__(None, None, None),
+                CLEANUP_SECONDS,
+            )
+
+    def _schedule_late_exit(self, task: asyncio.Task[Any]) -> None:
+        cleanup = asyncio.create_task(self._exit_late_entry(task))
+        _retain_background_task(cleanup)
+
+    async def __aenter__(self) -> Any:
+        task = asyncio.create_task(self._context.__aenter__())
+        remaining = max(0.0, self._dispatch_deadline_unix - time.time())
+        done, _ = await asyncio.wait({task}, timeout=remaining)
+        if done:
+            value = task.result()
+            self._entered = True
+            return value
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
+        if done:
+            await self._exit_late_entry(task)
+        else:
+            task.add_done_callback(self._schedule_late_exit)
+            _retain_background_task(task)
+        raise StreamChannelError(
+            ChannelErrorCode.DISPATCH_DEADLINE,
+            "dispatch deadline expired during channel setup",
+        )
+
+    async def __aexit__(self, *exc_info: object) -> Any:
+        if not self._entered:
+            return None
+        self._entered = False
+        return await self._context.__aexit__(*exc_info)
 
 
 async def _cancel_or_retain_spawn(
@@ -210,7 +273,10 @@ async def _cancel_call(call: Any) -> None:
 
 async def _clear_partition(queue: Any, partition: str) -> None:
     with contextlib.suppress(Exception):
-        await asyncio.wait_for(queue.clear.aio(partition=partition), timeout=CLEANUP_SECONDS)
+        await _bounded_shield(
+            queue.clear.aio(partition=partition),
+            CLEANUP_SECONDS,
+        )
 
 
 class CancellableStreamChannel:
@@ -270,11 +336,12 @@ class CancellableStreamChannel:
     async def _run(self) -> AsyncIterator[dict[str, Any]]:
         import modal
 
-        context = (
+        raw_context = (
             self._queue_context()
             if self._queue_context is not None
             else modal.Queue.ephemeral.aio()
         )
+        context = _DispatchDeadlineContext(raw_context, self._dispatch_deadline_unix)
         call = None
         call_result_task: asyncio.Task[Any] | None = None
         completed = False
@@ -291,7 +358,11 @@ class CancellableStreamChannel:
                     await control.cancel()
 
             try:
-                await control.initial()
+                await _dispatch_bounded(
+                    control.initial(),
+                    self._dispatch_deadline_unix,
+                    "initial lease publication",
+                )
                 call = await _spawn_cancellation_safe(
                     lambda: self._spawn_method.spawn.aio(
                         self._payload_dict,
@@ -381,7 +452,6 @@ class CancellableStreamChannel:
                 if not completed and call is not None:
                     with contextlib.suppress(Exception):
                         await _cancel_call(call)
-                if not completed:
                     await control.cancel()
                 else:
                     await control.stop_heartbeats()
