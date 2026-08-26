@@ -1,11 +1,8 @@
-"""Bootstrap shared by instance-based providers (e.g. Lambda). Runs inside the worker container.
-
-Stdlib + huggingface_hub only — never import flash here. Reads payload from ``/root/flash/payload.json``.
-Launch scripts must ship ``bootstrap_console.py``, ``bootstrap_secrets.py`` and ``bootstrap_pip.py``.
-"""
+"""bootstrap shared by instance providers inside the worker container."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import multiprocessing
@@ -27,10 +24,9 @@ if __package__:
         _read_console_tail,
         _safe_detail,
     )
+    from flash.providers._lifecycle.host.preload_failure import publish_preload_failure
     from flash.snapshot import archive as _source_snapshot
 else:
-    # running as a bare script on the box: the launch scripts ship bootstrap_secrets.py into the
-    # same directory, and the script directory leads sys.path.
     import archive as _source_snapshot  # type: ignore[no-redef]
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
@@ -40,6 +36,7 @@ else:
         _read_console_tail,
         _safe_detail,
     )
+    from preload_failure import publish_preload_failure  # type: ignore[no-redef]
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
@@ -514,7 +511,6 @@ def build_worker_env(payload: dict) -> dict:
             "bootstrap payload carries no job spec: both job_spec_json and the job_spec_in_hf "
             "sentinel are absent/empty — the control plane built an invalid worker payload"
         )
-    # Large specs go via a file to avoid execve "Argument list too long".
     if len(spec_json) > 96_000:
         with open("/tmp/job_spec.json", "w") as f:
             f.write(spec_json)
@@ -524,7 +520,6 @@ def build_worker_env(payload: dict) -> dict:
         env["FLASH_JOB_SPEC_JSON"] = spec_json
     env["PHASE"] = payload["phase"]
     env["SEED"] = str(payload["seed"])
-    # binds every worker artifact to this reserved attempt.
     attempt = payload.get("attempt")
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise RuntimeError("bootstrap attempt identity is invalid")
@@ -670,6 +665,68 @@ def _publish_cancelled_result(
     )
 
 
+def _finish_run_mode(
+    payload: dict,
+    env: dict,
+    *,
+    code_dir: str,
+    console: str,
+    mode: str,
+    timed_out: bool,
+    cancelled: bool,
+    upload_deadline_at: float,
+    reaping_deadline_at: float,
+    worker_started_at: float,
+    deadline_watchdog: list[object] | None,
+) -> None:
+    try:
+        extra = ""
+        if timed_out:
+            extra = f"\n--- bootstrap: mode '{mode}' hit the wall-clock cap; killed ---\n"
+        elif cancelled:
+            extra = f"\n--- bootstrap: mode '{mode}' was cancelled; killed ---\n"
+        if upload_deadline_at <= _finite_positive_number(time.time(), "current clock"):
+            print("final console upload skipped; uploader reaping reserve reached", flush=True)
+        elif not _upload_console_tail_bounded(
+            payload,
+            console,
+            mode,
+            extra,
+            upload_deadline_at,
+            reaping_deadline_at,
+        ):
+            print("final console upload exceeded its allowance", flush=True)
+    except Exception as exc:
+        print(
+            f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+            flush=True,
+        )
+    if timed_out or cancelled:
+        _transition_deadline_watchdog(
+            deadline_watchdog,
+            _finite_positive_number(
+                payload.get("result_deadline_at"), "result visibility deadline"
+            ),
+            payload,
+        )
+    if timed_out:
+        _publish_deadline_result(
+            payload,
+            env,
+            code_dir=code_dir,
+            started_at=worker_started_at,
+        )
+        raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
+    if cancelled:
+        _publish_cancelled_result(
+            payload,
+            env,
+            code_dir=code_dir,
+            started_at=worker_started_at,
+        )
+        raise _CancellationRequested
+
+
 def run_mode(
     payload: dict,
     env: dict,
@@ -685,8 +742,6 @@ def run_mode(
         _worker_execution_deadline(upload_deadline_at),
         _finite_positive_number(payload.get("work_deadline_at"), "work deadline"),
     )
-    # cap work from its actual start: the absolute deadline includes boot grace, whose unused
-    # portion must not extend the declared wall-time budget.
     budget = payload.get("run_max_wall_seconds")
     if isinstance(budget, (int, float)) and not isinstance(budget, bool):
         budget = float(budget)
@@ -793,52 +848,19 @@ def run_mode(
             )
             if not uploader_clean:
                 print("console uploader exceeded its shutdown allowance; terminated", flush=True)
-    try:
-        extra = ""
-        if timed_out:
-            extra = f"\n--- bootstrap: mode '{mode}' hit the wall-clock cap; killed ---\n"
-        elif cancelled:
-            extra = f"\n--- bootstrap: mode '{mode}' was cancelled; killed ---\n"
-        if upload_deadline_at <= _finite_positive_number(time.time(), "current clock"):
-            print("final console upload skipped; uploader reaping reserve reached", flush=True)
-        elif not _upload_console_tail_bounded(
-            payload,
-            console,
-            mode,
-            extra,
-            upload_deadline_at,
-            reaping_deadline_at,
-        ):
-            print("final console upload exceeded its allowance", flush=True)
-    except Exception as exc:
-        print(
-            f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
-            flush=True,
-        )
-    if timed_out or cancelled:
-        _transition_deadline_watchdog(
-            deadline_watchdog,
-            _finite_positive_number(
-                payload.get("result_deadline_at"), "result visibility deadline"
-            ),
-            payload,
-        )
-    if timed_out:
-        _publish_deadline_result(
-            payload,
-            env,
-            code_dir=code_dir,
-            started_at=worker_started_at,
-        )
-        raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
-    if cancelled:
-        _publish_cancelled_result(
-            payload,
-            env,
-            code_dir=code_dir,
-            started_at=worker_started_at,
-        )
-        raise _CancellationRequested
+    _finish_run_mode(
+        payload,
+        env,
+        code_dir=code_dir,
+        console=console,
+        mode=mode,
+        timed_out=timed_out,
+        cancelled=cancelled,
+        upload_deadline_at=upload_deadline_at,
+        reaping_deadline_at=reaping_deadline_at,
+        worker_started_at=worker_started_at,
+        deadline_watchdog=deadline_watchdog,
+    )
     return proc.returncode
 
 
@@ -937,7 +959,11 @@ def main() -> int:
             with open("/tmp/preload_result.json", "w") as f:
                 json.dump(result, f)
             hf_upload(payload, "/tmp/preload_result.json", "preload_result.json")
-            return 0 if not result.get("error") and not result.get("failed") else 1
+            failure = result.get("error") or result.get("failed")
+            if failure:
+                publish_preload_failure(payload, _safe_detail(failure, 1000), hf_upload)
+                return 1
+            return 0
         deadline_watchdog = list(arm_deadline_watchdog(deadline, payload))
         fetch_code(payload)
         install_extra_pip(payload)
@@ -959,6 +985,8 @@ def main() -> int:
     except BaseException as exc:
         detail = _safe_detail(exc, 1800, secrets=_payload_secrets(payload))
         print(f"bootstrap failed: {detail}", flush=True)
+        with contextlib.suppress(Exception):
+            publish_preload_failure(payload, detail, hf_upload)
         return 1
     finally:
         if deadline_watchdog is not None:

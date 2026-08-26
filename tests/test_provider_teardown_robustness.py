@@ -101,8 +101,7 @@ def test_label_bounded_and_sweep_matches_for_long_run_id():
 
 
 def test_user_data_fails_fast_and_throttles_bootlog():
-    """The cloud-init writes a retriable failure marker on docker failure and throttles the host
-    boot-log (no 30s-forever loop that would blow HF's commit budget)."""
+    """cloud-init keeps training marker-free and emits preload-only host failure evidence."""
     from flash.providers._lifecycle.instances.instance import build_user_data
 
     payload = {
@@ -110,6 +109,7 @@ def test_user_data_fails_fast_and_throttles_bootlog():
         "hf_prefix": "sft/x/seed0",
         "flash_arm": "lambda",
         "attempt": 0,
+        "fence": 1,
         "job_spec_json": "{}",
         "phase": "sft",
         "seed": 0,
@@ -117,18 +117,18 @@ def test_user_data_fails_fast_and_throttles_bootlog():
         "extra_pip": [],
         "env": {"HF_TOKEN": "t"},
     }
-    s = build_user_data(payload, image="img:tag")
-    assert "capsule.pyz failmark" in s  # host writes the attempt-failure marker
-    assert 'fail "worker image pull failed' in s  # fail fast when the image can't pull
-    assert 'fail "worker container did not start' in s
-    assert "sleep 120" in s  # boot-log throttled to 120s
-    assert "sleep 30;" not in s  # NOT the old 30s-forever loop
-    # A fast CLEAN exit (code 0 — an already-complete retry restores metrics + writes its ok-marker
-    # in <5s) is the success signal itself: the host inspects the exit code and writes the retriable
-    # failmark ONLY on a non-zero exit, so it never clobbers the worker's just-written ok-marker.
-    assert "{{.State.ExitCode}}" in s
-    assert '[ "$EXIT" = "0" ] || fail' in s
-    assert "donecheck" not in s  # no host-side HF check (it would race the worker's marker upload)
+    training = build_user_data(payload, image="img:tag")
+    preload = build_user_data({**payload, "mode": "preload"}, image="img:tag")
+    assert "capsule.pyz preload_failure" not in training
+    assert "capsule.pyz preload_failure" in preload
+    assert "lambda_attempt0.json" not in training + preload
+    assert 'fail "worker image pull failed' in training
+    assert 'fail "worker container did not start' in training
+    assert "deadline_sleep 120" in training
+    assert "sleep 30;" not in training
+    assert "{{.State.ExitCode}}" in training
+    assert '[ "$EXIT" = "0" ] || fail' in training
+    assert "donecheck" not in training
 
 
 def test_instance_realized_cost_is_wall_times_rate():

@@ -16,6 +16,7 @@ from collections.abc import Callable
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
+from flash.core.spec import gpu_count_of
 from flash.providers._lifecycle.instances.poll import make_say
 from flash.providers._lifecycle.instances.poll_instance import (
     InstancePollAdapter,
@@ -88,6 +89,8 @@ _DEAD_MACHINE_RUNS_MAX = 512
 # class is gone". only paid when the default page is entirely blacklisted, which needs a run that
 # already lost that many hosts.
 _EXHAUSTION_RECHECK_LIMIT = 1024
+
+
 def _note_dead_machine(run_id: str, machine_id: int | None) -> None:
     """Remember that ``machine_id`` took this run's money and did not deliver a worker."""
     if not run_id or not machine_id or machine_id <= 0:
@@ -377,8 +380,6 @@ def deploy_and_submit(
 
     Try five ranked offers, then refresh once while excluding machines already tried.
     """
-    from flash.core.spec import gpu_count_of
-
     say = make_say(log)
     absolute_deadline = require_deadline_at(deadline_at)
 
@@ -584,9 +585,7 @@ def poll_vast_job(
         dead_states=_DEAD_STATES,
         missing_dead_threshold=4,
         stamp_cost_and_notes=stamp_cost_and_notes,
-        record_resource_loss=lambda _status: _note_dead_machine(
-            spec.run_id, handle.machine_id
-        ),
+        record_resource_loss=lambda _status: _note_dead_machine(spec.run_id, handle.machine_id),
     )
     return poll_instance_job(
         adapter,

@@ -2003,10 +2003,9 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
     monkeypatch.setattr(
         b,
         "run_mode",
-        lambda _payload, _env, _phase, deadline, **_kwargs: events.append(
-            ("training", deadline)
-        )
-        or 0,
+        lambda _payload, _env, _phase, deadline, **_kwargs: (
+            events.append(("training", deadline)) or 0
+        ),
     )
     monkeypatch.setattr(b.os.path, "exists", lambda path: path == "/tmp/metrics.json")
 
@@ -2054,8 +2053,6 @@ def test_main_source_verification_failure_prevents_pip(monkeypatch):
     assert events == []
 
 
-
-
 # ---------------------------------------------------------------------------
 # deadline watchdogs
 # ---------------------------------------------------------------------------
@@ -2080,8 +2077,6 @@ def test_arm_deadline_watchdog_hard_exits(monkeypatch):
 
     assert not done.is_set()
     assert exits == [124]
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -2222,8 +2217,6 @@ def test_console_snapshot_redacts_a_payload_env_secret(tmp_path, monkeypatch):
     assert "Traceback (most recent call last):" in tail
     assert '  File "train.py", line 7, in <module>' in tail
     assert uploads == [(str(console) + "_attempt0.tail", "console_sft_attempt0.txt")]
-
-
 
 
 def test_safe_detail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):
@@ -2569,6 +2562,7 @@ def _preload_payload(**over):
         "run_id": "preload-run",
         "seed": 0,
         "attempt": 0,
+        "fence": 1,
         "env": {},
         "run_created_at": created_at,
         "run_max_wall_seconds": 999.0,
@@ -2602,6 +2596,14 @@ def test_main_preload_failure_arms_wall_cap_and_reports_failed_models(monkeypatc
     uploads = []
     monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: uploads.append((path, sub)))
     assert b.main() == 1
-    assert uploads == [("/tmp/preload_result.json", "preload_result.json")]
+    assert uploads == [
+        ("/tmp/preload_result.json", "preload_result.json"),
+        ("/tmp/preload_failure.json", "preload_failure.json"),
+    ]
     with open("/tmp/preload_result.json") as file:
         assert json.load(file)["failed"] == {"a/b": "oom"}
+    with open("/tmp/preload_failure.json") as file:
+        failure = json.load(file)
+    assert failure["run_id"] == "preload-run"
+    assert failure["attempt"] == 0
+    assert failure["fence"] == 1

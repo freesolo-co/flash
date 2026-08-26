@@ -91,10 +91,8 @@ def _write_terminal_metadata(
         train_wall=train_wall,
         setup_seconds=setup_seconds,
         train_tokens=0,
-        # carry the completed step, as the sft and opd finalizers already do. without it the
-        # rl_train_done and done progresss land stepless and overwrite the stepped rl_trained ping
-        # above, so a cancel arriving between here and DONE reprices a fully trained run at zero
-        # steps (actual_steps_run returns 0 for a non-training stage with no step).
+        # carry the observed completed step through cumulative progress and into the fenced result
+        # manifest; progress remains diagnostic while the result manifest owns terminal authority.
         step=steps_run,
         progress_fields={"metrics_last": list(metrics_last)},
         generated_tokens=int(

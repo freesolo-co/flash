@@ -201,9 +201,9 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # /opt/flash/kernelcache, and engine.worker._load_kernel_cache_if_present loads it at boot
 # (torch.compiler.load_cache_artifacts) — measured cold compile ~124s -> warm load ~0.2s (537x).
 #
-# FALLBACK (the DEFAULT, BUILD_KERNEL_CACHE=false): NOTHING is baked and the build needs no GPU. The
-# first-run JIT happens on the worker exactly as before; flash #163's init heartbeat keeps the stall
-# detector quiet through it. So the opt-in is purely additive — an absent cache changes nothing.
+# fallback (the default, build_kernel_cache=false): nothing is baked and the build needs no gpu. the
+# first-run jit stays bounded by the fixed worker deadline, and observational progress resumes after
+# setup produces work. the opt-in is additive, so an absent cache changes nothing.
 #
 # The COPY is made safe-when-absent with the standard "COPY a path that always exists + a guard"
 # trick. `build/kernel_cache/` is checked into the repo with just a `.keep` placeholder, so the COPY

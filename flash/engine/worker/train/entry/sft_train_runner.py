@@ -179,7 +179,9 @@ def _resolve_sft_options(spec) -> _SftOptions:
     # targets for any env whose row construction uses python/numpy randomness.
     _sft_train.seed_training_rngs(_worker_state.SEED)
     started_at = time.time()
-    _worker_progress.publish_progress("sft_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False))
+    _worker_progress.publish_progress(
+        "sft_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False)
+    )
     gpu_probe = _sft_train._probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
@@ -628,9 +630,9 @@ def _prepare_sft_child(
     # the gdn boundary shim resets conv and recurrent state at packed example boundaries, but only
     # when the verl child has the kernels that read seq_idx and cu_seqlens; the no-fla fallbacks
     # accept both and discard them. so the shim is installed only when the child proves it can reset.
-    # `gdn_reset_arch` is resolved by the caller, inside the configuring liveness wrap, because the
-    # probe is part of the setup silence that wrap exists to cover, and because a packed run must
-    # take the RAISING gate there rather than the soft form.
+    # `gdn_reset_arch` is resolved by the caller inside the configuring observation phase so setup
+    # progress brackets the probe; the fixed worker deadline bounds it, and a packed run takes the
+    # raising gate there rather than the soft form.
     world_size, micro_batch = _resolve_sft_width_and_micro_batch(options, data, model)
     target_parameters = lora_target_parameters(options.model_id)
     fsdp_generation = _resolve_fsdp_generation("sft", target_parameters)

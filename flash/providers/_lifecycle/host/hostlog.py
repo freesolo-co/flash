@@ -18,8 +18,8 @@ import time
 def main() -> None:
     """Upload the host boot log to the attempt-scoped HF path. Best effort by design.
 
-    Every failure is swallowed: this is a liveness artifact, and a box must never die because its
-    diagnostic upload did. The control plane treats the artifact's ABSENCE as the signal.
+    every failure is swallowed because this artifact is diagnostics only. its presence or absence
+    has no lifecycle authority, and a box must never die because the upload failed.
     """
     try:
         with open("/opt/flash/payload.json") as _payload_file:

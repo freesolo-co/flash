@@ -73,8 +73,8 @@ def write_train_meta(
     m = RunMetrics(
         arm=os.environ.get("FLASH_ARM", "runpod"),
         phase=phase,
-        # Completed optimizer updates (opd passes step=opt_steps; sft/rl omit it -> None). _finalize
-        # reads metrics.step to carry the true step onto the terminal `done` progress.
+        # completed optimizer updates, when available, remain observational progress and are also
+        # carried into the fenced result manifest that authoritatively records the terminal outcome.
         step=step,
         seed=worker_state.SEED,
         model_id=model_id,

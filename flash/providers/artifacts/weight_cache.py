@@ -408,11 +408,11 @@ def _warm_one_lambda_instance(
             f"{prefix}/preload_result.json",
             min_interval_s=max(5.0, poll_interval_s),
         )
-        # Also watch the attempt marker: if the box dies early the failmark is the only signal (avoids
-        # polling to full timeout on a dead box). Completion file is authoritative when present.
+        # the preload-only failure artifact stops polling after terminal host bootstrap failure.
+        # it has no training lifecycle authority; preload_result.json remains the success result.
         fail_reader = make_hf_text_reader(
             status_repo,
-            f"{prefix}/lambda_attempt0.json",
+            f"{prefix}/preload_failure.json",
             min_interval_s=max(5.0, poll_interval_s),
         )
         logger.info("warm lambda/%s: launched preload (%d models)", region, len(models))
@@ -421,23 +421,18 @@ def _warm_one_lambda_instance(
             text = reader(force=True)
             if text:
                 break
-            # No completion file yet — the terminal attempt marker is the backstop: ok=false means the
-            # box already died (stop polling, free it now), ok=true means the download SUCCEEDED but
-            # only the preload_result.json upload had a transient Hub blip (the worker still wrote a
-            # terminal ok=true marker), so the box is ALREADY warmed — short-circuit the wait instead
-            # of polling to the full budget then terminating a warmed box and reporting it timed out.
             fail_text = fail_reader(force=True)
             if fail_text:
                 try:
                     fail = json.loads(fail_text)
                 except Exception:
                     fail = {}
-                if fail.get("ok") is True:
-                    bad = fail.get("error") or fail.get("failed")
-                    return _result("partial" if bad else "ok", result=fail)
-                if not fail.get("ok", True):
-                    # Completion file is authoritative: a partial run writes it before the fail marker,
-                    # so re-check once before reporting early death.
+                if (
+                    fail.get("run_id") == run_id
+                    and fail.get("attempt") == 0
+                    and fail.get("fence") == 1
+                ):
+                    # re-check the authoritative preload result before reporting host failure.
                     text = reader(force=True)
                     if text:
                         break

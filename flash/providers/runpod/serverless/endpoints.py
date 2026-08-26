@@ -12,7 +12,6 @@ from flash._internal.diagnostics import sanitize_diagnostic
 from flash.providers._lifecycle.net.worker import logger
 from flash.providers.core.base import canonical_gpu, gpu_short
 
-# runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
 
 _CONSOLE_UPLOAD_INTERVAL_S = 3600.0
@@ -105,8 +104,6 @@ def _train_body(input_data: dict) -> dict:
         import urllib.parse
 
         mapping = {**os.environ, **(secrets or {})}
-        # declared runtime secrets can carry any name, so the control plane lists them in
-        # flash_secret_env_keys; the name-shape rule stays as the fail-closed fallback.
         declared = {
             name.strip().upper()
             for name in str(mapping.get("FLASH_SECRET_ENV_KEYS") or "").split(",")
@@ -887,8 +884,6 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
     """Delete the remote Flash endpoint(s) for a run via the RunPod API. Best-effort, never raises."""
     friendly = canonical_gpu(friendly_gpu)
     target = endpoint_name(friendly, _run_suffix(run_id))
-    # Serialize isolation + lookup + undeploy: isolate_flash_state swaps process-wide globals,
-    # and a concurrent call could swap the registry scope between our lookup and undeploy.
     with FLASH_SDK_LOCK:
         try:
             from flash.providers.runpod.client.auth import ensure_auth
@@ -935,7 +930,6 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             except RuntimeError:
                 results = asyncio.run(_undeploy_all())
             else:
-                # Running event loop (FastAPI lifespan etc) — run in a daemon thread.
                 _out: list = []
                 _err: list = []
 
@@ -962,7 +956,6 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                 }
             ]
 
-    # registry-less cleanup must inspect every configured account and exact retry suffix.
     try:
         from flash.providers.runpod.client import api as runpod_api
 

@@ -1854,11 +1854,20 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     """launch_and_submit(mode='preload', models=...) embeds a preload payload in the cache user_data."""
     import base64
     import json as _json
+    from types import SimpleNamespace
 
     from flash.providers.lambda_ import jobs
     from flash.providers.lambda_.client import api as lambda_api
+    from flash.runner.lifecycle import status as lifecycle_status
+    from flash.runner.lifecycle.protocol import AttemptRecord
 
     launched = {}
+    attempt = AttemptRecord(0, 1, "reserved", 1.0, 2.0, 3.0, 5.0, 4.0)
+    monkeypatch.setattr(
+        lifecycle_status,
+        "get_status",
+        lambda _run_id: SimpleNamespace(attempt=attempt.to_dict()),
+    )
     monkeypatch.setattr(
         lambda_api,
         "ensure_filesystem",
@@ -1895,14 +1904,23 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
 def test_lambda_warm_caller_uses_source_independent_preload_payload(monkeypatch):
     import base64
     import json as _json
+    from types import SimpleNamespace
 
     from flash.providers.artifacts import weight_cache as preload
     from flash.providers.lambda_ import jobs
     from flash.providers.lambda_.client import api as lambda_api
+    from flash.runner.lifecycle import status as lifecycle_status
+    from flash.runner.lifecycle.protocol import AttemptRecord
     from tests.test_lambda_runner import _inst
 
     launched = {}
     terminated = []
+    attempt = AttemptRecord(0, 1, "reserved", 1.0, 2.0, 3.0, 5.0, 4.0)
+    monkeypatch.setattr(
+        lifecycle_status,
+        "get_status",
+        lambda _run_id: SimpleNamespace(attempt=attempt.to_dict()),
+    )
     monkeypatch.setattr(preload, "_ensure_region_filesystem", lambda *_args: "listed")
     monkeypatch.setattr(
         preload,
@@ -2078,10 +2096,9 @@ def test_warm_instance_terminates_on_launch_failure(monkeypatch):
     assert len(terminated) == 1  # finally still tears down
 
 
-def test_warm_instance_stops_early_on_failure_marker(monkeypatch):
-    """The box can die BEFORE run_preload uploads preload_result.json (docker/GPU never ready, image
-    pull fails, the bootstrap crashes early); it still writes the <arm>_attempt0.json failure marker.
-    The driver must watch that marker and free the paid box at once instead of polling the full budget."""
+def test_warm_instance_stops_early_on_preload_failure_artifact(monkeypatch):
+    """preload host failure evidence frees a dead paid box before the full polling budget."""
+    import json
     import types as _types
 
     from flash.providers.artifacts import weight_cache as preload
@@ -2090,15 +2107,27 @@ def test_warm_instance_stops_early_on_failure_marker(monkeypatch):
     terminated = []
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
 
-    # Two distinct readers by path: the completion file never appears; the attempt-failure marker does.
+    run_id = {"value": ""}
+
     def reader_factory(repo, path, min_interval_s=45.0):
         if path.endswith("preload_result.json"):
             return lambda force=False: None
-        return lambda force=False: '{"ok": false, "error": "image pull failed"}'
+        return lambda force=False: json.dumps(
+            {
+                "run_id": run_id["value"],
+                "attempt": 0,
+                "fence": 1,
+                "error": "image pull failed",
+            }
+        )
 
     monkeypatch.setattr(preload, "make_hf_text_reader", reader_factory)
     monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
-    monkeypatch.setattr(lj, "launch_and_submit", lambda *a, **k: None)
+    monkeypatch.setattr(
+        lj,
+        "launch_and_submit",
+        lambda spec, *args, **kwargs: run_id.__setitem__("value", spec.run_id),
+    )
     monkeypatch.setattr(lj, "terminate_run_instances", lambda rid: terminated.append(rid))
     # Clock that ticks 1 virtual second per sleep — if the early-out works, the poll exits on the FIRST
     # pass (well under the 60s floor), proving the box wasn't held to the full budget.
@@ -2116,6 +2145,52 @@ def test_warm_instance_stops_early_on_failure_marker(monkeypatch):
     assert "image pull failed" in res[0]["error"]
     assert clock["t"] - start < 5  # bailed immediately, did NOT poll the full 600s
     assert len(terminated) == 1
+
+
+def test_preload_failure_artifact_is_emitted_only_for_preload(monkeypatch):
+    import json
+
+    from flash.providers._lifecycle.host import preload_failure
+
+    payload = {
+        "mode": "training",
+        "run_id": "preload-run",
+        "attempt": 0,
+        "fence": 1,
+        "hf_prefix": "sft/preload-run",
+        "hf_repo": "org/preload",
+        "env": {"HF_TOKEN": "token"},
+    }
+    uploads = []
+
+    class Api:
+        def __init__(self, token):
+            assert token == "token"
+
+        def upload_file(self, **kwargs):
+            uploads.append(kwargs)
+
+    monkeypatch.setattr(preload_failure.time, "time", lambda: 123.0)
+    monkeypatch.setitem(
+        __import__("sys").modules, "huggingface_hub", types.SimpleNamespace(HfApi=Api)
+    )
+
+    assert preload_failure.publish_preload_failure(payload, "image pull failed") is False
+    assert uploads == []
+
+    payload["mode"] = "preload"
+    assert preload_failure.publish_preload_failure(payload, "image pull failed") is True
+
+    assert len(uploads) == 1
+    assert uploads[0]["path_in_repo"] == "sft/preload-run/preload_failure.json"
+    artifact = json.loads(uploads[0]["path_or_fileobj"].getvalue())
+    assert artifact == {
+        "attempt": 0,
+        "error": "image pull failed",
+        "fence": 1,
+        "run_id": "preload-run",
+        "ts": 123.0,
+    }
 
 
 def test_warm_instances_no_capacity_returns_empty(monkeypatch):
@@ -2878,7 +2953,7 @@ def test_preload_status_repo_is_managed_across_all_paths(monkeypatch):
     assert managed_repo == submitted[0].train.hf_repo
     assert [repo for repo, _path in readers] == [managed_repo, managed_repo]
     assert readers[0][1].endswith("/preload_result.json")
-    assert readers[1][1].endswith("/lambda_attempt0.json")
+    assert readers[1][1].endswith("/preload_failure.json")
     assert result["status"] == "ok"
     assert len(terminated) == 1
 

@@ -501,8 +501,8 @@ def _resolve_grpo_inputs():
 
         # warm-start: continue the sft adapter in place (verl lora_adapter_path). uses the SOURCE
         # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
-        # a multi-GB adapter pull emits nothing of its own, so it must run under a liveness wrap or
-        # the provider judges the silence as a stall.
+        # the phase wrapper publishes observational progress before and after the multi-gb adapter
+        # pull; the fixed worker deadline remains the authority for bounding the download.
         with observe_phase("rl_adapter_loading"):
             warmstart_adapter = _download_adapter(_t.init_from_adapter)
         if not warmstart_adapter:

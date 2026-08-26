@@ -43,6 +43,7 @@ _INSTANCE_BOOTSTRAP_SOURCES = (
 _HOST_HELPER_SOURCES = (
     (f"{_LIFECYCLE}/host/deadline_sleep.py", "deadline_sleep.py"),
     (f"{_LIFECYCLE}/host/hostlog.py", "hostlog.py"),
+    (f"{_LIFECYCLE}/host/preload_failure.py", "preload_failure.py"),
 )
 
 PROFILES: dict[str, Profile] = {
@@ -50,7 +51,7 @@ PROFILES: dict[str, Profile] = {
     # script runs directly. one profile, because both providers execute the same programs.
     "instance-bootstrap": Profile(
         name="instance-bootstrap",
-        version=4,
+        version=5,
         entrypoint="bootstrap.py",
         sources=_INSTANCE_BOOTSTRAP_SOURCES + _HOST_HELPER_SOURCES,
     ),

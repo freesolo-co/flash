@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import inspect
+import itertools
+import threading
+import time
 
 from flash.engine.worker.io import progress as progress_io
+from flash.runner.lifecycle.protocol import digest_record
 
 
 def _reset(monkeypatch) -> None:
@@ -46,6 +50,56 @@ def test_failed_upload_reuses_sequence_and_chain_head(monkeypatch) -> None:
     assert [record.sequence for record, _required in records] == [1, 1]
     assert all(record.previous_digest is None for record, _required in records)
     assert progress_io._PROGRESS_SEQUENCE == 1
+
+
+def test_concurrent_publish_serializes_uploads_and_reuses_failed_sequence(monkeypatch) -> None:
+    _reset(monkeypatch)
+    records = []
+    state_lock = threading.Lock()
+    active_uploads = 0
+    max_active_uploads = 0
+    failed_once = False
+    barrier = threading.Barrier(5)
+
+    def upload(record, *, required):
+        nonlocal active_uploads, failed_once, max_active_uploads
+        with state_lock:
+            active_uploads += 1
+            max_active_uploads = max(max_active_uploads, active_uploads)
+        try:
+            time.sleep(0.01)
+            with state_lock:
+                records.append(record)
+                if not failed_once:
+                    failed_once = True
+                    return False
+                return True
+        finally:
+            with state_lock:
+                active_uploads -= 1
+
+    monkeypatch.setattr(progress_io, "_upload_record", upload)
+
+    def publish(index):
+        barrier.wait()
+        progress_io.publish_progress("rl_step", step=index)
+
+    threads = [threading.Thread(target=publish, args=(index,)) for index in range(4)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert max_active_uploads == 1
+    assert len(records) == 4
+    committed = records[1:]
+    assert [record.sequence for record in committed] == [1, 2, 3]
+    assert records[0].sequence == records[1].sequence == 1
+    assert records[0].previous_digest is None
+    assert records[1].previous_digest is None
+    for previous, current in itertools.pairwise(committed):
+        assert current.previous_digest == digest_record(previous.to_dict())
 
 
 def test_checkpoint_failure_is_sticky_until_a_successful_checkpoint(monkeypatch) -> None:
