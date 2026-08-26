@@ -207,7 +207,7 @@ def _status_present(api, repo: str, retries: int = 1) -> bool:
 
 
 def _poll_bake(api, repo: str, handle, deadline_at: float, *, renew_lease=None) -> str:
-    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.client import pods as runpod_pods
     from flash.providers.runpod.execution.hf_intent import INTENT_LEASE_S
 
     dead = 0
@@ -218,7 +218,7 @@ def _poll_bake(api, repo: str, handle, deadline_at: float, *, renew_lease=None) 
             next_renewal = time.time() + INTENT_LEASE_S / 3.0
         if _status_present(api, repo):
             return "done"
-        pod = runpod_api.get_pod_for_fingerprint(
+        pod = runpod_pods.get_pod_for_fingerprint(
             handle.pod_id, handle.key_fingerprint, deadline_at=deadline_at
         )
         dead = dead + 1 if pod is None or pod.desired_status in _DEAD_STATES else 0

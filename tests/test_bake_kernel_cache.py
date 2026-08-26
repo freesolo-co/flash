@@ -177,6 +177,54 @@ def test_bake_launch_boundary_cuda_floor(monkeypatch, sm, allowed, expected):
     assert payload_for_handle(handle)["allowedCudaVersions"] == expected
 
 
+@pytest.mark.parametrize(
+    ("repo_files", "pod_statuses", "expected", "expected_pod_calls"),
+    [
+        ([[], ["out/STATUS"]], ["RUNNING"], "done", 1),
+        ([[]], ["DEAD", "DEAD"], "pod_died", 2),
+        ([["out/STATUS"]], [], "done", 0),
+    ],
+)
+def test_poll_bake_uses_strict_pod_client(
+    monkeypatch, repo_files, pod_statuses, expected, expected_pod_calls
+):
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.client import pods as runpod_pods
+
+    observed = []
+
+    def list_repo_files(repo, *, repo_type):
+        assert repo == "owner/repo"
+        assert repo_type == "dataset"
+        if len(repo_files) > 1:
+            return repo_files.pop(0)
+        return repo_files[0]
+
+    def get_pod(pod_id, fingerprint, *, deadline_at):
+        observed.append((pod_id, fingerprint, deadline_at))
+        return SimpleNamespace(desired_status=pod_statuses.pop(0))
+
+    def wrong_owner(*args, **kwargs):
+        raise AssertionError("strict Pod lookup must use client.pods")
+
+    monkeypatch.setattr(runpod_pods, "get_pod_for_fingerprint", get_pod)
+    monkeypatch.setattr(runpod_api, "get_pod_for_fingerprint", wrong_owner, raising=False)
+    monkeypatch.setattr(bake.time, "sleep", lambda seconds: None)
+    deadline_at = time.time() + 60
+    handle = SimpleNamespace(pod_id="pod-1", key_fingerprint="rpk-fingerprint")
+
+    assert (
+        bake._poll_bake(
+            SimpleNamespace(list_repo_files=list_repo_files),
+            "owner/repo",
+            handle,
+            deadline_at,
+        )
+        == expected
+    )
+    assert observed == [("pod-1", "rpk-fingerprint", deadline_at)] * expected_pod_calls
+
+
 def test_empty_allowed_cuda_means_no_override():
     assert bake._allowed_cuda_override("") is None
     assert bake._allowed_cuda_override("13.0") == ("13.0",)
