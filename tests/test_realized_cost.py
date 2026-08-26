@@ -367,6 +367,40 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
     assert persisted.realized_cost_remote is None
 
 
+def test_reconciled_cost_retains_charge_attribution_until_billing_completes(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
+    remote = {
+        "provider": "runpod",
+        "endpoint_id": "ep-charge-pending",
+        "allocated_gpu": "A100 PCIe",
+        "allocated_gpu_count": 4,
+    }
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id="charge-pending",
+            state="done",
+            spec={"algorithm": "sft", "model": "m"},
+            billing_context={"org_id": "org-1"},
+            billing_state="failed",
+            realized_cost_remote=remote,
+        )
+    )
+
+    runner_costs.record_realized_cost("charge-pending", realized_cost_usd=3.5, reconciled_at=100.0)
+
+    pending = runner_status.get_status("charge-pending")
+    assert pending.realized_cost_remote == remote
+    runner_costs.record_billing_state(
+        "charge-pending",
+        billing_state="charged",
+        billing_error=None,
+        billing_charge={"amountCents": 125},
+    )
+    charged = runner_status.get_status("charge-pending")
+    assert charged.realized_cost_remote is None
+    assert charged.realized_cost_usd == 3.5
+
+
 def test_reconcile_once_disabled_without_internal_key(monkeypatch):
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     monkeypatch.setattr(runner_status, "list_runs", lambda: [_status(updated_at=0)])

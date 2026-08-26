@@ -170,7 +170,10 @@ def _compare_and_complete_remote(
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
             return False
-        if not _expected_remote_matches(status.remote, expected_remote):
+        confirmed_teardown = status.remote is None and _expected_remote_matches(
+            status.cleanup_confirmed_remote, expected_remote
+        )
+        if not _expected_remote_matches(status.remote, expected_remote) and not confirmed_teardown:
             return False
     expected_attempt = (
         expected_remote.get("attempt")
@@ -182,14 +185,22 @@ def _compare_and_complete_remote(
         metrics,
         expected_attempt=expected_attempt,
     )
-    if expected_remote is not None and not _record_cleanup_remote(run_id, expected_remote):
+    if (
+        expected_remote is not None
+        and not confirmed_teardown
+        and not _record_cleanup_remote(run_id, expected_remote)
+    ):
         return False
     recovered_cost = status_ops._persist_metrics(spec, metrics)
     with state._status_guard(run_id):
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
             return False
-        if not _expected_remote_matches(status.remote, expected_remote):
+        expected_still_owned = _expected_remote_matches(status.remote, expected_remote) or (
+            status.remote is None
+            and _expected_remote_matches(status.cleanup_confirmed_remote, expected_remote)
+        )
+        if not expected_still_owned:
             return False
         measured = float(status.cost_usd or 0.0) + recovered_cost
         charge_usd = costs._status_estimated_charge(status, spec, fallback=measured)
@@ -203,7 +214,11 @@ def _compare_and_complete_remote(
         state._save_status_unlocked(status)
         report_status = status
     confirmed = status_ops.get_status(run_id)
-    if confirmed.state != "done" or not _expected_remote_matches(confirmed.remote, expected_remote):
+    expected_still_owned = _expected_remote_matches(confirmed.remote, expected_remote) or (
+        confirmed.remote is None
+        and _expected_remote_matches(confirmed.cleanup_confirmed_remote, expected_remote)
+    )
+    if confirmed.state != "done" or not expected_still_owned:
         raise RuntimeError("terminal recovery completion was not durably confirmed")
     if report_status is not None:
         reporting._report_status(report_status)
@@ -260,6 +275,33 @@ def _cleanup_remotes_from_raw(raw: dict) -> list[dict]:
 def _snapshot_cleanup_remotes(run_id: str) -> list[dict]:
     with state._status_guard(run_id):
         return _cleanup_remotes_from_raw(status_ops._load_status_json(run_id))
+
+
+def _retain_remote_for_accounting(status: RunStatus) -> bool:
+    return status.reconciled_at is None or (
+        bool(status.billing_context) and status.billing_state != "charged"
+    )
+
+
+def _compare_and_confirm_remote_teardown(run_id: str, expected_remote: dict) -> bool:
+    """clear one exact active remote after its teardown was independently confirmed."""
+    if _remote_resource_identity(expected_remote) is None:
+        return False
+    report_status: RunStatus | None = None
+    with state._status_guard(run_id):
+        status = status_ops.get_status(run_id)
+        if not _expected_remote_matches(status.remote, expected_remote):
+            return False
+        status.cleanup_confirmed_remote = dict(status.remote)
+        if _retain_remote_for_accounting(status):
+            status.realized_cost_remote = dict(status.remote)
+        status.remote = None
+        status.updated_at = time.time()
+        state._save_status_unlocked(status)
+        report_status = status
+    if report_status is not None:
+        reporting._report_status(report_status)
+    return True
 
 
 def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bool:

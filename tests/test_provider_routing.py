@@ -1286,6 +1286,52 @@ def test_success_preserves_uncanonical_cleanup_sibling_and_returns_metrics(orch,
     assert persisted.realized_cost_remote["endpoint_id"] == "ep-current"
 
 
+@pytest.mark.parametrize("teardown_confirmed", [False, True])
+def test_success_attempts_teardown_when_cleanup_recording_fails(
+    orch, monkeypatch, teardown_confirmed
+):
+    import flash.runner.accounting.reconciliation as reconciliation
+    import flash.runner.supervise.seed_submission as seed_submission
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import job_execution as rp_jobs
+
+    monkeypatch.setattr(reconciliation, "_record_cleanup_remote", lambda *_args: False)
+    torn_down = []
+
+    def fake_teardown(handle, run_id):
+        torn_down.append((handle.data["endpoint_id"], run_id))
+        return teardown_confirmed
+
+    monkeypatch.setattr(seed_submission._lifecycle, "_strict_teardown_handle", fake_teardown)
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
+        on_handle(_runpod_handle("ep-record-failed", "job-record-failed", attempt))
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(run_id=f"cleanup-record-failed-{teardown_confirmed}", type="H100")
+    _seed_status(orch, spec)
+
+    metrics = runner_lifecycle._submit_seed_supervised(
+        spec,
+        spec.seed,
+        io.StringIO(),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+
+    assert metrics["train_tokens"] == 4096
+    assert torn_down == [("ep-record-failed", spec.run_id)]
+    persisted = runner_status.get_status(spec.run_id)
+    if teardown_confirmed:
+        assert persisted.remote is None
+        assert persisted.cleanup_confirmed_remote["endpoint_id"] == "ep-record-failed"
+        assert persisted.realized_cost_remote["endpoint_id"] == "ep-record-failed"
+    else:
+        assert persisted.remote["endpoint_id"] == "ep-record-failed"
+        assert persisted.cleanup_confirmed_remote is None
+        assert persisted.realized_cost_remote is None
+
+
 def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch, monkeypatch):
     """A fixed multi-class market stops when the projected class refuses twice."""
     from flash.providers.core import allocator
@@ -1328,6 +1374,10 @@ def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch,
     # attempts saved are 900s of capacity grace each. every named class still got a look first,
     # which is what separates this from writing a run off on one refusal.
     assert submitted_gpus == ["A100 PCIe", "A100 SXM", "A100 PCIe"]
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.remote is None
+    assert persisted.cleanup_confirmed_remote["endpoint_id"] == "ep2"
+    assert persisted.realized_cost_remote["endpoint_id"] == "ep2"
     out = log.getvalue()
     assert "has already refused capacity twice" in out
     assert "drop the gpu.type pin" in out

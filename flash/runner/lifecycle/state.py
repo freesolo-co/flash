@@ -138,8 +138,8 @@ class RunStatus:
     lifecycle_progressed_attempt: int | None = None
     # exact provider handle whose teardown was confirmed independently of retained billing identity.
     cleanup_confirmed_remote: dict | None = None
-    # exact torn-down provider handle retained only until delayed realized-cost reconciliation. it is
-    # private, is not an active resource, and is cleared when reconciliation succeeds.
+    # exact torn-down provider handle retained until both delayed realized-cost reconciliation and any
+    # pending customer charge complete. it is private and is not an active resource.
     realized_cost_remote: dict | None = None
     # Instance providers (lambda/vast) configured WHEN THIS RUN WAS SUBMITTED — the set that could have
     # owned a pre-handle non-idempotent create. Recovery's phantom guard (_confirm_run_clear) fails

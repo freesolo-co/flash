@@ -5479,7 +5479,9 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
         assert status.state == "failed"
         assert status.error == "stalled: host vanished"
         assert training_calls == []
-        assert status.remote["endpoint_id"] == "epA"
+        assert status.remote is None
+        assert status.cleanup_confirmed_remote["endpoint_id"] == "epA"
+        assert status.realized_cost_remote["endpoint_id"] == "epA"
 
 
 def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):

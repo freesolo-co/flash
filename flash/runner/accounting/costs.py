@@ -378,7 +378,8 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
             return
         status.realized_cost_usd = realized_cost_usd
         status.reconciled_at = reconciled_at
-        status.realized_cost_remote = None
+        if not status.billing_context or status.billing_state == "charged":
+            status.realized_cost_remote = None
         status.updated_at = time.time()
         state._save_status_unlocked(status)
     reporting._report_status(status)
@@ -403,6 +404,8 @@ def record_billing_state(run_id: str, **fields) -> None:
             return
         for key, value in fields.items():
             setattr(status, key, value)
+        if status.billing_state == "charged" and status.reconciled_at is not None:
+            status.realized_cost_remote = None
         status.updated_at = time.time()
         state._save_status_unlocked(status)
     reporting._report_status(status)
