@@ -576,7 +576,28 @@ def _handle_attach_wall_deadline(
     )
 
     _load_run_deadline_at(run_id)
-    metrics = _attempt_result_metrics(run_id, context.persisted_remote)
+    try:
+        metrics = _attempt_result_metrics(run_id, context.persisted_remote)
+    except Exception as artifact_error:
+        from flash.snapshot.archive import is_transient_fetch_error
+
+        if not isinstance(artifact_error, OSError) and not is_transient_fetch_error(artifact_error):
+            raise
+        _schedule_attach_reconciliation(
+            run_id,
+            context.persisted_remote,
+            context.worker_spec,
+            context.next_attempt,
+            context.source_snapshot,
+            log,
+            str(exc),
+        )
+        print(
+            f"attach: {run_id} current-fence result observation is temporarily unavailable; "
+            "deferring recovery",
+            file=log,
+        )
+        return get_status(run_id)
     if metrics is not None:
         _carry_allocation_stamp(metrics, context.persisted_remote)
         try:
