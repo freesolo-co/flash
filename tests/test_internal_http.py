@@ -1193,6 +1193,24 @@ def test_unknown_stdlib_urlopen_fails_closed_before_transport(monkeypatch) -> No
     assert contacted == []
 
 
+def test_sourceless_stdlib_urlopen_fails_closed_before_transport(monkeypatch) -> None:
+    contacted: list[str] = []
+
+    class UnexpectedTransport(urllib.request.BaseHandler):
+        def https_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    monkeypatch.setattr(urllib.request, "__file__", f"{urllib.request.__file__}c")
+    urllib.request.install_opener(urllib.request.build_opener(UnexpectedTransport()))
+
+    with pytest.raises(urllib.error.URLError) as exc_info:
+        _urlopen_no_redirect(urllib.request.Request("https://source.invalid/data"), timeout=3.0)
+
+    assert exc_info.value.reason == "stdlib urllib transport cannot be classified safely"
+    assert contacted == []
+
+
 def test_urlopen_helper_preserves_late_bound_monkeypatch(monkeypatch) -> None:
     seen = []
     response = object()
@@ -1295,6 +1313,77 @@ def test_explicit_global_urlopen_is_compared_against_one_snapshot(monkeypatch) -
 
     assert reads == 1
     assert calls == ["opener"]
+
+
+def test_copied_handler_callback_bound_to_original_fails_before_transport() -> None:
+    callback_calls: list[str] = []
+
+    class InstanceCallbackHandler(urllib.request.BaseHandler):
+        def __init__(self):
+            self.custom_open = self.open_custom
+
+        def open_custom(self, request):
+            callback_calls.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = InstanceCallbackHandler()
+    opener = urllib.request.build_opener(handler)
+    request = urllib.request.Request("custom://source.invalid/data")
+    with opener.open(request, timeout=1.0) as response:
+        assert response.read() == b"ok"
+    callback_calls.clear()
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(request, timeout=1.0)
+
+    assert callback_calls == []
+    assert handler.parent is opener
+    assert urllib.request._opener is opener
+
+
+def test_copied_handler_callback_in_inherited_mangled_slot_fails_before_transport() -> None:
+    callback_calls: list[str] = []
+
+    class CallbackSlots(urllib.request.BaseHandler):
+        __slots__ = ("__callback",)
+
+        def bind_callback(self):
+            self.__callback = self.open_custom
+
+        def dispatch(self, request):
+            return self.__callback(request)
+
+    class SlottedCallbackHandler(CallbackSlots):
+        def __init__(self):
+            self.bind_callback()
+
+        def custom_open(self, request):
+            return self.dispatch(request)
+
+        def open_custom(self, request):
+            callback_calls.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = SlottedCallbackHandler()
+    assert not any(type(value) is types.MethodType for value in handler.__dict__.values())
+    opener = urllib.request.build_opener(handler)
+    request = urllib.request.Request("custom://source.invalid/data")
+    with opener.open(request, timeout=1.0) as response:
+        assert response.read() == b"ok"
+    callback_calls.clear()
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(request, timeout=1.0)
+
+    assert callback_calls == []
+    assert handler.parent is opener
+    assert urllib.request._opener is opener
 
 
 def test_unsnapshotable_installed_handler_fails_before_transport() -> None:

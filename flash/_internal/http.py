@@ -187,32 +187,43 @@ def _mangled_slot_name(owner: type, name: str) -> str:
     return name
 
 
+def _slot_values(
+    handler: urllib.request.BaseHandler,
+) -> tuple[tuple[int, str, object], ...]:
+    found = []
+    seen: set[int] = set()
+    handler_type = type(handler)
+    for owner in type.__getattribute__(handler_type, "__mro__"):
+        namespace = type.__getattribute__(owner, "__dict__")
+        declaration = namespace.get("__slots__", ())
+        for declared_name in _slot_names(declaration):
+            if declared_name in {"__dict__", "__weakref__", "parent"}:
+                continue
+            slot_name = _mangled_slot_name(owner, declared_name)
+            descriptor = namespace.get(slot_name)
+            if type(descriptor) is not types.MemberDescriptorType:
+                raise TypeError
+            if id(descriptor) in seen:
+                continue
+            seen.add(id(descriptor))
+            try:
+                value = types.MemberDescriptorType.__get__(descriptor, handler, handler_type)
+            except AttributeError:
+                value = _ABSENT_SLOT
+            found.append((id(owner), slot_name, value))
+    return tuple(found)
+
+
 def _slot_config_signature(handler: urllib.request.BaseHandler) -> tuple[object, ...]:
     try:
-        found = []
-        seen: set[int] = set()
-        handler_type = type(handler)
-        for owner in type.__getattribute__(handler_type, "__mro__"):
-            namespace = type.__getattribute__(owner, "__dict__")
-            declaration = namespace.get("__slots__", ())
-            for declared_name in _slot_names(declaration):
-                if declared_name in {"__dict__", "__weakref__", "parent"}:
-                    continue
-                slot_name = _mangled_slot_name(owner, declared_name)
-                descriptor = namespace.get(slot_name)
-                if type(descriptor) is not types.MemberDescriptorType:
-                    raise TypeError
-                if id(descriptor) in seen:
-                    continue
-                seen.add(id(descriptor))
-                try:
-                    value = types.MemberDescriptorType.__get__(descriptor, handler, handler_type)
-                except AttributeError:
-                    snapshot = _ABSENT_SLOT
-                else:
-                    snapshot = _snapshot_value(value)
-                found.append((id(owner), slot_name, snapshot))
-        return tuple(found)
+        return tuple(
+            (
+                owner_id,
+                slot_name,
+                value if value is _ABSENT_SLOT else _snapshot_value(value),
+            )
+            for owner_id, slot_name, value in _slot_values(handler)
+        )
     except Exception:
         raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
 
@@ -238,11 +249,21 @@ def _copy_installed_handler(
         copied = copy.copy(handler)
         if isinstance(handler, urllib.request.ProxyHandler):
             urllib.request.ProxyHandler.__init__(copied, handler.proxies)
+        copied_state = object.__getattribute__(copied, "__dict__")
+        copied_values = tuple(copied_state.values()) + tuple(
+            value for _owner_id, _slot_name, value in _slot_values(copied)
+        )
+        retains_original_method = any(
+            type(value) is types.MethodType
+            and object.__getattribute__(value, "__self__") is handler
+            for value in copied_values
+        )
         invalid = (
             copied is handler
             or type(copied) is not type(handler)
-            or copied.__dict__ is handler.__dict__
+            or copied_state is handler.__dict__
             or getattr(copied, "parent", None) is not opener
+            or retains_original_method
         )
     except Exception:
         raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
@@ -378,18 +399,17 @@ def _classify_urlopen(transport: object) -> _UrlopenKind:
         module_file = os.path.realpath(urllib.request.__file__)
         code_file = os.path.realpath(code.co_filename)
         arguments = code.co_varnames[: code.co_argcount + code.co_kwonlyargcount]
-        origin_matches = (
-            code_file == module_file
-            and code.co_name == "urlopen"
+        shape_matches = (
+            code.co_name == "urlopen"
             and code.co_argcount == 3
             and code.co_kwonlyargcount == 4
             and arguments == _STDLIB_URLOPEN_ARGUMENTS
         )
     except Exception:
         return _UrlopenKind.UNKNOWN_STDLIB
-    if not origin_matches:
+    if not shape_matches:
         return _UrlopenKind.INJECTED
-    if code.co_names != _STDLIB_URLOPEN_NAMES:
+    if code_file != module_file or code.co_names != _STDLIB_URLOPEN_NAMES:
         return _UrlopenKind.UNKNOWN_STDLIB
     return _UrlopenKind.STDLIB
 
