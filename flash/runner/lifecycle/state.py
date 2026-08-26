@@ -111,13 +111,6 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     return status.run_id
 
 
-# Heartbeat stages that mean the worker has entered training (GPU work underway). The per-step
-# `step` field is 1-indexed and only appears once a step COMPLETES, so the expensive first step (a
-# GRPO rollout can be ~17 min, an opd step waits on the teacher round-trips) streams one of these
-# stages with NO step yet -- still real GPU time.
-_TRAINING_STAGES = frozenset({"rl_step", "sft_step", "opd_step"})
-
-
 @dataclass
 class RunStatus:
     run_id: str

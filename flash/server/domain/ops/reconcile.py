@@ -95,9 +95,7 @@ def reconcile_run(status: RunStatus, *, now: float | None = None) -> bool:
     # instance cost attribution independently requires a valid persisted started_ts and returns none
     # when it is absent or malformed rather than substituting this bound.
     start = float(remote.get("started_ts") or status.created_at)
-    # The run's true terminal time (~teardown / billing stop); see _terminal_ts for why this is
-    # the frozen finished_at rather than the mutable updated_at (which deploy/heartbeat move past
-    # teardown and would make the instance providers' flat $/hr bill until that later event).
+    # use the frozen terminal time rather than later deployment or reconciliation updates
     run_end = _terminal_ts(status)
     # RunPod's billing query pads past run end so the settled invoice is in range; the instance
     # providers bill flat $/hr to teardown, so they get the UN-padded run_end (no extra settle hour).
