@@ -3047,6 +3047,134 @@ def test_indirect_cached_private_opener_capture_cannot_enable_redirect_transport
     assert all(url != sink for url, _authorization in observed)
 
 
+@pytest.mark.parametrize("global_kind", ["direct", "module"])
+def test_cached_private_opener_global_cannot_enable_redirect_transport(
+    global_kind: str,
+) -> None:
+    safe = "https://safe.invalid/data"
+    source = "https://source.invalid/data"
+    sink = "https://sink.invalid/steal"
+    observed: list[tuple[str, str | None]] = []
+
+    def dispatch(request, private):
+        observed.append((request.full_url, request.get_header("Authorization")))
+        if request.full_url == source:
+            blocker = next(
+                handler
+                for handler in private.handlers
+                if isinstance(handler, http_transport._NoRedirectHandler)
+            )
+            private.handlers.remove(blocker)
+            private.process_response["https"].remove(blocker)
+            for status in http_transport._REDIRECT_STATUSES:
+                private.handle_error["http"][status].remove(blocker)
+            private.add_handler(urllib.request.HTTPRedirectHandler())
+            headers = email.message.Message()
+            headers["Location"] = sink
+            response = urllib.response.addinfourl(
+                io.BytesIO(b""), headers, request.full_url, code=302
+            )
+            response.msg = "redirect"
+            return response
+        return _response(request.full_url)
+
+    expression = "retained" if global_kind == "direct" else "retained_namespace.private"
+    module_code = compile(
+        f"def callback(self, request):\n    return dispatch(request, {expression})\n",
+        "<cached-private-global>",
+        "exec",
+    )
+    callback_code = next(value for value in module_code.co_consts if type(value) is types.CodeType)
+    namespace = types.ModuleType("cached_private_namespace")
+    types.ModuleType.__getattribute__(namespace, "__dict__")["private"] = None
+    callback_globals = {
+        "dispatch": dispatch,
+        "retained": None,
+        "retained_namespace": namespace,
+    }
+    callback = types.FunctionType(callback_code, callback_globals, "callback")
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        handler_order = 100
+        https_open = callback
+
+    opener = urllib.request.build_opener(CallbackHandler())
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request(safe), timeout=1.0) as response:
+        assert response.read() == b"ok"
+    private = http_transport._INSTALLED_OPENER_CACHE.private
+    if global_kind == "direct":
+        callback_globals["retained"] = private
+    else:
+        types.ModuleType.__getattribute__(namespace, "__dict__")["private"] = private
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert observed == [(safe, None)]
+    assert all(url != sink for url, _authorization in observed)
+
+
+def test_nested_reader_disqualifies_append_only_private_observer() -> None:
+    safe = "https://safe.invalid/data"
+    source = "https://source.invalid/data"
+    sink = "https://sink.invalid/steal"
+    observed: list[object] = []
+    contacted: list[tuple[str, str | None]] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        handler_order = 100
+
+        def https_open(self, request):
+            observed.append(self.parent)
+
+            def nested():
+                private = observed[-1]
+                blocker = next(
+                    handler
+                    for handler in private.handlers
+                    if isinstance(handler, http_transport._NoRedirectHandler)
+                )
+                private.handlers.remove(blocker)
+                private.process_response["https"].remove(blocker)
+                for status in http_transport._REDIRECT_STATUSES:
+                    private.handle_error["http"][status].remove(blocker)
+                private.add_handler(urllib.request.HTTPRedirectHandler())
+                headers = email.message.Message()
+                headers["Location"] = sink
+                response = urllib.response.addinfourl(
+                    io.BytesIO(b""), headers, request.full_url, code=302
+                )
+                response.msg = "redirect"
+                return response
+
+            contacted.append((request.full_url, request.get_header("Authorization")))
+            if request.full_url == source:
+                return nested()
+            return _response(request.full_url)
+
+    opener = urllib.request.build_opener(CallbackHandler())
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request(safe), timeout=1.0) as response:
+        assert response.read() == b"ok"
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert contacted == [(safe, None)]
+    assert all(url != sink for url, _authorization in contacted)
+
+
 @pytest.mark.parametrize("change", ["add", "remove"])
 def test_redirect_callback_eligibility_change_rebuilds_cached_topology(change: str) -> None:
     observed: list[str] = []

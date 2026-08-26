@@ -20,6 +20,7 @@ from .http_refs import (
     _function_append_only_capture_values,
     _function_bound_reference_values,
     _function_capture_values,
+    _function_global_reference_values,
     _function_reference_values,
     _getattr_type_static,
 )
@@ -631,7 +632,10 @@ def _validate_class_callbacks(
                 type(capture) is list and any(capture is observer for observer in append_only)
             ):
                 raise TypeError
-        for reference in _function_bound_reference_values(callback, handler):
+        for reference in (
+            *_function_global_reference_values(callback),
+            *_function_bound_reference_values(callback, handler),
+        ):
             if _references_target(reference, private_targets):
                 raise TypeError
 

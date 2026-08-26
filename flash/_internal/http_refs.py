@@ -308,22 +308,69 @@ def _function_append_only_capture_values(function: types.FunctionType) -> tuple[
     code = object.__getattribute__(function, "__code__")
     roots = _function_reference_roots(function)
     captures = {**roots["default"], **roots["binding"]}
+    root_origins = {
+        name: (root_kind, name) for root_kind in ("default", "binding") for name in roots[root_kind]
+    }
     usage = {name: [False, True] for name in captures}
-    instructions = tuple(dis.get_instructions(code))
-    for index, instruction in enumerate(instructions):
-        name = instruction.argval
-        if name not in usage or instruction.opname not in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}:
+    pending = [(code, root_origins)]
+    seen: set[int] = set()
+    while pending:
+        current, origins = pending.pop()
+        if id(current) in seen:
             continue
-        usage[name][0] = True
-        if index + 1 >= len(instructions):
-            usage[name][1] = False
-            continue
-        following = instructions[index + 1]
-        if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"} or following.argval != "append":
-            usage[name][1] = False
+        seen.add(id(current))
+        if len(seen) > _SNAPSHOT_ITEMS_MAX:
+            raise ValueError
+        instructions = tuple(dis.get_instructions(current))
+        for index, instruction in enumerate(instructions):
+            name = instruction.argval
+            if name not in origins or instruction.opname not in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}:
+                continue
+            root_kind, root_name = origins[name]
+            if root_kind not in {"default", "binding"}:
+                continue
+            usage[root_name][0] = True
+            if index + 1 >= len(instructions):
+                usage[root_name][1] = False
+                continue
+            following = instructions[index + 1]
+            if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"} or following.argval != "append":
+                usage[root_name][1] = False
+        constants = object.__getattribute__(current, "co_consts")
+        if type(constants) is not tuple:
+            raise ValueError
+        for child in constants:
+            if type(child) is not types.CodeType:
+                continue
+            free_names = object.__getattribute__(child, "co_freevars")
+            if type(free_names) is not tuple:
+                raise ValueError
+            child_origins = {name: origins[name] for name in free_names if name in origins}
+            code_index = next(
+                index
+                for index, instruction in enumerate(instructions)
+                if instruction.opname == "LOAD_CONST" and instruction.argval is child
+            )
+            child_origins.update(_nested_default_origins(instructions, code_index, child, origins))
+            pending.append((child, child_origins))
     return tuple(
         captures[name] for name, (loaded, append_only) in usage.items() if loaded and append_only
     )
+
+
+def _function_global_reference_values(function: types.FunctionType) -> tuple[object, ...]:
+    code = object.__getattribute__(function, "__code__")
+    roots = _function_reference_roots(function)
+    values = []
+    for root_kind, name, attributes in _loaded_reference_paths(code, {}):
+        if root_kind != "global":
+            continue
+        if name in _DYNAMIC_NAMESPACE_NAMES:
+            raise ValueError
+        if name not in roots["global"]:
+            continue
+        values.append(_resolve_reference_path(roots["global"][name], attributes))
+    return tuple(values)
 
 
 def _function_bound_reference_values(
