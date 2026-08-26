@@ -13,6 +13,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from flash._http_support.signatures import (
+    function_implementation_signature as _function_implementation_signature,
+)
+from flash._http_support.signatures import snapshot_value as _snapshot_value
+from flash._http_support.signatures import stdlib_function_signature as _stdlib_function_signature
+from flash._http_support.slots import slot_entries as _slot_entries
+
 from .http_refs import (
     _TRAVERSAL_NODES_MAX,
     _function_bound_reference_values,
@@ -26,12 +33,6 @@ from .http_refs import (
 from .http_refs import (
     _references_target as _find_references_target,
 )
-from .http_signatures import (
-    function_implementation_signature as _function_implementation_signature,
-)
-from .http_signatures import snapshot_value as _snapshot_value
-from .http_signatures import stdlib_function_signature as _stdlib_function_signature
-from .http_slots import slot_entries as _slot_entries
 
 _UrlOpen = Callable[..., Any]
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)

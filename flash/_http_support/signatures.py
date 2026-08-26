@@ -6,7 +6,11 @@ import struct
 import types
 import urllib.request
 
-from .http_refs import _SNAPSHOT_ITEMS_MAX, _TRAVERSAL_NODES_MAX, _module_function_code
+from flash._internal.http_refs import (
+    _SNAPSHOT_ITEMS_MAX,
+    _TRAVERSAL_NODES_MAX,
+    _module_function_code,
+)
 
 _ABSENT_SLOT = object()
 
