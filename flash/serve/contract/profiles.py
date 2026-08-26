@@ -38,6 +38,9 @@ from flash.serve.provisioning import ServingImage
 # is part of the engine identity so a runtime repair or upgrade cannot reuse an engine id validated
 # against different execution bytes.
 SERVE_RUNTIME_FAMILY = "vllm-0.23.0-pr42120"
+_CERTIFIED_MODAL_IMAGE_DIGEST = (
+    "sha256:2bf27b51f6e4b7f0b2d805d96202579d94868e2c594b7c496777d350ad6936f6"
+)
 
 
 class ProfileError(ValueError):
@@ -73,8 +76,8 @@ class RunPodGpu:
 # `https://{podId}-8000.proxy.runpod.net/` with 200 and an exited one with 404.
 _RUNPOD_L40S = RunPodGpu(gpu_type_id="NVIDIA L40S", container_disk_gb=100, volume_size_gb=120)
 # these gpu ids already exist in the runpod-backed source, but the storage values are deliberately
-# oversized construction values, not measured claims. the new profiles remain blocked from real
-# deployment until live qualification replaces these values and marks each provider qualified.
+# oversized nonshipping construction values, not measured claims. the 27b and 35b runpod profiles
+# remain blocked until exact h200 qualification replaces these provisional storage values.
 _PROVISIONAL_RUNPOD_H200 = RunPodGpu(
     gpu_type_id="NVIDIA H200", container_disk_gb=150, volume_size_gb=300
 )
@@ -113,6 +116,8 @@ class ServingProfile:
     modal_live_qualified: bool
     runpod_live_qualified: bool
     tensor_parallel_size: int = 1
+    modal_certified_image_digest: str | None = None
+    runpod_certified_image_digest: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "engine_args", MappingProxyType(dict(self.engine_args)))
@@ -258,8 +263,9 @@ _PROFILES: dict[str, ServingProfile] = {
         # modal's trailing `!` forbids automatic h200 substitution for an h100 request.
         modal_gpu_request="H100!",
         runpod_gpu=_PROVISIONAL_RUNPOD_H200,
-        modal_live_qualified=False,
+        modal_live_qualified=True,
         runpod_live_qualified=False,
+        modal_certified_image_digest=_CERTIFIED_MODAL_IMAGE_DIGEST,
     ),
     "Qwen/Qwen3.6-35B-A3B": ServingProfile(
         model_id="Qwen/Qwen3.6-35B-A3B",
@@ -288,8 +294,9 @@ _PROFILES: dict[str, ServingProfile] = {
         modal_gpu="H200",
         modal_gpu_request="H200",
         runpod_gpu=_PROVISIONAL_RUNPOD_H200,
-        modal_live_qualified=False,
+        modal_live_qualified=True,
         runpod_live_qualified=False,
+        modal_certified_image_digest=_CERTIFIED_MODAL_IMAGE_DIGEST,
     ),
 }
 
@@ -315,6 +322,18 @@ def _public_catalog_models() -> frozenset[str]:
 def _require_profile_string(value: object, name: str) -> None:
     if type(value) is not str or not value or value != value.strip():
         raise ProfileError(f"{name} must be a nonempty unpadded string")
+
+
+def _require_certified_image_digest(value: object, name: str) -> None:
+    if value is None:
+        return
+    if (
+        type(value) is not str
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise ProfileError(f"{name} must be sha256: followed by 64 lowercase hex characters")
 
 
 def _require_profile_structure(profile: ServingProfile) -> None:
@@ -346,6 +365,8 @@ def _require_profile_structure(profile: ServingProfile) -> None:
     for name in ("modal_live_qualified", "runpod_live_qualified"):
         if type(getattr(profile, name)) is not bool:
             raise ProfileError(f"{profile.model_id} {name} must be an exact bool")
+    for name in ("modal_certified_image_digest", "runpod_certified_image_digest"):
+        _require_certified_image_digest(getattr(profile, name), f"{profile.model_id} {name}")
     revision = profile.served_model_revision
     if revision is not None and (
         type(revision) is not str
@@ -443,19 +464,28 @@ def _require_catalog_agreement(profile: ServingProfile) -> None:
             )
 
 
-def require_live_qualification(profile: ServingProfile, provider: Provider) -> None:
-    """reject provider allocation for a profile whose exact live shape is still provisional."""
+def require_live_qualification(
+    profile: ServingProfile, provider: Provider, image_digest: str
+) -> None:
+    """reject provider allocation unless the requested live shape was certified."""
 
     if provider == "modal":
         qualified = profile.modal_live_qualified
+        certified_digest = profile.modal_certified_image_digest
     elif provider == "runpod":
         qualified = profile.runpod_live_qualified
+        certified_digest = profile.runpod_certified_image_digest
     else:
         raise ProfileError("provider must be modal or runpod")
     if not qualified:
         raise ProfileError(
             f"{profile.model_id} {provider} serving profile is pending exact live qualification; "
             "offline dry-run construction is available, but provider allocation is disabled"
+        )
+    if certified_digest is not None and image_digest != certified_digest:
+        raise ProfileError(
+            f"{profile.model_id} {provider} serving profile is qualified only for certified image "
+            f"digest {certified_digest}; requested {image_digest}"
         )
 
 

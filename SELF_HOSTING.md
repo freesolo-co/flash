@@ -22,9 +22,13 @@ Two credentials and at least one GPU account:
 
 Everything else is optional.
 
-The active training catalog is Qwen3.5 9B, Qwen3.8 27B, and Qwen3.6 35B-A3B. Customer-owned
-serving through `flash serve deploy` remains Qwen3.5 9B-only; the hosted 27B profile is not a
-customer-provider placement contract.
+The active training catalog is Qwen3.5 9B, Qwen3.8 27B, and Qwen3.6 35B-A3B. Hosted Qwen3.8
+27B remains inactive. Customer-owned Modal supports all three models; 27B and 35B-A3B are bound to
+the certified serving image digest. Persistent RunPod remains qualified only where the model
+profile's live-qualification flag is enabled, currently 9B; 27B and
+35B-A3B remain blocked pending exact H200 qualification because provider allocation never produced
+a pod handle. Their provisional RunPod storage values are nonshipping construction inputs, not
+qualified measurements.
 
 ## Quickstart
 
@@ -364,9 +368,20 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 ## Serving
 
 `flash serve deploy` provisions serving in **your own** Modal or RunPod account, running the
-published worker image against one base model and one run's adapter. Training and export remain
-independent of serving. Catalog serving checkpoint repositories are informational only and are never
-resolved by the training path.
+published worker image against one exact base model and that model's compatible adapters. A separate
+deployment is required for each base model. Training and export remain independent of serving.
+Catalog serving checkpoint repositories are informational only and are never resolved by the
+training path.
+
+Customer-owned Modal is live-qualified for Qwen3.5 9B, Qwen3.8 27B, and Qwen3.6 35B-A3B. The 27B
+and 35B-A3B qualifications are bound to the certified serving image digest. The 27B engine runs on
+`H100!` and serves the pinned `Qwen/Qwen3.8-27B-FP8` checkpoint while retaining
+`Qwen/Qwen3.8-27B` as its logical base and tokenizer provenance. The 35B-A3B engine serves the BF16
+model on one H200 with FP8 KV cache, a 32K context, eight sequences, a 4096 batched-token cap, and
+six rank-64 LoRA slots.
+Persistent RunPod is live-qualified only where the profile flag is enabled. The 27B and 35B-A3B
+RunPod H200 placements remain pending because exact-head allocation attempts produced no pod handle,
+so their provisional 150 GB container and 300 GB volume values are not qualified or shipping.
 
 ```bash
 # the `server` extra, not the bare install: `serve deploy` resolves the adapter through

@@ -19,6 +19,8 @@ from flash.serve.provisioning import InterruptedProvisioning
 
 DIGEST = "sha256:" + "a" * 64
 IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{DIGEST}"
+CERTIFIED_DIGEST = "sha256:2bf27b51f6e4b7f0b2d805d96202579d94868e2c594b7c496777d350ad6936f6"
+CERTIFIED_IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{CERTIFIED_DIGEST}"
 MODEL = "Qwen/Qwen3.5-9B"
 
 
@@ -558,26 +560,95 @@ def test_tokenizer_uses_the_adapter_resolved_logical_base_revision(
     assert bundle.spec.engine.tokenizer_revision == "e" * 40
 
 
-@pytest.mark.parametrize(
-    ("model", "provider"),
-    [
-        ("Qwen/Qwen3.8-27B", "modal"),
-        ("Qwen/Qwen3.8-27B", "runpod"),
-        ("Qwen/Qwen3.6-35B-A3B", "modal"),
-        ("Qwen/Qwen3.6-35B-A3B", "runpod"),
-    ],
-)
-def test_unqualified_profile_fails_before_resolution_on_real_deploy(
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"])
+def test_certified_modal_image_reaches_resolution_before_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    model: str,
+) -> None:
+    _stub_resolution(monkeypatch)
+    monkeypatch.delenv(serve_deploy.MODAL_TOKEN_ID_ENV, raising=False)
+    monkeypatch.delenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, raising=False)
+
+    assert cmd_serve_deploy(_args(model=model, provider="modal", image=CERTIFIED_IMAGE)) == 1
+    error = capsys.readouterr().err
+    assert "MODAL_TOKEN_ID is not set" in error
+    assert "pending exact live qualification" not in error
+    assert "qualified only for certified image digest" not in error
+
+
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"])
+def test_uncertified_modal_image_fails_before_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    model: str,
+) -> None:
+    def _explode(_args):
+        raise AssertionError("bundle resolution ran before image qualification")
+
+    monkeypatch.setattr(serve_deploy, "_deployment_bundle", _explode)
+
+    assert cmd_serve_deploy(_args(model=model, provider="modal", image=IMAGE)) == 1
+    error = capsys.readouterr().err
+    assert f"{model} modal serving profile is qualified only for certified image digest" in error
+    assert f"requested {DIGEST}" in error
+
+
+@pytest.mark.parametrize("provider", ["modal", "runpod"])
+def test_9b_qualification_remains_image_digest_agnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+) -> None:
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+
+    target = (
+        "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment"
+        if provider == "modal"
+        else "flash.serve.provisioning.runpod.operations.provision_runpod_deployment"
+    )
+    monkeypatch.setattr(
+        target,
+        lambda bundle, credentials, secrets, *, deadline_at, **_kwargs: _result(bundle),
+    )
+
+    assert cmd_serve_deploy(_args(model=MODEL, provider=provider, image=IMAGE)) == 0
+
+
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"])
+def test_runpod_profile_fails_before_resolution_on_real_deploy(
     monkeypatch: pytest.MonkeyPatch,
     model: str,
-    provider: str,
 ) -> None:
     def _explode(**_kwargs):
         raise AssertionError("resolution ran before live qualification")
 
     monkeypatch.setattr("flash.serve.deployment.resolve.resolve_adapter", _explode)
 
-    assert cmd_serve_deploy(_args(model=model, provider=provider)) == 1
+    assert cmd_serve_deploy(_args(model=model, provider="runpod")) == 1
+
+
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"])
+def test_synthetic_unqualified_modal_profile_still_fails_before_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    from dataclasses import replace
+
+    from flash.serve.contract import profiles
+
+    def _explode(**_kwargs):
+        raise AssertionError("resolution ran before live qualification")
+
+    profile = get_profile(model)
+    monkeypatch.setitem(
+        profiles._PROFILES,
+        model,
+        replace(profile, modal_live_qualified=False),
+    )
+    monkeypatch.setattr("flash.serve.deployment.resolve.resolve_adapter", _explode)
+
+    assert cmd_serve_deploy(_args(model=model, provider="modal", image=CERTIFIED_IMAGE)) == 1
 
 
 def test_runpod_provisioning_warns_that_the_pod_may_be_live_and_billing(

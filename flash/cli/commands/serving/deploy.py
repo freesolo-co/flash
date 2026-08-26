@@ -264,7 +264,8 @@ def cmd_serve_deploy(args) -> int:
         if not getattr(args, "dry_run", False):
             from flash.serve.contract.profiles import get_profile, require_live_qualification
 
-            require_live_qualification(get_profile(args.model), provider)
+            image = _image(args.image)
+            require_live_qualification(get_profile(args.model), provider, image.digest)
         bundle = _deployment_bundle(args)
     # resolver errors subclass valueerror. the wider catch also covers validation beneath the
     # resolver and bundle construction, so bad user input stays on the normal cli error path.

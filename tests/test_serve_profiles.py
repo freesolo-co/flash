@@ -208,6 +208,33 @@ def test_structurally_invalid_profile_fails_the_whole_registry(
         supported_models()
 
 
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "sha256:" + "A" * 64,
+        "sha256:" + "a" * 63,
+        "sha512:" + "a" * 64,
+        "sha256:" + "g" * 64,
+    ],
+)
+def test_invalid_certified_image_digest_fails_the_whole_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    digest: str,
+) -> None:
+    from flash.serve.contract import profiles
+
+    monkeypatch.setitem(
+        profiles._PROFILES,
+        MODEL,
+        replace(get_profile(MODEL), modal_certified_image_digest=digest),
+    )
+
+    with pytest.raises(
+        ProfileError, match="must be sha256: followed by 64 lowercase hex characters"
+    ):
+        supported_models()
+
+
 def test_invalid_runpod_storage_fails_the_whole_registry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -286,8 +313,12 @@ def test_model_specific_checkpoint_and_scheduler_choices() -> None:
     assert twenty_seven.runpod_gpu.gpu_type_id == "NVIDIA H200"
     assert twenty_seven.runpod_gpu.container_disk_gb == 150
     assert twenty_seven.runpod_gpu.volume_size_gb == 300
-    assert twenty_seven.modal_live_qualified is False
+    assert twenty_seven.modal_live_qualified is True
     assert twenty_seven.runpod_live_qualified is False
+    assert twenty_seven.modal_certified_image_digest == (
+        "sha256:2bf27b51f6e4b7f0b2d805d96202579d94868e2c594b7c496777d350ad6936f6"
+    )
+    assert twenty_seven.runpod_certified_image_digest is None
     assert thirty_five.served_model == "Qwen/Qwen3.6-35B-A3B"
     assert thirty_five.modal_gpu_request == "H200"
     assert thirty_five.quantization is None
@@ -296,6 +327,12 @@ def test_model_specific_checkpoint_and_scheduler_choices() -> None:
     assert thirty_five.max_num_seqs == 8
     assert thirty_five.max_loras == 6
     assert thirty_five.max_lora_rank == 64
+    assert thirty_five.modal_live_qualified is True
+    assert thirty_five.runpod_live_qualified is False
+    assert thirty_five.modal_certified_image_digest == twenty_seven.modal_certified_image_digest
+    assert thirty_five.runpod_certified_image_digest is None
+    assert nine.modal_certified_image_digest is None
+    assert nine.runpod_certified_image_digest is None
 
 
 def test_engine_binds_the_supplied_image_and_revisions() -> None:
