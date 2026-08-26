@@ -86,6 +86,149 @@ def test_exactly_once_publish_adopts_matching_concurrent_result(monkeypatch, tmp
     assert api.created == 1
 
 
+def test_exact_fence_terminal_lookup_validates_source_identity(monkeypatch) -> None:
+    _set_identity(monkeypatch)
+    existing = _manifest()
+
+    class Api:
+        def repo_info(self, **_kwargs):
+            return SimpleNamespace(sha="c" * 40)
+
+        def list_repo_files(self, **_kwargs):
+            return [result_path(existing)]
+
+    monkeypatch.setattr(result_io.hf_io, "hf_api", Api)
+    monkeypatch.setattr(result_io, "_download_result", lambda _path, *, revision: existing)
+    monkeypatch.setattr(result_io, "_source_attestation", lambda: ATTESTATION)
+
+    assert result_io.read_existing_terminal_result() == existing
+
+    monkeypatch.setattr(
+        result_io,
+        "_source_attestation",
+        lambda: {**ATTESTATION, "revision": "d" * 40},
+    )
+    with pytest.raises(RuntimeError, match="source identity"):
+        result_io.read_existing_terminal_result()
+
+
+def test_exact_fence_terminal_lookup_fails_closed_on_malformed_result(
+    monkeypatch, tmp_path
+) -> None:
+    import huggingface_hub
+
+    _set_identity(monkeypatch)
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("not-json")
+
+    class Api:
+        def repo_info(self, **_kwargs):
+            return SimpleNamespace(sha="c" * 40)
+
+        def list_repo_files(self, **_kwargs):
+            return ["rl/run-1/attempts/2-9/result/not-a-result.json"]
+
+    monkeypatch.setattr(result_io.hf_io, "hf_api", Api)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: str(malformed))
+
+    with pytest.raises(RuntimeError, match="manifest is malformed"):
+        result_io.read_existing_terminal_result()
+
+
+def test_exact_fence_terminal_lookup_transport_failure_is_retriable(monkeypatch) -> None:
+    _set_identity(monkeypatch)
+
+    class Api:
+        def repo_info(self, **_kwargs):
+            raise OSError("temporary transport failure")
+
+    monkeypatch.setattr(result_io.hf_io, "hf_api", Api)
+
+    with pytest.raises(result_io.hf_io.RetriableInfraError, match="terminal result lookup"):
+        result_io.read_existing_terminal_result()
+
+
+def test_exact_fence_terminal_lookup_fails_closed_on_conflicts(monkeypatch) -> None:
+    _set_identity(monkeypatch)
+    first = _manifest()
+    second = _manifest(outcome="failed", failure_class="worker", metrics={})
+
+    class Api:
+        def repo_info(self, **_kwargs):
+            return SimpleNamespace(sha="c" * 40)
+
+        def list_repo_files(self, **_kwargs):
+            return [result_path(first), result_path(second)]
+
+    monkeypatch.setattr(result_io.hf_io, "hf_api", Api)
+
+    with pytest.raises(RuntimeError, match="conflicting result manifests"):
+        result_io.read_existing_terminal_result()
+
+
+def test_worker_boot_adopts_existing_terminal_result_before_setup(monkeypatch) -> None:
+    from flash.engine.worker.entry import worker
+
+    existing = _manifest()
+    calls = []
+    monkeypatch.setattr(worker.hf_io, "_disable_xet_upload_staging", lambda: calls.append("xet"))
+    monkeypatch.setattr(
+        worker.result_io,
+        "read_existing_terminal_result",
+        lambda: calls.append("result") or existing,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_preflight_gpu_occupancy_for_spec",
+        lambda: pytest.fail("gpu occupancy must not run"),
+    )
+    monkeypatch.setattr(
+        worker.kernel_warmup,
+        "load_mega_cache",
+        lambda: pytest.fail("kernel cache must not load"),
+    )
+    monkeypatch.setattr(
+        worker.sft_entry,
+        "run_sft",
+        lambda: pytest.fail("handler must not run"),
+    )
+    monkeypatch.setattr(worker.state, "RUN_MODE", "sft")
+
+    worker._run_worker_mode()
+
+    assert calls == ["xet", "result"]
+
+
+def test_worker_boot_terminal_lookup_failure_does_not_start_setup(monkeypatch) -> None:
+    from flash.engine.worker.entry import worker
+
+    monkeypatch.setattr(worker.hf_io, "_disable_xet_upload_staging", lambda: None)
+    monkeypatch.setattr(
+        worker.result_io,
+        "read_existing_terminal_result",
+        lambda: (_ for _ in ()).throw(RuntimeError("conflicting result manifests")),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_preflight_gpu_occupancy_for_spec",
+        lambda: pytest.fail("gpu occupancy must not run"),
+    )
+    monkeypatch.setattr(
+        worker.kernel_warmup,
+        "load_mega_cache",
+        lambda: pytest.fail("kernel cache must not load"),
+    )
+    monkeypatch.setattr(
+        worker.sft_entry,
+        "run_sft",
+        lambda: pytest.fail("handler must not run"),
+    )
+    monkeypatch.setattr(worker.state, "RUN_MODE", "sft")
+
+    with pytest.raises(RuntimeError, match="conflicting"):
+        worker._run_worker_mode()
+
+
 def test_cancelled_result_uses_latest_current_fence_progress(monkeypatch) -> None:
     _set_identity(monkeypatch)
     captured = []

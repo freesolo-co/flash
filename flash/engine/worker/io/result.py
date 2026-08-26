@@ -21,6 +21,10 @@ from flash.runner.lifecycle.protocol import (
 _RESULT_COMMIT_ATTEMPTS = 3
 
 
+class _TerminalResultEvidenceError(RuntimeError):
+    pass
+
+
 def _source_attestation() -> dict | None:
     raw = os.environ.get("FLASH_SOURCE_SNAPSHOT_JSON")
     if not raw:
@@ -78,28 +82,58 @@ def _download_result(path: str, *, revision: str) -> ResultManifest:
         force_download=True,
     )
     with open(local, "rb") as handle:
-        manifest = ResultManifest.from_dict(json.loads(handle.read()))
+        payload = handle.read()
+    try:
+        manifest = ResultManifest.from_dict(json.loads(payload))
+    except (TypeError, ValueError) as exc:
+        raise _TerminalResultEvidenceError("existing result manifest is malformed") from exc
     if result_path(manifest) != path:
-        raise RuntimeError("existing result does not match its immutable path")
+        raise _TerminalResultEvidenceError("existing result does not match its immutable path")
     return manifest
 
 
 def _existing_result(api, *, revision: str) -> ResultManifest | None:
     base = f"{attempt_prefix(state.PHASE, state.RUN_ID, state.ATTEMPT, state.FENCE)}/result/"
-    paths = [
-        path
-        for path in api.list_repo_files(
-            repo_id=state.HF_REPO,
-            repo_type="dataset",
-            revision=revision,
-        )
-        if isinstance(path, str) and path.startswith(base)
-    ]
+    repo_paths = api.list_repo_files(
+        repo_id=state.HF_REPO,
+        repo_type="dataset",
+        revision=revision,
+    )
+    if not isinstance(repo_paths, list) or any(not isinstance(path, str) for path in repo_paths):
+        raise _TerminalResultEvidenceError("artifact repository listing is malformed")
+    paths = [path for path in repo_paths if path.startswith(base)]
     if not paths:
         return None
     if len(paths) != 1:
-        raise RuntimeError("conflicting result manifests exist for one fenced attempt")
+        raise _TerminalResultEvidenceError(
+            "conflicting result manifests exist for one fenced attempt"
+        )
     return _download_result(paths[0], revision=revision)
+
+
+def read_existing_terminal_result() -> ResultManifest | None:
+    """return the exact fenced terminal result, failing closed on invalid evidence."""
+    if not state.HF_REPO:
+        return None
+    hf_io._require_hf_deadline_allowance()
+    try:
+        api = hf_io.hf_api()
+        revision = str(api.repo_info(repo_id=state.HF_REPO, repo_type="dataset").sha or "").strip()
+        if not revision:
+            raise RuntimeError("artifact repository revision is unavailable")
+        existing = _existing_result(api, revision=revision)
+    except _TerminalResultEvidenceError:
+        raise
+    except Exception as exc:
+        detail = sanitize_diagnostic(exc, limit=500)
+        raise hf_io.RetriableInfraError(
+            f"terminal result lookup failed before worker setup: {detail}"
+        ) from exc
+    if existing is None:
+        return None
+    if existing.source_attestation != _source_attestation():
+        raise RuntimeError("existing terminal result source identity does not match this worker")
+    return existing
 
 
 def _same_terminal_claim(existing: ResultManifest, proposed: ResultManifest) -> bool:

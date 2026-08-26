@@ -31,6 +31,7 @@ _PROGRESS_PREVIOUS_DIGEST: str | None = None
 _PROGRESS_TRAINING_ENTERED = False
 _PROGRESS_COMPLETED_STEPS = 0
 _PROGRESS_PENDING_CHECKPOINT_FAILURE: dict[str, int | str] | None = None
+_PROGRESS_PENDING_UPLOAD: tuple[ProgressRecord, str, str, bool] | None = None
 LATEST_GRPO_METRICS: list = []
 GRPO_METRIC_HISTORY_LIMIT = 1024
 
@@ -47,6 +48,7 @@ def _progress_kind(stage: str) -> str:
 
 def _progress_sections(fields: dict) -> tuple[dict, list, dict, dict, dict, dict]:
     metrics_keys = {
+        "discarded_rollouts",
         "epoch",
         "entropy",
         "frac_reward_zero_std",
@@ -69,6 +71,16 @@ def _progress_sections(fields: dict) -> tuple[dict, list, dict, dict, dict, dict
         "wall_deadline_at_risk",
     }
     metrics = {key: fields[key] for key in metrics_keys if key in fields}
+    metrics_last = fields.get("metrics_last")
+    if isinstance(metrics_last, list):
+        for row in reversed(metrics_last):
+            if not isinstance(row, dict):
+                continue
+            latest = {key: row[key] for key in metrics_keys if key in row}
+            if not latest:
+                continue
+            metrics = {**latest, **metrics}
+            break
     reward_metrics = fields.get("reward_metrics")
     if isinstance(reward_metrics, dict):
         metrics["reward_metrics"] = reward_metrics
@@ -120,16 +132,39 @@ def _write_local_immutable(payload: bytes) -> str:
             os.unlink(temporary)
 
 
-def _upload_record(record: ProgressRecord, *, required: bool) -> bool:
-    local = _write_local_immutable(canonical_bytes(record.to_dict()))
-    return hf_io.hf_upload_absolute(local, progress_path(record), required=required)
+def _upload_record(
+    record: ProgressRecord,
+    *,
+    required: bool,
+    local_path: str | None = None,
+    remote_path: str | None = None,
+) -> bool:
+    local = local_path or _write_local_immutable(canonical_bytes(record.to_dict()))
+    remote = remote_path or progress_path(record)
+    return hf_io.hf_upload_absolute(local, remote, required=required)
 
 
 def publish_progress(stage: str, *, initial: bool = False, **fields):
     """Publish one immutable cumulative progress record for observed work only."""
     global _PROGRESS_COMPLETED_STEPS, _PROGRESS_PENDING_CHECKPOINT_FAILURE
-    global _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE, _PROGRESS_TRAINING_ENTERED
+    global _PROGRESS_PENDING_UPLOAD, _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE
+    global _PROGRESS_TRAINING_ENTERED
     with _PROGRESS_LOCK:
+        if _PROGRESS_PENDING_UPLOAD is not None:
+            record, local_path, remote_path, required = _PROGRESS_PENDING_UPLOAD
+            committed = _upload_record(
+                record,
+                required=required,
+                local_path=local_path,
+                remote_path=remote_path,
+            )
+            if committed:
+                _PROGRESS_SEQUENCE = record.sequence
+                _PROGRESS_PREVIOUS_DIGEST = digest_record(record.to_dict())
+                _PROGRESS_PENDING_UPLOAD = None
+            print("PROGRESS", json.dumps(record.to_dict(), allow_nan=False, sort_keys=True))
+            if not committed:
+                return False
         step = fields.get("step")
         if isinstance(step, (int, float)) and not isinstance(step, bool) and step >= 0:
             _PROGRESS_COMPLETED_STEPS = max(_PROGRESS_COMPLETED_STEPS, int(step))
@@ -164,10 +199,19 @@ def publish_progress(stage: str, *, initial: bool = False, **fields):
             gpu_observation=bounded_json(gpu),
             diagnostics=bounded_json(diagnostics),
         )
-        committed = _upload_record(record, required=initial)
+        local_path = _write_local_immutable(canonical_bytes(record.to_dict()))
+        remote_path = progress_path(record)
+        _PROGRESS_PENDING_UPLOAD = (record, local_path, remote_path, initial)
+        committed = _upload_record(
+            record,
+            required=initial,
+            local_path=local_path,
+            remote_path=remote_path,
+        )
         if committed:
             _PROGRESS_SEQUENCE = sequence
             _PROGRESS_PREVIOUS_DIGEST = digest_record(record.to_dict())
+            _PROGRESS_PENDING_UPLOAD = None
     print("PROGRESS", json.dumps(record.to_dict(), allow_nan=False, sort_keys=True))
     return committed
 

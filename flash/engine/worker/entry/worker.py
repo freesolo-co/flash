@@ -53,6 +53,8 @@ def _run_worker_mode() -> None:
     # captures HF_HUB_DISABLE_XET when it is imported, so setting it afterwards has no effect on
     # which upload path is used. anything imported before this line could freeze the default.
     hf_io._disable_xet_upload_staging()
+    if result_io.read_existing_terminal_result() is not None:
+        return
 
     modes = {
         "sft": sft_entry.run_sft,

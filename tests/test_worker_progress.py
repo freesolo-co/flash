@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import inspect
 
+from flash.cli.commands.ops.log_follow import _log_follow_metric_rows
 from flash.engine.worker.io import progress as progress_io
+from flash.providers.artifacts import attempts as attempt_artifacts
+from flash.runner.lifecycle.protocol import canonical_bytes, progress_path
 
 
 def _reset(monkeypatch) -> None:
@@ -15,6 +18,7 @@ def _reset(monkeypatch) -> None:
     monkeypatch.setattr(progress_io, "_PROGRESS_TRAINING_ENTERED", False)
     monkeypatch.setattr(progress_io, "_PROGRESS_COMPLETED_STEPS", 0)
     monkeypatch.setattr(progress_io, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_PENDING_UPLOAD", None, raising=False)
 
 
 def test_progress_api_exposes_only_initial_and_observed_fields() -> None:
@@ -27,25 +31,176 @@ def test_progress_api_exposes_only_initial_and_observed_fields() -> None:
     assert list(phase_signature.parameters) == ["stage", "progress", "fields", "progress_step"]
 
 
-def test_failed_upload_reuses_sequence_and_chain_head(monkeypatch) -> None:
+def test_failed_upload_retries_the_identical_record_and_path(monkeypatch) -> None:
     _reset(monkeypatch)
-    records = []
-    outcomes = iter([False, True])
+    attempts = []
+    outcomes = iter([False, True, True])
 
-    def upload(record, *, required):
-        records.append((record, required))
+    def upload(record, *, required, local_path=None, remote_path=None):
+        attempts.append(
+            (
+                canonical_bytes(record.to_dict()),
+                progress_path(record),
+                local_path,
+                remote_path,
+                required,
+            )
+        )
         return next(outcomes)
 
     monkeypatch.setattr(progress_io, "_upload_record", upload)
 
-    assert progress_io.publish_progress("boot") is False
+    assert progress_io.publish_progress("boot", gpu={"used_mb": 1}) is False
     assert progress_io._PROGRESS_SEQUENCE == 0
     assert progress_io._PROGRESS_PREVIOUS_DIGEST is None
 
-    assert progress_io.publish_progress("boot") is True
-    assert [record.sequence for record, _required in records] == [1, 1]
-    assert all(record.previous_digest is None for record, _required in records)
-    assert progress_io._PROGRESS_SEQUENCE == 1
+    assert progress_io.publish_progress("rl_step", step=1, reward=0.5) is True
+    assert attempts[0] == attempts[1]
+    assert attempts[2][1] != attempts[1][1]
+    assert progress_io._PROGRESS_SEQUENCE == 2
+    assert progress_io._PROGRESS_PENDING_UPLOAD is None
+
+
+def test_commit_landed_response_failed_retries_without_breaking_reader(monkeypatch) -> None:
+    _reset(monkeypatch)
+    uploaded = {}
+    upload_calls = []
+
+    def upload_absolute(local_path, remote_path, *, required):
+        with open(local_path, "rb") as handle:
+            payload = handle.read()
+        upload_calls.append((remote_path, payload, required))
+        uploaded[remote_path] = payload
+        return len(upload_calls) > 1
+
+    monkeypatch.setattr(progress_io.hf_io, "hf_upload_absolute", upload_absolute)
+
+    assert progress_io.publish_progress("boot", gpu={"used_mb": 1}) is False
+    assert progress_io.publish_progress("rl_step", step=1, reward=0.5) is True
+    assert upload_calls[0] == upload_calls[1]
+    assert upload_calls[2][0] != upload_calls[1][0]
+
+    monkeypatch.setattr(
+        attempt_artifacts,
+        "_download_bytes",
+        lambda _repo, path, *, revision: uploaded[path],
+    )
+    decoded = attempt_artifacts._decode_progress(
+        "org/repo",
+        list(uploaded),
+        prefix="rl/run-1/attempts/2-9",
+        revision="c" * 40,
+        observed_at=200.0,
+    )
+
+    assert decoded is not None
+    assert decoded["sequence"] == 2
+    assert decoded["phase"] == "rl_step"
+    assert decoded["metrics"]["reward"] == 0.5
+
+
+def test_grpo_producer_metrics_reach_current_progress_and_cli(monkeypatch) -> None:
+    from flash.engine.worker.train.entry import rl_train_runner
+
+    _reset(monkeypatch)
+    records = []
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda record, **_kwargs: records.append(record) or True,
+    )
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = rl_train_runner._StepMetricState()
+
+    rl_train_runner._ingest_step_metrics(
+        "step:2 - critic/rewards/mean:0.75 - actor/grad_norm:1.25",
+        {"max_completion": 256},
+        state,
+        dict,
+    )
+
+    record = records[-1]
+    assert record.metrics == {
+        "grad_norm": 1.25,
+        "max_completion_tokens": 256,
+        "reward": 0.75,
+    }
+    assert record.diagnostics["metrics_last"][-1]["reward"] == 0.75
+    status = {
+        "attempt": {"attempt_id": 2, "fence": 9},
+        "progress": record.to_dict(),
+    }
+    assert _log_follow_metric_rows(status, set()) == [
+        "progress_seq=1 step=2 reward=0.75 grad_norm=1.25 max_comp_tokens=256"
+    ]
+
+
+def test_explicit_current_metrics_override_grpo_history() -> None:
+    metrics, *_sections = progress_io._progress_sections(
+        {
+            "reward": 0.9,
+            "metrics_last": [{"step": 2, "reward": 0.75, "grad_norm": 1.25}],
+        }
+    )
+
+    assert metrics == {"reward": 0.9, "grad_norm": 1.25}
+
+
+def test_opd_producer_discarded_rollouts_reaches_progress_and_cli(monkeypatch) -> None:
+    from flash.engine.worker.train.entry import opd_train_runner
+    from flash.engine.worker.train.opd.orchestration.progress import _OpdProgressState
+
+    _reset(monkeypatch)
+    records = []
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda record, **_kwargs: records.append(record) or True,
+    )
+    monkeypatch.setattr(
+        opd_train_runner._backend,
+        "verify_applied_shim_markers",
+        lambda *_args: None,
+    )
+
+    class Watcher:
+        @staticmethod
+        def raise_if_failed() -> None:
+            return None
+
+    class Bridge:
+        parent_work = None
+
+        @staticmethod
+        def accounting_snapshot() -> dict:
+            return {
+                "aligned_sequences": 4,
+                "coverage_sum": 4.0,
+                "truncated_rollouts": 3,
+                "samples_seen": 4,
+                "no_signal_skipped_steps": 0,
+            }
+
+    callbacks = opd_train_runner._build_child_callbacks(
+        Watcher(),
+        _OpdProgressState(),
+        Bridge(),
+        0,
+        "unused",
+        ("lora-rollout-guard",),
+    )
+    callbacks.on_line("step:1 - actor/distillation/loss:0.4")
+    callbacks.on_step(1)
+
+    record = records[-1]
+    assert record.metrics["discarded_rollouts"] == 3
+    status = {
+        "attempt": {"attempt_id": 2, "fence": 9},
+        "progress": record.to_dict(),
+    }
+    assert _log_follow_metric_rows(status, set()) == [
+        "progress_seq=1 step=1 trunc=0.75 discarded=3"
+    ]
 
 
 def test_checkpoint_failure_is_sticky_until_a_successful_checkpoint(monkeypatch) -> None:
@@ -54,7 +209,7 @@ def test_checkpoint_failure_is_sticky_until_a_successful_checkpoint(monkeypatch)
     monkeypatch.setattr(
         progress_io,
         "_upload_record",
-        lambda record, *, required: records.append(record) or True,
+        lambda record, **_kwargs: records.append(record) or True,
     )
     failure = {"step": 50, "operation": "resume", "error": "quota denied"}
 
