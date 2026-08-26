@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import enum
 import inspect
-import struct
 import threading
 import types
 import urllib.error
 import urllib.request
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from .http_refs import (
-    _SNAPSHOT_ITEMS_MAX,
     _TRAVERSAL_NODES_MAX,
     _function_bound_reference_values,
     _function_capture_values,
@@ -23,11 +22,16 @@ from .http_refs import (
     _getattr_type_static,
     _is_registered_callback_name,
     _module_function_code,
-    _slot_entries,
 )
 from .http_refs import (
     _references_target as _find_references_target,
 )
+from .http_signatures import (
+    function_implementation_signature as _function_implementation_signature,
+)
+from .http_signatures import snapshot_value as _snapshot_value
+from .http_signatures import stdlib_function_signature as _stdlib_function_signature
+from .http_slots import slot_entries as _slot_entries
 
 _UrlOpen = Callable[..., Any]
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
@@ -164,7 +168,7 @@ class _UrlopenKind(enum.Enum):
 
 @dataclass(frozen=True)
 class _InstalledOpenerCache:
-    installed: urllib.request.OpenerDirector
+    installed: weakref.ReferenceType[urllib.request.OpenerDirector]
     handler_signature: tuple[int, tuple[tuple[int, object], ...]]
     addheader_signature: tuple[int, tuple[tuple[str, str], ...]]
     private: urllib.request.OpenerDirector
@@ -198,7 +202,15 @@ def _build_no_redirect_opener(
 _OPENER_LOCK = threading.Lock()
 _DEFAULT_NO_REDIRECT_OPENER: urllib.request.OpenerDirector | None = None
 _INSTALLED_OPENER_CACHE: _InstalledOpenerCache | None = None
-_STDLIB_INSTALL_OPENER = urllib.request.install_opener
+_STDLIB_INSTALL_OPENER = globals().get("_STDLIB_INSTALL_OPENER", urllib.request.install_opener)
+
+
+def _release_installed_opener_cache(reference: weakref.ReferenceType[object]) -> None:
+    global _INSTALLED_OPENER_CACHE
+
+    cached = _INSTALLED_OPENER_CACHE
+    if cached is not None and cached.installed is reference:
+        _INSTALLED_OPENER_CACHE = None
 
 
 def _install_opener_with_cache_reset(opener) -> None:
@@ -235,93 +247,6 @@ def _callback_roles(handler: urllib.request.BaseHandler) -> tuple[bool, bool]:
     return redirects, any(name not in _REDIRECT_CALLBACK_NAMES for name in names)
 
 
-def _snapshot_value(
-    value: object,
-    seen: set[int] | None = None,
-    active: set[int] | None = None,
-    budget: list[int] | None = None,
-) -> object:
-    if seen is None:
-        seen = set()
-    if active is None:
-        active = set()
-    if budget is None:
-        budget = [0]
-    budget[0] += 1
-    if budget[0] > _TRAVERSAL_NODES_MAX:
-        raise ValueError
-    value_type = type(value)
-    if value is None or value_type in (bool, int, str, bytes):
-        return (value_type, value)
-    if value_type is float:
-        return (float, struct.pack("!d", value))
-    if value_type in (list, tuple, dict, set, frozenset):
-        value_id = id(value)
-        if value_id in active:
-            raise ValueError
-        if value_id in seen:
-            return ("alias", value_id)
-        seen.add(value_id)
-        active.add(value_id)
-        try:
-            if len(value) > _SNAPSHOT_ITEMS_MAX:
-                raise ValueError
-            if value_type in (list, tuple):
-                snapshot = tuple(_snapshot_value(item, seen, active, budget) for item in value)
-            elif value_type is dict:
-                snapshot = frozenset(
-                    (
-                        _snapshot_value(key, seen, active, budget),
-                        _snapshot_value(item, seen, active, budget),
-                    )
-                    for key, item in value.items()
-                )
-            else:
-                snapshot = frozenset(_snapshot_value(item, seen, active, budget) for item in value)
-        finally:
-            active.remove(value_id)
-        return (value_type, snapshot)
-    return ("opaque", id(value_type), id(value))
-
-
-def _function_implementation_signature(function: types.FunctionType) -> tuple[object, ...]:
-    code = object.__getattribute__(function, "__code__")
-    defaults = object.__getattribute__(function, "__defaults__")
-    kwdefaults = object.__getattribute__(function, "__kwdefaults__")
-    closure = object.__getattribute__(function, "__closure__")
-    if (
-        type(code) is not types.CodeType
-        or (defaults is not None and type(defaults) is not tuple)
-        or (kwdefaults is not None and type(kwdefaults) is not dict)
-        or (closure is not None and type(closure) is not tuple)
-    ):
-        raise TypeError
-    seen: set[int] = set()
-    active: set[int] = set()
-    budget = [0]
-    closure_values = []
-    for cell in closure or ():
-        try:
-            value = object.__getattribute__(cell, "cell_contents")
-        except ValueError:
-            value = _ABSENT_SLOT
-        closure_values.append(_snapshot_value(value, seen, active, budget))
-    return (
-        code,
-        _snapshot_value(defaults, seen, active, budget),
-        _snapshot_value(kwdefaults, seen, active, budget),
-        tuple(closure_values),
-    )
-
-
-def _stdlib_function_signature(function: types.FunctionType) -> tuple[object, ...]:
-    qualname = object.__getattribute__(function, "__qualname__")
-    if type(qualname) is not str:
-        raise TypeError
-    implementation = _function_implementation_signature(function)
-    return (_module_function_code(urllib.request, qualname), *implementation[1:])
-
-
 _STDLIB_HANDLER_CALLBACK_SIGNATURES = tuple(
     (callback, _stdlib_function_signature(callback)) for callback in _STDLIB_HANDLER_CALLBACKS
 )
@@ -329,6 +254,28 @@ _STDLIB_URLOPEN = urllib.request.urlopen
 _STDLIB_URLOPEN_CODE = _module_function_code(urllib.request, "urlopen")
 _STANDARD_DO_OPEN = urllib.request.AbstractHTTPHandler.do_open
 _STANDARD_DO_OPEN_SIGNATURE = _stdlib_function_signature(_STANDARD_DO_OPEN)
+_STANDARD_AUTH_HELPERS = tuple(
+    (handler_type, name, helper, _stdlib_function_signature(helper))
+    for handler_type, names in (
+        (
+            urllib.request.AbstractBasicAuthHandler,
+            ("_parse_realm", "retry_http_basic_auth"),
+        ),
+        (
+            urllib.request.AbstractDigestAuthHandler,
+            (
+                "retry_http_digest_auth",
+                "get_authorization",
+                "get_algorithm_impls",
+                "get_entity_digest",
+                "get_cnonce",
+                "reset_retry_count",
+            ),
+        ),
+    )
+    for name in names
+    for helper in (_getattr_type_static(handler_type, name, _ABSENT_SLOT),)
+)
 _STANDARD_OPENER_METHOD_SIGNATURES = tuple(
     (
         name,
@@ -377,7 +324,13 @@ def _slot_config_signature(
                 slot_name,
                 value
                 if value is _ABSENT_SLOT
-                else _snapshot_value(value, seen=seen, active=active, budget=budget),
+                else _snapshot_value(
+                    value,
+                    seen=seen,
+                    active=active,
+                    budget=budget,
+                    limit=_TRAVERSAL_NODES_MAX,
+                ),
             )
             for owner_id, slot_name, value in _slot_values(handler)
         )
@@ -434,7 +387,13 @@ def _handler_config_signature(handler: urllib.request.BaseHandler) -> object:
         dictionary = frozenset(
             (
                 name,
-                _snapshot_value(value, seen=seen, active=active, budget=budget),
+                _snapshot_value(
+                    value,
+                    seen=seen,
+                    active=active,
+                    budget=budget,
+                    limit=_TRAVERSAL_NODES_MAX,
+                ),
             )
             for name, value in state.items()
             if name != "parent"
@@ -552,6 +511,11 @@ def _validate_callback_helpers(handler: urllib.request.BaseHandler) -> None:
             or _function_implementation_signature(helper) != _STANDARD_DO_OPEN_SIGNATURE
         ):
             raise TypeError
+    for owner, name, standard, signature in _STANDARD_AUTH_HELPERS:
+        if isinstance(handler, owner):
+            helper = _getattr_handler_static(handler, name, _ABSENT_SLOT)
+            if helper is not standard or _function_implementation_signature(helper) != signature:
+                raise TypeError
 
 
 def _proxy_callback_names(
@@ -881,7 +845,7 @@ def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
             cached = _INSTALLED_OPENER_CACHE
             if (
                 cached is not None
-                and cached.installed is installed
+                and cached.installed() is installed
                 and cached.handler_signature == handler_signature
             ):
                 try:
@@ -911,7 +875,7 @@ def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
                 if cached.addheader_signature != addheader_signature:
                     cached.private.addheaders = list(addheaders)
                     cached = _InstalledOpenerCache(
-                        installed,
+                        cached.installed,
                         handler_signature,
                         addheader_signature,
                         cached.private,
@@ -925,7 +889,7 @@ def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
                 addheader_signature,
             ):
                 _INSTALLED_OPENER_CACHE = _InstalledOpenerCache(
-                    installed,
+                    weakref.ref(installed, _release_installed_opener_cache),
                     handler_signature,
                     addheader_signature,
                     private,

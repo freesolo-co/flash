@@ -1,13 +1,10 @@
 """descriptor-safe callback reference analysis for private http transport."""
 
-from __future__ import annotations
-
 import _thread
 import builtins
 import dis
 import functools
 import importlib.machinery
-import itertools
 import operator
 import types
 import zipimport
@@ -82,55 +79,6 @@ def _module_function_code(module: types.ModuleType, qualname: str) -> types.Code
     if len(matches) != 1:
         raise ValueError
     return matches[0]
-
-
-def _slot_names(declaration: object) -> tuple[str, ...]:
-    if type(declaration) is str:
-        names = (declaration,)
-    elif type(declaration) in (list, tuple, set, frozenset):
-        names = tuple(declaration)
-    elif type(declaration) is dict:
-        names = tuple(declaration.keys())
-    else:
-        raise TypeError
-    if any(type(name) is not str for name in names):
-        raise TypeError
-    return names
-
-
-def _mangled_slot_name(owner: type, name: str) -> str:
-    if name.startswith("__") and not name.endswith("__"):
-        class_name = type.__getattribute__(owner, "__name__").lstrip("_")
-        if class_name:
-            return f"_{class_name}{name}"
-    return name
-
-
-def _slot_entries(
-    value: object,
-    absent: object,
-) -> tuple[tuple[int, str, types.MemberDescriptorType, object], ...]:
-    found = []
-    seen: set[int] = set()
-    value_type = type(value)
-    for owner in type.__getattribute__(value_type, "__mro__"):
-        namespace = type.__getattribute__(owner, "__dict__")
-        for declared_name in _slot_names(namespace.get("__slots__", ())):
-            if declared_name in {"__dict__", "__weakref__", "parent"}:
-                continue
-            slot_name = _mangled_slot_name(owner, declared_name)
-            descriptor = namespace.get(slot_name)
-            if type(descriptor) is not types.MemberDescriptorType:
-                raise TypeError
-            if id(descriptor) in seen:
-                continue
-            seen.add(id(descriptor))
-            try:
-                slot_value = types.MemberDescriptorType.__get__(descriptor, value, value_type)
-            except AttributeError:
-                slot_value = absent
-            found.append((id(owner), slot_name, descriptor, slot_value))
-    return tuple(found)
 
 
 def _getattr_type_static(owner: type, name: str, default: object) -> object:
@@ -244,8 +192,13 @@ def _has_ambiguous_default_control_flow(
     start: int,
     end: int,
     origins: dict[str, tuple[str, str]],
+    *,
+    local_only: bool = False,
 ) -> bool:
     offset_indices = {instruction.offset: index for index, instruction in enumerate(instructions)}
+    origin_loads = _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}
+    if not local_only:
+        origin_loads |= {"LOAD_GLOBAL", "LOAD_NAME"}
     for index, instruction in enumerate(instructions[:end]):
         if instruction.opcode not in _BRANCH_OPCODES:
             continue
@@ -254,9 +207,10 @@ def _has_ambiguous_default_control_flow(
         if target_index is None or not start <= target_index <= end:
             continue
         branch_start = _stack_expression_start(instructions, index)
+        while instructions[branch_start].opname == "COPY":
+            branch_start = _stack_expression_start(instructions, branch_start)
         if any(
-            candidate.opname in {"LOAD_GLOBAL", "LOAD_NAME", "LOAD_DEREF"} | _FAST_LOAD_OPNAMES
-            and _loaded_origin(candidate, origins) is not None
+            candidate.opname in origin_loads and _loaded_origin(candidate, origins) is not None
             for candidate in instructions[branch_start:end]
         ):
             return True
@@ -267,9 +221,13 @@ def _static_default_origin(
     instructions: tuple[dis.Instruction, ...],
     span: tuple[int, int],
     origins: dict[str, tuple[str, str]],
+    *,
+    fail_on_unsupported: bool = True,
 ) -> tuple[str, str] | None:
     start, end = span
-    if _has_ambiguous_default_control_flow(instructions, start, end, origins):
+    if fail_on_unsupported and _has_ambiguous_default_control_flow(
+        instructions, start, end, origins
+    ):
         raise ValueError
     expression = instructions[start:end]
     has_origin = any(
@@ -338,7 +296,7 @@ def _static_default_origin(
             if type(depth) is not int or depth < 2 or depth > len(stack):
                 raise ValueError
             stack[-1], stack[-depth] = stack[-depth], stack[-1]
-        elif has_origin:
+        elif has_origin and fail_on_unsupported:
             raise ValueError
         else:
             return None
@@ -349,7 +307,7 @@ def _static_default_origin(
         return result[1]
     if _contains_static_origin(result):
         raise ValueError
-    if has_origin:
+    if has_origin and fail_on_unsupported:
         raise ValueError
     return None
 
@@ -451,24 +409,43 @@ def _loaded_reference_paths(
             raise ValueError
         instructions = tuple(dis.get_instructions(current))
         current_origins = dict(origins)
+        propagated_names: set[str] = set()
         changed = True
         while changed:
             changed = False
-            for source, target in itertools.pairwise(instructions):
+            for index, target in enumerate(instructions):
                 if target.opname not in {"STORE_FAST", "STORE_DEREF"}:
                     continue
-                source_name = source.argval
-                if source.opname in {"LOAD_GLOBAL", "LOAD_NAME"}:
-                    origin = ("global", source_name)
-                elif source.opname in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}:
-                    origin = current_origins.get(source_name)
-                else:
-                    continue
                 target_name = target.argval
-                if type(source_name) is not str or type(target_name) is not str:
+                if type(target_name) is not str:
                     raise ValueError
+                try:
+                    start = _stack_expression_start(instructions, index)
+                except ValueError:
+                    continue
+                expression = instructions[start:index]
+                strict_origins = {name: current_origins[name] for name in propagated_names}
+                strict = any(
+                    candidate.opname in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}
+                    and _loaded_origin(candidate, strict_origins) is not None
+                    for candidate in expression
+                ) or _has_ambiguous_default_control_flow(
+                    instructions, start, index, strict_origins, local_only=True
+                )
+                try:
+                    origin = _static_default_origin(
+                        instructions,
+                        (start, index),
+                        current_origins,
+                        fail_on_unsupported=strict,
+                    )
+                except ValueError:
+                    if strict:
+                        raise
+                    continue
                 if origin is not None and current_origins.get(target_name) != origin:
                     current_origins[target_name] = origin
+                    propagated_names.add(target_name)
                     changed = True
         for index, instruction in enumerate(instructions):
             if instruction.opname in {"IMPORT_NAME", "IMPORT_FROM", "IMPORT_STAR"}:

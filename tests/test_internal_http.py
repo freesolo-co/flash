@@ -757,6 +757,55 @@ def test_unsupported_slot_descriptor_fails_before_transport() -> None:
     assert handler.parent is original_parent
 
 
+def test_trusted_basic_auth_callback_helper_override_fails_before_transport() -> None:
+    source = "https://source.invalid/data"
+    sink = "https://sink.invalid/steal"
+    observed: list[tuple[str, str | None]] = []
+    opener = None
+
+    class AuthSource(urllib.request.BaseHandler):
+        handler_order = 100
+
+        def https_open(self, request):
+            authorization = request.get_header("Authorization")
+            observed.append((request.full_url, authorization))
+            if request.full_url == sink:
+                return _response(request.full_url)
+            if authorization:
+                headers = email.message.Message()
+                headers["Location"] = sink
+                response = urllib.response.addinfourl(
+                    io.BytesIO(b""), headers, request.full_url, code=302
+                )
+                response.msg = "redirect"
+                return response
+            headers = email.message.Message()
+            headers["WWW-Authenticate"] = 'Basic realm="realm"'
+            response = urllib.response.addinfourl(
+                io.BytesIO(b""), headers, request.full_url, code=401
+            )
+            response.msg = "unauthorized"
+            return response
+
+    class OverrideAuthHandler(urllib.request.HTTPBasicAuthHandler):
+        def retry_http_basic_auth(self, host, request, realm):
+            retried = urllib.request.Request(
+                request.full_url,
+                headers={"Authorization": "Bearer secret"},
+            )
+            return opener.open(retried, timeout=request.timeout)
+
+    opener = urllib.request.build_opener(AuthSource(), OverrideAuthHandler())
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request(source), timeout=1.0)
+
+    assert observed == []
+
+
 def test_installed_digest_handler_state_survives_across_requests() -> None:
     password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
     password_manager.add_password("realm", "https://source.invalid", "user", "pass")
@@ -1328,7 +1377,7 @@ def test_resetting_installed_opener_releases_cached_original() -> None:
         urllib.request.Request("custom://source.invalid/first"), timeout=1.0
     ) as response:
         assert response.read() == b"ok"
-    assert http_transport._INSTALLED_OPENER_CACHE.installed is opener
+    assert http_transport._INSTALLED_OPENER_CACHE.installed() is opener
 
     urllib.request._opener = None
     del opener
@@ -1340,6 +1389,31 @@ def test_resetting_installed_opener_releases_cached_original() -> None:
 
     assert http_transport._INSTALLED_OPENER_CACHE is None
     assert opener_ref() is None
+
+
+def test_module_reload_preserves_nonrecursive_install_opener() -> None:
+    script = textwrap.dedent(
+        """
+        import importlib
+        import urllib.request
+
+        import flash._internal.http as http_transport
+
+        importlib.reload(http_transport)
+        urllib.request.install_opener(urllib.request.build_opener())
+        assert urllib.request._opener is not None
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_non_none_install_releases_cached_openers_immediately() -> None:
@@ -1365,6 +1439,45 @@ def test_non_none_install_releases_cached_openers_immediately() -> None:
     assert http_transport._INSTALLED_OPENER_CACHE is None
     assert first_ref() is None
     assert first_private_ref() is None
+
+
+def test_preimport_saved_install_alias_releases_stale_cache() -> None:
+    script = textwrap.dedent(
+        """
+        import gc
+        import urllib.request
+        import weakref
+
+        saved_install_opener = urllib.request.install_opener
+        import flash._internal.http as http_transport
+
+        first = urllib.request.build_opener()
+        saved_install_opener(first)
+        http_transport._active_no_redirect_opener()
+        first_private = http_transport._INSTALLED_OPENER_CACHE.private
+        first_ref = weakref.ref(first)
+        first_private_ref = weakref.ref(first_private)
+
+        saved_install_opener(urllib.request.build_opener())
+        del first
+        del first_private
+        gc.collect()
+        gc.collect()
+
+        assert first_ref() is None
+        assert first_private_ref() is None
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_saved_install_alias_replacement_does_not_reuse_stale_cache() -> None:
@@ -1395,7 +1508,7 @@ def test_saved_install_alias_replacement_does_not_reuse_stale_cache() -> None:
         assert response.read() == b"ok"
 
     assert observed == ["first", "second"]
-    assert http_transport._INSTALLED_OPENER_CACHE.installed is second
+    assert http_transport._INSTALLED_OPENER_CACHE.installed() is second
     assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
 
 
@@ -1753,7 +1866,22 @@ def test_mutated_instance_callback_holder_fails_before_cached_transport() -> Non
 
 
 @pytest.mark.parametrize("root_kind", ["module", "type"])
-def test_local_alias_of_global_namespace_fails_before_transport(root_kind: str) -> None:
+@pytest.mark.parametrize(
+    "alias_expression",
+    [
+        "alias",
+        "(alias,)[0]",
+        "[alias][0]",
+        "{'retained': alias}['retained']",
+        "identity(alias)",
+        "alias if flag else other",
+        "alias or other",
+    ],
+)
+def test_local_alias_of_global_namespace_fails_before_transport(
+    root_kind: str,
+    alias_expression: str,
+) -> None:
     source = "custom://source.invalid/data"
     sink = "custom://sink.invalid/steal"
     contacted: list[str] = []
@@ -1764,7 +1892,10 @@ def test_local_alias_of_global_namespace_fails_before_transport(root_kind: str) 
     )
     callback_globals = {
         "contacted": contacted,
+        "flag": True,
+        "identity": lambda value: value,
         "namespace": namespace,
+        "other": object(),
         "sink": sink,
         "urllib": urllib,
         "response": _response,
@@ -1775,8 +1906,9 @@ def test_local_alias_of_global_namespace_fails_before_transport(root_kind: str) 
         "    if request.full_url == sink:\n"
         "        return response(request.full_url)\n"
         "    alias = namespace\n"
+        f"    hidden = {alias_expression}\n"
         "    redirected = urllib.request.Request(sink)\n"
-        "    return alias.target.open(redirected, timeout=request.timeout)\n",
+        "    return hidden.target.open(redirected, timeout=request.timeout)\n",
         callback_globals,
     )
 
