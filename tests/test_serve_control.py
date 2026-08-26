@@ -225,6 +225,7 @@ def test_engine_id_is_canonical_stable_and_sensitive_to_every_field() -> None:
         "mm_processor_cache_gb": 1.0,
         "enable_tower_connector_lora": True,
         "reasoning_parser": "qwen3",
+        "tool_parser": "qwen3_coder",
         "trust_remote_code": True,
         "engine_args_fingerprint": "8" * 64,
         "tokenizer_kwargs_fingerprint": "9" * 64,
@@ -240,6 +241,26 @@ def test_engine_id_is_canonical_stable_and_sensitive_to_every_field() -> None:
         elif name == "enable_tower_connector_lora":
             overrides.update(modality="multimodal", image_limit=4)
         assert replace(identity, **overrides).engine_id != identity.engine_id, name
+
+
+def test_deployment_binds_tool_parser_to_logical_base_model() -> None:
+    unqualified_engine = _engine(tool_parser="qwen3_coder")
+    unqualified_adapter = _adapter(
+        1,
+        unqualified_engine,
+        base_model="org/logical-base",
+    )
+    with pytest.raises(ValueError, match="qualified logical base model"):
+        plan_deployment(_modal_request(unqualified_adapter))
+
+    missing_parser_engine = _engine()
+    qualified_adapter = _adapter(
+        2,
+        missing_parser_engine,
+        base_model="Qwen/Qwen3.5-9B",
+    )
+    with pytest.raises(ValueError, match="qualified logical base model"):
+        plan_deployment(_modal_request(qualified_adapter))
 
 
 def test_engine_identity_enforces_modality_and_image_limit_consistency() -> None:

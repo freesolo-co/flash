@@ -7,6 +7,23 @@ from flash.serve.contract.errors import RetryableServingUnavailable
 from tests._helpers.chat_transport import StreamClient, StreamContext, StreamResponse
 
 
+def _tools():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
 @pytest.fixture(autouse=True)
 def _reset_chat_clients(monkeypatch):
     monkeypatch.setattr(transport, "_CHAT_HTTP_CLIENT", None)
@@ -232,12 +249,16 @@ def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkey
     messages = [{"role": "user", "content": "hello"}]
     d.chat("run-1", messages, structured_outputs={})
     d.chat("run-1", messages)
+    d.chat("run-1", messages, tools=_tools())
 
     first_url, first = requests[0]
     second_url, second = requests[1]
-    assert first_url == second_url == "https://serve.example/v1/chat/completions"
+    third_url, third = requests[2]
+    assert first_url == second_url == third_url == "https://serve.example/v1/chat/completions"
     assert first["json"]["structured_outputs"] == {}
     assert "structured_outputs" not in second["json"]
+    assert third["json"]["tool_choice"] == "auto"
+    assert third["json"]["parallel_tool_calls"] is True
     assert first["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
     assert second["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
 
@@ -300,6 +321,28 @@ def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch
         "structured_outputs": {"json_object": True},
         "stream_options": {"include_usage": True},
     }
+    assert len(exits) == 1
+
+
+def test_chat_sse_defaults_tool_controls(monkeypatch):
+    import flash.serve.deployment.deploy as d
+
+    seen = {}
+    exits = []
+    upstream = StreamResponse(byte_chunks=(b"data: [DONE]\n\n",))
+    client = StreamClient(StreamContext(upstream, exits), seen)
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
+
+    response = d.chat_sse(
+        "run-1",
+        [{"role": "user", "content": "weather"}],
+        tools=_tools(),
+    )
+
+    assert list(response.iter_bytes()) == [b"data: [DONE]\n\n"]
+    assert seen["json"]["tool_choice"] == "auto"
+    assert seen["json"]["parallel_tool_calls"] is True
     assert len(exits) == 1
 
 

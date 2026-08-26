@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Any, cast
 from flash.serve.request.validation import (
     MAX_COMPRESSED_BYTES,
     MAX_SOURCE_CHARS,
+    has_image_blocks,
     normalize_messages,
     normalize_structured_outputs,
 )
@@ -21,6 +23,7 @@ from flash.serve.runtime.sampling import (
     validate_seed,
     validate_top_logprobs,
 )
+from flash.serve.runtime.tool_calls import FunctionTool, normalize_tools
 
 DEFAULT_MAX_TOKENS = 1024
 _ALLOWED_REQUEST_KEYS = frozenset(
@@ -33,6 +36,7 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "messages",
         "model",
         "n",
+        "parallel_tool_calls",
         "presence_penalty",
         "response_format",
         "seed",
@@ -42,6 +46,8 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "stream_options",
         "structured_outputs",
         "temperature",
+        "tool_choice",
+        "tools",
         "top_logprobs",
         "top_p",
     }
@@ -58,6 +64,9 @@ _RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
         "return_assistant_tokens_mask",
         "return_dict",
         "return_tensors",
+        "tool_choice",
+        "tools",
+        "parallel_tool_calls",
         "tokenize",
         "truncation",
     }
@@ -86,6 +95,9 @@ class NormalizedChatRequest:
     stop: tuple[str, ...]
     chat_template_kwargs: dict[str, Any]
     structured_outputs: dict[str, Any] | None
+    tools: tuple[FunctionTool, ...] | None
+    tool_choice: str | None
+    parallel_tool_calls: bool | None
     stream: bool
     stream_options: dict[str, bool] | None
 
@@ -138,6 +150,18 @@ def parse_chat_request(
         )
     except ValueError as exc:
         raise OpenAIRequestError(str(exc)) from exc
+    structured_outputs = _structured_outputs(payload)
+    tools, tool_choice, parallel_tool_calls = _tool_controls(payload)
+    if tools is not None:
+        if logprobs:
+            raise OpenAIRequestError("tools cannot be combined with logprobs")
+        if "structured_outputs" in payload and payload["structured_outputs"] is not None:
+            raise OpenAIRequestError("tools cannot be combined with structured outputs")
+        response_format = payload.get("response_format")
+        if response_format is not None and response_format != {"type": "text"}:
+            raise OpenAIRequestError("tools require a text response_format")
+        if has_image_blocks(messages, sequence_types=list):
+            raise OpenAIRequestError("tools cannot be combined with image messages")
 
     return NormalizedChatRequest(
         model=model,
@@ -153,7 +177,10 @@ def parse_chat_request(
         top_logprobs=top_logprobs,
         stop=_stop_values(payload.get("stop")),
         chat_template_kwargs=_chat_template_kwargs(payload.get("chat_template_kwargs")),
-        structured_outputs=_structured_outputs(payload),
+        structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         stream=stream,
         stream_options=_stream_options(payload.get("stream_options"), stream),
     )
@@ -164,6 +191,19 @@ def reject_thinking_logprobs(*, thinking: bool, logprobs: bool) -> None:
 
     if thinking and logprobs:
         raise OpenAIRequestError("logprobs are not supported for thinking-enabled generation")
+
+
+def reject_tool_capability(
+    *, tools: tuple[FunctionTool, ...] | None, thinking: bool, tool_parser: str | None
+) -> None:
+    """apply authoritative adapter and engine tool capability checks."""
+
+    if tools is None:
+        return
+    if thinking:
+        raise OpenAIRequestError("tools are not supported for thinking-enabled generation")
+    if tool_parser != "qwen3_coder":
+        raise OpenAIRequestError("this serving engine is not qualified for tool calling")
 
 
 def merge_stop_sequences(
@@ -239,7 +279,7 @@ def _messages(value: object) -> list[dict[str, Any]]:
                 f"image source exceeds the {MAX_COMPRESSED_BYTES}-byte limit"
             ) from exc
         raise
-    return [dict(message) for message in value]
+    return copy.deepcopy(value)
 
 
 def _stop_values(value: object) -> tuple[str, ...]:
@@ -332,6 +372,29 @@ def _response_format(value: object) -> object:
     if not strict:
         raise OpenAIRequestError("response_format.json_schema.strict=false is not supported")
     return {"json": declaration["schema"]}
+
+
+def _tool_controls(
+    payload: dict[str, Any],
+) -> tuple[tuple[FunctionTool, ...] | None, str | None, bool | None]:
+    has_tools = "tools" in payload
+    has_choice = "tool_choice" in payload
+    has_parallel = "parallel_tool_calls" in payload
+    if not has_tools:
+        if has_choice or has_parallel:
+            raise OpenAIRequestError("tool_choice and parallel_tool_calls require tools")
+        return None, None, None
+    try:
+        tools = normalize_tools(payload["tools"], error_type=OpenAIRequestError)
+    except OpenAIRequestError:
+        raise
+    choice = payload.get("tool_choice", "auto")
+    if type(choice) is not str or choice not in {"auto", "none"}:
+        raise OpenAIRequestError("tool_choice must be auto or none")
+    parallel = payload.get("parallel_tool_calls", True)
+    if parallel is not True:
+        raise OpenAIRequestError("parallel_tool_calls must be true")
+    return tools, choice, True
 
 
 def parse_stream_options(value: object, stream: bool) -> bool:

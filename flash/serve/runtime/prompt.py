@@ -9,8 +9,11 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+from flash.content.reasoning_normalization import messages_for_chat_template
+
 from .errors import MultimodalRequestError, PromptError, ServingRuntimeError
 from .multimodal import has_image_blocks, normalize_text_messages, prepare_multimodal_request
+from .tool_calls import detached_template_messages, tools_wire
 from .types import AdapterSpec, EngineConfig, GenerationRequest
 
 _RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
@@ -20,6 +23,9 @@ _RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
         "return_dict",
         "return_tensors",
         "return_assistant_tokens_mask",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
         "enable_thinking",
         "conversation",
         "documents",
@@ -69,6 +75,8 @@ def effective_chat_template_kwargs(
     kwargs = safe_chat_template_kwargs(request.chat_template_kwargs)
     if thinking is not None:
         kwargs["enable_thinking"] = thinking
+    if request.tools is not None and request.tool_choice == "auto":
+        kwargs["tools"] = tools_wire(request.tools)
     return kwargs
 
 
@@ -133,8 +141,9 @@ class PromptPreparer:
             # escape before `_rejection_as_prompt_error` and answer 503, telling the caller to
             # retry a request that must fail identically while the engine is perfectly healthy.
             try:
+                template_messages = messages_for_chat_template(detached_template_messages(messages))
                 token_ids = self._tokenizer.apply_chat_template(
-                    messages,
+                    template_messages,
                     tokenize=True,
                     add_generation_prompt=True,
                     return_dict=False,
@@ -179,6 +188,16 @@ class PromptPreparer:
                     sort_keys=True,
                     default=str,
                 )
+                if request.tools is not None:
+                    raw += "\0" + json.dumps(
+                        {
+                            "tools": tools_wire(request.tools),
+                            "tool_choice": request.tool_choice,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
             except TypeError:
                 return None
             kind = "messages"

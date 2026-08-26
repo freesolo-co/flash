@@ -20,7 +20,12 @@ from flash.serve.contract.provenance import (
     decode_freesolo_body,
     decode_freesolo_headers,
 )
-from flash.serve.request.openai import DEFAULT_MAX_TOKENS, OpenAIRequestError, parse_chat_request
+from flash.serve.request.openai import (
+    DEFAULT_MAX_TOKENS,
+    OpenAIRequestError,
+    parse_chat_request,
+    reject_tool_capability,
+)
 from flash.serve.request.streaming import _complete_sse_frames
 from flash.serve.request.transport import OpenAIStreamResponse
 from flash.server.routes.serving_revisions import _authorized_chat_revision
@@ -341,6 +346,179 @@ def test_provenance_decoders_share_one_typed_value() -> None:
     assert decode_flash_body(flash) == expected
     assert decode_freesolo_headers(freesolo_headers) == expected
     assert decode_flash_headers(flash_headers) == expected
+
+
+def _function_tools() -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "look up weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "days": {"type": "integer"},
+                    },
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
+def test_tool_controls_and_template_keys_are_strict() -> None:
+    request = parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "weather"}],
+            "tools": _function_tools(),
+            "chat_template_kwargs": {"tools": ["bypass"], "tool_choice": "required"},
+        },
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+    assert request.tool_choice == "auto"
+    assert request.parallel_tool_calls is True
+    assert request.chat_template_kwargs == {}
+    for update, match in (
+        ({"tool_choice": "required"}, "auto or none"),
+        ({"parallel_tool_calls": False}, "must be true"),
+    ):
+        with pytest.raises(OpenAIRequestError, match=match):
+            parse_chat_request(
+                {
+                    "messages": [{"role": "user", "content": "weather"}],
+                    "tools": _function_tools(),
+                    **update,
+                },
+                require_model=False,
+                allow_managed_selectors=True,
+            )
+
+
+def test_tool_names_and_schema_container_keywords_are_exact() -> None:
+    valid = _function_tools()
+    valid[0]["function"]["name"] = "9-weather_tool"
+    request = parse_chat_request(
+        {"messages": [{"role": "user", "content": "weather"}], "tools": valid},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+    assert request.tools is not None
+    assert request.tools[0].name == "9-weather_tool"
+
+    for name in ("weather.lookup", "x" * 65):
+        invalid = _function_tools()
+        invalid[0]["function"]["name"] = name
+        with pytest.raises(OpenAIRequestError, match=r"function\.name is invalid"):
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "weather"}], "tools": invalid},
+                require_model=False,
+                allow_managed_selectors=True,
+            )
+
+    invalid_schema = _function_tools()
+    invalid_schema[0]["function"]["parameters"]["items"] = {"type": "string"}
+    with pytest.raises(OpenAIRequestError, match="object schema contains array-only keywords"):
+        parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": invalid_schema,
+            },
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+def test_tool_capability_rejection_uses_authoritative_thinking_and_parser() -> None:
+    tools = parse_chat_request(
+        {"messages": [{"role": "user", "content": "weather"}], "tools": _function_tools()},
+        require_model=False,
+        allow_managed_selectors=True,
+    ).tools
+    reject_tool_capability(tools=tools, thinking=False, tool_parser="qwen3_coder")
+    with pytest.raises(OpenAIRequestError, match="thinking-enabled"):
+        reject_tool_capability(tools=tools, thinking=True, tool_parser="qwen3_coder")
+    with pytest.raises(OpenAIRequestError, match="not qualified"):
+        reject_tool_capability(tools=tools, thinking=False, tool_parser=None)
+
+
+def test_tool_history_is_strict_and_does_not_mutate_caller_messages() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "name": "weather", "content": "sunny"},
+        {"role": "user", "content": "thanks"},
+    ]
+    original = json.loads(json.dumps(messages))
+    request = parse_chat_request(
+        {"messages": messages}, require_model=False, allow_managed_selectors=True
+    )
+    assert request.messages == original
+    assert messages == original
+    with pytest.raises(OpenAIRequestError, match="before all preceding tool calls were resolved"):
+        parse_chat_request(
+            {"messages": [messages[0], messages[2]]},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+    for message, match in (
+        (
+            {
+                "role": "user",
+                "content": "not an assistant",
+                "tool_calls": messages[0]["tool_calls"],
+            },
+            "tool_calls require the assistant role",
+        ),
+        (
+            {"role": "assistant", "content": "not a tool", "tool_call_id": "call_1"},
+            "tool_call_id requires the tool role",
+        ),
+    ):
+        with pytest.raises(OpenAIRequestError, match=match):
+            parse_chat_request(
+                {"messages": [message]},
+                require_model=False,
+                allow_managed_selectors=True,
+            )
+
+    invalid_history = json.loads(json.dumps(messages[0]))
+    invalid_history["tool_calls"][0]["function"]["name"] = "weather.lookup"
+    with pytest.raises(OpenAIRequestError, match="function name is invalid"):
+        parse_chat_request(
+            {"messages": [invalid_history]},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+    with pytest.raises(OpenAIRequestError, match="tool result content must be a string"):
+        parse_chat_request(
+            {
+                "messages": [
+                    messages[0],
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": [{"type": "text", "text": "sunny"}],
+                    },
+                ]
+            },
+            require_model=False,
+            allow_managed_selectors=True,
+        )
 
 
 def test_authorized_revision_resolver_prefers_ready_revision_for_ambiguous_step() -> None:

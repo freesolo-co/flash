@@ -151,7 +151,30 @@ The packaged, hosted, and managed OpenAI entry points share one strict sampling 
 - `logprobs` is a strict boolean and `top_logprobs` is an exact integer from 0 through 20. A positive
   `top_logprobs` requires `logprobs: true`.
 - Thinking-enabled adapters reject logprobs after the requested adapter or run has been authorized
-  and resolved. Tools, tool selection, and unrelated vLLM extensions remain unsupported.
+  and resolved.
+
+Function tools are supported only for the exact qualified Qwen3.5 packaged and hosted profile. The
+parser identity is `qwen3_coder`; Qwen3.6 and unqualified engines reject tools after authorization
+and immutable adapter resolution, before generation. Declarations must be closed function objects
+with unique nonempty names. Parameters use a bounded root-object JSON Schema profile with
+`properties`, `required`, `additionalProperties: false`, recursive scalar, object, and array types,
+descriptions, enums, and array `items`. Unsupported keywords and `strict: true` are rejected.
+
+`tool_choice` defaults to `auto` and accepts only `auto` or `none`. `parallel_tool_calls` defaults to
+`true` and accepts only exact `true`; either control requires `tools`. Tools cannot be combined with
+thinking, logprobs, structured outputs, a non-text `response_format`, or image messages. Historical
+assistant calls require unique IDs, function type, valid names, and JSON-string object arguments.
+Each immediately following tool-result turn must resolve every declared call exactly once before a
+non-tool turn. External messages remain unchanged; only a detached template copy converts argument
+strings to objects.
+
+In `auto` mode, complete schema-valid Qwen3 Coder XML candidates become OpenAI `tool_calls` with
+independent call indexes and `finish_reason: "tool_calls"`. Parsed responses contain no raw Qwen
+tags. Ordinary text and malformed or incomplete candidates remain exact assistant text with the
+native finish reason. Candidate regions are buffered in raw SSE because argument deltas cannot be
+retracted safely. Native prompt, completion, cached, and reasoning token accounting remains
+authoritative and is never recomputed from serialized arguments. Flash parses calls but does not
+execute or resubmit them.
 
 A buffered response contains one indexed `choices` entry per generated choice. Each choice keeps its
 own finish reason and, when requested, OpenAI token logprobs. Prompt and cached tokens count once per
@@ -162,8 +185,9 @@ request lifecycle before emitting successful terminals. Managed serving forwards
 SSE frames without flattening choices or rewriting provenance.
 
 The decoded convenience `chat_stream` iterator remains text-only and single-choice. It rejects
-`n != 1` and any logprob request before opening transport; use buffered JSON or raw SSE for those
-features.
+`n != 1`, logprobs, and tools before opening transport; use buffered JSON or raw SSE for those
+features. Raw `/generate` and `/adapters/{id}/generate` remain tool-free. Buffered hosted responses
+and raw hosted SSE are authoritative; managed serving forwards them and never reparses tool calls.
 
 Every successful response reports the exact revision, checkpoint, and Hugging Face commit in:
 

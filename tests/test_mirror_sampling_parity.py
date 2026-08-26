@@ -18,6 +18,7 @@ from flash.serve.request.openai import (
 )
 from flash.serve.runtime.errors import RuntimeNotReadyError
 from flash.serve.runtime.sampling import complete_indexed_outputs, normalize_token_logprobs
+from flash.serve.runtime.tool_calls import ParsedToolCall
 from flash.serve.runtime.types import (
     GenerationChoice,
     GenerationResult,
@@ -317,6 +318,128 @@ def test_packaged_sse_emits_empty_content_with_logprobs():
     assert choice["logprobs"] == {"content": token_logprobs}
 
 
+def _response_context():
+    resolved = SimpleNamespace(
+        requested_model="adapter",
+        adapter=SimpleNamespace(
+            adapter_revision="adapter",
+            checkpoint="run",
+            source_revision="a" * 40,
+            source_subfolder=None,
+            aggregate_sha256="incarnation",
+        ),
+    )
+    manifest = SimpleNamespace(
+        deployment_id="deployment",
+        spec_id="spec",
+        manifest_id="manifest",
+        expected_oci_digest="sha256:image",
+        logical_base_model="base",
+        logical_base_revision="b" * 40,
+        engine=SimpleNamespace(
+            engine_id="engine",
+            served_model="served",
+            model_revision="c" * 40,
+            tokenizer_model="tokenizer",
+            tokenizer_revision="d" * 40,
+        ),
+    )
+    return manifest, resolved
+
+
+def test_packaged_buffered_response_formats_structured_tool_calls():
+    choice = GenerationChoice(
+        index=0,
+        text="",
+        finish_reason="tool_calls",
+        token_ids=(1, 2),
+        tool_calls=(ParsedToolCall("call_1", "weather", '{"city":"Paris"}'),),
+    )
+    result = GenerationResult(
+        request_id="request",
+        adapter_id="revision",
+        incarnation="digest",
+        choices=(choice,),
+        prompt_tokens=3,
+        completion_tokens=2,
+        cached_tokens=0,
+        cached_tokens_reported=True,
+        thinking=False,
+    )
+    manifest, resolved = _response_context()
+    response = nonstream_response(result, manifest, resolved)
+    wire_choice = response["choices"][0]
+    assert wire_choice["message"]["content"] is None
+    assert wire_choice["message"]["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+        }
+    ]
+    assert wire_choice["finish_reason"] == "tool_calls"
+
+
+def test_packaged_sse_emits_complete_structured_tool_delta() -> None:
+    ready = StreamReady(
+        request_id="request",
+        runtime_id="runtime",
+        adapter_id="adapter",
+        incarnation="incarnation",
+        thinking=False,
+    )
+    _, resolved = _response_context()
+    call = ParsedToolCall("call_1", "weather", '{"city":"Paris"}')
+
+    async def events():
+        yield StreamDelta(index=0, text="", tool_calls=(call,))
+        yield StreamChoiceFinished(
+            index=0,
+            text="raw tags",
+            finish_reason="tool_calls",
+            token_ids=(1,),
+            tool_calls=(call,),
+        )
+        yield StreamFinished(
+            request_id="request",
+            runtime_id="runtime",
+            adapter_id="adapter",
+            incarnation="incarnation",
+            choices=(
+                GenerationChoice(
+                    index=0,
+                    text="raw tags",
+                    finish_reason="tool_calls",
+                    token_ids=(1,),
+                    tool_calls=(call,),
+                ),
+            ),
+            prompt_tokens=2,
+            completion_tokens=1,
+            cached_tokens=0,
+            cached_tokens_reported=True,
+            thinking=False,
+        )
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in stream_chat_body(
+                events(), ready, resolved, {}, choice_count=1, include_usage=False
+            )
+        ]
+
+    payloads = [json.loads(chunk[6:-2]) for chunk in asyncio.run(collect())[:-1]]
+    tool_delta = next(
+        payload["choices"][0]["delta"]["tool_calls"]
+        for payload in payloads
+        if payload["choices"][0]["delta"].get("tool_calls")
+    )
+    assert tool_delta[0]["index"] == 0
+    assert tool_delta[0]["id"] == "call_1"
+    assert all("<tool_call>" not in chunk.decode() for chunk in asyncio.run(collect()))
+
+
 def test_usage_facts_keeps_aggregate_completion_count():
     facts = usage_facts(
         {
@@ -342,6 +465,8 @@ def test_text_only_stream_rejects_multi_choice_before_transport(monkeypatch):
         deploy.chat_stream("run", [{"role": "user", "content": "hi"}], n=2)
     with pytest.raises(ValueError, match="does not expose logprobs"):
         deploy.chat_stream("run", [{"role": "user", "content": "hi"}], logprobs=True)
+    with pytest.raises(ValueError, match="does not support tools"):
+        deploy.chat_stream("run", [{"role": "user", "content": "hi"}], tools=[])
 
 
 @pytest.mark.parametrize(

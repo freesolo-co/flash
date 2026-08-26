@@ -327,6 +327,33 @@ def test_prepare_chat_request_sends_step_without_adapter_revision() -> None:
     assert "adapter_revision" not in body
 
 
+def test_prepare_chat_request_defaults_tool_controls() -> None:
+    base_run_id, body = _prepare_chat_request(
+        "run-abc",
+        [{"role": "user", "content": "weather"}],
+        0.0,
+        32,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+    )
+
+    assert base_run_id == "run-abc"
+    assert body["tool_choice"] == "auto"
+    assert body["parallel_tool_calls"] is True
+
+
 def test_chat_omits_thinking_template_controls(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")

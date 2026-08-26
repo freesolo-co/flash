@@ -212,7 +212,13 @@ def openai_chat_completion(
         reasoning, content = split_reasoning(
             str(choice["text"]), thinking=bool(generation.get("thinking"))
         )
-        message: dict[str, Any] = {"role": "assistant", "content": content}
+        tool_calls = choice.get("tool_calls") or []
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": content if content else None if tool_calls else content,
+        }
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         if reasoning is not None:
             message["reasoning_content"] = reasoning
         choice_logprobs = choice.get("logprobs")
@@ -260,4 +266,7 @@ def openai_generate_fields(request: NormalizedChatRequest, adapter_id: str) -> d
         "chat_template_kwargs": request.chat_template_kwargs,
         "stop": list(request.stop) or None,
         "structured_outputs": request.structured_outputs,
+        "tools": None if request.tools is None else [tool.wire() for tool in request.tools],
+        "tool_choice": request.tool_choice,
+        "parallel_tool_calls": request.parallel_tool_calls,
     }

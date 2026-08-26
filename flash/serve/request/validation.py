@@ -113,7 +113,6 @@ def normalize_messages(
             normalized.append(dict(message))
             continue
         if content is None and role == "assistant" and "tool_calls" in message:
-            validate_tool_calls(message["tool_calls"], message_index, error_type=error_type)
             normalized.append(dict(message))
             continue
         if not isinstance(content, list):
@@ -133,19 +132,10 @@ def normalize_messages(
                 ),
             }
         )
+    from flash.serve.runtime.tool_calls import validate_tool_history
+
+    validate_tool_history(normalized, error_type=error_type)
     return normalized, sources
-
-
-def validate_tool_calls(tool_calls: Any, message_index: int, *, error_type: ErrorType) -> None:
-    # validation stops at structure because template-specific requirements differ. an empty list
-    # leaves content null with nothing to render, so it is invalid for every template.
-    if not isinstance(tool_calls, list) or not tool_calls:
-        raise error_type(
-            f"message {message_index} tool_calls must be a nonempty list of call objects"
-        )
-    for call_index, call in enumerate(tool_calls):
-        if not isinstance(call, dict):
-            raise error_type(f"message {message_index} tool call {call_index} must be an object")
 
 
 def normalize_blocks(

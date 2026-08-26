@@ -25,6 +25,13 @@ from flash.serve.runtime import (
 )
 from flash.serve.runtime.multimodal import prepare_multimodal_request
 from flash.serve.runtime.prompt import PromptPreparer, resolve_thinking
+from flash.serve.runtime.tool_calls import (
+    FunctionTool,
+    ToolCallStreamParser,
+    detached_template_messages,
+    normalize_tools,
+    parse_qwen3_coder_output,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}}
@@ -369,9 +376,8 @@ def test_a_template_rejecting_the_request_is_a_client_error_not_an_unavailable_e
 ) -> None:
     """the template, not the engine, is what refused -- and only the request chose that shape.
 
-    Structural validation upstream deliberately stops short of any single template's rules, so a
-    payload it accepts can still be unrenderable: Qwen3.5 raises `TypeError` on a tool call whose
-    `arguments` is the string the OpenAI schema specifies. Preparation runs before
+    Strict history validation accepts this complete OpenAI lifecycle, but a tokenizer may still
+    reject a template-specific shape. Preparation runs before
     `_rejection_as_prompt_error`, so an unclassified failure here answered 503 and invited a retry
     that must fail identically, while the engine was healthy the whole time.
     """
@@ -393,10 +399,16 @@ def test_a_template_rejecting_the_request_is_a_client_error_not_an_unavailable_e
                     messages=[
                         {
                             "role": "assistant",
+                            "content": None,
                             "tool_calls": [
-                                {"function": {"name": "f", "arguments": "{}"}},
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "f", "arguments": "{}"},
+                                },
                             ],
-                        }
+                        },
+                        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
                     ]
                 ),
                 False,
@@ -539,6 +551,113 @@ def test_multimodal_prompt_failure_closes_decoded_images(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="render failed"):
         asyncio.run(preparer.prepare(request, False))
     assert closed == [True]
+
+
+def _runtime_tools():
+    return normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                        "required": ["city"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+
+
+def test_generation_request_revalidates_tools_and_rejects_tool_images() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="tools must be a nonempty array"):
+        GenerationRequest(
+            messages=[{"role": "user", "content": "weather"}],
+            tools=(),
+            tool_choice="auto",
+            parallel_tool_calls=True,
+        )
+    with pytest.raises(RuntimeConfigurationError, match="additionalProperties must be false"):
+        GenerationRequest(
+            messages=[{"role": "user", "content": "weather"}],
+            tools=(
+                FunctionTool(
+                    "weather",
+                    None,
+                    {"type": "object", "properties": {}, "required": []},
+                ),
+            ),
+            tool_choice="auto",
+            parallel_tool_calls=True,
+        )
+    with pytest.raises(RuntimeConfigurationError, match="image messages"):
+        GenerationRequest(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": _data_uri()}],
+                }
+            ],
+            tools=_runtime_tools(),
+            tool_choice="auto",
+            parallel_tool_calls=True,
+        )
+
+
+def test_qwen3_coder_parser_validates_schema_and_exact_fallback() -> None:
+    valid = (
+        "<tool_call>\n<function=weather>\n"
+        "<parameter=city>\nParis\n</parameter>\n"
+        "<parameter=days>\n2\n</parameter>\n"
+        "</function>\n</tool_call>  \n\t"
+    )
+    result = parse_qwen3_coder_output(valid, _runtime_tools(), id_factory=lambda: "call_fixed")
+    assert result.content is None
+    assert result.calls[0].wire() == {
+        "id": "call_fixed",
+        "type": "function",
+        "function": {"name": "weather", "arguments": '{"city":"Paris","days":2}'},
+    }
+    malformed = valid.replace("<parameter=days>", "<parameter=unknown>")
+    assert parse_qwen3_coder_output(malformed, _runtime_tools()).content == malformed
+
+
+def test_qwen3_coder_stream_parser_buffers_candidates_and_falls_back_exactly() -> None:
+    parser = ToolCallStreamParser(_runtime_tools(), id_factory=lambda: "call_fixed")
+    pieces = [
+        "prefix <tool",
+        "_call>\n<function=weather>\n<parameter=city>\nParis",
+        "\n</parameter>\n</function>\n</tool_call>  \n",
+    ]
+    assert [parser.feed(piece) for piece in pieces] == ["prefix ", "", ""]
+    parsed = parser.finish()
+    assert parsed.content is None
+    assert parsed.calls[0].name == "weather"
+
+
+def test_detached_history_arguments_are_objects_without_caller_mutation() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                }
+            ],
+        }
+    ]
+    converted = detached_template_messages(messages)
+    assert converted[0]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
 
 
 def test_a_multimodal_template_rejection_is_a_client_error_not_an_unavailable_engine(

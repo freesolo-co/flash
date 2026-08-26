@@ -403,6 +403,59 @@ def test_chat_rejects_conflicting_structured_forms_and_invalid_stop(api, monkeyp
     assert response.status_code == 400
 
 
+def test_managed_chat_forwards_normalized_tools_without_parsing_output(api, monkeypatch):
+    import flash.server.asgi.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    seen = {}
+
+    def fake_chat(**kwargs):
+        seen.update(kwargs)
+        result = _managed_chat_result(kwargs["run_id"])
+        result["choices"][0] = {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                    }
+                ],
+            },
+            "finish_reason": "tool_calls",
+        }
+        return result
+
+    monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "weather"}], "tools": tools},
+        headers=_bearer(key),
+    )
+    assert response.status_code == 200, response.text
+    assert seen["tool_choice"] == "auto"
+    assert seen["parallel_tool_calls"] is True
+    assert seen["tools"][0].name == "weather"
+    assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+
+
 @pytest.mark.parametrize("strict", [None, True])
 def test_chat_accepts_strict_json_schema_response_format(api, monkeypatch, strict):
     import flash.runner.lifecycle.status as runner_status

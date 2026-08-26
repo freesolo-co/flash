@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl
-from flash.serving.src.engine.model_config import reasoning_parser_for
+from flash.serving.src.engine.model_config import reasoning_parser_for, tool_parser_for
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.openai_request import OpenAIGenerateRequest
 from flash.serving.src.io.openai_stream import openai_chat_stream
@@ -67,6 +67,52 @@ class _BufferedChoiceEngine:
         )
 
 
+class _ToolChoiceEngine:
+    async def generate(self, _prompt: Any, _sampling: Any, _request_id: str, **_kwargs: Any):
+        yield SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    index=0,
+                    text=(
+                        "<tool_call>\n<function=weather>\n"
+                        "<parameter=city>\nParis\n</parameter>\n"
+                        "</function>\n</tool_call>  \n\t"
+                    ),
+                    finish_reason="stop",
+                    token_ids=[10, 11],
+                    logprobs=None,
+                )
+            ],
+            prompt_token_ids=[1, 2],
+            num_cached_tokens=0,
+        )
+
+
+class _StreamingToolChoiceEngine:
+    async def generate(self, _prompt: Any, _sampling: Any, _request_id: str, **_kwargs: Any):
+        for text, token_id, finish_reason in (
+            ("<tool_call>\n<function=weather>\n", 10, None),
+            (
+                "<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>  \n",
+                11,
+                "stop",
+            ),
+        ):
+            yield SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        index=0,
+                        text=text,
+                        finish_reason=finish_reason,
+                        token_ids=[token_id],
+                        logprobs=None,
+                    )
+                ],
+                prompt_token_ids=[1, 2],
+                num_cached_tokens=0,
+            )
+
+
 class _InterleavedChoiceEngine:
     def __init__(self) -> None:
         self.sampling_params: Any = None
@@ -96,10 +142,28 @@ class _InterleavedChoiceEngine:
         )
 
 
+def _tool_payload() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
 def _engine(vllm_engine: Any, *, thinking: bool = False) -> _LoraEngineImpl:
     engine = object.__new__(_LoraEngineImpl)
     engine.base_model = QWEN
     engine.reasoning_parser = reasoning_parser_for(QWEN)
+    engine.tool_parser = tool_parser_for(QWEN)
     engine.tokenizer = _Tokenizer()
     engine.registry = AdapterRegistry()
     engine.registry.hydrate(
@@ -134,6 +198,54 @@ def test_hosted_base_model_engine_honors_boolean_thinking_override() -> None:
         )
     )
     assert result["thinking"] is False
+
+
+def test_hosted_buffered_generation_parses_qualified_tool_calls() -> None:
+    result = asyncio.run(
+        _engine(_ToolChoiceEngine())._generate(
+            {
+                "adapter_id": "adapter",
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": _tool_payload(),
+                "tool_choice": "auto",
+                "parallel_tool_calls": True,
+            }
+        )
+    )
+    choice = result["choices"][0]
+    assert choice["text"] == ""
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["tool_calls"][0]["function"] == {
+        "name": "weather",
+        "arguments": '{"city":"Paris"}',
+    }
+    assert result["completion_tokens"] == 2
+
+
+def test_hosted_stream_reports_hidden_tool_usage_before_structured_delta() -> None:
+    engine = _engine(_StreamingToolChoiceEngine())
+
+    async def collect() -> list[dict[str, Any]]:
+        return [
+            event
+            async for event in engine._stream_generate(
+                {
+                    "adapter_id": "adapter",
+                    "messages": [{"role": "user", "content": "weather"}],
+                    "tools": _tool_payload(),
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": True,
+                }
+            )
+        ]
+
+    events = asyncio.run(collect())
+    progress = [event for event in events if event["type"] == "usage_progress"]
+    tool_delta = next(event for event in events if event.get("tool_calls"))
+    assert [event["completion_tokens"] for event in progress] == [1, 2]
+    assert tool_delta["completion_tokens"] == 2
+    assert tool_delta["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
+    assert events[-1]["completion_tokens"] == 2
 
 
 def _buffered_result(
@@ -247,6 +359,29 @@ class _UsageSession:
         return None
 
 
+def test_hosted_private_tool_envelope_requires_text_chat_messages() -> None:
+    controls = {
+        "adapter_id": "adapter",
+        "tools": _tool_payload(),
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+    with pytest.raises(ValueError, match="tools require chat messages"):
+        OpenAIGenerateRequest.model_validate({**controls, "prompt": "weather"})
+    with pytest.raises(ValueError, match="image messages"):
+        OpenAIGenerateRequest.model_validate(
+            {
+                **controls,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image", "image": "data:image/png;base64,AA=="}],
+                    }
+                ],
+            }
+        )
+
+
 def test_raw_generate_schema_forbids_openai_sampling_fields() -> None:
     base = {"adapter_id": "adapter", "prompt": "hi"}
     for field, value in (
@@ -333,6 +468,37 @@ def test_hosted_sse_emits_empty_content_with_logprobs() -> None:
     )
     assert choice["delta"] == {"content": ""}
     assert choice["logprobs"] == {"content": token_logprobs}
+
+
+def test_hosted_sse_uses_hidden_usage_progress_without_serializing_it() -> None:
+    session = _UsageSession()
+    record = _record()
+
+    async def events():
+        yield {"type": "ready", "thinking": False, "prompt_tokens": 2, "completion_tokens": 0}
+        yield {"type": "usage_progress", "prompt_tokens": 2, "completion_tokens": 2}
+        yield {"type": "error", "message": "engine failed", "code": 502}
+
+    async def collect() -> list[bytes]:
+        return [
+            chunk
+            async for chunk in openai_chat_stream(
+                AdapterRouter([record]),
+                record=record,
+                events=events(),
+                adapter_id="adapter",
+                completion_id="chatcmpl-test",
+                created=123,
+                include_usage=False,
+                usage_session=session,  # type: ignore[arg-type]
+                thinking=False,
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+    assert session.failed[0][0]["completion_tokens"] == 2
+    assert session.failed[0][1] == "engine_failed"
+    assert all(b"usage_progress" not in chunk for chunk in chunks)
 
 
 def test_hosted_sse_has_independent_reasoning_and_post_settlement_terminals() -> None:

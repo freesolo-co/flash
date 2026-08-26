@@ -15,6 +15,7 @@ from flash.serving.src.engine.model_config import (
     reasoning_parser_for,
     serve_model_for,
     supports_image_input,
+    tool_parser_for,
 )
 
 
@@ -50,6 +51,11 @@ def test_uncataloged_base_models_are_not_supported() -> None:
 def test_reasoning_parser_is_configured_for_every_model() -> None:
     for model in base_models():
         assert reasoning_parser_for(model) == "qwen3"
+
+
+def test_tool_parser_is_qualified_only_for_exact_qwen35() -> None:
+    assert tool_parser_for("Qwen/Qwen3.5-9B") == "qwen3_coder"
+    assert tool_parser_for("Qwen/Qwen3.6-35B-A3B") is None
 
 
 def test_no_model_runs_language_model_only() -> None:

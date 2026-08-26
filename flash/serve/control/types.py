@@ -258,6 +258,7 @@ class EngineIdentity:
     engine_args_fingerprint: str
     tokenizer_kwargs_fingerprint: str
     processor_kwargs_fingerprint: str
+    tool_parser: str | None = None
 
     def __post_init__(self) -> None:
         validate_engine_identity(self)
@@ -325,6 +326,9 @@ def validate_engine_identity(identity: EngineIdentity) -> None:
     if identity.modality == "text" and identity.enable_tower_connector_lora:
         raise ValueError("text engines cannot enable tower connector lora")
     _require_optional_nonempty(identity.reasoning_parser, "reasoning_parser")
+    tool_parser = _require_optional_nonempty(identity.tool_parser, "tool_parser")
+    if tool_parser not in {None, "qwen3_coder"}:
+        raise ValueError("tool_parser must be qwen3_coder or null")
     _require_bool(identity.trust_remote_code, "trust_remote_code")
     for name in (
         "engine_args_fingerprint",
@@ -530,6 +534,12 @@ def _validate_deployment_components(
                 "all adapters in one deployment must use the same logical base model and revision"
             )
 
+    if expected_base is None:
+        raise ValueError("deployments require at least one logical base model")
+    from flash.serve.runtime.tool_calls import qualified_tool_parser
+
+    if engine.tool_parser != qualified_tool_parser(expected_base[0]):
+        raise ValueError("engine tool_parser does not match the qualified logical base model")
     if len(adapters) > engine.adapter_capacity:
         raise ValueError("deployment adapter count exceeds the validated max_cpu_loras capacity")
 

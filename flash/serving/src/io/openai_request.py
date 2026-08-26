@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import field_validator, model_validator
 
+from flash.serve.request.validation import MAX_SOURCE_CHARS, has_image_blocks, normalize_messages
 from flash.serve.runtime.sampling import (
     validate_choice_count,
     validate_logprobs,
@@ -14,6 +15,7 @@ from flash.serve.runtime.sampling import (
     validate_seed,
     validate_top_logprobs,
 )
+from flash.serve.runtime.tool_calls import normalize_tools, tools_wire
 from flash.serving.src.io.schemas import GenerateRequest
 
 
@@ -26,6 +28,9 @@ class OpenAIGenerateRequest(GenerateRequest):
     presence_penalty: float = 0.0
     logprobs: bool = False
     top_logprobs: int = 0
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | None = None
+    parallel_tool_calls: bool | None = None
 
     @field_validator("n", mode="before")
     @classmethod
@@ -52,6 +57,20 @@ class OpenAIGenerateRequest(GenerateRequest):
     def validate_top_logprobs_value(cls, value: Any) -> int:
         return validate_top_logprobs(value)
 
+    @model_validator(mode="before")
+    @classmethod
+    def validate_tools(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or value.get("tools") is None:
+            return value
+        normalized = normalize_tools(value["tools"])
+        updated = dict(value)
+        updated["tools"] = tools_wire(normalized)
+        if updated.get("tool_choice") not in {"auto", "none"}:
+            raise ValueError("tool_choice must be auto or none")
+        if updated.get("parallel_tool_calls") is not True:
+            raise ValueError("parallel_tool_calls must be true")
+        return updated
+
     @model_validator(mode="after")
     def validate_sampling(self) -> OpenAIGenerateRequest:
         validate_sampling_relationships(
@@ -60,4 +79,22 @@ class OpenAIGenerateRequest(GenerateRequest):
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
         )
+        if self.tools is None and (
+            self.tool_choice is not None or self.parallel_tool_calls is not None
+        ):
+            raise ValueError("tool controls require tools")
+        if self.tools is not None:
+            if self.messages is None:
+                raise ValueError("tools require chat messages")
+            normalize_messages(
+                self.messages,
+                sequence_types=list,
+                sequence_error="messages must be a nonempty array of objects",
+                error_type=ValueError,
+                max_source_chars=MAX_SOURCE_CHARS,
+            )
+            if has_image_blocks(self.messages, sequence_types=list):
+                raise ValueError("tools cannot be combined with image messages")
+            if self.logprobs or self.structured_outputs:
+                raise ValueError("tools cannot be combined with logprobs or structured outputs")
         return self

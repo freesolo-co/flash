@@ -727,7 +727,18 @@ def test_raw_generate_responses_exclude_internal_fields(app_setup, path, payload
 
 
 @pytest.mark.parametrize(
-    "field", ["n", "seed", "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs"]
+    "field",
+    [
+        "n",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "logprobs",
+        "top_logprobs",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+    ],
 )
 @pytest.mark.parametrize(
     ("path", "payload"),

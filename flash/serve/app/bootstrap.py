@@ -95,6 +95,7 @@ def engine_config_from_manifest(manifest: ServingManifest) -> EngineConfig:
         mm_processor_cache_gb=identity.mm_processor_cache_gb,
         enable_tower_connector_lora=identity.enable_tower_connector_lora,
         reasoning_parser=identity.reasoning_parser,
+        tool_parser=identity.tool_parser,
         engine_args=named_args,
         tokenizer_kwargs=dict(manifest.tokenizer_kwargs),
         processor_kwargs=dict(manifest.processor_kwargs),

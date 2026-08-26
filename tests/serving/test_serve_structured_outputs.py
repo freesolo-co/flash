@@ -340,7 +340,6 @@ def test_reasoning_state_matches_effective_thinking_mode(modal_app_module):
     assert thinking.engine.reasoning_ended[-1] is False
     assert thinking.engine.reasoning_parser_kwargs[-1] == {
         "chat_template_kwargs": {
-            "tools": ["search"],
             "enable_thinking": True,
             "preserve_thinking": False,
         }

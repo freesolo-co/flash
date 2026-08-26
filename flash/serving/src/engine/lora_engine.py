@@ -20,6 +20,7 @@ from typing import Any
 # _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
 # the vllm build probes engine_boot uses.
 from flash.content.thinking import messages_for_chat_template
+from flash.serve.runtime.tool_calls import detached_template_messages, normalize_tools, tools_wire
 from flash.serving.src.engine.lora_entries import _LoraEntry, cached_lora_request, entries_for
 from flash.serving.src.engine.model_config import (
     engine_overrides_for,
@@ -28,6 +29,7 @@ from flash.serving.src.engine.model_config import (
     immutable_serving_revisions,
     supports_image_input,
     tokenizer_model_for,
+    tool_parser_for,
 )
 from flash.serving.src.engine.support import (
     _adapter_cache_path,
@@ -93,6 +95,7 @@ class _LoraEngineImpl:
         )
         self._pin_loras = pin_loras_default(overrides, cfg)
         self.reasoning_parser = kwargs.get("reasoning_parser")
+        self.tool_parser = tool_parser_for(self.base_model)
         self.engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**kwargs))
         # No in-engine kernel-patching hook runs here (2026-07-05 35B outage post-mortem): under
         # vLLM V1 the model executes in a SEPARATE EngineCore process, so patching this process's
@@ -423,11 +426,14 @@ class _LoraEngineImpl:
         ctk = _safe_chat_template_kwargs(getattr(payload, "chat_template_kwargs", None))
         if not isinstance(thinking_default, bool):
             raise ValueError("adapter thinking default is required")
-        return {
+        effective = {
             **ctk,
             "enable_thinking": thinking_default,
             "preserve_thinking": False,
         }
+        if getattr(payload, "tools", None) is not None and payload.tool_choice == "auto":
+            effective["tools"] = tools_wire(normalize_tools(payload.tools))
+        return effective
 
     def _prompt_cache_key(
         self, payload: Any, thinking_default: bool | None = None
@@ -505,13 +511,16 @@ class _LoraEngineImpl:
             # trained ``thinking`` value so every caller renders in the mode this LoRA was trained
             # with. Reserved/return-shape kwargs are dropped before rendering to avoid 500s.
             ctk = self._effective_chat_template_kwargs(payload, thinking_default)
-            prompt_token_ids = self.tokenizer.apply_chat_template(
-                messages_for_chat_template(payload.messages),
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=False,
-                **ctk,
-            )
+            try:
+                prompt_token_ids = self.tokenizer.apply_chat_template(
+                    messages_for_chat_template(detached_template_messages(payload.messages)),
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=False,
+                    **ctk,
+                )
+            except Exception as exc:
+                raise ValueError(f"chat template rejected the request messages: {exc}") from exc
             return list(prompt_token_ids)
         if payload.prompt:
             prompt_token_ids = self.tokenizer.encode(payload.prompt, add_special_tokens=False)
@@ -549,7 +558,7 @@ class _LoraEngineImpl:
             # over the message list, and its sibling image decode above already runs off-loop.
             rendered = await asyncio.to_thread(
                 lambda: processor.apply_chat_template(
-                    messages_for_chat_template(template_messages),
+                    messages_for_chat_template(detached_template_messages(template_messages)),
                     tokenize=False,
                     add_generation_prompt=True,
                     **ctk,

@@ -1208,8 +1208,18 @@ def test_a_malformed_message_is_rejected_before_the_runtime_is_reached(
             "assistant tool calls",
             [
                 {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
-                {"role": "tool", "content": "result"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "result", "tool_call_id": "1"},
             ],
         ),
     ],

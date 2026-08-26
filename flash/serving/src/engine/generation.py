@@ -7,12 +7,18 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from flash.serve.runtime.sampling import (
     complete_indexed_outputs,
     indexed_outputs,
     normalize_token_logprobs,
+)
+from flash.serve.runtime.tool_calls import (
+    ParsedToolCall,
+    ToolCallStreamParser,
+    normalize_tools,
+    parse_qwen3_coder_output,
 )
 from flash.serving.src.engine.support import (
     _cached_tokens_reported,
@@ -27,6 +33,7 @@ class _ChoiceState(TypedDict):
     text: str
     token_ids: list[int]
     finish_reason: str | None
+    tool_calls: NotRequired[list[dict[str, Any]]]
 
 
 _OPENAI_FIELDS = frozenset(
@@ -37,6 +44,9 @@ _OPENAI_FIELDS = frozenset(
         "presence_penalty",
         "logprobs",
         "top_logprobs",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
     }
 )
 
@@ -67,14 +77,22 @@ def _sampling_params(payload: OpenAIGenerateRequest, structured: Any, output_kin
     )
 
 
-def _choice(index: int, output: Any, *, top_logprobs: int) -> dict[str, Any]:
+def _choice(index: int, output: Any, *, top_logprobs: int, tools: Any = None) -> dict[str, Any]:
     token_ids = [int(value) for value in (getattr(output, "token_ids", None) or [])]
     finish_reason = getattr(output, "finish_reason", None)
     if not isinstance(finish_reason, str) or not finish_reason:
         raise RuntimeError("vLLM generation ended without a finish reason")
+    text = str(getattr(output, "text", "") or "")
+    tool_calls: tuple[ParsedToolCall, ...] = ()
+    if tools is not None:
+        parsed = parse_qwen3_coder_output(text, tools)
+        if parsed.tools_called:
+            text = parsed.content or ""
+            tool_calls = parsed.calls
+            finish_reason = "tool_calls"
     return {
         "index": index,
-        "text": str(getattr(output, "text", "") or ""),
+        "text": text,
         "finish_reason": finish_reason,
         "token_ids": token_ids,
         "logprobs": normalize_token_logprobs(
@@ -82,7 +100,23 @@ def _choice(index: int, output: Any, *, top_logprobs: int) -> dict[str, Any]:
             getattr(output, "logprobs", None),
             top_logprobs=top_logprobs,
         ),
+        "tool_calls": [call.wire() for call in tool_calls],
     }
+
+
+def _validate_tool_request(owner: Any, payload: OpenAIGenerateRequest, thinking: bool) -> None:
+    if payload.tools is None:
+        return
+    if thinking:
+        raise ValueError("tools are not supported for thinking-enabled generation")
+    if getattr(owner, "tool_parser", None) != "qwen3_coder":
+        raise ValueError("this serving engine is not qualified for tool calling")
+
+
+def _active_tools(payload: OpenAIGenerateRequest) -> Any:
+    if payload.tools is None or payload.tool_choice != "auto":
+        return None
+    return normalize_tools(payload.tools)
 
 
 def _usage_fields(
@@ -132,6 +166,7 @@ async def generate(
     thinking = owner._thinking_default(record, payload)
     if thinking and payload.logprobs:
         raise ValueError("logprobs are not supported for thinking-enabled generation")
+    _validate_tool_request(owner, payload, thinking)
     structured, reasoning_ended, parser_kwargs = owner._structured_outputs_state(
         payload, record, thinking
     )
@@ -158,7 +193,12 @@ async def generate(
     if final_output is None:
         raise RuntimeError("vLLM returned no output")
     choices = [
-        _choice(index, output, top_logprobs=payload.top_logprobs)
+        _choice(
+            index,
+            output,
+            top_logprobs=payload.top_logprobs,
+            tools=_active_tools(payload),
+        )
         for index, output in sorted(complete_indexed_outputs(final_output, n=payload.n).items())
     ]
     completion_ids = [token for choice in choices for token in choice["token_ids"]]
@@ -183,6 +223,113 @@ async def generate(
     }
 
 
+def _consume_stream_output(
+    current: Any,
+    payload: OpenAIGenerateRequest,
+    choice_state: dict[int, _ChoiceState],
+    completion_ids: list[int],
+    tool_parsers: dict[int, ToolCallStreamParser],
+    usage_kwargs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for index, output in sorted(indexed_outputs(current, n=payload.n).items()):
+        state = choice_state[index]
+        if state["finish_reason"] is not None:
+            raise RuntimeError("vLLM emitted data after a choice terminal")
+        token_ids = [int(value) for value in (getattr(output, "token_ids", None) or [])]
+        logprobs = normalize_token_logprobs(
+            token_ids,
+            getattr(output, "logprobs", None),
+            top_logprobs=payload.top_logprobs,
+        )
+        text = str(getattr(output, "text", "") or "")
+        state["text"] += text
+        state["token_ids"].extend(token_ids)
+        completion_ids.extend(token_ids)
+        visible = tool_parsers[index].feed(text) if index in tool_parsers else text
+        if visible or logprobs is not None:
+            events.append(
+                {
+                    "type": "delta",
+                    "index": index,
+                    "text": visible,
+                    "logprobs": logprobs,
+                    **_usage_fields(current, completion_ids, **usage_kwargs),
+                }
+            )
+        elif token_ids:
+            events.append(
+                {
+                    "type": "usage_progress",
+                    **_usage_fields(current, completion_ids, **usage_kwargs),
+                }
+            )
+        finish_reason = getattr(output, "finish_reason", None)
+        if finish_reason is not None:
+            events.extend(
+                _finish_stream_choice(
+                    current,
+                    index,
+                    finish_reason,
+                    state,
+                    completion_ids,
+                    tool_parsers,
+                    usage_kwargs,
+                )
+            )
+    return events
+
+
+def _finish_stream_choice(
+    current: Any,
+    index: int,
+    finish_reason: Any,
+    state: _ChoiceState,
+    completion_ids: list[int],
+    tool_parsers: dict[int, ToolCallStreamParser],
+    usage_kwargs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not isinstance(finish_reason, str) or not finish_reason:
+        raise RuntimeError("vLLM returned an invalid finish reason")
+    events: list[dict[str, Any]] = []
+    tool_calls: list[dict[str, Any]] = []
+    if index in tool_parsers:
+        parsed = tool_parsers[index].finish()
+        if parsed.tools_called:
+            tool_calls = [call.wire() for call in parsed.calls]
+            finish_reason = "tool_calls"
+            events.append(
+                {
+                    "type": "delta",
+                    "index": index,
+                    "text": "",
+                    "tool_calls": tool_calls,
+                    **_usage_fields(current, completion_ids, **usage_kwargs),
+                }
+            )
+        elif parsed.content:
+            events.append(
+                {
+                    "type": "delta",
+                    "index": index,
+                    "text": parsed.content,
+                    **_usage_fields(current, completion_ids, **usage_kwargs),
+                }
+            )
+    state["finish_reason"] = finish_reason
+    if tool_calls:
+        state["tool_calls"] = tool_calls
+    events.append(
+        {
+            "type": "choice_finished",
+            "index": index,
+            "finish_reason": finish_reason,
+            **_usage_fields(current, completion_ids, **usage_kwargs),
+        }
+    )
+    return events
+
+
 async def stream_generate(
     owner: Any,
     payload_dict: dict[str, Any],
@@ -199,6 +346,7 @@ async def stream_generate(
     thinking = owner._thinking_default(record, payload)
     if thinking and payload.logprobs:
         raise ValueError("logprobs are not supported for thinking-enabled generation")
+    _validate_tool_request(owner, payload, thinking)
     structured, reasoning_ended, parser_kwargs = owner._structured_outputs_state(
         payload, record, thinking
     )
@@ -211,6 +359,12 @@ async def stream_generate(
     choice_state: dict[int, _ChoiceState] = {
         index: {"text": "", "token_ids": [], "finish_reason": None} for index in range(payload.n)
     }
+    active_tools = _active_tools(payload)
+    tool_parsers = (
+        {index: ToolCallStreamParser(active_tools) for index in range(payload.n)}
+        if active_tools is not None
+        else {}
+    )
     usage_kwargs = {
         "start": start,
         "request_id": request_id,
@@ -250,39 +404,15 @@ async def stream_generate(
         try:
             while True:
                 last_output = current
-                for index, output in sorted(indexed_outputs(current, n=payload.n).items()):
-                    state = choice_state[index]
-                    if state["finish_reason"] is not None:
-                        raise RuntimeError("vLLM emitted data after a choice terminal")
-                    token_ids = [int(value) for value in (getattr(output, "token_ids", None) or [])]
-                    logprobs = normalize_token_logprobs(
-                        token_ids,
-                        getattr(output, "logprobs", None),
-                        top_logprobs=payload.top_logprobs,
-                    )
-                    text = str(getattr(output, "text", "") or "")
-                    state["text"] += text
-                    state["token_ids"].extend(token_ids)
-                    completion_ids.extend(token_ids)
-                    if text or logprobs is not None:
-                        yield {
-                            "type": "delta",
-                            "index": index,
-                            "text": text,
-                            "logprobs": logprobs,
-                            **_usage_fields(current, completion_ids, **usage_kwargs),
-                        }
-                    finish_reason = getattr(output, "finish_reason", None)
-                    if finish_reason is not None:
-                        if not isinstance(finish_reason, str) or not finish_reason:
-                            raise RuntimeError("vLLM returned an invalid finish reason")
-                        state["finish_reason"] = finish_reason
-                        yield {
-                            "type": "choice_finished",
-                            "index": index,
-                            "finish_reason": finish_reason,
-                            **_usage_fields(current, completion_ids, **usage_kwargs),
-                        }
+                for event in _consume_stream_output(
+                    current,
+                    payload,
+                    choice_state,
+                    completion_ids,
+                    tool_parsers,
+                    usage_kwargs,
+                ):
+                    yield event
                 try:
                     current = await anext(output_stream)
                 except StopAsyncIteration:

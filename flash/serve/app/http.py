@@ -137,7 +137,11 @@ def create_app(
         if resolved is None:
             return _error(404, "model_not_found", "requested model is not deployed")
         try:
-            parsed = parse_chat_request(payload, resolved)
+            parsed = parse_chat_request(
+                payload,
+                resolved,
+                tool_parser=state.bootstrap.manifest.engine.tool_parser,
+            )
         except (OpenAIRequestError, PromptError, RuntimeConfigurationError, ValueError):
             return _error(422, "invalid_request", "request validation failed")
         provenance = provenance_payload(state.bootstrap.manifest, resolved)

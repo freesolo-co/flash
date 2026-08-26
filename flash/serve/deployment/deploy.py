@@ -667,6 +667,9 @@ def chat_sse(
     stop: list[str] | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
     structured_outputs: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
     stream_options: dict[str, bool] | None = None,
     n: int = 1,
     seed: int | None = None,
@@ -696,6 +699,9 @@ def chat_sse(
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         stream_options=stream_options,
         frame_bytes=streaming_support._complete_sse_frames,
     )
@@ -714,9 +720,12 @@ def chat_stream(
     presence_penalty: float = 0.0,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    tools: list[dict[str, Any]] | None = None,
 ) -> Iterator[str]:
     """yield one decoded choice while preserving eager open and cleanup semantics."""
 
+    if tools is not None:
+        raise ValueError("text-only chat_stream does not support tools")
     n = validate_choice_count(n)
     logprobs = validate_logprobs(logprobs)
     top_logprobs = validate_top_logprobs(top_logprobs)
@@ -765,6 +774,9 @@ def chat(
     retry_unavailable: bool = False,
     stop: list[str] | None = None,
     structured_outputs: dict | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
     top_p: float = 0.95,
     chat_template_kwargs: dict | None = None,
     n: int = 1,
@@ -823,6 +835,9 @@ def chat(
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         timeout=timeout,
         before_raise=classify_unavailable,
         balance_payload=lambda payload, enabled: thinking_support._balance_thinking_payload(

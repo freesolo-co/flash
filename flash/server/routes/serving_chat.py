@@ -18,8 +18,10 @@ from flash.serve.request.openai import (
     merge_stop_sequences,
     parse_chat_request,
     reject_thinking_logprobs,
+    reject_tool_capability,
 )
 from flash.serve.request.transport import RawChatStream, is_event_stream_content_type
+from flash.serve.runtime.tool_calls import qualified_tool_parser
 from flash.server.asgi import app as _app
 from flash.server.platform.deps import manageable_run
 from flash.server.routes.serving_revisions import (
@@ -115,6 +117,11 @@ def _resolve_chat_request(
             thinking=effective_spec.thinking,
             logprobs=request.logprobs,
         )
+        reject_tool_capability(
+            tools=request.tools,
+            thinking=effective_spec.thinking,
+            tool_parser=qualified_tool_parser(effective_spec.model),
+        )
     except OpenAIRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return request, messages, effective_spec, authorized_revision
@@ -156,6 +163,16 @@ def _require_active_deployment(
     )
 
 
+def _tool_forward_fields(request: Any) -> dict[str, Any]:
+    if request.tools is None:
+        return {}
+    return {
+        "tools": request.tools,
+        "tool_choice": request.tool_choice,
+        "parallel_tool_calls": request.parallel_tool_calls,
+    }
+
+
 def _forward_stream(
     *,
     run_id: str,
@@ -183,6 +200,7 @@ def _forward_stream(
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=request.structured_outputs,
         stream_options=request.stream_options,
+        **_tool_forward_fields(request),
     )
     try:
         content_type = upstream.headers.get("content-type", "")
@@ -259,6 +277,7 @@ def managed_chat(
             stop=stop_sequences,
             chat_template_kwargs=chat_template_kwargs,
             structured_outputs=request.structured_outputs,
+            **_tool_forward_fields(request),
         )
         if not isinstance(response, dict):
             raise ValueError("serving backend returned a non-object chat response")

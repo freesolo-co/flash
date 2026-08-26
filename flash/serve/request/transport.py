@@ -23,6 +23,7 @@ from flash.serve.contract.urls import (
     serving_base_url,
     serving_control_url,
 )
+from flash.serve.runtime.tool_calls import FunctionTool, tools_wire
 
 _INTERNAL_KEY_HEADER_NAME = "X-Freesolo-Internal-Key"
 _MAX_REDIRECTS = 100
@@ -218,6 +219,9 @@ def chat_request_body(
     stop: list[str] | None,
     chat_template_kwargs: dict[str, Any] | None,
     structured_outputs: dict[str, Any] | None,
+    tools: tuple[FunctionTool, ...] | list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
     stream_options: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """serialize the supported serving request fields exactly once."""
@@ -244,6 +248,12 @@ def chat_request_body(
         body["stop"] = [str(value) for value in stop]
     if structured_outputs is not None:
         body["structured_outputs"] = structured_outputs
+    if tools is not None:
+        body["tools"] = (
+            tools_wire(tools) if all(type(tool) is FunctionTool for tool in tools) else tools
+        )
+        body["tool_choice"] = "auto" if tool_choice is None else tool_choice
+        body["parallel_tool_calls"] = True if parallel_tool_calls is None else parallel_tool_calls
     if stream_options is not None:
         body["stream_options"] = stream_options
     return body
@@ -355,6 +365,9 @@ def request_chat_sse(
     stop: list[str] | None,
     chat_template_kwargs: dict[str, Any] | None,
     structured_outputs: dict[str, Any] | None,
+    tools: tuple[FunctionTool, ...] | list[dict[str, Any]] | None,
+    tool_choice: str | None,
+    parallel_tool_calls: bool | None,
     stream_options: dict[str, bool] | None,
     frame_bytes: Callable[[Iterator[bytes]], Iterator[bytes]],
 ) -> OpenAIStreamResponse:
@@ -375,6 +388,9 @@ def request_chat_sse(
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         stream_options=stream_options,
     )
     return open_chat_stream(
@@ -463,6 +479,9 @@ def request_chat_json(
     stop: list[str] | None,
     chat_template_kwargs: dict[str, Any] | None,
     structured_outputs: dict[str, Any] | None,
+    tools: tuple[FunctionTool, ...] | list[dict[str, Any]] | None,
+    tool_choice: str | None,
+    parallel_tool_calls: bool | None,
     timeout: float,
     before_raise: Callable[[httpx.Response], None] | None,
     balance_payload: Callable[[Any, bool], None],
@@ -485,6 +504,9 @@ def request_chat_json(
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
     )
     response = post_chat_json(
         client_context,

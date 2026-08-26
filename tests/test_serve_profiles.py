@@ -18,7 +18,7 @@ from flash.serve.contract.profiles import (
 from flash.serve.control import ModalPlacement, RunPodPlacement
 from flash.serve.provisioning import ServingImage
 from flash.serve.runtime.multimodal import _MAX_IMAGES
-from flash.serving.src.engine.model_config import reasoning_parser_for
+from flash.serving.src.engine.model_config import reasoning_parser_for, tool_parser_for
 from flash.serving.src.store.settings import KV_CACHE_DTYPE
 
 MODEL = "Qwen/Qwen3.5-9B"
@@ -110,6 +110,12 @@ def test_profiles_carry_the_reasoning_parser_hosted_serving_configures() -> None
             f"{model_id} diverges from the parser hosted serving runs for the same checkpoint; "
             "thinking plus structured outputs would 400"
         )
+
+
+def test_profiles_carry_the_same_exact_tool_parser_as_hosted_serving() -> None:
+    for model_id in supported_models():
+        assert get_profile(model_id).tool_parser == tool_parser_for(model_id)
+    assert get_profile(MODEL).tool_parser == "qwen3_coder"
 
 
 def test_profiles_keep_the_validated_fp8_kv_cache() -> None:
