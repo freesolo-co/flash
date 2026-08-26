@@ -2954,7 +2954,6 @@ def test_recovered_handleless_retryable_result_resubmits_with_remaining_budget(
 
 def test_recovered_handleless_multicard_sft_oom_uses_executed_width(monkeypatch, tmp_path):
     import io
-    from dataclasses import replace
 
     import flash.server.platform.runtime as runtime
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
@@ -2971,7 +2970,7 @@ def test_recovered_handleless_multicard_sft_oom_uses_executed_width(monkeypatch,
             model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(batch_size=2, max_examples=2),
-            gpu=GpuSpec(count=4, max_retries=1),
+            gpu=GpuSpec(type="RTX 4090", count=4, max_retries=1),
         )
     )
     status = runner_state.RunStatus(
@@ -2983,26 +2982,9 @@ def test_recovered_handleless_multicard_sft_oom_uses_executed_width(monkeypatch,
     runner_state._save_status(status, _next_attempt=0)
     assert _persist_effective_worker_spec(spec) is True
     observed = runner_attempts._reserve_attempt_record(spec.run_id)
-    persisted_resource = {
-        **_runpod_remote(
-            endpoint_id="endpoint-failed",
-            job_id="job-failed",
-            attempt=observed.attempt_id,
-            fence=observed.fence,
-        ),
-        "allocated_gpu": "RTX 4090",
-        "allocated_gpu_count": 4,
-    }
-    with runner_state._status_guard(spec.run_id):
-        persisted = runner_status.get_status(spec.run_id)
-        attempt = runner_status._current_attempt(persisted)
-        persisted.attempt = replace(
-            attempt,
-            state="active",
-            provider="runpod",
-            resource=persisted_resource,
-        ).to_dict()
-        runner_state._save_status_unlocked(persisted)
+    assert observed.provider is None
+    assert observed.resource is None
+    assert runner_status.get_status(spec.run_id).remote is None
     monkeypatch.setattr(
         runner_lifecycle,
         "_attempt_result",
@@ -3015,6 +2997,9 @@ def test_recovered_handleless_multicard_sft_oom_uses_executed_width(monkeypatch,
     from flash.runner.lifecycle.retry_policy import load_retry_policy
 
     policy = load_retry_policy(spec.run_id)
+    assert policy.oom_used == 1
+    assert policy.failed_providers == frozenset()
+    assert policy.tried_classes == frozenset()
     assert policy.oom_vram_floor == pytest.approx(combined_vram_gb(24, 2))
     replacement = runner_attempts._reserve_attempt_record(spec.run_id)
     context = attempt_supervision._build_context(
@@ -3050,6 +3035,11 @@ def test_recovered_handleless_multicard_sft_oom_uses_executed_width(monkeypatch,
         "runpod",
         "A100 SXM 40GB",
         1,
+    )
+    assert runner_lifecycle._candidate_usable_vram_gb(plan.chosen) > policy.oom_vram_floor
+    assert not runner_lifecycle._oom_escalated(
+        [Candidate("runpod", "RTX 4090", 0.5, 24, 4, executed_gpu_count=2)],
+        policy.oom_vram_floor,
     )
 
 

@@ -439,6 +439,17 @@ class _FakePrivateHf:
         self.calls.append(("list_repo_files", kwargs))
         return list(self.files)
 
+    def list_repo_tree(self, **kwargs):
+        from huggingface_hub import RepoFile
+
+        self.calls.append(("list_repo_tree", kwargs))
+        prefix = kwargs["path_in_repo"].rstrip("/") + "/"
+        return [
+            RepoFile(path=path, size=len(payload), oid=path)
+            for path, payload in self.files.items()
+            if path.startswith(prefix)
+        ]
+
     def download(self, **kwargs):
         self.calls.append(("download", kwargs))
         path = kwargs["filename"]
@@ -706,12 +717,20 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     assert provider.events.index(("destroy", 0)) < retry_submit
     assert [name for name, _kwargs in private_hf.calls] == [
         "repo_info",
-        "list_repo_files",
+        "list_repo_tree",
         "repo_info",
-        "list_repo_files",
+        "list_repo_tree",
         "repo_info",
         "get_paths_info",
     ]
+    for index in (1, 3):
+        assert private_hf.calls[index][1] == {
+            "repo_id": "private/runs",
+            "path_in_repo": f"opd/{spec.run_id}/attempts/0-1",
+            "recursive": True,
+            "revision": "private-pinned-sha",
+            "repo_type": "dataset",
+        }
     assert private_hf.calls[5][1]["paths"] == [opd_optimizer_start_marker_path(spec.run_id, 0)]
 
 
@@ -867,12 +886,19 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
     assert "replacement is blocked" in status.error
     assert [name for name, _kwargs in private_hf.calls] == [
         "repo_info",
-        "list_repo_files",
+        "list_repo_tree",
         "repo_info",
         "get_paths_info",
         "download",
         "list_repo_files",
     ]
+    assert private_hf.calls[1][1] == {
+        "repo_id": "private/runs",
+        "path_in_repo": f"opd/{spec.run_id}/attempts/0-1",
+        "recursive": True,
+        "revision": "private-pinned-sha",
+        "repo_type": "dataset",
+    }
     assert private_hf.calls[4][1]["revision"] == "private-pinned-sha"
 
 
@@ -910,16 +936,24 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
     assert "replacement is blocked" in status.error
     assert [name for name, _kwargs in private_hf.calls] == [
         "repo_info",
-        "list_repo_files",
+        "list_repo_tree",
         "repo_info",
-        "list_repo_files",
+        "list_repo_tree",
         "repo_info",
         "get_paths_info",
         "download",
         "list_repo_files",
         "repo_info",
-        "list_repo_files",
+        "list_repo_tree",
     ]
+    for index in (1, 3, 9):
+        assert private_hf.calls[index][1] == {
+            "repo_id": "private/runs",
+            "path_in_repo": f"opd/{spec.run_id}/attempts/0-1",
+            "recursive": True,
+            "revision": "private-pinned-sha",
+            "repo_type": "dataset",
+        }
 
 
 def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypatch, tmp_path):

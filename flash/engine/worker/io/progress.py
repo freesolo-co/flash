@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from flash.engine.result.rollout_samples import (
@@ -25,14 +26,28 @@ from flash.runner.lifecycle.protocol import (
     progress_path,
 )
 
+
+@dataclass(frozen=True)
+class _ProgressObservation:
+    stage: str
+    initial: bool
+    fields: dict
+
+
 _PROGRESS_LOCK = threading.Lock()
+_PROGRESS_CONDITION = threading.Condition(_PROGRESS_LOCK)
 _PROGRESS_SEQUENCE = 0
 _PROGRESS_PREVIOUS_DIGEST: str | None = None
 _PROGRESS_TRAINING_ENTERED = False
 _PROGRESS_COMPLETED_STEPS = 0
 _PROGRESS_PENDING_CHECKPOINT_FAILURE: dict[str, int | str] | None = None
 _PROGRESS_PENDING_UPLOAD: tuple[ProgressRecord, str, str, bool] | None = None
-_PROGRESS_BLOCKED_OBSERVATION: tuple[str, bool, dict] | None = None
+_PROGRESS_LATEST_OBSERVATION: _ProgressObservation | None = None
+_PROGRESS_PUBLISHER: threading.Thread | None = None
+_PROGRESS_ACTIVE = False
+_PROGRESS_FLUSH_REQUIRED = False
+_PROGRESS_GENERATION = 0
+_PROGRESS_ERROR: BaseException | None = None
 LATEST_GRPO_METRICS: list = []
 GRPO_METRIC_HISTORY_LIMIT = 1024
 
@@ -169,87 +184,189 @@ def _observe_progress(stage: str, fields: dict) -> dict:
     return bounded if isinstance(bounded, dict) else {}
 
 
-def _merge_blocked_progress(stage: str, initial: bool, fields: dict) -> tuple[str, bool, dict]:
-    """retain bounded cumulative observations behind one immutable pending record."""
-    global _PROGRESS_BLOCKED_OBSERVATION
+def _merge_latest_observation(stage: str, initial: bool, fields: dict) -> None:
+    """retain one latest cumulative observation while a record is being published."""
+    global _PROGRESS_LATEST_OBSERVATION
 
     observed = _observe_progress(stage, fields)
-    if _PROGRESS_BLOCKED_OBSERVATION is not None:
-        _prior_stage, prior_initial, prior_fields = _PROGRESS_BLOCKED_OBSERVATION
-        observed = bounded_json({**prior_fields, **observed})
-        initial = initial or prior_initial
+    if _PROGRESS_LATEST_OBSERVATION is not None:
+        prior = _PROGRESS_LATEST_OBSERVATION
+        observed = bounded_json({**prior.fields, **observed})
+        initial = initial or prior.initial
     if stage == "checkpoint_uploaded":
         observed.pop("checkpoint_failure", None)
-    merged = (stage, initial, observed)
-    _PROGRESS_BLOCKED_OBSERVATION = merged
-    return merged
+    _PROGRESS_LATEST_OBSERVATION = _ProgressObservation(stage, initial, observed)
+
+
+def _progress_record(
+    observation: _ProgressObservation,
+    *,
+    sequence: int,
+    previous_digest: str | None,
+    training_entered: bool,
+    completed_steps: int,
+) -> ProgressRecord:
+    metrics, samples, timing, checkpoint, gpu, diagnostics = _progress_sections(observation.fields)
+    return ProgressRecord(
+        run_id=worker_state.RUN_ID,
+        phase_namespace=worker_state.PHASE,
+        attempt_id=worker_state.ATTEMPT,
+        fence=worker_state.FENCE,
+        sequence=sequence,
+        previous_digest=previous_digest,
+        occurred_at=time.time(),
+        kind=_progress_kind(observation.stage),
+        phase=observation.stage,
+        training_entered=training_entered,
+        completed_steps=completed_steps,
+        metrics=bounded_json(metrics),
+        samples=bounded_json(samples),
+        timing=bounded_json(timing),
+        checkpoint=bounded_json(checkpoint),
+        gpu_observation=bounded_json(gpu),
+        diagnostics=bounded_json(diagnostics),
+    )
+
+
+def _commit_progress_record(record: ProgressRecord) -> None:
+    global _PROGRESS_PENDING_UPLOAD, _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE
+
+    _PROGRESS_SEQUENCE = record.sequence
+    _PROGRESS_PREVIOUS_DIGEST = digest_record(record.to_dict())
+    _PROGRESS_PENDING_UPLOAD = None
+
+
+def _start_progress_publisher_locked() -> None:
+    global _PROGRESS_PUBLISHER
+
+    if _PROGRESS_PUBLISHER is not None or _PROGRESS_ACTIVE:
+        return
+    if _PROGRESS_PENDING_UPLOAD is None and _PROGRESS_LATEST_OBSERVATION is None:
+        return
+    _PROGRESS_PUBLISHER = threading.Thread(
+        target=_progress_publisher_loop,
+        name="flash-progress-publisher",
+        daemon=True,
+    )
+    _PROGRESS_PUBLISHER.start()
+
+
+def _publish_pending_record(pending: tuple[ProgressRecord, str, str, bool]) -> bool:
+    record, local_path, remote_path, required = pending
+    committed = _upload_record(
+        record,
+        required=required,
+        local_path=local_path,
+        remote_path=remote_path,
+    )
+    print("PROGRESS", json.dumps(record.to_dict(), allow_nan=False, sort_keys=True))
+    return committed
+
+
+def _progress_publisher_loop() -> None:
+    global _PROGRESS_ACTIVE, _PROGRESS_ERROR, _PROGRESS_FLUSH_REQUIRED
+    global _PROGRESS_LATEST_OBSERVATION, _PROGRESS_PENDING_UPLOAD, _PROGRESS_PUBLISHER
+
+    while True:
+        with _PROGRESS_CONDITION:
+            upload_generation = _PROGRESS_GENERATION
+            if _PROGRESS_PENDING_UPLOAD is not None:
+                pending = _PROGRESS_PENDING_UPLOAD
+            elif _PROGRESS_LATEST_OBSERVATION is not None:
+                observation = _PROGRESS_LATEST_OBSERVATION
+                _PROGRESS_LATEST_OBSERVATION = None
+                sequence = _PROGRESS_SEQUENCE + 1
+                previous_digest = _PROGRESS_PREVIOUS_DIGEST
+                training_entered = _PROGRESS_TRAINING_ENTERED
+                completed_steps = _PROGRESS_COMPLETED_STEPS
+                _PROGRESS_ACTIVE = True
+                pending = None
+            else:
+                _PROGRESS_PUBLISHER = None
+                _PROGRESS_CONDITION.notify_all()
+                return
+        if pending is None:
+            try:
+                record = _progress_record(
+                    observation,
+                    sequence=sequence,
+                    previous_digest=previous_digest,
+                    training_entered=training_entered,
+                    completed_steps=completed_steps,
+                )
+                local_path = _write_local_immutable(canonical_bytes(record.to_dict()))
+                pending = (record, local_path, progress_path(record), observation.initial)
+            except BaseException as exc:
+                with _PROGRESS_CONDITION:
+                    _PROGRESS_ACTIVE = False
+                    _PROGRESS_ERROR = exc
+                    _PROGRESS_PUBLISHER = None
+                    _PROGRESS_CONDITION.notify_all()
+                return
+            with _PROGRESS_CONDITION:
+                _PROGRESS_PENDING_UPLOAD = pending
+                _PROGRESS_ACTIVE = False
+                _PROGRESS_CONDITION.notify_all()
+        try:
+            committed = _publish_pending_record(pending)
+        except BaseException as exc:
+            committed = False
+            if pending[3]:
+                with _PROGRESS_CONDITION:
+                    _PROGRESS_ERROR = exc
+                    _PROGRESS_PUBLISHER = None
+                    _PROGRESS_CONDITION.notify_all()
+                return
+        if committed:
+            with _PROGRESS_CONDITION:
+                _commit_progress_record(pending[0])
+                _PROGRESS_CONDITION.notify_all()
+            continue
+        with _PROGRESS_CONDITION:
+            if _PROGRESS_FLUSH_REQUIRED:
+                record, local_path, remote_path, _required = pending
+                _PROGRESS_PENDING_UPLOAD = (record, local_path, remote_path, True)
+            if upload_generation == _PROGRESS_GENERATION and not _PROGRESS_FLUSH_REQUIRED:
+                _PROGRESS_CONDITION.wait()
+
+
+def flush_progress() -> None:
+    """wait until the latest cumulative observation is durably published."""
+    global _PROGRESS_FLUSH_REQUIRED
+
+    with _PROGRESS_CONDITION:
+        _PROGRESS_FLUSH_REQUIRED = True
+        _start_progress_publisher_locked()
+        while (
+            _PROGRESS_PUBLISHER is not None
+            or _PROGRESS_ACTIVE
+            or _PROGRESS_PENDING_UPLOAD is not None
+            or _PROGRESS_LATEST_OBSERVATION is not None
+        ):
+            if _PROGRESS_ERROR is not None:
+                raise _PROGRESS_ERROR
+            _PROGRESS_CONDITION.notify_all()
+            _PROGRESS_CONDITION.wait(timeout=0.1)
+            _start_progress_publisher_locked()
+        if _PROGRESS_ERROR is not None:
+            raise _PROGRESS_ERROR
+        _PROGRESS_FLUSH_REQUIRED = False
 
 
 def publish_progress(stage: str, *, initial: bool = False, **fields):
-    """Publish one immutable cumulative progress record for observed work only."""
-    global _PROGRESS_BLOCKED_OBSERVATION, _PROGRESS_PENDING_UPLOAD
-    global _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE
-    with _PROGRESS_LOCK:
-        if _PROGRESS_PENDING_UPLOAD is not None:
-            record, local_path, remote_path, required = _PROGRESS_PENDING_UPLOAD
-            committed = _upload_record(
-                record,
-                required=required,
-                local_path=local_path,
-                remote_path=remote_path,
-            )
-            if committed:
-                _PROGRESS_SEQUENCE = record.sequence
-                _PROGRESS_PREVIOUS_DIGEST = digest_record(record.to_dict())
-                _PROGRESS_PENDING_UPLOAD = None
-            print("PROGRESS", json.dumps(record.to_dict(), allow_nan=False, sort_keys=True))
-            if not committed:
-                _merge_blocked_progress(stage, initial, fields)
-                return False
-        if _PROGRESS_BLOCKED_OBSERVATION is not None:
-            _, blocked_initial, blocked_fields = _PROGRESS_BLOCKED_OBSERVATION
-            fields = {**blocked_fields, **fields}
-            initial = initial or blocked_initial
-            _PROGRESS_BLOCKED_OBSERVATION = None
-            if stage == "checkpoint_uploaded":
-                fields.pop("checkpoint_failure", None)
-        fields = _observe_progress(stage, fields)
-        sequence = _PROGRESS_SEQUENCE + 1
-        metrics, samples, timing, checkpoint, gpu, diagnostics = _progress_sections(fields)
-        record = ProgressRecord(
-            run_id=worker_state.RUN_ID,
-            phase_namespace=worker_state.PHASE,
-            attempt_id=worker_state.ATTEMPT,
-            fence=worker_state.FENCE,
-            sequence=sequence,
-            previous_digest=_PROGRESS_PREVIOUS_DIGEST,
-            occurred_at=time.time(),
-            kind=_progress_kind(stage),
-            phase=stage,
-            training_entered=_PROGRESS_TRAINING_ENTERED,
-            completed_steps=_PROGRESS_COMPLETED_STEPS,
-            metrics=bounded_json(metrics),
-            samples=bounded_json(samples),
-            timing=bounded_json(timing),
-            checkpoint=bounded_json(checkpoint),
-            gpu_observation=bounded_json(gpu),
-            diagnostics=bounded_json(diagnostics),
-        )
-        local_path = _write_local_immutable(canonical_bytes(record.to_dict()))
-        remote_path = progress_path(record)
-        _PROGRESS_PENDING_UPLOAD = (record, local_path, remote_path, initial)
-        committed = _upload_record(
-            record,
-            required=initial,
-            local_path=local_path,
-            remote_path=remote_path,
-        )
-        if committed:
-            _PROGRESS_SEQUENCE = sequence
-            _PROGRESS_PREVIOUS_DIGEST = digest_record(record.to_dict())
-            _PROGRESS_PENDING_UPLOAD = None
-    print("PROGRESS", json.dumps(record.to_dict(), allow_nan=False, sort_keys=True))
-    return committed
+    """queue one latest cumulative progress observation without step-path network i/o."""
+    global _PROGRESS_GENERATION
+
+    with _PROGRESS_CONDITION:
+        if _PROGRESS_ERROR is not None:
+            raise _PROGRESS_ERROR
+        _merge_latest_observation(stage, initial, fields)
+        _PROGRESS_GENERATION += 1
+        _start_progress_publisher_locked()
+        _PROGRESS_CONDITION.notify_all()
+    if initial:
+        flush_progress()
+    return True
 
 
 _REWARD_METRIC_NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9_.-]")

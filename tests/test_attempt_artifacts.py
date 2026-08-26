@@ -71,6 +71,104 @@ def _result(**updates) -> ResultManifest:
     return ResultManifest(**values)
 
 
+def test_snapshot_lists_exact_attempt_prefix_at_pinned_revision(monkeypatch) -> None:
+    import huggingface_hub
+
+    calls = []
+    prefix = "rl/run-1/attempts/2-9"
+
+    class Api:
+        def __init__(self, *, token):
+            calls.append(("init", token))
+
+        @staticmethod
+        def repo_info(**kwargs):
+            calls.append(("repo_info", kwargs))
+            return type("Info", (), {"sha": "c" * 40})()
+
+        @staticmethod
+        def list_repo_tree(**kwargs):
+            calls.append(("list_repo_tree", kwargs))
+            return [
+                huggingface_hub.RepoFile(
+                    path=f"{prefix}/progress/nested/ignored.json", size=1, oid="a"
+                ),
+                huggingface_hub.RepoFile(path=f"{prefix}/progress/record.json", size=1, oid="b"),
+                type("RepoFolder", (), {"path": f"{prefix}/progress"})(),
+                huggingface_hub.RepoFile(path="other/file.json", size=1, oid="c"),
+            ]
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+    revision, paths = attempts._repo_snapshot("org/repo", prefix=prefix)
+
+    assert revision == "c" * 40
+    assert paths == [
+        f"{prefix}/progress/nested/ignored.json",
+        f"{prefix}/progress/record.json",
+    ]
+    assert calls[-1] == (
+        "list_repo_tree",
+        {
+            "repo_id": "org/repo",
+            "path_in_repo": prefix,
+            "recursive": True,
+            "revision": "c" * 40,
+            "repo_type": "dataset",
+        },
+    )
+
+
+def test_snapshot_missing_attempt_directory_is_empty(monkeypatch) -> None:
+    import httpx
+    import huggingface_hub
+    from huggingface_hub.errors import RemoteEntryNotFoundError
+
+    class Api:
+        def __init__(self, *, token):
+            del token
+
+        @staticmethod
+        def repo_info(**_kwargs):
+            return type("Info", (), {"sha": "c" * 40})()
+
+        @staticmethod
+        def list_repo_tree(**_kwargs):
+            response = httpx.Response(404, request=httpx.Request("GET", "https://example.test"))
+            raise RemoteEntryNotFoundError("missing", response=response)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+
+    assert attempts._repo_snapshot("org/repo", prefix="rl/run-1/attempts/2-9") == (
+        "c" * 40,
+        [],
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [PermissionError("authentication denied"), OSError("transport down")],
+)
+def test_snapshot_propagates_listing_failures(monkeypatch, error) -> None:
+    import huggingface_hub
+
+    class Api:
+        def __init__(self, *, token):
+            del token
+
+        @staticmethod
+        def repo_info(**_kwargs):
+            return type("Info", (), {"sha": "c" * 40})()
+
+        @staticmethod
+        def list_repo_tree(**_kwargs):
+            raise error
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+
+    with pytest.raises(type(error), match=str(error)):
+        attempts._repo_snapshot("org/repo", prefix="rl/run-1/attempts/2-9")
+
+
 def test_reads_latest_verified_progress_and_single_result(monkeypatch) -> None:
     first = _progress(1)
     second = _progress(2, first)
@@ -80,7 +178,9 @@ def test_reads_latest_verified_progress_and_single_result(monkeypatch) -> None:
         progress_path(second): canonical_bytes(second.to_dict()),
         result_path(result): canonical_bytes(result.to_dict()),
     }
-    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, list(payloads)))
+    monkeypatch.setattr(
+        attempts, "_repo_snapshot", lambda _repo, *, prefix: ("c" * 40, list(payloads))
+    )
     monkeypatch.setattr(
         attempts,
         "_download_bytes",
@@ -112,7 +212,7 @@ def test_repeated_polls_download_result_before_progress(monkeypatch) -> None:
         result_path(result): canonical_bytes(result.to_dict()),
     }
     paths = list(payloads)
-    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, paths))
+    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo, *, prefix: ("c" * 40, paths))
     downloads = []
 
     def download(_repo, path, *, revision):
@@ -144,7 +244,9 @@ def test_poll_without_result_replays_strict_progress_chain(monkeypatch) -> None:
         progress_path(second): canonical_bytes(second.to_dict()),
     }
     downloads = []
-    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, list(payloads)))
+    monkeypatch.setattr(
+        attempts, "_repo_snapshot", lambda _repo, *, prefix: ("c" * 40, list(payloads))
+    )
 
     def download(_repo, path, *, revision):
         downloads.append(path)
@@ -169,7 +271,7 @@ def test_poll_without_result_replays_strict_progress_chain(monkeypatch) -> None:
 def test_result_download_transport_error_remains_retriable(monkeypatch) -> None:
     result = _result()
     path = result_path(result)
-    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, [path]))
+    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo, *, prefix: ("c" * 40, [path]))
     monkeypatch.setattr(
         attempts,
         "_download_bytes",
@@ -192,7 +294,9 @@ def test_downloaded_malformed_result_is_attempt_artifact_error(monkeypatch) -> N
     result = _result()
     path = result_path(result)
     payloads = {progress_path(progress): canonical_bytes(progress.to_dict()), path: b"not-json"}
-    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, list(payloads)))
+    monkeypatch.setattr(
+        attempts, "_repo_snapshot", lambda _repo, *, prefix: ("c" * 40, list(payloads))
+    )
     downloads = []
 
     def download(_repo, artifact_path, *, revision):
@@ -220,7 +324,9 @@ def test_rejects_conflicting_results(monkeypatch) -> None:
         result_path(first): canonical_bytes(first.to_dict()),
         result_path(second): canonical_bytes(second.to_dict()),
     }
-    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, list(payloads)))
+    monkeypatch.setattr(
+        attempts, "_repo_snapshot", lambda _repo, *, prefix: ("c" * 40, list(payloads))
+    )
     monkeypatch.setattr(
         attempts,
         "_download_bytes",
@@ -246,7 +352,9 @@ def test_stale_fence_records_are_not_visible(monkeypatch) -> None:
         }
     )
     payloads = {progress_path(stale): json.dumps(stale.to_dict()).encode()}
-    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, list(payloads)))
+    monkeypatch.setattr(
+        attempts, "_repo_snapshot", lambda _repo, *, prefix: ("c" * 40, list(payloads))
+    )
     monkeypatch.setattr(
         attempts,
         "_download_bytes",

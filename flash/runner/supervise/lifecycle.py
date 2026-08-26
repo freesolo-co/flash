@@ -104,31 +104,40 @@ def _recovered_retry_placement(
     provider = attempt.provider or resource.get("provider")
     gpu = resource.get("allocated_gpu")
     gpu_count = resource.get("allocated_gpu_count")
-    if (
-        not isinstance(provider, str)
-        or not provider
-        or not isinstance(gpu, str)
-        or not gpu
-        or isinstance(gpu_count, bool)
-        or not isinstance(gpu_count, int)
-        or gpu_count < 1
-    ):
-        return _RetryPlacement()
-    shape = (provider, gpu, gpu_count)
+    complete_shape = (
+        isinstance(provider, str)
+        and bool(provider)
+        and isinstance(gpu, str)
+        and bool(gpu)
+        and not isinstance(gpu_count, bool)
+        and isinstance(gpu_count, int)
+        and gpu_count >= 1
+    )
     if failure == "oom":
         effective_spec = effective_spec_from_status(status)
+        selected_gpu = gpu if complete_shape else effective_spec.gpu.type
+        selected_count = gpu_count if complete_shape else gpu_count_of(effective_spec)
+        if not isinstance(selected_gpu, str) or not selected_gpu:
+            return _RetryPlacement()
         overrides = sft_ranking_overrides(effective_spec)
         sized_train = _overridden_train(effective_spec.train, overrides)
         executed_gpu_count = _executed_gpu_count(
             effective_spec.algorithm,
             sized_train,
             overrides,
-            gpu_count,
+            selected_count,
         )
+        floor = combined_vram_gb(gpu_vram_gb(selected_gpu), executed_gpu_count)
+        if not complete_shape:
+            return _RetryPlacement(oom_vram_floor=floor)
+        shape = (provider, gpu, gpu_count)
         return _RetryPlacement(
             tried_classes=frozenset({shape}),
-            oom_vram_floor=combined_vram_gb(gpu_vram_gb(gpu), executed_gpu_count),
+            oom_vram_floor=floor,
         )
+    if not complete_shape:
+        return _RetryPlacement()
+    shape = (provider, gpu, gpu_count)
     return _RetryPlacement(
         failed_providers=frozenset({provider}),
         tried_classes=frozenset({shape}),

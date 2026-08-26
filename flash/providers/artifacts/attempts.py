@@ -50,17 +50,29 @@ def _download_bytes(hf_repo: str, path: str, *, revision: str) -> bytes:
         return handle.read()
 
 
-def _repo_snapshot(hf_repo: str) -> tuple[str, list[str]]:
-    from huggingface_hub import HfApi
+def _repo_snapshot(hf_repo: str, *, prefix: str) -> tuple[str, list[str]]:
+    from huggingface_hub import HfApi, RepoFile
+    from huggingface_hub.errors import RemoteEntryNotFoundError
 
     api = HfApi(token=os.environ.get("HF_TOKEN"))
     revision = str(api.repo_info(repo_id=hf_repo, repo_type="dataset").sha or "").strip()
     if not revision:
         raise AttemptArtifactError("artifact repository revision is unavailable")
-    paths = api.list_repo_files(repo_id=hf_repo, repo_type="dataset", revision=revision)
-    if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+    try:
+        entries = api.list_repo_tree(
+            repo_id=hf_repo,
+            path_in_repo=prefix,
+            recursive=True,
+            revision=revision,
+            repo_type="dataset",
+        )
+        paths = [entry.path for entry in entries if isinstance(entry, RepoFile)]
+    except RemoteEntryNotFoundError:
+        return revision, []
+    if any(not isinstance(path, str) for path in paths):
         raise AttemptArtifactError("artifact repository listing is malformed")
-    return revision, paths
+    base = prefix.rstrip("/") + "/"
+    return revision, [path for path in paths if path.startswith(base)]
 
 
 def _decode_progress(
@@ -215,7 +227,7 @@ def read_attempt_artifacts(
     from flash.runner.lifecycle.protocol import attempt_prefix
 
     prefix = attempt_prefix(phase, run_id, attempt_id, fence)
-    revision, paths = _repo_snapshot(hf_repo)
+    revision, paths = _repo_snapshot(hf_repo, prefix=prefix)
     observed_at = time.time()
     result = _decode_result(
         hf_repo,

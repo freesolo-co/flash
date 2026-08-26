@@ -102,7 +102,7 @@ def _finalize(metrics: RunMetrics, *, progress_fields=None):
     metrics.save("/tmp/metrics.json")
     step = metrics.step
     completed_steps = int(step) if isinstance(step, (int, float)) and step > 0 else 0
-    manifest = result_io.publish_result(
+    result_io.publish_result(
         outcome="succeeded",
         failure_class=None,
         started_at=worker_state.WORKER_START_TIME,
@@ -111,11 +111,5 @@ def _finalize(metrics: RunMetrics, *, progress_fields=None):
         metrics=json.loads(metrics.to_json()),
         checkpoint={"failure": (progress_fields or {}).get("checkpoint_failure")},
         artifacts={"metrics": "embedded", "adapter": "published"},
-    )
-    progress_io.publish_progress(
-        "result_published",
-        step=completed_steps,
-        result_path=result_io.result_path(manifest),
-        gpu=gpu_diagnostics(),
     )
     print("NODE RESULT:", metrics.to_json())

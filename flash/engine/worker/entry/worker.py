@@ -91,10 +91,16 @@ def _run_worker_mode() -> None:
     worker_perf._restrict_fla_gdn_autotune_on_blackwell()
     progress_io.publish_progress("boot", gpu=worker_perf.gpu_diagnostics(include_torch=False))
     kernel_warmup.load_mega_cache()
+    completed = False
     try:
         handler()
+        completed = True
     finally:
-        state._cleanup_active_env_package()
+        try:
+            if completed:
+                progress_io.flush_progress()
+        finally:
+            state._cleanup_active_env_package()
     # hard-exit: colocated vllm can deadlock on nccl/cuda teardown; all artifacts are already on hf.
     sys.stdout.flush()
     sys.stderr.flush()
@@ -135,6 +141,24 @@ def main():
         failure_class = (
             "oom" if flags["oom"] else "artifact_transport" if flags["retriable"] else "worker"
         )
+        # preserve the bounded metric backlog on both the primary and fallback error progress.
+        _err_metrics = (
+            {"metrics_last": list(progress_io.LATEST_GRPO_METRICS)}
+            if progress_io.LATEST_GRPO_METRICS
+            else {}
+        )
+        try:
+            progress_io.publish_progress(
+                f"error_{state.RUN_MODE}",
+                error=detail,
+                **flags,
+                **_err_metrics,
+                gpu=worker_perf.gpu_diagnostics(),
+            )
+        except Exception:
+            progress_io.publish_progress(
+                f"error_{state.RUN_MODE}", error=detail, **flags, **_err_metrics
+            )
         result_publication_error: Exception | None = None
         try:
             result_io.publish_result(
@@ -156,31 +180,6 @@ def main():
                 "result-publication failed:",
                 sanitize_diagnostic(result_error, limit=500),
                 flush=True,
-            )
-        # preserve the bounded metric backlog on BOTH the primary and the fallback error
-        # progress. compute it (and detail) before the guarded call -- both are cheap and
-        # cannot raise -- so that if the primary progress fails (most likely worker_perf.gpu_diagnostics()
-        # or the upload itself), the fallback still carries metrics_last, which is the backlog
-        # this path exists to surface for short failing RL runs.
-        _err_metrics = (
-            {"metrics_last": list(progress_io.LATEST_GRPO_METRICS)}
-            if progress_io.LATEST_GRPO_METRICS
-            else {}
-        )
-        try:
-            progress_io.publish_progress(
-                f"error_{state.RUN_MODE}",
-                error=detail,
-                **flags,
-                **_err_metrics,
-                # `gpu=`, like every other producer here: this was the one path spelling it `diag`,
-                # and the consumer reads `gpu` alone. the mismatch is worse than a missing field --
-                # use the canonical gpu section so the error record retains the final observation.
-                gpu=worker_perf.gpu_diagnostics(),
-            )
-        except Exception:
-            progress_io.publish_progress(
-                f"error_{state.RUN_MODE}", error=detail, **flags, **_err_metrics
             )
         remaining = state._remaining_worker_wall_seconds()
         delay = 10.0 if remaining is None else min(10.0, remaining)

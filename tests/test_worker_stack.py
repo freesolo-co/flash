@@ -497,7 +497,7 @@ def test_train_metadata_preserves_terminal_progress_fields(monkeypatch):
     assert finalized[0][1] == {"progress_fields": {"metrics_last": metrics_last}}
 
 
-def test_finalize_publishes_result_receipt_progress(monkeypatch):
+def test_finalize_does_not_publish_progress_after_terminal_result(monkeypatch):
     from unittest.mock import mock_open
 
     from flash.engine.result.accounting import RunMetrics
@@ -514,7 +514,6 @@ def test_finalize_publishes_result_receipt_progress(monkeypatch):
             run_id="run-1", phase_namespace="rl", attempt_id=1, fence=1
         ),
     )
-    monkeypatch.setattr(finalize.result_io, "result_path", lambda _manifest: "result.json")
     monkeypatch.setattr(
         finalize.progress_io,
         "publish_progress",
@@ -525,8 +524,7 @@ def test_finalize_publishes_result_receipt_progress(monkeypatch):
 
     finalize._finalize(RunMetrics(phase="rl"), progress_fields={"metrics_last": metrics_last})
 
-    assert emitted[-1][0] == "result_published"
-    assert emitted[-1][1]["result_path"] == "result.json"
+    assert emitted == []
 
 
 # ---------------------------------------------------------------------------
