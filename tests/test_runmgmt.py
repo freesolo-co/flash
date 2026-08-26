@@ -538,7 +538,11 @@ def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypa
         assert runner_status.get_status("fa").finished_at == teardown
 
 
-def test_persist_metrics_preserves_authoritative_zero_provider_cost(monkeypatch):
+@pytest.mark.parametrize("provider", ["lambda", "vast"])
+@pytest.mark.parametrize("cost_value", [0.0, "0.0"])
+def test_persist_metrics_preserves_authoritative_zero_provider_cost(
+    monkeypatch, provider, cost_value
+):
     import json
     import os
 
@@ -549,9 +553,9 @@ def test_persist_metrics_preserves_authoritative_zero_provider_cost(monkeypatch)
 
         spec = JobSpec(run_id="r0", model="Qwen/Qwen3.5-9B", algorithm="grpo")
         metrics = {
-            "cost_usd": 0.0,
+            "cost_usd": cost_value,
             "wall_seconds": 1.0,
-            "allocated_provider": "lambda",
+            "allocated_provider": provider,
         }
         out = runner_status._persist_metrics(spec, metrics)
         assert out == 0.0
@@ -559,6 +563,30 @@ def test_persist_metrics_preserves_authoritative_zero_provider_cost(monkeypatch)
             on_disk = json.load(f)
         assert on_disk["cost_usd"] == 0.0
         assert "gpu_rate_usd_hr" not in on_disk.get("notes", {})
+
+
+@pytest.mark.parametrize("cost_value", [0.0, "0.0"])
+def test_persist_metrics_reprices_runpod_zero_placeholder(monkeypatch, cost_value):
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", tmp)
+        monkeypatch.setattr(runner_costs, "_gpu_rate", lambda gpu, provider="": 3600.0)
+        from flash.core.spec import JobSpec
+
+        spec = JobSpec(run_id="r-runpod-zero", model="Qwen/Qwen3.5-9B", algorithm="grpo")
+        metrics = {
+            "cost_usd": cost_value,
+            "wall_seconds": 1.0,
+            "allocated_provider": "runpod",
+        }
+        out = runner_status._persist_metrics(spec, metrics)
+        assert out == 1.0
+        with open(os.path.join(runner_state.artifacts_dir(spec), "metrics.json")) as f:
+            on_disk = json.load(f)
+        assert on_disk["cost_usd"] == 1.0
+        assert on_disk["notes"]["provider"] == "runpod"
 
 
 def test_persist_metrics_attributes_the_provider_that_billed_the_run(monkeypatch):

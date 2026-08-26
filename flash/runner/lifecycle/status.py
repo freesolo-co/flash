@@ -467,9 +467,13 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     # reason `allocated_gpu` is: the spec's gpu.count is only a ceiling and allocation may pick
     # fewer. Absent on records predating the stamp, where one card is the correct reading.
     gpu_count = max(1, int(metrics.get("allocated_gpu_count") or 1))
-    cost = metrics.get("cost_usd")
-    if cost is not None:
+    raw_cost = metrics.get("cost_usd")
+    cost = float(raw_cost) if raw_cost is not None else None
+    # lambda and vast stamp provider-authoritative cost; runpod leaves zero as an unset placeholder.
+    provider_stamped_zero = provider in {"lambda", "vast"} and cost == 0.0
+    if cost or provider_stamped_zero:
         cost = float(cost)
+        metrics = {**metrics, "cost_usd": cost}
     else:
         wall = float(metrics.get("wall_seconds") or 0.0)
         cost = wall / 3600.0 * rate * gpu_count
