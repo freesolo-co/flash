@@ -27,6 +27,12 @@ from flash.serving.src.stream_channel.protocol import (
 _T = TypeVar("_T")
 
 
+class _UnsettledGuardedOperation(Exception):
+    def __init__(self, cause: BaseException) -> None:
+        self.cause = cause
+        super().__init__(str(cause))
+
+
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 
@@ -169,15 +175,17 @@ class _LeaseWatch:
         operation: Awaitable[_T],
         *,
         abort: Callable[[], Awaitable[None]] | None = None,
+        require_settled: bool = False,
     ) -> _T:
         operation_task = asyncio.ensure_future(operation)
 
-        async def stop_operation() -> None:
+        async def stop_operation() -> bool:
             operation_task.cancel()
             if abort is not None:
                 with contextlib.suppress(Exception):
                     await _bounded_operation(abort(), CLEANUP_SECONDS)
             await _join_task(operation_task)
+            return operation_task.done()
 
         try:
             self.check()
@@ -185,8 +193,10 @@ class _LeaseWatch:
                 raise StreamChannelError(
                     ChannelErrorCode.CHANNEL_FAULT, "lease watcher is not running"
                 )
-        except Exception:
-            await stop_operation()
+        except Exception as exc:
+            settled = await stop_operation()
+            if require_settled and not settled:
+                raise _UnsettledGuardedOperation(exc) from exc
             raise
         try:
             done, _ = await asyncio.wait(
@@ -198,10 +208,12 @@ class _LeaseWatch:
             raise
         if operation_task in done:
             return await operation_task
-        await stop_operation()
+        settled = await stop_operation()
         exception = self._task.exception()
         if exception is None:
-            raise StreamChannelError(ChannelErrorCode.CHANNEL_FAULT, "lease watcher stopped")
+            exception = StreamChannelError(ChannelErrorCode.CHANNEL_FAULT, "lease watcher stopped")
+        if require_settled and not settled:
+            raise _UnsettledGuardedOperation(exception) from exception
         raise exception
 
     async def close(self) -> None:
@@ -336,7 +348,11 @@ async def stream_generate_call(
                 terminal=terminal,
                 event=event,
             )
-            await lease.guarded(_put_data(queue, envelope), abort=abort_if_started)
+            await lease.guarded(
+                _put_data(queue, envelope),
+                abort=abort_if_started,
+                require_settled=True,
+            )
             sequence += 1
             if terminal:
                 terminal_kind = "event"
@@ -348,6 +364,8 @@ async def stream_generate_call(
         completed = True
     except asyncio.CancelledError:
         raise
+    except _UnsettledGuardedOperation as exc:
+        raise exc.cause from None
     except Exception as exc:
         code = exc.code if isinstance(exc, StreamChannelError) else ChannelErrorCode.ENGINE_ERROR
         envelope = DataEnvelope(

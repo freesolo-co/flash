@@ -865,6 +865,77 @@ def test_guarded_abort_timeout_retains_noncooperative_abort(
     assert asyncio.run(scenario()) == (True, True)
 
 
+def test_unsettled_data_write_does_not_publish_a_competing_terminal_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[list[dict[str, Any]], bool]:
+        monkeypatch.setattr(channel_engine, "CLEANUP_SECONDS", 0.01)
+        queue = _FakeQueue()
+        _patch_modal(monkeypatch, queue)
+        await queue.control(_control(0, call_id=None))
+        await queue.control(_control(1))
+        data_put_started = asyncio.Event()
+        data_put_cancelled = asyncio.Event()
+        release_data_put = asyncio.Event()
+        original_put = queue.put.aio
+
+        async def noncooperative_put(
+            value: Any,
+            block: bool = True,
+            timeout: float | None = None,  # noqa: ASYNC109
+            *,
+            partition: str | None = None,
+            partition_ttl: int = 86400,
+        ) -> None:
+            if partition == DATA_PARTITION:
+                data_put_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    data_put_cancelled.set()
+                    await release_data_put.wait()
+            await original_put(
+                value,
+                block=block,
+                timeout=timeout,
+                partition=partition,
+                partition_ttl=partition_ttl,
+            )
+
+        queue.put.aio = noncooperative_put
+        owner = _Owner([{"type": "final", "ok": True}])
+        task = asyncio.create_task(
+            stream_generate_call(
+                owner,
+                {},
+                None,
+                None,
+                "generation-1",
+                time.time() + 5,
+                queue.object_id,
+                "nonce-1",
+            )
+        )
+        await data_put_started.wait()
+        await queue.control(_control(2, kind="cancel"))
+        with pytest.raises(StreamChannelError, match="cancelled"):
+            await asyncio.wait_for(task, timeout=0.2)
+        await data_put_cancelled.wait()
+        returned_before_late_commit = queue._partitions[DATA_PARTITION].empty()
+        release_data_put.set()
+        for retained_task in tuple(channel_engine._BACKGROUND_TASKS):
+            await retained_task
+        values = list(queue._partitions[DATA_PARTITION]._queue)
+        return values, returned_before_late_commit
+
+    values, returned_before_late_commit = asyncio.run(scenario())
+    assert returned_before_late_commit
+    assert len(values) == 1
+    assert values[0]["kind"] == "event"
+    assert values[0]["sequence"] == 0
+    assert values[0]["terminal"] is True
+
+
 def test_backpressure_does_not_starve_control_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> _Owner:
         queue = _FakeQueue(data_capacity=1)
