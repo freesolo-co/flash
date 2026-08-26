@@ -152,7 +152,7 @@ def _static_namespace_attribute(namespace: object, name: str) -> object:
     ):
         raise ValueError
     state = _static_object_state(namespace)
-    if name not in state:
+    if state is None or name not in state:
         raise ValueError
     return state[name]
 
@@ -250,7 +250,7 @@ def _function_reference_values(function: types.FunctionType) -> tuple[object, ..
     return tuple(values)
 
 
-def _static_object_state(value: object) -> dict[str, object]:
+def _static_object_state(value: object) -> dict[str, object] | None:
     for owner in type.__getattribute__(type(value), "__mro__"):
         namespace = type.__getattribute__(owner, "__dict__")
         descriptor = namespace.get("__dict__", _ABSENT_SLOT)
@@ -262,7 +262,7 @@ def _static_object_state(value: object) -> dict[str, object]:
         if type(state) is not dict or any(type(name) is not str for name in state):
             raise ValueError
         return state
-    raise ValueError
+    return None
 
 
 def _references_target(
@@ -273,6 +273,7 @@ def _references_target(
     budget: list[int] | None = None,
     inspect_global_object: bool = False,
     max_nodes: int = _TRAVERSAL_NODES_MAX,
+    trusted_objects: tuple[object, ...] = (),
 ) -> bool:
     if seen is None:
         seen = set()
@@ -282,6 +283,8 @@ def _references_target(
         budget = [0]
     if any(value is target for target in targets):
         return True
+    if any(value is trusted for trusted in trusted_objects):
+        return False
     value_type = type(value)
     if value is None or value_type in (bool, int, float, str, bytes, type):
         budget[0] += 1
@@ -304,7 +307,10 @@ def _references_target(
             method_self = object.__getattribute__(value, "__self__")
             if any(method_self is target for target in targets):
                 return True
-            related = (object.__getattribute__(value, "__func__"),)
+            related = (
+                object.__getattribute__(value, "__func__"),
+                method_self,
+            )
         elif value_type is functools.partial:
             related = (
                 object.__getattribute__(value, "func"),
@@ -332,19 +338,30 @@ def _references_target(
             if len(value) > _SNAPSHOT_ITEMS_MAX:
                 raise ValueError
             related = (item for pair in value.items() for item in pair)
-        elif value_type is types.ModuleType:
+        elif value_type in (
+            types.ModuleType,
+            types.BuiltinFunctionType,
+            types.BuiltinMethodType,
+        ):
             return False
         elif isinstance(value, (list, tuple, set, frozenset, dict, functools.partial)) or callable(
             value
         ):
             raise ValueError
-        elif inspect_global_object:
+        else:
+            value_type = type(value)
+            if (
+                _getattr_type_static(value_type, "__getattribute__", _ABSENT_SLOT)
+                is not object.__getattribute__
+                or _getattr_type_static(value_type, "__getattr__", _ABSENT_SLOT) is not _ABSENT_SLOT
+            ):
+                raise ValueError
             state = _static_object_state(value)
+            if state is None:
+                return False
             if len(state) > _SNAPSHOT_ITEMS_MAX:
                 raise ValueError
             related = state.values()
-        else:
-            return False
         found = False
         for item in related:
             if item is not None:
@@ -360,6 +377,7 @@ def _references_target(
                         budget,
                         inspect_global_object or item_is_global,
                         max_nodes,
+                        trusted_objects,
                     )
                     or found
                 )

@@ -174,6 +174,20 @@ def _build_no_redirect_opener(
 _OPENER_LOCK = threading.Lock()
 _DEFAULT_NO_REDIRECT_OPENER: urllib.request.OpenerDirector | None = None
 _INSTALLED_OPENER_CACHE: _InstalledOpenerCache | None = None
+_STDLIB_INSTALL_OPENER = urllib.request.install_opener
+
+
+def _install_opener_with_cache_reset(opener) -> None:
+    global _DEFAULT_NO_REDIRECT_OPENER, _INSTALLED_OPENER_CACHE
+
+    with _OPENER_LOCK:
+        _STDLIB_INSTALL_OPENER(opener)
+        if opener is None:
+            _DEFAULT_NO_REDIRECT_OPENER = None
+            _INSTALLED_OPENER_CACHE = None
+
+
+urllib.request.install_opener = _install_opener_with_cache_reset
 
 
 def _handles_redirect_error(handler: urllib.request.BaseHandler) -> bool:
@@ -380,6 +394,7 @@ def _references_target(
     active: set[int] | None = None,
     budget: list[int] | None = None,
     inspect_global_object: bool = False,
+    trusted_objects: tuple[object, ...] = (),
 ) -> bool:
     return _find_references_target(
         value,
@@ -389,6 +404,7 @@ def _references_target(
         budget,
         inspect_global_object,
         _TRAVERSAL_NODES_MAX,
+        trusted_objects,
     )
 
 
@@ -442,6 +458,38 @@ def _rebuild_proxy_callbacks(
         )
 
 
+def _registered_class_callbacks(
+    handler: urllib.request.BaseHandler,
+    state: dict[str, object],
+) -> tuple[types.FunctionType, ...]:
+    callbacks = []
+    seen = set(state)
+    for owner in type.__getattribute__(type(handler), "__mro__"):
+        namespace = type.__getattribute__(owner, "__dict__")
+        if namespace.get("__module__") == urllib.request.__name__:
+            continue
+        for name, value in namespace.items():
+            if name in seen:
+                continue
+            seen.add(name)
+            if name in {"redirect_request", "do_open", "proxy_open"} or "_" not in name:
+                continue
+            condition = name.split("_", 1)[1]
+            if not (
+                condition == "open"
+                or condition == "request"
+                or condition == "response"
+                or condition.startswith("error")
+            ):
+                continue
+            if type(value) is not types.FunctionType:
+                raise TypeError
+            if object.__getattribute__(value, "__module__") == urllib.request.__name__:
+                continue
+            callbacks.append(value)
+    return tuple(callbacks)
+
+
 def _copy_installed_handler(
     handler: urllib.request.BaseHandler,
     opener: urllib.request.OpenerDirector,
@@ -457,12 +505,14 @@ def _copy_installed_handler(
             _rebuild_proxy_callbacks(copied, copied_state)
         if copied_state is handler_state or copied_state.get("parent", _ABSENT_SLOT) is not opener:
             raise TypeError
-        copied_values = tuple(
-            value for name, value in copied_state.items() if name != "parent"
-        ) + tuple(
-            value
-            for _owner_id, _slot_name, value in _slot_values(copied)
-            if value is not _ABSENT_SLOT
+        copied_values = (
+            tuple(value for name, value in copied_state.items() if name != "parent")
+            + tuple(
+                value
+                for _owner_id, _slot_name, value in _slot_values(copied)
+                if value is not _ABSENT_SLOT
+            )
+            + _registered_class_callbacks(copied, copied_state)
         )
         reference_seen: set[int] = set()
         reference_active: set[int] = set()
@@ -476,6 +526,7 @@ def _copy_installed_handler(
                     seen=reference_seen,
                     active=reference_active,
                     budget=reference_budget,
+                    trusted_objects=(copied,),
                 )
                 or retains_target
             )
