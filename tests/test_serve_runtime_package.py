@@ -22,6 +22,16 @@ CONTROL_FILES = {
     "flash/serve/control/planning.py",
     "flash/serve/control/types.py",
 }
+DEPLOYMENT_FILES = {
+    "flash/serve/deployment/__init__.py",
+    "flash/serve/deployment/adapter_check.py",
+    "flash/serve/deployment/deploy.py",
+    "flash/serve/deployment/export.py",
+    "flash/serve/deployment/preflight.py",
+    "flash/serve/deployment/profiles.py",
+    "flash/serve/deployment/readiness.py",
+    "flash/serve/deployment/resolve.py",
+}
 APP_FILES = {
     "flash/serve/app/__init__.py",
     "flash/serve/app/__main__.py",
@@ -90,7 +100,7 @@ def test_wheel_contains_runtime_and_declares_extra(tmp_path: Path) -> None:
 
     with zipfile.ZipFile(wheels[0]) as wheel:
         names = set(wheel.namelist())
-        assert names >= APP_FILES | RUNTIME_FILES | CONTROL_FILES
+        assert names >= APP_FILES | RUNTIME_FILES | CONTROL_FILES | DEPLOYMENT_FILES
         metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
         metadata = wheel.read(metadata_name).decode()
 
