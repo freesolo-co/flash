@@ -7,7 +7,6 @@ import httpx
 
 from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
 from flash.serving.src.io.schemas import AdapterRecord, PersistedAdapterRecord
-from flash.serving.src.store.persisted_columns import PERSISTED_COLUMNS
 from flash.serving.src.store.settings import ADAPTER_TABLE, Settings
 from flash.serving.src.store.supabase_rest import (
     postgrest_error,
@@ -18,6 +17,11 @@ from flash.serving.src.store.supabase_rest import (
 
 FOREIGN_KEY_VIOLATION = "23503"
 UNIQUE_VIOLATION = "23505"
+PERSISTED_COLUMNS = (
+    "id,org_id,run_id,checkpoint,checkpoint_id,source_repo_type,source_repository,"
+    "source_revision,source_subfolder,artifact_digest,artifact_fingerprint,base_model,"
+    "lora_config,serving_defaults,url,status,deployment_generation,created_at,updated_at"
+)
 
 
 class PersistenceConflict(RuntimeError):
