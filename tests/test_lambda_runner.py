@@ -281,7 +281,11 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, extra_pip=()):
 
     monkeypatch.setattr(lb, "load_payload", payload)
     monkeypatch.setattr(lb, "fetch_code", lambda p: None)
-    monkeypatch.setattr(lb, "run_mode", lambda p, e, m, d: (calls.append(m), rc)[1])
+    monkeypatch.setattr(
+        lb,
+        "run_mode",
+        lambda p, e, m, d, **_kwargs: (calls.append(m), rc)[1],
+    )
     return lb, calls
 
 
@@ -1970,6 +1974,69 @@ def test_poll_lambda_returns_current_fenced_result_before_status(monkeypatch):
     assert result.metrics == {"wall_seconds": 12.0}
 
 
+def test_poll_lambda_retries_result_download_and_costs_manifest_finished_at(monkeypatch):
+    from flash.providers._lifecycle.instances import poll_instance as poll_module
+    from flash.providers.artifacts.attempts import AttemptArtifacts
+    from flash.runner.lifecycle.protocol import ResultManifest
+    from flash.snapshot.archive import source_attestation
+
+    real_observe = poll_module._observe_result
+    jobs, poll_instance = _wire_lambda_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="lambda", work=100.0, result=120.0),
+        instances=[{"status": "active"}],
+    )
+    manifest = ResultManifest(
+        run_id=_spec().run_id,
+        phase_namespace="sft",
+        attempt_id=0,
+        fence=1,
+        outcome="succeeded",
+        failure_class=None,
+        started_at=9_000.0,
+        finished_at=9_100.0,
+        training_entered=True,
+        completed_steps=1,
+        metrics={"wall_seconds": 80.0},
+        checkpoint={},
+        artifacts={"adapter": "published"},
+        source_attestation=source_attestation(
+            SOURCE_SNAPSHOT,
+            run_id=_spec().run_id,
+            attempt=0,
+            fence=1,
+        ),
+        diagnostics={},
+    )
+    reads = iter(
+        [
+            OSError("temporary result download failure"),
+            AttemptArtifacts("revision", 9_101.0, None, manifest.to_dict()),
+        ]
+    )
+    def read_artifacts(*_args, **_kwargs):
+        observed = next(reads)
+        if isinstance(observed, Exception):
+            raise observed
+        return observed
+
+    monkeypatch.setattr(poll_instance, "_observe_result", real_observe)
+    monkeypatch.setattr(poll_instance, "read_attempt_artifacts", read_artifacts)
+    monkeypatch.setattr(poll_instance, "persist_attempt_artifacts", lambda *_args: None)
+    monkeypatch.setattr(poll_instance.time, "time", _instance_clock(step=1.0))
+
+    result = jobs.poll_lambda_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+    )
+
+    assert result.ok
+    assert result.metrics["cost_usd"] == round(100.0 / 3600.0 * 1.29, 6)
+    assert result.metrics["notes"]["lambda_region"] == "us-east-1"
+
+
 def test_poll_lambda_dead_instance_waits_for_result_deadline(monkeypatch):
     jobs, poll_instance = _wire_lambda_poll(
         monkeypatch,
@@ -2385,6 +2452,14 @@ def test_handle_roundtrip():
     d = h.to_dict()
     assert d["provider"] == "lambda"
     assert LambdaJobHandle.from_dict(d) == h
+
+
+@pytest.mark.parametrize("started_ts", [0, -1, float("inf")])
+def test_handle_rejects_invalid_launch_timestamp(started_ts):
+    from flash.providers.lambda_.jobs.builders import LambdaJobHandle
+
+    with pytest.raises(ValueError, match="launch timestamp is invalid"):
+        LambdaJobHandle.from_dict({**_handle().to_dict(), "started_ts": started_ts})
 
 
 def test_sweep_orphans_label_safety(monkeypatch):
