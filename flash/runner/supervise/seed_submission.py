@@ -33,7 +33,7 @@ class _SubmitContext:
     started_with_shared_cache: bool
     last_handle: dict = field(default_factory=dict)
     current_gpu: dict = field(default_factory=dict)
-    # persisted into the run handle so attach_run recovery polls with the same stall tuning.
+    # persisted into the run handle so attach recovery keeps the same queue-capacity window.
     current_on_last_gpu: bool = False
     current_attempt: int = 0
     current_fence: int = 0
@@ -46,7 +46,7 @@ class _SubmitContext:
     # how many times each shape has refused capacity, so a second refusal of the SAME one is a
     # repeat rather than a first look. counted per shape, not collected as a set of names: over
     # several classes a set says "everything has refused" while one of them has been asked once.
-    # only capacity failures land here -- a stall or a preemption says nothing about rentability.
+    # only capacity failures land here. provider loss says nothing about current rentability.
     capacity_refusals: dict[tuple[str, str, int], int] = field(default_factory=dict)
     oom_vram_floor: float = 0.0
     last_detail: str | None = None
@@ -258,6 +258,10 @@ def _require_opd_configuration(ctx: _SubmitContext) -> None:
 def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     if not ctx.last_handle:
         return None
+    with contextlib.suppress(Exception):
+        metrics = _lifecycle._attempt_result_metrics(ctx.spec.run_id, ctx.last_handle)
+        if metrics is not None:
+            return metrics
     from flash.providers.core.base import JobHandle
     from flash.providers.core.registry import get_provider
     from flash.runner.accounting.reconciliation import (
@@ -770,6 +774,16 @@ def _handle_failure(
 
     # cancel wins over any retry-shaped failure.
     ctx.raise_if_cancelled()
+    if ctx.last_handle:
+        try:
+            completed_metrics = _lifecycle._attempt_result_metrics(
+                ctx.spec.run_id, ctx.last_handle
+            )
+        except Exception:
+            completed_metrics = None
+        if completed_metrics is not None:
+            ctx.raise_if_cancelled()
+            return _FailureDecision(completed_metrics, False)
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
     if outcome.chosen is not None and result.failure in ("job_preempted", "oom"):

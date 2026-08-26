@@ -2,8 +2,8 @@
 
 Lambda and Vast are ~identical thin delegators over the shared ``base.Provider`` interface: they
 provision a GPU instance, boot it, and detect completion from the worker's HF artifacts. The only
-differences are per-substrate details (which auth/pricing/jobs module to call, the handle class, the
-reattach deadline formula, and how a reattached instance is torn down).
+differences are per-substrate details such as auth, pricing, job modules, handle types, and how a
+reattached instance is torn down.
 
 ``InstanceProvider`` folds the identical method bodies here and defers each per-substrate detail to a
 small hook the subclass overrides. "Add a rent-a-box provider" becomes "subclass ``InstanceProvider``

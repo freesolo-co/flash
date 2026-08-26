@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import base64
 import io
-import itertools
 import json
 import re
 import time
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -77,21 +78,55 @@ def _build_payload(builders, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
     kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
-    return builders.build_payload(*args, **kwargs)
+    kwargs.setdefault("fence", 1)
+    attempt_id = kwargs.get("attempt", args[2] if len(args) > 2 else 0)
+    deadline_at = kwargs["deadline_at"]
+    attempt = _instance_attempt(
+        provider="lambda",
+        grant=deadline_at - 120.0,
+        work=deadline_at - 60.0,
+        result=deadline_at,
+        attempt_id=attempt_id,
+        fence=kwargs["fence"],
+    )
+    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
+        return builders.build_payload(*args, **kwargs)
 
 
 def _launch(jobs, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
     kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
-    return jobs.launch_and_submit(*args, **kwargs)
+    kwargs.setdefault("fence", 1)
+    deadline_at = kwargs["deadline_at"]
+    attempt = _instance_attempt(
+        provider="lambda",
+        grant=deadline_at - 120.0,
+        work=deadline_at - 60.0,
+        result=deadline_at,
+        attempt_id=kwargs.get("attempt", 0),
+        fence=kwargs["fence"],
+    )
+    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
+        return jobs.launch_and_submit(*args, **kwargs)
 
 
 def _submit(jobs, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
     kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
-    return jobs.submit_run_lambda(*args, **kwargs)
+    kwargs.setdefault("fence", 1)
+    deadline_at = kwargs["deadline_at"]
+    attempt = _instance_attempt(
+        provider="lambda",
+        grant=deadline_at - 120.0,
+        work=deadline_at - 60.0,
+        result=deadline_at,
+        attempt_id=kwargs.get("attempt", 0),
+        fence=kwargs["fence"],
+    )
+    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
+        return jobs.submit_run_lambda(*args, **kwargs)
 
 
 def _inst(gpu="A10", region="us-east-1", itype="gpu_1x_a10", price=1.29, disk_gb=None):
@@ -118,20 +153,8 @@ def _handle(started_ts=10_000.0, rate=1.29):
         gpu="A10",
         hourly_usd=rate,
         attempt=0,
+        fence=1,
         started_ts=started_ts,
-    )
-
-
-def _terminal_marker(*, ok: bool, retriable: bool = False, error: str = "") -> str:
-    return json.dumps(
-        {
-            "attempt": 0,
-            "error": error,
-            "ok": ok,
-            "retriable": retriable,
-            "run_id": "flash-1700000000-abcd1234",
-            "ts": 10_000.0,
-        }
     )
 
 
@@ -175,11 +198,10 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     # no module crosses the boundary as a bare source heredoc any more.
     assert "cat > /opt/flash/bootstrap.py" not in script
     assert not re.search(r"cat > \S+\.py", script)
-    # the worker still signals completion through metrics.json. That contract now lives INSIDE the
-    # shipped bootstrap rather than in the launch text (the capsule is compressed, so a substring
-    # check against the script would be vacuous), and the siblings it imports must ride with it.
+    # the worker owns fenced result publication. the shipped bootstrap only launches it and treats
+    # the immutable result manifest as terminal authority.
     shipped = _capsule_member("bootstrap.py")
-    assert "metrics.json" in shipped
+    assert "fenced result manifest" in shipped
     for sibling in ("bootstrap_secrets.py", "bootstrap_console.py", "bootstrap_pip.py"):
         assert sibling.removesuffix(".py") in shipped, sibling
     # runs the prebuilt WORKER_IMAGE via Docker with the GPU + the capsule bootstrap as the command
@@ -231,11 +253,10 @@ def test_image_per_sm_selects_arch_tag():
     assert f"{WORKER_IMAGE}-sm90" in script
 
 
-def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True, extra_pip=()):
+def _bootstrap_env(monkeypatch, phase="sft", rc=0, extra_pip=()):
     from flash.providers._lifecycle.bootstrapping import bootstrap as lb
 
     calls: list[str] = []
-    markers: list[tuple[bool, str, bool]] = []
 
     def payload(path=lb.PAYLOAD_PATH):
         del path
@@ -255,25 +276,18 @@ def _bootstrap_env(monkeypatch, phase="sft", rc=0, metrics=True, extra_pip=()):
             "run_created_at": created_at,
             "run_max_wall_seconds": 60.0,
             "attempt": 0,
+            "fence": 1,
         }
 
     monkeypatch.setattr(lb, "load_payload", payload)
     monkeypatch.setattr(lb, "fetch_code", lambda p: None)
     monkeypatch.setattr(lb, "run_mode", lambda p, e, m, d: (calls.append(m), rc)[1])
-    monkeypatch.setattr(
-        lb,
-        "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
-    )
-    monkeypatch.setattr(lb.os.path, "exists", lambda p: metrics if "metrics.json" in p else False)
-    return lb, calls, markers
+    return lb, calls
 
 
-def test_build_worker_env_exports_attempt():
-    # the worker stamps every heartbeat with os.environ["ATTEMPT"], and worker_flagged_retriable
-    # accepts only matching attempt and timestamp provenance. the shared instance bootstrap (Vast + Lambda)
-    # must export ATTEMPT, or a worker on a nonzero retry defaults to attempt 0 and its current heartbeat is
-    # rejected as mismatched, potentially losing valid retriable evidence.
+def test_build_worker_env_exports_fenced_identity():
+    # every worker artifact is bound to the reserved attempt and fence. the shared instance bootstrap
+    # must export both identities before worker execution.
     from flash.providers._lifecycle.bootstrapping import bootstrap as lb
 
     payload = {
@@ -281,6 +295,7 @@ def test_build_worker_env_exports_attempt():
         "seed": 0,
         "flash_arm": "vast",
         "attempt": 2,
+        "fence": 3,
         "run_id": "run-1",
         "job_spec_json": "{}",
         "source_snapshot": SOURCE_SNAPSHOT,
@@ -290,7 +305,8 @@ def test_build_worker_env_exports_attempt():
         },
     }
     env = lb.build_worker_env(payload)
-    assert env["ATTEMPT"] == "2"  # exported from the payload attempt, as a str (worker reads a str)
+    assert env["ATTEMPT"] == "2"
+    assert env["FENCE"] == "3"
     assert "GITHUB_TOKEN" not in env
     assert "GIT_ASKPASS" not in env
     payload.pop("attempt")
@@ -299,55 +315,20 @@ def test_build_worker_env_exports_attempt():
 
 
 def test_bootstrap_train_success(monkeypatch):
-    lb, calls, markers = _bootstrap_env(monkeypatch)
+    lb, calls = _bootstrap_env(monkeypatch)
     assert lb.main() == 0
-    assert calls == ["sft"]  # one fresh worker process
-    assert markers == [(True, "", False)]  # success marker, not retriable
+    assert calls == ["sft"]
 
 
-def test_bootstrap_fails_without_metrics(monkeypatch):
-    lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
-    # A genuine crash: no local metrics AND nothing on HF (stub keeps the check offline + deterministic).
-    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
-    assert lb.main() == 1
-    ok, error, retriable = markers[0]
-    assert not ok
-    assert error.startswith("RuntimeError: train phase 'sft' produced no /tmp/metrics.json")
-    # A genuine no-metrics crash (the worker never produced metrics) is a REAL failure, not infra:
-    # it must NOT be flagged retriable (that would loop a deterministically-broken run).
-    assert retriable is False
-
-
-def test_bootstrap_missing_local_metrics_but_remote_confirmed_is_retriable(monkeypatch):
-    """No local /tmp/metrics.json but the run IS complete on HF (DONE+metrics uploaded) — e.g. the
-    idempotency replay hit a transient HF read. This is a SUCCEEDED run; the bootstrap must consult
-    remote completion BEFORE the missing-local-file RuntimeError and surface a RETRIABLE marker so a
-    fresh worker re-fetches the persisted metrics, never fail a confirmed-complete run."""
-    lb, _calls, markers = _bootstrap_env(monkeypatch, metrics=False)
-    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
-    assert lb.main() == 1
-    ok, error, retriable = markers[0]
-    assert not ok
-    assert error.startswith("RetriableBootstrapError: train phase 'sft' is complete on HF")
-    assert retriable is True  # confirmed-complete -> reschedule to re-fetch, not a fatal job_failed
-
-
-def test_bootstrap_fetch_code_failure_is_retriable(monkeypatch):
-    # A transient HF blip fetching the run's OWN code (the control plane uploaded it before submit) is
-    # infra-shaped, exactly like the already-wrapped fetch_spec_from_hf — it must surface as a
-    # retriable marker so the run walks to a fresh host, NOT a fatal job_failed (the asymmetry = bug).
-    lb, calls, markers = _bootstrap_env(monkeypatch)
+def test_bootstrap_fetch_code_failure_prevents_worker_launch(monkeypatch):
+    lb, calls = _bootstrap_env(monkeypatch)
 
     def boom(_payload):
         raise lb.RetriableBootstrapError("failed to fetch the pinned flash source snapshot")
 
     monkeypatch.setattr(lb, "fetch_code", boom)
     assert lb.main() == 1
-    assert calls == []  # crashed before launching the worker subprocess
-    ok, error, retriable = markers[0]
-    assert not ok
-    assert error == "RetriableBootstrapError: failed to fetch the pinned flash source snapshot"
-    assert retriable is True
+    assert calls == []
 
 
 def test_bootstrap_sets_lambda_arm():
@@ -361,6 +342,7 @@ def test_bootstrap_sets_lambda_arm():
             "phase": "sft",
             "seed": 0,
             "attempt": 0,
+            "fence": 1,
             "env": {},
             "flash_arm": "lambda",
             "run_id": "run-1",
@@ -369,14 +351,9 @@ def test_bootstrap_sets_lambda_arm():
     )
     assert env["FLASH_ARM"] == "lambda"
     # And Lambda's build_payload is what sets flash_arm='lambda'.
-    from flash.providers.lambda_.jobs.builders import build_payload
+    from flash.providers.lambda_.jobs import builders
 
-    assert (
-        build_payload(_spec(), 0, 0, source_snapshot=SOURCE_SNAPSHOT, deadline_at=_deadline_at())[
-            "flash_arm"
-        ]
-        == "lambda"
-    )
+    assert _build_payload(builders, _spec(), 0, 0)["flash_arm"] == "lambda"
 
 
 class _FakePipProc:
@@ -762,18 +739,12 @@ def test_bootstrap_extra_pip_transient_only_text_still_retries(monkeypatch):
     assert len(calls) == 4  # one attempt plus the three bounded retries
 
 
-def test_main_marks_exhausted_extra_pip_index_failure_retriable(monkeypatch):
-    # End to end through main(): the marker the poller reads must say retriable, so the attempt is
-    # classified job_preempted (walk to a fresh host) instead of job_failed (fail the paid run).
-    lb, calls, markers = _bootstrap_env(monkeypatch, extra_pip=["some-env-pkg"])
+def test_main_stops_before_worker_when_extra_pip_index_is_unreachable(monkeypatch):
+    lb, calls = _bootstrap_env(monkeypatch, extra_pip=["some-env-pkg"])
     monkeypatch.setattr(lb.subprocess, "Popen", lambda *_a, **_k: _FakePipProc("read timed out", 1))
     monkeypatch.setattr(lb.time, "sleep", lambda _s: None)
     assert lb.main() == 1
-    assert calls == []  # crashed before launching the worker subprocess
-    ok, error, retriable = markers[0]
-    assert not ok
-    assert error.startswith("RetriableBootstrapError: extra_pip install could not reach")
-    assert retriable is True
+    assert calls == []
 
 
 def test_bootstrap_extra_pip_retry_sleep_never_outlives_the_deadline(monkeypatch):
@@ -857,12 +828,11 @@ def test_bootstrap_extra_pip_backoff_leaves_time_to_run_the_retry(monkeypatch):
     assert max(slept) < 8.0
 
 
-def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
-    # The instance bootstrap must stamp ATTEMPT into the worker env (RunPod does it in jobs.py) — the
-    # worker reads it into every heartbeat, and the poller's stale-heartbeat rejection is dead without
-    # it (a prior attempt's leftover heartbeat would disarm the new attempt's fast failover).
+def test_bootstrap_promotes_attempt_and_fence_to_worker_env():
+    # the instance bootstrap must stamp the fenced attempt identity into the worker environment so
+    # immutable progress and result records are written under the current authority boundary.
     from flash.providers._lifecycle.bootstrapping import bootstrap as lb
-    from flash.providers.lambda_.jobs.builders import build_payload
+    from flash.providers.lambda_.jobs import builders
 
     base = {
         "job_spec_json": "{}",
@@ -873,20 +843,35 @@ def test_bootstrap_promotes_attempt_to_env_for_heartbeat_gating():
         "run_id": "run-1",
         "source_snapshot": SOURCE_SNAPSHOT,
     }
-    assert lb.build_worker_env({**base, "attempt": 3})["ATTEMPT"] == "3"
-    assert lb.build_worker_env({**base, "attempt": 0})["ATTEMPT"] == "0"
+    assert lb.build_worker_env({**base, "attempt": 3, "fence": 7})["ATTEMPT"] == "3"
+    assert lb.build_worker_env({**base, "attempt": 3, "fence": 7})["FENCE"] == "7"
+    assert lb.build_worker_env({**base, "attempt": 0, "fence": 1})["ATTEMPT"] == "0"
     with pytest.raises(RuntimeError, match="attempt identity is invalid"):
-        lb.build_worker_env(base)
+        lb.build_worker_env({**base, "fence": 1})
     # And the producer end actually carries the launched attempt into the payload bootstrap reads.
     assert (
-        build_payload(
+        _build_payload(
+            builders,
             _spec(),
             seed=0,
             attempt=2,
+            fence=4,
             source_snapshot=SOURCE_SNAPSHOT,
             deadline_at=_deadline_at(),
         )["attempt"]
         == 2
+    )
+    assert (
+        _build_payload(
+            builders,
+            _spec(),
+            seed=0,
+            attempt=2,
+            fence=4,
+            source_snapshot=SOURCE_SNAPSHOT,
+            deadline_at=_deadline_at(),
+        )["fence"]
+        == 4
     )
 
 
@@ -1128,33 +1113,6 @@ def test_ambiguous_filesystem_create_fails_closed_without_second_post(monkeypatc
 
     assert posts == [True]
     assert listings["count"] == 2
-
-
-def test_lambda_failure_detail_is_bounded_and_redacts_credentials(monkeypatch):
-    import flash.providers.lambda_.jobs as jobs
-
-    monkeypatch.setenv("HF_TOKEN", "hf-private-token")
-
-    def reader(_repo, path, *_args, **_kwargs):
-        if path.endswith("_boot.log"):
-            return lambda force=False: "boot failed Authorization: Bearer hf-private-token"
-        return lambda force=False: "worker failed token=hf-private-token"
-
-    monkeypatch.setattr(jobs, "_make_hf_file_reader", reader)
-
-    detail = jobs._failure_detail(
-        "org/repo",
-        "sft/run",
-        "sft",
-        {"error": "RuntimeError: worker failed"},
-        1,
-    )
-
-    assert "RuntimeError: worker failed" in detail
-    assert "error_sft_attempt1.txt" in detail
-    assert "lambda_attempt1_boot.log" in detail
-    assert "hf-private-token" not in detail
-    assert "<redacted>" in detail
 
 
 def test_lambda_cleanup_logs_suppress_provider_detail(monkeypatch):
@@ -1678,15 +1636,14 @@ def test_cache_bind_uses_returned_mount_point(monkeypatch):
 def test_cache_payload_points_base_model_prefetch_at_the_bind(monkeypatch):
     """The base64 payload points the base-model prefetch (FLASH_WEIGHT_CACHE_DIR) at the bind so the
     model download persists — NOT a process-global HF_HOME, so env/reward downloads stay ephemeral (#252)."""
-    from flash.providers.lambda_.jobs import build_payload
+    from flash.providers.lambda_.jobs import builders
 
-    payload = build_payload(
+    payload = _build_payload(
+        builders,
         _spec(network_volume="flash-weights"),
         0,
         0,
         cache_host_mount="/lambda/nfs/flash-weights",
-        source_snapshot=SOURCE_SNAPSHOT,
-        deadline_at=_deadline_at(),
     )
     assert payload["env"]["FLASH_WEIGHT_CACHE_DIR"] == "/weight-cache/hf-cache/hub"
     assert "HF_HOME" not in payload["env"]
@@ -1929,740 +1886,243 @@ def test_cache_ensured_per_region_in_the_walk(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# poll_lambda_job state machine
+# lambda resource and fenced-result polling
 # ---------------------------------------------------------------------------
-_AUTO_MARKER = object()
+def _instance_attempt(*, provider, grant=5.0, work=200.0, result=220.0, attempt_id=0, fence=1):
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    return AttemptRecord.from_dict(
+        {
+            "attempt_id": attempt_id,
+            "fence": fence,
+            "state": "active",
+            "reserved_at": 1.0,
+            "grant_deadline_at": grant,
+            "work_deadline_at": work,
+            "result_deadline_at": result,
+            "run_deadline_at": work,
+            "provider": provider,
+            "provider_contract": None,
+            "resource": None,
+            "allocation": None,
+            "progress_receipt": None,
+            "result_receipt": None,
+            "cleanup": {},
+            "schema_version": 1,
+        }
+    )
 
 
-def _wire_poll(
-    monkeypatch,
-    instances,
-    done=None,
-    marker=_AUTO_MARKER,
-    metrics=None,
-    boot=None,
-    error=None,
-    step=10.0,
-):
+def _instance_clock(start=0.0, step=10.0):
+    value = start - step
+
+    def now():
+        nonlocal value
+        value += step
+        return value
+
+    return now
+
+
+def _wire_lambda_poll(monkeypatch, *, attempt=None, results=(), instances=()):
     import flash.providers.lambda_.jobs as jobs
+    from flash.providers._lifecycle.instances import poll_instance
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.runner.lifecycle import status as status_ops
+
+    result_iter = iter(results)
+    instance_iter = iter(instances)
+    last = {"value": None}
+
+    def get_instance(*_args, **_kwargs):
+        last["value"] = next(instance_iter, last["value"])
+        return last["value"]
+
+    monkeypatch.setattr(lambda_api, "get_instance", get_instance)
+    monkeypatch.setattr(status_ops, "get_status", lambda _run_id: SimpleNamespace(remote={}))
+    monkeypatch.setattr(
+        status_ops,
+        "source_snapshot_from_status",
+        lambda _status, required=True: dict(SOURCE_SNAPSHOT),
+    )
+    monkeypatch.setattr(
+        poll_instance,
+        "_current_attempt",
+        lambda _adapter: attempt or _instance_attempt(provider="lambda"),
+    )
+    monkeypatch.setattr(poll_instance, "_record_resource", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(poll_instance, "_observe_result", lambda _adapter: next(result_iter, None))
+    monkeypatch.setattr(poll_instance.time, "sleep", lambda _seconds: None)
+    return jobs, poll_instance
+
+
+def test_poll_lambda_returns_current_fenced_result_before_status(monkeypatch):
+    from flash.providers.core.base import PollResult
+
+    jobs, _poll = _wire_lambda_poll(
+        monkeypatch,
+        results=[PollResult(True, metrics={"wall_seconds": 12.0})],
+    )
+
+    result = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+
+    assert result.ok
+    assert result.metrics == {"wall_seconds": 12.0}
+
+
+def test_poll_lambda_dead_instance_waits_for_result_deadline(monkeypatch):
+    jobs, poll_instance = _wire_lambda_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="lambda", work=20.0, result=30.0),
+        results=[None, None],
+        instances=[{"status": "terminated"}],
+    )
+    monkeypatch.setattr(poll_instance.time, "time", _instance_clock())
+
+    result = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+
+    assert result.failure == "job_preempted"
+    assert "terminated" in result.detail
+    assert "result manifest" in result.detail
+
+
+def test_poll_lambda_dead_instance_before_grant_waits_for_result_deadline(monkeypatch):
+    jobs, poll_instance = _wire_lambda_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="lambda", grant=25.0, work=40.0, result=50.0),
+        results=[None, None, None],
+        instances=[{"status": "terminated"}],
+    )
+    monkeypatch.setattr(poll_instance.time, "time", _instance_clock())
+
+    result = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+
+    assert result.failure == "job_preempted"
+    assert "terminated" in result.detail
+    assert "result manifest" in result.detail
+    assert "grant deadline" not in result.detail
+
+
+def test_poll_lambda_active_without_progress_uses_attempt_deadline(monkeypatch):
+    jobs, poll_instance = _wire_lambda_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="lambda", work=25.0, result=45.0),
+        results=[None, None, None],
+        instances=[{"status": "active"}],
+    )
+    monkeypatch.setattr(poll_instance.time, "time", _instance_clock())
+
+    result = jobs.poll_lambda_job(
+        _handle(),
+        _spec(),
+        seed=0,
+        interval_s=0,
+        deadline_at=10_000.0,
+    )
+
+    assert result.failure == "job_preempted"
+    assert "work deadline expired" in result.detail
+
+
+def test_poll_lambda_preserves_provisioning_deadline(monkeypatch):
+    jobs, poll_instance = _wire_lambda_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="lambda", grant=15.0, work=100.0, result=120.0),
+        results=[None, None],
+        instances=[{"status": "booting"}],
+    )
+    monkeypatch.setattr(poll_instance.time, "time", _instance_clock())
+
+    result = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+
+    assert result.failure == "job_preempted"
+    assert "grant deadline" in result.detail
+
+
+def test_poll_lambda_bounds_provider_status_failures(monkeypatch):
+    from flash.providers._lifecycle.instances import poll as poll_helpers
     from flash.providers.lambda_.client import api as lambda_api
 
-    if marker is _AUTO_MARKER:
-        if done is None:
-            marker = None
-        else:
-
-            def auto_marker():
-                done_value = done() if callable(done) else done
-                if done_value is None:
-                    return None
-                return _terminal_marker(ok=True)
-
-            marker = auto_marker
-
-    seq = iter(instances)
-    last = {"inst": None}
-
-    def fake_get(instance_id):
-        last["inst"] = next(seq, last["inst"])
-        return last["inst"]
-
-    monkeypatch.setattr(lambda_api, "get_instance", fake_get)
-    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
-    clock = itertools.count(start=10_000, step=step)
-    monkeypatch.setattr(jobs.time, "time", lambda: float(next(clock)))
-
-    def factory(hf_repo, path, min_interval_s=45.0):
-        def read(force=False):
-            if path.endswith("/DONE"):
-                return done() if callable(done) else done
-            if "lambda_attempt" in path and path.endswith(".json"):  # not the _boot.log
-                return marker() if callable(marker) else marker
-            if path.endswith("metrics.json"):
-                return metrics() if callable(metrics) else metrics
-            if path.endswith("_boot.log"):  # attempt-scoped: lambda_attempt<N>_boot.log
-                return boot() if callable(boot) else boot
-            if "/error_" in path:
-                return error() if callable(error) else error
-            return None
-
-        return read
-
-    monkeypatch.setattr(jobs, "_make_hf_file_reader", factory)
-    return jobs
-
-
-def test_poll_success_stamps_real_cost(monkeypatch):
-    jobs = _wire_poll(
+    jobs, poll_instance = _wire_lambda_poll(
         monkeypatch,
-        instances=[{"status": "active"}],
-        done="10000.0",
-        metrics=json.dumps({"train_tokens": 4096, "wall_seconds": 100, "cost_usd": 0.0}),
+        attempt=_instance_attempt(provider="lambda", work=1_000.0, result=1_020.0),
+        results=[None] * 10,
     )
-    # started_ts precedes the mocked clock (starts 10_000) so wall is positive on the first tick.
-    res = jobs.poll_lambda_job(_handle(started_ts=9_000.0), _spec(), seed=0, interval_s=0)
-    assert res.ok
-    assert res.metrics["train_tokens"] == 4096
-    # cost comes from the instance's real $/hr x wall time, not a runpod table rate
-    assert res.metrics["cost_usd"] > 0
-    assert res.metrics["notes"]["provider"] == "lambda"
-    assert res.metrics["notes"]["lambda_rate_usd_hr"] == 1.29
-    assert res.metrics["notes"]["lambda_region"] == "us-east-1"
-
-
-def test_poll_caps_recovered_cost_at_done_timestamp(monkeypatch):
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        done="9100.0",
-        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
+    monkeypatch.setattr(poll_instance.time, "time", _instance_clock(step=1.0))
+    monkeypatch.setattr(poll_helpers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        lambda_api,
+        "get_instance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(lambda_api.LambdaApiError("offline")),
     )
-    res = jobs.poll_lambda_job(_handle(started_ts=9000.0), _spec(), seed=0, interval_s=0)
-    assert res.ok
-    assert res.metrics["cost_usd"] == round((9100.0 - 9000.0) / 3600.0 * 1.29, 6)
+
+    result = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+
+    assert result.failure == "poll_error"
 
 
-def test_poll_retries_transient_metrics_blip_after_done(monkeypatch):
-    # A fresh DONE guarantees metrics.json was uploaded first, so a None read is a transient HF blip
-    # (the reader swallows 429/network and returns None) — it must be retried, not turned into a
-    # terminal job_failed that discards (while still billing) a successful run.
-    reads = {"n": 0}
+def test_lambda_poll_adapter_carries_attempt_fence_and_cost_stamp(monkeypatch):
+    import flash.providers.lambda_.jobs as jobs
+    from flash.runner.lifecycle import status as status_ops
 
-    def metrics():
-        reads["n"] += 1
-        return None if reads["n"] <= 2 else json.dumps({"wall_seconds": 100, "cost_usd": 0.0})
-
-    jobs = _wire_poll(
-        monkeypatch, instances=[{"status": "active"}], done="10000.0", metrics=metrics
+    captured = {}
+    monkeypatch.setattr(status_ops, "get_status", lambda _run_id: SimpleNamespace())
+    monkeypatch.setattr(
+        status_ops,
+        "source_snapshot_from_status",
+        lambda _status, required=True: dict(SOURCE_SNAPSHOT),
     )
-    res = jobs.poll_lambda_job(_handle(started_ts=9000.0), _spec(), seed=0, interval_s=0)
-    assert res.ok, res
-    assert reads["n"] >= 3  # retried past the two transient None reads instead of failing
 
+    def capture(adapter, **_kwargs):
+        captured["adapter"] = adapter
+        from flash.providers.core.base import PollResult
 
-def test_poll_persistent_metrics_unreadable_is_retriable_not_job_failed(monkeypatch):
-    # If metrics.json stays unreadable after retries, fail RETRIABLY (poll_error) so the run is
-    # re-attempted (a re-launch hits the worker's DONE-idempotency and restores the persisted
-    # metrics without re-training) — NEVER the terminal job_failed that drops a billed success.
-    jobs = _wire_poll(
-        monkeypatch, instances=[{"status": "active"}], done="10000.0", metrics=lambda: None
-    )
-    res = jobs.poll_lambda_job(_handle(started_ts=9000.0), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "poll_error"
+        return PollResult(True, metrics={})
 
+    monkeypatch.setattr(jobs, "poll_instance_job", capture)
 
-def test_poll_marker_failure_is_job_failed(monkeypatch):
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        marker=_terminal_marker(ok=False, error="RuntimeError: worker failed"),
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "job_failed"  # real worker error fails fast
-    assert "RuntimeError: worker failed" in res.detail
+    result = jobs.poll_lambda_job(_handle(started_ts=9_000.0), _spec(), seed=0)
+    metrics = {"wall_seconds": 100.0}
+    captured["adapter"].stamp_cost_and_notes(metrics, end_ts=9_100.0, launch_ts=9_000.0)
 
+    assert result.ok
+    assert captured["adapter"].current_attempt == 0
+    assert captured["adapter"].fence == 1
+    assert metrics["cost_usd"] == round(100.0 / 3600.0 * 1.29, 6)
+    assert metrics["notes"]["provider"] == "lambda"
 
-def test_poll_retriable_marker_is_job_preempted(monkeypatch):
-    """A worker-flagged retriable failure retries on a fresh host (job_preempted), not job_failed."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        marker=_terminal_marker(ok=False, retriable=True, error="worker failed; detail suppressed"),
-    )
-    res = jobs.poll_lambda_job(
-        _handle(),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: {
-            "retriable": True,
-            "attempt": 0,
-            "ts": 10_000.0,
-        },
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"
 
-
-def test_poll_dead_host_without_marker_is_preempted(monkeypatch):
-    """A host that died without writing DONE/marker is retryable without exposing its boot log."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminated"}],
-        boot="+ docker pull ...\nFLASH: gpu never became ready",
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "job_preempted"
-    assert "lambda_attempt0_boot.log" in res.detail
-    assert "gpu never became ready" in res.detail
-
-
-def test_poll_dead_host_with_error_file_is_job_failed(monkeypatch):
-    """A worker error artifact fails fast without exposing its arbitrary content."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminating"}],
-        error="Traceback (most recent call last):\nFileNotFoundError: environment archive did not contain ...",
-    )
-    res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0, heartbeat_reader=lambda force=False: {}
-    )
-    assert not res.ok
-    assert res.failure == "job_failed"
-    assert "error_sft_attempt0.txt" in res.detail
-    assert "environment archive" in res.detail
-
-
-def test_poll_dead_host_with_retriable_error_still_preempted(monkeypatch):
-    """Even WITH an error_<phase>.txt, a crash the worker flagged retriable (RetriableInfraError,
-    stamped in the heartbeat) retries on a fresh host (job_preempted) -- same contract as
-    fail_from_marker. This is also what keeps a stale prior-attempt error file from flipping a
-    genuine preemption to job_failed."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "terminating"}],
-        error="Traceback ...\nRetriableInfraError: cuda device not ready",
-    )
-    res = jobs.poll_lambda_job(
-        _handle(),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: {
-            "retriable": True,
-            "attempt": 0,
-            "ts": 10_000.0,
-        },
-    )
-    assert not res.ok
-    assert res.failure == "job_preempted"
-
-
-def test_poll_loading_timeout(monkeypatch):
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "booting"}], step=100.0)
-    monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", 300.0)
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert "never became active" in res.detail
-
-
-def test_poll_heartbeat_stall(monkeypatch):
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
-    # A FRESH training heartbeat (ts >= launch 10_000) that then FROZE: it proves liveness (so the
-    # fast first-liveness failover is satisfied) AND arms the tight training stall window, so the
-    # subsequent no-progress gap past stall_after_s is the stall actually under test here.
-    frozen = {"stage": "rl", "step": 3, "ts": 10_000.0, "attempt": 0}
-    res = jobs.poll_lambda_job(
-        _handle(),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: frozen,
-        stall_after_s=500.0,
-    )
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert "no worker progress" in res.detail
-
-
-def test_poll_active_no_liveness_fails_over_fast(monkeypatch):
-    """The observed Lambda us-east-1 sick region: the instance reaches OS 'active' but the worker
-    NEVER starts — no host boot.log, no heartbeat, no marker. The first-liveness deadline fails it
-    over fast as a retriable 'stalled' (escaped cross-provider by the runner) instead of burning the
-    full ~50 min setup grace."""
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=500.0)
-    assert not res.ok
-    assert res.failure == "stalled"  # infra-shaped -> retried + escaped cross-provider (PR #241)
-    assert "no worker liveness" in res.detail
-    assert "limit 500s" in res.detail
-
-
-def test_poll_active_boot_log_protects_slow_cold_start(monkeypatch):
-    """A HEALTHY box still in its long cold start (multi-GB image pull) emits the host boot.log but
-    no heartbeat yet — the first-liveness deadline must NOT fire (that would kill a good box). Modeled
-    by an active box whose attempt-scoped boot.log is present; it later dies, so the terminal result
-    is job_preempted, NOT the 'no worker liveness' stalled."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
-        boot="+ docker pull ... (still pulling the worker image)",
-        step=100.0,
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
-    assert not res.ok
-    assert (
-        res.failure == "job_preempted"
-    )  # died as a host loss, NOT killed by the liveness deadline
-    assert "no worker liveness" not in (res.detail or "")
-
-
-def test_poll_active_empty_boot_log_counts_as_liveness(monkeypatch):
-    """An empty ("") boot.log still proves cloud-init ran — its mere EXISTENCE is liveness. A bare
-    ``not boot_log_reader()`` would treat "" as absent and spuriously fail the box over; the fix uses
-    ``is None``. Box later dies as a host loss -> job_preempted, NOT the 'no worker liveness' stall."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
-        boot="",
-        step=100.0,
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
-    assert res.failure == "job_preempted"
-    assert "no worker liveness" not in (res.detail or "")
-
-
-def test_poll_active_boot_log_seen_once_survives_rate_limited_none(monkeypatch):
-    """Regression: make_hf_text_reader returns None for BOTH a missing boot.log AND a rate-limited
-    read, so a bare ``not boot_log_reader()`` re-checked each poll would spuriously stall a HEALTHY box
-    on the first throttled read after the log was already seen. The boot.log is read with force=True and
-    latched once observed, so a later None can't re-trigger failover. Modeled by a boot.log present on
-    the first read then None (rate-limited) after; the box later dies -> job_preempted, not stalled."""
-    calls = {"n": 0}
-
-    def boot_then_rate_limited():
-        calls["n"] += 1
-        return "+ docker pull ..." if calls["n"] == 1 else None  # seen once, then "rate-limited"
-
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[
-            {"status": "active"},
-            {"status": "active"},
-            {"status": "active"},
-            {"status": "terminated"},
-        ],
-        boot=boot_then_rate_limited,
-        step=100.0,
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
-    assert res.failure == "job_preempted"  # NOT a spurious 'stalled' from the throttled None
-    assert "no worker liveness" not in (res.detail or "")
-    # Latched after the first observation: the liveness check reads the boot.log once (not once per
-    # poll); the only other read is the terminal-failure-detail surfacer when the box dies.
-    assert calls["n"] <= 2
-
-
-def test_poll_active_transient_boot_log_error_does_not_fail_over(monkeypatch):
-    """make_hf_text_reader returns None for a MISSING boot.log AND a momentary HF/Hub network error,
-    so a lone forced-read None at the first-liveness deadline must NOT immediately stall — a transient
-    blip clears on the next poll (the absence must persist BOOT_LOG_ABSENT_POLLS times to fail over).
-    Here the first forced read errors (None), the next returns the real boot.log -> latched, no
-    failover; the box later dies -> job_preempted, NOT a spurious 'stalled' from the one transient
-    None."""
-    calls = {"n": 0}
-
-    def transient_then_present():
-        calls["n"] += 1
-        return (
-            None if calls["n"] == 1 else "+ docker pull ..."
-        )  # transient error first, then readable
-
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
-        boot=transient_then_present,
-        step=100.0,
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
-    assert res.failure == "job_preempted"  # the single transient None did not trip a failover
-    assert "no worker liveness" not in (res.detail or "")
-
-
-def test_poll_active_persistent_boot_log_absence_stalls_after_threshold(monkeypatch):
-    """The genuine sick-region case: the boot.log is absent on EVERY forced read (cloud-init never
-    ran). After BOOT_LOG_ABSENT_POLLS consecutive absent reads the first-liveness check declares the
-    region 'stalled' (retriable, escaped cross-provider). Asserts the absence-count threshold is what
-    gates the failover, not a single read."""
-    from flash.providers._lifecycle.instances.poll import BOOT_LOG_ABSENT_POLLS
-
-    calls = {"n": 0}
-
-    def always_absent():
-        calls["n"] += 1  # implicit None: every forced read comes back absent
-
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], boot=always_absent, step=100.0)
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, first_liveness_s=50.0)
-    assert res.failure == "stalled"
-    assert "no worker liveness" in res.detail
-    assert calls["n"] >= BOOT_LOG_ABSENT_POLLS  # required the absence to persist, not a lone None
-
-
-def test_poll_active_fresh_heartbeat_satisfies_liveness(monkeypatch):
-    """Any FRESH heartbeat (even the early 'boot' stage) proves the worker started, so the
-    first-liveness deadline is satisfied and must not fire."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}, {"status": "active"}, {"status": "terminated"}],
-        step=100.0,
-    )
-    res = jobs.poll_lambda_job(
-        _handle(),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        first_liveness_s=50.0,
-        heartbeat_reader=lambda force=False: {
-            "stage": "boot",
-            "step": 0,
-            "ts": 10_000.0,
-            "attempt": 0,
-        },
-    )
-    assert res.failure == "job_preempted"
-    assert "no worker liveness" not in (res.detail or "")
-
-
-def test_poll_active_stale_heartbeat_does_not_satisfy_liveness(monkeypatch):
-    """A LEFTOVER heartbeat from a PRIOR attempt (ts < this launch; the heartbeat path is not
-    attempt-scoped) must NOT disarm the deadline — otherwise the retry INTO the sick region it must
-    catch would be let through. With no fresh boot.log either, first-liveness still fires."""
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=10_000.0),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        first_liveness_s=50.0,
-        heartbeat_reader=lambda force=False: {
-            "stage": "boot",
-            "step": 0,
-            "ts": 1.0,
-            "attempt": 0,
-        },
-    )
-    assert res.failure == "stalled"
-    assert "no worker liveness" in res.detail
-
-
-def test_poll_reattach_already_active_anchors_liveness_to_launch(monkeypatch):
-    """On a reattach after a control-plane restart, the FIRST status read is already ACTIVE
-    (last_status starts None, so it is not a transition). active_since must stay anchored to LAUNCH,
-    so a box silent since before the restart fails over on the first tick rather than getting a fresh
-    full first-liveness window. (Clock starts 10_000; launch was 5_000s earlier.)
-
-    The box is silent for ~5_000s — already PAST the 3_000s setup grace — so the setup-grace stall
-    (which needs no boot.log read) fires immediately, before the first-liveness check accumulates its
-    BOOT_LOG_ABSENT_POLLS confirmations. Either way it's a retriable ``stalled`` and the reported
-    elapsed (~5_000s) is measured from LAUNCH, not the reattach (~0s) — which is what proves the
-    anchoring. A fresh launch (elapsed < setup grace) still fails over via the fast first-liveness
-    path well before the setup grace, so the FAST-failover guarantee is unaffected."""
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, first_liveness_s=500.0
-    )
-    assert not res.ok
-    assert res.failure == "stalled"
-    # Elapsed counts from LAUNCH (~5_000s ago), not the reattach (~0s) — proves active_since stayed
-    # anchored. Asserted as a floor (not an exact tick) so the terminal-artifact force-read before the
-    # stall return can't make this brittle on the precise fake-clock count.
-    elapsed = int(res.detail.split("for ", 1)[1].split("s", 1)[0])
-    assert elapsed >= 5_000, res.detail
-
-
-def test_cloud_init_emits_boot_log_before_pull_and_attempt_scoped(monkeypatch):
-    """The host boot-log uploader must run BEFORE the docker image pull (so a box that ran cloud-init
-    leaves an HF liveness artifact within ~2 min, well before the worker's first heartbeat), and its
-    HF path must be attempt-scoped so a prior attempt's boot.log can't falsely prove liveness."""
-    from flash.providers.lambda_.jobs import builders
-
-    monkeypatch.setenv("LAMBDA_API_KEY", "lk")
-    monkeypatch.setenv("HF_TOKEN", "hf")
-    payload = _build_payload(builders, _spec(), seed=0, attempt=2)
-    assert payload["source_snapshot"] == SOURCE_SNAPSHOT
-    assert "code_prefix" not in payload
-    script = builders.build_user_data(payload)
-    # the uploader INVOCATION precedes the image pull
-    uploader = "python3 /opt/flash/capsule.pyz hostlog"
-    assert uploader in script
-    assert "docker pull" in script
-    assert script.index(uploader) < script.index("docker pull")
-    # ...and it precedes the capsule verification failure path as little as it must: the digest check
-    # gates EVERY capsule invocation, uploader included, so an unverified capsule uploads nothing.
-    assert script.index("sha256sum -c") < script.index(uploader)
-    # attempt-scoped boot.log path, asserted against the SHIPPED uploader rather than the launch
-    # text (the path is built inside the member now, not interpolated into the shell).
-    assert '_attempt" + str(att) + "_boot.log' in _capsule_member("hostlog.py")
-
-
-def test_poll_recovery_seeds_load_clock_from_launch(monkeypatch):
-    """Reattach after a control-plane restart: a still-booting box has been billing since LAUNCH
-    (handle.started_ts), so LOAD_TIMEOUT_S is measured from launch, NOT from this poll's first
-    tick. A box already past the load window fails over on the first reattach iteration instead of
-    getting another full window. (The mocked clock starts at 10_000; launch was 5000s earlier.)"""
-    import re
-
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "booting"}], step=10.0)
-    res = jobs.poll_lambda_job(_handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0)
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert "never became active" in res.detail
-    m = re.search(r"for (\d+)s", res.detail)
-    assert m is not None, res.detail
-    # launch-relative (~5000s); the old "reset to reattach tick" code would report ~LOAD_TIMEOUT_S.
-    assert int(m.group(1)) >= 2000, res.detail
-
-
-def test_poll_rejects_missing_started_timestamp(monkeypatch):
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        done="10000.0",
-        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
-        step=10.0,
-    )
-    with pytest.raises(ValueError, match="launch timestamp is invalid"):
-        jobs.poll_lambda_job(_handle(started_ts=0.0), _spec(), seed=0, interval_s=0)
-
-
-def test_poll_stale_heartbeat_does_not_buy_fresh_window(monkeypatch):
-    """A heartbeat that was already stale before a restart must not reset the stall clock to the
-    reattach time: its OWN ts is credited as last-progress, so an active worker frozen long ago
-    stalls promptly instead of getting another full stall window. (Clock starts 10_000; the
-    worker's last heartbeat was at 8500, launch at 8000, stall budget 500s.)"""
-    import re
-
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
-    hb = {"stage": "rl", "step": 7, "ts": 8500.0, "attempt": 0}
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=8_000.0),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: hb,
-        stall_after_s=500.0,
-    )
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert "no worker progress" in res.detail
-    m = re.search(r"for (\d+)s", res.detail)
-    assert m is not None, res.detail
-    # measured from the heartbeat ts (~1500s+), not the reattach tick (which the old code used,
-    # yielding only ~stall_after_s).
-    assert int(m.group(1)) >= 1000, res.detail
-
-
-def test_poll_prior_attempt_heartbeat_does_not_arm_training_stall(monkeypatch):
-    """A LEFTOVER heartbeat from a PRIOR attempt (ts < this attempt's launch; retries reuse the same
-    seed heartbeat path) must not be treated as current progress. Clamping its ts up to launch made
-    a stale training-stage heartbeat arm the tighter training stall window and fail a healthy new
-    attempt mid-setup before it overwrote the file. With the freshness gate, a pre-launch heartbeat
-    neither advances last_progress nor sets seen_training_hb, so the run gets the longer SETUP grace
-    measured from launch. (Clock starts 10_000; launch 9000; old heartbeat ts 8000 < launch.)"""
-    import re
-
-    # boot.log present: the box DID run cloud-init THIS attempt (so the fast first-liveness failover
-    # is satisfied), isolating the behavior under test — a STALE heartbeat must not arm the tighter
-    # training stall, leaving the longer SETUP grace to govern.
-    jobs = _wire_poll(
-        monkeypatch, instances=[{"status": "active"}], step=10.0, boot="+ cloud-init\n+ docker pull"
-    )
-    stale = {"stage": "rl", "step": 2, "ts": 8000.0}  # training stage, but predates this launch
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=9_000.0),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: stale,
-        setup_grace_s=3000.0,
-        stall_after_s=500.0,
-    )
-    assert not res.ok
-    assert res.failure == "stalled"
-    # Stalls on SETUP grace (3000s from launch), not the tighter 500s training window the stale
-    # heartbeat would have armed -> the reported idle time exceeds the training budget.
-    assert "setup (pre-training)" in res.detail
-    m = re.search(r"for (\d+)s", res.detail)
-    assert m is not None, res.detail
-    assert int(m.group(1)) >= 3000, res.detail
-
-
-def test_poll_gapfill_step0_keeps_setup_grace(monkeypatch):
-    """The train-liveness gap-filler emits rl_step/sft_step at step=0 throughout the silent FIRST step
-    (a cold rollout can run minutes before global_step ticks to 1). That FRESH, non-setup but step-0
-    heartbeat proves liveness yet must NOT tighten to the training window before any step completed —
-    the larger SETUP grace must still govern (RunPod has the same step>=1 guard). (Clock starts
-    10_000; launch 9000; fresh gap-fill ts 9500 >= launch but step 0.)"""
-    import re
-
-    jobs = _wire_poll(
-        monkeypatch, instances=[{"status": "active"}], step=10.0, boot="+ cloud-init\n+ docker pull"
-    )
-    gapfill = {"stage": "rl_step", "step": 0, "ts": 9500.0}  # fresh, non-setup, but step 0
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=9_000.0),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: gapfill,
-        setup_grace_s=3000.0,
-        stall_after_s=500.0,
-    )
-    assert not res.ok
-    assert res.failure == "stalled"
-    # SETUP grace (3000s) governs, not the tighter 500s training window a step-0 ping would have armed.
-    assert "setup (pre-training)" in res.detail
-    m = re.search(r"for (\d+)s", res.detail)
-    assert m is not None, res.detail
-    assert int(m.group(1)) >= 3000, res.detail
-
-
-def test_poll_client_deadline(monkeypatch):
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=100.0)
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0, deadline_at=10_250.0)
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert "deadline" in res.detail
-
-
-def test_poll_recovered_deadline_accepts_terminal_artifacts(monkeypatch):
-    reads = {"done": 0, "metrics": 0}
-
-    def done():
-        reads["done"] += 1
-        return "9900.0"
-
-    def metrics():
-        reads["metrics"] += 1
-        return json.dumps({"wall_seconds": 100, "cost_usd": 0.0})
-
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        done=done,
-        metrics=metrics,
-        step=10.0,
-    )
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=5_000.0), _spec(), seed=0, interval_s=0, deadline_at=10_250.0
-    )
-    assert res.ok
-    assert reads == {"done": 2, "metrics": 1}
-
-
-def test_poll_recovered_deadline_without_artifacts_still_stalls(monkeypatch):
-    """When the recovered deadline fires and there is NO terminal artifact, the poller still returns
-    `stalled` (the worker did not finish during the outage)."""
-    jobs = _wire_poll(monkeypatch, instances=[{"status": "active"}], step=10.0)
-    res = jobs.poll_lambda_job(
-        _handle(started_ts=10_000.0),
-        _spec(),
-        seed=0,
-        interval_s=0,
-        deadline_at=10_250.0,
-        first_liveness_s=10_000.0,
-        setup_grace_s=10_000.0,
-        stall_after_s=10_000.0,
-    )
-    assert not res.ok
-    assert res.failure == "stalled"
-    assert "deadline" in res.detail
-
-
-def test_provider_initial_and_reattached_poll_use_same_absolute_deadline(monkeypatch):
-    """Initial and reattached polling consume the same persisted terminal cutoff."""
+def test_provider_initial_and_reattached_poll_keep_same_deadline(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.core.base import JobHandle, PollResult
     from flash.providers.lambda_.execution.provider import LambdaProvider
 
-    deadline_at = 12_345.0
     captured = []
 
-    def fake_poll(
-        handle,
-        spec,
-        seed,
-        *,
-        log=None,
-        heartbeat_reader=None,
-        deadline_at=None,
-        first_liveness_s=None,
-        setup_grace_s=None,
-    ):
+    def fake_poll(_handle, _spec, _seed, *, log=None, deadline_at=None):
         captured.append(deadline_at)
-        return PollResult(True)
+        return PollResult(True, metrics={})
 
-    monkeypatch.setattr(jobs, "usable_instances", lambda _gpu, **_k: [_inst()])
-    monkeypatch.setattr(jobs, "launch_and_submit", lambda *_a, **_k: _handle(started_ts=1.0))
-    monkeypatch.setattr(jobs, "heartbeat_reader_for", lambda _spec: None)
+    monkeypatch.setattr(jobs, "usable_instances", lambda _gpu, **_kwargs: [_inst()])
+    monkeypatch.setattr(jobs, "launch_and_submit", lambda *_args, **_kwargs: _handle(started_ts=1.0))
     monkeypatch.setattr(jobs, "poll_lambda_job", fake_poll)
     monkeypatch.setattr(
-        "flash.providers.lambda_.client.api.terminate_instance_confirmed", lambda instance_id: None
+        "flash.providers.lambda_.client.api.terminate_instance_confirmed",
+        lambda _instance_id: None,
     )
-    spec = _spec()
     provider = LambdaProvider()
-    assert provider.submit_run(spec, seed=0, _deadline_at=deadline_at).ok
-    handle = JobHandle.from_dict({"provider": "lambda", **_handle(started_ts=1.0).to_dict()})
-    assert provider.poll(handle, spec, seed=0, _deadline_at=deadline_at).ok
-
-    assert captured == [deadline_at, deadline_at]
-
-
-def test_provider_poll_uses_uniform_wait_ignoring_on_last_gpu(monkeypatch):
-    """The instance recovery poll uses a UNIFORM per-GPU wait: a persisted on_last_gpu does NOT scale
-    first_liveness / setup grace — the poll relies on its unscaled defaults, matching the submit path.
-    (on_last_gpu stays a Provider-interface param for RunPod; the instance providers ignore it.)"""
-    from flash.providers.core.base import JobHandle
-    from flash.providers.lambda_.execution.provider import LambdaProvider
-
-    captured = {}
-
-    def fake_poll(
-        handle,
-        spec,
-        seed,
-        *,
-        log=None,
-        heartbeat_reader=None,
-        deadline_at=None,
-        first_liveness_s=None,
-        setup_grace_s=None,
-    ):
-        captured["first_liveness_s"] = first_liveness_s
-        captured["setup_grace_s"] = setup_grace_s
-        from flash.providers.core.base import PollResult
-
-        return PollResult(True)
-
-    monkeypatch.setattr("flash.providers.lambda_.jobs.poll_lambda_job", fake_poll)
-    monkeypatch.setattr(
-        "flash.providers.lambda_.client.api.terminate_instance_confirmed", lambda instance_id: None
-    )
     spec = _spec()
-    # on_last_gpu=True must NOT override the timing -> the poll's unscaled defaults apply.
-    handle = JobHandle.from_dict({**_handle().to_dict(), "provider": "lambda", "on_last_gpu": True})
-    LambdaProvider().poll(handle, spec, seed=0)
-    assert captured["first_liveness_s"] is None  # not overridden -> poll uses its uniform default
-    assert captured["setup_grace_s"] is None
-    # on_last_gpu absent/False -> identical uniform wait.
-    captured.clear()
-    handle2 = JobHandle.from_dict({**_handle().to_dict(), "provider": "lambda"})
-    LambdaProvider().poll(handle2, spec, seed=0)
-    assert captured["first_liveness_s"] is None
-    assert captured["setup_grace_s"] is None
 
+    assert provider.submit_run(
+        spec,
+        seed=0,
+        source_snapshot=SOURCE_SNAPSHOT,
+        _deadline_at=12_345.0,
+    ).ok
+    handle = JobHandle.from_dict(_handle(started_ts=1.0).to_dict())
+    assert provider.poll(handle, spec, seed=0, _deadline_at=12_345.0).ok
 
-def test_poll_surfaces_worker_progress_in_log(monkeypatch):
-    # DONE appears only on the 2nd poll, so the loop reaches the heartbeat-surfacing block first.
-    done_seq = iter([None, "10500.0", "10500.0", "10500.0"])
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        done=lambda: next(done_seq, "10500.0"),
-        metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
-    )
-    log = io.StringIO()
-    hb = {"stage": "sft", "step": 5, "ts": 2.0, "loss": 1.5}
-    res = jobs.poll_lambda_job(
-        _handle(), _spec(), seed=0, interval_s=0, log=log, heartbeat_reader=lambda force=False: hb
-    )
-    assert res.ok
-    assert "stage=sft" in log.getvalue()
-
+    assert captured == [12_345.0, 12_345.0]
 
 # ---------------------------------------------------------------------------
 # the cost-safety invariant: every exit path terminates the instance
@@ -2750,7 +2210,7 @@ def test_runner_propagates_process_control_from_teardown(monkeypatch, control_ex
 def test_runner_terminates_on_failure_and_exception(monkeypatch):
     from flash.providers.core.base import PollResult
 
-    jobs, terminated, _ = _wire_runner(monkeypatch, PollResult(False, failure="stalled"))
+    jobs, terminated, _ = _wire_runner(monkeypatch, PollResult(False, failure="job_preempted"))
     res = _submit(jobs, _spec(), seed=0)
     assert not res.ok
     assert terminated == [["i-9999"]]
@@ -3122,21 +2582,6 @@ def test_allocator_capacity_aware(monkeypatch):
 
 
 # --- review-fix regressions ---
-def test_poll_ok_marker_succeeds_with_stale_done(monkeypatch):
-    """A retry that hits the worker's already-complete path leaves DONE stale but writes ok marker +
-    metrics; the poller must treat that as SUCCESS, not poll until it stalls."""
-    jobs = _wire_poll(
-        monkeypatch,
-        instances=[{"status": "active"}],
-        done="9000.0",  # STALE (before the handle's started_ts=10000)
-        marker=_terminal_marker(ok=True),
-        metrics=json.dumps({"wall_seconds": 50, "cost_usd": 0.0}),
-    )
-    res = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
-    assert res.ok
-    assert res.metrics["notes"]["provider"] == "lambda"
-
-
 def test_ambiguous_launch_reconciles_and_stops(monkeypatch):
     """An ambiguous launch failure (timeout/5xx, maybe created an instance) must NOT walk to another
     region — it reconciles by name and raises so the run retries cleanly (cost safety)."""
@@ -3518,51 +2963,10 @@ def test_cacheless_clean_reject_say_baseexception_does_not_trigger_run_wide_reap
 # ---------------------------------------------------------------------------
 # #228 follow-up: don't mask worker failures + keep large specs out of user_data
 # ---------------------------------------------------------------------------
-def test_bootstrap_honors_nonzero_exit_without_remote_artifacts(monkeypatch):
-    """Bug: a worker that exits non-zero AFTER writing /tmp/metrics.json locally but BEFORE its
-    required DONE/metrics.json upload (e.g. a transient RetriableInfraError uploading them) must
-    NOT be reported as success. The local file exists, so the old code wrote ok=true; now we only
-    tolerate a non-zero exit when the REMOTE completion artifacts are confirmed on HF.
-
-    The failure is infra-shaped (a failed required upload), so the marker carries retriable=True:
-    during an HF outage the worker's own retriable heartbeat may also be missing, so the marker's
-    flag is what makes the poller retry on a fresh host (job_preempted) instead of failing fast."""
-    lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
-    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: False)
+def test_bootstrap_propagates_nonzero_worker_exit(monkeypatch):
+    lb, calls = _bootstrap_env(monkeypatch, rc=1)
     assert lb.main() == 1
-    ok, error, retriable = markers[0]
-    assert not ok
-    assert error.startswith("RetriableBootstrapError: train phase 'sft' exited non-zero")
-    assert retriable is True  # infra/upload failure -> retried, not job_failed
-
-
-def test_bootstrap_tolerates_nonzero_exit_when_remote_confirmed(monkeypatch):
-    """The benign case the non-zero tolerance exists for: RL's colocated vLLM segfaults at
-    interpreter exit AFTER the adapter + metrics.json + DONE are uploaded. Remote artifacts present
-    -> still a success despite the non-zero rc."""
-    lb, _calls, markers = _bootstrap_env(monkeypatch, rc=1, metrics=True)
-    monkeypatch.setattr(lb, "remote_completion_confirmed", lambda p: True)
-    assert lb.main() == 0
-    assert markers[0] == (True, "", False)
-
-
-def test_remote_completion_confirmed_requires_done_and_metrics(monkeypatch):
-    """remote_completion_confirmed is True ONLY when BOTH DONE and metrics.json exist on HF, and
-    stays conservative (False) on an HF read error so a non-zero exit propagates."""
-    from flash.providers._lifecycle.bootstrapping import bootstrap as lb
-
-    payload = {"hf_repo": "o/r", "hf_prefix": "sft/x", "env": {}}
-    present = {"DONE", "metrics.json"}
-    monkeypatch.setattr(lb, "hf_file_exists", lambda p, sub: sub in present)
-    assert lb.remote_completion_confirmed(payload) is True
-    present.discard("DONE")
-    assert lb.remote_completion_confirmed(payload) is False  # metrics but no DONE
-
-    def boom(p, sub):
-        raise RuntimeError("hf down")
-
-    monkeypatch.setattr(lb, "hf_file_exists", boom)
-    assert lb.remote_completion_confirmed(payload) is False  # read error -> conservative
+    assert calls == ["sft"]
 
 
 def test_bootstrap_fetches_spilled_spec_from_hf(monkeypatch):
@@ -3579,6 +2983,7 @@ def test_bootstrap_fetches_spilled_spec_from_hf(monkeypatch):
             "phase": "sft",
             "seed": 0,
             "attempt": 0,
+            "fence": 1,
             "env": {},
             "flash_arm": "lambda",
             "run_id": "run-1",
@@ -3626,12 +3031,9 @@ def test_build_worker_env_spilled_spec_fetch_failure_is_retriable(monkeypatch):
         )
 
 
-def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
-    """End-to-end: a payload whose spilled-spec HF fetch fails -> main() exits non-zero AND the
-    written attempt marker carries retriable=True (so the poller -> job_preempted, not job_failed)."""
+def test_main_stops_when_spilled_spec_fetch_fails(monkeypatch):
     from flash.providers._lifecycle.bootstrapping import bootstrap as lb
 
-    markers: list[tuple[bool, str, bool]] = []
     created_at = time.time()
     monkeypatch.setattr(
         lb,
@@ -3651,22 +3053,14 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
             "run_created_at": created_at,
             "run_max_wall_seconds": 60.0,
             "attempt": 0,
+            "fence": 1,
         },
     )
     monkeypatch.setattr(lb, "fetch_code", lambda p: None)
     monkeypatch.setattr(
         lb, "fetch_spec_from_hf", lambda p: (_ for _ in ()).throw(RuntimeError("hf 503"))
     )
-    monkeypatch.setattr(
-        lb,
-        "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
-    )
     assert lb.main() == 1
-    ok, error, retriable = markers[0]
-    assert not ok
-    assert error == "RetriableBootstrapError: failed to fetch the spilled job spec from HF"
-    assert retriable is True
 
 
 def test_shipped_bootstrap_secrets_is_byte_identical_to_the_repository_module():
@@ -3769,15 +3163,29 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     # the remaining budget fails here instead of at a provider's launch call. The margin is asserted
     # too: the real payload also carries env, deadline, and cache fields this minimal one does not.
     uploaded.clear()
-    representative = inst.build_payload(
-        _spec(),
-        seed=0,
-        attempt=7,
-        arm="lambda",
-        cache_host_mount="/mnt/cache",
-        source_snapshot=SOURCE_SNAPSHOT,
-        deadline_at=_deadline_at(),
+    deadline_at = _deadline_at()
+    attempt = _instance_attempt(
+        provider="lambda",
+        grant=deadline_at - 120.0,
+        work=deadline_at - 60.0,
+        result=deadline_at,
+        attempt_id=7,
+        fence=1,
     )
+    with patch(
+        "flash.runner.lifecycle.status.get_status",
+        return_value=SimpleNamespace(attempt=attempt.to_dict()),
+    ):
+        representative = inst.build_payload(
+            _spec(),
+            seed=0,
+            attempt=7,
+            fence=1,
+            arm="lambda",
+            cache_host_mount="/mnt/cache",
+            source_snapshot=SOURCE_SNAPSHOT,
+            deadline_at=deadline_at,
+        )
     spec_document = json.loads(representative["job_spec_json"])
     spec_document["_threshold_padding"] = ""
     compact = json.dumps(spec_document, separators=(",", ":"))
@@ -3907,12 +3315,10 @@ def test_build_user_data_starts_no_spec_upload_at_deadline(monkeypatch):
     assert calls == []
 
 
-def test_host_artifact_helpers_start_no_hf_request_at_deadline(monkeypatch):
-    """At/after the deadline both helpers must abandon the upload BEFORE constructing HfApi.
+def test_host_log_helper_starts_no_hf_request_at_deadline(monkeypatch):
+    """At or after the deadline the host log helper exits before constructing HfApi.
 
-    This asserts an absence, so it needs a positive control: a helper that never ran also touches
-    HF zero times. The same clock is therefore replayed one second BEFORE the deadline, where each
-    helper must reach HfApi -- so the empty result at the deadline is the guard, not a no-op.
+    The same clock is replayed one second before the deadline as a positive control.
     """
     import math
     import sys
@@ -3924,9 +3330,6 @@ def test_host_artifact_helpers_start_no_hf_request_at_deadline(monkeypatch):
         class FakeApi:
             def __init__(self, token=None):
                 calls.append("init")
-
-            def file_exists(self, **kwargs):
-                return True  # worker marker present: stop failmark before any upload
 
         monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeApi))
         monkeypatch.setattr(time, "time", lambda: now)
@@ -3945,140 +3348,13 @@ def test_host_artifact_helpers_start_no_hf_request_at_deadline(monkeypatch):
         def fake_open(path, *args, **kwargs):
             return io.StringIO(json.dumps(payload) if path == "/opt/flash/payload.json" else "")
 
-        for member in ("hostlog.py", "failmark.py"):
-            _run_capsule_member(
-                member, {"json": json, "math": math, "time": time, "open": fake_open}
-            )
+        _run_capsule_member(
+            "hostlog.py", {"json": json, "math": math, "time": time, "open": fake_open}
+        )
         return calls
 
     assert run_at(200.0) == []
-    assert run_at(199.0) == ["init", "init"]
-
-
-def test_failmark_uses_truthful_detection_timestamp(monkeypatch):
-    import math
-    import sys
-    import types
-
-    uploaded = []
-    written = {}
-
-    class FakeApi:
-        def __init__(self, token=None):
-            pass
-
-        def file_exists(self, **kwargs):
-            return False
-
-        def upload_file(self, **kwargs):
-            uploaded.append(kwargs)
-
-    class _Capture(io.StringIO):
-        def write(self, value):
-            written["marker"] = value
-            return super().write(value)
-
-    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeApi))
-    monkeypatch.setattr(time, "time", lambda: 150.0)
-    payload = {
-        "flash_arm": "lambda",
-        "attempt": 0,
-        "run_id": "x",
-        "hf_prefix": "sft/x",
-        "hf_repo": "o/r",
-        "env": {},
-        "deadline_at": 200.0,
-        "run_created_at": 100.0,
-        "run_max_wall_seconds": 100.0,
-    }
-
-    def fake_open(path, *args, **kwargs):
-        if path == "/opt/flash/payload.json":
-            return io.StringIO(json.dumps(payload))
-        return _Capture()
-
-    _run_capsule_member(
-        "failmark.py", {"json": json, "math": math, "time": time, "open": fake_open}
-    )
-
-    assert len(uploaded) == 1
-    assert json.loads(written["marker"])["ts"] == 150.0
-
-
-def test_failmark_skips_when_worker_marker_exists(monkeypatch):
-    """Bug: a container that fast-fails on a real user/config error uploads its own ok=false marker,
-    then the host's ~5s liveness check fires fail() and would CLOBBER it with a retriable host
-    marker (relabeling the user error as job_preempted). The host failmark must SKIP the write when
-    a worker attempt marker already exists at the path (and stay conservative on a read error).
-
-    Also covers the TOCTOU race: the worker can write its marker in the window BETWEEN the initial
-    existence check and the host upload, so the failmark RE-checks immediately before uploading and
-    still skips if the worker's marker has appeared."""
-    import sys
-    import types
-
-    created_at = time.time()
-    payload = {
-        "flash_arm": "lambda",
-        "attempt": 0,
-        "run_id": "x",
-        "hf_prefix": "sft/x",
-        "hf_repo": "o/r",
-        "env": {},
-        "deadline_at": created_at + 60.0,
-        "run_created_at": created_at,
-        "run_max_wall_seconds": 60.0,
-    }
-
-    def run_failmark(exists_seq=(False,), read_raises=False):
-        """Execute the shipped host failmark member against a fake HfApi + payload, return uploads.
-
-        ``exists_seq`` is the sequence of file_exists() return values across the (up to two) checks
-        the script makes; the last value repeats once exhausted."""
-        uploaded = []
-        seq = list(exists_seq)
-        calls = {"n": 0}
-
-        class FakeApi:
-            def __init__(self, token=None):
-                pass
-
-            def file_exists(self, *, repo_id, filename, repo_type):
-                if read_raises:
-                    raise RuntimeError("hf down")
-                i = min(calls["n"], len(seq) - 1)
-                calls["n"] += 1
-                return seq[i]
-
-            def upload_file(self, *, path_or_fileobj, path_in_repo, repo_id, repo_type):
-                uploaded.append(path_in_repo)
-
-        monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(HfApi=FakeApi))
-
-        def fake_open(path, *a, **k):
-            return io.StringIO(json.dumps(payload) if path == "/opt/flash/payload.json" else "")
-
-        _run_capsule_member(
-            "failmark.py",
-            {
-                "json": json,
-                "sys": types.SimpleNamespace(argv=["failmark.py", "boom"]),
-                "open": fake_open,
-            },
-        )
-        return uploaded
-
-    # Worker already wrote its marker -> host must NOT clobber it.
-    assert run_failmark(exists_seq=(True,)) == []
-    # No worker marker at all (never-started container) -> host failmark IS written.
-    assert run_failmark(exists_seq=(False,)) == ["sft/x/lambda_attempt0.json"]
-    # HF read error -> conservative: skip the write (never risk clobbering).
-    assert run_failmark(exists_seq=(False,), read_raises=True) == []
-    # RACE: absent on the first check, present on the re-check (worker uploaded in the gap) -> SKIP.
-    assert run_failmark(exists_seq=(False, True)) == []
-    # A mismatched canonical deadline is untrusted identity and must not produce a terminal marker.
-    payload["run_max_wall_seconds"] = 59.0
-    assert run_failmark(exists_seq=(False,)) == []
+    assert run_at(199.0) == ["init"]
 
 
 @pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])

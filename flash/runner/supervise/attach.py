@@ -354,6 +354,7 @@ def _reconcile_attached_remote(
         except Exception:
             completed_metrics = None
         if completed_metrics is not None:
+            _carry_allocation_stamp(completed_metrics, expected_remote)
             if _reconcile_completed_remote(
                 run_id,
                 worker_spec,
@@ -643,6 +644,7 @@ def _handle_failed_attach_poll(
     print(f"attach: {run_id} ended ({result.failure}); evaluating recovery", file=log)
     completed_metrics = _attempt_result_metrics(run_id, context.persisted_remote)
     if completed_metrics is not None:
+        _carry_allocation_stamp(completed_metrics, context.persisted_remote)
         # the job completed. adoption may return False (a transient defer, e.g. a
         # cleanup-remote CAS lost) OR raise (e.g. a durable-confirmation exception);
         # treat BOTH the same -- never tear down completed work, defer to background

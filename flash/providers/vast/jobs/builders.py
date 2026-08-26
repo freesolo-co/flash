@@ -155,8 +155,8 @@ def build_onstart(payload: dict) -> str:
     and no SSH key is needed on the account. Everything dynamic travels base64-encoded (never interpolated
     into shell syntax), so the job-spec JSON survives byte-exact. The training stack is baked into the
     worker image, so only the shared bootstrap runs here — installs the per-run ``extra_pip``, fetches the
-    flash code from HF, runs the worker, uploads the ``vast_attempt<N>.json`` marker the poller keys on. The
-    bootstrap is the SHARED ``_instance_bootstrap.py`` Lambda also runs, so in-container behavior is
+    flash code from HF and runs the fenced worker. The bootstrap is the shared instance bootstrap
+    Lambda also runs, so in-container behavior is
     identical across substrates.
     """
     # Spill a large job spec to HF first (like Lambda's build_user_data): a big inline spec balloons the
@@ -179,8 +179,8 @@ export PIP_BREAK_SYSTEM_PACKAGES=1
 PYBIN=/opt/conda/bin/python; [ -x "$PYBIN" ] || PYBIN=/usr/local/bin/python; [ -x "$PYBIN" ] || PYBIN=$(command -v python3 || command -v python)
 # No python at all: neither the bootstrap NOR the python-based self-destroy backstop below can run, so
 # don't fall through to confusing "command not found" failures. Hold briefly so the control plane can
-# pull the log tail, then exit non-zero — the instance carries the flash- label, so the poller's
-# stall/first-liveness detection + sweep_orphans reap it (the control-plane destroy is primary anyway).
+# pull the log tail, then exit non-zero. the instance carries the flash- label, so provider-loss
+# recovery and sweep_orphans can reap it while control-plane teardown remains primary.
 if [ -z "$PYBIN" ]; then
   echo "flash: no python interpreter (python3/python) on PATH or at /opt/conda,/usr/local; cannot run bootstrap or self-destroy" >&2
   sleep 600

@@ -100,64 +100,6 @@ def test_method_signatures_match_runpod(provider):
         assert rs == os_, f"{meth} param mismatch: runpod={rs} {provider}={os_}"
 
 
-def test_setup_vs_training_gate_contract():
-    """define the canonical setup-vs-training classifier contract used by provider polling."""
-    from flash.providers._lifecycle.instances.poll import (
-        SETUP_HEARTBEAT_STAGES,
-        STEP_GATED_STAGES,
-        is_training_heartbeat,
-    )
-
-    # The slow cold-start pings must count as setup (kept under the wide setup grace).
-    for stage in ("model_prefetching", "model_prefetched", "sft_initializing", "rl_initializing"):
-        assert stage in SETUP_HEARTBEAT_STAGES, f"{stage} must be treated as setup, not training"
-        assert is_training_heartbeat(stage, 9) is False
-    # Per-step training heartbeats are step-gated: NOT setup, but only flip the window at step >= 1.
-    assert sorted(STEP_GATED_STAGES) == ["opd_step", "rl_step", "sft_step"]
-    assert is_training_heartbeat("rl_step", 0) is False  # cold first step keeps setup grace
-    assert is_training_heartbeat("rl_step", 1) is True
-    # opd_step is gated the same way: its mid-step ping reports opt_steps (0 during the first
-    # optimizer step), which must keep setup grace, not trip the tight training window.
-    assert is_training_heartbeat("opd_step", 0) is False
-    assert is_training_heartbeat("opd_step", 1) is True
-    # Post-training stages flip to the tight window even without a step field.
-    assert is_training_heartbeat("sft_trained", None) is True
-
-
-def test_format_heartbeat_includes_rl_step_metrics():
-    from flash.providers._lifecycle.instances.poll import _format_heartbeat
-
-    rendered = _format_heartbeat(
-        {
-            "stage": "rl_step",
-            "step": 4,
-            "reward": 0.75,
-            "reward_std": 0.12,
-            "grad_norm": 1.5,
-            "kl": 0.03,
-            "entropy": 0.82,
-            "frac_reward_zero_std": 0.25,
-            "mean_completion_tokens": 48.5,
-            "truncation_rate": 0.125,
-            "max_completion_tokens": 256,
-        }
-    )
-
-    for field in (
-        "step=4",
-        "reward=0.750",
-        "reward_std=0.120",
-        "grad_norm=1.500",
-        "kl=0.030",
-        "entropy=0.820",
-        "frac_reward_zero_std=0.250",
-        "mean_completion_tokens=48.500",
-        "truncation_rate=0.125",
-        "max_completion_tokens=256",
-    ):
-        assert field in rendered
-
-
 def test_runpod_provider_implements_the_interface():
     from flash.providers.core.base import Provider
     from flash.providers.core.registry import get_provider
@@ -342,6 +284,7 @@ def test_provider_cancel_destroy_dispatch(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "j",
             "attempt": 0,
+            "fence": 1,
             "started_ts": 1.0,
         },
     )
@@ -375,6 +318,7 @@ def test_runpod_destroy_accepts_exact_owner_404_confirmation(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "j",
             "attempt": 0,
+            "fence": 1,
             "started_ts": 1.0,
         },
     )
@@ -407,6 +351,7 @@ def test_runpod_destroy_rejects_non_authoritative_absence_result(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "j",
             "attempt": 0,
+            "fence": 1,
             "started_ts": 1.0,
         },
     )

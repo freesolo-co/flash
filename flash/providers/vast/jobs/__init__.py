@@ -27,7 +27,6 @@ from flash.providers._lifecycle.net.deadline import (
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers.artifacts.hf import error_artifact_name, make_hf_text_reader
 from flash.providers.core.base import (
     GPU_INFO,
     PollResult,
@@ -299,8 +298,7 @@ def _reconcile_ambiguous_create(
     # Coerce defensively: a truthy-but-unparseable id can't be adopted -> fall through to the abort.
     adopted_id = _coerce_instance_id(adopted.get("id")) if adopted is not None else None
     if adopted_id is not None:
-        # Stamp the box's REAL launch time (start_date epoch) so cost/liveness/stall/deadline timing
-        # align with its actual runtime, not this later reconciliation moment.
+        # stamp the box's real launch time so cost and fixed deadlines use its actual runtime.
         started_raw = adopted.get("start_date")
         if isinstance(started_raw, bool) or not isinstance(started_raw, (int, float)):
             _cleanup_unpublished_instance(
@@ -518,34 +516,6 @@ def deploy_and_submit(
         raise
 
 
-# Rate-limited reader for one HF artifact's text content (None until it exists). Shared with runpod's
-# poller via make_hf_text_reader; kept under this module-local name because tests monkeypatch
-# ``vast.jobs._make_hf_file_reader`` and the poll/failure paths resolve it as a module global.
-_make_hf_file_reader = make_hf_text_reader
-
-
-def _failure_detail(
-    hf_repo: str,
-    prefix: str,
-    phase: str,
-    marker: dict | None,
-    instance_id: int,
-    attempt: int = 0,
-) -> str:
-    """Assemble bounded failure detail from worker artifacts and the Vast console."""
-    parts = []
-    if marker and marker.get("error"):
-        parts.append(sanitize_diagnostic(marker["error"], limit=4096))
-    err_name = error_artifact_name(phase, attempt)
-    content = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
-    if content:
-        parts.append(f"--- {err_name} ---\n{sanitize_diagnostic(content[-4096:], limit=4096)}")
-    logs = vast_api.instance_logs(int(instance_id))
-    if logs:
-        parts.append(f"--- instance log tail ---\n{sanitize_diagnostic(logs[-4096:], limit=4096)}")
-    return "\n".join(parts) or "vast worker terminated without a strict terminal marker"
-
-
 def poll_vast_job(
     handle: VastJobHandle,
     spec,
@@ -554,10 +524,10 @@ def poll_vast_job(
     interval_s: float = 15.0,
     deadline_at: float | None = None,
 ) -> PollResult:
-    """Poll Vast status and HF artifacts through the shared instance-poll kernel.
+    """Poll Vast resource state and fenced attempt artifacts.
 
-    Stamp cost from worker training wall, use container logs for liveness, and build failures from
-    HF artifacts plus the instance log. Read ``LOAD_TIMEOUT_S`` here to preserve the test seam.
+    Successful manifests stamp cost from worker training wall while resource loss remains an explicit
+    provider observation.
     """
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
@@ -566,8 +536,7 @@ def poll_vast_job(
     source_snapshot = source_snapshot_from_status(get_status(spec.run_id), required=True)
 
     def stamp_cost_and_notes(metrics, *, end_ts, launch_ts) -> None:
-        # Customer cost is the worker TRAIN wall x the offer's live $/hr; the instance-wall note anchors
-        # to the worker's DONE / ok-marker ts (already resolved into ``end_ts``), else now.
+        # customer cost is the worker training wall times the offer's live hourly rate.
         instance_wall_s = max(0.0, end_ts - launch_ts)
         try:
             train_wall_s = max(0.0, float(metrics.get("wall_seconds") or 0.0))
@@ -615,6 +584,9 @@ def poll_vast_job(
         dead_states=_DEAD_STATES,
         missing_dead_threshold=4,
         stamp_cost_and_notes=stamp_cost_and_notes,
+        record_resource_loss=lambda _status: _note_dead_machine(
+            spec.run_id, handle.machine_id
+        ),
     )
     return poll_instance_job(
         adapter,
@@ -637,8 +609,8 @@ def submit_run_vast(
 ) -> PollResult:
     """Vast equivalent of ``lambdalabs.jobs.submit_run_lambda``: rent, persist, poll, destroy.
 
-    The ``finally`` destroy is the cost-safety primary: every exit path — success, failure, stall,
-    exception, KeyboardInterrupt — tears the paid instance down.
+    The ``finally`` destroy is the cost-safety primary: every exit path, including success, failure,
+    exception, and KeyboardInterrupt, tears the paid instance down.
     """
     # GPU_INFO is keyed by concrete GPU class; a policy word ("cheapest"/"auto") would KeyError opaquely.
     # The allocator resolves policy words to a concrete class upstream, so reaching here with one is a

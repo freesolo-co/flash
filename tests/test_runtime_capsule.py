@@ -264,8 +264,7 @@ def test_capsule_members_import_with_flash_absent(tmp_path):
         # importing process or fire a real HF upload. Anything that walks flash's modules (a
         # packaging probe, a test collector) imports them, so a missing guard is a live defect --
         # and an omission HERE is how it reaches main.
-        "for name in ('bootstrap_secrets', 'bootstrap_pip', 'deadline_sleep', 'hostlog', "
-        "'failmark'):\n"
+        "for name in ('bootstrap_secrets', 'bootstrap_pip', 'deadline_sleep', 'hostlog'):\n"
         "    importlib.import_module(name)\n"
         "print('OK')\n"
     )
@@ -334,10 +333,8 @@ def test_every_program_the_launch_scripts_invoke_is_a_capsule_member():
     so they could not desync. Now the name is a bare string in a shell line and the code is a member
     resolved at run time, and nothing structural holds them together.
 
-    A rename that misses a call site is invisible locally: two of the invocations end in
-    `|| true` (hostlog) or `|| true` inside `fail()` (failmark), so on a rented box the program
-    simply never runs and the launch continues, losing the console log or the failure marker with no
-    error anywhere.
+    A rename that misses the best-effort hostlog call is invisible locally because the launch
+    continues after that helper fails.
     """
     invoked = set()
     for module in (instance, vast_builders):

@@ -50,13 +50,12 @@ _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
 _CONSOLE_UPLOAD_REAP_RESERVE_S = 2 * _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S
 _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
-_TERMINAL_MARKER_GRACE_S = 0.25
-_TERMINAL_BOOKKEEPING_RESERVE_S = _TERMINAL_MARKER_GRACE_S
+_TERMINAL_BOOKKEEPING_RESERVE_S = 0.25
 _MAX_ATTEMPT_ID = (1 << 63) - 1
 
 
 class RetriableBootstrapError(RuntimeError):
-    """Infra-shaped failure → marker carries retriable=True → poller retries (job_preempted) instead of job_failed."""
+    """an infrastructure-shaped bootstrap failure raised before worker execution."""
 
 
 def _finite_positive_number(value: object, label: str) -> float:
@@ -234,8 +233,7 @@ def _upload_console_snapshot(
 
     The periodic snapshot and the terminal one never share a scratch file or a repo destination.
     Reaping the periodic child at teardown is best-effort, so one killed mid-write would otherwise
-    truncate the scratch file the terminal snapshot is uploading, or overwrite the terminal artifact
-    itself -- losing the failure detail the control plane reads, including the wall-clock-cap marker.
+    truncate the scratch file the final snapshot is uploading, or overwrite the final artifact itself.
 
     The terminal snapshot keeps the canonical ``console_<mode>.txt`` the control plane reads; the
     periodic one takes the attempt-scoped name it reads separately, matching the serverless handler,
@@ -402,7 +400,7 @@ def _stop_upload_process(
     upload_deadline_at: float,
     reaping_deadline_at: float,
 ) -> bool:
-    """stop and reap an uploader before terminal-marker bookkeeping."""
+    """stop and reap an uploader before final result bookkeeping."""
     return _cleanup_upload_process(
         process,
         upload_deadline_at,
@@ -433,7 +431,7 @@ def _upload_console_tail_bounded(
     upload_deadline_at: float,
     reaping_deadline_at: float,
 ) -> bool:
-    """upload the final console snapshot before terminal-marker bookkeeping."""
+    """upload the final console snapshot before final result bookkeeping."""
     if upload_deadline_at <= _finite_positive_number(time.time(), "current clock"):
         return False
     context = multiprocessing.get_context("spawn")
@@ -463,19 +461,6 @@ def hf_file_exists(payload: dict, repo_subpath: str) -> bool:
         filename=f"{payload['hf_prefix']}/{repo_subpath}",
         repo_type="dataset",
     )
-
-
-def remote_completion_confirmed(payload: dict) -> bool:
-    """True iff DONE + metrics.json are on HF. Local /tmp/metrics.json is not sufficient proof."""
-    try:
-        return hf_file_exists(payload, "DONE") and hf_file_exists(payload, "metrics.json")
-    except Exception as exc:
-        # read errors are infra-shaped and leave completion unconfirmed.
-        print(
-            f"remote-completion check warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
-            flush=True,
-        )
-        return False
 
 
 def fetch_spec_from_hf(payload: dict) -> str:
