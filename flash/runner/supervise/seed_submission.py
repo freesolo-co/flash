@@ -820,22 +820,23 @@ def submit_seed_supervised(
     reserved_claim: AttemptLaunchClaim | None = None,
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures."""
-    if spec.algorithm == "opd":
-        from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
-
-        # policy and plane configuration are spec-level gates and must fail before durable run state
-        # or source identity is consulted. the deadline-dependent gate still runs after context load.
-        preflight_validate_managed_teacher(spec)
-    ctx = _build_context(
-        spec,
-        seed,
-        log,
-        runtime_secrets,
-        source_snapshot,
-        reserved_claim,
-    )
-    _require_opd_configuration(ctx)
+    ctx = None
     try:
+        if spec.algorithm == "opd":
+            from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
+
+            # policy and plane configuration are spec-level gates and must fail before durable run state
+            # or source identity is consulted. the deadline-dependent gate still runs after context load.
+            preflight_validate_managed_teacher(spec)
+        ctx = _build_context(
+            spec,
+            seed,
+            log,
+            runtime_secrets,
+            source_snapshot,
+            reserved_claim,
+        )
+        _require_opd_configuration(ctx)
         while True:
             preparation = _prepare_attempt(ctx)
             if preparation.completed_metrics is not None:
@@ -858,10 +859,12 @@ def submit_seed_supervised(
         ctx.gc_seen_endpoints()
         raise RuntimeError(f"seed {seed} failed after retries: {ctx.last_detail}")
     finally:
-        claim = ctx.current_claim
+        claim = reserved_claim if ctx is None else ctx.current_claim or ctx.reserved_claim
         if claim is not None:
             from flash.runner.lifecycle.attempts import consume_active_launch_claim
 
             with contextlib.suppress(Exception):
-                consume_active_launch_claim(ctx.spec.run_id, claim)
-            ctx.current_claim = None
+                consume_active_launch_claim(spec.run_id, claim)
+            if ctx is not None:
+                ctx.current_claim = None
+                ctx.reserved_claim = None

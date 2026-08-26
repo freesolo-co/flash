@@ -1799,6 +1799,42 @@ def test_cancel_before_provider_submit_consumes_prehandle_claim(orch, monkeypatc
     claim_lock.close(fd)
 
 
+def test_reserved_claim_context_failure_preserves_error_and_consumes_claim(orch, monkeypatch):
+    from flash.runner.lifecycle import attempts as runner_attempts
+    from flash.runner.lifecycle import claim_lock
+    from flash.runner.supervise import seed_submission as submission
+
+    class SourceContextFailure(RuntimeError):
+        pass
+
+    spec = _spec(run_id="flash-reserved-context-failure")
+    _seed_status(orch, spec)
+    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert claim is not None
+    monkeypatch.setattr(
+        submission,
+        "_build_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            SourceContextFailure("source context failed")
+        ),
+    )
+
+    with pytest.raises(SourceContextFailure, match="source context failed"):
+        runner_lifecycle._submit_seed_supervised(
+            spec,
+            spec.seed,
+            io.StringIO(),
+            source_snapshot=_SOURCE_SNAPSHOT,
+            reserved_claim=claim,
+        )
+
+    raw = runner_status._load_status_json(spec.run_id)
+    assert runner_state._ACTIVE_LAUNCH_CLAIM_KEY not in raw
+    fd = claim_lock.try_acquire(spec.run_id)
+    assert fd is not None
+    claim_lock.close(fd)
+
+
 def test_stale_reserved_attempt_cannot_reach_provider_submit(orch, monkeypatch):
     from flash.providers.core import registry as providers
     from flash.runner.lifecycle import attempts as runner_attempts
