@@ -11,7 +11,6 @@ from .types import (
     EngineIdentity,
     ModalPlacement,
     ResolvedAdapter,
-    RunPodPlacement,
     validate_deployment_spec,
     validate_engine_identity,
     validate_resolved_adapter,
@@ -95,27 +94,18 @@ def canonical_adapter_sort_key(value: ResolvedAdapter) -> str:
     return canonical_json(_adapter_payload(value))
 
 
-def _placement_payload(value: ModalPlacement | RunPodPlacement) -> dict[str, object]:
-    if type(value) is ModalPlacement:
-        return {
-            "workspace_name": value.workspace_name,
-            "environment": value.environment,
-            # part of the identity, not decoration: the suffix is what makes the public url
-            # `<workspace>-<suffix>--<label>.modal.run`, so two placements that differ only here
-            # are two different endpoints. omitting it would collapse them to one `spec_id`.
-            "web_suffix": value.web_suffix,
-            "gpu": value.gpu,
-            "region": value.region,
-            "gpu_count": value.gpu_count,
-            "provider": value.provider,
-        }
+def _placement_payload(value: ModalPlacement) -> dict[str, object]:
+    _require_exact(value, ModalPlacement, "placement")
     return {
-        "account_id": value.account_id,
-        "gpu_type_id": value.gpu_type_id,
+        "workspace_name": value.workspace_name,
+        "environment": value.environment,
+        # part of the identity, not decoration: the suffix is what makes the public url
+        # `<workspace>-<suffix>--<label>.modal.run`, so two placements that differ only here
+        # are two different endpoints. omitting it would collapse them to one `spec_id`.
+        "web_suffix": value.web_suffix,
+        "gpu": value.gpu,
+        "region": value.region,
         "gpu_count": value.gpu_count,
-        "data_center_id": value.data_center_id,
-        "container_disk_gb": value.container_disk_gb,
-        "volume_size_gb": value.volume_size_gb,
         "provider": value.provider,
     }
 
