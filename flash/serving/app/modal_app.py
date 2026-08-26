@@ -6,6 +6,7 @@ README to deploy.
 
 import asyncio
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -392,6 +393,30 @@ def _build_engine(
                 yield event
 
         @modal.method()
+        async def stream_generate_call(
+            self,
+            payload_dict: dict[str, Any],
+            record_dict: dict[str, Any] | None,
+            expected_checkpoint: str | None,
+            generation_id: str,
+            dispatch_deadline_unix: float,
+            queue_id: str,
+            invocation_nonce: str,
+        ) -> dict[str, Any]:
+            from flash.serving.src.engine.stream_channel_engine import stream_generate_call
+
+            return await stream_generate_call(
+                self,
+                payload_dict,
+                record_dict,
+                expected_checkpoint,
+                generation_id,
+                dispatch_deadline_unix,
+                queue_id,
+                invocation_nonce,
+            )
+
+        @modal.method()
         async def unregister(
             self,
             adapter_id: str,
@@ -511,6 +536,37 @@ class _ModalEnginePool:
             close = getattr(remote_stream, "aclose", None)
             if close is not None:
                 await close()
+
+    def stream_generate_cancellable(
+        self,
+        base_model: str,
+        payload: Any,
+        record: Any,
+        *,
+        expected_checkpoint: str | None = None,
+        dispatch_deadline_unix: float | None = None,
+    ) -> Any:
+        """Build the additive channel transport without changing the rolling default."""
+        from flash.serving.src.engine.stream_channel_client import CancellableStreamChannel
+
+        generation_id = payload.generation_id
+        if not generation_id:
+            raise RuntimeError("generation id is required before modal dispatch")
+        engine = _engine_cls_for(base_model)(base_model=base_model)
+        deadline = (
+            dispatch_deadline_unix
+            if dispatch_deadline_unix is not None
+            else time.time() + ROUTER_TIMEOUT_SECONDS
+        )
+        return CancellableStreamChannel(
+            spawn_method=engine.stream_generate_call,
+            payload_dict=payload.model_dump(by_alias=True),
+            record_dict=self._record_payload(record),
+            expected_checkpoint=expected_checkpoint,
+            generation_id=generation_id,
+            dispatch_deadline_unix=deadline,
+            invocation_nonce=uuid.uuid4().hex,
+        )
 
     async def register(self, base_model: str, record: Any) -> None:
         engine = _engine_cls_for(base_model)(base_model=base_model)

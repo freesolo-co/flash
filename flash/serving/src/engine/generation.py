@@ -6,7 +6,7 @@ import inspect
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, TypedDict
 
 from flash.serve.runtime.sampling import (
@@ -189,6 +189,8 @@ async def stream_generate(
     record_dict: dict[str, Any] | None = None,
     expected_checkpoint: str | None = None,
     generation_id: str | None = None,
+    *,
+    pre_generate_check: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     from vllm.sampling_params import RequestOutputKind
 
@@ -219,6 +221,8 @@ async def stream_generate(
         "thinking": thinking,
     }
     try:
+        if pre_generate_check is not None:
+            await pre_generate_check()
         try:
             output_stream = owner.engine.generate(
                 prompt_input,

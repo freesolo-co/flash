@@ -641,6 +641,8 @@ class _LoraEngineImpl:
         record_dict: dict[str, Any] | None = None,
         expected_checkpoint: str | None = None,
         generation_id: str | None = None,
+        *,
+        pre_generate_check: Any = None,
     ):
         from flash.serving.src.engine.generation import stream_generate
 
@@ -650,6 +652,7 @@ class _LoraEngineImpl:
             record_dict,
             expected_checkpoint,
             generation_id,
+            pre_generate_check=pre_generate_check,
         )
         try:
             async for event in stream:
