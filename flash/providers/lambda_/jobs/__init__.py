@@ -53,10 +53,7 @@ from flash.providers.lambda_.jobs.reap import (
 
 logger = get_logger(__name__)
 
-# The shared instance-poll timing defaults imported from ``_poll`` above (setup grace covers Docker pull
-# + pip + model download, before any heartbeat). load_timeout_s is read at call time so
-# ``monkeypatch.setattr(jobs, …)`` takes effect; setup_grace_s / stall_after_s / first_liveness_s
-# are supplied as ``poll_lambda_job`` defaults (override by passing the kwarg, not by patching the global).
+# load_timeout_s is read at call time so monkeypatching the module takes effect in tests
 
 _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
 
