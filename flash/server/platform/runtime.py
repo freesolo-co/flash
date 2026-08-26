@@ -630,6 +630,7 @@ def _classify_recoverable_runs(
         if status.state not in _RECOVERABLE:
             continue
         if status.remote is None and status.cleanup_confirmed_remote is not None:
+            active.add(status.run_id)
             threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
             continue
         if status.remote:

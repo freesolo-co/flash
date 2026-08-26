@@ -1935,6 +1935,52 @@ def test_attach_resumes_after_cleanup_drain_clears_classified_remote(monkeypatch
     assert attached.realized_cost_remote == remote
 
 
+def test_attach_reconciler_continues_after_confirmed_runpod_teardown(monkeypatch, tmp_path):
+    import io
+
+    import flash.runner.supervise.attach as attach_mod
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-confirmed-cleanup",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1, max_wall_seconds=200),
+    )
+    remote = _runpod_remote("endpoint-confirmed", "job-confirmed", attempt=0)
+    runner_state._save_status(provisioned_status(spec, state="running", remote=remote))
+    monkeypatch.setattr(
+        runner_lifecycle, "_runpod_completed_metrics", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(attach_mod, "_wait_for_replacement_window", lambda *_args: False)
+    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", lambda *_args: True)
+    monkeypatch.setattr(
+        runner_reconciliation, "_record_cleanup_remote", lambda *_args, **_kwargs: False
+    )
+    resumed = []
+    monkeypatch.setattr(
+        attach_mod,
+        "_resume_after_confirmed_teardown",
+        lambda *_args, **_kwargs: resumed.append(True),
+    )
+
+    attach_mod._reconcile_attached_remote(
+        spec.run_id,
+        remote,
+        spec,
+        1,
+        _SOURCE_SNAPSHOT,
+        io.StringIO(),
+        "stalled: host vanished",
+    )
+
+    assert resumed == [True]
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.remote is None
+    assert persisted.cleanup_confirmed_remote == remote
+
+
 def test_attach_reconciler_persists_unconfirmed_runpod_teardown(monkeypatch, tmp_path):
     import io
 
@@ -3099,6 +3145,12 @@ def test_recover_runs_reattaches_confirmed_teardown_marker(monkeypatch, tmp_path
     monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
     monkeypatch.setattr(providers, "configured_providers", list)
     monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
+    swept = []
+    monkeypatch.setattr(
+        runtime,
+        "_sweep_provider_orphans",
+        lambda active, known: swept.append((set(active), set(known))),
+    )
     attached = []
     monkeypatch.setattr(runner_attach, "attach_run", lambda run_id: attached.append(run_id))
     monkeypatch.setattr(
@@ -3119,6 +3171,7 @@ def test_recover_runs_reattaches_confirmed_teardown_marker(monkeypatch, tmp_path
     runtime.recover_runs()
 
     assert attached == [spec.run_id]
+    assert swept == [({spec.run_id}, {spec.run_id})]
 
 
 def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):

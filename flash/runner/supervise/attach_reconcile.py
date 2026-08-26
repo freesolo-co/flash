@@ -71,8 +71,10 @@ def teardown_reconciled_remote(
         worker_gone = _worker_provably_gone(run_id, handle)
     if not worker_gone:
         return False, resource_deleted
+    if resource_deleted:
+        return True, True
     if handle.provider != "runpod":
-        return True, resource_deleted
+        return True, False
     try:
         cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
     except Exception:
