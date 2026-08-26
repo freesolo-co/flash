@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from flash.serve.contract.errors import ServingError
-from flash.serving.src.store.identity import immutable_binding_fingerprint
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 
 if TYPE_CHECKING:
     import httpx

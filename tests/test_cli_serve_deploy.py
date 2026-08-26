@@ -14,7 +14,7 @@ from flash.cli.commands.serving import deploy as serve_deploy
 from flash.cli.commands.serving.deploy import cmd_serve_deploy
 from flash.cli.commands.serving.identity import encode_deployment_identity
 from flash.cli.parsing.serve_parser import _add_serve_commands
-from flash.serve.contract.profiles import get_profile, placement_for
+from flash.serve.deployment.profiles import get_profile, placement_for
 from flash.serve.provisioning import InterruptedProvisioning
 
 DIGEST = "sha256:" + "a" * 64
@@ -744,8 +744,9 @@ def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     """resolve against fixed hub facts so the command path is tested without the network."""
 
+    from flash.schema import format_checkpoint_ref
     from flash.serve.app import AdapterExecutionInput, ArtifactFile, aggregate_file_digest
-    from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
+    from flash.serve.control import ResolvedAdapter
     from flash.serve.deployment.resolve import ResolvedDeploymentInputs
 
     artifact_revision = "c" * 40
@@ -753,7 +754,7 @@ def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
         ArtifactFile("adapter_config.json", 1308, "1" * 64),
         ArtifactFile("adapter_model.safetensors", 43346432, "2" * 64),
     )
-    revision = f"run1@final.{artifact_revision}"
+    checkpoint_id = format_checkpoint_ref("run1", None)
 
     def _fake_base_revision(model_id: str) -> str:
         return "d" * 40
@@ -761,8 +762,7 @@ def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     def _fake_resolve(**kwargs) -> ResolvedDeploymentInputs:
         adapter = ResolvedAdapter(
             run_id=kwargs["run_id"],
-            checkpoint="final",
-            adapter_revision=revision,
+            checkpoint_id=checkpoint_id,
             artifact_repo_id=kwargs["artifact_repo_id"],
             artifact_repo_type="dataset",
             artifact_revision=artifact_revision,
@@ -773,11 +773,10 @@ def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
             lora_rank=kwargs["lora_rank"],
             thinking_default=bool(kwargs.get("thinking_default", False)),
             structured_outputs_default_json=None,
-            alias_intent=AdapterAliasIntent(activate=True, expected_adapter_revision=None),
         )
         return ResolvedDeploymentInputs(
             adapter=adapter,
-            execution=AdapterExecutionInput(adapter_revision=revision, files=files),
+            execution=AdapterExecutionInput(checkpoint_id=checkpoint_id, files=files),
         )
 
     monkeypatch.setattr("flash.serve.deployment.resolve.resolve_adapter", _fake_resolve)

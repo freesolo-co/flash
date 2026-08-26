@@ -237,8 +237,8 @@ def test_checkpoint_provenance_is_derived_from_an_agreeing_step_subfolder(
         artifact_subfolder="rl/run1/checkpoints/step-10/adapter", checkpoint_step=10
     )
 
-    assert resolved.adapter.checkpoint == "step-10"
-    assert resolved.adapter.adapter_revision == f"run1@step-10.{ARTIFACT_REVISION}"
+    assert resolved.adapter.checkpoint_id == "run1/step-10"
+    assert resolved.adapter.artifact_revision == ARTIFACT_REVISION
 
 
 def test_unrecognized_artifact_layout_keeps_the_authored_checkpoint(monkeypatch, tmp_path) -> None:
@@ -252,7 +252,7 @@ def test_unrecognized_artifact_layout_keeps_the_authored_checkpoint(monkeypatch,
 
     resolved = _resolve(artifact_subfolder="sft/run-1-step-2", checkpoint_step=2)
 
-    assert resolved.adapter.checkpoint == "step-2"
+    assert resolved.adapter.checkpoint_id == "run1/step-2"
 
 
 @pytest.mark.parametrize(
