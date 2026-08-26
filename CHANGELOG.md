@@ -39,37 +39,49 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   supported, including same-algorithm continuation. A warm-started SFT run also inherits its
   source's base-model pin instead of resolving its own, so it stays deployable and no longer breaks
   when the base model's hub tip moves.
-- Managed attempts now pin, verify, and report one immutable Flash source archive across retries and recovery.
+- Managed training now uses durable fenced attempts with immutable grant, work, result, and run
+  deadlines. Workers publish cumulative attempt-scoped progress and one digest-addressed terminal
+  result manifest through the private Hugging Face dataset repository. Provider status describes
+  resource state only, and the result manifest is the sole terminal worker authority for RunPod,
+  Lambda, and Vast.
+- `flash runs status` now exposes attempt, progress, resource, and result projections. Sparse or old
+  progress is observational only: it cannot terminate work, trigger retry or teardown, extend a
+  deadline, or authorize success. Provider observations keep the CLI visibly active while progress
+  is quiet, without inferring failure from age.
+- Managed attempts pin, verify, and report one immutable Flash source archive across retries and
+  recovery.
 - Multi-turn GRPO now clones each sibling rollout from the task state that produced its prepared
   prompt. Environments that record randomized episode choices on the task during `start_episode`
   are stepped and scored against the same episode the model saw, without sharing mutable state
   between sibling rollouts.
-- A RunPod attempt's stall window is now measured from evidence timestamps rather than from when
-  the control plane happened to look at it. The window was seeded from the moment polling started
-  and was reset again by the first status read, and a heartbeat was credited at the time it was
-  read rather than the time it was written. Every one of those is a wall-clock reading, so each
-  reattach handed a worker that was already wedged a complete fresh setup window, and a supervisor
-  that reattached repeatedly could keep a dead worker on a paid GPU until the run's wall deadline.
-  The window is now anchored to the persisted launch, a heartbeat is credited at its own timestamp
-  clamped to that launch, and only a genuine status transition counts as progress. Instance
-  polling (Vast/Lambda) already worked this way; this brings RunPod onto the same rule. A job that
-  is still queued is unaffected: the capacity wait keeps its own exemption, so a worker granted
-  late still gets its full cold-start budget.
-- An attempt's terminal artifacts (its strict marker plus `metrics.json`) are now interpreted by
-  one shared protocol instead of being decoded separately by live instance polling and by each
-  recovery path. The two decoders disagreed about identical bytes. A marker that could not be tied
-  to the attempt was a terminal failure to the live poller but indistinguishable from "no marker
-  yet" to recovery, so the same corrupt artifact produced a different story depending on which
-  layer happened to observe it; recovery now names it rather than logging silence. Neither path
-  ever adopted such a marker as completed work, and neither does now. Recovery also computed a
-  fresh observation window for the marker and then another for `metrics.json`, so the real ceiling
-  was their sum and moved with however long the first read took; both reads now share one window,
-  which makes the bound the cutoff rather than the sum.
+- The mutable training heartbeat, stage registry, progress-carry state, heartbeat-derived provider
+  timers, and `stalled` retry outcome have been removed. Fixed deadlines and explicit provider
+  capacity, transport, preemption, resource-loss, OOM, cancellation, and worker-result evidence now
+  determine lifecycle transitions.
+- The Flash-to-Freesolo status report no longer sends `lastHeartbeat` or `gpuStatus`. All existing
+  lifecycle, project, cost, deployment, model, algorithm, artifact, and timestamp fields remain.
+  Freesolo live progress is intentionally unavailable until its separate consumer update; Flash
+  does not send new progress under compatibility names.
 - CI runs the offline test suite on both supported interpreters (3.11 and 3.12) rather than
   3.11 alone, and sets `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` so a test that reaches the
   network fails deterministically instead of depending on runner connectivity.
 - Every GitHub Action is pinned to a commit SHA rather than a mutable tag.
 - `mypy` runs in CI as an advisory (non-blocking) job.
+
+### Deployment cutover
+
+This release requires a maintenance-window cutover because old mutable lifecycle records are not
+translated or read by the new protocol:
+
+1. Stop new training submissions.
+2. Drain or explicitly cancel every old-source queued, provisioning, running, finalizing, or
+   reconciling attempt.
+3. Confirm that no old RunPod job or endpoint and no Lambda or Vast instance remains.
+4. Confirm that cleanup ledgers contain no unconfirmed resources.
+5. Deploy the Flash control plane, worker images, and CLI package together at version `1.2.118`.
+6. Accept that Freesolo live progress is unavailable until its separate consumer update; lifecycle
+   mirroring continues without `lastHeartbeat` or `gpuStatus`.
+7. Run the smallest safe SFT, GRPO, and OPD lifecycle smokes before reopening submissions.
 
 ### Fixed
 
@@ -102,25 +114,13 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   through affordability and allocation and hit the same permanent credential error on the worker.
   They are now classified permanent, like 404 and 422. The rate-limit 403 is still transient.
 
-- A slow heartbeat upload no longer stalls every other heartbeat behind it. The throttle clock only
-  advances once a commit lands, so during a slow HuggingFace commit other callers still saw an
-  upload as due and blocked on the upload lock for up to its acquire timeout — 30s, or 120s on a
-  critical stage — which stalled the liveness daemon and delayed leaving the wrapped stage by the
-  same window. A throttled heartbeat now skips while a commit is in flight, since that commit
-  already carries the stage's state. Terminal, error, initial, and forced step commits still queue
-  and land: they carry state no later heartbeat would repair.
-
-- A GRPO or OPD run whose rollout actor exited hard no longer wedges on a paid GPU until the
-  wall-time limit. The actor's `os._exit` bypassed verl's own prompt handler, so the prompt
-  stayed `running` forever and verl's unbounded replay poll waited on it at ~0% utilization. The
-  child now writes durable failure evidence, marks the prompt failed, cleans up, and only then
-  exits, and replay sampling fails the step on an explicit failure tag or a positively dead
-  actor instead of returning a survivor-only batch that would silently train on fewer rollouts
-  than were collected. A child that reaches the fit loop and then stops producing distinct
-  output, while the parent has no teacher or environment work in flight, is torn down with a
-  named cause rather than running silently to the limit; repeated identical lines count as
-  silence, and authoritative OOM, host-RAM, and infrastructure evidence still classifies the
-  exit first.
+- Verl child silence now emits bounded diagnostics only. It no longer terminates the child,
+  classifies lifecycle failure, tears down provider resources, or starts a retry. Top-level worker
+  cancellation and fixed work-deadline enforcement use exact process-group supervision with TERM,
+  bounded grace, KILL, and group-disappearance verification.
+- Cancellation billing reads only current-attempt, current-fence cumulative progress. Positive
+  completed steps are prorated against the accepted quote, entering training carries a one-step
+  floor, and stale attempt progress is ignored.
 - `flash models deploy` now warns before it moves the shared `<run-id>` model id onto a
   different checkpoint. Every checkpoint of a run is served under that one id, so deploying
   `<run-id>/step-50` while `step-100` was live silently changed what `<run-id>` served for
