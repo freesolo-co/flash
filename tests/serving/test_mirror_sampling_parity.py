@@ -252,6 +252,8 @@ def test_hosted_stream_reports_hidden_tool_usage_before_structured_delta() -> No
     assert tool_delta["completion_tokens"] == 2
     assert tool_delta["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
     assert events[-1]["completion_tokens"] == 2
+    assert events[-1]["choices"][0]["text"] == ""
+    assert events[-1]["choices"][0]["tool_calls"] == tool_delta["tool_calls"]
 
 
 @pytest.mark.parametrize("streaming", [False, True], ids=["buffered", "streaming"])
@@ -289,6 +291,30 @@ def test_hosted_tools_reject_effective_persisted_structured_default_after_resolu
 
     assert resolved == ["adapter"]
     assert vllm_engine.sampling_params is None
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["buffered", "streaming"])
+def test_hosted_tool_choice_none_allows_effective_structured_default(streaming: bool) -> None:
+    vllm_engine = _BufferedChoiceEngine()
+    engine = _engine(vllm_engine, structured_outputs={"choice": ["sunny", "rainy"]})
+    payload = {
+        "adapter_id": "adapter",
+        "messages": [{"role": "user", "content": "weather"}],
+        "tools": _tool_payload(),
+        "tool_choice": "none",
+        "parallel_tool_calls": True,
+    }
+
+    async def exercise() -> None:
+        if streaming:
+            async for _event in engine._stream_generate(payload):
+                pass
+        else:
+            await engine._generate(payload)
+
+    asyncio.run(exercise())
+
+    assert vllm_engine.sampling_params.structured_outputs is not None
 
 
 def _buffered_result(
@@ -655,3 +681,58 @@ def test_hosted_sse_has_independent_reasoning_and_post_settlement_terminals() ->
     terminal_payload = next(payload for payload in payloads if "usage" in payload)
     assert terminal_payload["usage"]["completion_tokens"] == 3
     assert chunks[-1] == b"data: [DONE]\n\n"
+
+
+@pytest.mark.parametrize(
+    "late_event",
+    [
+        {"type": "delta", "index": 0, "text": "late"},
+        {"type": "choice_finished", "index": 0, "finish_reason": "stop"},
+        {"type": "usage_progress"},
+        {"type": "error", "message": "late error", "code": 502},
+        {"type": "final"},
+    ],
+    ids=["delta", "choice-finished", "usage-progress", "error", "second-final"],
+)
+def test_hosted_sse_rejects_every_event_after_final_before_output_or_usage(
+    late_event: dict[str, Any],
+) -> None:
+    session = _UsageSession()
+    record = _record()
+    chunks: list[bytes] = []
+
+    async def events():
+        yield {"type": "ready", "thinking": False, "prompt_tokens": 2, "completion_tokens": 0}
+        yield {
+            "type": "choice_finished",
+            "index": 0,
+            "finish_reason": "stop",
+            "prompt_tokens": 2,
+            "completion_tokens": 1,
+        }
+        yield {"type": "final", "prompt_tokens": 2, "completion_tokens": 1}
+        yield {**late_event, "prompt_tokens": 99, "completion_tokens": 99}
+
+    async def collect() -> None:
+        async for chunk in openai_chat_stream(
+            AdapterRouter([record]),
+            record=record,
+            events=events(),
+            adapter_id="adapter",
+            completion_id="chatcmpl-test",
+            created=123,
+            include_usage=True,
+            usage_session=session,  # type: ignore[arg-type]
+            thinking=False,
+        ):
+            chunks.append(chunk)  # noqa: PERF401
+
+    with pytest.raises(RuntimeError, match="followed request terminal"):
+        asyncio.run(collect())
+
+    assert session.finalized == []
+    assert session.failed == [
+        ({"type": "final", "prompt_tokens": 2, "completion_tokens": 1}, "stream_failed")
+    ]
+    assert all(b"late" not in chunk and b'"completion_tokens":99' not in chunk for chunk in chunks)
+    assert all(b'"usage"' not in chunk and chunk != b"data: [DONE]\n\n" for chunk in chunks)

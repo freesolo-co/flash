@@ -105,7 +105,7 @@ def _choice(index: int, output: Any, *, top_logprobs: int, tools: Any = None) ->
 
 
 def _validate_tool_request(owner: Any, payload: OpenAIGenerateRequest, thinking: bool) -> None:
-    if payload.tools is None:
+    if not _tools_active(payload):
         return
     if thinking:
         raise ValueError("tools are not supported for thinking-enabled generation")
@@ -113,14 +113,19 @@ def _validate_tool_request(owner: Any, payload: OpenAIGenerateRequest, thinking:
         raise ValueError("this serving engine is not qualified for tool calling")
 
 
+def _tools_active(payload: OpenAIGenerateRequest) -> bool:
+    return payload.tools is not None and payload.tool_choice == "auto"
+
+
 def _active_tools(payload: OpenAIGenerateRequest) -> Any:
-    if payload.tools is None or payload.tool_choice != "auto":
+    if not _tools_active(payload):
         return None
+    assert payload.tools is not None
     return normalize_tools(payload.tools)
 
 
 def _reject_tools_with_structured_outputs(payload: OpenAIGenerateRequest, structured: Any) -> None:
-    if payload.tools is not None and structured is not None:
+    if _tools_active(payload) and structured is not None:
         raise ValueError("tools cannot be combined with logprobs or structured outputs")
 
 
@@ -249,10 +254,10 @@ def _consume_stream_output(
             top_logprobs=payload.top_logprobs,
         )
         text = str(getattr(output, "text", "") or "")
-        state["text"] += text
         state["token_ids"].extend(token_ids)
         completion_ids.extend(token_ids)
         visible = tool_parsers[index].feed(text) if index in tool_parsers else text
+        state["text"] += visible
         if visible or logprobs is not None:
             events.append(
                 {
@@ -314,6 +319,7 @@ def _finish_stream_choice(
                 }
             )
         elif parsed.content:
+            state["text"] += parsed.content
             events.append(
                 {
                     "type": "delta",

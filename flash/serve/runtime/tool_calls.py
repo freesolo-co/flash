@@ -14,6 +14,7 @@ import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 TOOL_PARSER_QWEN3_CODER = "qwen3_coder"
@@ -305,21 +306,14 @@ def parse_qwen3_coder_output(
     parsed: list[tuple[str, dict[str, Any]]] = []
     tool_map = {tool.name: tool for tool in tools}
     while cursor < len(text):
-        while cursor < len(text) and text[cursor].isspace():
-            cursor += 1
+        cursor = _skip_whitespace(text, cursor)
         if cursor == len(text):
             break
-        if not text.startswith(TOOL_CALL_START, cursor):
+        parsed_call = _parse_tool_call(text, cursor, tool_map)
+        if parsed_call is None:
             return ToolParseResult(content=text, calls=())
-        end = text.find(TOOL_CALL_END, cursor + len(TOOL_CALL_START))
-        if end < 0:
-            return ToolParseResult(content=text, calls=())
-        body = text[cursor + len(TOOL_CALL_START) : end]
-        call = _parse_function_body(body, tool_map)
-        if call is None:
-            return ToolParseResult(content=text, calls=())
+        cursor, call = parsed_call
         parsed.append(call)
-        cursor = end + len(TOOL_CALL_END)
     if not parsed:
         return ToolParseResult(content=text, calls=())
     make_id = id_factory or (lambda: f"call_{uuid.uuid4().hex[:24]}")
@@ -327,7 +321,7 @@ def parse_qwen3_coder_output(
         ParsedToolCall(
             id=_validated_call_id(make_id()),
             name=name,
-            arguments=json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+            arguments=_dump_exact_json(arguments),
         )
         for name, arguments in parsed
     )
@@ -369,9 +363,11 @@ def _normalize_schema(
         detached = _json_copy(enum, path, error_type)
         if any(not _matches_type(item, schema_type) for item in detached):
             raise error_type(f"{path}.enum values must match {schema_type}")
-        if len(
-            {json.dumps(item, sort_keys=True, separators=(",", ":")) for item in detached}
-        ) != len(detached):
+        if any(
+            _json_values_equal(item, prior)
+            for index, item in enumerate(detached)
+            for prior in detached[:index]
+        ):
             raise error_type(f"{path}.enum values must be unique")
         normalized["enum"] = detached
     if schema_type == "object":
@@ -480,66 +476,77 @@ def _validate_tool_result(
     resolved.add(call_id)
 
 
-def _parse_function_body(
-    body: str, tools: Mapping[str, FunctionTool]
-) -> tuple[str, dict[str, Any]] | None:
-    stripped = body.strip()
-    if not stripped.startswith(_FUNCTION_START) or not stripped.endswith(_FUNCTION_END):
+def _parse_tool_call(
+    text: str,
+    cursor: int,
+    tools: Mapping[str, FunctionTool],
+) -> tuple[int, tuple[str, dict[str, Any]]] | None:
+    if not text.startswith(TOOL_CALL_START, cursor):
         return None
-    opening_end = stripped.find(">", len(_FUNCTION_START))
-    if opening_end < 0:
+    cursor = _skip_whitespace(text, cursor + len(TOOL_CALL_START))
+    if not text.startswith(_FUNCTION_START, cursor):
         return None
-    name = stripped[len(_FUNCTION_START) : opening_end]
+    name_end = text.find(">", cursor + len(_FUNCTION_START))
+    if name_end < 0:
+        return None
+    name = text[cursor + len(_FUNCTION_START) : name_end]
     tool = tools.get(name)
     if tool is None:
         return None
-    parameters_text = stripped[opening_end + 1 : -len(_FUNCTION_END)]
+    parsed_parameters = _parse_parameters(text, name_end + 1, tool)
+    if parsed_parameters is None:
+        return None
+    cursor, values = parsed_parameters
+    cursor = _skip_whitespace(text, cursor)
+    if not text.startswith(TOOL_CALL_END, cursor):
+        return None
+    return cursor + len(TOOL_CALL_END), (name, values)
+
+
+def _parse_parameters(
+    text: str,
+    cursor: int,
+    tool: FunctionTool,
+) -> tuple[int, dict[str, Any]] | None:
     values: dict[str, Any] = {}
-    cursor = 0
-    while cursor < len(parameters_text):
-        while cursor < len(parameters_text) and parameters_text[cursor].isspace():
-            cursor += 1
-        if cursor == len(parameters_text):
+    while True:
+        cursor = _skip_whitespace(text, cursor)
+        if text.startswith(_FUNCTION_END, cursor):
+            cursor += len(_FUNCTION_END)
             break
-        if not parameters_text.startswith(_PARAMETER_START, cursor):
+        if not text.startswith(_PARAMETER_START, cursor):
             return None
-        name_end = parameters_text.find(">", cursor + len(_PARAMETER_START))
+        name_end = text.find(">", cursor + len(_PARAMETER_START))
         if name_end < 0:
             return None
-        parameter_name = parameters_text[cursor + len(_PARAMETER_START) : name_end]
+        parameter_name = text[cursor + len(_PARAMETER_START) : name_end]
         schema = tool.parameters["properties"].get(parameter_name)
         if schema is None or parameter_name in values:
             return None
-        parsed_value = _parse_parameter_value(parameters_text, name_end + 1, schema)
+        parsed_value = _parse_parameter_value(text, name_end + 1, schema)
         if parsed_value is None:
             return None
-        value_end, value = parsed_value
-        values[parameter_name] = value
-        cursor = value_end + len(_PARAMETER_END)
+        cursor, values[parameter_name] = parsed_value
     if set(tool.parameters["required"]) - set(values):
         return None
     if not _validate_value(values, tool.parameters):
         return None
-    return name, values
+    return cursor, values
 
 
 def _parse_parameter_value(
-    parameters_text: str,
+    text: str,
     value_start: int,
     schema: Mapping[str, Any],
 ) -> tuple[int, Any] | None:
     search_from = value_start
     while True:
-        value_end = parameters_text.find(_PARAMETER_END, search_from)
+        value_end = text.find(_PARAMETER_END, search_from)
         if value_end < 0:
             return None
-        following = value_end + len(_PARAMETER_END)
-        while following < len(parameters_text) and parameters_text[following].isspace():
-            following += 1
-        if following == len(parameters_text) or parameters_text.startswith(
-            _PARAMETER_START, following
-        ):
-            raw_value = parameters_text[value_start:value_end]
+        following = _skip_whitespace(text, value_end + len(_PARAMETER_END))
+        if text.startswith((_PARAMETER_START, _FUNCTION_END), following):
+            raw_value = text[value_start:value_end]
             if raw_value.startswith("\n"):
                 raw_value = raw_value[1:]
             if raw_value.endswith("\n"):
@@ -547,7 +554,7 @@ def _parse_parameter_value(
             value = _coerce_value(raw_value, schema["type"])
             if not _validate_value(value, schema):
                 return None
-            return value_end, value
+            return value_end + len(_PARAMETER_END), value
         search_from = value_end + len(_PARAMETER_END)
 
 
@@ -563,24 +570,10 @@ def _coerce_value(value: str, schema_type: str) -> Any:
         if lowered in {"false", "0"}:
             return False
         return value
-    if schema_type == "integer":
+    if schema_type in {"array", "integer", "number", "object"}:
         try:
-            return int(value)
-        except ValueError:
-            return value
-    if schema_type == "number":
-        try:
-            return int(value)
-        except ValueError:
-            try:
-                number = float(value)
-                return int(number) if math.isfinite(number) and number.is_integer() else number
-            except ValueError:
-                return value
-    if schema_type in {"array", "object"}:
-        try:
-            return json.loads(value)
-        except ValueError:
+            return _load_exact_json(value)
+        except (TypeError, ValueError):
             return value
     return value
 
@@ -589,7 +582,7 @@ def _validate_value(value: Any, schema: Mapping[str, Any]) -> bool:
     schema_type = schema["type"]
     if not _matches_type(value, schema_type):
         return False
-    if "enum" in schema and value not in schema["enum"]:
+    if "enum" in schema and not any(_json_values_equal(value, item) for item in schema["enum"]):
         return False
     if schema_type == "object":
         properties = schema["properties"]
@@ -609,6 +602,8 @@ def _matches_type(value: Any, schema_type: str) -> bool:
     if schema_type == "integer":
         return type(value) is int
     if schema_type == "number":
+        if type(value) is Decimal:
+            return value.is_finite()
         return type(value) is int or (type(value) is float and math.isfinite(value))
     if schema_type == "string":
         return type(value) is str
@@ -617,8 +612,17 @@ def _matches_type(value: Any, schema_type: str) -> bool:
     return type(value) is dict
 
 
+def _load_exact_json(value: str) -> Any:
+    return json.loads(
+        value,
+        parse_float=Decimal,
+        parse_int=int,
+        parse_constant=_raise_nonfinite,
+    )
+
+
 def _decode_json_object(value: str) -> dict[str, Any]:
-    decoded = json.loads(value, parse_constant=lambda constant: _raise_nonfinite(constant))
+    decoded = json.loads(value, parse_constant=_raise_nonfinite)
     if type(decoded) is not dict:
         raise ValueError("arguments are not an object")
     return decoded
@@ -626,6 +630,65 @@ def _decode_json_object(value: str) -> dict[str, Any]:
 
 def _raise_nonfinite(value: str) -> None:
     raise ValueError(f"non-finite json constant {value}")
+
+
+def _json_values_equal(left: Any, right: Any) -> bool:
+    if _is_json_number(left) and _is_json_number(right):
+        return _as_decimal(left) == _as_decimal(right)
+    if type(left) is not type(right):
+        return False
+    if type(left) is list:
+        return len(left) == len(right) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if type(left) is dict:
+        return set(left) == set(right) and all(
+            _json_values_equal(left[key], right[key]) for key in left
+        )
+    return left == right
+
+
+def _is_json_number(value: Any) -> bool:
+    return type(value) in {Decimal, float, int}
+
+
+def _as_decimal(value: Decimal | float) -> Decimal:
+    if type(value) is Decimal:
+        return value
+    if type(value) is int:
+        return Decimal(value)
+    return Decimal(json.dumps(value, allow_nan=False))
+
+
+def _dump_exact_json(value: Any) -> str:
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "true" if value else "false"
+    if type(value) is int:
+        return str(value)
+    if type(value) is Decimal:
+        if not value.is_finite():
+            raise ValueError("non-finite decimal")
+        rendered = format(value, "f") if value.as_tuple().exponent >= 0 else str(value)
+        return rendered.replace("E", "e")
+    if type(value) is float:
+        return json.dumps(value, allow_nan=False, separators=(",", ":"))
+    if type(value) is str:
+        return json.dumps(value, ensure_ascii=False)
+    if type(value) is list:
+        return "[" + ",".join(_dump_exact_json(item) for item in value) + "]"
+    if type(value) is dict:
+        return (
+            "{"
+            + ",".join(
+                f"{json.dumps(key, ensure_ascii=False)}:{_dump_exact_json(item)}"
+                for key, item in value.items()
+            )
+            + "}"
+        )
+    raise TypeError(f"unsupported exact JSON value {type(value).__name__}")
 
 
 def _json_copy(value: Any, path: str, error_type: type[Exception]) -> Any:
@@ -648,6 +711,12 @@ def _strings_overlap(left: str, right: str) -> bool:
     return any(
         left[-size:] == right[:size] or right[-size:] == left[:size] for size in range(1, limit)
     )
+
+
+def _skip_whitespace(text: str, cursor: int) -> int:
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    return cursor
 
 
 def _validated_call_id(value: object) -> str:

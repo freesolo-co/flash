@@ -592,6 +592,23 @@ def test_payload_balancing_is_a_no_op_outside_thinking_mode():
     assert payload["choices"][0]["message"]["content"] == "a</think>b"
 
 
+def test_payload_balancing_preserves_tool_only_null_content() -> None:
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "tool_calls": [{"type": "function", "function": {"name": "weather"}}],
+                }
+            }
+        ]
+    }
+
+    serving_thinking._balance_thinking_payload(payload, thinking=False)
+
+    assert payload["choices"][0]["message"]["content"] is None
+
+
 def test_payload_balancing_tolerates_shapes_it_cannot_rewrite():
     for payload in (None, [], "text", {}, {"choices": None}, {"choices": [{}, {"message": None}]}):
         serving_thinking._balance_thinking_payload(payload, thinking=True)  # must not raise
@@ -636,3 +653,12 @@ def test_non_thinking_chat_returns_serving_content_unchanged(monkeypatch):
     result = deploy.chat("run-1", [{"role": "user", "content": "hi"}])
 
     assert result["choices"][0]["message"]["content"] == "foo</think>bar"
+
+
+def test_non_thinking_chat_preserves_tool_only_null_content(monkeypatch) -> None:
+    tool_calls = [{"type": "function", "function": {"name": "weather", "arguments": "{}"}}]
+    _stub_serving(monkeypatch, {"content": None, "tool_calls": tool_calls})
+
+    result = deploy.chat("run-1", [{"role": "user", "content": "hi"}])
+
+    assert result["choices"][0]["message"] == {"content": None, "tool_calls": tool_calls}

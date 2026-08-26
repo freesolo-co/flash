@@ -243,6 +243,8 @@ async def _produce_openai_chat_stream(
                 break
             if event is None:
                 break
+            if final is not None:
+                raise RuntimeError("stream event followed request terminal")
             if _has_usage(event):
                 latest_usage = event
             kind = event.get("type")
