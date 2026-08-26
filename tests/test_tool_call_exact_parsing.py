@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import pytest
 
+import flash.serve.runtime.tool_calls as tool_calls_module
 from flash.serve.runtime.tool_calls import (
     ToolCallStreamParser,
     normalize_tools,
@@ -166,6 +167,58 @@ def test_string_enum_rejects_unrepresentable_structural_delimiter(enum_value: st
 
     with pytest.raises(ValueError, match="unrepresentable tool grammar delimiter"):
         normalize_tools([declaration])
+
+
+def _enum_tool(enum: list[object]) -> list[dict[str, object]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "store",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "enum": enum,
+                        }
+                    },
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
+def test_enum_fingerprint_detects_exact_numeric_duplicates_without_pairwise_comparison(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        tool_calls_module,
+        "_json_values_equal",
+        lambda *_args: pytest.fail("enum uniqueness must not use pairwise recursive comparison"),
+    )
+
+    with pytest.raises(ValueError, match="enum values must be unique"):
+        normalize_tools(_enum_tool([[1, 2], [1.0, 2.0]]))
+
+
+def test_enum_fingerprint_uses_exact_json_number_equality() -> None:
+    fingerprint = tool_calls_module._json_value_fingerprint
+
+    assert fingerprint(1) == fingerprint(1.0) == fingerprint(Decimal("1.00"))
+    assert fingerprint(9007199254740992) != fingerprint(9007199254740993)
+    assert fingerprint(Decimal("1e-400")) != fingerprint(Decimal("0"))
+
+
+def test_enum_fingerprint_accepts_bounded_distinct_nested_values() -> None:
+    enum = [[*range(255), index] for index in range(128)]
+
+    tools = normalize_tools(_enum_tool(enum))
+
+    assert len(tools[0].parameters["properties"]["value"]["enum"]) == 128
 
 
 def test_string_enum_allows_nonstructural_parameter_delimiter_text() -> None:

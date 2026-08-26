@@ -38,6 +38,7 @@ _MAX_SCHEMA_DEPTH = 8
 _MAX_SCHEMA_NODES = 512
 _MAX_ENUM_VALUES = 128
 _MAX_FIXED_DECIMAL_DIGITS = 1024
+_MAX_TOOL_STOP_COMPARISON_CHARS = 16 * 1024 * 1024
 _SCHEMA_TYPES = frozenset({"array", "boolean", "integer", "null", "number", "object", "string"})
 _SCHEMA_KEYS = frozenset(
     {"additionalProperties", "description", "enum", "items", "properties", "required", "type"}
@@ -236,6 +237,10 @@ def validate_tool_stop_sequences(
     for tool in tools:
         markers.append(f"{_FUNCTION_START}{tool.name}>")
         markers.extend(f"{_PARAMETER_START}{name}>" for name in tool.parameters["properties"])
+    marker_chars = sum(len(marker) for marker in markers)
+    stop_chars = sum(len(stop_value) for stop_value in stop)
+    if len(stop) * marker_chars + len(markers) * stop_chars > _MAX_TOOL_STOP_COMPARISON_CHARS:
+        raise error_type("active tool stop validation exceeds the supported complexity")
     if any(_strings_overlap(stop_value, marker) for stop_value in stop for marker in markers):
         raise error_type(
             "stop sequences cannot overlap qwen tool-call grammar markers when tool_choice='auto'"
@@ -400,11 +405,8 @@ def _normalize_schema(
             _string_enum_conflicts_with_tool_grammar(item) for item in detached
         ):
             raise error_type(f"{path}.enum contains an unrepresentable tool grammar delimiter")
-        if any(
-            _json_values_equal(item, prior)
-            for index, item in enumerate(detached)
-            for prior in detached[:index]
-        ):
+        fingerprints = [_json_value_fingerprint(item) for item in detached]
+        if len(fingerprints) != len(set(fingerprints)):
             raise error_type(f"{path}.enum values must be unique")
         normalized["enum"] = detached
     if schema_type == "object":
@@ -708,6 +710,19 @@ def _contains_decimal(value: Any) -> bool:
 
 def _raise_nonfinite(value: str) -> None:
     raise ValueError(f"non-finite json constant {value}")
+
+
+def _json_value_fingerprint(value: Any) -> tuple[Any, ...]:
+    if _is_json_number(value):
+        return ("number", _as_decimal(value))
+    if type(value) is list:
+        return ("array", *(_json_value_fingerprint(item) for item in value))
+    if type(value) is dict:
+        return (
+            "object",
+            *((key, _json_value_fingerprint(value[key])) for key in sorted(value)),
+        )
+    return (type(value).__name__, value)
 
 
 def _json_values_equal(left: Any, right: Any) -> bool:

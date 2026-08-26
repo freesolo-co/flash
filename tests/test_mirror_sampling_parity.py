@@ -156,6 +156,37 @@ def test_canonical_tool_choice_none_allows_tool_marker_stop_sequences():
     assert request.stop == ("</tool_call>",)
 
 
+def _wide_tool() -> list[dict]:
+    tool = _tools()[0]
+    properties = {f"field_{index}": {"type": "string"} for index in range(256)}
+    tool["function"]["parameters"]["properties"] = properties
+    tool["function"]["parameters"]["required"] = []
+    return [tool]
+
+
+def test_canonical_active_tool_stop_validation_has_an_aggregate_complexity_bound():
+    stops = ["!" * 4096] * 64
+
+    with pytest.raises(OpenAIRequestError, match="stop validation exceeds"):
+        parse_chat_request(
+            _payload(tools=_wide_tool(), stop=stops),
+            require_model=True,
+            allow_managed_selectors=False,
+        )
+
+
+def test_canonical_tool_choice_none_bypasses_active_stop_complexity_bound():
+    stops = ["!" * 4096] * 64
+
+    request = parse_chat_request(
+        _payload(tools=_wide_tool(), tool_choice="none", stop=stops),
+        require_model=True,
+        allow_managed_selectors=False,
+    )
+
+    assert request.stop == tuple(stops)
+
+
 @pytest.mark.parametrize(
     ("feature", "expected"),
     [
