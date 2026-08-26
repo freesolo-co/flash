@@ -987,10 +987,9 @@ def test_unattested_revision_is_refused_on_the_plain_generate_routes(
     assert "attest" in response.json()["detail"]
 
 
-def test_a_refused_attestation_is_never_metered(monkeypatch) -> None:
-    # usage is scheduled inside generate_once, so attesting after it returned meant the caller had
-    # already been billed for a generation we then rejected with a 502. the check has to run
-    # before metering, not after it.
+def test_a_refused_attestation_fails_the_admission_without_finalizing(monkeypatch) -> None:
+    # price admission must exist before dispatch, but an unattested result must fail that identity
+    # instead of finalizing billable usage for weights the engine did not prove it served.
     _unattesting_pool(monkeypatch)
     store = RecordingUsageStore()
     revision = _revision(QWEN).model_copy(update={"thinking": False})
@@ -1005,9 +1004,11 @@ def test_a_refused_attestation_is_never_metered(monkeypatch) -> None:
     response = client.post("/generate", json={"adapter_id": REVISION_ID, "prompt": "hi"})
 
     assert response.status_code == 502
-    assert store.captured == []
+    assert len(store.captured) == 1
     assert store.finalized == []
-    assert store.failed == []
+    assert len(store.failed) == 1
+    assert store.failed[0][0].identity == store.captured[0].identity
+    assert store.failed[0][1] == "generation_failed"
 
 
 def test_mismatched_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> None:

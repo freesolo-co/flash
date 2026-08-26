@@ -592,9 +592,6 @@ def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
         async def finalize(self, _result):
             return None
 
-        async def capture(self, _result):
-            return None
-
         async def fail(self, _result, _code):
             return None
 

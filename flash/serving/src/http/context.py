@@ -1,6 +1,7 @@
 """The per-app collaborators serving request handlers use."""
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -10,10 +11,16 @@ from flash.serving.src.accounting.usage import (
     AuthorizedTraffic,
     UsageSession,
     build_usage_session,
+    capture_authoritative_price,
     principal_for_external_org,
     principal_for_trusted_internal,
 )
-from flash.serving.src.accounting.usage_outbox import RequestIdentity, UsageStore
+from flash.serving.src.accounting.usage_outbox import (
+    CapturedPrice,
+    RequestIdentity,
+    UsageOutboxError,
+    UsageStore,
+)
 from flash.serving.src.http.headers import _bearer_token, assert_internal, is_trusted_internal
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
 from flash.serving.src.io.schemas import AdapterRecord
@@ -21,6 +28,15 @@ from flash.serving.src.io.streaming import generate_once, openai_chat_stream, pr
 from flash.serving.src.store.lookup import AdapterLookup
 
 APP_STATE_ATTR = "serving_context"
+
+
+async def _finish_usage_write(write: Awaitable[None]) -> None:
+    operation = asyncio.ensure_future(write)
+    try:
+        await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        await operation
+        raise
 
 
 class ServingContext:
@@ -85,6 +101,35 @@ class ServingContext:
             "serving auth did not return an attributable principal",
         )
 
+    def capture_price(self, traffic: AuthorizedTraffic, target: AdapterRecord) -> CapturedPrice:
+        return capture_authoritative_price(traffic.principal, target)
+
+    async def admit_usage(
+        self,
+        identity: RequestIdentity,
+        traffic: AuthorizedTraffic,
+        requested: AdapterRecord,
+        target: AdapterRecord,
+        price: CapturedPrice,
+        captured_at: Any,
+    ) -> UsageSession:
+        session = build_usage_session(
+            self.usage,
+            identity,
+            traffic.principal,
+            requested,
+            target,
+            price=price,
+            deployment_id=self.deployment_id,
+            serving_release=self.serving_release,
+            captured_at=captured_at,
+        )
+        await session.admit()
+        return session
+
+    async def fail_usage(self, session: UsageSession, code: str) -> None:
+        await _finish_usage_write(session.fail_admission(code))
+
     def reject_unsettleable_thinking(self, payload: Any, target: AdapterRecord) -> None:
         if not self.usage.enabled:
             return
@@ -125,60 +170,35 @@ class ServingContext:
         requested: AdapterRecord,
         target: AdapterRecord,
         *,
-        identity: RequestIdentity,
-        traffic: AuthorizedTraffic,
-        captured_at: Any,
+        usage_session: UsageSession,
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
-        result = await generate_once(
-            self.pool,
-            self.router,
-            payload,
-            requested,
-            target,
-            generation_id=identity.request_id,
-            require_generation_id=self.usage.enabled,
-            expected_checkpoint=expected_checkpoint,
-        )
-        session = build_usage_session(
-            self.usage,
-            identity,
-            traffic.principal,
-            requested,
-            target,
-            result,
-            deployment_id=self.deployment_id,
-            serving_release=self.serving_release,
-            captured_at=captured_at,
-        )
-        finalization = asyncio.create_task(session.finalize(result))
         try:
-            await asyncio.shield(finalization)
+            result = await generate_once(
+                self.pool,
+                self.router,
+                payload,
+                requested,
+                target,
+                generation_id=usage_session.identity.request_id,
+                require_generation_id=self.usage.enabled,
+                expected_checkpoint=expected_checkpoint,
+            )
         except asyncio.CancelledError:
-            await finalization
+            await _finish_usage_write(usage_session.fail_admission("client_disconnected"))
+            raise
+        except BaseException:
+            await _finish_usage_write(usage_session.fail_admission("generation_failed"))
+            raise
+        session = usage_session.with_attestation(result)
+        try:
+            await _finish_usage_write(session.finalize(result))
+        except UsageOutboxError:
+            with contextlib.suppress(UsageOutboxError):
+                await _finish_usage_write(session.fail(result, "finalization_failed"))
+            session.relinquish()
             raise
         return result
-
-    def usage_session(
-        self,
-        identity: RequestIdentity,
-        traffic: AuthorizedTraffic,
-        requested: AdapterRecord,
-        target: AdapterRecord,
-        result: dict[str, Any],
-        captured_at: Any,
-    ) -> UsageSession:
-        return build_usage_session(
-            self.usage,
-            identity,
-            traffic.principal,
-            requested,
-            target,
-            result,
-            deployment_id=self.deployment_id,
-            serving_release=self.serving_release,
-            captured_at=captured_at,
-        )
 
     async def prepare_stream(
         self,

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import uuid
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, DecimalException
+from types import MappingProxyType
 from typing import Any
 
 from fastapi import Request
@@ -19,6 +22,7 @@ from flash.serving.src.accounting.usage_outbox import (
     ServingTrafficPrincipal,
     TrustedInternalTrafficPrincipal,
     UsageEvent,
+    UsageOutboxError,
     UsageStore,
 )
 from flash.serving.src.io.schemas import AdapterRecord
@@ -35,6 +39,24 @@ _FREESOLO_USD_PER_MTOK: dict[str, tuple[str, str, str]] = {
 }
 _FREESOLO_MARKUP = Decimal("1.2")
 _USD_PER_MTOK_DIVISOR = Decimal("1000000")
+_DECIMAL_PRICE_RE = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")
+_FREESOLO_PRICE_KEYS = frozenset(
+    {"prompt_token_usd", "cached_prompt_token_usd", "completion_token_usd"}
+)
+_OPENROUTER_REQUIRED_PRICE_KEYS = frozenset({"promptTokenUsd", "completionTokenUsd"})
+_OPENROUTER_PRICE_KEYS = _OPENROUTER_REQUIRED_PRICE_KEYS | frozenset(
+    {"cachedPromptTokenUsd", "requestUsd"}
+)
+_ADMISSION_RESULT = MappingProxyType(
+    {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "cached_tokens": 0,
+        "cached_tokens_reported": False,
+        "reasoning_tokens": 0,
+        "thinking": False,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -78,9 +100,9 @@ class UsageSession:
             facts=usage_facts(result),
         )
 
-    async def capture(self, result: dict[str, Any]) -> None:
+    async def admit(self) -> None:
         if self.store.enabled:
-            await self.store.capture(self.event(result))
+            await self.store.capture(self.event(dict(_ADMISSION_RESULT)))
 
     async def finalize(self, result: dict[str, Any]) -> None:
         if self.store.enabled:
@@ -89,6 +111,13 @@ class UsageSession:
     async def fail(self, result: dict[str, Any], code: str) -> None:
         if self.store.enabled:
             await self.store.fail(self.event(result), code)
+
+    async def fail_admission(self, code: str) -> None:
+        await self.fail(dict(_ADMISSION_RESULT), code)
+
+    def with_attestation(self, result: dict[str, Any]) -> UsageSession:
+        attested = _optional_text(result.get("lora_request_adapter"))
+        return replace(self, attested_adapter=attested or self.attested_adapter)
 
     def relinquish(self) -> None:
         if self.store.enabled:
@@ -124,13 +153,12 @@ def build_usage_session(
     principal: ServingTrafficPrincipal,
     requested: AdapterRecord,
     target: AdapterRecord,
-    result: dict[str, Any],
     *,
+    price: CapturedPrice,
     deployment_id: str,
     serving_release: str,
     captured_at: datetime,
 ) -> UsageSession:
-    resolved_checkpoint = _optional_text(result.get("checkpoint"))
     public_model_id = (
         principal.publicModelId if principal.kind == "openrouter" else requested.adapter_id
     )
@@ -141,17 +169,8 @@ def build_usage_session(
         base_model=target.base_model,
         requested_adapter_id=requested_adapter_id,
         resolved_adapter_revision=resolved_revision,
-        resolved_checkpoint_id=resolved_checkpoint,
+        resolved_checkpoint_id=target.checkpoint,
         resolved_hf_revision=target.hf_revision,
-    )
-    price = (
-        CapturedPrice(
-            source="openrouter_admission",
-            version=principal.providerCatalogDigest,
-            snapshot=principal.acceptedPriceSnapshot.model_dump(mode="json"),
-        )
-        if principal.kind == "openrouter"
-        else freesolo_price(target.base_model)
     )
     if principal.kind == "trusted_internal" and target.org_id is not None:
         principal = TrustedInternalTrafficPrincipal(
@@ -167,8 +186,37 @@ def build_usage_session(
         captured_at=captured_at,
         deployment_id=deployment_id or None,
         serving_release=serving_release or None,
-        attested_adapter=_optional_text(result.get("lora_request_adapter")),
+        attested_adapter=None,
     )
+
+
+def capture_authoritative_price(
+    principal: ServingTrafficPrincipal, target: AdapterRecord
+) -> CapturedPrice:
+    try:
+        if principal.kind == "openrouter":
+            price = CapturedPrice(
+                source="openrouter_admission",
+                version=principal.providerCatalogDigest,
+                snapshot=principal.acceptedPriceSnapshot.model_dump(mode="json"),
+            )
+            _validate_price(
+                price,
+                required_keys=_OPENROUTER_REQUIRED_PRICE_KEYS,
+                allowed_keys=_OPENROUTER_PRICE_KEYS,
+                optional_none_keys=_OPENROUTER_PRICE_KEYS - _OPENROUTER_REQUIRED_PRICE_KEYS,
+            )
+            return replace(price, snapshot=MappingProxyType(dict(price.snapshot)))
+
+        price = freesolo_price(target.base_model)
+        _validate_price(
+            price,
+            required_keys=_FREESOLO_PRICE_KEYS,
+            allowed_keys=_FREESOLO_PRICE_KEYS,
+        )
+        return price
+    except (AttributeError, DecimalException, KeyError, TypeError, ValueError) as exc:
+        raise UsageOutboxError("durable_serving_price_unavailable") from exc
 
 
 def freesolo_price(base_model: str) -> CapturedPrice:
@@ -177,18 +225,54 @@ def freesolo_price(base_model: str) -> CapturedPrice:
     except KeyError as exc:
         raise ValueError(f"no durable serving price for base model {base_model!r}") from exc
 
-    def per_token(rate: str) -> str:
-        return format(Decimal(rate) * _FREESOLO_MARKUP / _USD_PER_MTOK_DIVISOR, "f")
+    def per_token(rate: Any) -> str:
+        value = _price_decimal(rate)
+        return format(value * _FREESOLO_MARKUP / _USD_PER_MTOK_DIVISOR, "f")
 
     return CapturedPrice(
         source=FREESOLO_PRICING_SOURCE,
         version=FREESOLO_PRICING_VERSION,
-        snapshot={
-            "prompt_token_usd": per_token(prompt_mtok),
-            "cached_prompt_token_usd": per_token(cached_mtok),
-            "completion_token_usd": per_token(completion_mtok),
-        },
+        snapshot=MappingProxyType(
+            {
+                "prompt_token_usd": per_token(prompt_mtok),
+                "cached_prompt_token_usd": per_token(cached_mtok),
+                "completion_token_usd": per_token(completion_mtok),
+            }
+        ),
     )
+
+
+def _validate_price(
+    price: CapturedPrice,
+    *,
+    required_keys: frozenset[str],
+    allowed_keys: frozenset[str],
+    optional_none_keys: frozenset[str] = frozenset(),
+) -> None:
+    if not isinstance(price.source, str) or not price.source:
+        raise ValueError("price source is missing")
+    if not isinstance(price.version, str) or not price.version:
+        raise ValueError("price version is missing")
+    if not isinstance(price.snapshot, Mapping):
+        raise TypeError("price snapshot must be a mapping")
+    keys = frozenset(price.snapshot)
+    if not required_keys <= keys or not keys <= allowed_keys:
+        raise ValueError("price snapshot keys are invalid")
+    for key, raw in price.snapshot.items():
+        if raw is None and key in optional_none_keys:
+            continue
+        _price_decimal(raw)
+
+
+def _price_decimal(raw: Any) -> Decimal:
+    if not isinstance(raw, str):
+        raise TypeError("price must be a string")
+    value = Decimal(raw)
+    if not value.is_finite() or value < 0:
+        raise ValueError("price must be finite and nonnegative")
+    if _DECIMAL_PRICE_RE.fullmatch(raw) is None:
+        raise ValueError("price must be a canonical decimal string")
+    return value
 
 
 def principal_for_external_org(org_id: str) -> FreesoloOrgTrafficPrincipal:

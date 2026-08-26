@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -11,6 +12,7 @@ from fastapi import Request
 from flash.serving.src.accounting.usage import (
     AuthorizedTraffic,
     build_usage_session,
+    capture_authoritative_price,
     principal_for_external_org,
 )
 from flash.serving.src.accounting.usage_outbox import RequestIdentity
@@ -109,6 +111,15 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
 
             async def authorize_inference(self, *_args):
                 return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
+
+            def capture_price(self, traffic, target):
+                return capture_authoritative_price(traffic.principal, target)
+
+            async def admit_usage(self, identity, *_args):
+                return SimpleNamespace(identity=identity)
+
+            async def fail_usage(self, *_args) -> None:
+                return None
 
             def reject_unsettleable_thinking(self, *_args) -> None:
                 return None
@@ -268,18 +279,8 @@ class _Context:
             expected_checkpoint=expected_checkpoint,
         )
 
-    def usage_session(self, identity, traffic, requested, target, first, admitted_at):
-        return build_usage_session(
-            self.store,
-            identity,
-            traffic.principal,
-            requested,
-            target,
-            first,
-            deployment_id="deployment-1",
-            serving_release="release-1",
-            captured_at=admitted_at,
-        )
+    async def fail_usage(self, session, code):
+        await session.fail_admission(code)
 
     def chat_stream(self, **kwargs):
         self.chat_stream_calls += 1
@@ -297,8 +298,22 @@ def _traffic() -> AuthorizedTraffic:
     return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
 
 
+def _usage_session(store: RecordingUsageStore, record: AdapterRecord, identity: RequestIdentity):
+    return build_usage_session(
+        store,
+        identity,
+        _traffic().principal,
+        record,
+        record,
+        price=capture_authoritative_price(_traffic().principal, record),
+        deployment_id="deployment-1",
+        serving_release="release-1",
+        captured_at=datetime.now(UTC),
+    )
+
+
 def test_disconnect_before_first_event_closes_engine_without_starting_response_body() -> None:
-    async def scenario() -> tuple[bool, bool, int]:
+    async def scenario() -> tuple[bool, bool, int, RecordingUsageStore]:
         entered = asyncio.Event()
         closed = asyncio.Event()
         messages: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -325,6 +340,8 @@ def test_disconnect_before_first_event_closes_engine_without_starting_response_b
             return await messages.get()
 
         context = _Context(Pool(), record, store)
+        usage_session = _usage_session(store, record, _identity())
+        await usage_session.admit()
         task = asyncio.create_task(
             _stream_chat_completion(
                 context,
@@ -336,9 +353,7 @@ def test_disconnect_before_first_event_closes_engine_without_starting_response_b
                 completion_id="chatcmpl-disconnect",
                 created=123,
                 include_usage=True,
-                identity=_identity(),
-                traffic=_traffic(),
-                admitted_at=datetime.now(UTC),
+                usage_session=usage_session,
             )
         )
         await _wait_event_or_task(entered, task)
@@ -348,12 +363,84 @@ def test_disconnect_before_first_event_closes_engine_without_starting_response_b
             isinstance(result[0], asyncio.CancelledError),
             closed.is_set(),
             context.chat_stream_calls,
+            store,
         )
 
-    disconnected, closed, chat_stream_calls = asyncio.run(scenario())
+    disconnected, closed, chat_stream_calls, store = asyncio.run(scenario())
     assert disconnected
     assert closed
     assert chat_stream_calls == 0
+    assert len(store.captured) == 1
+    assert len(store.failed) == 1
+    assert store.failed[0][0].identity == store.captured[0].identity
+    assert store.failed[0][0].price is store.captured[0].price
+    assert store.failed[0][1] == "client_disconnected"
+
+
+@pytest.mark.parametrize("native_usage", [False, True], ids=["admission", "cumulative"])
+def test_disconnect_race_with_cancellation_resistant_preparation_terminalizes_once(
+    native_usage: bool,
+) -> None:
+    async def scenario() -> tuple[RecordingUsageStore, bool]:
+        entered = asyncio.Event()
+        closed = asyncio.Event()
+        record = _record()
+        store = RecordingUsageStore()
+        identity = _identity()
+        context = _Context(object(), record, store)
+        session = _usage_session(store, record, identity)
+        await session.admit()
+        first = _ready(record, identity.request_id)
+        if not native_usage:
+            first.pop("prompt_tokens")
+            first.pop("completion_tokens")
+
+        async def events():
+            try:
+                yield first
+            finally:
+                closed.set()
+
+        async def cancellation_resistant_prepare(*_args, **_kwargs):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return events(), {}, False, first
+
+        context.prepare_stream = cancellation_resistant_prepare  # type: ignore[method-assign]
+
+        async def receive():
+            await entered.wait()
+            return {"type": "http.disconnect"}
+
+        with pytest.raises(asyncio.CancelledError):
+            await _stream_chat_completion(
+                context,
+                _request(receive),
+                GenerateRequest(adapter_id=record.adapter_id, prompt="hi"),
+                record,
+                record,
+                adapter_id=record.adapter_id,
+                completion_id="chatcmpl-cancellation-resistant-race",
+                created=123,
+                include_usage=True,
+                usage_session=session,
+            )
+        return store, closed.is_set()
+
+    store, closed = asyncio.run(scenario())
+
+    assert closed
+    assert len(store.captured) == 1
+    assert len(store.failed) == 1
+    failed, code = store.failed[0]
+    assert failed.identity == store.captured[0].identity
+    assert failed.price is store.captured[0].price
+    assert failed.facts.prompt_tokens == (2 if native_usage else 0)
+    assert failed.facts.completion_tokens == 0
+    assert failed.attestation_evidence == {"resolved_adapter_revision": _record().adapter_id}
+    assert code == "client_disconnected"
 
 
 def test_discard_prepared_stream_persists_ready_failure_and_closes_iterator() -> None:
@@ -369,7 +456,7 @@ def test_discard_prepared_stream_persists_ready_failure_and_closes_iterator() ->
             _traffic().principal,
             record,
             record,
-            first,
+            price=capture_authoritative_price(_traffic().principal, record),
             deployment_id="deployment-1",
             serving_release="release-1",
             captured_at=datetime.now(UTC),
@@ -429,6 +516,42 @@ def test_post_first_validation_failure_closes_engine_iterator(failure: str) -> N
     assert asyncio.run(scenario())
 
 
+def test_pre_first_event_failure_updates_admitted_identity() -> None:
+    async def scenario() -> RecordingUsageStore:
+        record = _record()
+        store = RecordingUsageStore()
+        context = _Context(object(), record, store)
+        usage_session = _usage_session(store, record, _identity())
+        await usage_session.admit()
+
+        async def fail_before_first(*_args, **_kwargs):
+            raise RuntimeError("engine failed before first event")
+
+        context.prepare_stream = fail_before_first  # type: ignore[method-assign]
+        request = _request(lambda: asyncio.Event().wait())
+        with pytest.raises(RuntimeError, match="engine failed before first event"):
+            await _stream_chat_completion(
+                context,
+                request,
+                GenerateRequest(adapter_id=record.adapter_id, prompt="hi"),
+                record,
+                record,
+                adapter_id=record.adapter_id,
+                completion_id="chatcmpl-pre-first-failure",
+                created=123,
+                include_usage=True,
+                usage_session=usage_session,
+            )
+        return store
+
+    store = asyncio.run(scenario())
+    assert len(store.captured) == 1
+    assert len(store.failed) == 1
+    assert store.failed[0][0].identity == store.captured[0].identity
+    assert store.failed[0][0].target == store.captured[0].target
+    assert store.failed[0][0].price is store.captured[0].price
+
+
 def test_completed_preparation_wins_same_tick_disconnect() -> None:
     async def scenario() -> bool:
         record = _record()
@@ -444,6 +567,8 @@ def test_completed_preparation_wins_same_tick_disconnect() -> None:
             return prepared_events(), {}, False, _ready(record, identity.request_id)
 
         context.prepare_stream = prepared  # type: ignore[method-assign]
+        usage_session = _usage_session(store, record, identity)
+        await usage_session.admit()
         request = _request(lambda: asyncio.sleep(0, {"type": "http.disconnect"}))
         response = await _stream_chat_completion(
             context,
@@ -455,9 +580,7 @@ def test_completed_preparation_wins_same_tick_disconnect() -> None:
             completion_id="chatcmpl-race",
             created=123,
             include_usage=True,
-            identity=identity,
-            traffic=_traffic(),
-            admitted_at=datetime.now(UTC),
+            usage_session=usage_session,
         )
         return response.status_code == 200
 

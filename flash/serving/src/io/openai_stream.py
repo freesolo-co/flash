@@ -220,8 +220,8 @@ async def _produce_openai_chat_stream(
     splitters = {index: ReasoningDeltaSplitter(thinking=thinking) for index in range(choice_count)}
     terminals: dict[int, dict[str, Any]] = {}
     final: dict[str, Any] | None = None
-    latest_usage: dict[str, Any] = {}
-    terminal_persisted = False
+    latest_usage: dict[str, Any] | None = None
+    terminal_started = False
     guarded_events = terminating_on_engine_error(router, events, adapter_id)
     disconnect_wait = asyncio.create_task(disconnected.wait())
     try:
@@ -263,22 +263,19 @@ async def _produce_openai_chat_stream(
                     }
                 final = event
             elif kind == "error":
-                if latest_usage:
-                    await usage_session.fail(latest_usage, "engine_failed")
-                    terminal_persisted = True
+                terminal_started = True
+                await _fail_usage(usage_session, latest_usage, "engine_failed")
                 await stream_output.terminal(stream_output.error(event["message"], event["code"]))
                 return
             elif kind != "ready":
                 raise RuntimeError("invalid engine stream event")
         if disconnected.is_set() and final is None:
-            if latest_usage:
-                await usage_session.fail(latest_usage, "client_disconnected")
-                terminal_persisted = True
+            terminal_started = True
+            await _fail_usage(usage_session, latest_usage, "client_disconnected")
             return
         if final is None or set(terminals) != set(range(choice_count)):
-            if latest_usage:
-                await usage_session.fail(latest_usage, "engine_terminal_missing")
-                terminal_persisted = True
+            terminal_started = True
+            await _fail_usage(usage_session, latest_usage, "engine_terminal_missing")
             await stream_output.terminal(
                 stream_output.error(
                     "The serving engine ended without a terminal event for every choice.",
@@ -286,10 +283,22 @@ async def _produce_openai_chat_stream(
                 )
             )
             return
-        if not await _finalize_usage(stream_output, usage_session, final):
-            terminal_persisted = True
+        try:
+            await usage_session.finalize(final)
+        except UsageOutboxError:
+            terminal_started = True
+            with contextlib.suppress(UsageOutboxError):
+                await usage_session.fail(final, "finalization_failed")
+            usage_session.relinquish()
+            await stream_output.terminal(
+                stream_output.error(
+                    "Durable serving accounting finalization failed.",
+                    503,
+                    "accounting_error",
+                )
+            )
             return
-        terminal_persisted = True
+        terminal_started = True
         for index in range(choice_count):
             for key, value in splitters[index].finish():
                 await stream_output.emit(stream_output.delta({key: value}, index=index))
@@ -306,9 +315,9 @@ async def _produce_openai_chat_stream(
             ignore_disconnect=disconnected.is_set(),
         )
     except Exception as exc:
-        if latest_usage and not terminal_persisted:
+        if not terminal_started:
             with contextlib.suppress(UsageOutboxError):
-                await usage_session.fail(latest_usage, "stream_failed")
+                await _fail_usage(usage_session, latest_usage, "stream_failed")
         if isinstance(exc, UsageOutboxError):
             if disconnected.is_set():
                 raise
@@ -361,24 +370,13 @@ def _has_usage(event: dict[str, Any]) -> bool:
     return event.get("prompt_tokens") is not None and event.get("completion_tokens") is not None
 
 
-async def _finalize_usage(
-    stream_output: _StreamOutput, usage_session: UsageSession, final: dict[str, Any]
-) -> bool:
-    try:
-        await usage_session.finalize(final)
-    except UsageOutboxError:
-        with contextlib.suppress(UsageOutboxError):
-            await usage_session.capture(final)
-        usage_session.relinquish()
-        await stream_output.terminal(
-            stream_output.error(
-                "Durable serving accounting finalization failed.",
-                503,
-                "accounting_error",
-            )
-        )
-        return False
-    return True
+async def _fail_usage(
+    usage_session: UsageSession, latest_usage: dict[str, Any] | None, code: str
+) -> None:
+    if latest_usage is None:
+        await usage_session.fail_admission(code)
+        return
+    await usage_session.fail(latest_usage, code)
 
 
 def _terminal_chunk(
