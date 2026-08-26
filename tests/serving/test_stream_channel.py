@@ -13,9 +13,10 @@ from typing import Any
 import modal
 import pytest
 
-from flash.serving.src.engine import stream_channel_client as client
-from flash.serving.src.engine import stream_channel_engine as channel_engine
-from flash.serving.src.engine.stream_channel import (
+from flash.serving.src.stream_channel import client
+from flash.serving.src.stream_channel import engine as channel_engine
+from flash.serving.src.stream_channel.engine import stream_generate_call
+from flash.serving.src.stream_channel.protocol import (
     CONTROL_PARTITION,
     DATA_PARTITION,
     PROTOCOL_VERSION,
@@ -30,7 +31,6 @@ from flash.serving.src.engine.stream_channel import (
     validate_data,
     validate_manifest,
 )
-from flash.serving.src.engine.stream_channel_engine import stream_generate_call
 
 
 class _AsyncMethod:

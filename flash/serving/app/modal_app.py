@@ -403,7 +403,7 @@ def _build_engine(
             queue_id: str,
             invocation_nonce: str,
         ) -> dict[str, Any]:
-            from flash.serving.src.engine.stream_channel_engine import stream_generate_call
+            from flash.serving.src.stream_channel.engine import stream_generate_call
 
             return await stream_generate_call(
                 self,
@@ -547,7 +547,7 @@ class _ModalEnginePool:
         dispatch_deadline_unix: float | None = None,
     ) -> Any:
         """Build the additive channel transport without changing the rolling default."""
-        from flash.serving.src.engine.stream_channel_client import CancellableStreamChannel
+        from flash.serving.src.stream_channel.client import CancellableStreamChannel
 
         generation_id = payload.generation_id
         if not generation_id:

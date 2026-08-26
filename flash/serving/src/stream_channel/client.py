@@ -9,7 +9,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from flash.serving.src.engine.stream_channel import (
+from flash.serving.src.stream_channel.protocol import (
     CALL_RESULT_SECONDS,
     CLEANUP_SECONDS,
     CONTROL_PARTITION,

@@ -10,7 +10,7 @@ import time
 from collections.abc import Awaitable
 from typing import Any, TypeVar
 
-from flash.serving.src.engine.stream_channel import (
+from flash.serving.src.stream_channel.protocol import (
     CLEANUP_SECONDS,
     CONTROL_PARTITION,
     CONTROL_POLL_SECONDS,
