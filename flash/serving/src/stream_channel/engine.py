@@ -99,6 +99,7 @@ class _LeaseWatch:
         )
         self._latest: ControlEnvelope | None = None
         self._task: asyncio.Task[None] | None = None
+        self._closed_error: BaseException | None = None
         self._consume_lock = asyncio.Lock()
 
     async def _consume(
@@ -156,6 +157,8 @@ class _LeaseWatch:
         self.check()
 
     def check(self) -> None:
+        if self._closed_error is not None:
+            raise self._closed_error
         task = self._task
         if task is not None and task.done() and not task.cancelled():
             exception = task.exception()
@@ -218,8 +221,18 @@ class _LeaseWatch:
 
     async def close(self) -> None:
         if self._task is None:
+            if self._closed_error is None:
+                self._closed_error = StreamChannelError(
+                    ChannelErrorCode.CHANNEL_FAULT, "lease watcher is closed"
+                )
             return
         task = self._task
+        if task.done() and not task.cancelled():
+            self._closed_error = task.exception()
+        if self._closed_error is None:
+            self._closed_error = StreamChannelError(
+                ChannelErrorCode.CHANNEL_FAULT, "lease watcher is closed"
+            )
         self._task = None
         await _stop_task(task)
 

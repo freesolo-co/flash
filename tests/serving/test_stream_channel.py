@@ -648,6 +648,66 @@ def test_heartbeat_expiry_aborts_exact_generation(monkeypatch: pytest.MonkeyPatc
     assert owner.finally_count == 1
 
 
+def test_closed_lease_rejects_retained_hydration_after_stream_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[str, int, bool]:
+        monkeypatch.setattr(channel_engine, "CLEANUP_SECONDS", 0.02)
+        queue = _FakeQueue()
+        _patch_modal(monkeypatch, queue)
+        await queue.control(_control(0, call_id=None))
+        await queue.control(_control(1))
+        owner = _Owner([])
+        hydration_cancelled = asyncio.Event()
+        hydration_release = asyncio.Event()
+        hydration_finished = asyncio.Event()
+        precheck_rejected = False
+
+        async def delayed_hydration(
+            *_args: Any, pre_generate_check: Any = None
+        ) -> AsyncIterator[dict[str, Any]]:
+            nonlocal precheck_rejected
+            owner.hydrated += 1
+            owner.precheck_ready.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                hydration_cancelled.set()
+                await hydration_release.wait()
+            try:
+                await pre_generate_check()
+            except StreamChannelError:
+                precheck_rejected = True
+                raise
+            finally:
+                hydration_finished.set()
+            owner.started += 1
+            yield {"type": "final", "ok": True}
+
+        owner._stream_generate = delayed_hydration  # type: ignore[method-assign]
+        task = asyncio.create_task(
+            stream_generate_call(
+                owner,
+                {},
+                None,
+                None,
+                "generation-1",
+                time.time() + 5,
+                queue.object_id,
+                "nonce-1",
+            )
+        )
+        await owner.precheck_ready.wait()
+        await queue.control(_control(2, kind="cancel"))
+        await asyncio.wait_for(hydration_cancelled.wait(), timeout=1)
+        manifest = await asyncio.wait_for(task, timeout=1)
+        hydration_release.set()
+        await asyncio.wait_for(hydration_finished.wait(), timeout=1)
+        return manifest["terminal_kind"], owner.started, precheck_rejected
+
+    assert asyncio.run(scenario()) == ("error", 0, True)
+
+
 def test_watchdog_idle_timeout_polls_do_not_fault_before_delayed_first_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -686,6 +746,7 @@ def test_guarded_committed_operation_wins_simultaneous_watchdog_failure(
         )
         await watch.admit()
         await watch.close()
+        watch._closed_error = None
         committed = asyncio.Event()
         watchdog_done = asyncio.Event()
         writes: list[tuple[int, bool]] = []
@@ -830,6 +891,7 @@ def test_guarded_abort_timeout_retains_noncooperative_abort(
         await watch.admit()
         assert watch._task is not None
         await watch.close()
+        watch._closed_error = None
         fail_watchdog = asyncio.Event()
         release_abort = asyncio.Event()
         abort_cancelled = asyncio.Event()
