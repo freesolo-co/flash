@@ -12,6 +12,7 @@ from flash.serve.runtime.tool_calls import (
     ToolCallStreamParser,
     normalize_tools,
     parse_qwen3_coder_output,
+    validate_tool_history,
     validate_tool_stop_sequences,
 )
 
@@ -721,6 +722,196 @@ def _optional_string_tools():
     }
     declaration["function"]["parameters"]["required"] = ["a"]
     return normalize_tools([declaration])
+
+
+def _candidate_string_tools():
+    declaration = _delimiter_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {
+        "a": {"type": "string"},
+        "b": {"type": "integer", "enum": [1]},
+        "c": {"type": "string"},
+    }
+    declaration["function"]["parameters"]["required"] = ["a", "c"]
+    return normalize_tools([declaration])
+
+
+def _candidate_call(parameters: str) -> str:
+    return f"<tool_call><function=store>{parameters}</function></tool_call>"
+
+
+_EMBEDDED_PARAMETER_CASES = [
+    (
+        "unknown",
+        _candidate_call(
+            "<parameter=a>before </parameter><parameter=unknown>inside</parameter> after</parameter>"
+            "<parameter=c>done</parameter>"
+        ),
+        {"a": "before </parameter><parameter=unknown>inside</parameter> after", "c": "done"},
+    ),
+    (
+        "consumed-required-before-current",
+        _candidate_call(
+            "<parameter=c>done</parameter>"
+            "<parameter=a>before </parameter><parameter=c>inside</parameter> after</parameter>"
+        ),
+        {"c": "done", "a": "before </parameter><parameter=c>inside</parameter> after"},
+    ),
+    (
+        "current-parameter",
+        _candidate_call(
+            "<parameter=a>before </parameter><parameter=a>inside</parameter> after</parameter>"
+            "<parameter=c>done</parameter>"
+        ),
+        {"a": "before </parameter><parameter=a>inside</parameter> after", "c": "done"},
+    ),
+    (
+        "invalid-optional-syntax",
+        _candidate_call(
+            "<parameter=a>before </parameter><parameter=b>nope</parameter> after</parameter>"
+            "<parameter=c>done</parameter>"
+        ),
+        {"a": "before </parameter><parameter=b>nope</parameter> after", "c": "done"},
+    ),
+    (
+        "invalid-optional-enum",
+        _candidate_call(
+            "<parameter=a>before </parameter><parameter=b>2</parameter> after</parameter>"
+            "<parameter=c>done</parameter>"
+        ),
+        {"a": "before </parameter><parameter=b>2</parameter> after", "c": "done"},
+    ),
+    (
+        "optional-leaves-required-missing",
+        _candidate_call(
+            "<parameter=a>before </parameter><parameter=b>1</parameter>"
+            "</function></tool_call> after</parameter><parameter=c>done</parameter>"
+        ),
+        {
+            "a": "before </parameter><parameter=b>1</parameter></function></tool_call> after",
+            "c": "done",
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("_case", "text", "expected"),
+    _EMBEDDED_PARAMETER_CASES,
+    ids=[case[0] for case in _EMBEDDED_PARAMETER_CASES],
+)
+def test_nonstructural_parameter_openers_remain_string_content_buffered(
+    _case: str,
+    text: str,
+    expected: dict[str, object],
+) -> None:
+    result = parse_qwen3_coder_output(
+        text, _candidate_string_tools(), id_factory=lambda: "call_fixed"
+    )
+
+    assert json.loads(result.calls[0].arguments) == expected
+
+
+@pytest.mark.parametrize(
+    ("_case", "text", "expected"),
+    _EMBEDDED_PARAMETER_CASES,
+    ids=[case[0] for case in _EMBEDDED_PARAMETER_CASES],
+)
+def test_nonstructural_parameter_openers_survive_arbitrary_stream_splits(
+    _case: str,
+    text: str,
+    expected: dict[str, object],
+) -> None:
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(_candidate_string_tools(), id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert json.loads(result.calls[0].arguments) == expected
+
+
+def test_required_parameter_opener_remains_structural_across_stream_splits() -> None:
+    text = _candidate_call("<parameter=a>before</parameter><parameter=c>inside</parameter>")
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(_candidate_string_tools(), id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        assert json.loads(parser.finish().calls[0].arguments) == {"a": "before", "c": "inside"}
+
+
+def test_parameter_continuation_probe_has_bounded_linear_work(monkeypatch) -> None:
+    count = 128
+    declaration = _delimiter_tools()[0].wire()
+    properties = {f"p{index}": {"type": "string"} for index in range(count)}
+    declaration["function"]["parameters"]["properties"] = properties
+    declaration["function"]["parameters"]["required"] = list(properties)
+    tools = normalize_tools([declaration])
+    text = _candidate_call("".join(f"<parameter={name}>value</parameter>" for name in properties))
+    original = tool_calls_module._parse_parameter_value
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tool_calls_module, "_parse_parameter_value", counted)
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert len(result.calls) == 1
+    assert calls <= 2 * count
+
+
+def _wide_array_tools():
+    declaration = _delimiter_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {
+        "values": {"type": "array", "items": {"type": "integer"}}
+    }
+    declaration["function"]["parameters"]["required"] = ["values"]
+    return normalize_tools([declaration])
+
+
+def _wide_array_call(count: int) -> str:
+    values = json.dumps(list(range(count)), separators=(",", ":"))
+    return _candidate_call(f"<parameter=values>{values}</parameter>")
+
+
+def _round_trip_history(call) -> list[dict[str, object]]:
+    return [
+        {"role": "assistant", "content": None, "tool_calls": [call.wire()]},
+        {"role": "tool", "tool_call_id": call.id, "content": "ok"},
+    ]
+
+
+def test_generated_tool_arguments_at_history_complexity_boundary_round_trip() -> None:
+    result = parse_qwen3_coder_output(
+        _wide_array_call(510), _wide_array_tools(), id_factory=lambda: "call_fixed"
+    )
+
+    assert result.content is None
+    validate_tool_history(_round_trip_history(result.calls[0]))
+
+
+def test_generated_tool_arguments_over_history_complexity_fall_back_exactly() -> None:
+    text = _wide_array_call(600)
+
+    result = parse_qwen3_coder_output(text, _wide_array_tools())
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+def test_over_complex_generated_tool_arguments_fall_back_across_stream_splits() -> None:
+    text = _wide_array_call(600)
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(_wide_array_tools(), id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert result.content == text
+        assert result.calls == ()
 
 
 def _optional_parameter_ambiguity() -> str:

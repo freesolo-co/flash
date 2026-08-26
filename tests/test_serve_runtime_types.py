@@ -890,29 +890,36 @@ def test_qwen3_coder_stream_parser_handles_split_embedded_and_structural_closes(
     }
 
 
-@pytest.mark.parametrize(
-    "malformed",
-    [
-        (
-            "<tool_call><function=store>"
-            '<parameter=object_value>{"nested":{"text":"before </parameter> after"}'
-            "</parameter></function></tool_call>"
-        ),
-        (
-            "<tool_call><function=store>"
-            "<parameter=string_value>before </parameter>"
-            "<parameter=count>not-an-int</parameter> after</parameter>"
-            "</function></tool_call>"
-        ),
-    ],
-    ids=["malformed-json", "ambiguous-grammar"],
-)
-def test_qwen3_coder_parser_returns_malformed_delimiter_candidate_exactly(
-    malformed: str,
-) -> None:
+def test_qwen3_coder_parser_returns_malformed_container_exactly() -> None:
+    malformed = (
+        "<tool_call><function=store>"
+        '<parameter=object_value>{"nested":{"text":"before </parameter> after"}'
+        "</parameter></function></tool_call>"
+    )
+
     result = parse_qwen3_coder_output(malformed, _delimiter_value_tools())
+
     assert result.content == malformed
     assert result.calls == ()
+
+
+def test_qwen3_coder_parser_keeps_invalid_optional_parameter_text_in_string() -> None:
+    text = (
+        "<tool_call><function=store>"
+        "<parameter=string_value>before </parameter>"
+        "<parameter=count>not-an-int</parameter> after</parameter>"
+        "</function></tool_call>"
+    )
+
+    result = parse_qwen3_coder_output(
+        text,
+        _delimiter_value_tools(),
+        id_factory=lambda: "call_fixed",
+    )
+
+    assert json.loads(result.calls[0].arguments) == {
+        "string_value": "before </parameter><parameter=count>not-an-int</parameter> after"
+    }
 
 
 def test_qwen3_coder_parser_accepts_boundary_property_names() -> None:

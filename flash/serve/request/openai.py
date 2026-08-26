@@ -295,7 +295,10 @@ def _messages(value: object) -> list[dict[str, Any]]:
                 f"image source exceeds the {MAX_COMPRESSED_BYTES}-byte limit"
             ) from exc
         raise
-    return copy.deepcopy(value)
+    try:
+        return copy.deepcopy(value)
+    except RecursionError as exc:
+        raise OpenAIRequestError("messages exceed the supported complexity") from exc
 
 
 def _stop_values(value: object) -> tuple[str, ...]:

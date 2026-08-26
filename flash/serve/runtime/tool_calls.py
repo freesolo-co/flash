@@ -1,9 +1,6 @@
 """strict tool declarations, history, and qwen3 coder output parsing.
 
-The XML grammar is adapted from vLLM 0.23.0's
-``vllm/tool_parsers/qwen3coder_tool_parser.py`` under Apache-2.0. Flash keeps
-this implementation dependency-light and validates every parsed call against
-the caller's closed function schema before exposing structured output.
+adapted from vllm 0.23.0's qwen3 coder parser under apache-2.0.
 """
 
 from __future__ import annotations
@@ -358,6 +355,11 @@ def parse_qwen3_coder_output(
         parsed.append(call)
     if not parsed:
         return ToolParseResult(content=text, calls=())
+    try:
+        for _, arguments in parsed:
+            _validate_tool_argument_complexity(arguments, "generated tool call", ValueError)
+    except ValueError:
+        return ToolParseResult(content=text, calls=())
     make_id = id_factory or (lambda: f"call_{uuid.uuid4().hex[:24]}")
     calls = tuple(
         ParsedToolCall(
@@ -505,14 +507,7 @@ def _validate_history_calls(
             if str(exc).startswith("numeric literal exceeds"):
                 raise error_type(f"{path} {exc}") from exc
             raise error_type(f"{path} function arguments must encode a JSON object") from exc
-        _validate_json_value_complexity(
-            decoded,
-            path,
-            error_type,
-            budget=[0],
-            max_nodes=_MAX_SCHEMA_NODES,
-            kind="tool argument",
-        )
+        _validate_tool_argument_complexity(decoded, path, error_type)
         calls.append((call_id, name))
     return calls
 
@@ -589,9 +584,13 @@ def _parse_parameters(
     text: str,
     cursor: int,
     tool: FunctionTool,
+    initial_values: Mapping[str, Any] | None = None,
+    probe: bool = False,
+    reject_ambiguity: bool = True,
 ) -> tuple[int, dict[str, Any]] | None:
-    values: dict[str, Any] = {}
-    optional_parameters = set(tool.parameters["properties"]) - set(tool.parameters["required"])
+    values = dict(initial_values or {})
+    optional = set(tool.parameters["properties"]) - set(tool.parameters["required"])
+    optional_markers = tuple(f"{_PARAMETER_START}{name}>" for name in optional)
     while True:
         cursor = _skip_whitespace(text, cursor)
         if text.startswith(_FUNCTION_END, cursor):
@@ -606,42 +605,29 @@ def _parse_parameters(
         schema = tool.parameters["properties"].get(parameter_name)
         if schema is None or parameter_name in values:
             return None
-        parsed_value = _parse_parameter_value(text, name_end + 1, schema)
+        free_string = schema["type"] == "string" and "enum" not in schema
+        follow = (tool, values, parameter_name) if free_string and not probe else None
+        parsed_value = _parse_parameter_value(text, name_end + 1, schema, follow)
         if parsed_value is None:
             return None
         cursor, values[parameter_name] = parsed_value
-        next_parameter = _next_parameter(text, cursor)
-        if schema["type"] == "string" and "enum" not in schema and next_parameter is not None:
-            next_name, next_value_start = next_parameter
-            next_schema = tool.parameters["properties"].get(next_name)
-            if (
-                next_name in optional_parameters
-                and next_schema is not None
-                and _parse_parameter_value(text, next_value_start, next_schema) is not None
-            ):
-                return None
-    if set(tool.parameters["required"]) - set(values):
-        return None
-    if not _validate_value(values, tool.parameters):
+        following = _skip_whitespace(text, cursor)
+        if probe and text.startswith(_PARAMETER_START, following):
+            return cursor, values
+        if reject_ambiguity and free_string and text.startswith(optional_markers, following):
+            return None
+    if set(tool.parameters["required"]) - set(values) or not _validate_value(
+        values, tool.parameters
+    ):
         return None
     return cursor, values
-
-
-def _next_parameter(text: str, cursor: int) -> tuple[str, int] | None:
-    cursor = _skip_whitespace(text, cursor)
-    if not text.startswith(_PARAMETER_START, cursor):
-        return None
-    name_end = text.find(">", cursor + len(_PARAMETER_START))
-    if name_end < 0:
-        return None
-    name = text[cursor + len(_PARAMETER_START) : name_end]
-    return name, name_end + 1
 
 
 def _parse_parameter_value(
     text: str,
     value_start: int,
     schema: Mapping[str, Any],
+    follow: tuple[FunctionTool, Mapping[str, Any], str] | None = None,
 ) -> tuple[int, Any] | None:
     search_from = value_start
     while True:
@@ -664,10 +650,8 @@ def _parse_parameter_value(
                 continue
         if text.startswith((_PARAMETER_START, _FUNCTION_END), following):
             raw_value = text[value_start:value_end]
-            if raw_value.startswith("\n"):
-                raw_value = raw_value[1:]
-            if raw_value.endswith("\n"):
-                raw_value = raw_value[:-1]
+            raw_value = raw_value[1:] if raw_value.startswith("\n") else raw_value
+            raw_value = raw_value[:-1] if raw_value.endswith("\n") else raw_value
             value = _coerce_value(raw_value, schema["type"])
             if not _validate_value(value, schema):
                 return None
@@ -675,7 +659,15 @@ def _parse_parameter_value(
                 value = _canonicalize_integer_values(value, schema)
             except DecimalException:
                 return None
-            return value_end + len(_PARAMETER_END), value
+            cursor = value_end + len(_PARAMETER_END)
+            if follow is None:
+                return cursor, value
+            tool, values, name = follow
+            parsed = _parse_parameters(text, cursor, tool, {**values, name: value}, True, False)
+            if parsed is not None and text.startswith(
+                (_PARAMETER_START, TOOL_CALL_END), _skip_whitespace(text, parsed[0])
+            ):
+                return cursor, value
         search_from = value_end + len(_PARAMETER_END)
 
 
@@ -920,6 +912,12 @@ def _dump_exact_json(value: Any) -> str:
         )
         return "{" + ",".join(members) + "}"
     raise TypeError(f"unsupported exact JSON value {type(value).__name__}")
+
+
+def _validate_tool_argument_complexity(value: Any, path: str, error_type: type[Exception]) -> None:
+    _validate_json_value_complexity(
+        value, path, error_type, budget=[0], max_nodes=_MAX_SCHEMA_NODES, kind="tool argument"
+    )
 
 
 def _validate_json_value_complexity(

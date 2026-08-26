@@ -486,6 +486,30 @@ def test_tool_capability_rejection_uses_authoritative_thinking_and_parser() -> N
         )
 
 
+def test_message_copy_complexity_is_controlled_and_caller_values_stay_detached() -> None:
+    nested: dict[str, object] = {}
+    for _ in range(1500):
+        nested = {"extra": nested}
+    messages = [{"role": "user", "content": "hello", "metadata": nested}]
+
+    with pytest.raises(OpenAIRequestError, match="messages exceed the supported complexity"):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+    assert messages[0]["metadata"] is nested
+    metadata = {"nested": {"value": 1}}
+    request = parse_chat_request(
+        {"messages": [{"role": "user", "content": "hello", "metadata": metadata}]},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+    metadata["nested"]["value"] = 2
+    assert request.messages[0]["metadata"] == {"nested": {"value": 1}}
+
+
 def test_tool_history_is_strict_and_does_not_mutate_caller_messages() -> None:
     messages = [
         {
