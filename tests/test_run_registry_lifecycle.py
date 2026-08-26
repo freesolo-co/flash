@@ -127,6 +127,7 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
     status.state = "done"
     status.lifecycle_started_attempt = 0
     status.lifecycle_progressed_attempt = 0
+    status.remote["allocated_gpu"] = "A100 PCIe"
     status.cleanup_confirmed_remote = status.remote
     status.realized_cost_remote = status.remote
     status.remote = None
@@ -135,7 +136,9 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
     assert "lifecycle_progressed_attempt" not in status.to_dict()
     assert "cleanup_confirmed_remote" not in status.to_dict()
     assert "realized_cost_remote" not in status.to_dict()
-    assert _report(monkeypatch, status)["lifecycle"] == {
+    report = _report(monkeypatch, status)
+    assert report["gpuType"] == "A100 PCIe"
+    assert report["lifecycle"] == {
         "started": True,
         "progressed": True,
         "artifactsComplete": True,
