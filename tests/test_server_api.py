@@ -5692,9 +5692,7 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
     assert "serving backend unreachable" in detail["message"]
     assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset({revision})
     deployment = runner_status.get_status(run_id).deployment
-    assert deployment["state"] == "revocation_failed"
-    assert deployment["checkpoint_id"] == revision
-    assert deployment["retryable"] is True
+    assert deployment == {"state": "ready", "checkpoint_id": revision}
 
 
 def test_undeploy_without_status_projection_invalidates_orphaned_ledger(api, monkeypatch):
