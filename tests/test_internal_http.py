@@ -10,6 +10,7 @@ import functools
 import gc
 import http.cookiejar
 import io
+import operator
 import os
 import ssl
 import subprocess
@@ -236,6 +237,38 @@ def test_installed_proxy_and_auth_handler_state_is_preserved() -> None:
     assert urllib.request._opener is opener
     assert {handler: handler.parent for handler in original_parents} == original_parents
     assert {handler: handler.__dict__ for handler in original_states} == original_states
+
+
+def test_environment_proxy_with_underscore_key_is_supported(monkeypatch) -> None:
+    for name in tuple(os.environ):
+        if name.lower().endswith("_proxy"):
+            monkeypatch.delenv(name, raising=False)
+    proxy_url = "custom://proxy.invalid:8080"
+    monkeypatch.setenv("CUSTOM_PROXY", proxy_url)
+    monkeypatch.setenv("YARN_HTTP_PROXY", "http://yarn-proxy.invalid:8080")
+    observed: list[tuple[str, str]] = []
+
+    class TerminalHandler(urllib.request.BaseHandler):
+        handler_order = 150
+
+        def custom_open(self, request):
+            observed.append((request.full_url, request.host))
+            return _response(request.full_url)
+
+    proxy = urllib.request.ProxyHandler()
+    assert proxy.proxies == {
+        "custom": proxy_url,
+        "yarn_http": "http://yarn-proxy.invalid:8080",
+    }
+    opener = urllib.request.build_opener(proxy, TerminalHandler())
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+
+    assert observed == [("custom://source.invalid/data", "proxy.invalid:8080")]
 
 
 def test_installed_proxy_callback_remains_supported_on_cache_hit() -> None:
@@ -996,6 +1029,53 @@ def test_concurrent_custom_opener_cache_construction_is_singleton() -> None:
     assert seen_parents[0] is http_transport._INSTALLED_OPENER_CACHE.private
 
 
+def test_mixed_redirect_handler_fails_before_transport() -> None:
+    observed: list[str] = []
+    redirect_calls: list[str] = []
+
+    class MixedHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            observed.append(request.full_url)
+            return _response(request.full_url)
+
+        def http_error_302(self, request, fp, code, msg, headers):
+            redirect_calls.append(request.full_url)
+            raise AssertionError("redirect callback executed")
+
+    opener = urllib.request.build_opener(MixedHandler())
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert observed == []
+    assert redirect_calls == []
+
+
+def test_aliased_mixed_redirect_handler_fails_before_transport() -> None:
+    observed: list[str] = []
+
+    class MixedHandler(urllib.request.BaseHandler):
+        def callback(self, request, *args):
+            observed.append(request.full_url)
+            return _response(request.full_url)
+
+        custom_open = callback
+        http_error_302 = callback
+
+    opener = urllib.request.build_opener(MixedHandler())
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert observed == []
+
+
 def test_installed_redirect_handler_cannot_reach_sink() -> None:
     source = "https://source.invalid/data"
     target = "https://sink.invalid/steal"
@@ -1588,6 +1668,42 @@ def test_mutated_instance_callback_holder_fails_before_cached_transport() -> Non
     assert contacted == [(safe, None)]
     assert all(url != sink for url, _authorization in contacted)
     assert http_transport._INSTALLED_OPENER_CACHE.private is first_private
+
+
+def test_attrgetter_callback_fails_before_transport() -> None:
+    source = "custom://source.invalid/data"
+    sink = "custom://sink.invalid/steal"
+    contacted: list[tuple[str, str | None]] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        target = None
+
+        def custom_open(self, request):
+            authorization = request.get_header("Authorization")
+            contacted.append((request.full_url, authorization))
+            if request.full_url == sink:
+                return _response(request.full_url)
+            redirected = urllib.request.Request(
+                sink,
+                headers={"Authorization": authorization},
+            )
+            target = operator.attrgetter("target")(CallbackHandler)
+            return target.open(redirected, timeout=request.timeout)
+
+    opener = urllib.request.build_opener(CallbackHandler())
+    CallbackHandler.target = opener
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert contacted == []
+    assert all(url != sink for url, _authorization in contacted)
 
 
 def test_partial_instance_callback_module_fails_before_transport() -> None:
@@ -3727,22 +3843,70 @@ def test_redirect_callback_eligibility_change_rebuilds_cached_topology(change: s
         type.__setattr__(MutableHandler, "http_error_302", redirect)
     opener = urllib.request.build_opener(MutableHandler(), TerminalHandler())
     urllib.request.install_opener(opener)
-    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/first"), timeout=1.0):
-        pass
-    first_private = http_transport._INSTALLED_OPENER_CACHE.private
 
     if change == "add":
+        with _urlopen_no_redirect(
+            urllib.request.Request("custom://source.invalid/first"), timeout=1.0
+        ):
+            pass
         type.__setattr__(MutableHandler, "http_error_302", redirect)
+        with pytest.raises(
+            urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+        ):
+            _urlopen_no_redirect(
+                urllib.request.Request("custom://source.invalid/second"), timeout=1.0
+            )
+        assert observed == ["mutable"]
     else:
+        with pytest.raises(
+            urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+        ):
+            _urlopen_no_redirect(
+                urllib.request.Request("custom://source.invalid/first"), timeout=1.0
+            )
         type.__delattr__(MutableHandler, "http_error_302")
-    with _urlopen_no_redirect(
-        urllib.request.Request("custom://source.invalid/second"), timeout=1.0
-    ):
+        with _urlopen_no_redirect(
+            urllib.request.Request("custom://source.invalid/second"), timeout=1.0
+        ):
+            pass
+        assert observed == ["mutable"]
+
+
+@pytest.mark.parametrize("mutation", ["class", "instance"])
+def test_cached_pure_redirect_handler_rejects_added_non_redirect_callback(
+    mutation: str,
+) -> None:
+    observed: list[str] = []
+
+    class RedirectHandler(urllib.request.BaseHandler):
+        def http_error_302(self, request, fp, code, msg, headers):
+            raise AssertionError("redirect callback executed")
+
+    class TerminalHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            observed.append(request.full_url)
+            return _response(request.full_url)
+
+    redirect = RedirectHandler()
+    opener = urllib.request.build_opener(redirect, TerminalHandler())
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/first"), timeout=1.0):
         pass
 
-    expected = ["mutable", "terminal"] if change == "add" else ["terminal", "mutable"]
-    assert observed == expected
-    assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
+    def custom_open(self, request):
+        observed.append(request.full_url)
+        return _response(request.full_url)
+
+    if mutation == "class":
+        type.__setattr__(RedirectHandler, "custom_open", custom_open)
+    else:
+        redirect.custom_open = types.MethodType(custom_open, redirect)
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/second"), timeout=1.0)
+
+    assert observed == ["custom://source.invalid/first"]
 
 
 def test_preimport_mutated_stdlib_callback_fails_before_transport() -> None:

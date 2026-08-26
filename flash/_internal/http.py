@@ -23,6 +23,7 @@ from .http_refs import (
     _function_global_reference_values,
     _function_reference_values,
     _getattr_type_static,
+    _is_registered_callback_name,
     _slot_entries,
     _source_function_code,
 )
@@ -32,6 +33,9 @@ from .http_refs import (
 
 _UrlOpen = Callable[..., Any]
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_REDIRECT_CALLBACK_NAMES = frozenset(
+    {"http_error_redirect", *(f"http_error_{status}" for status in _REDIRECT_STATUSES)}
+)
 _STDLIB_URLOPEN_ARGUMENTS = (
     "url",
     "data",
@@ -91,18 +95,6 @@ _STANDARD_HANDLER_METHODS = tuple(
     )
     for name in _HANDLER_COPY_METHODS
 )
-
-
-def _is_registered_callback_name(name: str) -> bool:
-    if name in {"redirect_request", "do_open", "proxy_open"} or "_" not in name:
-        return False
-    condition = name.split("_", 1)[1]
-    return (
-        condition == "open"
-        or condition == "request"
-        or condition == "response"
-        or condition.startswith("error")
-    )
 
 
 _STDLIB_HANDLER_TYPES = (
@@ -238,14 +230,26 @@ def _install_opener_with_cache_reset(opener) -> None:
 urllib.request.install_opener = _install_opener_with_cache_reset
 
 
-def _handles_redirect_error(handler: urllib.request.BaseHandler) -> bool:
-    try:
-        return any(
-            callable(_getattr_handler_static(handler, f"http_error_{status}", None))
-            for status in _REDIRECT_STATUSES
+def _registered_callback_names(handler: urllib.request.BaseHandler) -> tuple[str, ...]:
+    names = set(_handler_state(handler))
+    for owner in type.__getattribute__(type(handler), "__mro__"):
+        names.update(type.__getattribute__(owner, "__dict__"))
+    return tuple(
+        sorted(
+            name
+            for name in names
+            if _is_registered_callback_name(name)
+            and callable(_getattr_handler_static(handler, name, _ABSENT_SLOT))
         )
-    except Exception:
-        raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
+    )
+
+
+def _callback_roles(handler: urllib.request.BaseHandler) -> tuple[bool, bool]:
+    names = _registered_callback_names(handler)
+    redirects = any(
+        name == f"http_error_{status}" for name in names for status in _REDIRECT_STATUSES
+    )
+    return redirects, any(name not in _REDIRECT_CALLBACK_NAMES for name in names)
 
 
 def _snapshot_value(
@@ -421,11 +425,12 @@ def _validate_handler_copy_protocol(
             raise TypeError
 
 
-def _redirect_config_signature(handler: urllib.request.BaseHandler) -> tuple[tuple[int, bool], ...]:
+def _callback_config_signature(
+    handler: urllib.request.BaseHandler,
+) -> tuple[tuple[str, int], ...]:
     return tuple(
-        (id(value), callable(value))
-        for status in _REDIRECT_STATUSES
-        for value in (_getattr_handler_static(handler, f"http_error_{status}", None),)
+        (name, id(_getattr_handler_static(handler, name, _ABSENT_SLOT)))
+        for name in _registered_callback_names(handler)
     )
 
 
@@ -448,7 +453,7 @@ def _handler_config_signature(handler: urllib.request.BaseHandler) -> object:
     return (
         dictionary,
         _slot_config_signature(handler, seen, active, budget),
-        _redirect_config_signature(handler),
+        _callback_config_signature(handler),
     )
 
 
@@ -615,11 +620,10 @@ def _registered_instance_callbacks(
 ) -> tuple[object, ...]:
     callbacks = []
     for name, value in state.items():
-        if not _is_registered_callback_name(name):
-            continue
         if _validate_proxy_instance_callback(handler, name, value, state):
             continue
-        callbacks.append(value)
+        if _is_registered_callback_name(name):
+            callbacks.append(value)
     return tuple(callbacks)
 
 
@@ -727,11 +731,14 @@ def _copy_installed_handler(
             raise TypeError
         _validate_callback_helpers(copied)
         _validate_instance_callbacks(copied, copied_state, (handler, opener))
+        proxy_callbacks = _proxy_callback_names(copied, copied_state)
         copied_values = (
             tuple(
                 value
                 for name, value in copied_state.items()
-                if name != "parent" and not _is_registered_callback_name(name)
+                if name != "parent"
+                and name not in proxy_callbacks
+                and not _is_registered_callback_name(name)
             )
             + tuple(
                 value
@@ -834,10 +841,16 @@ def _clone_installed_opener(
     handlers: tuple[urllib.request.BaseHandler, ...],
     addheaders: list[tuple[str, str]],
 ) -> urllib.request.OpenerDirector:
+    try:
+        roles = tuple(_callback_roles(handler) for handler in handlers)
+        if any(redirects and non_redirects for redirects, non_redirects in roles):
+            raise TypeError
+    except Exception:
+        raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
     copied = [
         _copy_installed_handler(handler, installed)
-        for handler in handlers
-        if not _handles_redirect_error(handler)
+        for handler, (redirects, _non_redirects) in zip(handlers, roles, strict=True)
+        if not redirects
     ]
     private = _build_no_redirect_opener(*copied, add_default_handlers=False)
     try:
@@ -878,22 +891,26 @@ def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
             ):
                 try:
                     for handler in handlers:
-                        if not _handles_redirect_error(handler):
-                            state = _handler_state(handler)
-                            private_targets = (cached.private, *cached.private.handlers)
-                            _validate_instance_callbacks(
-                                handler,
-                                state,
-                                (handler, installed),
-                                private_targets,
-                            )
-                            _validate_class_callbacks(
-                                handler,
-                                state,
-                                (handler, installed),
-                                private_targets,
-                                private_targets,
-                            )
+                        redirects, non_redirects = _callback_roles(handler)
+                        if redirects and non_redirects:
+                            raise TypeError
+                        if redirects:
+                            continue
+                        state = _handler_state(handler)
+                        private_targets = (cached.private, *cached.private.handlers)
+                        _validate_instance_callbacks(
+                            handler,
+                            state,
+                            (handler, installed),
+                            private_targets,
+                        )
+                        _validate_class_callbacks(
+                            handler,
+                            state,
+                            (handler, installed),
+                            private_targets,
+                            private_targets,
+                        )
                 except Exception:
                     raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
                 if cached.addheader_signature != addheader_signature:

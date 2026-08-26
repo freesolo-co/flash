@@ -6,6 +6,7 @@ import _thread
 import builtins
 import dis
 import functools
+import operator
 import types
 
 _SNAPSHOT_ITEMS_MAX = 256
@@ -13,13 +14,30 @@ _TRAVERSAL_NODES_MAX = 1024
 _DYNAMIC_NAMESPACE_NAMES = frozenset(
     {"__import__", "compile", "eval", "exec", "getattr", "globals", "locals", "vars"}
 )
-_DYNAMIC_NAMESPACE_VALUES = tuple(
-    types.ModuleType.__getattribute__(builtins, "__dict__")[name]
-    for name in _DYNAMIC_NAMESPACE_NAMES
+_DYNAMIC_NAMESPACE_VALUES = (
+    *(
+        types.ModuleType.__getattribute__(builtins, "__dict__")[name]
+        for name in _DYNAMIC_NAMESPACE_NAMES
+    ),
+    operator.attrgetter,
+    operator.itemgetter,
+    operator.methodcaller,
 )
 _ABSENT_SLOT = object()
 _FAST_LOAD_OPNAMES = frozenset({"LOAD_FAST", "LOAD_FAST_CHECK"})
 _STATELESS_TERMINAL_TYPES = (object, _thread.LockType, _thread.RLock)
+
+
+def _is_registered_callback_name(name: str) -> bool:
+    if name in {"redirect_request", "do_open", "proxy_open"} or "_" not in name:
+        return False
+    condition = name.split("_", 1)[1]
+    return (
+        condition == "open"
+        or condition == "request"
+        or condition == "response"
+        or condition.startswith("error")
+    )
 
 
 def _source_function_code(filename: str, qualname: str) -> types.CodeType:
