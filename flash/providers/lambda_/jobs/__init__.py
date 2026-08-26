@@ -27,7 +27,6 @@ from flash.providers._lifecycle.net.deadline import (
     require_create_allowance,
     require_deadline_at,
 )
-from flash.providers.artifacts.hf import error_artifact_name, make_hf_text_reader
 from flash.providers.core.base import (
     GPU_INFO,
     PollResult,
@@ -52,8 +51,6 @@ from flash.providers.lambda_.jobs.reap import (
 )
 
 logger = get_logger(__name__)
-
-# load_timeout_s is read at call time so monkeypatching the module takes effect in tests
 
 _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
 
@@ -665,28 +662,6 @@ def launch_and_submit(
         raise
 
 
-# Tests monkeypatch this name so keep it as a module-level alias.
-_make_hf_file_reader = make_hf_text_reader
-
-
-def _failure_detail(
-    hf_repo: str, prefix: str, phase: str, marker: dict | None, attempt: int
-) -> str:
-    """Assemble bounded failure detail from the worker and host artifacts."""
-    parts = []
-    if marker and marker.get("error"):
-        parts.append(sanitize_diagnostic(marker["error"], limit=4096))
-    err_name = error_artifact_name(phase, attempt)
-    err = _make_hf_file_reader(hf_repo, f"{prefix}/{err_name}")(force=True)
-    if err:
-        parts.append(f"--- {err_name} ---\n{sanitize_diagnostic(err[-4096:], limit=4096)}")
-    boot_name = f"lambda_attempt{attempt}_boot.log"
-    boot = _make_hf_file_reader(hf_repo, f"{prefix}/{boot_name}")(force=True)
-    if boot:
-        parts.append(f"--- {boot_name} (host) ---\n{sanitize_diagnostic(boot[-4096:], limit=4096)}")
-    return "\n".join(parts) or "lambda worker terminated without a strict terminal marker"
-
-
 def poll_lambda_job(
     handle: LambdaJobHandle,
     spec,
@@ -698,10 +673,8 @@ def poll_lambda_job(
     """Poll instance status + HF artifacts to a terminal state.
 
     A thin wrapper that builds the Lambda :class:`InstancePollAdapter` and defers to the shared
-    ``poll_instance_job`` kernel (baselined on Vast). Lambda stamps the customer cost from the INSTANCE
-    wall (launch->done), notes the provider instance type + region, and — having no live console API —
-    reads early-liveness + failure detail from the host boot.log on HF. ``LOAD_TIMEOUT_S`` is read here
-    (a module global) so ``monkeypatch.setattr(jobs, "LOAD_TIMEOUT_S", ...)`` still bites.
+    ``poll_instance_job`` kernel. Lambda stamps the customer cost from the instance wall and records
+    the provider instance type and region.
     """
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     from flash.runner.lifecycle.status import get_status, source_snapshot_from_status

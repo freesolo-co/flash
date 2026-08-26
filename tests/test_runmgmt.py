@@ -1641,8 +1641,33 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
         "endpoint-old",
         "job-old",
         attempt=persisted_attempt,
+        fence=1,
     )
-    status = provisioned_status(spec, state="running", created_at=100.0, remote=remote)
+    attempt = {
+        "attempt_id": persisted_attempt,
+        "fence": 1,
+        "state": "active",
+        "reserved_at": 100.0,
+        "grant_deadline_at": 120.0,
+        "work_deadline_at": 250.0,
+        "result_deadline_at": 280.0,
+        "run_deadline_at": 300.0,
+        "provider": "runpod",
+        "provider_contract": None,
+        "resource": None,
+        "allocation": None,
+        "progress_receipt": None,
+        "result_receipt": None,
+        "cleanup": {},
+        "schema_version": 1,
+    }
+    status = provisioned_status(
+        spec,
+        state="running",
+        created_at=100.0,
+        attempt=attempt,
+        remote=remote,
+    )
     status.source_snapshot = _SOURCE_SNAPSHOT
     runner_state._save_status(
         status,
@@ -1655,7 +1680,7 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
     class FailedProvider:
         def poll(self, _handle, poll_spec, *_args, **_kwargs):
             poll_walls.append(poll_spec.gpu.max_wall_seconds)
-            return PollResult(False, failure="stalled", detail="worker stopped")
+            return PollResult(False, failure="job_preempted", detail="worker stopped")
 
         def cancel(self, _handle):
             return None
@@ -1664,6 +1689,7 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
             return None
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: FailedProvider())
+    monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     resumed = []
 

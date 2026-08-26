@@ -129,7 +129,7 @@ class RunpodProvider:
             spec,
             log=log,
             **deadline_kwargs(runpod_polling.poll_job, _deadline_at),
-            # the persisted scarcity flag controls stall grace, not capacity wording. recovery
+            # the persisted scarcity flag controls queue grace, not capacity wording. recovery
             # rebuilds the unpinned allocation with a fresh candidate set, so claiming no escalation
             # remains would be false.
             #

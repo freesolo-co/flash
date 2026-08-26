@@ -201,9 +201,7 @@ def build_payload(
     source_snapshot: dict | None = None,
     deadline_at: float | None = None,
 ) -> dict:
-    """The bootstrap's input — field-compatible with the RunPod ``_train_body`` payload, plus the
-    bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
-    ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name)."""
+    """The bootstrap input, including the deadlines and fenced identity the instance cannot infer."""
     from flash.core.spec import require_matching_seed
     from flash.envs.loading.base import worker_pip_with_extras
     from flash.providers._lifecycle.net.worker import (
@@ -368,9 +366,9 @@ CAPSULE_SHA256={capsule_sha256!r}
 echo "$CAPSULE_SHA256  /opt/flash/capsule.pyz" | sha256sum -c - >/dev/null 2>&1 \\
   || {{ echo "FLASH: runtime capsule failed verification" >&2; exit 1; }}
 IMAGE={image!r}
-fail() {{ echo "FLASH: $1" >&2; python3 /opt/flash/capsule.pyz failmark "$1" >/dev/null 2>&1 || true; exit 1; }}
+fail() {{ echo "FLASH: $1" >&2; exit 1; }}
 deadline_sleep() {{ python3 /opt/flash/capsule.pyz deadline_sleep "$1"; }}
-# huggingface_hub on the host for the boot-log + failure-marker uploaders (best-effort).
+# huggingface_hub on the host for the best-effort boot-log uploader.
 deadline_sleep 0 || exit 124
 # exact-pinned so host bootstrap retries cannot resolve different uploader behavior.
 pip3 install -q huggingface_hub==1.28.0 >/dev/null 2>&1 \\
@@ -396,7 +394,7 @@ done
 docker info >/dev/null 2>&1 || fail "docker never became ready"
 nvidia-smi >/dev/null 2>&1 || fail "gpu never became ready"
 {cache_setup}
-# retry transient image-pull failures before writing the failure marker.
+# retry transient image-pull failures before exiting the bootstrap.
 PULLED=0
 for i in 1 2 3 4 5; do
   deadline_sleep 0 || fail "run wall deadline exceeded"
@@ -411,7 +409,7 @@ docker run -d --name flashrun --gpus all --shm-size=16g --network host \\
   -v /opt/flash:/root/flash {cache_bind}-w /root/flash \\
   "$IMAGE" python /root/flash/capsule.pyz bootstrap || fail "docker run failed"
 deadline_sleep 5 || fail "run wall deadline exceeded"
-# a stopped container succeeds only at exit 0; failmark preserves any worker marker.
+# a stopped container succeeds only at exit 0.
 if ! docker ps --filter name=flashrun --filter status=running -q | grep -q .; then
   EXIT="$(docker inspect -f '{{{{.State.ExitCode}}}}' flashrun 2>/dev/null || echo 1)"
   [ "$EXIT" = "0" ] || fail "worker container did not start (exit ${{EXIT}})"

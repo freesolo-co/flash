@@ -30,6 +30,13 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
+def _run_mode(payload, env, mode, *, deadline_ts):
+    payload = dict(payload)
+    payload.setdefault("work_deadline_at", deadline_ts)
+    payload.setdefault("result_deadline_at", deadline_ts)
+    return b.run_mode(payload, env, mode, deadline_ts=deadline_ts)
+
+
 @pytest.mark.parametrize("arm", ["lambda", "vast"])
 def test_arm_accepts_current_provider_identity(arm):
     assert b._arm({"flash_arm": arm}) == arm
@@ -537,6 +544,7 @@ def _source_payload() -> dict:
         "hf_repo": "org/repo",
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
         "env": {"HF_TOKEN": "t"},
         "deadline_at": created_at + 60.0,
@@ -636,6 +644,7 @@ class _FakeProc:
     def __init__(self, lines, rc=0, timeout_once=False):
         self.stdout = iter(lines)
         self.returncode = rc
+        self.pid = 123
         self._timeout_once = timeout_once
         self._waits = 0
         self.killed = False
@@ -654,6 +663,7 @@ class _RaisingWaitProc:
     def __init__(self, error):
         self.args = ["worker"]
         self.stdout = iter(())
+        self.pid = 123
         self.returncode = None
         self.error = error
 
@@ -773,10 +783,13 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
         "env": {},
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
     }
     deadline = b.time.time() + 100
-    rc = b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=deadline)
+    payload["work_deadline_at"] = deadline - 20
+    payload["result_deadline_at"] = deadline
+    rc = _run_mode(payload, {"E": "1"}, "sft", deadline_ts=deadline)
     assert rc == 0
     assert popen_calls[0][0][0] == [sys.executable, "-m", "flash.engine.support.worker_entrypoint"]
     upload_deadline, _reaping_deadline = b._upload_cleanup_deadlines(deadline)
@@ -815,11 +828,12 @@ def test_run_mode_sanitizes_the_echoed_child_line_but_not_the_console_file(monke
         "hf_prefix": "sft/run",
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
         # AWS_SECRET_ACCESS_KEY matches no suffix heuristic, so this covers the declared channel.
         "env": {"FLASH_SECRET_ENV_KEYS": "AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY": secret},
     }
-    b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=b.time.time() + 100)
+    _run_mode(payload, {"E": "1"}, "sft", deadline_ts=b.time.time() + 100)
 
     echoed = capfd.readouterr().out
     assert secret not in echoed
@@ -848,10 +862,11 @@ def test_run_mode_echoes_the_end_of_an_oversized_child_line(monkeypatch, capfd):
         "hf_prefix": "sft/run",
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
         "env": {},
     }
-    b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=b.time.time() + 100)
+    _run_mode(payload, {"E": "1"}, "sft", deadline_ts=b.time.time() + 100)
 
     echoed = capfd.readouterr().out
     assert "ROOTCAUSE: CUDA OOM" in echoed
@@ -878,10 +893,9 @@ def test_run_mode_caps_the_worker_at_the_declared_wall_budget(monkeypatch):
 
     The absolute deadline is minted when the box is RENTED, so a job whose deadline deliberately
     carries a boot allowance on top of its wall budget -- a workload profile does exactly this --
-    would hand a fast-booting box the whole remainder to work in. The plane tightens its own
-    deadline at the first heartbeat, but FLASH_RUN_DEADLINE_AT is absolute and already delivered,
-    so nothing downstream would ever narrow it: a 10-minute profile could work ~30 minutes on a job
-    priced for its wall alone.
+    would hand a fast-booting box the whole remainder to work in. FLASH_RUN_DEADLINE_AT is absolute
+    and already delivered, so the bootstrap must cap worker execution itself: a 10-minute profile
+    could otherwise work ~30 minutes on a job priced for its wall alone.
     """
     _disable_periodic_console_upload(monkeypatch)
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
@@ -903,10 +917,11 @@ def test_run_mode_caps_the_worker_at_the_declared_wall_budget(monkeypatch):
         "env": {},
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
         "run_max_wall_seconds": budget,
     }
-    assert b.run_mode(payload, {}, "profile", deadline_ts=deadline) == 0
+    assert _run_mode(payload, {}, "profile", deadline_ts=deadline) == 0
 
     handed = float(popen_calls[0][1]["env"]["FLASH_RUN_DEADLINE_AT"])
     assert handed - b.time.time() <= budget, (
@@ -937,10 +952,11 @@ def test_run_mode_leaves_a_deadline_already_inside_the_budget_alone(monkeypatch)
         "env": {},
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
         "run_max_wall_seconds": 3600.0,
     }
-    assert b.run_mode(payload, {}, "sft", deadline_ts=deadline) == 0
+    assert _run_mode(payload, {}, "sft", deadline_ts=deadline) == 0
 
     upload_deadline, _reaping = b._upload_cleanup_deadlines(deadline)
     assert float(popen_calls[0][1]["env"]["FLASH_RUN_DEADLINE_AT"]) == pytest.approx(
@@ -967,8 +983,20 @@ def test_run_mode_reaps_uploader_before_base_exception_propagates(monkeypatch, w
         lambda *_args, **_kwargs: _RaisingWaitProc(wait_error),
     )
 
+    deadline = b.time.time() + 100
     with pytest.raises(type(wait_error)) as raised:
-        b.run_mode({"attempt": 0, "run_id": "run-1"}, {}, "sft", deadline_ts=b.time.time() + 100)
+        _run_mode(
+            {
+                "attempt": 0,
+                "fence": 1,
+                "run_id": "run-1",
+                "work_deadline_at": deadline - 20,
+                "result_deadline_at": deadline,
+            },
+            {},
+            "sft",
+            deadline_ts=deadline,
+        )
 
     assert raised.value is wait_error
     assert stop_upload.is_set()
@@ -981,19 +1009,21 @@ def test_run_mode_reaps_uploader_before_base_exception_propagates(monkeypatch, w
     [SystemExit(17), KeyboardInterrupt("interrupted"), RuntimeError("wait failed")],
     ids=["system-exit", "keyboard-interrupt", "unexpected-exception"],
 )
-def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeypatch, wait_error):
+def test_wait_error_reaps_uploader_before_main_returns_failure(monkeypatch, wait_error):
     uploader = _ReapTrackedUploader()
     stop_upload = threading.Event()
-    marker_states = []
     created_at = b.time.time()
     payload = {
         "phase": "sft",
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
         "source_snapshot": SOURCE_SNAPSHOT,
         "run_created_at": created_at,
         "run_max_wall_seconds": 100.0,
         "deadline_at": created_at + 100.0,
+        "work_deadline_at": created_at + 80.0,
+        "result_deadline_at": created_at + 100.0,
     }
 
     class _Timer:
@@ -1024,26 +1054,11 @@ def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeyp
         "_upload_console_tail_bounded",
         lambda *_args: pytest.fail("final upload must not run after a wait error"),
     )
-    monkeypatch.setattr(
-        b,
-        "write_attempt_marker",
-        lambda _payload, ok, error="", retriable=False: marker_states.append(
-            (ok, error, retriable, uploader.is_alive(), uploader.close_called)
-        ),
-    )
-
     assert b.main() == 1
 
     assert stop_upload.is_set()
     assert uploader.is_alive() is False
     assert uploader.close_called is True
-    assert len(marker_states) == 1
-    ok, error, retriable, uploader_alive, uploader_closed = marker_states[0]
-    assert ok is False
-    assert type(wait_error).__name__ in error
-    assert retriable is False
-    assert uploader_alive is False
-    assert uploader_closed is True
 
 
 @pytest.mark.parametrize("cleanup_path", ["periodic", "final"])
@@ -1229,10 +1244,11 @@ def test_run_mode_reaps_final_uploader_before_terminal_marker_reserve(monkeypatc
         "env": {},
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
     }
 
-    assert b.run_mode(payload, {}, "sft", deadline_ts=deadline) == 0
+    assert _run_mode(payload, {}, "sft", deadline_ts=deadline) == 0
 
     marker_started_at = clock["now"]
     events.append(("marker", marker_started_at, uploader.is_alive()))
@@ -1324,10 +1340,11 @@ def test_run_mode_drains_delayed_terminal_output_before_upload(monkeypatch):
         "env": {},
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
     }
 
-    assert b.run_mode(payload, {}, "sft", deadline_ts=b.time.time() + 20) == 0
+    assert _run_mode(payload, {}, "sft", deadline_ts=b.time.time() + 20) == 0
 
     assert final_write_attempt.wait(2.0)
     assert late_writes == []
@@ -1389,10 +1406,11 @@ def test_run_mode_reaps_periodic_uploader_before_terminal_marker_reserve(monkeyp
         "env": {},
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
     }
 
-    assert b.run_mode(payload, {}, "sft", deadline_ts=deadline) == 0
+    assert _run_mode(payload, {}, "sft", deadline_ts=deadline) == 0
 
     marker_started_at = clock["now"]
     events.append(("marker", marker_started_at, uploader.is_alive()))
@@ -1415,7 +1433,7 @@ def test_run_mode_reaps_periodic_uploader_before_terminal_marker_reserve(monkeyp
 
 @pytest.mark.wallclock
 @pytest.mark.parametrize("_iteration", range(3))
-def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monkeypatch, _iteration):
+def test_run_mode_reserves_cleanup_before_deadline_result_with_real_timing(monkeypatch, _iteration):
     stop_timeout = 0.03
     final_timeout = 0.03
     terminate_timeout = 0.02
@@ -1486,9 +1504,10 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
             events.append(("uploader-stop", self.set_at))
 
     worker = _TimedWorker()
+    worker.pid = 123
     uploader = _TimedUploader()
     stop_upload = _RecordingStopEvent()
-    markers = []
+    results = []
     payload = {
         "hf_repo": "org/repo",
         "job_spec_json": "{}",
@@ -1503,11 +1522,14 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
         "run_created_at": started_at,
         "run_max_wall_seconds": deadline - started_at,
         "deadline_at": deadline,
+        "work_deadline_at": deadline,
+        "result_deadline_at": deadline + 1.0,
         "attempt": 0,
+        "fence": 1,
     }
 
-    def record_marker(kind):
-        markers.append((kind, time.time(), uploader.is_alive()))
+    def record_result(*_args, **_kwargs):
+        results.append((time.time(), uploader.is_alive()))
 
     monkeypatch.setattr(b, "load_payload", lambda: payload)
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: None)
@@ -1515,23 +1537,20 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
     monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
     monkeypatch.setattr(b.subprocess, "Popen", lambda *_args, **_kwargs: worker)
     monkeypatch.setattr(
+        b.bootstrap_processes,
+        "terminate_process_group",
+        lambda proc, **_kwargs: proc.kill(),
+    )
+    monkeypatch.setattr(
         b,
         "_start_console_uploader",
         lambda *_args: (uploader, stop_upload),
     )
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *_args: True)
-    monkeypatch.setattr(
-        b,
-        "_publish_timeout_marker_then_exit",
-        lambda *_args: record_marker("watchdog"),
-    )
-    monkeypatch.setattr(
-        b,
-        "write_attempt_marker",
-        lambda *_args, **_kwargs: record_marker("terminal"),
-    )
+    monkeypatch.setattr(b, "_publish_deadline_result", record_result)
 
-    assert b.main() == 1
+    with pytest.raises(TimeoutError, match="wall-clock cap"):
+        _run_mode(payload, {}, "sft", deadline_ts=deadline)
 
     assert worker.killed_at is not None
     assert worker.killed_at <= worker_cutoff + 0.02
@@ -1539,12 +1558,11 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
     assert worker.killed_at <= stop_upload.set_at
     assert uploader.is_alive() is False
     assert uploader.closed is True
-    assert markers
-    assert all(uploader_alive is False for _, _, uploader_alive in markers)
-    terminal_markers = [marker for marker in markers if marker[0] == "terminal"]
-    assert len(terminal_markers) == 1
-    assert deadline - terminal_markers[0][1] >= bookkeeping_reserve - 0.01
-    assert terminal_markers[0][1] <= reaping_deadline
+    assert len(results) == 1
+    result_at, uploader_alive = results[0]
+    assert uploader_alive is False
+    assert deadline - result_at >= bookkeeping_reserve - 0.01
+    assert result_at <= reaping_deadline
 
 
 @pytest.mark.wallclock
@@ -1740,6 +1758,11 @@ def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
     monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
     proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(
+        b.bootstrap_processes,
+        "terminate_process_group",
+        lambda process, **_kwargs: process.kill(),
+    )
 
     payload = {
         "hf_repo": "o/r",
@@ -1747,10 +1770,11 @@ def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
         "env": {},
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
     }
     with pytest.raises(TimeoutError, match="wall-clock cap"):
-        b.run_mode(payload, {}, "grpo", deadline_ts=b.time.time() + 100)
+        _run_mode(payload, {}, "grpo", deadline_ts=b.time.time() + 100)
     assert proc.killed is True  # the child was killed on the deadline
 
 
@@ -1783,13 +1807,14 @@ def test_run_mode_cancellation_terminates_exact_group_and_publishes_result(monke
         "env": {},
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
         "work_deadline_at": now + 100,
         "result_deadline_at": now + 200,
     }
 
     with pytest.raises(b._CancellationRequested):
-        b.run_mode(payload, {}, "sft", deadline_ts=now + 300)
+        _run_mode(payload, {}, "sft", deadline_ts=now + 300)
 
     assert events[0] == (process, 123)
     assert events[1][0] == "result"
@@ -1808,11 +1833,12 @@ def test_run_mode_starts_no_subprocess_at_deadline(monkeypatch):
         "env": {},
         "source_snapshot": SOURCE_SNAPSHOT,
         "attempt": 0,
+        "fence": 1,
         "run_id": "run-1",
     }
 
     with pytest.raises(TimeoutError, match="wall-clock cap"):
-        b.run_mode(payload, {}, "sft", deadline_ts=200.0)
+        _run_mode(payload, {}, "sft", deadline_ts=200.0)
 
 
 def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch):
@@ -1858,7 +1884,6 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
         lambda _payload, _env, _phase, deadline: events.append(("training", deadline)) or 0,
     )
     monkeypatch.setattr(b.os.path, "exists", lambda path: path == "/tmp/metrics.json")
-    monkeypatch.setattr(b, "write_attempt_marker", lambda *_args, **_kwargs: None)
 
     assert b.main() == 0
     assert events[:4] == [
@@ -1899,172 +1924,19 @@ def test_main_source_verification_failure_prevents_pip(monkeypatch):
         ),
     )
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: events.append("pip"))
-    monkeypatch.setattr(b, "write_attempt_marker", lambda *_args, **_kwargs: None)
 
     assert b.main() == 1
     assert events == []
 
 
-@pytest.mark.parametrize("boundary", ["run_mode", "remote_confirmation"])
-def test_main_accepts_required_completion_artifacts_at_deadline(monkeypatch, boundary):
-    markers = []
-    remote_checks = []
-    clock = {"now": 100.0}
-    payload = {
-        "hf_repo": "org/repo",
-        "job_spec_json": "{}",
-        "phase": "sft",
-        "seed": 0,
-        "flash_arm": "lambda",
-        "env": {},
-        "extra_pip": [],
-        "hf_prefix": "sft/run",
-        "source_snapshot": SOURCE_SNAPSHOT,
-        "run_id": "run",
-        "run_created_at": 100.0,
-        "run_max_wall_seconds": 100.0,
-        "deadline_at": 200.0,
-        "attempt": 0,
-    }
-
-    class _Done:
-        def set(self):
-            return None
-
-    class _Timer:
-        def cancel(self):
-            return None
-
-    def run_mode(*_args):
-        clock["now"] = 200.0 if boundary == "run_mode" else 199.0
-        return 1
-
-    def remote_completion_confirmed(_payload):
-        remote_checks.append(True)
-        if boundary == "remote_confirmation":
-            clock["now"] = 200.0
-        return True
-
-    monkeypatch.setattr(b.time, "time", lambda: clock["now"])
-    monkeypatch.setattr(b, "load_payload", lambda: payload)
-    monkeypatch.setattr(b, "arm_deadline_watchdog", lambda deadline, _payload: (_Timer(), _Done()))
-    monkeypatch.setattr(b, "install_extra_pip", lambda _payload: None)
-    monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
-    monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
-    monkeypatch.setattr(b, "run_mode", run_mode)
-    monkeypatch.setattr(b.os.path, "exists", lambda path: path == "/tmp/metrics.json")
-    monkeypatch.setattr(b, "remote_completion_confirmed", remote_completion_confirmed)
-    monkeypatch.setattr(
-        b,
-        "write_attempt_marker",
-        lambda _payload, ok, error="", retriable=False: markers.append((ok, error, retriable)),
-    )
-
-    assert b.main() == 0
-    assert remote_checks == [True]
-    assert markers == [(True, "", False)]
 
 
 # ---------------------------------------------------------------------------
-# write_attempt_marker
+# deadline watchdogs
 # ---------------------------------------------------------------------------
-def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch):
-    uploads: list[tuple] = []
-    monkeypatch.setattr(
-        b,
-        "hf_upload",
-        lambda p, path, sub, **kwargs: uploads.append((path, sub, kwargs)),
-    )
-    monkeypatch.setattr(b.time, "time", lambda: 100.0)
-    payload = {
-        "hf_repo": "o/r",
-        "hf_prefix": "p",
-        "flash_arm": "vast",
-        "attempt": 3,
-        "run_id": "run-marker",
-        "deadline_at": 200.0,
-        "run_created_at": 100.0,
-        "run_max_wall_seconds": 100.0,
-        "env": {},
-    }
-    long_error = "E" * 3000
-    b.write_attempt_marker(payload, ok=False, error=long_error, retriable=True)
-
-    path, sub, kwargs = uploads[-1]
-    assert path == "/tmp/attempt_marker.json"
-    assert sub == "vast_attempt3.json"  # <arm>_attempt<N>.json
-    assert kwargs == {"enforce_deadline": False}
-    with open(path) as f:
-        marker = json.load(f)
-    assert marker["ok"] is False
-    assert marker["retriable"] is True
-    assert marker["attempt"] == 3
-    assert marker["run_id"] == "run-marker"
-    assert marker["ts"] == 100.0
-    assert marker["error"] == long_error[-2000:]  # tail-truncated to 2000 chars
-    assert len(marker["error"]) == 2000
-
-
-def test_write_attempt_marker_preserves_success_after_deadline(monkeypatch):
-    monkeypatch.setattr(b, "hf_upload", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(b.time, "time", lambda: 205.0)
-    payload = {
-        "hf_repo": "o/r",
-        "hf_prefix": "p",
-        "flash_arm": "vast",
-        "attempt": 3,
-        "run_id": "run-marker",
-        "deadline_at": 200.0,
-        "run_created_at": 100.0,
-        "run_max_wall_seconds": 100.0,
-        "env": {},
-        "source_snapshot": SOURCE_SNAPSHOT,
-    }
-
-    b.write_attempt_marker(payload, ok=True)
-
-    with open("/tmp/attempt_marker.json") as f:
-        marker = json.load(f)
-    assert marker["ok"] is True
-    assert marker["retriable"] is False
-    assert marker["error"] == ""
-    assert marker["ts"] == 205.0
-    assert marker["source_attestation"]["sha256"] == SOURCE_SNAPSHOT["sha256"]
-    assert marker["source_attestation"]["attempt"] == 3
-
-
-def test_write_attempt_marker_rejects_noncanonical_deadline(monkeypatch):
-    uploads = []
-    monkeypatch.setattr(b, "hf_upload", lambda *_args: uploads.append(True))
-    monkeypatch.setattr(b.time, "time", lambda: 250.0)
-    payload = {
-        "hf_repo": "o/r",
-        "hf_prefix": "p",
-        "flash_arm": "vast",
-        "attempt": 3,
-        "run_id": "run-marker",
-        "deadline_at": 200.0,
-        "run_created_at": 100.0,
-        "run_max_wall_seconds": 99.0,
-        "env": {},
-    }
-
-    with pytest.raises(RuntimeError, match="canonical submission deadline"):
-        b.write_attempt_marker(payload, ok=False, error="safe", retriable=True)
-
-    assert uploads == []
-
-
-# ---------------------------------------------------------------------------
-# deadline watchdogs: marker publication before hard exit
-# ---------------------------------------------------------------------------
-def test_arm_deadline_watchdog_publishes_marker_before_exit(monkeypatch):
-    marks: list[tuple] = []
+def test_arm_deadline_watchdog_hard_exits(monkeypatch):
     exits: list[int] = []
     monkeypatch.setattr(b.time, "time", lambda: 100.0)
-    monkeypatch.setattr(
-        b, "write_attempt_marker", lambda p, ok, error="", **k: marks.append((ok, error))
-    )
     monkeypatch.setattr(b.os, "_exit", lambda code: exits.append(code))
     payload = {
         "deadline_at": 160.0,
@@ -2082,40 +1954,17 @@ def test_arm_deadline_watchdog_publishes_marker_before_exit(monkeypatch):
     timer.function()
 
     assert not done.is_set()
-    assert marks == [(False, "run wall deadline exceeded; self-terminating box")]
     assert exits == [124]
 
 
-def test_deadline_watchdog_hard_exits_when_terminal_marker_writer_blocks(monkeypatch):
-    writer_started = threading.Event()
-    release_writer = threading.Event()
-    exits = []
-
-    def blocked_writer(*_args, **_kwargs):
-        writer_started.set()
-        release_writer.wait(2.0)
-
-    monkeypatch.setattr(b, "_TERMINAL_MARKER_GRACE_S", 0.01)
-    monkeypatch.setattr(b, "write_attempt_marker", blocked_writer)
-    monkeypatch.setattr(b.os, "_exit", lambda code: exits.append(code))
-
-    b._publish_timeout_marker_then_exit({}, "deadline reached")
-
-    assert writer_started.is_set()
-    assert exits == [124]
-    release_writer.set()
 
 
 # ---------------------------------------------------------------------------
 # _arm_preload_wall_cap: the _fire watchdog path
 # ---------------------------------------------------------------------------
 def test_arm_preload_wall_cap_uses_remaining_absolute_deadline(monkeypatch):
-    marks: list[tuple] = []
     exits: list[int] = []
     monkeypatch.setattr(b.time, "time", lambda: 100.0)
-    monkeypatch.setattr(
-        b, "write_attempt_marker", lambda p, ok, error="", **k: marks.append((ok, error))
-    )
     monkeypatch.setattr(b.os, "_exit", lambda code: exits.append(code))
 
     payload = {
@@ -2131,22 +1980,17 @@ def test_arm_preload_wall_cap_uses_remaining_absolute_deadline(monkeypatch):
     timer.cancel()
     assert timer.interval == 60.0
 
-    # manually invoke the watchdog closure: not done means marker then hard exit.
+    # manually invoke the watchdog closure: not done means a hard exit.
     timer.function()
     assert exits == [124]
-    assert marks
-    assert marks[-1][0] is False
-    assert "run wall deadline" in marks[-1][1]
 
     # if the download already finished, the watchdog is a no-op.
-    marks.clear()
     exits.clear()
     timer2, done2 = b._arm_preload_wall_cap(payload)
     timer2.cancel()
     done2.set()
     timer2.function()
     assert exits == []
-    assert marks == []
 
 
 # ---------------------------------------------------------------------------
@@ -2255,27 +2099,6 @@ def test_console_snapshot_redacts_a_payload_env_secret(tmp_path, monkeypatch):
     assert uploads == [(str(console) + "_attempt0.tail", "console_sft_attempt0.txt")]
 
 
-def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
-    monkeypatch.delenv("WANDB_API_KEY", raising=False)
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub, **kwargs: None)
-    monkeypatch.setattr(b.time, "time", lambda: 100.0)
-    payload = {
-        "hf_repo": "o/r",
-        "hf_prefix": "p",
-        "flash_arm": "vast",
-        "attempt": 1,
-        "run_id": "run-marker",
-        "deadline_at": 200.0,
-        "run_created_at": 100.0,
-        "run_max_wall_seconds": 100.0,
-        "env": {"WANDB_API_KEY": _PAYLOAD_SECRET},
-    }
-
-    b.write_attempt_marker(payload, ok=False, error=f"worker died holding {_PAYLOAD_SECRET}")
-
-    with open("/tmp/attempt_marker.json") as f:
-        marker = json.load(f)
-    assert marker["error"] == "worker died holding <redacted>"
 
 
 def test_safe_detail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):
@@ -2630,47 +2453,30 @@ def _preload_payload(**over):
     return base
 
 
-def test_main_preload_success_returns_zero_and_writes_ok_marker(monkeypatch):
-    markers: list[tuple] = []
+def test_main_preload_success_returns_zero_and_uploads_result(monkeypatch):
     monkeypatch.setattr(b, "load_payload", lambda path=b.PAYLOAD_PATH: _preload_payload())
     monkeypatch.setattr(
         b, "run_preload", lambda p: {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
     )
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
-    monkeypatch.setattr(
-        b, "hf_file_exists", lambda p, sub: True
-    )  # completion file confirmed first try
-    monkeypatch.setattr(
-        b,
-        "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
-    )
+    uploads = []
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: uploads.append((path, sub)))
     assert b.main() == 0
-    assert markers == [(True, "", False)]
+    assert uploads == [("/tmp/preload_result.json", "preload_result.json")]
     with open("/tmp/preload_result.json") as f:
         assert json.load(f)["preloaded"] == ["a/b"]
 
 
 def test_main_preload_failure_arms_wall_cap_and_reports_failed_models(monkeypatch):
-    markers: list[tuple] = []
-    monkeypatch.setattr(b.time, "sleep", lambda s: None)  # neutralize the confirm-retry backoff
+    monkeypatch.setattr(b.time, "sleep", lambda s: None)
     monkeypatch.setattr(b, "load_payload", lambda path=b.PAYLOAD_PATH: _preload_payload())
     monkeypatch.setattr(
         b,
         "run_preload",
         lambda p: {"preloaded": [], "already_cached": [], "failed": {"a/b": "oom"}},
     )
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
-    monkeypatch.setattr(
-        b, "hf_file_exists", lambda p, sub: False
-    )  # confirm loop exhausts -> else branch
-    monkeypatch.setattr(
-        b,
-        "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
-    )
+    uploads = []
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: uploads.append((path, sub)))
     assert b.main() == 1
-    ok, error, retriable = markers[0]
-    assert ok is False
-    assert error == "model preload failed"
-    assert retriable is False
+    assert uploads == [("/tmp/preload_result.json", "preload_result.json")]
+    with open("/tmp/preload_result.json") as file:
+        assert json.load(file)["failed"] == {"a/b": "oom"}

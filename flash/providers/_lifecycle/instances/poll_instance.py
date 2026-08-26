@@ -37,6 +37,7 @@ class InstancePollAdapter:
     dead_states: frozenset
     missing_dead_threshold: int
     stamp_cost_and_notes: Callable[..., None]
+    record_resource_loss: Callable[[str], None] | None = None
 
 
 def _current_attempt(adapter: InstancePollAdapter) -> AttemptRecord:
@@ -127,14 +128,18 @@ def poll_instance_job(
         if result is not None:
             return result
         now = time.time()
-        if terminal_status is not None and now >= attempt.result_deadline_at:
+        if now >= attempt.result_deadline_at:
+            if terminal_status is not None and adapter.record_resource_loss is not None:
+                adapter.record_resource_loss(terminal_status)
+            state_detail = (
+                f"resource ended with {terminal_status}"
+                if terminal_status is not None
+                else "work deadline expired"
+            )
             return PollResult(
                 False,
                 failure="job_preempted",
-                detail=(
-                    f"{adapter.provider} resource ended with {terminal_status} "
-                    "without a result manifest"
-                ),
+                detail=f"{adapter.provider} {state_detail} without a result manifest",
             )
         if now >= attempt.work_deadline_at:
             delay = min(interval_s, max(0.0, attempt.result_deadline_at - time.time()))
@@ -163,7 +168,11 @@ def poll_instance_job(
             last_status = status
         if status in adapter.dead_states or missing_streak >= adapter.missing_dead_threshold:
             terminal_status = status
-        if status != adapter.running_status and now >= attempt.grant_deadline_at:
+        if (
+            terminal_status is None
+            and status != adapter.running_status
+            and now >= attempt.grant_deadline_at
+        ):
             return PollResult(
                 False,
                 failure="job_preempted",
