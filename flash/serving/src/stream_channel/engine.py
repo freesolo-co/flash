@@ -7,7 +7,7 @@ import contextlib
 import inspect
 import queue as stdlib_queue
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
 from flash.serving.src.stream_channel.protocol import (
@@ -25,6 +25,11 @@ from flash.serving.src.stream_channel.protocol import (
 )
 
 _T = TypeVar("_T")
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        task.exception()
 
 
 class _LeaseWatch:
@@ -68,23 +73,16 @@ class _LeaseWatch:
             return True
 
     async def admit(self) -> None:
-        try:
-            consumed = await self._consume(timeout=CONTROL_POLL_SECONDS)
-        except stdlib_queue.Empty as exc:
-            raise StreamChannelError(
-                ChannelErrorCode.CHANNEL_FAULT, "initial lease is missing"
-            ) from exc
+        consumed = await self._consume(timeout=CONTROL_POLL_SECONDS)
         if not consumed:
             raise StreamChannelError(ChannelErrorCode.CHANNEL_FAULT, "initial lease is missing")
-        self.check()
         while self._latest is not None and self._latest.function_call_id is None:
             if await self._consume(block=False):
                 continue
-            self.check()
-            try:
-                await self._consume(timeout=CONTROL_POLL_SECONDS)
-            except stdlib_queue.Empty:
+            if not await self._consume(timeout=CONTROL_POLL_SECONDS):
                 self.check()
+        while await self._consume(block=False):
+            pass
         self.check()
         self._task = asyncio.create_task(self._run())
 
@@ -116,8 +114,25 @@ class _LeaseWatch:
         if time.time() >= latest.lease_deadline_unix:
             raise StreamChannelError(ChannelErrorCode.LEASE_EXPIRED, "stream lease expired")
 
-    async def guarded(self, operation: Awaitable[_T]) -> _T:
+    async def guarded(
+        self,
+        operation: Awaitable[_T],
+        *,
+        abort: Callable[[], Awaitable[None]] | None = None,
+    ) -> _T:
         operation_task = asyncio.ensure_future(operation)
+
+        async def stop_operation() -> None:
+            if abort is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(abort(), timeout=CLEANUP_SECONDS)
+            operation_task.cancel()
+            done, _ = await asyncio.wait({operation_task}, timeout=CLEANUP_SECONDS)
+            if done:
+                await asyncio.gather(operation_task, return_exceptions=True)
+            else:
+                operation_task.add_done_callback(_consume_task_result)
+
         try:
             self.check()
             if self._task is None:
@@ -125,8 +140,7 @@ class _LeaseWatch:
                     ChannelErrorCode.CHANNEL_FAULT, "lease watcher is not running"
                 )
         except Exception:
-            operation_task.cancel()
-            await asyncio.gather(operation_task, return_exceptions=True)
+            await stop_operation()
             raise
         try:
             done, _ = await asyncio.wait(
@@ -134,13 +148,11 @@ class _LeaseWatch:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         except asyncio.CancelledError:
-            operation_task.cancel()
-            await asyncio.gather(operation_task, return_exceptions=True)
+            await stop_operation()
             raise
         if operation_task in done:
             return await operation_task
-        operation_task.cancel()
-        await asyncio.gather(operation_task, return_exceptions=True)
+        await stop_operation()
         exception = self._task.exception()
         if exception is None:
             raise StreamChannelError(ChannelErrorCode.CHANNEL_FAULT, "lease watcher stopped")
@@ -265,7 +277,7 @@ async def stream_generate_call(
         )
         while True:
             try:
-                event = await lease.guarded(anext(stream))
+                event = await lease.guarded(anext(stream), abort=abort_if_started)
             except StopAsyncIteration:
                 break
             terminal = event.get("type") == "final"
@@ -279,7 +291,7 @@ async def stream_generate_call(
                 terminal=terminal,
                 event=event,
             )
-            await lease.guarded(_put_data(queue, envelope))
+            await lease.guarded(_put_data(queue, envelope), abort=abort_if_started)
             sequence += 1
             if terminal:
                 terminal_kind = "event"
@@ -311,6 +323,8 @@ async def stream_generate_call(
                 "failed to publish terminal channel error",
             ) from exc
         sequence += 1
+        if not isinstance(exc, StreamChannelError):
+            raise
     finally:
         cleanup_cancellation: asyncio.CancelledError | None = None
         if stream is not None:

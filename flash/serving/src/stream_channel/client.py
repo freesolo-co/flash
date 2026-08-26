@@ -26,6 +26,11 @@ from flash.serving.src.stream_channel.protocol import (
 )
 
 
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        task.exception()
+
+
 async def _bounded_shield(operation: Awaitable[Any], deadline_seconds: float) -> None:
     task = asyncio.ensure_future(operation)
     try:
@@ -39,18 +44,28 @@ async def _bounded_shield(operation: Awaitable[Any], deadline_seconds: float) ->
 async def _spawn_cancellation_safe(
     spawn: Callable[[], Awaitable[Any]],
     cancel: Callable[[Any], Awaitable[None]],
+    *,
+    dispatch_deadline_unix: float,
 ) -> Any:
     task = asyncio.create_task(spawn())
     try:
         return await asyncio.shield(task)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancellation:
+        remaining = max(0.0, dispatch_deadline_unix - time.time())
+        handle_wait = min(LEASE_SECONDS, remaining)
         try:
-            call = await asyncio.shield(task)
+            call = await asyncio.wait_for(asyncio.shield(task), timeout=handle_wait)
         except Exception:
-            raise
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
+            if done:
+                await asyncio.gather(task, return_exceptions=True)
+            else:
+                task.add_done_callback(_consume_task_result)
+            raise cancellation from None
         with contextlib.suppress(Exception):
-            await asyncio.shield(cancel(call))
-        raise
+            await _bounded_shield(cancel(call), CALL_RESULT_SECONDS)
+        raise cancellation
 
 
 class _ControlWriter:
@@ -230,6 +245,7 @@ class CancellableStreamChannel:
                         self._invocation_nonce,
                     ),
                     cancel_spawned,
+                    dispatch_deadline_unix=self._dispatch_deadline_unix,
                 )
                 function_call_id = call.object_id
                 if not isinstance(function_call_id, str) or not function_call_id:
@@ -256,7 +272,14 @@ class CancellableStreamChannel:
                     if raw is not None:
                         envelope = validator.accept(raw)
                         if envelope.terminal:
-                            manifest = await self._terminal_manifest(call_result_task)
+                            if envelope.kind == "error":
+                                completed = True
+                                await self._call_result(call_result_task)
+                                raise StreamChannelError(
+                                    envelope.error_code or ChannelErrorCode.CHANNEL_FAULT,
+                                    "remote stream failed without a function exception",
+                                )
+                            manifest = await self._call_result(call_result_task)
                             validator.reconcile(manifest)
                             extra = None
                             with contextlib.suppress(stdlib_queue.Empty):
@@ -267,11 +290,6 @@ class CancellableStreamChannel:
                             if extra is not None:
                                 validator.accept(extra)
                             completed = True
-                            if envelope.kind == "error":
-                                raise StreamChannelError(
-                                    envelope.error_code or ChannelErrorCode.CHANNEL_FAULT,
-                                    "remote stream failed",
-                                )
                             if envelope.event is None:
                                 raise StreamChannelError(
                                     ChannelErrorCode.PROTOCOL_ERROR,
@@ -289,8 +307,7 @@ class CancellableStreamChannel:
                         if drain_deadline is None:
                             drain_deadline = time.monotonic() + TERMINAL_DRAIN_SECONDS
                         elif time.monotonic() >= drain_deadline:
-                            with contextlib.suppress(Exception):
-                                call_result_task.result()
+                            call_result_task.result()
                             raise StreamChannelError(
                                 ChannelErrorCode.CHANNEL_FAULT,
                                 "function completed before terminal data became visible",
@@ -309,7 +326,7 @@ class CancellableStreamChannel:
                 await _clear_partition(queue, CONTROL_PARTITION)
 
     @staticmethod
-    async def _terminal_manifest(call_result_task: asyncio.Task[Any]) -> Any:
+    async def _call_result(call_result_task: asyncio.Task[Any]) -> Any:
         try:
             return await asyncio.wait_for(
                 asyncio.shield(call_result_task),
@@ -318,10 +335,5 @@ class CancellableStreamChannel:
         except TimeoutError as exc:
             raise StreamChannelError(
                 ChannelErrorCode.CHANNEL_FAULT,
-                "terminal manifest timed out",
-            ) from exc
-        except Exception as exc:
-            raise StreamChannelError(
-                ChannelErrorCode.CHANNEL_FAULT,
-                "remote function failed before manifest",
+                "remote function result timed out",
             ) from exc
