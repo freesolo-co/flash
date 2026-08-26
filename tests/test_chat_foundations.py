@@ -398,6 +398,20 @@ def test_tool_controls_and_template_keys_are_strict() -> None:
             )
 
 
+def test_enum_member_complexity_is_a_request_error() -> None:
+    tools = _function_tools()
+    tools[0]["function"]["parameters"]["properties"]["days"]["enum"] = [
+        json.loads("[" * 600 + "0" + "]" * 600)
+    ]
+
+    with pytest.raises(OpenAIRequestError, match="enum value complexity"):
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "weather"}], "tools": tools},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
 def test_tool_names_and_schema_container_keywords_are_exact() -> None:
     valid = _function_tools()
     valid[0]["function"]["name"] = "9-weather_tool"
@@ -552,6 +566,68 @@ def test_tool_history_is_strict_and_does_not_mutate_caller_messages() -> None:
         {"type": "input_text", "text": "sun"},
         {"type": "text", "text": "ny"},
     ]
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"days":1e99999999999999999999}',
+        '{"days":1e-99999999999999999999}',
+    ],
+)
+def test_extreme_decimal_exponent_in_tool_history_is_a_request_error(argument: str) -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": argument},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+
+    with pytest.raises(OpenAIRequestError, match="arguments must encode a JSON object"):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"days":1,"days":2}',
+        '{"nested":{"days":1,"days":2}}',
+    ],
+)
+def test_duplicate_object_keys_in_tool_history_are_a_request_error(argument: str) -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": argument},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+
+    with pytest.raises(OpenAIRequestError, match="arguments must encode a JSON object"):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
 
 
 def test_authorized_revision_resolver_prefers_ready_revision_for_ambiguous_step() -> None:

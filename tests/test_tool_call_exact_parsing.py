@@ -134,6 +134,126 @@ def test_tool_call_huge_positive_exponent_survives_character_at_a_time_streaming
 
 
 @pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("1.0", "1"),
+        ("1e3", "1000"),
+        ("9007199254740993.0", "9007199254740993"),
+    ],
+)
+def test_integer_schema_accepts_exact_integral_json_numbers(
+    raw_value: str,
+    expected: str,
+) -> None:
+    text = _exact_call().replace(
+        "<parameter=count>2</parameter>", f"<parameter=count>{raw_value}</parameter>"
+    )
+
+    result = parse_qwen3_coder_output(text, _exact_tools(), id_factory=lambda: "call_fixed")
+
+    assert f'"count":{expected}' in result.calls[0].arguments
+
+
+def test_integer_schema_rejects_fractional_json_numbers_exactly() -> None:
+    text = _exact_call().replace(
+        "<parameter=count>2</parameter>", "<parameter=count>1.5</parameter>"
+    )
+
+    result = parse_qwen3_coder_output(text, _exact_tools())
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+def test_nested_integer_values_serialize_canonically() -> None:
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "count": {"type": "integer"},
+                                    "values": {"type": "array", "items": {"type": "integer"}},
+                                },
+                                "required": ["count", "values"],
+                                "additionalProperties": False,
+                            }
+                        },
+                        "required": ["payload"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+    text = (
+        "<tool_call><function=store>"
+        '<parameter=payload>{"count":1.0,"values":[1e3,9007199254740993.0]}</parameter>'
+        "</function></tool_call>"
+    )
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert result.calls[0].arguments == '{"payload":{"count":1,"values":[1000,9007199254740993]}}'
+
+
+def test_integer_enum_uses_json_schema_mathematical_integer_semantics() -> None:
+    declaration = _exact_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"]["count"]["enum"] = [1.0]
+
+    tools = normalize_tools([declaration])
+
+    assert tools[0].parameters["properties"]["count"]["enum"] == [1.0]
+
+
+@pytest.mark.parametrize("raw_value", ["1", "0", "TRUE", "False"])
+def test_boolean_schema_rejects_non_json_boolean_literals_exactly(raw_value: str) -> None:
+    text = _exact_call().replace(
+        "<parameter=enabled>true</parameter>",
+        f"<parameter=enabled>{raw_value}</parameter>",
+    )
+
+    result = parse_qwen3_coder_output(text, _exact_tools())
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+@pytest.mark.parametrize("raw_value", ["1e99999999999999999999", "1e-99999999999999999999"])
+def test_extreme_decimal_exponents_fall_back_exactly(raw_value: str) -> None:
+    text = _exact_call().replace("9007199254740993.0</parameter>", f"{raw_value}</parameter>", 1)
+
+    result = parse_qwen3_coder_output(text, _exact_tools())
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+def test_generated_arguments_with_duplicate_object_keys_fall_back_exactly() -> None:
+    text = _exact_call().replace(
+        '"exact":9007199254740993.0,',
+        '"exact":1,"exact":2,',
+    )
+
+    result = parse_qwen3_coder_output(text, _exact_tools())
+
+    assert result.content == text
+    assert result.calls == ()
+
+    parser = ToolCallStreamParser(_exact_tools())
+    assert all(parser.feed(character) == "" for character in text)
+    streamed = parser.finish()
+    assert streamed.content == text
+    assert streamed.calls == ()
+
+
+@pytest.mark.parametrize(
     "raw_value",
     ["NaN", "Infinity", "-Infinity", '{"exact":NaN,"tiny":1,"text":"x"}'],
 )
@@ -221,6 +341,20 @@ def test_enum_fingerprint_accepts_bounded_distinct_nested_values() -> None:
     assert len(tools[0].parameters["properties"]["value"]["enum"]) == 128
 
 
+def test_enum_member_depth_is_bounded_before_fingerprinting() -> None:
+    enum_value = json.loads("[" * 600 + "0" + "]" * 600)
+
+    with pytest.raises(ValueError, match="enum value complexity"):
+        normalize_tools(_enum_tool([enum_value]))
+
+
+def test_enum_aggregate_nodes_are_bounded_before_fingerprinting() -> None:
+    enum = [[*range(512), index] for index in range(128)]
+
+    with pytest.raises(ValueError, match="enum value complexity"):
+        normalize_tools(_enum_tool(enum))
+
+
 def test_string_enum_allows_nonstructural_parameter_delimiter_text() -> None:
     declaration = _exact_tools()[0].wire()
     enum_value = "before </parameter> after"
@@ -266,9 +400,9 @@ def _delimiter_tools():
 def _delimiter_calls() -> str:
     return (
         "<tool_call><function=store>"
-        "<parameter=scalar>before </tool_call> after</parameter>"
         '<parameter=nested>{"text":"nested </tool_call> value"}</parameter>'
         '<parameter=values>["array </tool_call> value"]</parameter>'
+        "<parameter=scalar>before </tool_call> after</parameter>"
         "</function></tool_call>"
         " <tool_call><function=store>"
         "<parameter=scalar>second </tool_call> value</parameter>"
@@ -316,6 +450,45 @@ def test_complete_structural_candidate_inside_string_falls_back_exactly() -> Non
 
     assert result.content == malformed
     assert result.calls == ()
+
+
+def _optional_string_tools():
+    declaration = _delimiter_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {
+        "a": {"type": "string"},
+        "b": {"type": "string"},
+    }
+    declaration["function"]["parameters"]["required"] = ["a"]
+    return normalize_tools([declaration])
+
+
+def _optional_parameter_ambiguity() -> str:
+    return (
+        "<tool_call><function=store>"
+        "<parameter=a>before </parameter><parameter=b>inside</parameter>"
+        "</function></tool_call>"
+    )
+
+
+def test_unconstrained_string_before_optional_parameter_falls_back_exactly() -> None:
+    text = _optional_parameter_ambiguity()
+
+    result = parse_qwen3_coder_output(text, _optional_string_tools())
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+def test_optional_parameter_ambiguity_survives_arbitrary_stream_splits() -> None:
+    text = _optional_parameter_ambiguity()
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(_optional_string_tools(), id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert result.content == text
+        assert result.calls == ()
 
 
 def test_tool_call_outer_closer_is_owned_after_function_grammar() -> None:

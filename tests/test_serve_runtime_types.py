@@ -638,6 +638,12 @@ def test_generation_request_revalidates_tools_and_rejects_tool_images() -> None:
     assert request.structured_outputs == {"json": SCHEMA}
 
 
+def _runtime_tools_with_required_days():
+    declaration = _runtime_tools()[0].wire()
+    declaration["function"]["parameters"]["required"] = ["city", "days"]
+    return normalize_tools([declaration])
+
+
 def test_qwen3_coder_parser_validates_schema_and_exact_fallback() -> None:
     valid = (
         "<tool_call>\n<function=weather>\n"
@@ -645,7 +651,9 @@ def test_qwen3_coder_parser_validates_schema_and_exact_fallback() -> None:
         "<parameter=days>\n2\n</parameter>\n"
         "</function>\n</tool_call>  \n\t"
     )
-    result = parse_qwen3_coder_output(valid, _runtime_tools(), id_factory=lambda: "call_fixed")
+    result = parse_qwen3_coder_output(
+        valid, _runtime_tools_with_required_days(), id_factory=lambda: "call_fixed"
+    )
     assert result.content is None
     assert result.calls[0].wire() == {
         "id": "call_fixed",
@@ -653,7 +661,10 @@ def test_qwen3_coder_parser_validates_schema_and_exact_fallback() -> None:
         "function": {"name": "weather", "arguments": '{"city":"Paris","days":2}'},
     }
     malformed = valid.replace("<parameter=days>", "<parameter=unknown>")
-    assert parse_qwen3_coder_output(malformed, _runtime_tools()).content == malformed
+    assert (
+        parse_qwen3_coder_output(malformed, _runtime_tools_with_required_days()).content
+        == malformed
+    )
 
 
 def _delimiter_value_tools():
@@ -733,6 +744,12 @@ def test_qwen3_coder_parser_preserves_parameter_delimiters_inside_values(
     assert json.loads(result.calls[0].arguments) == {parameter_name: expected}
 
 
+def _delimiter_value_tools_with_required_count():
+    declaration = _delimiter_value_tools()[0].wire()
+    declaration["function"]["parameters"]["required"] = ["string_value", "count"]
+    return normalize_tools([declaration])
+
+
 def test_qwen3_coder_parser_preserves_embedded_delimiter_before_another_parameter() -> None:
     text = (
         "<tool_call><function=store>"
@@ -742,7 +759,7 @@ def test_qwen3_coder_parser_preserves_embedded_delimiter_before_another_paramete
     )
     result = parse_qwen3_coder_output(
         text,
-        _delimiter_value_tools(),
+        _delimiter_value_tools_with_required_count(),
         id_factory=lambda: "call_fixed",
     )
     assert json.loads(result.calls[0].arguments) == {
@@ -752,7 +769,9 @@ def test_qwen3_coder_parser_preserves_embedded_delimiter_before_another_paramete
 
 
 def test_qwen3_coder_stream_parser_handles_split_embedded_and_structural_closes() -> None:
-    parser = ToolCallStreamParser(_delimiter_value_tools(), id_factory=lambda: "call_fixed")
+    parser = ToolCallStreamParser(
+        _delimiter_value_tools_with_required_count(), id_factory=lambda: "call_fixed"
+    )
     pieces = [
         "<tool_call><function=store><parameter=string_value>before </para",
         "meter> after</para",

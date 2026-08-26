@@ -14,7 +14,7 @@ import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from typing import Any
 
 TOOL_PARSER_QWEN3_CODER = "qwen3_coder"
@@ -37,6 +37,7 @@ _MAX_TOOLS = 128
 _MAX_SCHEMA_DEPTH = 8
 _MAX_SCHEMA_NODES = 512
 _MAX_ENUM_VALUES = 128
+_MAX_ENUM_NODES = _MAX_ENUM_VALUES * _MAX_SCHEMA_NODES
 _MAX_FIXED_DECIMAL_DIGITS = 1024
 _MAX_TOOL_STOP_COMPARISON_CHARS = 16 * 1024 * 1024
 _SCHEMA_TYPES = frozenset({"array", "boolean", "integer", "null", "number", "object", "string"})
@@ -398,6 +399,15 @@ def _normalize_schema(
         enum = raw["enum"]
         if type(enum) is not list or not enum or len(enum) > _MAX_ENUM_VALUES:
             raise error_type(f"{path}.enum must be a nonempty bounded array")
+        enum_budget = [0]
+        for enum_index, item in enumerate(enum):
+            _validate_json_value_complexity(
+                item,
+                f"{path}.enum[{enum_index}]",
+                error_type,
+                budget=enum_budget,
+                max_nodes=_MAX_ENUM_NODES,
+            )
         detached = _json_copy(enum, path, error_type)
         if any(not _matches_type(item, schema_type) for item in detached):
             raise error_type(f"{path}.enum values must match {schema_type}")
@@ -559,6 +569,7 @@ def _parse_parameters(
     tool: FunctionTool,
 ) -> tuple[int, dict[str, Any]] | None:
     values: dict[str, Any] = {}
+    optional_parameters = set(tool.parameters["properties"]) - set(tool.parameters["required"])
     while True:
         cursor = _skip_whitespace(text, cursor)
         if text.startswith(_FUNCTION_END, cursor):
@@ -577,11 +588,32 @@ def _parse_parameters(
         if parsed_value is None:
             return None
         cursor, values[parameter_name] = parsed_value
+        next_parameter = _next_parameter(text, cursor)
+        if schema["type"] == "string" and "enum" not in schema and next_parameter is not None:
+            next_name, next_value_start = next_parameter
+            next_schema = tool.parameters["properties"].get(next_name)
+            if (
+                next_name in optional_parameters
+                and next_schema is not None
+                and _parse_parameter_value(text, next_value_start, next_schema) is not None
+            ):
+                return None
     if set(tool.parameters["required"]) - set(values):
         return None
     if not _validate_value(values, tool.parameters):
         return None
     return cursor, values
+
+
+def _next_parameter(text: str, cursor: int) -> tuple[str, int] | None:
+    cursor = _skip_whitespace(text, cursor)
+    if not text.startswith(_PARAMETER_START, cursor):
+        return None
+    name_end = text.find(">", cursor + len(_PARAMETER_START))
+    if name_end < 0:
+        return None
+    name = text[cursor + len(_PARAMETER_START) : name_end]
+    return name, name_end + 1
 
 
 def _parse_parameter_value(
@@ -613,6 +645,10 @@ def _parse_parameter_value(
             value = _coerce_value(raw_value, schema["type"])
             if not _validate_value(value, schema):
                 return None
+            try:
+                value = _canonicalize_integer_values(value, schema)
+            except DecimalException:
+                return None
             return value_end + len(_PARAMETER_END), value
         search_from = value_end + len(_PARAMETER_END)
 
@@ -623,10 +659,10 @@ def _coerce_value(value: str, schema_type: str) -> Any:
     if schema_type == "null":
         return None if value.strip().lower() == "null" else value
     if schema_type == "boolean":
-        lowered = value.strip().lower()
-        if lowered in {"true", "1"}:
+        stripped = value.strip()
+        if stripped == "true":
             return True
-        if lowered in {"false", "0"}:
+        if stripped == "false":
             return False
         return value
     if schema_type in {"array", "integer", "number", "object"}:
@@ -653,13 +689,32 @@ def _validate_value(value: Any, schema: Mapping[str, Any]) -> bool:
     return True
 
 
+def _canonicalize_integer_values(value: Any, schema: Mapping[str, Any]) -> Any:
+    schema_type = schema["type"]
+    if schema_type == "integer" and type(value) is Decimal:
+        return value.to_integral_value()
+    if schema_type == "object":
+        properties = schema["properties"]
+        return {
+            name: _canonicalize_integer_values(nested, properties[name])
+            for name, nested in value.items()
+        }
+    if schema_type == "array":
+        return [_canonicalize_integer_values(nested, schema["items"]) for nested in value]
+    return value
+
+
 def _matches_type(value: Any, schema_type: str) -> bool:
     if schema_type == "null":
         return value is None
     if schema_type == "boolean":
         return type(value) is bool
     if schema_type == "integer":
-        return type(value) is int
+        return (
+            type(value) is int
+            or (type(value) is Decimal and _decimal_is_integral(value))
+            or (type(value) is float and math.isfinite(value) and value.is_integer())
+        )
     if schema_type == "number":
         if type(value) is Decimal:
             return value.is_finite()
@@ -671,13 +726,28 @@ def _matches_type(value: Any, schema_type: str) -> bool:
     return type(value) is dict
 
 
+def _decimal_is_integral(value: Decimal) -> bool:
+    if not value.is_finite():
+        return False
+    digits = value.as_tuple().digits
+    exponent = value.as_tuple().exponent
+    if exponent >= 0:
+        return True
+    fractional_digits = -exponent
+    return all(digit == 0 for digit in digits[-fractional_digits:])
+
+
 def _load_exact_json(value: str) -> Any:
-    return json.loads(
-        value,
-        parse_float=Decimal,
-        parse_int=int,
-        parse_constant=_raise_nonfinite,
-    )
+    try:
+        return json.loads(
+            value,
+            parse_float=Decimal,
+            parse_int=int,
+            parse_constant=_raise_nonfinite,
+            object_pairs_hook=_unique_json_object,
+        )
+    except DecimalException as exc:
+        raise ValueError("invalid decimal number") from exc
 
 
 def _decode_json_object(value: str) -> dict[str, Any]:
@@ -710,6 +780,15 @@ def _contains_decimal(value: Any) -> bool:
 
 def _raise_nonfinite(value: str) -> None:
     raise ValueError(f"non-finite json constant {value}")
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, nested in pairs:
+        if key in value:
+            raise ValueError(f"duplicate json object key {key!r}")
+        value[key] = nested
+    return value
 
 
 def _json_value_fingerprint(value: Any) -> tuple[Any, ...]:
@@ -784,6 +863,26 @@ def _dump_exact_json(value: Any) -> str:
             + "}"
         )
     raise TypeError(f"unsupported exact JSON value {type(value).__name__}")
+
+
+def _validate_json_value_complexity(
+    value: Any,
+    path: str,
+    error_type: type[Exception],
+    *,
+    budget: list[int],
+    max_nodes: int,
+) -> None:
+    stack = [(value, 0)]
+    while stack:
+        nested, depth = stack.pop()
+        budget[0] += 1
+        if depth > _MAX_SCHEMA_DEPTH or budget[0] > max_nodes:
+            raise error_type(f"{path} exceeds the supported enum value complexity")
+        if type(nested) is list:
+            stack.extend((item, depth + 1) for item in nested)
+        elif type(nested) is dict:
+            stack.extend((item, depth + 1) for item in nested.values())
 
 
 def _json_copy(value: Any, path: str, error_type: type[Exception]) -> Any:
