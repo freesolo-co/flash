@@ -181,7 +181,22 @@ def deploy_adapter(
     if dry_run:
         return dep
 
-    artifact_revision = resolve_artifact_revision(hf_repo)
+    checkpoint_id = format_checkpoint_ref(run_id, checkpoint_step)
+    dep.checkpoint_id = checkpoint_id
+    from flash.server.platform.auth import serving_org_id
+
+    normalized_org_id = serving_org_id(org_id)
+    bound_record = (
+        _registered_adapter(normalized_org_id, checkpoint_id) if normalized_org_id else None
+    )
+    bound_revision = (
+        str(bound_record.get("artifact_revision") or "").strip().lower()
+        if isinstance(bound_record, dict)
+        else ""
+    )
+    artifact_revision = (
+        bound_revision if is_commit_sha(bound_revision) else resolve_artifact_revision(hf_repo)
+    )
     artifact_metadata = adapter_check.adapter_artifact_metadata(
         hf_repo, subfolder, artifact_revision=artifact_revision
     )
@@ -190,8 +205,6 @@ def deploy_adapter(
         artifact_metadata.lora_rank,
         rank_source="adapter artifact",
     )
-    checkpoint_id = format_checkpoint_ref(run_id, checkpoint_step)
-    dep.checkpoint_id = checkpoint_id
     so_default = parse_structured_outputs(structured_outputs) if structured_outputs else None
     advertised = _require_serving_capabilities(
         thinking_structured_outputs=thinking and so_default is not None
@@ -213,9 +226,6 @@ def deploy_adapter(
     }
     if so_default is not None:
         body["structured_outputs"] = so_default
-    from flash.server.platform.auth import serving_org_id
-
-    normalized_org_id = serving_org_id(org_id)
     if not normalized_org_id:
         raise ValueError("org_id is required for hosted checkpoint deployment")
     body["org_id"] = normalized_org_id

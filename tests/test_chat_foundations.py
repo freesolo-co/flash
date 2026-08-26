@@ -63,6 +63,19 @@ def test_canonical_request_parser_owns_defaults_and_strict_schema() -> None:
             )
 
 
+def test_request_parser_rejects_retired_step_selector() -> None:
+    with pytest.raises(OpenAIRequestError, match=r"unsupported chat request field.*step"):
+        parse_chat_request(
+            {
+                "model": "run-1/final",
+                "messages": [{"role": "user", "content": "hello"}],
+                "step": 20,
+            },
+            require_model=True,
+            allow_managed_selectors=True,
+        )
+
+
 @pytest.mark.parametrize("field", ["temperature", "top_p"])
 def test_request_parser_rejects_numeric_overflow_as_a_controlled_error(field: str) -> None:
     with pytest.raises(OpenAIRequestError, match=f"{field} must be a finite number"):

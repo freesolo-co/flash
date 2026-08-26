@@ -36,7 +36,6 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "presence_penalty",
         "response_format",
         "seed",
-        "step",
         "stop",
         "stream",
         "stream_options",

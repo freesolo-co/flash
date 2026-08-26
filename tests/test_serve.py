@@ -163,6 +163,34 @@ def _capture_registration_body(
     return seen["json"]
 
 
+def test_redeploy_reuses_bound_artifact_revision(
+    monkeypatch, tmp_path, stub_serving_registry
+) -> None:
+    bound_revision = "b" * 40
+    monkeypatch.setattr(
+        d,
+        "_registered_adapter",
+        lambda _org_id, _checkpoint_id: {"artifact_revision": bound_revision},
+    )
+    monkeypatch.setattr(
+        d,
+        "resolve_artifact_revision",
+        lambda _repo: pytest.fail("redeploy must not resolve the mutable repository tip"),
+    )
+
+    body = _capture_registration_body(
+        monkeypatch,
+        tmp_path,
+        stub_serving_registry,
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-9B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd",
+    )
+
+    assert body["artifact_revision"] == bound_revision
+
+
 def test_deploy_dry_run():
     from flash.serve.deployment.deploy import deploy_adapter
 
@@ -475,6 +503,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
         return _Resp()
 
     monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
     dep = d.deploy_adapter(
         run_id="flash-7-abcd",
         model="Qwen/Qwen3.5-9B",
@@ -623,7 +652,8 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
             return {"capabilities": sorted(capabilities - ({missing} if missing else set()))}
 
     def fake_get(url, **_kwargs):
-        assert url == "https://serve.example/healthz"
+        if url != "https://serve.example/healthz":
+            return httpx.Response(404, request=httpx.Request("GET", url))
         if health_case == "unreachable":
             request = httpx.Request("GET", url)
             raise httpx.ConnectError("connection refused", request=request)
@@ -815,6 +845,7 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
 
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
     monkeypatch.setattr(d, "resolve_artifact_revision", lambda _repo: "a" * 40)
+    monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
 
     class Response:
         status_code = 200
@@ -1065,6 +1096,7 @@ def test_deploy_ready_read_returned_at_deadline_never_succeeds(monkeypatch, tmp_
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
     monkeypatch.setattr(d, "_wait_checkpoint_ready", real_wait_checkpoint_ready)
     monkeypatch.setattr(d, "resolve_artifact_revision", lambda _repo: "a" * 40)
+    monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
     registration_body = {}
 
     class Response:
