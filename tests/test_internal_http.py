@@ -1799,6 +1799,103 @@ def test_local_alias_of_global_namespace_fails_before_transport(root_kind: str) 
     assert contacted == []
 
 
+@pytest.mark.parametrize("root_kind", ["module", "type"])
+@pytest.mark.parametrize("default_kind", ["positional", "keyword"])
+@pytest.mark.parametrize("nested_levels", [1, 2])
+@pytest.mark.parametrize(
+    "default_expression",
+    [
+        "alias",
+        "(alias,)[0]",
+        "[alias][0]",
+        "{'retained': alias}['retained']",
+        "alias if flag else other",
+        "alias or other",
+        "(lambda value: value)(alias)",
+    ],
+)
+def test_local_alias_nested_parameter_default_fails_before_transport(
+    root_kind: str,
+    default_kind: str,
+    nested_levels: int,
+    default_expression: str,
+) -> None:
+    source = "custom://source.invalid/data"
+    sink = "custom://sink.invalid/steal"
+    contacted: list[str] = []
+    namespace = (
+        types.ModuleType("nested_alias_namespace")
+        if root_kind == "module"
+        else type("NestedAliasNamespace", (), {})
+    )
+    parameter = (
+        f"retained: object={default_expression}"
+        if default_kind == "positional"
+        else f"*, retained: object={default_expression}"
+    )
+    if nested_levels == 1:
+        nested_body = (
+            f"    def nested({parameter}):\n"
+            "        contacted.append(request.full_url)\n"
+            "        if request.full_url == source:\n"
+            "            redirected = urllib.request.Request(sink)\n"
+            "            return retained.target.open(redirected, timeout=request.timeout)\n"
+            "        return response(request.full_url)\n"
+            "    return nested()\n"
+        )
+    else:
+        next_expression = default_expression.replace("alias", "next_alias")
+        inner_parameter = (
+            f"target: object={next_expression}"
+            if default_kind == "positional"
+            else f"*, target: object={next_expression}"
+        )
+        nested_body = (
+            f"    def first({parameter}):\n"
+            "        next_alias = retained\n"
+            f"        def second({inner_parameter}):\n"
+            "            contacted.append(request.full_url)\n"
+            "            if request.full_url == source:\n"
+            "                redirected = urllib.request.Request(sink)\n"
+            "                return target.target.open(redirected, timeout=request.timeout)\n"
+            "            return response(request.full_url)\n"
+            "        return second()\n"
+            "    return first()\n"
+        )
+    callback_globals = {
+        "contacted": contacted,
+        "flag": True,
+        "namespace": namespace,
+        "other": object(),
+        "response": _response,
+        "sink": sink,
+        "source": source,
+        "urllib": urllib,
+    }
+    exec(
+        "def custom_open(self, request):\n    alias = namespace\n" + nested_body,
+        callback_globals,
+    )
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        pass
+
+    type.__setattr__(CallbackHandler, "custom_open", callback_globals["custom_open"])
+    opener = urllib.request.build_opener(CallbackHandler())
+    if root_kind == "module":
+        types.ModuleType.__getattribute__(namespace, "__dict__")["target"] = opener
+    else:
+        type.__setattr__(namespace, "target", opener)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request(source), timeout=1.0)
+
+    assert contacted == []
+
+
 def test_attrgetter_callback_fails_before_transport() -> None:
     source = "custom://source.invalid/data"
     sink = "custom://sink.invalid/steal"

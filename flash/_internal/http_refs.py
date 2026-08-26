@@ -27,6 +27,12 @@ _DYNAMIC_NAMESPACE_VALUES = (
     operator.methodcaller,
 )
 _ABSENT_SLOT = object()
+_STATIC_CONSTANT = object()
+_STATIC_MAPPING = object()
+_STATIC_ORIGIN = object()
+_STATIC_SEQUENCE = object()
+_STATIC_UNKNOWN = object()
+_BRANCH_OPCODES = frozenset((*dis.hasjabs, *dis.hasjrel))
 _FAST_LOAD_OPNAMES = frozenset({"LOAD_FAST", "LOAD_FAST_CHECK"})
 _STATELESS_TERMINAL_TYPES = (object, _thread.LockType, _thread.RLock)
 
@@ -135,34 +141,295 @@ def _getattr_type_static(owner: type, name: str, default: object) -> object:
     return default
 
 
+def _stack_expression_start(
+    instructions: tuple[dis.Instruction, ...],
+    end: int,
+) -> int:
+    required = 1
+    for index in range(end - 1, -1, -1):
+        instruction = instructions[index]
+        if instruction.opcode in _BRANCH_OPCODES:
+            raise ValueError
+        if instruction.arg is None:
+            effect = dis.stack_effect(instruction.opcode)
+        else:
+            effect = dis.stack_effect(instruction.opcode, instruction.arg)
+        required -= effect
+        if required == 0:
+            return index
+        if required < 0:
+            raise ValueError
+    raise ValueError
+
+
+def _function_metadata_spans(
+    instructions: tuple[dis.Instruction, ...],
+    code_index: int,
+) -> dict[int, tuple[int, int]]:
+    if code_index + 1 >= len(instructions):
+        return {}
+    make_function = instructions[code_index + 1]
+    flags = make_function.arg
+    if make_function.opname != "MAKE_FUNCTION" or type(flags) is not int or flags & ~0x0F:
+        return {}
+    spans = {}
+    cursor = code_index
+    for flag in (0x08, 0x04, 0x02, 0x01):
+        if flags & flag:
+            start = _stack_expression_start(instructions, cursor)
+            spans[flag] = (start, cursor)
+            cursor = start
+    return spans
+
+
+def _loaded_origin(
+    instruction: dis.Instruction,
+    origins: dict[str, tuple[str, str]],
+) -> tuple[str, str] | None:
+    source_name = instruction.argval
+    if type(source_name) is not str:
+        raise ValueError
+    if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}:
+        return ("global", source_name)
+    if instruction.opname in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}:
+        return origins.get(source_name)
+    return None
+
+
+def _contains_static_origin(value: tuple[object, ...]) -> bool:
+    tag = value[0]
+    if tag is _STATIC_ORIGIN:
+        return True
+    if tag is _STATIC_SEQUENCE:
+        return any(_contains_static_origin(item) for item in value[1])
+    if tag is _STATIC_MAPPING:
+        return any(_contains_static_origin(item) for pair in value[1] for item in pair)
+    return False
+
+
+def _static_subscript(
+    container: tuple[object, ...],
+    key: tuple[object, ...],
+) -> tuple[object, ...]:
+    if key[0] is not _STATIC_CONSTANT:
+        return (_STATIC_UNKNOWN,)
+    key_value = key[1]
+    if container[0] is _STATIC_SEQUENCE and type(key_value) is int:
+        values = container[1]
+        if -len(values) <= key_value < len(values):
+            return values[key_value]
+    elif container[0] is _STATIC_MAPPING:
+        for candidate, value in reversed(container[1]):
+            if (
+                candidate[0] is _STATIC_CONSTANT
+                and type(candidate[1]) is type(key_value)
+                and candidate[1] == key_value
+            ):
+                return value
+    return (_STATIC_UNKNOWN,)
+
+
+def _static_constant(value: object) -> tuple[object, ...]:
+    if value is None or type(value) in (bool, int, float, str, bytes):
+        return (_STATIC_CONSTANT, value)
+    if type(value) is tuple:
+        items = tuple(_static_constant(item) for item in value)
+        if all(item[0] is _STATIC_CONSTANT for item in items):
+            return (_STATIC_CONSTANT, value)
+    return (_STATIC_UNKNOWN,)
+
+
+def _has_ambiguous_default_control_flow(
+    instructions: tuple[dis.Instruction, ...],
+    start: int,
+    end: int,
+    origins: dict[str, tuple[str, str]],
+) -> bool:
+    offset_indices = {instruction.offset: index for index, instruction in enumerate(instructions)}
+    for index, instruction in enumerate(instructions[:end]):
+        if instruction.opcode not in _BRANCH_OPCODES:
+            continue
+        target = instruction.argval
+        target_index = offset_indices.get(target) if type(target) is int else None
+        if target_index is None or not start <= target_index <= end:
+            continue
+        branch_start = _stack_expression_start(instructions, index)
+        if any(
+            candidate.opname in {"LOAD_GLOBAL", "LOAD_NAME", "LOAD_DEREF"} | _FAST_LOAD_OPNAMES
+            and _loaded_origin(candidate, origins) is not None
+            for candidate in instructions[branch_start:end]
+        ):
+            return True
+    return False
+
+
+def _static_default_origin(
+    instructions: tuple[dis.Instruction, ...],
+    span: tuple[int, int],
+    origins: dict[str, tuple[str, str]],
+) -> tuple[str, str] | None:
+    start, end = span
+    if _has_ambiguous_default_control_flow(instructions, start, end, origins):
+        raise ValueError
+    expression = instructions[start:end]
+    has_origin = any(
+        instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME", "LOAD_DEREF"} | _FAST_LOAD_OPNAMES
+        and _loaded_origin(instruction, origins) is not None
+        for instruction in expression
+    )
+    stack: list[tuple[object, ...]] = []
+    for instruction in expression:
+        if instruction.opname == "LOAD_CONST":
+            stack.append(_static_constant(instruction.argval))
+        elif instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME", "LOAD_DEREF"} | _FAST_LOAD_OPNAMES:
+            origin = _loaded_origin(instruction, origins)
+            stack.append((_STATIC_ORIGIN, origin) if origin is not None else (_STATIC_UNKNOWN,))
+        elif instruction.opname in {"BUILD_TUPLE", "BUILD_LIST"}:
+            count = instruction.arg
+            if type(count) is not int or count < 0 or len(stack) < count:
+                raise ValueError
+            values = tuple(stack[-count:]) if count else ()
+            if count:
+                del stack[-count:]
+            stack.append((_STATIC_SEQUENCE, values))
+        elif instruction.opname == "LIST_TO_TUPLE":
+            if not stack:
+                raise ValueError
+        elif instruction.opname == "BUILD_CONST_KEY_MAP":
+            count = instruction.arg
+            if type(count) is not int or count < 1 or len(stack) < count + 1:
+                raise ValueError
+            keys = stack.pop()
+            values = stack[-count:]
+            del stack[-count:]
+            if keys[0] is not _STATIC_CONSTANT or type(keys[1]) is not tuple:
+                stack.append((_STATIC_UNKNOWN,))
+            else:
+                stack.append(
+                    (
+                        _STATIC_MAPPING,
+                        tuple(
+                            ((_STATIC_CONSTANT, key), value)
+                            for key, value in zip(keys[1], values, strict=True)
+                        ),
+                    )
+                )
+        elif instruction.opname == "BUILD_MAP":
+            count = instruction.arg
+            if type(count) is not int or count < 0 or len(stack) < 2 * count:
+                raise ValueError
+            items = stack[-2 * count :] if count else []
+            if count:
+                del stack[-2 * count :]
+            stack.append((_STATIC_MAPPING, tuple(zip(items[::2], items[1::2], strict=True))))
+        elif instruction.opname == "BINARY_SUBSCR":
+            if len(stack) < 2:
+                raise ValueError
+            key = stack.pop()
+            container = stack.pop()
+            stack.append(_static_subscript(container, key))
+        elif instruction.opname == "COPY":
+            depth = instruction.arg
+            if type(depth) is not int or depth < 1 or depth > len(stack):
+                raise ValueError
+            stack.append(stack[-depth])
+        elif instruction.opname == "SWAP":
+            depth = instruction.arg
+            if type(depth) is not int or depth < 2 or depth > len(stack):
+                raise ValueError
+            stack[-1], stack[-depth] = stack[-depth], stack[-1]
+        elif has_origin:
+            raise ValueError
+        else:
+            return None
+    if len(stack) != 1:
+        raise ValueError
+    result = stack[0]
+    if result[0] is _STATIC_ORIGIN:
+        return result[1]
+    if _contains_static_origin(result):
+        raise ValueError
+    if has_origin:
+        raise ValueError
+    return None
+
+
+def _preceding_value_spans(
+    instructions: tuple[dis.Instruction, ...],
+    start: int,
+    end: int,
+    count: int,
+) -> tuple[tuple[int, int], ...]:
+    values = []
+    cursor = end
+    for _ in range(count):
+        value_start = _stack_expression_start(instructions, cursor)
+        values.append((value_start, cursor))
+        cursor = value_start
+    if cursor != start:
+        return ()
+    values.reverse()
+    return tuple(values)
+
+
 def _nested_default_origins(
     instructions: tuple[dis.Instruction, ...],
     code_index: int,
     child: types.CodeType,
     origins: dict[str, tuple[str, str]],
 ) -> dict[str, tuple[str, str]]:
-    if code_index < 2:
-        return {}
-    build = instructions[code_index - 1]
-    if build.opname != "BUILD_TUPLE" or type(build.arg) is not int or build.arg < 1:
-        return {}
-    sources = instructions[code_index - 1 - build.arg : code_index - 1]
-    if len(sources) != build.arg:
-        return {}
     child_names = object.__getattribute__(child, "co_varnames")
     child_argcount = object.__getattribute__(child, "co_argcount")
-    if type(child_names) is not tuple or type(child_argcount) is not int:
+    child_kwonlyargcount = object.__getattribute__(child, "co_kwonlyargcount")
+    if (
+        type(child_names) is not tuple
+        or type(child_argcount) is not int
+        or type(child_kwonlyargcount) is not int
+    ):
         raise ValueError
-    default_names = child_names[child_argcount - build.arg : child_argcount]
-    if len(default_names) != len(sources):
-        return {}
+    spans = _function_metadata_spans(instructions, code_index)
     mapped = {}
-    for child_name, source in zip(default_names, sources, strict=True):
-        if source.opname not in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}:
-            continue
-        source_name = source.argval
-        if source_name in origins:
-            mapped[child_name] = origins[source_name]
+    positional_span = spans.get(0x01)
+    if positional_span is not None:
+        start, end = positional_span
+        build = instructions[end - 1]
+        count = build.arg
+        if build.opname == "BUILD_TUPLE" and type(count) is int and 1 <= count <= child_argcount:
+            sources = _preceding_value_spans(instructions, start, end - 1, count)
+            default_names = child_names[child_argcount - count : child_argcount]
+            if len(sources) == len(default_names):
+                for child_name, source in zip(default_names, sources, strict=True):
+                    origin = _static_default_origin(instructions, source, origins)
+                    if origin is not None:
+                        mapped[child_name] = origin
+    keyword_span = spans.get(0x02)
+    if keyword_span is not None:
+        start, end = keyword_span
+        build = instructions[end - 1]
+        count = build.arg
+        if build.opname == "BUILD_CONST_KEY_MAP" and type(count) is int and count >= 1:
+            key_start = _stack_expression_start(instructions, end - 1)
+            if key_start + 1 == end - 1:
+                keys = instructions[key_start].argval
+                if (
+                    type(keys) is tuple
+                    and len(keys) == count
+                    and all(type(name) is str for name in keys)
+                ):
+                    values = _preceding_value_spans(
+                        instructions,
+                        start,
+                        key_start,
+                        count,
+                    )
+                    keyword_names = child_names[
+                        child_argcount : child_argcount + child_kwonlyargcount
+                    ]
+                    if set(keys).issubset(keyword_names) and len(values) == len(keys):
+                        for child_name, source in zip(keys, values, strict=True):
+                            origin = _static_default_origin(instructions, source, origins)
+                            if origin is not None:
+                                mapped[child_name] = origin
     return mapped
 
 
@@ -259,7 +526,9 @@ def _loaded_reference_paths(
                 for index, instruction in enumerate(instructions)
                 if instruction.opname == "LOAD_CONST" and instruction.argval is item
             )
-            child_origins.update(_nested_default_origins(instructions, code_index, item, origins))
+            child_origins.update(
+                _nested_default_origins(instructions, code_index, item, current_origins)
+            )
             pending.append((item, child_origins))
     return tuple(sorted(paths))
 
