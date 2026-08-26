@@ -81,14 +81,28 @@ def detached_messages(
 ) -> list[dict[str, Any]]:
     if not isinstance(messages, sequence_types):
         raise error_type(sequence_error)
+    coerced: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise error_type(f"message {index} must be an object")
+        try:
+            coerced.append(dict(message))
+        except Exception as exc:
+            raise error_type(f"message {index} must be an object") from exc
     active: set[int] = set()
-    stack: list[tuple[Any, bool]] = [(messages, False)]
+    stack: list[tuple[Any, int | None]] = [(iter((coerced,)), None)]
     nodes = 0
     while stack:
-        value, exiting = stack.pop()
-        if exiting:
-            active.remove(id(value))
+        iterator, identity = stack[-1]
+        try:
+            value = next(iterator)
+        except StopIteration:
+            stack.pop()
+            if identity is not None:
+                active.remove(identity)
             continue
+        except Exception as exc:
+            raise error_type("messages contain an unsupported value") from exc
         nodes += 1
         if nodes > MAX_MESSAGE_NODES:
             raise error_type("messages exceed the supported complexity")
@@ -97,13 +111,17 @@ def detached_messages(
             if identity in active:
                 raise error_type("messages must not contain recursive containers")
             active.add(identity)
-            stack.append((value, True))
-            nested = value.values() if isinstance(value, Mapping) else value
-            stack.extend((item, False) for item in nested)
+            try:
+                nested = value.values() if isinstance(value, Mapping) else value
+                stack.append((iter(nested), identity))
+            except Exception as exc:
+                raise error_type("messages contain an unsupported value") from exc
     try:
-        return copy.deepcopy(messages)
+        return copy.deepcopy(coerced)
     except RecursionError as exc:
         raise error_type("messages exceed the supported complexity") from exc
+    except Exception as exc:
+        raise error_type("messages contain an unsupported value") from exc
 
 
 def has_image_blocks(messages: Any, *, sequence_types: type | tuple[type, ...]) -> bool:

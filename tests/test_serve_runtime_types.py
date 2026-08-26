@@ -7,14 +7,17 @@ import io
 import json
 import subprocess
 import sys
+from collections import UserDict
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
 from PIL import Image
 
+from flash.serve.request.validation import MAX_MESSAGE_NODES
 from flash.serve.runtime import (
     AdapterSpec,
     EngineConfig,
@@ -618,18 +621,95 @@ def test_packaged_tool_history_rejects_surrogate_call_ids_before_cache(field: st
         GenerationRequest(messages=messages)
 
 
+class _BrokenMessage(Mapping):
+    def __len__(self) -> int:
+        return 1
+
+    def __iter__(self):
+        raise TypeError("broken mapping")
+
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+
+class _BrokenMetadata(Mapping):
+    def __len__(self) -> int:
+        return 1
+
+    def __iter__(self):
+        return iter(("value",))
+
+    def __getitem__(self, key):
+        return 1
+
+    def values(self):
+        raise TypeError("broken values")
+
+
+class _WideMetadata(Mapping):
+    def __init__(self, width: int) -> None:
+        self.width = width
+        self.yielded = 0
+
+    def __len__(self) -> int:
+        return self.width
+
+    def __iter__(self):
+        return iter(range(self.width))
+
+    def __getitem__(self, key):
+        return key
+
+    def values(self):
+        for value in range(self.width):
+            self.yielded += 1
+            yield value
+
+
+def test_generation_request_wide_metadata_stops_at_the_complexity_bound() -> None:
+    metadata = _WideMetadata(100_000)
+
+    with pytest.raises(RuntimeConfigurationError, match="messages exceed the supported complexity"):
+        GenerationRequest(messages=[{"role": "user", "content": "hello", "metadata": metadata}])
+
+    assert metadata.yielded <= MAX_MESSAGE_NODES
+
+
+def test_generation_request_accepts_and_detaches_mapping_messages() -> None:
+    authored = {"role": "user", "content": "hello", "metadata": {"value": 1}}
+    for message in (UserDict(authored), MappingProxyType(authored)):
+        request = GenerationRequest(messages=[message])
+        authored["metadata"]["value"] = 2
+        assert type(request.messages[0]) is dict
+        assert request.messages[0]["metadata"] == {"value": 1}
+        authored["metadata"]["value"] = 1
+
+
+def test_generation_request_translates_mapping_copy_failures() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="message 0 must be an object"):
+        GenerationRequest(messages=[_BrokenMessage()])
+    with pytest.raises(RuntimeConfigurationError, match="messages contain an unsupported value"):
+        GenerationRequest(
+            messages=[{"role": "user", "content": "hello", "metadata": _BrokenMetadata()}]
+        )
+
+
 def test_generation_request_recursively_detaches_caller_messages() -> None:
-    metadata = {"nested": {"value": 1}}
+    shared = {"value": 1}
+    metadata = {"left": shared, "right": shared}
     content = [{"type": "text", "text": "hello"}]
     messages = [{"role": "user", "content": content, "metadata": metadata}]
 
     request = GenerationRequest(messages=messages)
-    metadata["nested"]["value"] = 2
+    shared["value"] = 2
     content[0]["text"] = "changed"
 
     assert isinstance(request.messages, tuple)
     assert isinstance(request.messages[0], dict)
-    assert request.messages[0]["metadata"] == {"nested": {"value": 1}}
+    assert request.messages[0]["metadata"] == {
+        "left": {"value": 1},
+        "right": {"value": 1},
+    }
     assert request.messages[0]["content"] == [{"type": "text", "text": "hello"}]
 
 

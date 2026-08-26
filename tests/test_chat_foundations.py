@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from types import MappingProxyType
 
 import pytest
 
@@ -508,6 +509,23 @@ def test_message_copy_complexity_is_controlled_and_caller_values_stay_detached()
     )
     metadata["nested"]["value"] = 2
     assert request.messages[0]["metadata"] == {"nested": {"value": 1}}
+
+
+def test_canonical_message_mapping_copy_failures_are_request_errors() -> None:
+    with pytest.raises(OpenAIRequestError, match="messages contain an unsupported value"):
+        parse_chat_request(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "hello",
+                        "metadata": MappingProxyType({"value": 1}),
+                    }
+                ]
+            },
+            require_model=False,
+            allow_managed_selectors=True,
+        )
 
 
 def test_tool_history_is_strict_and_does_not_mutate_caller_messages() -> None:
