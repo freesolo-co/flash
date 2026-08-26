@@ -61,6 +61,7 @@ def _import_modal_app(monkeypatch: pytest.MonkeyPatch, *, is_local: bool, enviro
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
     modal_stub.enter.side_effect = _passthrough_decorator
+    modal_stub.exit.side_effect = _passthrough_decorator
     modal_stub.asgi_app.side_effect = _passthrough_decorator
     modal_stub.parameter.return_value = None
     app_mock = MagicMock(name="app")

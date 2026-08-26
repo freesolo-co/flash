@@ -6,11 +6,10 @@ lazy inside engine methods; only pure serving support modules are imported at mo
 """
 
 import asyncio
+import contextlib
 import hashlib
-import inspect
 import json
 import os
-import shutil
 import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -21,7 +20,11 @@ from typing import Any
 # _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
 # the vllm build probes engine_boot uses.
 from flash.content.thinking import messages_for_chat_template
-from flash.serving.src.engine.lora_entries import _LoraEntry, cached_lora_request, entries_for
+from flash.serving.src.engine.lora_lifecycle import (
+    LoraLifecycleMixin,
+    ReplicaSourceCache,
+    _LoraEntry,
+)
 from flash.serving.src.engine.model_config import (
     engine_overrides_for,
     gpu_for,
@@ -31,21 +34,15 @@ from flash.serving.src.engine.model_config import (
     tokenizer_model_for,
 )
 from flash.serving.src.engine.support import (
-    _adapter_cache_path,
-    _adapter_cache_ready,
-    _adapter_source_cache_dir,
-    _adapter_source_ident,
-    _assert_source_cache_containment,
     _engine_is_dead,
     _load_adapters_for_base,
-    _materialize_adapter_snapshot,
     _replica_adapter_cache_dir,
     _safe_chat_template_kwargs,
     enforce_expected_checkpoint,
 )
 
 
-class _LoraEngineImpl:
+class _LoraEngineImpl(LoraLifecycleMixin):
     """Implementation of one vLLM multi-LoRA engine for a base model.
 
     Plain base class: each generated Modal subclass bakes one exact base-model identity and its GPU
@@ -55,21 +52,13 @@ class _LoraEngineImpl:
 
     base_model: str  # immutable class identity set by the per-model modal subclass
 
-    def _replica_identifier(self) -> str:
-        replica_id = getattr(self, "_replica_id", None)
-        if replica_id is None:
-            replica_id = uuid.uuid4().hex
-            self._replica_id = replica_id
-        return replica_id
-
-    def _adapter_materialization_dir(self) -> Path:
-        path = getattr(self, "_adapter_cache_dir", None)
-        if path is None:
-            from flash.serving.src.store.settings import ADAPTER_CACHE_DIR
-
-            path = _replica_adapter_cache_dir(ADAPTER_CACHE_DIR, self._replica_identifier())
-            self._adapter_cache_dir = path
-        return path
+    async def _exit(self) -> None:
+        task = getattr(self, "_liveness_task", None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        await self._source_cache_manager().close()
 
     async def _load(self) -> None:
         # async so the cached-LoRA preload (and the engine's first async use) run on the SAME event
@@ -80,7 +69,11 @@ class _LoraEngineImpl:
         from flash.serving.src.engine.boot import load_engine_config, pin_loras_default
         from flash.serving.src.store import settings as cfg
         from flash.serving.src.store.registry import AdapterRegistry
-        from flash.serving.src.store.settings import ADAPTER_CACHE_DIR, Settings
+        from flash.serving.src.store.settings import (
+            ADAPTER_CACHE_DIR,
+            ADAPTER_CACHE_MAX_BYTES,
+            Settings,
+        )
 
         self._replica_id = uuid.uuid4().hex
         self._adapter_cache_dir = _replica_adapter_cache_dir(ADAPTER_CACHE_DIR, self._replica_id)
@@ -91,6 +84,10 @@ class _LoraEngineImpl:
         self._source_locks: dict[tuple[str, str, str, str | None], asyncio.Lock] = {}
         self._source_locks_guard = asyncio.Lock()
         self._source_paths: dict[tuple[str, str, str, str | None], Path] = {}
+        self._source_cache = ReplicaSourceCache(
+            self._adapter_cache_dir,
+            ADAPTER_CACHE_MAX_BYTES,
+        )
         self._lora_entries: dict[str, _LoraEntry] = {}
         self._prompt_token_cache: OrderedDict[tuple[str, str], tuple[int, ...]] = OrderedDict()
         self._prompt_cache_size = cfg.PROMPT_TOKEN_CACHE_SIZE
@@ -169,206 +166,9 @@ class _LoraEngineImpl:
         except Exception:  # a monitor bug must never take serving down
             return
 
-    async def _adapter_lock(self, adapter_id: str) -> asyncio.Lock:
-        async with self._adapter_locks_guard:
-            lock = self._adapter_locks.get(adapter_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._adapter_locks[adapter_id] = lock
-            return lock
-
-    async def _source_lock(self, record: Any) -> asyncio.Lock:
-        ident = _adapter_source_ident(record)
-        async with self._source_locks_guard:
-            lock = self._source_locks.get(ident)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._source_locks[ident] = lock
-            return lock
-
-    def _entries(self) -> dict[str, _LoraEntry]:
-        return entries_for(self)
-
-    async def _evict_loaded_lora(self, adapter_id: str) -> None:
-        entries = self._entries()
-        if (entry := entries.get(adapter_id)) is None:
-            return
-        if entry.state == "reserved":
-            entries.pop(adapter_id)
-            return
         # durable routing disablement rejects new work before dispatch. vllm removal is deliberately
         # deferred to its lru or container teardown because remove_lora can race an active iterator on
         # this replica. retaining the immutable loaded entry lets already-resolved work finish safely.
-
-    async def _pin_lora(self, lora_request: Any) -> None:
-        pin = getattr(self.engine, "pin_lora", None)
-        if pin is None:
-            return
-        result = pin(lora_request.lora_int_id)
-        if inspect.isawaitable(result):
-            await result
-
-    async def _add_lora_locked(self, record: Any, path: Path) -> None:
-        adapter_id = record.adapter_id
-        entries = self._entries()
-        lora_request = self._cached_lora_request_locked(record, path)
-        was_reserved = entries[adapter_id].state == "reserved"
-        try:
-            added = await self.engine.add_lora(lora_request)
-        except Exception:
-            if was_reserved:
-                entries.pop(adapter_id)
-            raise
-        if added is False and was_reserved:
-            entries.pop(adapter_id)
-            raise RuntimeError("vLLM rejected a new LoRA registration")
-        entry = entries[adapter_id]
-        entries[adapter_id] = _LoraEntry(entry.source_ident, lora_request, "loaded")
-        if self._pin_loras:  # capped pools stay unpinned so surplus adapters can lru-swap
-            await self._pin_lora(lora_request)
-
-    async def _preload_cached_loras(self) -> None:
-        for record in self.registry.list_ready():
-            source_ident = _adapter_source_ident(record)
-            local_dir = _adapter_source_cache_dir(self._adapter_materialization_dir(), record)
-            subfolder = getattr(record, "subfolder", None)
-            path = _adapter_cache_path(local_dir, subfolder)
-            if not _adapter_cache_ready(path):
-                continue
-            lock = await self._adapter_lock(record.adapter_id)
-            async with lock:
-                self._source_paths[source_ident] = path
-                self.registry.set_local_path(record, path)
-                try:
-                    await self._add_lora_locked(record, path)
-                except Exception as exc:  # a bad cached LoRA must not kill startup
-                    print(
-                        f"cached LoRA preload skipped for {record.adapter_id}: {exc!r}",
-                        flush=True,
-                    )
-
-    async def _ensure_adapter_local_locked(self, record: Any) -> Path:
-        # Download body; caller must already hold self._adapter_lock(record.adapter_id).
-        import anyio
-        from huggingface_hub import snapshot_download
-
-        from flash.serving.src.store.settings import HF_HUB_CACHE_DIR
-
-        adapter_id = record.adapter_id
-        local_dir = _adapter_source_cache_dir(self._adapter_materialization_dir(), record)
-        subfolder = getattr(record, "subfolder", None)
-        cached_path = _adapter_cache_path(local_dir, subfolder)
-        # Stale cached path (source changed) -> fence the mismatched immutable identity. Physical vllm
-        # removal is intentionally deferred because it can race an active generation iterator.
-        if self.registry.local_path_is_stale(record):
-            await self._evict_loaded_lora(adapter_id)
-        path = self.registry.local_path(record)
-        if path is not None:
-            _assert_source_cache_containment(local_dir, path)
-            # this is the steady-state hit for an already-materialized adapter. keep the filesystem
-            # validation off the event loop so local disk stalls cannot block co-resident requests.
-            if await asyncio.to_thread(_adapter_cache_ready, path):
-                return path
-
-        source_ident = _adapter_source_ident(record)
-        source_lock = await self._source_lock(record)
-        async with source_lock:
-            path = self.registry.local_path(record)
-            if path is not None:
-                _assert_source_cache_containment(local_dir, path)
-                if _adapter_cache_ready(path):
-                    return path
-            if cached := self._source_paths.get(source_ident):
-                _assert_source_cache_containment(local_dir, cached)
-                if _adapter_cache_ready(cached):
-                    self.registry.set_local_path(record, cached)
-                    return cached
-                self._source_paths.pop(source_ident, None)
-
-            local_dir.parent.mkdir(parents=True, exist_ok=True)
-            repo_type = getattr(record, "repo_type", "model") or "model"
-            allow = [f"{subfolder}/**", f"{subfolder}/*"] if subfolder else None
-            if _adapter_cache_ready(cached_path):
-                self._source_paths[source_ident] = cached_path
-                self.registry.set_local_path(record, cached_path)
-                return cached_path
-            if local_dir.exists():
-                shutil.rmtree(local_dir, ignore_errors=True)
-
-            last_exc: Exception | None = None
-            for attempt in range(3):
-                try:
-                    downloaded = await anyio.to_thread.run_sync(
-                        lambda: snapshot_download(
-                            repo_id=record.repo_id,
-                            repo_type=repo_type,
-                            revision=record.hf_revision,
-                            cache_dir=str(HF_HUB_CACHE_DIR),
-                            token=self.settings.hf_api_key,
-                            allow_patterns=allow,
-                        )
-                    )
-                    path = await asyncio.to_thread(
-                        _materialize_adapter_snapshot,
-                        Path(downloaded),
-                        local_dir,
-                        subfolder,
-                    )
-                    self._source_paths[source_ident] = path
-                    self.registry.set_local_path(record, path)
-                    return path
-                except Exception as exc:  # Hub/network errors are often transient
-                    last_exc = exc
-                    if attempt == 2:
-                        break
-                    await asyncio.sleep(0.5 * (2**attempt))
-
-            assert last_exc is not None
-            raise last_exc
-
-    def _cached_lora_request_locked(self, record: Any, path: Path) -> Any:
-        return cached_lora_request(self, record, path)
-
-    async def _lora_request(
-        self, adapter_id: str, record_dict: dict[str, Any] | None = None
-    ) -> tuple[Any, Any]:
-        """Resolve (LoRARequest, record) for ``adapter_id`` under the adapter lock.
-
-        Returns the RESOLVED record alongside the request so the caller can bind the prompt's
-        thinking default to the SAME record the weights came from — a later registry re-read could
-        observe a different record after a concurrent same-id redeploy (see
-        ``_effective_chat_template_kwargs``).
-        """
-        from flash.serving.src.io.schemas import AdapterRecord
-
-        # Lock across read + download so a concurrent unregister can't slip in between.
-        lock = await self._adapter_lock(adapter_id)
-        async with lock:
-            forwarded = None
-            if record_dict is not None:
-                forwarded = AdapterRecord.model_validate(record_dict)
-                if forwarded.adapter_id != adapter_id or forwarded.base_model != self.base_model:
-                    raise ValueError("forwarded adapter identity does not match engine dispatch")
-                if not forwarded.serve_base_model and not forwarded.is_revision:
-                    raise ValueError("forwarded adapter must be an immutable revision")
-                self.registry.upsert(forwarded)
-            record = self.registry.get(adapter_id)
-            if record is None or record.status != "ready":
-                raise ValueError(f"Unknown adapter id on {self.base_model}: {adapter_id}")
-            if (
-                forwarded is not None
-                and record.immutable_fingerprint() != forwarded.immutable_fingerprint()
-            ):
-                raise ValueError(
-                    "engine adapter identity differs from the routed immutable revision"
-                )
-            if not record.serve_base_model and not record.is_revision:
-                raise ValueError(f"Unknown adapter id on {self.base_model}: {adapter_id}")
-            if record.serve_base_model:
-                # No LoRA to resolve: generate against the base weights the engine already has.
-                return None, record
-            path = await self._ensure_adapter_local_locked(record)
-            return self._cached_lora_request_locked(record, path), record
 
     def _thinking_default(self, record: Any, payload: Any) -> bool:
         """The ``enable_thinking`` to render with. A trained LoRA forces its own value; a base-model
@@ -583,30 +383,6 @@ class _LoraEngineImpl:
             if close is not None:
                 close()
 
-    async def _register(
-        self,
-        record_dict: dict[str, Any],
-        deployment_generation: str | None = None,
-    ) -> dict[str, Any]:
-        """Download + register an adapter into this engine's cache."""
-        from flash.serving.src.io.schemas import AdapterRecord
-
-        record = AdapterRecord.model_validate(record_dict).model_copy(
-            update={"deployment_generation": deployment_generation}
-        )
-        if not record.serve_base_model and not record.is_revision:
-            raise ValueError("only immutable adapter revisions can be registered")
-        lock = await self._adapter_lock(record.adapter_id)
-        async with lock:  # _locked variant: we hold the lock (the public one would deadlock)
-            if record.serve_base_model:
-                # No LoRA to download or add — the base weights are already loaded; just track the id.
-                self.registry.upsert(record, revive=True)
-                return {"ok": True, "adapter_id": record.adapter_id, "base_model": self.base_model}
-            path = await self._ensure_adapter_local_locked(record)
-            await self._add_lora_locked(record, path)
-            self.registry.upsert(record, revive=True)
-        return {"ok": True, "adapter_id": record.adapter_id, "base_model": self.base_model}
-
     @staticmethod
     def _lora_request_attestation(record: Any, lora_request: Any) -> str | None:
         """Attest that the engine resolved the exact immutable adapter that was asked for.
@@ -633,8 +409,26 @@ class _LoraEngineImpl:
         expected_checkpoint: str | None = None,
         generation_id: str | None = None,
         pre_header_dispatch_deadline: float | None = None,
+        admission_queue_id: str | None = None,
+        invocation_nonce: str | None = None,
     ) -> dict[str, Any]:
+        from flash.serving.src.engine.dispatch import publish_admission_acknowledgement
         from flash.serving.src.engine.generation import generate
+
+        admit = None
+        if admission_queue_id is not None:
+            if not generation_id or not invocation_nonce:
+                raise ValueError("non-streaming admission identity is incomplete")
+
+            async def admit() -> None:
+                if pre_header_dispatch_deadline is None:
+                    raise ValueError("non-streaming admission deadline is missing")
+                await publish_admission_acknowledgement(
+                    admission_queue_id,
+                    generation_id=generation_id,
+                    invocation_nonce=invocation_nonce,
+                    deadline=pre_header_dispatch_deadline,
+                )
 
         return await generate(
             self,
@@ -643,6 +437,7 @@ class _LoraEngineImpl:
             expected_checkpoint,
             generation_id,
             pre_header_dispatch_deadline,
+            admit=admit,
         )
 
     async def _stream_generate(
@@ -673,40 +468,6 @@ class _LoraEngineImpl:
             close = getattr(stream, "aclose", None)
             if close is not None:
                 await close()
-
-    async def _unregister(
-        self,
-        adapter_id: str,
-        expected_generation: str | None = None,
-    ) -> dict[str, Any]:
-        # undeploy under the per-adapter lock so register and stale background cleanup have one order.
-        lock = await self._adapter_lock(adapter_id)
-        async with lock:
-            current = self.registry.get(adapter_id)
-            current_generation = current.deployment_generation if current is not None else None
-            stale = current is not None and (
-                current_generation is not None
-                if expected_generation is None
-                else current_generation != expected_generation
-            )
-            if stale:
-                return {
-                    "ok": True,
-                    "removed": None,
-                    "skipped_stale_generation": True,
-                    "base_model": self.base_model,
-                    "cleanup_scope": "replica_local",
-                    "engine_replica_id": self._replica_identifier(),
-                }
-            self.registry.remove(adapter_id)
-            await self._evict_loaded_lora(adapter_id)
-        return {
-            "ok": True,
-            "removed": adapter_id,
-            "base_model": self.base_model,
-            "cleanup_scope": "replica_local",
-            "engine_replica_id": self._replica_identifier(),
-        }
 
     def _health(self) -> dict[str, Any]:
         cuda_available: bool | None = None

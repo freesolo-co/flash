@@ -97,22 +97,88 @@ class AdapterLookup:
         self._router.upsert(authoritative)
         return self._router.resolve(adapter_id)
 
+    @staticmethod
+    def _alias_refresh_identity(record: AdapterRecord) -> tuple[Any, ...]:
+        return (
+            record.status,
+            record.updated_at,
+            record.deployment_generation,
+            record.immutable_fingerprint(),
+        )
+
+    async def _refresh_exact_alias(
+        self,
+        adapter_id: str,
+        resolved: tuple[AdapterRecord, AdapterRecord],
+    ) -> tuple[AdapterRecord, AdapterRecord] | None:
+        if not resolved[0].is_alias or self._lookup_record is None:
+            return resolved
+        async with self._reload_lock:
+            cached_target_id = resolved[0].alias_of
+            observed_target_ids = {cached_target_id} if cached_target_id else set()
+            try:
+                for _attempt in range(3):
+                    alias = await asyncio.to_thread(self._lookup_record, adapter_id)
+                    target_id = alias.alias_of if alias is not None else None
+                    if isinstance(target_id, str) and target_id:
+                        observed_target_ids.add(target_id)
+                    target = (
+                        await asyncio.to_thread(self._lookup_record, target_id)
+                        if isinstance(target_id, str) and target_id
+                        else None
+                    )
+                    if (
+                        alias is None
+                        or alias.status != "ready"
+                        or not alias.is_alias
+                        or alias.adapter_id != adapter_id
+                        or target is None
+                        or target.status != "ready"
+                        or not target.is_revision
+                        or target.adapter_id != target_id
+                    ):
+                        break
+                    confirmed_alias = await asyncio.to_thread(self._lookup_record, adapter_id)
+                    if confirmed_alias is None or self._alias_refresh_identity(
+                        confirmed_alias
+                    ) != self._alias_refresh_identity(alias):
+                        continue
+                    for stale_target_id in observed_target_ids - {target.adapter_id}:
+                        self._router.discard_cached(stale_target_id)
+                    self._router.upsert(target)
+                    self._router.upsert(alias)
+                    refreshed = self._router.resolve(adapter_id)
+                    if refreshed is not None and refreshed == (alias, target):
+                        return refreshed
+                    break
+            except Exception:
+                self._router.discard_cached(adapter_id)
+                for target_id in observed_target_ids:
+                    self._router.discard_cached(target_id)
+                raise
+            self._router.discard_cached(adapter_id)
+            for target_id in observed_target_ids:
+                self._router.discard_cached(target_id)
+            return None
+
     async def resolve(
         self, adapter_id: str, *, require_supported_base_model: bool = True
     ) -> tuple[AdapterRecord, AdapterRecord]:
         resolved = self._router.resolve(adapter_id)
-        if resolved is not None and self._reload_records is not None:
-            if resolved[0].is_alias:
-                # mutable aliases must re-read durable routing authority before every dispatch. a
-                # storage failure cannot fall back to a cached ready alias after another router may
-                # have fenced it.
+        if resolved is not None and resolved[0].is_alias:
+            if self._lookup_record is not None:
+                resolved = await self._refresh_exact_alias(adapter_id, resolved)
+            elif self._reload_records is not None:
                 await self.reload()
                 resolved = self._router.resolve(adapter_id)
-            elif self._is_stale():
+        elif resolved is not None and self._reload_records is not None:
+            if self._is_stale():
                 self._schedule_reload()
         elif resolved is None and self._reload_records is not None:
             await self.reload()
             resolved = self._router.resolve(adapter_id)
+            if resolved is not None and resolved[0].is_alias and self._lookup_record is not None:
+                resolved = await self._refresh_exact_alias(adapter_id, resolved)
         if resolved is not None:
             resolved = await self._refresh_exact_revision(adapter_id, resolved)
         if resolved is None:

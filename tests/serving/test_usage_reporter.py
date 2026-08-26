@@ -31,6 +31,7 @@ def modal_app_module(load_modal_app_under_stub):
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
     modal_stub.enter.side_effect = _passthrough_decorator
+    modal_stub.exit.side_effect = _passthrough_decorator
     modal_stub.asgi_app.side_effect = _passthrough_decorator
     modal_stub.parameter.return_value = None
     app_mock = MagicMock(name="app")
@@ -887,7 +888,7 @@ def test_preload_cached_loras_adds_only_replica_cached_adapters(
 def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkeypatch, tmp_path):
     # two distinct adapters whose sha1 masks collide to the same vllm int id must not share it.
     # unconfirmed entries still occupy their id because vllm may retain the corresponding weights.
-    from flash.serving.src.engine.lora_engine import _LoraEntry
+    from flash.serving.src.engine.lora_lifecycle import _LoraEntry
     from flash.serving.src.io.schemas import AdapterRecord
     from flash.serving.src.store import registry as registry_mod
 
@@ -922,7 +923,7 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
 
 
 def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_module, monkeypatch):
-    from flash.serving.src.engine.lora_engine import _LoraEntry
+    from flash.serving.src.engine.lora_lifecycle import _LoraEntry
     from flash.serving.src.store import registry as registry_mod
 
     monkeypatch.setattr(registry_mod, "lora_int_id", lambda _adapter_id: 42)

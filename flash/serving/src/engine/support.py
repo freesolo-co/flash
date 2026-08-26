@@ -124,16 +124,23 @@ def _adapter_cache_ready(path: Path) -> bool:
         return False
 
 
-def _materialize_adapter_snapshot(
-    snapshot_root: Path, local_dir: Path, subfolder: str | None
-) -> Path:
-    """Atomically copy one immutable hub snapshot into a replica-local final directory."""
+def _adapter_snapshot_size(snapshot_root: Path, subfolder: str | None) -> int:
+    """return the exact bytes that materialization will copy from an immutable snapshot."""
     source = _adapter_cache_path(snapshot_root, subfolder)
     if not _adapter_cache_ready(source):
         raise RuntimeError(
             f"downloaded adapter cache is incomplete: {source} has no non-empty adapter_model "
             "tensor file"
         )
+    return sum(path.stat().st_size for path in source.rglob("*") if path.is_file())
+
+
+def _materialize_adapter_snapshot(
+    snapshot_root: Path, local_dir: Path, subfolder: str | None
+) -> Path:
+    """Atomically copy one immutable hub snapshot into a replica-local final directory."""
+    source = _adapter_cache_path(snapshot_root, subfolder)
+    _adapter_snapshot_size(snapshot_root, subfolder)
     staging = local_dir.with_name(f".{local_dir.name}.tmp-{uuid.uuid4().hex}")
     try:
         target = _adapter_cache_path(staging, subfolder)

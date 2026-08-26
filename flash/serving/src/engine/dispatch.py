@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 PRE_HEADER_DISPATCH_TIMEOUT_SECONDS = 120.0
 CAPACITY_RETRY_AFTER_SECONDS = 1
@@ -32,3 +34,83 @@ def require_pre_header_dispatch_time(
         raise ValueError("pre-header dispatch deadline must be a finite timestamp")
     if (clock or time.time)() >= normalized:
         raise PreHeaderDispatchExpired("request expired before gpu generation began")
+
+
+_PROTOCOL_VERSION = 1
+_ACK_FIELDS = frozenset(
+    {
+        "protocol_version",
+        "kind",
+        "generation_id",
+        "invocation_nonce",
+        "function_call_id",
+    }
+)
+
+
+class AdmissionProtocolError(RuntimeError):
+    """the remote admission acknowledgement was not exact and trustworthy."""
+
+
+def admission_acknowledgement(
+    *,
+    generation_id: str,
+    invocation_nonce: str,
+    function_call_id: str,
+) -> dict[str, Any]:
+    return {
+        "protocol_version": _PROTOCOL_VERSION,
+        "kind": "admitted",
+        "generation_id": generation_id,
+        "invocation_nonce": invocation_nonce,
+        "function_call_id": function_call_id,
+    }
+
+
+def validate_admission_acknowledgement(
+    value: Any,
+    *,
+    generation_id: str,
+    invocation_nonce: str,
+    function_call_id: str,
+) -> None:
+    if not isinstance(value, Mapping) or frozenset(value) != _ACK_FIELDS:
+        raise AdmissionProtocolError("invalid non-streaming admission acknowledgement")
+    expected = admission_acknowledgement(
+        generation_id=generation_id,
+        invocation_nonce=invocation_nonce,
+        function_call_id=function_call_id,
+    )
+    if dict(value) != expected:
+        raise AdmissionProtocolError("mismatched non-streaming admission acknowledgement")
+
+
+async def publish_admission_acknowledgement(
+    queue_id: str,
+    *,
+    generation_id: str,
+    invocation_nonce: str,
+    deadline: float,
+) -> None:
+    import modal
+
+    function_call_id = modal.current_function_call_id()
+    if not isinstance(function_call_id, str) or not function_call_id:
+        raise AdmissionProtocolError("function call id is unavailable for admission")
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        raise PreHeaderDispatchExpired("request expired before gpu generation began")
+    queue = modal.Queue.from_id(queue_id)
+    try:
+        await asyncio.wait_for(
+            queue.put.aio(
+                admission_acknowledgement(
+                    generation_id=generation_id,
+                    invocation_nonce=invocation_nonce,
+                    function_call_id=function_call_id,
+                )
+            ),
+            timeout=remaining,
+        )
+    except TimeoutError as exc:
+        raise PreHeaderDispatchExpired("request expired before gpu generation began") from exc

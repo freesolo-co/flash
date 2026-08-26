@@ -161,7 +161,10 @@ def test_targeted_get_reads_disabled_revision_without_status_filter() -> None:
     record = get_adapter(REVISION_ID, _settings())
     assert record is not None
     assert record.status == "disabled"
-    assert "status" not in FakeClient.requests[0]["params"]
+    params = FakeClient.requests[0]["params"]
+    assert params["adapter_id"] == f"eq.{REVISION_ID}"
+    assert params["limit"] == "1"
+    assert "status" not in params
 
 
 def test_insert_is_non_upserting_and_returns_authoritative_row() -> None:

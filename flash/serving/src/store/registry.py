@@ -135,6 +135,14 @@ class AdapterRegistry:
             self._local_idents.pop(adapter_id, None)
             return removed
 
+    def discard_cached(self, adapter_id: str) -> AdapterRecord | None:
+        """drop untrusted cached state without creating a durable undeploy tombstone."""
+        with self._lock:
+            removed = self._records.pop(adapter_id, None)
+            self._local_paths.pop(adapter_id, None)
+            self._local_idents.pop(adapter_id, None)
+            return removed
+
     def local_path_is_stale(self, record: AdapterRecord) -> bool:
         if record.is_alias:
             return False
@@ -152,6 +160,11 @@ class AdapterRegistry:
         with self._lock:
             self._local_paths[record.adapter_id] = path
             self._local_idents[record.adapter_id] = _download_ident(record)
+
+    def clear_local_path(self, adapter_id: str) -> None:
+        with self._lock:
+            self._local_paths.pop(adapter_id, None)
+            self._local_idents.pop(adapter_id, None)
 
     def local_path(self, record: AdapterRecord) -> Path | None:
         if record.is_alias:

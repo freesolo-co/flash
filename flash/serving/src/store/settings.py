@@ -12,6 +12,7 @@ HF_HUB_CACHE_DIR = HOSTING_CACHE_DIR / "hub"
 # adapter final directories stay replica-local. immutable hub, weight, and compile caches remain on
 # the shared hosting volume through the environment configured by the modal app.
 ADAPTER_CACHE_DIR = Path("/tmp/flash-serving-adapters")
+ADAPTER_CACHE_MAX_BYTES = 32 * 1024 * 1024 * 1024
 
 # ── Hardcoded serving config (no knobs) ───────────────────────────────────────────────────────
 # An optimization either exists (baked in here) or it doesn't — there is nothing to tune at deploy

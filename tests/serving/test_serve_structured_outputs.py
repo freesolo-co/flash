@@ -25,8 +25,12 @@ import pytest
 from pydantic import ValidationError
 
 from flash.serve.request.openai import parse_chat_request
+from flash.serving.src.engine.lora_lifecycle import _LoraEntry
 from flash.serving.src.engine.model_config import reasoning_parser_for
-from flash.serving.src.engine.support import _require_reasoning_api_compatibility
+from flash.serving.src.engine.support import (
+    _adapter_source_ident,
+    _require_reasoning_api_compatibility,
+)
 from flash.serving.src.io.responses import openai_generate_fields
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.io.streaming import openai_chat_stream
@@ -49,6 +53,7 @@ def modal_app_module(load_modal_app_under_stub):
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
     modal_stub.enter.side_effect = _passthrough_decorator
+    modal_stub.exit.side_effect = _passthrough_decorator
     modal_stub.asgi_app.side_effect = _passthrough_decorator
     modal_stub.parameter.return_value = None
     app_mock = MagicMock(name="app")
@@ -459,10 +464,15 @@ def test_stream_generate_attests_the_resolved_revision_before_deltas(modal_app_m
         }
     )
 
+    request = types.SimpleNamespace(lora_name=revision_id, lora_int_id=42)
+
     async def resolved_lora(_adapter_id, _record_dict=None):
-        return types.SimpleNamespace(lora_name=revision_id), revision
+        return request, revision
 
     eng._lora_request = resolved_lora
+    eng._lora_entries = {
+        revision_id: _LoraEntry(_adapter_source_ident(revision), request, "reserved")
+    }
 
     async def first_event():
         stream = eng._stream_generate({"adapter_id": revision_id, "prompt": "hi"})

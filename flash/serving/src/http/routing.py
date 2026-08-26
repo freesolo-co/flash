@@ -74,6 +74,9 @@ class AdapterRouter:
     def remove(self, adapter_id: str) -> AdapterRecord | None:
         return self._registry.remove(adapter_id)
 
+    def discard_cached(self, adapter_id: str) -> AdapterRecord | None:
+        return self._registry.discard_cached(adapter_id)
+
     def resolve(self, adapter_id: str) -> tuple[AdapterRecord, AdapterRecord] | None:
         requested = self._registry.get(adapter_id)
         if requested is None or requested.status != "ready":

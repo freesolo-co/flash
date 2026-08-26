@@ -42,6 +42,7 @@ def modal_app_module(load_modal_app_under_stub):
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
     modal_stub.enter.side_effect = _passthrough_decorator
+    modal_stub.exit.side_effect = _passthrough_decorator
     modal_stub.asgi_app.side_effect = _passthrough_decorator
     modal_stub.parameter.return_value = None
     app_mock = MagicMock(name="app")
@@ -95,6 +96,7 @@ modal_stub = MagicMock(name="modal")
 modal_stub.concurrent.side_effect = passthrough_decorator
 modal_stub.method.side_effect = passthrough_decorator
 modal_stub.enter.side_effect = passthrough_decorator
+modal_stub.exit.side_effect = passthrough_decorator
 modal_stub.asgi_app.side_effect = passthrough_decorator
 modal_stub.parameter.return_value = None
 app_mock = MagicMock(name="app")
@@ -744,6 +746,7 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
 
     class _Call:
         def __init__(self, result: dict) -> None:
+            self.object_id = "fc-generate"
             self.result = result
             self.cancelled = False
             self.get = types.SimpleNamespace(aio=self._get)
@@ -755,9 +758,42 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
         async def _cancel(self) -> None:
             self.cancelled = True
 
-    async def _spawn_generate(*args: Any) -> _Call:
-        return _Call(await _generate(*args))
+    class _AdmissionQueue:
+        def __init__(self) -> None:
+            self.object_id = "qu-generate"
+            self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            self.get = types.SimpleNamespace(aio=self._queue.get)
 
+    class _AdmissionContext:
+        def __init__(self, queue: _AdmissionQueue) -> None:
+            self.queue = queue
+
+        async def __aenter__(self) -> _AdmissionQueue:
+            return self.queue
+
+        async def __aexit__(self, *_exc_info: object) -> None:
+            return None
+
+    admission_queue = _AdmissionQueue()
+
+    async def _spawn_generate(*args: Any) -> _Call:
+        from flash.serving.src.engine.dispatch import admission_acknowledgement
+
+        payload_dict, record_dict, checkpoint, generation_id, deadline, queue_id, nonce = args
+        assert queue_id == admission_queue.object_id
+        call = _Call(
+            await _generate(payload_dict, record_dict, checkpoint, generation_id, deadline)
+        )
+        await admission_queue._queue.put(
+            admission_acknowledgement(
+                generation_id=generation_id,
+                invocation_nonce=nonce,
+                function_call_id=call.object_id,
+            )
+        )
+        return call
+
+    mod.modal.Queue.ephemeral.aio.return_value = _AdmissionContext(admission_queue)
     stream_call_method = types.SimpleNamespace(spawn=types.SimpleNamespace(aio=None))
     monkeypatch.setattr(
         "flash.serving.src.stream_channel.client.CancellableStreamChannel",
@@ -933,109 +969,6 @@ def test_modal_stream_rejects_missing_or_invalid_deadline(modal_app_module, dead
     )
     with pytest.raises(RuntimeError, match="valid pre-header dispatch deadline"):
         modal_app_module._ModalEnginePool().stream_generate("Qwen/Qwen3.5-9B", payload, object())
-
-
-def test_blocked_modal_spawn_expires_with_absolute_deadline(modal_app_module) -> None:
-    spawn_cancelled = False
-
-    async def blocked_spawn() -> Any:
-        nonlocal spawn_cancelled
-        try:
-            await asyncio.Event().wait()
-        finally:
-            spawn_cancelled = True
-
-    method = types.SimpleNamespace(spawn=types.SimpleNamespace(aio=blocked_spawn))
-
-    async def scenario() -> None:
-        with pytest.raises(modal_app_module.PreHeaderDispatchExpired):
-            await modal_app_module._spawn_modal_call(method, time.time() + 0.01)
-        await asyncio.sleep(0)
-
-    asyncio.run(scenario())
-    assert spawn_cancelled is True
-
-
-def test_blocked_modal_result_expires_and_cancels_exact_call(modal_app_module) -> None:
-    class _Call:
-        def __init__(self) -> None:
-            self.cancelled = 0
-            self.get = types.SimpleNamespace(aio=self._get)
-            self.cancel = types.SimpleNamespace(aio=self._cancel)
-
-        async def _get(self) -> dict[str, bool]:
-            await asyncio.Event().wait()
-            return {"ok": True}
-
-        async def _cancel(self) -> None:
-            self.cancelled += 1
-
-    call = _Call()
-
-    async def scenario() -> None:
-        with pytest.raises(modal_app_module.PreHeaderDispatchExpired):
-            await modal_app_module._await_modal_call(call, time.time() + 0.01)
-
-    asyncio.run(scenario())
-    assert call.cancelled == 1
-
-
-def test_modal_cancel_cleanup_failure_does_not_mask_primary_failures(modal_app_module) -> None:
-    class _ModalFailure(RuntimeError):
-        pass
-
-    class _Call:
-        def __init__(self, get: Any) -> None:
-            self.cancelled = 0
-            self.get = types.SimpleNamespace(aio=get)
-            self.cancel = types.SimpleNamespace(aio=self._cancel)
-
-        async def _cancel(self) -> None:
-            self.cancelled += 1
-            raise RuntimeError("cleanup failed")
-
-    async def blocked() -> dict[str, bool]:
-        await asyncio.Event().wait()
-        return {"ok": True}
-
-    async def modal_failure() -> dict[str, bool]:
-        raise _ModalFailure("modal failed")
-
-    async def scenario() -> tuple[int, int, int]:
-        timed_out = _Call(blocked)
-        with pytest.raises(modal_app_module.PreHeaderDispatchExpired):
-            await modal_app_module._await_modal_call(timed_out, time.time() + 0.01)
-
-        failed = _Call(modal_failure)
-        with pytest.raises(_ModalFailure, match="modal failed"):
-            await modal_app_module._await_modal_call(failed, time.time() + 60)
-
-        cancelled = _Call(blocked)
-        task = asyncio.create_task(modal_app_module._await_modal_call(cancelled, time.time() + 60))
-        await asyncio.sleep(0)
-        task.cancel()
-        result = await asyncio.gather(task, return_exceptions=True)
-        assert isinstance(result[0], asyncio.CancelledError)
-        return timed_out.cancelled, failed.cancelled, cancelled.cancelled
-
-    assert asyncio.run(scenario()) == (1, 1, 1)
-
-
-def test_completed_modal_call_is_not_cancelled(modal_app_module) -> None:
-    class _Call:
-        def __init__(self) -> None:
-            self.cancelled = 0
-            self.get = types.SimpleNamespace(aio=lambda: asyncio.sleep(0, result={"ok": True}))
-            self.cancel = types.SimpleNamespace(aio=self._cancel)
-
-        async def _cancel(self) -> None:
-            self.cancelled += 1
-
-    call = _Call()
-    result = asyncio.run(modal_app_module._await_modal_call(call, time.time() + 60))
-
-    assert result == {"ok": True}
-    assert call.cancelled == 0
 
 
 # ---- Functional: actually run _load() and capture the AsyncEngineArgs (vLLM/tokenizer stubbed) ----

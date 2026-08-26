@@ -7,6 +7,7 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any, TypedDict
 
 from flash.serve.runtime.sampling import (
@@ -102,6 +103,32 @@ async def _close_output_stream(output_stream: Any) -> None:
             raise
 
 
+async def _confirm_lora_consumed(owner: Any, record: Any, lora_request: Any) -> None:
+    confirm = getattr(owner, "_mark_lora_consumed", None)
+    if confirm is not None:
+        await confirm(record, lora_request)
+
+
+@asynccontextmanager
+async def _in_flight_lease(owner: Any, record: Any, lora_request: Any) -> AsyncIterator[None]:
+    factory = getattr(owner, "_lora_request_in_flight", None)
+    if factory is None:
+        yield
+        return
+    async with factory(record, lora_request):
+        yield
+
+
+@asynccontextmanager
+async def _source_lease(owner: Any, record: Any, lora_request: Any) -> AsyncIterator[None]:
+    factory = getattr(owner, "_source_generation_lease", None)
+    if factory is None:
+        yield
+        return
+    async with factory(record, lora_request):
+        yield
+
+
 def _usage_fields(
     request_output: Any,
     completion_token_ids: list[int],
@@ -140,6 +167,8 @@ async def generate(
     expected_checkpoint: str | None = None,
     generation_id: str | None = None,
     pre_header_dispatch_deadline: float | None = None,
+    *,
+    admit: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     require_pre_header_dispatch_time(pre_header_dispatch_deadline)
 
@@ -160,10 +189,17 @@ async def generate(
     start = time.time()
     final_output = None
     output_stream = None
+    in_flight_lease = None
     prompt_input = await owner._prepare_prompt_input(payload, thinking)
+    source_lease = _source_lease(owner, record, lora_request)
+    await source_lease.__aenter__()
     try:
         require_pre_header_dispatch_time(pre_header_dispatch_deadline)
+        if admit is not None:
+            await admit()
         try:
+            in_flight_lease = _in_flight_lease(owner, record, lora_request)
+            await in_flight_lease.__aenter__()
             output_stream = owner.engine.generate(
                 prompt_input,
                 sampling,
@@ -173,6 +209,7 @@ async def generate(
                 reasoning_parser_kwargs=parser_kwargs,
             )
             async for output in output_stream:
+                await _confirm_lora_consumed(owner, record, lora_request)
                 final_output = output
         except Exception:
             owner._self_heal_if_dead("generate")
@@ -181,7 +218,14 @@ async def generate(
         try:
             await _close_output_stream(output_stream)
         finally:
-            owner._close_prompt_images(prompt_input)
+            try:
+                owner._close_prompt_images(prompt_input)
+            finally:
+                try:
+                    await source_lease.__aexit__(None, None, None)
+                finally:
+                    if in_flight_lease is not None:
+                        await in_flight_lease.__aexit__(None, None, None)
     if final_output is None:
         raise RuntimeError("vLLM returned no output")
     choices = [
@@ -239,7 +283,10 @@ async def stream_generate(
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
     start = time.time()
     prompt_input = await owner._prepare_prompt_input(payload, thinking)
+    source_lease = _source_lease(owner, record, lora_request)
+    await source_lease.__aenter__()
     output_stream = None
+    in_flight_lease = None
     completion_ids: list[int] = []
     choice_state: dict[int, _ChoiceState] = {
         index: {"text": "", "token_ids": [], "finish_reason": None} for index in range(payload.n)
@@ -257,6 +304,8 @@ async def stream_generate(
         else:
             require_pre_header_dispatch_time(pre_header_dispatch_deadline)
         try:
+            in_flight_lease = _in_flight_lease(owner, record, lora_request)
+            await in_flight_lease.__aenter__()
             output_stream = owner.engine.generate(
                 prompt_input,
                 sampling,
@@ -266,6 +315,7 @@ async def stream_generate(
                 reasoning_parser_kwargs=parser_kwargs,
             )
             first_output = await anext(output_stream)
+            await _confirm_lora_consumed(owner, record, lora_request)
         except StopAsyncIteration as exc:
             raise RuntimeError("vLLM returned no output") from exc
         except Exception:
@@ -340,4 +390,11 @@ async def stream_generate(
         try:
             await _close_output_stream(output_stream)
         finally:
-            owner._close_prompt_images(prompt_input)
+            try:
+                owner._close_prompt_images(prompt_input)
+            finally:
+                try:
+                    await source_lease.__aexit__(None, None, None)
+                finally:
+                    if in_flight_lease is not None:
+                        await in_flight_lease.__aexit__(None, None, None)
