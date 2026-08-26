@@ -88,11 +88,8 @@ class _LeaseWatch:
 
     async def _run(self) -> None:
         while True:
-            self.check()
-            try:
-                await self._consume(timeout=CONTROL_POLL_SECONDS)
-            except stdlib_queue.Empty:
-                continue
+            await self.refresh_and_check()
+            await self._consume(timeout=CONTROL_POLL_SECONDS)
 
     async def refresh_and_check(self) -> None:
         while await self._consume(block=False):

@@ -57,7 +57,11 @@ async def _bounded_shield(operation: Awaitable[Any], deadline_seconds: float) ->
         await asyncio.wait_for(asyncio.shield(task), timeout=deadline_seconds)
     except (TimeoutError, asyncio.CancelledError):
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
+        if done:
+            await asyncio.gather(task, return_exceptions=True)
+        else:
+            task.add_done_callback(_consume_task_result)
         raise
 
 

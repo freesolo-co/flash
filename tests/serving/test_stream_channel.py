@@ -390,6 +390,30 @@ def test_cold_start_admission_drains_fresh_bound_lease_before_expiry_check(
     assert manifest["terminal_kind"] == "event"
 
 
+def test_running_lease_watch_drains_fresh_heartbeat_before_expiry_check() -> None:
+    async def scenario() -> ChannelErrorCode:
+        queue = _FakeQueue()
+        watch = channel_engine._LeaseWatch(
+            queue,
+            generation_id="generation-1",
+            invocation_nonce="nonce-1",
+            function_call_id="fc-1",
+        )
+        watch._latest = watch._validator.accept(
+            _control(0, call_id=None, deadline=time.time() - 1).to_dict()
+        )
+        watch._latest = watch._validator.accept(_control(1, deadline=time.time() - 1).to_dict())
+        await queue.control(_control(2, deadline=time.time() + 5))
+        task = asyncio.create_task(watch._run())
+        await asyncio.sleep(0)
+        await queue.control(_control(3, kind="cancel"))
+        with pytest.raises(StreamChannelError) as exc_info:
+            await asyncio.wait_for(task, timeout=1)
+        return exc_info.value.code
+
+    assert asyncio.run(scenario()) == ChannelErrorCode.CANCELLED
+
+
 def test_queued_lease_expiry_refuses_before_hydration(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> tuple[int, int, dict[str, Any]]:
         queue = _FakeQueue()
@@ -928,6 +952,38 @@ def test_bounded_cancel_timeout_cancels_and_awaits_local_rpc_task() -> None:
     assert asyncio.run(scenario()) == (True, False)
 
 
+def test_bounded_cancel_timeout_does_not_join_noncooperative_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[bool, bool]:
+        monkeypatch.setattr(client, "CLEANUP_SECONDS", 0.01)
+        cancellation_received = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def noncooperative_rpc() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_received.set()
+                await release.wait()
+            finally:
+                finished.set()
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                client._bounded_shield(noncooperative_rpc(), 0.01),
+                timeout=0.1,
+            )
+        await cancellation_received.wait()
+        returned_before_release = not finished.is_set()
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=0.1)
+        return returned_before_release, finished.is_set()
+
+    assert asyncio.run(scenario()) == (True, True)
+
+
 class _FakeCall:
     def __init__(self, object_id: str, result: Any) -> None:
         self.object_id = object_id
@@ -1376,7 +1432,8 @@ def test_channel_is_direct_async_iterator_with_one_spawn_and_idempotent_close() 
     async def scenario() -> tuple[dict[str, Any], int, int, list[str], bool]:
         queue = _FakeQueue()
         pending = asyncio.Event()
-        call = _FakeCall("fc-1", pending.wait())
+        pending_result = asyncio.create_task(pending.wait())
+        call = _FakeCall("fc-1", pending_result)
         method = _FakeSpawnMethod(None)
 
         async def spawn(*_args: Any) -> _FakeCall:
@@ -1415,7 +1472,8 @@ def test_cancelled_anext_runs_channel_cleanup_before_idempotent_close() -> None:
     async def scenario() -> tuple[int, list[str], int]:
         queue = _FakeQueue()
         pending = asyncio.Event()
-        call = _FakeCall("fc-1", pending.wait())
+        pending_result = asyncio.create_task(pending.wait())
+        call = _FakeCall("fc-1", pending_result)
         method = _FakeSpawnMethod(None)
         spawn_ready = asyncio.Event()
 
@@ -1455,7 +1513,8 @@ def test_iterator_close_sends_tombstone_and_exact_call_cancel() -> None:
     async def scenario() -> tuple[int, list[str]]:
         queue = _FakeQueue()
         pending = asyncio.Event()
-        call = _FakeCall("fc-1", pending.wait())
+        pending_result = asyncio.create_task(pending.wait())
+        call = _FakeCall("fc-1", pending_result)
         method = _FakeSpawnMethod(None)
 
         async def spawn(*_args: Any) -> _FakeCall:
