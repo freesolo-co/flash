@@ -607,9 +607,7 @@ def test_poll_job_queue_deadline_remains_no_capacity(monkeypatch):
         ({"throttled": 1}, "throttled_grace_s", "no_capacity"),
     ],
 )
-def test_poll_job_preserves_provider_health_observations(
-    monkeypatch, workers, grace_name, failure
-):
+def test_poll_job_preserves_provider_health_observations(monkeypatch, workers, grace_name, failure):
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs
 
@@ -662,7 +660,9 @@ def test_poll_job_recovers_transient_result_download_to_current_fenced_success(m
 
     monkeypatch.setattr(polling, "_observe_artifacts", observe)
     monkeypatch.setattr(polling.time, "time", _stepped_clock(step=1.0))
-    monkeypatch.setattr(runpod_api, "job_status", lambda *_args, **_kwargs: {"status": "IN_PROGRESS"})
+    monkeypatch.setattr(
+        runpod_api, "job_status", lambda *_args, **_kwargs: {"status": "IN_PROGRESS"}
+    )
 
     result = polling.poll_job(_runpod_handle(jobs), _poll_spec(), interval_s=0)
 
@@ -750,6 +750,7 @@ def test_current_attempt_rejects_a_stale_runpod_fence(monkeypatch):
 
     with pytest.raises(RuntimeError, match="current fenced attempt"):
         polling._current_attempt("run-poll", _runpod_handle(jobs, fence=1))
+
 
 # ---------------------------------------------------------------------------
 # Supervisor retry logic (runner) with mocked job submit
@@ -2084,7 +2085,9 @@ def test_shared_cache_zero_retry_budget_submits_exactly_once(monkeypatch, failur
 
         submissions = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, fence=1, on_last_gpu=False, **_):
+        def fake_submit(
+            spec, seed, log=None, on_handle=None, attempt=0, fence=1, on_last_gpu=False, **_
+        ):
             submissions.append((attempt, spec.gpu.network_volume, on_last_gpu))
             return jobs.PollResult(False, failure=failure, detail="cache-constrained failure")
 
@@ -2399,7 +2402,9 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
         monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
         last_flags: list[bool] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, fence=1, on_last_gpu=False, **_):
+        def fake_submit(
+            spec, seed, log=None, on_handle=None, attempt=0, fence=1, on_last_gpu=False, **_
+        ):
             last_flags.append(on_last_gpu)
             if on_handle:
                 on_handle(

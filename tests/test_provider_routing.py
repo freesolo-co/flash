@@ -504,8 +504,9 @@ def test_concurrent_supervisors_keep_only_the_current_fenced_provider(orch, monk
     monkeypatch.setattr(
         runpod_api,
         "cancel_job",
-        lambda endpoint_id, job_id, **_kwargs: cancelled.append((endpoint_id, job_id))
-        or {"status": "CANCELLED"},
+        lambda endpoint_id, job_id, **_kwargs: (
+            cancelled.append((endpoint_id, job_id)) or {"status": "CANCELLED"}
+        ),
     )
     monkeypatch.setattr(
         runpod_api,
@@ -1246,7 +1247,9 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
         submitted_gpus.append(run_spec.gpu.type)
         if attempt == 0:
             on_handle(_runpod_handle("ep1", "j1", attempt))
-            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
+            return PollResult(
+                False, failure="job_preempted", detail="provider reported worker loss"
+            )
         on_handle(_runpod_handle("ep2", "j2", attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
@@ -1977,7 +1980,9 @@ def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monk
         gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt == 0:
-            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
+            return PollResult(
+                False, failure="job_preempted", detail="provider reported worker loss"
+            )
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -2027,7 +2032,9 @@ def test_retry_message_admits_when_the_projected_provider_already_failed(orch, m
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt < 2:
-            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
+            return PollResult(
+                False, failure="job_preempted", detail="provider reported worker loss"
+            )
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -2168,7 +2175,9 @@ def test_last_gpu_retry_message_names_the_clamped_back_class_not_the_current_one
         gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt < 2:
-            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
+            return PollResult(
+                False, failure="job_preempted", detail="provider reported worker loss"
+            )
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -2325,7 +2334,9 @@ def test_projected_retry_class_is_worded_as_a_projection_not_a_promise(orch, mon
         gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt == 0:
-            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
+            return PollResult(
+                False, failure="job_preempted", detail="provider reported worker loss"
+            )
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -2413,7 +2424,9 @@ def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         if attempt == 0:
-            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
+            return PollResult(
+                False, failure="job_preempted", detail="provider reported worker loss"
+            )
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)

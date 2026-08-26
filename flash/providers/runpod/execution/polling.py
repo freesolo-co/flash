@@ -109,7 +109,9 @@ def _observe_artifacts(context: _PollContext) -> PollResult | None:
     return poll_result_from_manifest(artifacts.result) if artifacts.result is not None else None
 
 
-def _queue_failure(context: _PollContext, state: _PollState, status: str, now: float) -> PollResult | None:
+def _queue_failure(
+    context: _PollContext, state: _PollState, status: str, now: float
+) -> PollResult | None:
     if status != "IN_QUEUE" or state.granted:
         state.queued.expired(False, now, context.queue_grace_s)
         state.unhealthy.expired(False, now, context.unhealthy_grace_s)
@@ -137,13 +139,9 @@ def _queue_failure(context: _PollContext, state: _PollState, status: str, now: f
     if usable or initializing or workers.get("unhealthy"):
         state.granted = True
         return None
-    if state.unhealthy.expired(
-        bool(workers.get("unhealthy")), now, context.unhealthy_grace_s
-    ):
+    if state.unhealthy.expired(bool(workers.get("unhealthy")), now, context.unhealthy_grace_s):
         return PollResult(False, failure="job_preempted", detail="RunPod worker remained unhealthy")
-    if state.throttled.expired(
-        bool(workers.get("throttled")), now, context.throttled_grace_s
-    ):
+    if state.throttled.expired(bool(workers.get("throttled")), now, context.throttled_grace_s):
         return PollResult(False, failure="no_capacity", detail="RunPod worker remained throttled")
     return None
 
@@ -224,7 +222,9 @@ def poll_job(
         except runpod_api.RunpodApiError as exc:
             _record_resource(context, state.last_status or "UNKNOWN", transport="unavailable")
             if poll_errors.record(exc, deadline_at=attempt.work_deadline_at):
-                return PollResult(False, failure="poll_error", detail="RunPod status transport failed")
+                return PollResult(
+                    False, failure="poll_error", detail="RunPod status transport failed"
+                )
             time.sleep(min(interval_s, max(0.0, attempt.work_deadline_at - time.time())))
             continue
         if status != state.last_status:

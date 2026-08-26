@@ -45,9 +45,7 @@ def terminate_process_group(
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=0)
     if _group_exists(process_group_id):
-        raise RuntimeError(
-            f"process group {process_group_id} survived term and kill supervision"
-        )
+        raise RuntimeError(f"process group {process_group_id} survived term and kill supervision")
 
 
 def start_process_group(args, **kwargs) -> tuple[subprocess.Popen, int]:

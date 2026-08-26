@@ -59,7 +59,10 @@ def _build_payload(builders, *args, **kwargs):
         attempt_id=attempt_id,
         fence=kwargs["fence"],
     )
-    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
+    with patch(
+        "flash.runner.lifecycle.status.get_status",
+        return_value=SimpleNamespace(attempt=attempt.to_dict()),
+    ):
         return builders.build_payload(*args, **kwargs)
 
 
@@ -77,7 +80,10 @@ def _deploy(vast, *args, **kwargs):
         attempt_id=kwargs.get("attempt", 0),
         fence=kwargs["fence"],
     )
-    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
+    with patch(
+        "flash.runner.lifecycle.status.get_status",
+        return_value=SimpleNamespace(attempt=attempt.to_dict()),
+    ):
         return vast.deploy_and_submit(*args, **kwargs)
 
 
@@ -95,7 +101,10 @@ def _submit(vast, *args, **kwargs):
         attempt_id=kwargs.get("attempt", 0),
         fence=kwargs["fence"],
     )
-    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
+    with patch(
+        "flash.runner.lifecycle.status.get_status",
+        return_value=SimpleNamespace(attempt=attempt.to_dict()),
+    ):
         return vast.submit_run_vast(*args, **kwargs)
 
 
@@ -1310,7 +1319,9 @@ def test_provider_initial_and_reattached_poll_keep_same_deadline(monkeypatch):
         return PollResult(True, metrics={})
 
     monkeypatch.setattr(vast, "usable_offers", lambda *_args, **_kwargs: [_offer()])
-    monkeypatch.setattr(vast, "deploy_and_submit", lambda *_args, **_kwargs: _handle(started_ts=1.0))
+    monkeypatch.setattr(
+        vast, "deploy_and_submit", lambda *_args, **_kwargs: _handle(started_ts=1.0)
+    )
     monkeypatch.setattr(vast, "poll_vast_job", fake_poll)
     monkeypatch.setattr(vast, "_best_effort_destroy", lambda *_args, **_kwargs: True)
     provider = VastProvider()
@@ -1326,6 +1337,7 @@ def test_provider_initial_and_reattached_poll_keep_same_deadline(monkeypatch):
     assert provider.poll(handle, spec, seed=0, _deadline_at=12_345.0).ok
 
     assert captured == [12_345.0, 12_345.0]
+
 
 # ---------------------------------------------------------------------------
 # submit_run_vast: guaranteed teardown

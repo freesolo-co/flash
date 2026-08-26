@@ -89,7 +89,10 @@ def _build_payload(builders, *args, **kwargs):
         attempt_id=attempt_id,
         fence=kwargs["fence"],
     )
-    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
+    with patch(
+        "flash.runner.lifecycle.status.get_status",
+        return_value=SimpleNamespace(attempt=attempt.to_dict()),
+    ):
         return builders.build_payload(*args, **kwargs)
 
 
@@ -107,7 +110,10 @@ def _launch(jobs, *args, **kwargs):
         attempt_id=kwargs.get("attempt", 0),
         fence=kwargs["fence"],
     )
-    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
+    with patch(
+        "flash.runner.lifecycle.status.get_status",
+        return_value=SimpleNamespace(attempt=attempt.to_dict()),
+    ):
         return jobs.launch_and_submit(*args, **kwargs)
 
 
@@ -125,7 +131,10 @@ def _submit(jobs, *args, **kwargs):
         attempt_id=kwargs.get("attempt", 0),
         fence=kwargs["fence"],
     )
-    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
+    with patch(
+        "flash.runner.lifecycle.status.get_status",
+        return_value=SimpleNamespace(attempt=attempt.to_dict()),
+    ):
         return jobs.submit_run_lambda(*args, **kwargs)
 
 
@@ -2014,6 +2023,7 @@ def test_poll_lambda_retries_result_download_and_costs_manifest_finished_at(monk
             AttemptArtifacts("revision", 9_101.0, None, manifest.to_dict()),
         ]
     )
+
     def read_artifacts(*_args, **_kwargs):
         observed = next(reads)
         if isinstance(observed, Exception):
@@ -2171,7 +2181,9 @@ def test_provider_initial_and_reattached_poll_keep_same_deadline(monkeypatch):
         return PollResult(True, metrics={})
 
     monkeypatch.setattr(jobs, "usable_instances", lambda _gpu, **_kwargs: [_inst()])
-    monkeypatch.setattr(jobs, "launch_and_submit", lambda *_args, **_kwargs: _handle(started_ts=1.0))
+    monkeypatch.setattr(
+        jobs, "launch_and_submit", lambda *_args, **_kwargs: _handle(started_ts=1.0)
+    )
     monkeypatch.setattr(jobs, "poll_lambda_job", fake_poll)
     monkeypatch.setattr(
         "flash.providers.lambda_.client.api.terminate_instance_confirmed",
@@ -2190,6 +2202,7 @@ def test_provider_initial_and_reattached_poll_keep_same_deadline(monkeypatch):
     assert provider.poll(handle, spec, seed=0, _deadline_at=12_345.0).ok
 
     assert captured == [12_345.0, 12_345.0]
+
 
 # ---------------------------------------------------------------------------
 # the cost-safety invariant: every exit path terminates the instance

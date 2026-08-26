@@ -95,8 +95,7 @@ def _lifecycle_pairs(
             pairs.append(("work deadline", f"{remaining} left"))
     resource = obj.get("resource")
     if isinstance(resource, dict) and (
-        identity is None
-        or (resource.get("attempt_id"), resource.get("fence")) == identity
+        identity is None or (resource.get("attempt_id"), resource.get("fence")) == identity
     ):
         value = str(resource.get("state") or "unknown")
         provider = resource.get("provider")

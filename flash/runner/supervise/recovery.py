@@ -23,6 +23,7 @@ def _lifecycle():
 
 _RUNPOD_STATUS_PROBE_TIMEOUT_S = 10.0
 
+
 def _canonical_provider_handle(handle):
     """Validate and canonicalize one complete provider-specific persisted handle."""
     from flash.providers.core.base import JobHandle
@@ -63,7 +64,9 @@ def _attempt_result_metrics(run_id: str, handle=None) -> dict | None:
     if handle is not None:
         data = _canonical_provider_handle(handle).to_dict()
         if data.get("attempt") != attempt.attempt_id or data.get("fence") != attempt.fence:
-            raise RuntimeError("persisted provider handle does not match the current fenced attempt")
+            raise RuntimeError(
+                "persisted provider handle does not match the current fenced attempt"
+            )
     spec = effective_spec_from_status(status)
     artifacts = read_attempt_artifacts(
         spec.train.hf_repo,

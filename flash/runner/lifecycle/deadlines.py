@@ -17,7 +17,9 @@ _ATTEMPT_GRANT_ALLOWANCE_S = 900.0
 _RESULT_VISIBILITY_ALLOWANCE_S = 120.0
 
 
-def _derive_attempt_deadlines(raw: dict, *, reserved_at: float) -> tuple[float, float, float, float]:
+def _derive_attempt_deadlines(
+    raw: dict, *, reserved_at: float
+) -> tuple[float, float, float, float]:
     """Derive immutable grant, work, result, and outer deadlines for one reservation."""
     _status, canonical = _canonical_run_deadline(raw)
     if state._RUN_DEADLINE_AT_KEY not in raw:

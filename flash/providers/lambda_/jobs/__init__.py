@@ -559,7 +559,15 @@ def launch_and_submit(
         )
     instances = _disk_capable_instances(spec, instances, say)
     plan = _build_launch_plan(
-        spec, seed, attempt, fence, runtime_secrets, source_snapshot, absolute_deadline, mode, models
+        spec,
+        seed,
+        attempt,
+        fence,
+        runtime_secrets,
+        source_snapshot,
+        absolute_deadline,
+        mode,
+        models,
     )
 
     tried_regions: set[str] = set()

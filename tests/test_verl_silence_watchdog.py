@@ -50,9 +50,7 @@ def _diagnostic_payload(captured: str) -> dict:
     return json.loads(line.removeprefix("VERL DIAGNOSTIC "))
 
 
-def test_repeated_frozen_lines_emit_one_diagnostic_without_lifecycle_failure(
-    monkeypatch, capsys
-):
+def test_repeated_frozen_lines_emit_one_diagnostic_without_lifecycle_failure(monkeypatch, capsys):
     clock, proc, tail, observer = _observer(monkeypatch)
     tail.record("Training Progress\n")
     observer.observe_line("Training Progress")

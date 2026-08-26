@@ -356,10 +356,9 @@ def actual_steps_run(status: RunStatus) -> int:
     """return current-fence cumulative work for cancellation billing."""
     progress = status.progress if isinstance(status.progress, dict) else {}
     attempt = status.attempt if isinstance(status.attempt, dict) else {}
-    if (
-        progress.get("attempt_id") != attempt.get("attempt_id")
-        or progress.get("fence") != attempt.get("fence")
-    ):
+    if progress.get("attempt_id") != attempt.get("attempt_id") or progress.get(
+        "fence"
+    ) != attempt.get("fence"):
         return 0
     completed = progress.get("completed_steps")
     if isinstance(completed, int) and not isinstance(completed, bool) and completed > 0:

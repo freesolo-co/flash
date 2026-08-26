@@ -268,6 +268,7 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         _compare_and_clear_remote,
         _record_cleanup_remote,
     )
+
     resource_deleted = False
     teardown_error: Exception | None = None
     try:
@@ -776,9 +777,7 @@ def _handle_failure(
     ctx.raise_if_cancelled()
     if ctx.last_handle:
         try:
-            completed_metrics = _lifecycle._attempt_result_metrics(
-                ctx.spec.run_id, ctx.last_handle
-            )
+            completed_metrics = _lifecycle._attempt_result_metrics(ctx.spec.run_id, ctx.last_handle)
         except Exception:
             completed_metrics = None
         if completed_metrics is not None:
