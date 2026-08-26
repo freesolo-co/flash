@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES, reject_non_finite_json_constant
+from flash.serve.request.tool_calls import qualified_tool_parser
 from flash.serve.runtime import (
     AdapterNotFoundError,
     EngineDeadError,
@@ -140,7 +141,7 @@ def create_app(
             parsed = parse_chat_request(
                 payload,
                 resolved,
-                tool_parser=state.bootstrap.manifest.engine.tool_parser,
+                tool_parser=qualified_tool_parser(state.bootstrap.manifest.logical_base_model),
             )
         except (OpenAIRequestError, PromptError, RuntimeConfigurationError, ValueError):
             return _error(422, "invalid_request", "request validation failed")

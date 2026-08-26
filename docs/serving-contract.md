@@ -166,9 +166,10 @@ The packaged, hosted, and managed OpenAI entry points share one strict sampling 
 - Thinking-enabled adapters reject logprobs after the requested adapter or run has been authorized
   and resolved.
 
-Function tools are supported only for the exact qualified Qwen3.5 packaged and hosted profile. The
-parser identity is `qwen3_coder`; Qwen3.6 and unqualified engines reject tools after authorization
-and immutable adapter resolution, before generation. Declarations must be closed function objects
+Function tools are implemented and offline-validated only for the exact qualified Qwen3.5 packaged
+and hosted profile. This path is not live-qualified pending exact model testing. The parser identity
+is `qwen3_coder`; Qwen3.6 and unqualified engines reject tools after authorization and immutable
+adapter resolution, before generation. Declarations must be closed function objects
 with unique nonempty names. Parameters use a bounded root-object JSON Schema profile with
 `properties`, `required`, `additionalProperties: false`, recursive scalar, object, and array types,
 descriptions, enums, and array `items`. Numeric enum members must be JSON integers; decimal and

@@ -9,6 +9,15 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal
 
+from flash.serve.request.tool_calls import (
+    FunctionTool,
+    normalize_tools,
+    tools_active,
+    tools_wire,
+    validate_tool_control_presence,
+    validate_tool_stop_sequences,
+)
+
 from .errors import RuntimeConfigurationError
 from .sampling import (
     validate_choice_count,
@@ -19,15 +28,7 @@ from .sampling import (
     validate_top_logprobs,
 )
 from .structured_outputs import normalize_structured_outputs
-from .tool_calls import (
-    FunctionTool,
-    ParsedToolCall,
-    normalize_tools,
-    tools_active,
-    tools_wire,
-    validate_tool_control_presence,
-    validate_tool_stop_sequences,
-)
+from .tool_calls import ParsedToolCall
 
 _REVISION_RE = re.compile(r"[0-9a-f]{40}")
 _RESERVED_MODEL_LOAD_KWARGS = frozenset({"revision", "token", "trust_remote_code"})
@@ -602,7 +603,6 @@ class StreamChoiceFinished:
     text: str
     finish_reason: str
     token_ids: tuple[int, ...]
-    tool_calls: tuple[ParsedToolCall, ...] = ()
     type: Literal["choice_finished"] = field(default="choice_finished", init=False)
 
 

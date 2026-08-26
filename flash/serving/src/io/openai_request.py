@@ -6,6 +6,13 @@ from typing import Any
 
 from pydantic import field_validator, model_validator
 
+from flash.serve.request.tool_calls import (
+    normalize_tools,
+    tools_active,
+    tools_wire,
+    validate_tool_control_presence,
+    validate_tool_stop_sequences,
+)
 from flash.serve.request.validation import MAX_SOURCE_CHARS, has_image_blocks, normalize_messages
 from flash.serve.runtime.sampling import (
     validate_choice_count,
@@ -14,13 +21,6 @@ from flash.serve.runtime.sampling import (
     validate_sampling_relationships,
     validate_seed,
     validate_top_logprobs,
-)
-from flash.serve.runtime.tool_calls import (
-    normalize_tools,
-    tools_active,
-    tools_wire,
-    validate_tool_control_presence,
-    validate_tool_stop_sequences,
 )
 from flash.serving.src.io.schemas import GenerateRequest
 

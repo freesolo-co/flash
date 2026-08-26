@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from flash.content.reasoning_normalization import messages_for_chat_template
+from flash.serve.request.tool_calls import detached_template_messages, tools_active, tools_wire
 
 from .errors import MultimodalRequestError, PromptError, ServingRuntimeError
 from .multimodal import has_image_blocks, normalize_text_messages, prepare_multimodal_request
-from .tool_calls import detached_template_messages, tools_active, tools_wire
 from .types import AdapterSpec, EngineConfig, GenerationRequest
 
 _RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
@@ -188,16 +188,6 @@ class PromptPreparer:
                     sort_keys=True,
                     default=str,
                 )
-                if tools_active(request.tools, request.tool_choice):
-                    raw += "\0" + json.dumps(
-                        {
-                            "tools": tools_wire(request.tools),
-                            "tool_choice": request.tool_choice,
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
             except TypeError:
                 return None
             kind = "messages"

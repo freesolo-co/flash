@@ -47,7 +47,6 @@ def _engine_payload(value: EngineIdentity) -> dict[str, object]:
         "mm_processor_cache_gb": value.mm_processor_cache_gb,
         "enable_tower_connector_lora": value.enable_tower_connector_lora,
         "reasoning_parser": value.reasoning_parser,
-        "tool_parser": value.tool_parser,
         "trust_remote_code": value.trust_remote_code,
         "engine_args_fingerprint": value.engine_args_fingerprint,
         "tokenizer_kwargs_fingerprint": value.tokenizer_kwargs_fingerprint,

@@ -1,7 +1,7 @@
 """complete immutable serving inputs for customer-owned modal deployments.
 
 ``provision_modal_deployment`` takes a ``DeploymentBundle``, which requires an exact
-``EngineIdentity`` (27 fields), an exact ``ModalPlacement``, and a digest-qualified
+``EngineIdentity`` (26 fields), an exact ``ModalPlacement``, and a digest-qualified
 ``ServingImage``. This module is that producer.
 
 Every value here is immutable serving identity: it feeds ``engine_id``, which is the sha-256 of
@@ -69,7 +69,6 @@ class ServingProfile:
     mm_processor_cache_gb: float
     enable_tower_connector_lora: bool
     reasoning_parser: str | None
-    tool_parser: str | None
     engine_args: Mapping[str, Any]
     tokenizer_kwargs: Mapping[str, Any]
     processor_kwargs: Mapping[str, Any]
@@ -123,7 +122,6 @@ class ServingProfile:
             mm_processor_cache_gb=self.mm_processor_cache_gb,
             enable_tower_connector_lora=self.enable_tower_connector_lora,
             reasoning_parser=self.reasoning_parser,
-            tool_parser=self.tool_parser,
             trust_remote_code=trust_remote_code,
             engine_args_fingerprint=canonical_mapping_fingerprint(self.engine_args),
             tokenizer_kwargs_fingerprint=canonical_mapping_fingerprint(self.tokenizer_kwargs),
@@ -175,7 +173,6 @@ _PROFILES: dict[str, ServingProfile] = {
         mm_processor_cache_gb=0.0,
         enable_tower_connector_lora=True,
         reasoning_parser="qwen3",
-        tool_parser="qwen3_coder",
         engine_args={},
         tokenizer_kwargs={},
         processor_kwargs={},
@@ -204,7 +201,6 @@ _PROFILES: dict[str, ServingProfile] = {
         mm_processor_cache_gb=0.0,
         enable_tower_connector_lora=True,
         reasoning_parser="qwen3",
-        tool_parser=None,
         engine_args={"enforce_eager": False},
         tokenizer_kwargs={},
         processor_kwargs={},
@@ -235,7 +231,6 @@ _PROFILES: dict[str, ServingProfile] = {
         mm_processor_cache_gb=0.0,
         enable_tower_connector_lora=True,
         reasoning_parser="qwen3",
-        tool_parser=None,
         engine_args={"enforce_eager": False},
         tokenizer_kwargs={},
         processor_kwargs={},

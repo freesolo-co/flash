@@ -7,6 +7,13 @@ import math
 from dataclasses import dataclass
 from typing import Any, cast
 
+from flash.serve.request.tool_calls import (
+    FunctionTool,
+    normalize_tools,
+    tools_active,
+    validate_tool_request_contract,
+    validate_tool_stop_sequences,
+)
 from flash.serve.request.validation import (
     MAX_COMPRESSED_BYTES,
     MAX_SOURCE_CHARS,
@@ -22,12 +29,6 @@ from flash.serve.runtime.sampling import (
     validate_sampling_relationships,
     validate_seed,
     validate_top_logprobs,
-)
-from flash.serve.runtime.tool_calls import (
-    FunctionTool,
-    normalize_tools,
-    tools_active,
-    validate_tool_stop_sequences,
 )
 
 DEFAULT_MAX_TOKENS = 1024
@@ -214,12 +215,13 @@ def reject_tool_capability(
 ) -> None:
     """apply authoritative adapter and engine tool capability checks."""
 
-    if not tools_active(tools, tool_choice):
-        return
-    if thinking:
-        raise OpenAIRequestError("tools are not supported for thinking-enabled generation")
-    if tool_parser != "qwen3_coder":
-        raise OpenAIRequestError("this serving engine is not qualified for tool calling")
+    validate_tool_request_contract(
+        tools=tools,
+        tool_choice=tool_choice,
+        thinking=thinking,
+        tool_parser=tool_parser,
+        error_type=OpenAIRequestError,
+    )
 
 
 def merge_stop_sequences(
@@ -406,10 +408,7 @@ def _tool_controls(
         if has_choice or has_parallel:
             raise OpenAIRequestError("tool_choice and parallel_tool_calls require tools")
         return None, None, None
-    try:
-        tools = normalize_tools(payload["tools"], error_type=OpenAIRequestError)
-    except OpenAIRequestError:
-        raise
+    tools = normalize_tools(payload["tools"], error_type=OpenAIRequestError)
     choice = payload.get("tool_choice", "auto")
     if type(choice) is not str or choice not in {"auto", "none"}:
         raise OpenAIRequestError("tool_choice must be auto or none")

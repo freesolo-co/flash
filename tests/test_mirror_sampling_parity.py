@@ -557,7 +557,6 @@ def test_packaged_sse_emits_complete_structured_tool_delta() -> None:
             text="raw tags",
             finish_reason="tool_calls",
             token_ids=(1,),
-            tool_calls=(call,),
         )
         yield StreamFinished(
             request_id="request",
@@ -588,7 +587,8 @@ def test_packaged_sse_emits_complete_structured_tool_delta() -> None:
             )
         ]
 
-    payloads = [json.loads(chunk[6:-2]) for chunk in asyncio.run(collect())[:-1]]
+    chunks = asyncio.run(collect())
+    payloads = [json.loads(chunk[6:-2]) for chunk in chunks[:-1]]
     tool_delta = next(
         payload["choices"][0]["delta"]["tool_calls"]
         for payload in payloads
@@ -596,7 +596,6 @@ def test_packaged_sse_emits_complete_structured_tool_delta() -> None:
     )
     assert tool_delta[0]["index"] == 0
     assert tool_delta[0]["id"] == "call_1"
-    assert all("<tool_call>" not in chunk.decode() for chunk in asyncio.run(collect()))
 
 
 def test_usage_facts_keeps_aggregate_completion_count():

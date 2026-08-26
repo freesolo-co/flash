@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from flash.serve.request.runtime_support import reasoning_compatibility_guard
+from flash.serve.request.tool_calls import tools_active
 
 from .adapters import AdapterBinding, AdapterManager
 from .errors import (
@@ -27,7 +28,7 @@ from .prompt import (
     resolve_thinking,
 )
 from .sampling import complete_indexed_outputs, indexed_outputs, normalize_token_logprobs
-from .tool_calls import ParsedToolCall, ToolCallStreamParser, parse_qwen3_coder_output, tools_active
+from .tool_calls import ParsedToolCall, ToolCallStreamParser, parse_qwen3_coder_output
 from .types import (
     AdapterSpec,
     EngineConfig,
@@ -142,7 +143,6 @@ class _StreamState:
                         text=choice.text,
                         finish_reason=finish_reason,
                         token_ids=tuple(choice.token_ids),
-                        tool_calls=tool_calls,
                     ),
                 )
             )

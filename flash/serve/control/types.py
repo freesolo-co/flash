@@ -218,7 +218,6 @@ class EngineIdentity:
     engine_args_fingerprint: str
     tokenizer_kwargs_fingerprint: str
     processor_kwargs_fingerprint: str
-    tool_parser: str | None = None
 
     def __post_init__(self) -> None:
         validate_engine_identity(self)
@@ -286,9 +285,6 @@ def validate_engine_identity(identity: EngineIdentity) -> None:
     if identity.modality == "text" and identity.enable_tower_connector_lora:
         raise ValueError("text engines cannot enable tower connector lora")
     _require_optional_nonempty(identity.reasoning_parser, "reasoning_parser")
-    tool_parser = _require_optional_nonempty(identity.tool_parser, "tool_parser")
-    if tool_parser not in {None, "qwen3_coder"}:
-        raise ValueError("tool_parser must be qwen3_coder or null")
     _require_bool(identity.trust_remote_code, "trust_remote_code")
     for name in (
         "engine_args_fingerprint",
@@ -441,9 +437,12 @@ def _validate_deployment_components(
 
     revisions: set[str] = set()
     activating_runs: set[str] = set()
-    expected_base: tuple[str, str] | None = None
-    for adapter in adapters:
-        validate_resolved_adapter(adapter)
+    first_adapter = adapters[0]
+    validate_resolved_adapter(first_adapter)
+    expected_base = (first_adapter.base_model, first_adapter.base_model_revision)
+    for index, adapter in enumerate(adapters):
+        if index:
+            validate_resolved_adapter(adapter)
         if adapter.adapter_revision in revisions:
             raise ValueError("deployment contains a duplicate adapter revision")
         revisions.add(adapter.adapter_revision)
@@ -454,19 +453,11 @@ def _validate_deployment_components(
         if adapter.lora_rank > engine.max_lora_rank:
             raise ValueError("adapter lora_rank exceeds engine max_lora_rank")
         base = (adapter.base_model, adapter.base_model_revision)
-        if expected_base is None:
-            expected_base = base
-        elif base != expected_base:
+        if base != expected_base:
             raise ValueError(
                 "all adapters in one deployment must use the same logical base model and revision"
             )
 
-    if expected_base is None:
-        raise ValueError("deployments require at least one logical base model")
-    from flash.serve.runtime.tool_calls import qualified_tool_parser
-
-    if engine.tool_parser != qualified_tool_parser(expected_base[0]):
-        raise ValueError("engine tool_parser does not match the qualified logical base model")
     if len(adapters) > engine.adapter_capacity:
         raise ValueError("deployment adapter count exceeds the validated max_cpu_loras capacity")
 

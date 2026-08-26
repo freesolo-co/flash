@@ -9,6 +9,11 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any, NotRequired, TypedDict
 
+from flash.serve.request.tool_calls import (
+    normalize_tools,
+    tools_active,
+    validate_tool_request_contract,
+)
 from flash.serve.runtime.sampling import (
     complete_indexed_outputs,
     indexed_outputs,
@@ -17,9 +22,7 @@ from flash.serve.runtime.sampling import (
 from flash.serve.runtime.tool_calls import (
     ParsedToolCall,
     ToolCallStreamParser,
-    normalize_tools,
     parse_qwen3_coder_output,
-    tools_active,
 )
 from flash.serving.src.engine.support import (
     _cached_tokens_reported,
@@ -106,12 +109,13 @@ def _choice(index: int, output: Any, *, top_logprobs: int, tools: Any = None) ->
 
 
 def _validate_tool_request(owner: Any, payload: OpenAIGenerateRequest, thinking: bool) -> None:
-    if not tools_active(payload.tools, payload.tool_choice):
-        return
-    if thinking:
-        raise ValueError("tools are not supported for thinking-enabled generation")
-    if getattr(owner, "tool_parser", None) != "qwen3_coder":
-        raise ValueError("this serving engine is not qualified for tool calling")
+    validate_tool_request_contract(
+        tools=payload.tools,
+        tool_choice=payload.tool_choice,
+        thinking=thinking,
+        tool_parser=getattr(owner, "tool_parser", None),
+        error_type=ValueError,
+    )
 
 
 def _active_tools(payload: OpenAIGenerateRequest) -> Any:
@@ -200,12 +204,13 @@ async def generate(
         owner._close_prompt_images(prompt_input)
     if final_output is None:
         raise RuntimeError("vLLM returned no output")
+    active_tools = _active_tools(payload)
     choices = [
         _choice(
             index,
             output,
             top_logprobs=payload.top_logprobs,
-            tools=_active_tools(payload),
+            tools=active_tools,
         )
         for index, output in sorted(complete_indexed_outputs(final_output, n=payload.n).items())
     ]

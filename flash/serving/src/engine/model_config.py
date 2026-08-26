@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from flash.serve.runtime.tool_calls import qualified_tool_parser
+from flash.serve.request.tool_calls import qualified_tool_parser
 from flash.serving.src.engine.prequant_config import (
     fp8_serve_model_for as _prequant_serve_model_for,
 )

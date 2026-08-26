@@ -304,12 +304,6 @@ class ServingManifest:
         )
         if _HEX_40_RE.fullmatch(self.logical_base_revision) is None:
             raise ManifestError("logical_base_revision must be an exact lowercase revision")
-        from flash.serve.runtime.tool_calls import qualified_tool_parser
-
-        if self.engine.tool_parser != qualified_tool_parser(self.logical_base_model):
-            raise ManifestError(
-                "engine tool_parser does not match the qualified logical base model"
-            )
         object.__setattr__(
             self, "engine_args", _frozen_json_mapping(self.engine_args, "engine_args")
         )

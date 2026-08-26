@@ -20,7 +20,7 @@ from typing import Any
 # _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
 # the vllm build probes engine_boot uses.
 from flash.content.thinking import messages_for_chat_template
-from flash.serve.runtime.tool_calls import (
+from flash.serve.request.tool_calls import (
     detached_template_messages,
     normalize_tools,
     tools_active,

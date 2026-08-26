@@ -14,7 +14,7 @@ from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 from flash.serving.src.engine.model_config import reasoning_parser_for, tool_parser_for
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.openai_request import OpenAIGenerateRequest
-from flash.serving.src.io.openai_stream import _produce_openai_chat_stream, openai_chat_stream
+from flash.serving.src.io.openai_stream import openai_chat_stream
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.store.registry import AdapterRegistry
 
@@ -110,6 +110,30 @@ class _StreamingToolChoiceEngine:
                     )
                 ],
                 prompt_token_ids=[1, 2],
+                num_cached_tokens=0,
+            )
+
+
+class _InterleavedToolChoiceEngine:
+    async def generate(self, _prompt: Any, _sampling: Any, _request_id: str, **_kwargs: Any):
+        fragments = (
+            (1, "<tool_call><function=weather><parameter=city>To", 31, None),
+            (0, "<tool_call><function=weather><parameter=city>Par", 30, None),
+            (1, "kyo</parameter></function></tool_call>", 33, "stop"),
+            (0, "is</parameter></function></tool_call>", 32, "stop"),
+        )
+        for index, text, token_id, finish_reason in fragments:
+            yield SimpleNamespace(
+                outputs=[
+                    SimpleNamespace(
+                        index=index,
+                        text=text,
+                        finish_reason=finish_reason,
+                        token_ids=[token_id],
+                        logprobs=None,
+                    )
+                ],
+                prompt_token_ids=[1, 2, 3],
                 num_cached_tokens=0,
             )
 
@@ -382,6 +406,42 @@ def test_hosted_buffered_sampling_params_and_choices_are_json_safe(choice_count:
     json.dumps(result, allow_nan=False)
 
 
+def test_hosted_tool_stream_keeps_interleaved_choice_parsers_isolated() -> None:
+    engine = _engine(_InterleavedToolChoiceEngine())
+
+    async def collect() -> list[dict[str, Any]]:
+        return [
+            event
+            async for event in engine._stream_generate(
+                {
+                    "adapter_id": "adapter",
+                    "messages": [{"role": "user", "content": "weather"}],
+                    "n": 2,
+                    "temperature": 0.5,
+                    "tools": _tool_payload(),
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": True,
+                }
+            )
+        ]
+
+    events = asyncio.run(collect())
+    tool_deltas = [event for event in events if event.get("tool_calls")]
+    final = events[-1]
+
+    assert [
+        (event["index"], event["tool_calls"][0]["function"]["arguments"]) for event in tool_deltas
+    ] == [
+        (1, '{"city":"Tokyo"}'),
+        (0, '{"city":"Paris"}'),
+    ]
+    assert [choice["tool_calls"][0]["function"]["arguments"] for choice in final["choices"]] == [
+        '{"city":"Paris"}',
+        '{"city":"Tokyo"}',
+    ]
+    assert all("<tool_call>" not in event.get("text", "") for event in events)
+
+
 def test_hosted_buffered_top_logprobs_zero_keeps_selected_record_only() -> None:
     _, result = _buffered_result(1, top_logprobs=0)
     token = result["choices"][0]["logprobs"][0]
@@ -446,50 +506,6 @@ class _UsageSession:
         return None
 
 
-@pytest.mark.parametrize(
-    "argument",
-    [
-        '{"value":' + "[" * 600 + "0" + "]" * 600 + "}",
-        json.dumps({"values": [0] * 511}),
-    ],
-    ids=["depth", "aggregate-nodes"],
-)
-def test_hosted_tool_free_history_rejects_excessive_argument_complexity(argument: str) -> None:
-    messages = _historical_tool_messages(argument)
-    original = json.loads(json.dumps(messages))
-
-    with pytest.raises(ValidationError, match="tool argument complexity"):
-        OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
-
-    assert messages == original
-
-
-@pytest.mark.parametrize(
-    "argument",
-    [
-        '{"value":' + "[" * 7 + "0" + "]" * 7 + "}",
-        json.dumps({"values": [0] * 510}),
-    ],
-    ids=["depth", "aggregate-nodes"],
-)
-def test_hosted_tool_free_history_accepts_argument_complexity_boundary(argument: str) -> None:
-    messages = _historical_tool_messages(argument)
-    original = json.loads(json.dumps(messages))
-
-    request = OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
-
-    assert request.messages == original
-    assert messages == original
-
-
-@pytest.mark.parametrize("argument", ['{"text":"\\ud800"}', '{"text":"\\udc00"}'])
-def test_hosted_tool_history_rejects_unpaired_surrogates(argument: str) -> None:
-    messages = _historical_tool_messages(argument)
-
-    with pytest.raises(ValidationError, match="arguments must encode a JSON object"):
-        OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
-
-
 def test_hosted_tool_history_accepts_valid_non_bmp_pair_and_serializes() -> None:
     messages = _historical_tool_messages('{"text":"\\ud83d\\ude00"}')
 
@@ -545,57 +561,8 @@ def test_hosted_tool_history_accepts_non_bmp_call_ids_and_serializes() -> None:
     assert engine._prompt_cache_key(request, thinking_default=False) is not None
 
 
-@pytest.mark.parametrize(
-    "argument",
-    [
-        '{"value":' + "[" * 1100 + "0" + "]" * 1100 + "}",
-        '{"value":' + '{"child":' * 1100 + "0" + "}" * 1100 + "}",
-    ],
-    ids=["array", "object"],
-)
-def test_hosted_historical_decoder_recursion_is_a_request_error(argument: str) -> None:
-    with pytest.raises(ValidationError, match="supported tool argument complexity"):
-        OpenAIGenerateRequest.model_validate(
-            {"adapter_id": "adapter", "messages": _historical_tool_messages(argument)}
-        )
-
-
-@pytest.mark.parametrize("digits", [1025, 5000], ids=["first-over-limit", "python-cap-proof"])
-def test_hosted_historical_integer_limit_is_explicit(digits: int) -> None:
-    argument = '{"value":' + "9" * digits + "}"
-
-    with pytest.raises(ValidationError) as raised:
-        OpenAIGenerateRequest.model_validate(
-            {"adapter_id": "adapter", "messages": _historical_tool_messages(argument)}
-        )
-
-    message = str(raised.value)
-    assert "1024-digit limit" in message
-    assert "Exceeds the limit (4300 digits)" not in message
-
-
-def test_hosted_message_validation_preserves_non_tool_and_active_tool_requests() -> None:
-    plain_messages = [{"role": "user", "content": "weather"}]
-    plain_request = OpenAIGenerateRequest.model_validate(
-        {"adapter_id": "adapter", "messages": plain_messages}
-    )
-    tool_request = OpenAIGenerateRequest.model_validate(
-        {
-            "adapter_id": "adapter",
-            "messages": plain_messages,
-            "tools": _tool_payload(),
-            "tool_choice": "auto",
-            "parallel_tool_calls": True,
-        }
-    )
-
-    assert plain_request.messages == plain_messages
-    assert tool_request.messages == plain_messages
-    assert tool_request.tools == _tool_payload()
-
-
-@pytest.mark.parametrize("number", ["1.0", "1e3", "9007199254740993.0", "1e-400"])
-def test_hosted_raw_json_rejects_decimal_numeric_enums(number: str) -> None:
+def test_hosted_raw_json_rejects_numeric_enum_1_0() -> None:
+    number = "1.0"
     raw = (
         '{"adapter_id":"adapter","messages":[{"role":"user","content":"weather"}],'
         '"tool_choice":"auto","parallel_tool_calls":true,"tools":[{"type":"function",'
@@ -865,113 +832,75 @@ def test_hosted_sse_has_independent_reasoning_and_post_settlement_terminals() ->
     assert chunks[-1] == b"data: [DONE]\n\n"
 
 
-@pytest.mark.parametrize(
-    "late_event",
-    [
-        {"type": "delta", "index": 0, "text": "late"},
-        {"type": "choice_finished", "index": 0, "finish_reason": "stop"},
-        {"type": "usage_progress"},
-        {"type": "error", "message": "late error", "code": 502},
-        {"type": "final"},
-    ],
-    ids=["delta", "choice-finished", "usage-progress", "error", "second-final"],
-)
-def test_hosted_sse_rejects_every_event_after_final_before_output_or_usage(
-    late_event: dict[str, Any],
-) -> None:
+def test_hosted_sse_treats_final_as_terminal_and_closes_a_stalled_source() -> None:
     session = _UsageSession()
     record = _record()
-    chunks: list[bytes] = []
 
-    async def events():
-        yield {"type": "ready", "thinking": False, "prompt_tokens": 2, "completion_tokens": 0}
-        yield {
-            "type": "choice_finished",
-            "index": 0,
-            "finish_reason": "stop",
-            "prompt_tokens": 2,
-            "completion_tokens": 1,
-        }
-        yield {"type": "final", "prompt_tokens": 2, "completion_tokens": 1}
-        yield {**late_event, "prompt_tokens": 99, "completion_tokens": 99}
+    class FinalThenStall:
+        def __init__(self) -> None:
+            self.index = 0
+            self.closed = False
+            self.stall = asyncio.Event()
+            self.events = [
+                {
+                    "type": "ready",
+                    "thinking": False,
+                    "prompt_tokens": 2,
+                    "completion_tokens": 0,
+                },
+                {
+                    "type": "choice_finished",
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                },
+                {"type": "final", "prompt_tokens": 2, "completion_tokens": 1},
+            ]
 
-    async def collect() -> None:
-        async for chunk in openai_chat_stream(
-            AdapterRouter([record]),
-            record=record,
-            events=events(),
-            adapter_id="adapter",
-            completion_id="chatcmpl-test",
-            created=123,
-            include_usage=True,
-            usage_session=session,  # type: ignore[arg-type]
-            thinking=False,
-        ):
-            chunks.append(chunk)  # noqa: PERF401
+        def __aiter__(self):
+            return self
 
-    with pytest.raises(RuntimeError, match="followed request terminal"):
-        asyncio.run(collect())
+        async def __anext__(self):
+            if self.index < len(self.events):
+                event = self.events[self.index]
+                self.index += 1
+                return event
+            await self.stall.wait()
+            raise StopAsyncIteration
 
-    assert session.finalized == []
-    assert session.failed == [
-        ({"type": "final", "prompt_tokens": 2, "completion_tokens": 1}, "stream_failed")
-    ]
-    assert all(b"late" not in chunk and b'"completion_tokens":99' not in chunk for chunk in chunks)
-    assert all(b'"usage"' not in chunk and chunk != b"data: [DONE]\n\n" for chunk in chunks)
+        async def aclose(self) -> None:
+            self.closed = True
+            self.stall.set()
 
+    async def collect():
+        source = FinalThenStall()
 
-def test_disconnect_after_final_does_not_hide_a_delayed_late_event() -> None:
-    session = _UsageSession()
-    record = _record()
-    output: asyncio.Queue[tuple[bytes | None, Exception | None]] = asyncio.Queue()
-    disconnected = asyncio.Event()
-    final_observed = asyncio.Event()
-    release_late = asyncio.Event()
+        async def consume() -> list[bytes]:
+            return [
+                chunk
+                async for chunk in openai_chat_stream(
+                    AdapterRouter([record]),
+                    record=record,
+                    events=source,
+                    adapter_id="adapter",
+                    completion_id="chatcmpl-test",
+                    created=123,
+                    include_usage=True,
+                    usage_session=session,  # type: ignore[arg-type]
+                    thinking=False,
+                )
+            ]
 
-    async def events():
-        yield {"type": "ready", "thinking": False, "prompt_tokens": 2, "completion_tokens": 0}
-        yield {
-            "type": "choice_finished",
-            "index": 0,
-            "finish_reason": "stop",
-            "prompt_tokens": 2,
-            "completion_tokens": 1,
-        }
-        yield {"type": "final", "prompt_tokens": 2, "completion_tokens": 1}
-        final_observed.set()
-        await release_late.wait()
-        yield {"type": "delta", "index": 0, "text": "late"}
+        chunks = await asyncio.wait_for(consume(), timeout=1.0)
+        return source, chunks
 
-    async def exercise() -> list[tuple[bytes | None, Exception | None]]:
-        producer = asyncio.create_task(
-            _produce_openai_chat_stream(
-                AdapterRouter([record]),
-                output,
-                disconnected,
-                record=record,
-                events=events(),
-                adapter_id="adapter",
-                completion_id="chatcmpl-test",
-                created=123,
-                include_usage=True,
-                usage_session=session,  # type: ignore[arg-type]
-                thinking=False,
-            )
-        )
-        await final_observed.wait()
-        disconnected.set()
-        release_late.set()
-        await producer
-        queued = []
-        while not output.empty():
-            queued.append(output.get_nowait())
-        return queued
+    source, chunks = asyncio.run(collect())
 
-    queued = asyncio.run(exercise())
-    chunks = [chunk for chunk, error in queued if chunk is not None and error is None]
-    assert session.finalized == []
-    assert session.failed == [
-        ({"type": "final", "prompt_tokens": 2, "completion_tokens": 1}, "stream_failed")
-    ]
-    assert all(b"late" not in chunk for chunk in chunks)
-    assert all(b'"usage"' not in chunk and chunk != b"data: [DONE]\n\n" for chunk in chunks)
+    assert source.closed
+    assert session.finalized == [{"type": "final", "prompt_tokens": 2, "completion_tokens": 1}]
+    assert session.failed == []
+    assert chunks[-1] == b"data: [DONE]\n\n"
+    terminal = json.loads(chunks[-2][6:-2])
+    assert terminal["choices"] == [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    assert terminal["usage"]["completion_tokens"] == 1

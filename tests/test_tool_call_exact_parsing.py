@@ -7,15 +7,15 @@ from decimal import Decimal
 
 import pytest
 
+import flash.serve.request.tool_calls as request_tool_calls_module
 import flash.serve.runtime.tool_calls as tool_calls_module
-from flash.serve.runtime.tool_calls import (
-    ToolCallStreamParser,
+from flash.serve.request.tool_calls import (
     normalize_tools,
-    parse_qwen3_coder_output,
     tools_wire,
     validate_tool_history,
     validate_tool_stop_sequences,
 )
+from flash.serve.runtime.tool_calls import ToolCallStreamParser, parse_qwen3_coder_output
 
 
 def test_tools_wire_recursively_detaches_the_normalized_schema() -> None:
@@ -43,6 +43,57 @@ def test_tools_wire_recursively_detaches_the_normalized_schema() -> None:
     assert tools[0].parameters["properties"]["value"]["type"] == "integer"
     assert tools[0].parameters["required"] == ["value"]
     assert tools_wire(tools) != wire
+
+
+@pytest.mark.parametrize(
+    "enum_value",
+    [
+        ("tuple",),
+        {1: "numeric key"},
+        {1: "collision", "1": "string key"},
+    ],
+    ids=["tuple", "non-string-key", "coercive-key-collision"],
+)
+def test_tool_enum_rejects_nonexact_json_containers(enum_value: object) -> None:
+    declaration = _enum_tool([enum_value])
+
+    with pytest.raises(ValueError, match=r"exact JSON values|string-keyed JSON objects"):
+        normalize_tools(declaration)
+
+
+def test_parser_accepts_one_and_64_character_property_names() -> None:
+    longest = "x" * 64
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "boundaries",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "string"},
+                            longest: {"type": "integer"},
+                        },
+                        "required": ["a", longest],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+    text = (
+        "<tool_call><function=boundaries>"
+        "<parameter=a>first</parameter>"
+        f"<parameter={longest}>2</parameter>"
+        "</function></tool_call>"
+    )
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert result.calls[0].arguments == json.dumps(
+        {"a": "first", longest: 2}, separators=(",", ":")
+    )
 
 
 def _exact_tools():
@@ -556,12 +607,25 @@ def test_numeric_enum_rejects_floats_nested_in_container_members(location: str) 
         normalize_tools(_numeric_enum_tool(location, 1.0))
 
 
-def test_numeric_enum_accepts_arbitrarily_large_exact_integers() -> None:
-    exact = 10**400 + 123
+@pytest.mark.parametrize("location", ["direct", "nested"])
+def test_numeric_enum_accepts_1024_digit_integers(location: str) -> None:
+    exact = int("9" * 1024)
 
-    tools = normalize_tools(_numeric_enum_tool("direct", exact))
+    tools = normalize_tools(_numeric_enum_tool(location, exact))
 
-    assert tools[0].parameters["properties"]["value"]["enum"] == [exact]
+    if location == "direct":
+        enum = tools[0].parameters["properties"]["value"]["enum"]
+    else:
+        enum = tools[0].parameters["properties"]["value"]["properties"]["number"]["enum"]
+    assert enum == [exact]
+
+
+@pytest.mark.parametrize("location", ["direct", "nested"])
+def test_numeric_enum_rejects_1025_digit_integers_before_copy(location: str) -> None:
+    exact = int("9" * 1025)
+
+    with pytest.raises(ValueError, match="1024-digit limit"):
+        normalize_tools(_numeric_enum_tool(location, exact))
 
 
 @pytest.mark.parametrize(
@@ -616,7 +680,7 @@ def test_enum_fingerprint_detects_exact_numeric_duplicates_without_pairwise_comp
 
 
 def test_enum_fingerprint_uses_exact_json_number_equality() -> None:
-    fingerprint = tool_calls_module._json_value_fingerprint
+    fingerprint = request_tool_calls_module._json_value_fingerprint
 
     assert fingerprint(1) == fingerprint(1.0) == fingerprint(Decimal("1.00"))
     assert fingerprint(9007199254740992) != fingerprint(9007199254740993)
@@ -665,8 +729,8 @@ def test_enum_limit_precedes_rejected_declaration_copy_and_fingerprint(monkeypat
     declarations = _enum_tool(first_enum) + _enum_tool(second_enum)
     declarations[1]["function"]["name"] = "store_two"
     copied_first = fingerprinted_first = False
-    original_copy = tool_calls_module._json_copy
-    original_fingerprint = tool_calls_module._json_value_fingerprint
+    original_copy = request_tool_calls_module._json_copy
+    original_fingerprint = request_tool_calls_module._json_value_fingerprint
 
     def tracked_copy(value, *args):
         nonlocal copied_first
@@ -683,8 +747,8 @@ def test_enum_limit_precedes_rejected_declaration_copy_and_fingerprint(monkeypat
             fingerprinted_first |= value[-1] >= 1_000_000
         return original_fingerprint(value)
 
-    monkeypatch.setattr(tool_calls_module, "_json_copy", tracked_copy)
-    monkeypatch.setattr(tool_calls_module, "_json_value_fingerprint", tracked_fingerprint)
+    monkeypatch.setattr(request_tool_calls_module, "_json_copy", tracked_copy)
+    monkeypatch.setattr(request_tool_calls_module, "_json_value_fingerprint", tracked_fingerprint)
     with pytest.raises(ValueError, match="enum value complexity"):
         normalize_tools(declarations)
     assert copied_first

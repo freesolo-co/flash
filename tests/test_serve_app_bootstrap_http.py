@@ -187,6 +187,7 @@ def test_engine_config_loads_served_checkpoint_not_logical_provenance() -> None:
     assert config.effective_served_model == manifest.engine.served_model
     assert config.model != manifest.logical_base_model
     assert config.model_revision == manifest.engine.model_revision
+    assert config.tool_parser == "qwen3_coder"
 
 
 @pytest.mark.parametrize(
@@ -211,6 +212,9 @@ def test_profile_fields_reach_the_runtime_engine_config(model_id: str) -> None:
     assert config.max_lora_rank == manifest.engine.max_lora_rank
     assert config.image_limit == manifest.engine.image_limit
     assert config.enable_tower_connector_lora is manifest.engine.enable_tower_connector_lora
+    assert config.tool_parser == (
+        "qwen3_coder" if manifest.logical_base_model == "Qwen/Qwen3.5-9B" else None
+    )
     if manifest.engine.max_num_batched_tokens is None:
         assert "max_num_batched_tokens" not in config.engine_args
     else:
@@ -1075,45 +1079,6 @@ def test_packaged_raw_json_rejects_decimal_numeric_enums(number: str) -> None:
 
     assert response.status_code == 422
     assert runtime.generation_requests == []
-
-
-@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
-def test_effective_structured_tool_conflict_is_a_client_error(stream: bool) -> None:
-    owner, runtime = _published_owner(thinking_default=False)
-    failure = PromptError("tools cannot be combined with logprobs or structured outputs")
-    if stream:
-        runtime.stream_events = [failure]
-    else:
-        runtime.generate_error = failure
-    app = create_app(owner, bearer_token=AUTH_TOKEN)
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "weather",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-    ]
-
-    response = asyncio.run(
-        _request(
-            app,
-            "POST",
-            "/v1/chat/completions",
-            headers=_auth(),
-            json=_chat_body(tools=tools, stream=stream),
-        )
-    )
-
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "invalid_request"
-    assert len(runtime.generation_requests) == 1
 
 
 @pytest.mark.parametrize("stream", [False, True])

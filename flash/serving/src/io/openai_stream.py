@@ -236,19 +236,13 @@ async def _produce_openai_chat_stream(
         await stream_output.emit(
             _assistant_role_chunk(completion_id, created, adapter_id, choice_count)
         )
-        while True:
+        while final is None:
             try:
-                event = (
-                    await anext(guarded_events)
-                    if final is not None
-                    else await _next_event_or_disconnect(guarded_events, disconnect_wait)
-                )
+                event = await _next_event_or_disconnect(guarded_events, disconnect_wait)
             except StopAsyncIteration:
                 break
             if event is None:
                 break
-            if final is not None:
-                raise RuntimeError("stream event followed request terminal")
             if _has_usage(event):
                 latest_usage = event
             kind = event.get("type")

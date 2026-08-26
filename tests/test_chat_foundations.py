@@ -717,54 +717,15 @@ def test_historical_tool_argument_complexity_boundary_succeeds(argument: str) ->
     [
         '{"days":1e99999999999999999999}',
         '{"days":1e-99999999999999999999}',
-    ],
-)
-def test_extreme_decimal_exponent_in_tool_history_is_a_request_error(argument: str) -> None:
-    messages = [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "weather", "arguments": argument},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
-    ]
-
-    with pytest.raises(OpenAIRequestError, match="arguments must encode a JSON object"):
-        parse_chat_request(
-            {"messages": messages},
-            require_model=False,
-            allow_managed_selectors=True,
-        )
-
-
-@pytest.mark.parametrize(
-    "argument",
-    [
         '{"days":1,"days":2}',
         '{"nested":{"days":1,"days":2}}',
     ],
+    ids=["positive-exponent", "negative-exponent", "duplicate-root", "duplicate-nested"],
 )
-def test_duplicate_object_keys_in_tool_history_are_a_request_error(argument: str) -> None:
-    messages = [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "weather", "arguments": argument},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
-    ]
+def test_malformed_numeric_or_duplicate_key_tool_history_is_a_request_error(
+    argument: str,
+) -> None:
+    messages = _historical_tool_messages(argument)
 
     with pytest.raises(OpenAIRequestError, match="arguments must encode a JSON object"):
         parse_chat_request(

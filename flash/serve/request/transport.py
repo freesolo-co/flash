@@ -23,7 +23,7 @@ from flash.serve.contract.urls import (
     serving_base_url,
     serving_control_url,
 )
-from flash.serve.runtime.tool_calls import (
+from flash.serve.request.tool_calls import (
     FunctionTool,
     tools_wire,
     validate_tool_control_presence,

@@ -634,7 +634,6 @@ def _historical_identity(
     from flash.serve.app import AdapterExecutionInput, ExecutionInputs, build_serving_manifest
     from flash.serve.control import DeploymentSpec
     from flash.serve.provisioning import DeploymentBundle
-    from flash.serve.runtime.tool_calls import qualified_tool_parser
 
     _stub_resolution(monkeypatch)
     current = serve_deploy._deployment_bundle(args)
@@ -642,7 +641,6 @@ def _historical_identity(
         current.spec.engine,
         served_model=retired_model,
         tokenizer_model=retired_model,
-        tool_parser=qualified_tool_parser(retired_model),
     )
     adapters = tuple(
         replace(adapter, base_model=retired_model) for adapter in current.spec.adapters

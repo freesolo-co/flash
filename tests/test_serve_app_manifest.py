@@ -66,7 +66,6 @@ def _engine(**overrides: object) -> EngineIdentity:
         "mm_processor_cache_gb": 0.0,
         "enable_tower_connector_lora": False,
         "reasoning_parser": None,
-        "tool_parser": "qwen3_coder",
         "trust_remote_code": False,
         "engine_args_fingerprint": canonical_mapping_fingerprint(ENGINE_ARGS),
         "tokenizer_kwargs_fingerprint": canonical_mapping_fingerprint(TOKENIZER_KWARGS),
@@ -204,16 +203,6 @@ def test_manifest_round_trip_is_canonical_and_data_only() -> None:
         return set()
 
     assert forbidden.isdisjoint(keys(payload))
-
-
-def test_manifest_revalidates_tool_parser_against_logical_base() -> None:
-    manifest = build_serving_manifest(*_spec_and_inputs())
-    payload = json.loads(manifest.canonical_json())
-    payload["engine"]["tool_parser"] = None
-    payload["engine"]["engine_id"] = _engine(tool_parser=None).engine_id
-
-    with pytest.raises(ManifestError, match="qualified logical base model"):
-        load_serving_manifest(payload)
 
 
 def test_manifest_rejects_unknown_keys_at_every_level_and_duplicate_json_keys() -> None:

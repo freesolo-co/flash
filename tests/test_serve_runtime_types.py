@@ -17,6 +17,11 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from flash.serve.request.tool_calls import (
+    FunctionTool,
+    detached_template_messages,
+    normalize_tools,
+)
 from flash.serve.request.validation import MAX_MESSAGE_NODES
 from flash.serve.runtime import (
     AdapterSpec,
@@ -30,13 +35,6 @@ from flash.serve.runtime import (
 )
 from flash.serve.runtime.multimodal import prepare_multimodal_request
 from flash.serve.runtime.prompt import PromptPreparer, resolve_thinking
-from flash.serve.runtime.tool_calls import (
-    FunctionTool,
-    ToolCallStreamParser,
-    detached_template_messages,
-    normalize_tools,
-    parse_qwen3_coder_output,
-)
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}}
@@ -869,6 +867,40 @@ def test_packaged_prompt_cache_key_utf8_encodes_accepted_tool_declarations() -> 
     assert key == preparer._cache_key(request, request.messages, False)
 
 
+def test_packaged_prompt_cache_keys_active_tool_schema_and_inactive_choice() -> None:
+    first = _runtime_tools()[0].wire()
+    second = _runtime_tools()[0].wire()
+    second["function"]["parameters"]["properties"]["country"] = {"type": "string"}
+    messages = [{"role": "user", "content": "weather"}]
+    active_first = GenerationRequest(
+        messages=messages,
+        tools=[first],
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    )
+    active_second = GenerationRequest(
+        messages=messages,
+        tools=[second],
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    )
+    inactive = GenerationRequest(
+        messages=messages,
+        tools=[first],
+        tool_choice="none",
+        parallel_tool_calls=True,
+    )
+    preparer = PromptPreparer(EngineConfig(model="model", prompt_cache_size=4), _Tokenizer(), None)
+
+    keys = {
+        preparer._cache_key(request, request.messages, False)
+        for request in (active_first, active_second, inactive)
+    }
+
+    assert None not in keys
+    assert len(keys) == 3
+
+
 def _runtime_tools():
     return normalize_tools(
         [
@@ -889,6 +921,27 @@ def _runtime_tools():
             }
         ]
     )
+
+
+@pytest.mark.parametrize(
+    "enum_value",
+    [("tuple",), {1: "numeric key"}, {1: "collision", "1": "string key"}],
+    ids=["tuple", "non-string-key", "coercive-key-collision"],
+)
+def test_generation_request_rejects_nonexact_tool_enum_json(enum_value: object) -> None:
+    declaration = _runtime_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"]["city"]["enum"] = [enum_value]
+
+    with pytest.raises(
+        RuntimeConfigurationError,
+        match=r"exact JSON values|string-keyed JSON objects",
+    ):
+        GenerationRequest(
+            messages=[{"role": "user", "content": "weather"}],
+            tools=[declaration],
+            tool_choice="auto",
+            parallel_tool_calls=True,
+        )
 
 
 def test_packaged_generation_request_rejects_active_tool_whitespace_stop() -> None:
@@ -961,265 +1014,6 @@ def test_generation_request_revalidates_tools_and_rejects_tool_images() -> None:
     assert request.stop == ("</tool_call>",)
     assert request.logprobs is True
     assert request.structured_outputs == {"json": SCHEMA}
-
-
-def _runtime_tools_with_required_days():
-    declaration = _runtime_tools()[0].wire()
-    declaration["function"]["parameters"]["required"] = ["city", "days"]
-    return normalize_tools([declaration])
-
-
-def test_qwen3_coder_parser_validates_schema_and_exact_fallback() -> None:
-    valid = (
-        "<tool_call>\n<function=weather>\n"
-        "<parameter=city>\nParis\n</parameter>\n"
-        "<parameter=days>\n2\n</parameter>\n"
-        "</function>\n</tool_call>  \n\t"
-    )
-    result = parse_qwen3_coder_output(
-        valid, _runtime_tools_with_required_days(), id_factory=lambda: "call_fixed"
-    )
-    assert result.content is None
-    assert result.calls[0].wire() == {
-        "id": "call_fixed",
-        "type": "function",
-        "function": {"name": "weather", "arguments": '{"city":"Paris","days":2}'},
-    }
-    malformed = valid.replace("<parameter=days>", "<parameter=unknown>")
-    assert (
-        parse_qwen3_coder_output(malformed, _runtime_tools_with_required_days()).content
-        == malformed
-    )
-
-
-def _delimiter_value_tools():
-    return normalize_tools(
-        [
-            {
-                "type": "function",
-                "function": {
-                    "name": "store",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "string_value": {"type": "string"},
-                            "object_value": {
-                                "type": "object",
-                                "properties": {
-                                    "nested": {
-                                        "type": "object",
-                                        "properties": {"text": {"type": "string"}},
-                                        "required": ["text"],
-                                        "additionalProperties": False,
-                                    }
-                                },
-                                "required": ["nested"],
-                                "additionalProperties": False,
-                            },
-                            "array_value": {
-                                "type": "array",
-                                "items": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
-                            },
-                            "count": {"type": "integer"},
-                        },
-                        "required": [],
-                        "additionalProperties": False,
-                    },
-                },
-            }
-        ]
-    )
-
-
-@pytest.mark.parametrize(
-    ("parameter_name", "raw_value", "expected"),
-    [
-        ("string_value", "before </parameter> after", "before </parameter> after"),
-        (
-            "object_value",
-            '{"nested":{"text":"before </parameter> after"}}',
-            {"nested": {"text": "before </parameter> after"}},
-        ),
-        (
-            "array_value",
-            '[["before </parameter> after"]]',
-            [["before </parameter> after"]],
-        ),
-    ],
-    ids=["string", "nested-object", "nested-array"],
-)
-def test_qwen3_coder_parser_preserves_parameter_delimiters_inside_values(
-    parameter_name: str,
-    raw_value: str,
-    expected: object,
-) -> None:
-    text = (
-        "<tool_call><function=store>"
-        f"<parameter={parameter_name}>{raw_value}</parameter>"
-        "</function></tool_call>"
-    )
-    result = parse_qwen3_coder_output(
-        text,
-        _delimiter_value_tools(),
-        id_factory=lambda: "call_fixed",
-    )
-    assert json.loads(result.calls[0].arguments) == {parameter_name: expected}
-
-
-def _delimiter_value_tools_with_required_count():
-    declaration = _delimiter_value_tools()[0].wire()
-    declaration["function"]["parameters"]["required"] = ["string_value", "count"]
-    return normalize_tools([declaration])
-
-
-def test_qwen3_coder_parser_preserves_embedded_delimiter_before_another_parameter() -> None:
-    text = (
-        "<tool_call><function=store>"
-        "<parameter=string_value>before </parameter> after</parameter>"
-        "<parameter=count>2</parameter>"
-        "</function></tool_call>"
-    )
-    result = parse_qwen3_coder_output(
-        text,
-        _delimiter_value_tools_with_required_count(),
-        id_factory=lambda: "call_fixed",
-    )
-    assert json.loads(result.calls[0].arguments) == {
-        "string_value": "before </parameter> after",
-        "count": 2,
-    }
-
-
-def test_qwen3_coder_stream_parser_handles_split_embedded_and_structural_closes() -> None:
-    parser = ToolCallStreamParser(
-        _delimiter_value_tools_with_required_count(), id_factory=lambda: "call_fixed"
-    )
-    pieces = [
-        "<tool_call><function=store><parameter=string_value>before </para",
-        "meter> after</para",
-        "meter><parameter=count>2</parameter></function></tool_call>",
-    ]
-    assert [parser.feed(piece) for piece in pieces] == ["", "", ""]
-    result = parser.finish()
-    assert json.loads(result.calls[0].arguments) == {
-        "string_value": "before </parameter> after",
-        "count": 2,
-    }
-
-
-def test_qwen3_coder_parser_returns_malformed_container_exactly() -> None:
-    malformed = (
-        "<tool_call><function=store>"
-        '<parameter=object_value>{"nested":{"text":"before </parameter> after"}'
-        "</parameter></function></tool_call>"
-    )
-
-    result = parse_qwen3_coder_output(malformed, _delimiter_value_tools())
-
-    assert result.content == malformed
-    assert result.calls == ()
-
-
-def test_qwen3_coder_parser_keeps_invalid_optional_parameter_text_in_string() -> None:
-    text = (
-        "<tool_call><function=store>"
-        "<parameter=string_value>before </parameter>"
-        "<parameter=count>not-an-int</parameter> after</parameter>"
-        "</function></tool_call>"
-    )
-
-    result = parse_qwen3_coder_output(
-        text,
-        _delimiter_value_tools(),
-        id_factory=lambda: "call_fixed",
-    )
-
-    assert json.loads(result.calls[0].arguments) == {
-        "string_value": "before </parameter><parameter=count>not-an-int</parameter> after"
-    }
-
-
-def test_qwen3_coder_parser_accepts_boundary_property_names() -> None:
-    longest = "x" * 64
-    tools = normalize_tools(
-        [
-            {
-                "type": "function",
-                "function": {
-                    "name": "boundaries",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "a": {"type": "string"},
-                            longest: {"type": "integer"},
-                        },
-                        "required": ["a", longest],
-                        "additionalProperties": False,
-                    },
-                },
-            }
-        ]
-    )
-    text = (
-        "<tool_call><function=boundaries>"
-        "<parameter=a>first</parameter>"
-        f"<parameter={longest}>2</parameter>"
-        "</function></tool_call>"
-    )
-    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
-    assert result.calls[0].arguments == json.dumps(
-        {"a": "first", longest: 2}, separators=(",", ":")
-    )
-
-
-def test_qwen3_coder_number_preserves_exact_integer_lexemes() -> None:
-    tools = normalize_tools(
-        [
-            {
-                "type": "function",
-                "function": {
-                    "name": "measure",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "exact": {"type": "number"},
-                            "decimal": {"type": "number"},
-                            "exponent": {"type": "number"},
-                        },
-                        "required": ["exact", "decimal", "exponent"],
-                        "additionalProperties": False,
-                    },
-                },
-            }
-        ]
-    )
-    text = (
-        "<tool_call><function=measure>"
-        "<parameter=exact>9007199254740993</parameter>"
-        "<parameter=decimal>1.25</parameter>"
-        "<parameter=exponent>1e3</parameter>"
-        "</function></tool_call>"
-    )
-    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
-    assert result.calls[0].arguments == (
-        '{"exact":9007199254740993,"decimal":1.25,"exponent":1000}'
-    )
-
-
-def test_qwen3_coder_stream_parser_buffers_candidates_and_falls_back_exactly() -> None:
-    parser = ToolCallStreamParser(_runtime_tools(), id_factory=lambda: "call_fixed")
-    pieces = [
-        "prefix <tool",
-        "_call>\n<function=weather>\n<parameter=city>\nParis",
-        "\n</parameter>\n</function>\n</tool_call>  \n",
-    ]
-    assert [parser.feed(piece) for piece in pieces] == ["prefix ", "", ""]
-    parsed = parser.finish()
-    assert parsed.content is None
-    assert parsed.calls[0].name == "weather"
 
 
 def test_historical_integer_lexeme_limit_detaches_exactly_and_rejects_overflow() -> None:

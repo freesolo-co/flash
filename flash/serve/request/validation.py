@@ -221,7 +221,7 @@ def normalize_messages(
                 ),
             }
         )
-    from flash.serve.runtime.tool_calls import validate_tool_history
+    from flash.serve.request.tool_calls import validate_tool_history
 
     validate_tool_history(normalized, error_type=error_type)
     return normalized, sources

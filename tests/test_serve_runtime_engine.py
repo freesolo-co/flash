@@ -809,6 +809,64 @@ def test_stream_trusts_pinned_delta_output_and_counts_chunks() -> None:
     asyncio.run(runtime.close())
 
 
+def test_stream_tool_parsers_isolate_interleaved_choices() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model", tool_parser="qwen3_coder"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+
+    def interleaved(index: int, text: str, token_id: int, finish_reason: str | None):
+        return SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    index=index,
+                    text=text,
+                    token_ids=[token_id],
+                    finish_reason=finish_reason,
+                    logprobs=None,
+                )
+            ],
+            prompt_token_ids=[1, 2, 3],
+            num_cached_tokens=0,
+        )
+
+    engine.responses.append(
+        [
+            interleaved(1, "<tool_call><function=weather><parameter=city>To", 31, None),
+            interleaved(0, "<tool_call><function=weather><parameter=city>Par", 30, None),
+            interleaved(1, "kyo</parameter></function></tool_call>", 33, "stop"),
+            interleaved(0, "is</parameter></function></tool_call>", 32, "stop"),
+        ]
+    )
+    request = GenerationRequest(
+        messages=[{"role": "user", "content": "weather"}],
+        n=2,
+        temperature=0.5,
+        tools=TOOLS,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    )
+
+    async def collect():
+        return [event async for event in runtime.stream(request)]
+
+    events = asyncio.run(collect())
+    tool_deltas = [event for event in events if isinstance(event, StreamDelta) and event.tool_calls]
+    final = events[-1]
+
+    assert isinstance(final, StreamFinished)
+    assert [(event.index, event.tool_calls[0].arguments) for event in tool_deltas] == [
+        (1, '{"city":"Tokyo"}'),
+        (0, '{"city":"Paris"}'),
+    ]
+    assert [choice.tool_calls[0].arguments for choice in final.choices] == [
+        '{"city":"Paris"}',
+        '{"city":"Tokyo"}',
+    ]
+    assert all("<tool_call>" not in event.text for event in events if hasattr(event, "text"))
+    asyncio.run(runtime.close())
+
+
 def test_stream_tool_choices_hide_raw_xml_in_terminals_and_final_choices() -> None:
     runtime = VllmLoraRuntime(EngineConfig(model="model", tool_parser="qwen3_coder"))
     asyncio.run(runtime.start())
@@ -844,11 +902,10 @@ def test_stream_tool_choices_hide_raw_xml_in_terminals_and_final_choices() -> No
     assert terminal.text == "I will check. "
     assert terminal.token_ids == (1, 2, 3, 4)
     assert terminal.finish_reason == "tool_calls"
-    assert terminal.tool_calls[0].name == "weather"
-    assert terminal.tool_calls[0].arguments == '{"city":"Paris"}'
     assert final.choices[0].text == "I will check. "
     assert final.choices[0].token_ids == (1, 2, 3, 4)
-    assert final.choices[0].tool_calls == terminal.tool_calls
+    assert final.choices[0].tool_calls[0].name == "weather"
+    assert final.choices[0].tool_calls[0].arguments == '{"city":"Paris"}'
     assert all("<tool_call>" not in event.text for event in events if hasattr(event, "text"))
     asyncio.run(runtime.close())
 
