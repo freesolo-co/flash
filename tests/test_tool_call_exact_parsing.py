@@ -38,7 +38,7 @@ def _exact_tools():
                                 "additionalProperties": False,
                             },
                             "values": {"type": "array", "items": {"type": "number"}},
-                            "selected": {"type": "number", "enum": [1.25]},
+                            "selected": {"type": "number"},
                             "count": {"type": "integer"},
                             "enabled": {"type": "boolean"},
                             "label": {"type": "string"},
@@ -219,11 +219,15 @@ def test_nested_integer_values_serialize_canonically() -> None:
 
 def test_integer_enum_uses_json_schema_mathematical_integer_semantics() -> None:
     declaration = _exact_tools()[0].wire()
-    declaration["function"]["parameters"]["properties"]["count"]["enum"] = [1.0]
-
+    declaration["function"]["parameters"]["properties"]["count"]["enum"] = [1]
     tools = normalize_tools([declaration])
+    text = _exact_call().replace(
+        "<parameter=count>2</parameter>", "<parameter=count>1.0</parameter>"
+    )
 
-    assert tools[0].parameters["properties"]["count"]["enum"] == [1.0]
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert '"count":1' in result.calls[0].arguments
 
 
 @pytest.mark.parametrize(
@@ -378,20 +382,82 @@ def _property_name_tool(property_name: str, *, nested: bool) -> list[dict[str, o
     ]
 
 
-@pytest.mark.parametrize("nested", [False, True], ids=["root", "nested"])
-def test_tool_declarations_reject_unpaired_surrogate_property_names(nested: bool) -> None:
-    with pytest.raises(ValueError, match="properties keys cannot contain an unpaired surrogate"):
-        normalize_tools(_property_name_tool("\ud800", nested=nested))
+def _unicode_declaration(location: str, value: str) -> list[dict[str, object]]:
+    declaration = _property_name_tool("value", nested=False)
+    function = declaration[0]["function"]
+    parameters = function["parameters"]
+    schema = parameters["properties"]["value"]
+    if location == "function-description":
+        function["description"] = value
+    elif location == "root-schema-description":
+        parameters["description"] = value
+    elif location == "nested-schema-description":
+        schema["description"] = value
+    elif location == "string-enum":
+        schema["enum"] = [value]
+    elif location == "array-enum-string":
+        parameters["properties"]["value"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "enum": [[value]],
+        }
+    elif location == "object-enum-string":
+        parameters["properties"]["value"] = {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+            "enum": [{"nested": value}],
+        }
+    elif location == "object-enum-key":
+        parameters["properties"]["value"] = {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+            "enum": [{value: "nested"}],
+        }
+    else:
+        return _property_name_tool(value, nested=True)
+    return declaration
 
 
-def test_tool_declarations_preserve_valid_non_bmp_nested_property_names() -> None:
-    property_name = "forecast_🌦"
+_UNICODE_DECLARATION_LOCATIONS = (
+    "function-description",
+    "root-schema-description",
+    "nested-schema-description",
+    "string-enum",
+    "array-enum-string",
+    "object-enum-string",
+    "object-enum-key",
+    "nested-property-key",
+)
 
-    tools = normalize_tools(_property_name_tool(property_name, nested=True))
 
-    nested = tools[0].parameters["properties"]["outer"]
-    assert nested["required"] == [property_name]
-    assert nested["properties"] == {property_name: {"type": "string"}}
+@pytest.mark.parametrize("location", _UNICODE_DECLARATION_LOCATIONS)
+def test_tool_declarations_reject_unpaired_surrogates_after_normalization(location: str) -> None:
+    with pytest.raises(ValueError, match="tools cannot contain an unpaired surrogate"):
+        normalize_tools(_unicode_declaration(location, "\ud800"))
+
+
+@pytest.mark.parametrize("location", _UNICODE_DECLARATION_LOCATIONS)
+def test_tool_declarations_preserve_valid_non_bmp_unicode(location: str) -> None:
+    tools = normalize_tools(_unicode_declaration(location, "forecast_🌦"))
+
+    assert "forecast_🌦" in json.dumps(tools[0].wire(), ensure_ascii=False)
+
+
+def test_root_property_surrogate_preserves_identifier_error_precedence() -> None:
+    with pytest.raises(ValueError, match="properties key is invalid"):
+        normalize_tools(_property_name_tool("\ud800", nested=False))
+
+
+def test_surrogate_check_runs_after_structural_normalization() -> None:
+    declaration = _unicode_declaration("function-description", "bad\ud800")
+    del declaration[0]["function"]["parameters"]["additionalProperties"]
+
+    with pytest.raises(ValueError, match="additionalProperties must be false"):
+        normalize_tools(declaration)
 
 
 def _enum_tool(enum: list[object]) -> list[dict[str, object]]:
@@ -417,6 +483,96 @@ def _enum_tool(enum: list[object]) -> list[dict[str, object]]:
     ]
 
 
+def _numeric_enum_tool(location: str, value: object) -> list[dict[str, object]]:
+    declaration = _property_name_tool("value", nested=False)
+    parameters = declaration[0]["function"]["parameters"]
+    if location == "direct":
+        parameters["properties"]["value"] = {"type": "number", "enum": [value]}
+    elif location == "root":
+        parameters["enum"] = [{"value": value}]
+    elif location == "nested":
+        parameters["properties"]["value"] = {
+            "type": "object",
+            "properties": {"number": {"type": "number", "enum": [value]}},
+            "required": ["number"],
+            "additionalProperties": False,
+        }
+    elif location == "array-member":
+        parameters["properties"]["value"] = {
+            "type": "array",
+            "items": {"type": "number"},
+            "enum": [[value]],
+        }
+    else:
+        parameters["properties"]["value"] = {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+            "enum": [{"number": value}],
+        }
+    return declaration
+
+
+@pytest.mark.parametrize("location", ["direct", "root", "nested"])
+@pytest.mark.parametrize("value", [1.0, Decimal("1.25")], ids=["float", "decimal"])
+def test_numeric_enum_rejects_inexact_python_numbers(location: str, value: object) -> None:
+    with pytest.raises(ValueError, match="numeric enum members must be JSON integers"):
+        normalize_tools(_numeric_enum_tool(location, value))
+
+
+@pytest.mark.parametrize("location", ["array-member", "object-member"])
+def test_numeric_enum_rejects_floats_nested_in_container_members(location: str) -> None:
+    with pytest.raises(ValueError, match="numeric enum members must be JSON integers"):
+        normalize_tools(_numeric_enum_tool(location, 1.0))
+
+
+def test_numeric_enum_accepts_arbitrarily_large_exact_integers() -> None:
+    exact = 10**400 + 123
+
+    tools = normalize_tools(_numeric_enum_tool("direct", exact))
+
+    assert tools[0].parameters["properties"]["value"]["enum"] == [exact]
+
+
+@pytest.mark.parametrize(
+    ("schema_type", "enum", "extra"),
+    [
+        ("string", ["exact"], {}),
+        ("boolean", [True, False], {}),
+        ("null", [None], {}),
+        ("array", [[1, 10**100]], {"items": {"type": "integer"}}),
+        (
+            "object",
+            [{"values": ["exact"], "id": 10**100}],
+            {
+                "properties": {
+                    "values": {"type": "array", "items": {"type": "string"}},
+                    "id": {"type": "integer"},
+                },
+                "required": ["values", "id"],
+                "additionalProperties": False,
+            },
+        ),
+    ],
+)
+def test_nonnumeric_and_integer_container_enums_remain_supported(
+    schema_type: str,
+    enum: list[object],
+    extra: dict[str, object],
+) -> None:
+    declaration = _property_name_tool("value", nested=False)
+    declaration[0]["function"]["parameters"]["properties"]["value"] = {
+        "type": schema_type,
+        "enum": enum,
+        **extra,
+    }
+
+    tools = normalize_tools(declaration)
+
+    assert tools[0].parameters["properties"]["value"]["enum"] == enum
+
+
 def test_enum_fingerprint_detects_exact_numeric_duplicates_without_pairwise_comparison(
     monkeypatch,
 ) -> None:
@@ -427,7 +583,7 @@ def test_enum_fingerprint_detects_exact_numeric_duplicates_without_pairwise_comp
     )
 
     with pytest.raises(ValueError, match="enum values must be unique"):
-        normalize_tools(_enum_tool([[1, 2], [1.0, 2.0]]))
+        normalize_tools(_enum_tool([[1, 2], [1, 2]]))
 
 
 def test_enum_fingerprint_uses_exact_json_number_equality() -> None:

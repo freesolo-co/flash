@@ -518,6 +518,21 @@ def test_hosted_message_validation_preserves_non_tool_and_active_tool_requests()
     assert tool_request.tools == _tool_payload()
 
 
+@pytest.mark.parametrize("number", ["1.0", "1e3", "9007199254740993.0", "1e-400"])
+def test_hosted_raw_json_rejects_decimal_numeric_enums(number: str) -> None:
+    raw = (
+        '{"adapter_id":"adapter","messages":[{"role":"user","content":"weather"}],'
+        '"tool_choice":"auto","parallel_tool_calls":true,"tools":[{"type":"function",'
+        '"function":{"name":"weather","parameters":{"type":"object","properties":'
+        '{"value":{"type":"number","enum":['
+        + number
+        + ']}},"required":["value"],"additionalProperties":false}}}]}'
+    )
+
+    with pytest.raises(ValidationError, match="numeric enum members must be JSON integers"):
+        OpenAIGenerateRequest.model_validate_json(raw)
+
+
 @pytest.mark.parametrize("stop", ["</tool_call>", " "])
 def test_hosted_private_tool_envelope_rejects_active_stop_grammar_collision(stop) -> None:
     with pytest.raises(ValueError, match=r"grammar markers.*tool_choice='auto'"):

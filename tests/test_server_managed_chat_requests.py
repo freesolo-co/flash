@@ -489,6 +489,34 @@ def test_managed_chat_rejects_active_tool_stop_marker_collision_before_forwardin
     assert "grammar markers" in response.json()["detail"]
 
 
+@pytest.mark.parametrize("number", ["1.0", "1e3", "9007199254740993.0", "1e-400"])
+def test_managed_raw_json_rejects_decimal_numeric_enums(api, monkeypatch, number):
+    import flash.server.asgi.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **_kwargs: pytest.fail("decimal numeric enum must not reach serving"),
+    )
+    raw = (
+        '{"messages":[{"role":"user","content":"weather"}],"tools":[{"type":"function",'
+        '"function":{"name":"weather","parameters":{"type":"object","properties":'
+        '{"value":{"type":"number","enum":['
+        + number
+        + ']}},"required":["value"],"additionalProperties":false}}}]}'
+    )
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        content=raw,
+        headers={**_bearer(key), "content-type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert "numeric enum members must be JSON integers" in response.json()["detail"]
+
+
 def test_managed_chat_forwards_normalized_tools_without_parsing_output(api, monkeypatch):
     import flash.server.asgi.app as app_mod
 

@@ -967,6 +967,31 @@ def test_non_finite_json_constants_are_rejected_as_invalid_json(body: str) -> No
     assert runtime.generation_requests == []
 
 
+@pytest.mark.parametrize("number", ["1.0", "1e3", "9007199254740993.0", "1e-400"])
+def test_packaged_raw_json_rejects_decimal_numeric_enums(number: str) -> None:
+    owner, runtime = _published_owner()
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+    tools = (
+        '"tools":[{"type":"function","function":{"name":"weather","parameters":'
+        '{"type":"object","properties":{"value":{"type":"number","enum":['
+        + number
+        + ']}},"required":["value"],"additionalProperties":false}}}]'
+    )
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers={**_auth(), "content-type": "application/json"},
+            content=_raw_chat_body(tools),
+        )
+    )
+
+    assert response.status_code == 422
+    assert runtime.generation_requests == []
+
+
 @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
 def test_effective_structured_tool_conflict_is_a_client_error(stream: bool) -> None:
     owner, runtime = _published_owner(thinking_default=False)

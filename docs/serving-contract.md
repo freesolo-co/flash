@@ -158,7 +158,9 @@ parser identity is `qwen3_coder`; Qwen3.6 and unqualified engines reject tools a
 and immutable adapter resolution, before generation. Declarations must be closed function objects
 with unique nonempty names. Parameters use a bounded root-object JSON Schema profile with
 `properties`, `required`, `additionalProperties: false`, recursive scalar, object, and array types,
-descriptions, enums, and array `items`. Unsupported keywords and `strict: true` are rejected.
+descriptions, enums, and array `items`. Numeric enum members must be JSON integers; decimal and
+exponent numeric enum lexemes are rejected because Flash cannot preserve them exactly across every
+ingress and template boundary. Unsupported keywords and `strict: true` are rejected.
 
 `tool_choice` defaults to `auto` and accepts only `auto` or `none`. `parallel_tool_calls` defaults to
 `true` and accepts only exact `true`; either control requires `tools`. Tools cannot be combined with

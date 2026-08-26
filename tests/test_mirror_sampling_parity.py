@@ -74,14 +74,13 @@ def _tools_with_property_name(property_name: str, *, nested: bool):
     return tools
 
 
-@pytest.mark.parametrize("nested", [False, True], ids=["root", "nested"])
-def test_canonical_request_rejects_unpaired_surrogate_tool_property_names(nested):
-    with pytest.raises(
-        OpenAIRequestError,
-        match="properties keys cannot contain an unpaired surrogate",
-    ):
+def test_canonical_request_rejects_unpaired_surrogate_tool_declarations():
+    tools = _tools()
+    tools[0]["function"]["description"] = "bad\ud800"
+
+    with pytest.raises(OpenAIRequestError, match="tools cannot contain an unpaired surrogate"):
         parse_chat_request(
-            _payload(tools=_tools_with_property_name("\ud800", nested=nested)),
+            _payload(tools=tools),
             require_model=True,
             allow_managed_selectors=False,
         )

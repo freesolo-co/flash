@@ -94,7 +94,6 @@ class ToolParseResult:
 
 def qualified_tool_parser(base_model: str) -> str | None:
     """return the parser qualified for one exact logical base model."""
-
     return TOOL_PARSER_QWEN3_CODER if base_model == "Qwen/Qwen3.5-9B" else None
 
 
@@ -193,12 +192,13 @@ def normalize_tools(
             root=True,
         )
         normalized.append(FunctionTool(name, description, parameters))
+    if _contains_unpaired_surrogate([tool.wire() for tool in normalized]):
+        raise error_type("tools cannot contain an unpaired surrogate")
     return tuple(normalized)
 
 
 def tools_wire(tools: Sequence[FunctionTool] | None) -> list[dict[str, Any]] | None:
     """return a detached OpenAI wire representation."""
-
     if tools is None:
         return None
     return [tool.wire() for tool in tools]
@@ -206,7 +206,6 @@ def tools_wire(tools: Sequence[FunctionTool] | None) -> list[dict[str, Any]] | N
 
 def tools_active(tools: object, tool_choice: str | None) -> bool:
     """report whether declared tools are active for this request."""
-
     return tools is not None and tool_choice == "auto"
 
 
@@ -436,8 +435,6 @@ def _normalize_schema(
             raise error_type(f"{path}.additionalProperties must be false")
         if any(type(name) is not str or not name for name in properties):
             raise error_type(f"{path}.properties keys must be nonempty strings")
-        if any(_contains_unpaired_surrogate(name) for name in properties):
-            raise error_type(f"{path}.properties keys cannot contain an unpaired surrogate")
         if root:
             for name in properties:
                 _identifier_name(name, f"{path}.properties key", error_type)
@@ -772,8 +769,7 @@ def _matches_type(value: Any, schema_type: str) -> bool:
 def _decimal_is_integral(value: Decimal) -> bool:
     if not value.is_finite():
         return False
-    digits = value.as_tuple().digits
-    exponent = value.as_tuple().exponent
+    digits, exponent = value.as_tuple().digits, value.as_tuple().exponent
     if exponent >= 0:
         return True
     fractional_digits = -exponent
@@ -941,9 +937,13 @@ def _validate_json_value_complexity(
         budget[0] += 1
         if depth > _MAX_SCHEMA_DEPTH or budget[0] > max_nodes:
             raise error_type(f"{path} exceeds the supported {kind} complexity")
+        if kind == "enum value" and type(nested) in {float, Decimal}:
+            raise error_type(f"{path} numeric enum members must be JSON integers")
         if type(nested) is list:
             stack.extend((item, depth + 1) for item in nested)
         elif type(nested) is dict:
+            if kind == "enum value" and any(type(key) in {float, Decimal} for key in nested):
+                raise error_type(f"{path} numeric enum members must be JSON integers")
             stack.extend((item, depth + 1) for item in nested.values())
 
 
