@@ -4,23 +4,39 @@ from __future__ import annotations
 
 import email.message
 import io
+import os
 import ssl
+import threading
 import urllib.error
 import urllib.request
 import urllib.response
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import flash._internal.http as http_transport
 from flash._internal.http import _build_no_redirect_opener, _urlopen_no_redirect
 
 
 @pytest.fixture(autouse=True)
-def _restore_global_opener():
+def _restore_http_globals():
     opener = urllib.request._opener
+    default = http_transport._DEFAULT_NO_REDIRECT_OPENER
+    cached = http_transport._INSTALLED_OPENER_CACHE
+    proxy_env = {key: os.environ.get(key) for key in ("HTTPS_PROXY", "https_proxy", "NO_PROXY")}
+    http_transport._DEFAULT_NO_REDIRECT_OPENER = None
+    http_transport._INSTALLED_OPENER_CACHE = None
     try:
         yield
     finally:
         urllib.request._opener = opener
+        http_transport._DEFAULT_NO_REDIRECT_OPENER = default
+        http_transport._INSTALLED_OPENER_CACHE = cached
+        for key, value in proxy_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _response(url: str, body: bytes = b"ok"):
@@ -210,6 +226,239 @@ def test_installed_proxy_and_auth_handler_state_is_preserved() -> None:
     assert {handler: handler.__dict__ for handler in original_states} == original_states
 
 
+def test_default_opener_discovers_proxy_environment_on_first_request(monkeypatch) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://late-proxy.invalid:8080")
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.setenv("NO_PROXY", "")
+    observed: list[tuple[str, str | None]] = []
+
+    def fake_https_open(self, request):
+        observed.append((request.host, request._tunnel_host))
+        return _response(request.full_url)
+
+    monkeypatch.setattr(urllib.request.HTTPSHandler, "https_open", fake_https_open)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("https://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+
+    assert observed == [("late-proxy.invalid:8080", "source.invalid")]
+
+
+def test_installed_addheaders_are_copied_and_isolated() -> None:
+    observed: list[str | None] = []
+
+    class TerminalHandler(urllib.request.AbstractHTTPHandler):
+        custom_request = urllib.request.AbstractHTTPHandler.do_request_
+
+        def custom_open(self, request):
+            observed.append(request.get_header("X-installed"))
+            return _response(request.full_url)
+
+    opener = urllib.request.build_opener(TerminalHandler())
+    opener.addheaders = [("X-installed", "original")]
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+
+    private = http_transport._INSTALLED_OPENER_CACHE.private
+    assert observed == ["original"]
+    assert private.addheaders == opener.addheaders
+    assert private.addheaders is not opener.addheaders
+    private.addheaders.append(("X-private", "value"))
+    assert opener.addheaders == [("X-installed", "original")]
+
+
+def test_installed_addheaders_mutation_updates_cached_private_opener() -> None:
+    observed: list[str | None] = []
+
+    class TerminalHandler(urllib.request.AbstractHTTPHandler):
+        custom_request = urllib.request.AbstractHTTPHandler.do_request_
+
+        def custom_open(self, request):
+            observed.append(request.get_header("X-installed"))
+            return _response(request.full_url)
+
+    opener = urllib.request.build_opener(TerminalHandler())
+    opener.addheaders = [("X-installed", "first")]
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/a"), timeout=1.0):
+        pass
+    private = http_transport._INSTALLED_OPENER_CACHE.private
+    opener.addheaders[0] = ("X-installed", "second")
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/b"), timeout=1.0):
+        pass
+    opener.addheaders = [("X-installed", "third")]
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/c"), timeout=1.0):
+        pass
+
+    assert observed == ["first", "second", "third"]
+    assert http_transport._INSTALLED_OPENER_CACHE.private is private
+    assert private.addheaders == [("X-installed", "third")]
+    assert private.addheaders is not opener.addheaders
+
+
+def test_installed_handler_list_mutation_rebuilds_private_opener() -> None:
+    observed: list[str] = []
+
+    class FirstHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            observed.append("first")
+            return _response(request.full_url)
+
+    class SecondHandler(urllib.request.BaseHandler):
+        handler_order = 50
+
+        def custom_open(self, request):
+            observed.append("second")
+            return _response(request.full_url)
+
+    opener = urllib.request.build_opener(FirstHandler())
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/a"), timeout=1.0):
+        pass
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    opener.add_handler(SecondHandler())
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/b"), timeout=1.0):
+        pass
+
+    assert observed == ["first", "second"]
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
+
+
+def test_installed_digest_handler_state_survives_across_requests() -> None:
+    password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    password_manager.add_password("realm", "https://source.invalid", "user", "pass")
+    digest = urllib.request.HTTPDigestAuthHandler(password_manager)
+    seen_nonce_counts: list[int] = []
+
+    class DigestSource(urllib.request.BaseHandler):
+        handler_order = 100
+
+        def https_open(self, request):
+            authorization = request.get_header("Authorization")
+            if authorization:
+                seen_nonce_counts.append(digest_copy(self).nonce_count)
+                return _response(request.full_url)
+            headers = email.message.Message()
+            headers["WWW-Authenticate"] = (
+                'Digest realm="realm", nonce="nonce-a", algorithm="MD5", qop="auth"'
+            )
+            response = urllib.response.addinfourl(
+                io.BytesIO(b""), headers, request.full_url, code=401
+            )
+            response.msg = "unauthorized"
+            return response
+
+    def digest_copy(handler):
+        return next(
+            item
+            for item in handler.parent.handlers
+            if isinstance(item, urllib.request.HTTPDigestAuthHandler)
+        )
+
+    opener = urllib.request.build_opener(DigestSource(), digest)
+    urllib.request.install_opener(opener)
+
+    for suffix in ("a", "b"):
+        with _urlopen_no_redirect(
+            urllib.request.Request(f"https://source.invalid/{suffix}"), timeout=1.0
+        ) as response:
+            assert response.read() == b"ok"
+
+    private_digest = next(
+        handler
+        for handler in http_transport._INSTALLED_OPENER_CACHE.private.handlers
+        if isinstance(handler, urllib.request.HTTPDigestAuthHandler)
+    )
+    assert seen_nonce_counts == [1, 2]
+    assert private_digest.nonce_count == 2
+    assert private_digest.last_nonce == "nonce-a"
+    assert digest.nonce_count == 0
+    assert digest.last_nonce is None
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_generic_redirect_error_handler_cannot_reach_sink(status: int) -> None:
+    source = "https://source.invalid/data"
+    target = "https://sink.invalid/steal"
+    observed: list[str] = []
+    redirect_calls: list[str] = []
+
+    class RedirectSource(urllib.request.BaseHandler):
+        def default_open(self, request):
+            observed.append(request.full_url)
+            if request.full_url == source:
+                headers = email.message.Message()
+                headers["Location"] = target
+                response = urllib.response.addinfourl(
+                    io.BytesIO(b""), headers, request.full_url, code=status
+                )
+                response.msg = "redirect"
+                return response
+            return _response(request.full_url)
+
+    class GenericRedirectHandler(urllib.request.BaseHandler):
+        handler_order = -100
+
+        def http_error_redirect(self, request, fp, code, msg, headers):
+            redirect_calls.append(request.full_url)
+            return self.parent.open(headers["Location"], timeout=request.timeout)
+
+        http_error_301 = http_error_redirect
+        http_error_302 = http_error_redirect
+        http_error_303 = http_error_redirect
+        http_error_307 = http_error_redirect
+        http_error_308 = http_error_redirect
+
+    opener = urllib.request.build_opener(RedirectSource(), GenericRedirectHandler())
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert exc_info.value.code == status
+    assert observed == [source]
+    assert redirect_calls == []
+
+
+def test_concurrent_custom_opener_cache_construction_is_singleton() -> None:
+    barrier = threading.Barrier(8)
+    seen_parents: list[object] = []
+    seen_lock = threading.Lock()
+
+    class TerminalHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            with seen_lock:
+                seen_parents.append(self.parent)
+            return _response(request.full_url)
+
+    opener = urllib.request.build_opener(TerminalHandler())
+    urllib.request.install_opener(opener)
+
+    def request(index: int) -> bytes:
+        barrier.wait()
+        with _urlopen_no_redirect(
+            urllib.request.Request(f"custom://source.invalid/{index}"), timeout=1.0
+        ) as response:
+            return response.read()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(request, range(8)))
+
+    assert results == [b"ok"] * 8
+    assert len({id(parent) for parent in seen_parents}) == 1
+    assert seen_parents[0] is http_transport._INSTALLED_OPENER_CACHE.private
+
+
 def test_installed_redirect_handler_cannot_reach_sink() -> None:
     source = "https://source.invalid/data"
     target = "https://sink.invalid/steal"
@@ -262,14 +511,19 @@ def test_replaced_installed_opener_is_observed() -> None:
     first = urllib.request.build_opener(TerminalHandler("first"))
     second = urllib.request.build_opener(TerminalHandler("second"))
     urllib.request.install_opener(first)
-    urllib.request.install_opener(second)
-
     with _urlopen_no_redirect(
-        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
+        urllib.request.Request("custom://source.invalid/first"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    urllib.request.install_opener(second)
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/second"), timeout=1.0
     ) as response:
         assert response.read() == b"ok"
 
-    assert observed == ["second"]
+    assert observed == ["first", "second"]
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
     assert urllib.request._opener is second
 
 
