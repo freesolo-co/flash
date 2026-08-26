@@ -1451,7 +1451,7 @@ def test_generate_routes_emit_revision_provenance(setup) -> None:
 def test_generate_base_model_response_carries_no_revision_provenance(setup) -> None:
     # base-model serving is not a revision: no freesolo body block and none of the revision headers,
     # so _inference_json_response falls back to the unchanged checkpoint-only behaviour.
-    client, _, router, _ = setup
+    _, pool, router, _ = setup
     base = AdapterRecord.model_validate(
         {
             "adapter_id": QWEN_35B,
@@ -1464,6 +1464,14 @@ def test_generate_base_model_response_carries_no_revision_provenance(setup) -> N
         }
     )
     router.upsert(base)
+
+    async def authorize(_token: str, _adapter_id: str) -> str:
+        return "org-1"
+
+    client = TestClient(
+        build_serving_app(pool, router, internal_key="secret", chat_authorizer=authorize),
+        headers={"Authorization": "Bearer user-key"},
+    )
     response = client.post("/generate", json={"adapter_id": QWEN_35B, "prompt": "hi"})
     assert response.status_code == 200
     assert "freesolo" not in response.json()

@@ -77,8 +77,10 @@ def build_serving_app(
     it is called with ``(freesolo_api_key, adapter_id)`` and must raise an ``HTTPException`` (401/403)
     when the key's org does not own the adapter (a base-model serve is authorized for any valid key).
     It returns the caller's org id, which bills a base-model serve to the caller (no adapter owner).
-    Trusted server-to-server callers presenting the shared internal key bypass it. If no
-    ``chat_authorizer`` is wired, a non-internal request fails closed (503) — prod always wires it.
+    Trusted server-to-server callers presenting the shared internal key bypass user-key auth, but
+    still require target-derived organization attribution. An unattributed base-model request fails
+    closed. If no ``chat_authorizer`` is wired, a non-internal request fails closed (503) — prod
+    always wires it.
     """
     context = ServingContext(
         pool,

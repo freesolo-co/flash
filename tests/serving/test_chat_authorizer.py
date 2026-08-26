@@ -317,13 +317,12 @@ def test_malformed_200_fails_closed_without_dispatch_or_cache(
         internal = _chat(client, **{"X-Freesolo-Internal-Key": _INTERNAL_KEY})
 
     assert allowed.status_code == 200
-    assert internal.status_code == 200
-    assert pool.generate_calls == 2
+    assert internal.status_code == 503
+    assert internal.json() == {"detail": "serving request lacks required organization attribution"}
+    assert pool.generate_calls == 1
     assert calls["n"] == 2
-    assert len(store.finalized) == 2
+    assert len(store.finalized) == 1
     assert store.finalized[0].principal.orgId == "org-1"
-    assert store.finalized[1].principal.kind == "trusted_internal"
-    assert store.finalized[1].principal.orgId is None
 
 
 def test_cancelled_waiter_does_not_cancel_shared_authorization(modal_app_module, monkeypatch):

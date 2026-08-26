@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from flash.serving.src.accounting.usage import (
     _FREESOLO_USD_PER_MTOK,
@@ -20,17 +21,16 @@ from flash.serving.src.accounting.usage import (
 )
 from flash.serving.src.accounting.usage_facts import usage_facts
 from flash.serving.src.accounting.usage_outbox import (
-    AcceptedPriceSnapshot,
     AuthoritativeProviderDay,
     DurableUsageOutbox,
     FreesoloOrgTrafficPrincipal,
     OfflineUsageStore,
-    OpenRouterTrafficPrincipal,
     OutboxSnapshot,
     ProviderSettlementRecord,
     ReconciliationDayResult,
     ReconciliationResult,
     RequestIdentity,
+    TrustedInternalTrafficPrincipal,
     UsageEvent,
     UsageOutboxError,
 )
@@ -225,6 +225,13 @@ def test_freesolo_prices_match_committed_catalog_fixed_point_contract() -> None:
         assert all("e" not in value.lower() for value in actual.values())
 
 
+def test_principals_require_nonempty_organization_attribution() -> None:
+    with pytest.raises(ValidationError):
+        FreesoloOrgTrafficPrincipal(orgId="   ")
+    with pytest.raises(ValidationError):
+        TrustedInternalTrafficPrincipal(orgId="   ")
+
+
 def test_generation_id_format_and_public_identity_separation() -> None:
     generation_id = new_generation_id()
 
@@ -236,16 +243,10 @@ def test_generation_id_format_and_public_identity_separation() -> None:
         request_id=generation_id,
         correlation_id="correlation-1",
         openai_completion_id="chatcmpl-1",
-        openrouter_request_id="or-request-1",
-        openrouter_generation_id="or-generation-1",
-        upstream_id="upstream-1",
     )
     assert identity.request_id not in {
         identity.correlation_id,
         identity.openai_completion_id,
-        identity.openrouter_request_id,
-        identity.openrouter_generation_id,
-        identity.upstream_id,
     }
 
 
@@ -544,22 +545,11 @@ def test_nonstream_capture_failure_returns_controlled_503() -> None:
     assert response.json() == {"detail": "durable serving accounting unavailable"}
 
 
-def test_openrouter_event_omits_org_and_billable_requested_adapter() -> None:
+def test_usage_event_contains_only_ordinary_attributed_pricing_contract() -> None:
     record = _revision()
-    principal = OpenRouterTrafficPrincipal(
-        publicModelId="public/model",
-        providerCatalogDigest="catalog-digest-1",
-        acceptedPriceSnapshot=AcceptedPriceSnapshot(
-            promptTokenUsd="0.000001",
-            cachedPromptTokenUsd="0.0000005",
-            completionTokenUsd="0.000002",
-        ),
-    )
     identity = RequestIdentity(
         request_id=new_generation_id(),
         correlation_id="correlation-1",
-        openrouter_request_id="or-request-1",
-        openrouter_generation_id="or-generation-1",
     )
     result = attest(
         record,
@@ -575,7 +565,7 @@ def test_openrouter_event_omits_org_and_billable_requested_adapter() -> None:
     session = build_usage_session(
         OfflineUsageStore(),
         identity,
-        principal,
+        FreesoloOrgTrafficPrincipal(orgId="org-1"),
         record,
         record,
         result,
@@ -586,12 +576,20 @@ def test_openrouter_event_omits_org_and_billable_requested_adapter() -> None:
 
     payload = session.event(result).rpc_payload()
 
-    assert payload["traffic_principal_kind"] == "openrouter"
-    assert payload["org_id"] is None
-    assert payload["requested_adapter_id"] is None
-    assert payload["public_model_id"] == "public/model"
-    assert payload["provider_catalog_digest"] == "catalog-digest-1"
-    assert payload["accepted_price_snapshot"]["completionTokenUsd"] == "0.000002"
+    assert payload["traffic_principal_kind"] == "freesolo_org"
+    assert payload["org_id"] == "org-1"
+    assert payload["requested_adapter_id"] == record.adapter_id
+    assert payload["base_model"] == record.base_model
+    assert payload["pricing_source"] == "freesolo_backend_catalog"
+    assert (
+        not {
+            "public_model_id",
+            "provider_catalog_digest",
+            "accepted_price_snapshot",
+            "quoted_provider_amount_micro_usd",
+        }
+        & payload.keys()
+    )
 
 
 def _usage_event() -> UsageEvent:
@@ -655,7 +653,6 @@ def _claimed_row(
         "traffic_principal_kind": "freesolo_org",
         "org_id": "org-1",
         "billing_attribution_explicit": False,
-        "public_model_id": "public/model",
     }
 
 
@@ -1066,6 +1063,32 @@ def test_heartbeat_batches_exact_active_generation_authority() -> None:
     assert payload["p_generation_owner_epoch"]
 
 
+def test_failure_accounting_keeps_ordinary_attribution_and_payload_contract() -> None:
+    event = _usage_event()
+    client = _QueuedClient([(200, [{"state": "pending", "replay": False}])])
+    outbox = DurableUsageOutbox(
+        _outbox_settings(), client=client, worker_id="worker-1", sleep=_no_sleep
+    )
+    outbox._active_generations.add(event.identity.request_id)
+
+    asyncio.run(outbox.fail(event, "client_disconnected"))
+
+    url, payload = client.calls[0]
+    assert url.endswith("/rpc/fail_serving_generation")
+    assert payload["p_failure_code"] == "client_disconnected"
+    assert payload["p_event"]["org_id"] == "org-1"
+    assert payload["p_event"]["requested_adapter_id"] == _revision().adapter_id
+    assert (
+        not {
+            "public_model_id",
+            "provider_catalog_digest",
+            "accepted_price_snapshot",
+            "quoted_provider_amount_micro_usd",
+        }
+        & payload["p_event"].keys()
+    )
+
+
 @pytest.mark.parametrize("terminal_operation", ["finalize", "fail"])
 def test_heartbeat_ignores_generation_terminalized_before_terminal_rpc_returns(
     terminal_operation: str,
@@ -1186,6 +1209,29 @@ def test_claimed_row_settlement_acknowledges_exact_identity() -> None:
     assert ack_url.endswith("/rpc/acknowledge_serving_usage_delivered")
     assert ack["p_outbox_id"] == row["id"]
     assert ack["p_result"]["usage_id"] == "usage-1"
+
+
+@pytest.mark.parametrize(
+    "row_update",
+    [
+        {"org_id": None},
+        {"org_id": "   "},
+        {"traffic_principal_kind": "trusted_internal"},
+    ],
+)
+def test_settlement_rejects_missing_or_implicit_attribution_before_delivery(
+    row_update: dict[str, Any],
+) -> None:
+    row = {**_claimed_row(), **row_update}
+    client = _QueuedClient([])
+    outbox = DurableUsageOutbox(
+        _outbox_settings(), client=client, worker_id="worker-1", sleep=_no_sleep
+    )
+
+    with pytest.raises(UsageOutboxError, match="usage_principal_invalid"):
+        asyncio.run(outbox._deliver(row))
+
+    assert client.calls == []
 
 
 def test_ack_replays_identical_rpc_after_committed_response_is_lost() -> None:

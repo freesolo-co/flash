@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.conftest import RecordingUsageStore, attest
@@ -186,15 +187,16 @@ def test_explicit_base_model_thinking_remains_rejected_before_settlement() -> No
     assert store.finalized == []
 
 
-def test_base_model_via_internal_key_is_durably_unattributed() -> None:
+def test_base_model_via_internal_key_fails_closed_without_org_attribution() -> None:
     client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
-    resp = _chat(client, QWEN, **{"X-Freesolo-Internal-Key": INTERNAL_KEY})
-    assert resp.status_code == 200
-    assert len(store.finalized) == 1
-    event = store.finalized[0]
-    assert event.principal.kind == "trusted_internal"
-    assert event.principal.orgId is None
-    assert event.target.requested_adapter_id == QWEN
+
+    response = _chat(client, QWEN, **{"X-Freesolo-Internal-Key": INTERNAL_KEY})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "serving request lacks required organization attribution"}
+    assert store.captured == []
+    assert store.finalized == []
+    assert store.failed == []
 
 
 def test_internal_lora_is_explicitly_attributed_to_immutable_owner() -> None:
@@ -219,6 +221,22 @@ def test_external_authorizer_none_fails_closed_before_dispatch() -> None:
     assert response.status_code == 503
     assert response.json() == {"detail": "serving auth did not return an attributable principal"}
     assert store.finalized == []
+
+
+def test_external_authorizer_cannot_inject_a_typed_principal() -> None:
+    class TypedAuthorizer:
+        async def __call__(self, _token: str, _adapter_id: str) -> AuthorizedTraffic:
+            return AuthorizedTraffic(principal=principal_for_external_org("org-injected"))
+
+    client, store = _build([_base_rec()], authorizer=TypedAuthorizer())
+
+    response = _chat(client, QWEN, Authorization="Bearer k")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "serving auth did not return an attributable principal"}
+    assert store.captured == []
+    assert store.finalized == []
+    assert store.failed == []
 
 
 def test_lora_adapter_still_requires_a_key_and_records_requested_identity() -> None:

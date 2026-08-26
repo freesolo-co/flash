@@ -376,7 +376,7 @@ def test_protocol_rejects_credential_fields_and_extra_fields() -> None:
         "SUPABASE_SERVICE_ROLE_KEY",
         "modal_token_secret",
         "hf-token",
-        "openrouter_provider_api_key",
+        "external_inference_api_key",
     ],
 )
 def test_protocol_rejects_nested_canonical_credential_aliases(field: str) -> None:

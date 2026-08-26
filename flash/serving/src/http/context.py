@@ -8,6 +8,8 @@ from fastapi import HTTPException, Request, status
 
 from flash.serving.src.accounting.usage import (
     AuthorizedTraffic,
+    InferenceAuthorization,
+    TrustedInternalAuthorization,
     UsageSession,
     build_usage_session,
     principal_for_external_org,
@@ -24,6 +26,19 @@ from flash.serving.src.store.lookup import AdapterLookup
 APP_STATE_ATTR = "serving_context"
 
 
+def require_attributed_traffic(
+    authorization: InferenceAuthorization, target: AdapterRecord
+) -> AuthorizedTraffic:
+    if isinstance(authorization, AuthorizedTraffic):
+        return authorization
+    if not isinstance(authorization, TrustedInternalAuthorization) or target.org_id is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "serving request lacks required organization attribution",
+        )
+    return AuthorizedTraffic(principal=principal_for_trusted_internal(target.org_id))
+
+
 class ServingContext:
     def __init__(
         self,
@@ -37,7 +52,7 @@ class ServingContext:
         serving_release: str,
         reload_records: Callable[[], list[AdapterRecord]] | None,
         lookup_record: Callable[[str], AdapterRecord | None] | None,
-        chat_authorizer: Callable[[str, str], Awaitable[str | AuthorizedTraffic | None]] | None,
+        chat_authorizer: Callable[[str, str], Awaitable[str | None]] | None,
     ) -> None:
         self.pool = pool
         self.router = router
@@ -58,9 +73,11 @@ class ServingContext:
     def assert_internal(self, request: Request) -> None:
         assert_internal(request, self.internal_key)
 
-    async def authorize_inference(self, request: Request, adapter_id: str) -> AuthorizedTraffic:
+    async def authorize_inference(
+        self, request: Request, adapter_id: str
+    ) -> InferenceAuthorization:
         if is_trusted_internal(request, self.trusted_internal_keys):
-            return AuthorizedTraffic(principal=principal_for_trusted_internal())
+            return TrustedInternalAuthorization()
         token = _bearer_token(request)
         if not token:
             raise HTTPException(
@@ -72,14 +89,7 @@ class ServingContext:
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is not configured"
             )
         authorized = await self.chat_authorizer(token, adapter_id)
-        if isinstance(authorized, AuthorizedTraffic):
-            if authorized.principal.kind == "trusted_internal":
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "serving auth did not return an attributable principal",
-                )
-            return authorized
-        if isinstance(authorized, str) and authorized:
+        if isinstance(authorized, str) and authorized.strip():
             return AuthorizedTraffic(principal=principal_for_external_org(authorized))
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,

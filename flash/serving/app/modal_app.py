@@ -954,8 +954,9 @@ def router():
         # durable capture is required in configured serving deployments.
         usage_store=_build_usage_outbox(settings),
         # External chat auth is ALWAYS enforced: a request needs a Freesolo API key whose org owns
-        # the adapter (the backend authorizes), or the shared internal key to bypass. The authorizer
-        # must be wired (backend URL + internal key) or non-internal chat fails closed.
+        # the adapter (the backend authorizes). The shared internal key bypasses user-key auth only;
+        # inference still requires target-derived organization attribution. The authorizer must be
+        # wired (backend URL + internal key) or non-internal chat fails closed.
         chat_authorizer=_build_chat_authorizer(settings),
     )
 
