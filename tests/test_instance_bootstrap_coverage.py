@@ -2003,10 +2003,9 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
     monkeypatch.setattr(
         b,
         "run_mode",
-        lambda _payload, _env, _phase, deadline, **_kwargs: events.append(
-            ("training", deadline)
-        )
-        or 0,
+        lambda _payload, _env, _phase, deadline, **_kwargs: (
+            events.append(("training", deadline)) or 0
+        ),
     )
     monkeypatch.setattr(b.os.path, "exists", lambda path: path == "/tmp/metrics.json")
 
@@ -2054,8 +2053,6 @@ def test_main_source_verification_failure_prevents_pip(monkeypatch):
     assert events == []
 
 
-
-
 # ---------------------------------------------------------------------------
 # deadline watchdogs
 # ---------------------------------------------------------------------------
@@ -2080,8 +2077,6 @@ def test_arm_deadline_watchdog_hard_exits(monkeypatch):
 
     assert not done.is_set()
     assert exits == [124]
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -2222,8 +2217,6 @@ def test_console_snapshot_redacts_a_payload_env_secret(tmp_path, monkeypatch):
     assert "Traceback (most recent call last):" in tail
     assert '  File "train.py", line 7, in <module>' in tail
     assert uploads == [(str(console) + "_attempt0.tail", "console_sft_attempt0.txt")]
-
-
 
 
 def test_safe_detail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):

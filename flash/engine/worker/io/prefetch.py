@@ -207,9 +207,7 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
     # Cold downloads can take tens of GB; observe_phase keeps the worker alive during the fetch.
     from flash.engine.worker.io.progress import observe_phase
 
-    with observe_phase(
-        "model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub)
-    ):
+    with observe_phase("model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub)):
 
         def _download() -> None:
             _hf()._require_hf_deadline_allowance()

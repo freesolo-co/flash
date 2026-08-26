@@ -179,7 +179,9 @@ def _resolve_sft_options(spec) -> _SftOptions:
     # targets for any env whose row construction uses python/numpy randomness.
     _sft_train.seed_training_rngs(_worker_state.SEED)
     started_at = time.time()
-    _worker_progress.publish_progress("sft_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False))
+    _worker_progress.publish_progress(
+        "sft_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False)
+    )
     gpu_probe = _sft_train._probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",

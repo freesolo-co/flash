@@ -130,7 +130,9 @@ def main():
             print("ray-log-collect warn:", sanitize_diagnostic(ray_err, limit=500))
         flags = _worker_failure_flags(e)
         detail = sanitize_diagnostic(e, limit=500)
-        failure_class = "oom" if flags["oom"] else "artifact_transport" if flags["retriable"] else "worker"
+        failure_class = (
+            "oom" if flags["oom"] else "artifact_transport" if flags["retriable"] else "worker"
+        )
         result_publication_error: Exception | None = None
         try:
             result_io.publish_result(

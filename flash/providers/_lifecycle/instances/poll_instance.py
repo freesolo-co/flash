@@ -152,7 +152,9 @@ def poll_instance_job(
         except adapter.poll_error_exceptions as exc:
             _record_resource(adapter, last_status or "unknown", transport="unavailable")
             if poll_errors.record(exc, deadline_at=attempt.work_deadline_at):
-                return PollResult(False, failure="poll_error", detail="provider status transport failed")
+                return PollResult(
+                    False, failure="poll_error", detail="provider status transport failed"
+                )
             wait_deadline = (
                 attempt.result_deadline_at if terminal_status else attempt.work_deadline_at
             )
@@ -161,7 +163,10 @@ def poll_instance_job(
                 time.sleep(delay)
             continue
         missing_streak = missing_streak + 1 if instance is None else 0
-        status = str((instance or {}).get(adapter.status_field) or ("missing" if instance is None else "unknown"))
+        status = str(
+            (instance or {}).get(adapter.status_field)
+            or ("missing" if instance is None else "unknown")
+        )
         _record_resource(adapter, status)
         if status != last_status:
             say(f"instance {adapter.instance_id}: {status}")

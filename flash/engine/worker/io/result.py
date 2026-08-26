@@ -85,9 +85,7 @@ def _download_result(path: str, *, revision: str) -> ResultManifest:
 
 
 def _existing_result(api, *, revision: str) -> ResultManifest | None:
-    base = (
-        f"{attempt_prefix(state.PHASE, state.RUN_ID, state.ATTEMPT, state.FENCE)}/result/"
-    )
+    base = f"{attempt_prefix(state.PHASE, state.RUN_ID, state.ATTEMPT, state.FENCE)}/result/"
     paths = [
         path
         for path in api.list_repo_files(
@@ -140,9 +138,7 @@ def _publish_exactly_once(manifest: ResultManifest, local_path: str) -> ResultMa
             api.create_commit(
                 repo_id=state.HF_REPO,
                 repo_type="dataset",
-                operations=[
-                    CommitOperationAdd(path_in_repo=path, path_or_fileobj=local_path)
-                ],
+                operations=[CommitOperationAdd(path_in_repo=path, path_or_fileobj=local_path)],
                 commit_message=(
                     f"record terminal result for {state.RUN_ID} "
                     f"attempt {state.ATTEMPT} fence {state.FENCE}"
@@ -151,7 +147,9 @@ def _publish_exactly_once(manifest: ResultManifest, local_path: str) -> ResultMa
             )
             return manifest
         except RuntimeError as exc:
-            if "conflicting terminal result" in str(exc) or "conflicting result manifests" in str(exc):
+            if "conflicting terminal result" in str(exc) or "conflicting result manifests" in str(
+                exc
+            ):
                 raise
             last_error = exc
         except Exception as exc:

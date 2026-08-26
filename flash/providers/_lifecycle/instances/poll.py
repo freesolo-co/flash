@@ -20,9 +20,7 @@ def preload_instance_run_id(
     return f"flash-preload-d{int(reap_deadline_epoch)}-{provider}-{region.lower()}-{suffix}"
 
 
-def preload_box_reap_due(
-    name: str, now: float, grace_s: float = PRELOAD_REAP_GRACE_S
-) -> bool:
+def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GRACE_S) -> bool:
     """return whether an embedded preload deadline elapsed beyond its grace."""
     match = re.search(r"-d(\d{10,})-", name)
     if not match:

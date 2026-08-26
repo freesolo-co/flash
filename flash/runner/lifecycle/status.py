@@ -270,7 +270,10 @@ def _record_projection(
         attempt = _current_attempt(status)
         if attempt.attempt_id != attempt_id or attempt.fence != fence:
             return False
-        if resource_identity is not None and _remote_resource_identity(status.remote) != resource_identity:
+        if (
+            resource_identity is not None
+            and _remote_resource_identity(status.remote) != resource_identity
+        ):
             return False
         setattr(status, field, bounded_json(value))
         status.updated_at = time.time()

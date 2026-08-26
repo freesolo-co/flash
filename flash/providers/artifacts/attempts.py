@@ -136,7 +136,10 @@ def _decode_result(
         payload = _download_bytes(hf_repo, path, revision=revision)
         try:
             manifest = ResultManifest.from_dict(json.loads(payload))
-            if result_path(manifest) != path or digest_record(manifest.to_dict()) != expected_digest:
+            if (
+                result_path(manifest) != path
+                or digest_record(manifest.to_dict()) != expected_digest
+            ):
                 raise ValueError("result digest does not match its immutable path")
             validate_attestation(
                 manifest.source_attestation,
@@ -161,7 +164,11 @@ def _decode_result(
 def poll_result_from_manifest(projection: dict) -> PollResult:
     """translate one verified result manifest into the provider poll contract."""
     manifest = ResultManifest.from_dict(
-        {key: value for key, value in projection.items() if key in ResultManifest.__dataclass_fields__}
+        {
+            key: value
+            for key, value in projection.items()
+            if key in ResultManifest.__dataclass_fields__
+        }
     )
     if manifest.outcome == "succeeded":
         metrics = {**manifest.metrics, TERMINAL_ATTESTATION_KEY: manifest.source_attestation}

@@ -364,6 +364,31 @@ def _reconcile_ambiguous_create(
     ) from err
 
 
+def _refresh_offer_candidates(spec, offers, tried, absolute_deadline: float) -> list[VastOffer]:
+    """Refresh the allocated shape while excluding every machine already lost by this run."""
+    from flash.core.spec import gpu_count_of
+
+    allowed = {offer.gpu for offer in offers}
+    return [
+        offer
+        for offer in usable_offers(
+            min(item.vram_gb for item in offers),
+            _effective_disk_gb(spec),
+            # include this call's rejections and machines earlier attempts rented and lost.
+            exclude_machine_ids={item.machine_id for item in tried} | dead_machine_ids(spec.run_id),
+            # exclusions consume the server-side price-sorted page before client filtering, so widen
+            # the refresh by the same amount as the exhaustion recheck.
+            limit=_EXHAUSTION_RECHECK_LIMIT,
+            max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
+            # the transient attempt spec carries the concrete allocated class and card count.
+            gpu_type=spec.gpu.type,
+            num_gpus=gpu_count_of(spec),
+            **deadline_kwargs(usable_offers, absolute_deadline),
+        )
+        if offer.gpu in allowed
+    ][:5]
+
+
 def deploy_and_submit(
     spec,
     offers: list[VastOffer],
@@ -378,8 +403,6 @@ def deploy_and_submit(
 
     Try five ranked offers, then refresh once while excluding machines already tried.
     """
-    from flash.core.spec import gpu_count_of
-
     say = make_say(log)
     absolute_deadline = require_deadline_at(deadline_at)
 
@@ -445,35 +468,12 @@ def deploy_and_submit(
                     )
                 if not candidates and not refreshed:
                     refreshed = True
-                    allowed = {o.gpu for o in offers}
-                    candidates = [
-                        o
-                        for o in usable_offers(
-                            min(o.vram_gb for o in offers),
-                            _effective_disk_gb(spec),
-                            # this call's create-rejections AND the machines earlier attempts of
-                            # this run rented and lost. `tried` alone is per-call, so a refresh
-                            # would happily re-offer a box a previous attempt already killed.
-                            exclude_machine_ids={o.machine_id for o in tried}
-                            | dead_machine_ids(spec.run_id),
-                            # the exclusion this refresh exists to apply is what makes the default
-                            # page too small: `search_offers` caps rows SERVER-side on a price-sorted
-                            # prefix, and the machines are dropped client-side afterwards. so the
-                            # more boxes this run has burned, the more of the page is already spent
-                            # -- and once they fill it the refresh returns empty while dearer usable
-                            # capacity sits just past the cap. widen for the same reason, and by the
-                            # same amount, as the exhaustion recheck below.
-                            limit=_EXHAUSTION_RECHECK_LIMIT,
-                            max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
-                            # the transient attempt spec always carries the concrete allocated class.
-                            gpu_type=spec.gpu.type,
-                            # refresh the SHAPE the allocator chose: dropping the count here would
-                            # rent a single-card offer while the worker still starts n ranks.
-                            num_gpus=gpu_count_of(spec),
-                            **deadline_kwargs(usable_offers, absolute_deadline),
-                        )
-                        if o.gpu in allowed
-                    ][:5]
+                    candidates = _refresh_offer_candidates(
+                        spec,
+                        offers,
+                        tried,
+                        absolute_deadline,
+                    )
                 continue
             try:
                 with contextlib.suppress(Exception):

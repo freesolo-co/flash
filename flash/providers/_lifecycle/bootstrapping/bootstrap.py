@@ -670,34 +670,18 @@ def _publish_cancelled_result(
     )
 
 
-def run_mode(
+def _execute_worker_mode(
     payload: dict,
     env: dict,
     mode: str,
-    deadline_ts: float,
-    *,
-    deadline_watchdog: list[object] | None = None,
-) -> int:
-    """run one worker subprocess and publish bounded terminal evidence."""
+    worker_deadline_at: float,
+    upload_deadline_at: float,
+    reaping_deadline_at: float,
+) -> tuple[str, int, bool, bool, str, float]:
+    """Run the worker child and its console uploader through bounded shutdown."""
     console = f"/tmp/console_{mode}.txt"
-    upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
-    worker_deadline_at = min(
-        _worker_execution_deadline(upload_deadline_at),
-        _finite_positive_number(payload.get("work_deadline_at"), "work deadline"),
-    )
-    # cap work from its actual start: the absolute deadline includes boot grace, whose unused
-    # portion must not extend the declared wall-time budget.
-    budget = payload.get("run_max_wall_seconds")
-    if isinstance(budget, (int, float)) and not isinstance(budget, bool):
-        budget = float(budget)
-        if math.isfinite(budget) and budget > 0:
-            worker_deadline_at = min(
-                worker_deadline_at,
-                _finite_positive_number(time.time(), "current clock") + budget,
-            )
     timed_out = False
     cancelled = False
-
     with open(console, "w", buffering=1) as cf:
         code_dir = _code_dir(payload)
         if worker_deadline_at - _finite_positive_number(time.time(), "current clock") <= 0:
@@ -714,21 +698,21 @@ def run_mode(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            # the worker's own output can carry bytes invalid under the container locale; strict
-            # decoding would raise mid-stream and fail a paid run whose training actually ran.
+            # the worker's output can contain bytes invalid under the container locale; strict
+            # decoding would fail a paid run whose training completed.
             errors="replace",
         )
         pump_done = threading.Event()
         pump_write_lock = threading.Lock()
         pump_writes_enabled = True
-        # resolved once: the payload does not change, and this runs per child line.
+        # resolve once because the payload is immutable and this runs for each child output line.
         pump_secrets = _payload_secrets(payload)
 
         def pump():
-            """tee sanitized output to the provider log and raw output to the console file.
+            """Tee sanitized output to the provider log and raw output to the console file.
 
-            only this process knows payload secret values. keep the end of oversized lines because
-            native stacks and json diagnostics place the root cause there.
+            only this process knows payload secrets. retain oversized-line endings because native
+            stacks and json diagnostics place the root cause there.
             """
             try:
                 for line in proc.stdout:
@@ -749,8 +733,8 @@ def run_mode(
             finally:
                 pump_done.set()
 
-        t = threading.Thread(target=pump, daemon=True)
-        t.start()
+        thread = threading.Thread(target=pump, daemon=True)
+        thread.start()
         uploader, stop_upload = _start_console_uploader(payload, console, mode)
         try:
             try:
@@ -779,7 +763,7 @@ def run_mode(
             )
             pump_finished = pump_done.wait(drain_timeout)
             if pump_finished:
-                t.join()
+                thread.join()
             else:
                 timed_out = True
                 with pump_write_lock:
@@ -793,6 +777,41 @@ def run_mode(
             )
             if not uploader_clean:
                 print("console uploader exceeded its shutdown allowance; terminated", flush=True)
+    return console, proc.returncode, timed_out, cancelled, code_dir, worker_started_at
+
+
+def run_mode(
+    payload: dict,
+    env: dict,
+    mode: str,
+    deadline_ts: float,
+    *,
+    deadline_watchdog: list[object] | None = None,
+) -> int:
+    """run one worker subprocess and publish bounded terminal evidence."""
+    upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
+    worker_deadline_at = min(
+        _worker_execution_deadline(upload_deadline_at),
+        _finite_positive_number(payload.get("work_deadline_at"), "work deadline"),
+    )
+    # cap work from its actual start: the absolute deadline includes boot grace, whose unused
+    # portion must not extend the declared wall-time budget.
+    budget = payload.get("run_max_wall_seconds")
+    if isinstance(budget, (int, float)) and not isinstance(budget, bool):
+        budget = float(budget)
+        if math.isfinite(budget) and budget > 0:
+            worker_deadline_at = min(
+                worker_deadline_at,
+                _finite_positive_number(time.time(), "current clock") + budget,
+            )
+    console, returncode, timed_out, cancelled, code_dir, worker_started_at = _execute_worker_mode(
+        payload,
+        env,
+        mode,
+        worker_deadline_at,
+        upload_deadline_at,
+        reaping_deadline_at,
+    )
     try:
         extra = ""
         if timed_out:
@@ -839,7 +858,7 @@ def run_mode(
             started_at=worker_started_at,
         )
         raise _CancellationRequested
-    return proc.returncode
+    return returncode
 
 
 def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Event]:
