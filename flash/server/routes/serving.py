@@ -479,7 +479,11 @@ def undeploy(
         response_state = (
             deployment
             if removed_summary
-            else {"state": "undeployed", "checkpoint_id": checkpoint_id}
+            else {
+                "state": "undeployed",
+                "checkpoint_id": checkpoint_id,
+                "checkpoint_step": parsed[1],
+            }
         )
         response = _public_deployment({**response_state, "run_id": run_id})
         response.update(

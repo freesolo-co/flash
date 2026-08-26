@@ -2970,7 +2970,7 @@ def test_sibling_undeploy_returns_exact_removed_checkpoint(api, monkeypatch):
     body = response.json()
     assert body == {
         "run_id": run_id,
-        "checkpoint_step": None,
+        "checkpoint_step": 20,
         "checkpoint_id": sibling,
         "state": "undeployed",
         "verified_at": None,
