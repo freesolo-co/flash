@@ -1045,6 +1045,7 @@ def test_warm_start_non_sft_cost_uses_the_authoritative_server_quote(
     monkeypatch.setattr(commands, "shadowed_login_warning", lambda: "shadowed!")
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("WARM_START_TOKEN", "server-only-secret")
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
     # group_size 2 is grpo's floor and is valid for opd too.
     body = (
         SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"')
@@ -1067,7 +1068,7 @@ def test_warm_start_non_sft_cost_uses_the_authoritative_server_quote(
     call = client.calls[0]
     assert call["dry_run"] is True
     assert call["spec"]["train"]["init_from_adapter"] == "source-run/final"
-    assert call["runtime_secrets"]["WARM_START_TOKEN"] == "server-only-secret"
+    assert call["runtime_secrets"] == {"WARM_START_TOKEN": "server-only-secret"}
     assert call["client_train_schema"]["version"]
     assert "init_from_adapter" in call["client_train_schema"]["authored_keys"]
     assert f"{1.005:.2f}" == "1.00", "the fixture must expose half-even formatting"

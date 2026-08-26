@@ -605,11 +605,11 @@ class _LoraEngineImpl:
 
     @staticmethod
     def _lora_request_attestation(record: Any, lora_request: Any) -> str | None:
-        """Attest that the engine resolved the exact immutable adapter that was asked for.
+        """attest the exact tenant-scoped permanent checkpoint loaded by the engine.
 
-        A mutable alias may legitimately resolve to whatever it currently points at, so only a
-        revision is attested. Returning the resolved name lets the router prove the weights it
-        billed for came from the requested revision rather than trusting the id it sent.
+        The opaque engine name binds the owning organization and checkpoint id. Returning the
+        checkpoint lets the router verify that generation used the authorized binding rather than
+        trusting only the request payload.
         """
         if not record.is_checkpoint:
             return None

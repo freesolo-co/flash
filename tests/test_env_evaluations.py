@@ -411,6 +411,13 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
     class Client(_EvalClient):
         def __init__(self):
             self.calls = []
+            self.run_calls = 0
+
+        def get_run(self, run_id):
+            self.run_calls += 1
+            if self.run_calls > 1:
+                raise RuntimeError("a second run lookup is unavailable")
+            return super().get_run(run_id)
 
         def chat_stream(self, target, messages, **kwargs):
             self.calls.append((target, messages, kwargs))
@@ -436,6 +443,7 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
     )
 
     assert result == 0
+    assert client.run_calls == 1
     assert client.calls == [
         (
             _EXPLICIT_TARGET,

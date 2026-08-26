@@ -34,6 +34,34 @@ def _rec(run_id: str, *, thinking: bool = True) -> AdapterRecord:
     return checkpoint_record(run_id, QWEN, thinking=thinking)
 
 
+class _NoReadyPool:
+    """engine pool whose first event is an attested content delta."""
+
+    def __init__(self) -> None:
+        self.first_event = None
+
+    async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
+        self.first_event = attest(
+            record,
+            {
+                "type": "delta",
+                "text": "write </think> verbatim",
+                "checkpoint": record.adapter_id,
+            },
+        )
+        yield self.first_event
+        yield {"type": "final", "finish_reason": "stop"}
+
+    async def generate(self, base_model, payload, record, *, expected_checkpoint=None):
+        raise AssertionError("stream test must not use buffered generation")
+
+    async def register(self, base_model, record) -> None:
+        pass
+
+    async def unregister(self, base_model, org_id, adapter_id, expected_generation=None) -> None:
+        pass
+
+
 class _Pool:
     """Engine pool that reports the rendered thinking mode, like the real engine does."""
 
@@ -223,3 +251,29 @@ def test_chat_stream_without_thinking_emits_only_content_deltas():
     assert all("reasoning_content" not in d for d in deltas)
     content = "".join(d["content"] for d in deltas if "content" in d)
     assert content == "write </think> to close"
+
+
+def test_chat_stream_accepts_attested_delta_without_ready_event() -> None:
+    pool = _NoReadyPool()
+    client = _client(pool, thinking=False)
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"model": "qa/final", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["X-Freesolo-Checkpoint"] == "qa/final"
+        assert response.headers["X-Freesolo-LoRA-Request-Adapter"] == "qa/final"
+        body = response.read().decode("utf-8")
+
+    assert pool.first_event["checkpoint"] == "qa/final"
+    assert pool.first_event["lora_request_adapter"] == "qa/final"
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [payload["choices"][0]["delta"] for payload in payloads]
+    assert all("reasoning_content" not in delta for delta in deltas)
+    assert "".join(delta.get("content", "") for delta in deltas) == "write </think> verbatim"

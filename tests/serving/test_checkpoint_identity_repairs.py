@@ -220,7 +220,7 @@ def test_evaluation_accepts_verified_sibling_without_latest_deployment_equality(
                 "deployment": {"state": "failed", "checkpoint_id": "run-a/step-40"},
             }
 
-    target, error = _resolve_evaluation_target(
+    target, run, error = _resolve_evaluation_target(
         SimpleNamespace(target=checkpoint, debug=False),
         _Client(),
         ("run-a", 20),
@@ -228,6 +228,7 @@ def test_evaluation_accepts_verified_sibling_without_latest_deployment_equality(
         RuntimeError,
     )
     assert target == checkpoint
+    assert run["verified_checkpoints"] == [checkpoint]
     assert error is None
 
 

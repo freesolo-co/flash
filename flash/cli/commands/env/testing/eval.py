@@ -547,7 +547,7 @@ def _print_report(report: EvalSuiteReport) -> None:
 
 def _resolve_evaluation_target(
     args, client, parsed, api_error, client_error
-) -> tuple[str, int | None]:
+) -> tuple[str, object, int | None]:
     """require the exact requested checkpoint to have verified ready authority."""
 
     run_id, _ = parsed
@@ -557,62 +557,26 @@ def _resolve_evaluation_target(
         if getattr(args, "debug", False):
             raise
         _err(f"env eval failed: could not resolve verified checkpoints for {run_id}: {exc}")
-        return args.target, _err("overall: FAIL")
+        return args.target, None, _err("overall: FAIL")
     except Exception as exc:
         if getattr(args, "debug", False):
             raise
         _err(f"env eval failed: could not resolve verified checkpoints for {run_id}: {exc}")
-        return args.target, _err("overall: FAIL")
+        return args.target, None, _err("overall: FAIL")
     verified = run.get("verified_checkpoints") if isinstance(run, dict) else None
     if not isinstance(verified, list) or any(not isinstance(item, str) for item in verified):
         _err(f"env eval failed: control plane returned invalid checkpoint authority for {run_id}")
-        return args.target, _err("overall: FAIL")
+        return args.target, None, _err("overall: FAIL")
     if args.target not in verified:
         _err(f"env eval failed: checkpoint {args.target} has not passed deployment verification")
-        return args.target, _err("overall: FAIL")
-    return args.target, None
+        return args.target, None, _err("overall: FAIL")
+    return args.target, run, None
 
 
-def _load_evaluation_run_spec(
-    args, client, parsed, api_error, client_error
-) -> tuple[object, int | None]:
-    """load the target run specification phase."""
-    # one run lookup supplies its training environment, reasoning mode, and owning project.
-    # these are target-run properties, not fallbacks, and reading once avoids one lookup per case.
-    spec = None
-    target_run_id = parsed[0]
-    if not target_run_id:
-        return spec, None
-    try:
-        spec = client.get_run(target_run_id).get("spec")
-    except client_error as exc:
-        # `ApiError` subclasses `ClientError`, so one handler must preserve retryable 5xx/429.
-        # both arms abort because the run's environment is required; they differ only in
-        # whether retrying can help.
-        if getattr(args, "debug", False):
-            raise
-        answered_definitively = (
-            isinstance(exc, api_error) and exc.status < 500 and exc.status != 429
-        )
-        if answered_definitively:
-            _err(
-                f"env eval failed: could not read the target run {target_run_id}: {exc}. "
-                "its published environment is what supplies the suites to score."
-            )
-        else:
-            _err(
-                f"env eval failed: could not reach the control plane for {target_run_id}: "
-                f"{exc}. retry once it is reachable."
-            )
-        return spec, _err("overall: FAIL")
-    except Exception as exc:
-        # anything else is not a transport fault, so it is not retryable either. broad, so an
-        # unexpected client shape cannot crash a command the user asked for.
-        if getattr(args, "debug", False):
-            raise
-        _err(f"env eval failed: could not read the target run {target_run_id}: {exc}")
-        return spec, _err("overall: FAIL")
-    return spec, None
+def _load_evaluation_run_spec(run: object) -> object:
+    """load the target run specification from the verified authority record."""
+
+    return run.get("spec") if isinstance(run, dict) else None
 
 
 def _resolve_evaluation_project(args, project_id, spec, client_error) -> tuple[str, int | None]:
@@ -874,15 +838,13 @@ def cmd_env_eval(args) -> int:
         return _err("overall: FAIL")
 
     client = client_from_config()
-    evaluation_target, exit_code = _resolve_evaluation_target(
+    evaluation_target, run, exit_code = _resolve_evaluation_target(
         args, client, parsed, ApiError, ClientError
     )
     if exit_code is not None:
         return exit_code
 
-    spec, exit_code = _load_evaluation_run_spec(args, client, parsed, ApiError, ClientError)
-    if exit_code is not None:
-        return exit_code
+    spec = _load_evaluation_run_spec(run)
 
     # graders must see what training graded, so the run's own `thinking` decides whether the
     # reasoning is stripped first (see `_scored_response`).
