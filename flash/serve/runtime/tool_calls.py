@@ -43,8 +43,6 @@ _SCHEMA_KEYS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class FunctionTool:
-    """one normalized function declaration with a closed parameters schema."""
-
     name: str
     description: str | None
     parameters: dict[str, Any]
@@ -666,10 +664,12 @@ def _parse_parameter_value(
                 if probe == 2 and text.startswith(_PARAMETER_START, after_probe):
                     return cursor, value, None
                 if text.startswith(TOOL_CALL_END, after_probe):
-                    if not parsed[3]:
-                        return cursor, value, None if probe == 2 else parsed
-                    search_from = after_probe + len(TOOL_CALL_END)
-                    continue
+                    if parsed[3]:
+                        if probe == 2:
+                            return None
+                        search_from = after_probe + len(TOOL_CALL_END)
+                        continue
+                    return cursor, value, None if probe == 2 else parsed
         search_from = value_end + len(_PARAMETER_END)
 
 

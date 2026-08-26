@@ -768,6 +768,12 @@ def _candidate_call(parameters: str) -> str:
     return f"<tool_call><function=store>{parameters}</function></tool_call>"
 
 
+def _absorbing_optional_string_tools():
+    declaration = _candidate_string_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"]["b"] = {"type": "string"}
+    return normalize_tools([declaration])
+
+
 _EMBEDDED_PARAMETER_CASES = [
     (
         "unknown",
@@ -881,6 +887,71 @@ def test_required_parameter_opener_remains_structural_across_stream_splits() -> 
         assert parser.feed(text[:split]) == ""
         assert parser.feed(text[split:]) == ""
         assert json.loads(parser.finish().calls[0].arguments) == {"a": "before", "c": "inside"}
+
+
+def _optional_free_string_absorption_case() -> tuple[str, dict[str, str]]:
+    text = _candidate_call(
+        "<parameter=a>before </parameter><parameter=b>inside</parameter>"
+        "</function></tool_call> boundary <parameter=c>embedded</parameter> after</parameter>"
+        "<parameter=c>done</parameter>"
+    )
+    expected = {
+        "a": (
+            "before </parameter><parameter=b>inside</parameter>"
+            "</function></tool_call> boundary <parameter=c>embedded</parameter> after"
+        ),
+        "c": "done",
+    }
+    return text, expected
+
+
+def test_optional_free_string_cannot_absorb_required_fields_buffered(monkeypatch) -> None:
+    text, expected = _optional_free_string_absorption_case()
+    original = tool_calls_module._parse_parameter_value
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tool_calls_module, "_parse_parameter_value", counted)
+    result = parse_qwen3_coder_output(
+        text, _absorbing_optional_string_tools(), id_factory=lambda: "call_fixed"
+    )
+
+    assert json.loads(result.calls[0].arguments) == expected
+    assert calls <= 4
+
+
+def test_optional_free_string_cannot_absorb_required_fields_across_splits() -> None:
+    text, expected = _optional_free_string_absorption_case()
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(
+            _absorbing_optional_string_tools(), id_factory=lambda: "call_fixed"
+        )
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        assert json.loads(parser.finish().calls[0].arguments) == expected
+
+
+def test_complete_optional_free_string_continuation_remains_ambiguous_across_splits() -> None:
+    text = _candidate_call(
+        "<parameter=c>done</parameter><parameter=a>before </parameter>"
+        "<parameter=b>inside</parameter>"
+    )
+
+    buffered = parse_qwen3_coder_output(text, _absorbing_optional_string_tools())
+    assert buffered.content == text
+    assert buffered.calls == ()
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(_absorbing_optional_string_tools())
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert result.content == text
+        assert result.calls == ()
 
 
 def test_parameter_continuation_probe_has_bounded_linear_work(monkeypatch) -> None:
