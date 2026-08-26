@@ -127,6 +127,34 @@ def _capacity_exhausted(
     return refusals.get(_lifecycle._shape_key(projected), 0) >= _REFUSALS_BEFORE_GIVING_UP
 
 
+def _retry_delay(ctx: _SubmitContext, local_attempt: int) -> float:
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+
+    if local_attempt >= ctx.infra_budget:
+        return 0
+    remaining = _load_run_deadline_at(ctx.spec.run_id) - _lifecycle.time.time()
+    return min(10 * (local_attempt + 1), remaining) if remaining > 0 else 0
+
+
+def _persist_retry_budget(ctx: _SubmitContext, prepared) -> None:
+    from flash.runner.lifecycle.protocol import AttemptRecord
+    from flash.runner.lifecycle.status import get_status, record_retry_counters
+
+    status = get_status(ctx.spec.run_id)
+    current = AttemptRecord.from_dict(status.attempt) if status.attempt is not None else None
+    identity = (
+        {"attempt_id": current.attempt_id, "fence": current.fence}
+        if current is not None and current.attempt_id == prepared.attempt
+        else {"expected_next_attempt": prepared.expected_next_attempt}
+    )
+    if not record_retry_counters(
+        ctx.spec.run_id,
+        ctx.retry_budget.counters(),
+        **identity,
+    ):
+        raise RuntimeError("retry counters could not be persisted at the current attempt identity")
+
+
 def _retry_target(
     ctx: _SubmitContext,
     outcome: _AttemptOutcome,

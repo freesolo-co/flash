@@ -253,6 +253,38 @@ def _current_attempt(status: RunStatus):
     return AttemptRecord.from_dict(status.attempt)
 
 
+def record_retry_counters(
+    run_id: str,
+    counters: dict,
+    *,
+    attempt_id: int | None = None,
+    fence: int | None = None,
+    expected_next_attempt: int | None = None,
+) -> bool:
+    """persist exact consumed retry categories at a current lifecycle identity."""
+    expected = {"infra", "oom", "cache"}
+    if set(counters) != expected or any(
+        type(value) is not int or value < 0 for value in counters.values()
+    ):
+        raise ValueError("retry counters must contain nonnegative exact categories")
+    with state._status_guard(run_id):
+        raw = _load_status_json(run_id)
+        status = _runstatus_from_json(raw)
+        if status.state in state.TERMINAL_STATES:
+            return False
+        if attempt_id is not None or fence is not None:
+            attempt = _current_attempt(status)
+            if attempt.attempt_id != attempt_id or attempt.fence != fence:
+                return False
+        elif raw.get(state._NEXT_ATTEMPT_KEY) != expected_next_attempt:
+            return False
+        status.retry_counters = dict(counters)
+        status.updated_at = time.time()
+        state._save_status_unlocked(status)
+    reporting._report_status(status)
+    return True
+
+
 def _record_projection(
     run_id: str,
     field: str,

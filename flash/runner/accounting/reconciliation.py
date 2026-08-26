@@ -71,8 +71,13 @@ def _expected_remote_matches(current: object, expected: dict | None) -> bool:
     return expected_identity is not None and _remote_resource_identity(current) == expected_identity
 
 
-def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
-    """Clear only the nonterminal remote that still names the destroyed resource."""
+def _compare_and_clear_remote(
+    run_id: str,
+    expected_remote: dict,
+    *,
+    retry_counters: dict | None = None,
+) -> bool:
+    """clear one destroyed remote and atomically persist its consumed retry budget."""
     if _remote_resource_identity(expected_remote) is None:
         return False
     report_status: RunStatus | None = None
@@ -82,6 +87,13 @@ def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
+        if retry_counters is not None:
+            expected = {"infra", "oom", "cache"}
+            if set(retry_counters) != expected or any(
+                type(value) is not int or value < 0 for value in retry_counters.values()
+            ):
+                raise ValueError("retry counters must contain nonnegative exact categories")
+            status.retry_counters = dict(retry_counters)
         status.remote = None
         status.updated_at = time.time()
         state._save_status_unlocked(status)

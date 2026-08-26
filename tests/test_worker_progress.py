@@ -217,6 +217,198 @@ def test_optional_upload_verification_blip_retries_identical_record(monkeypatch)
     assert not progress_io._PROGRESS_QUEUE
 
 
+def test_optional_deferred_target_stays_queued_and_nonfatal(monkeypatch) -> None:
+    _reset(monkeypatch)
+    attempts = []
+
+    def upload(record, *, required):
+        attempts.append((record, required))
+        raise progress_io._ProgressUploadDeferred("optional readback unavailable")
+
+    monkeypatch.setattr(progress_io, "_upload_record", upload)
+
+    assert progress_io.publish_optional_progress("model_prefetching", initial=True) is False
+    assert len(progress_io._PROGRESS_QUEUE) == 1
+    assert progress_io._PROGRESS_QUEUE[0].record is attempts[0][0]
+    assert attempts[0][1] is False
+    assert progress_io._PROGRESS_FATAL_ERROR is None
+    assert progress_io._PROGRESS_SEQUENCE == 0
+    assert progress_io._PROGRESS_PREVIOUS_DIGEST is None
+
+
+def test_required_boundary_resolves_landed_deferred_optional_predecessor(monkeypatch) -> None:
+    _reset(monkeypatch)
+    monkeypatch.setattr(progress_io.worker_state, "HF_REPO", "org/repo")
+    remote = {}
+    uploads = []
+    verification_calls = {"count": 0}
+
+    def upload(local, path, *, required):
+        with open(local, "rb") as handle:
+            payload = handle.read()
+        uploads.append((path, payload, required))
+        remote[path] = payload
+        return len(uploads) == 3
+
+    def verify(path):
+        verification_calls["count"] += 1
+        if verification_calls["count"] == 1:
+            raise ConnectionError("temporary readback failure")
+        return remote.get(path)
+
+    monkeypatch.setattr(progress_io.hf_io, "hf_upload_absolute", upload)
+    monkeypatch.setattr(progress_io, "_remote_record_payload", verify)
+
+    assert progress_io.publish_optional_progress("model_prefetching", initial=True) is False
+    deferred = progress_io._PROGRESS_QUEUE[0]
+    assert progress_io.publish_progress("boot", initial=True) is True
+
+    assert uploads[0][:2] == uploads[1][:2]
+    assert [required for _path, _payload, required in uploads] == [False, True, True]
+    records = [
+        progress_io.ProgressRecord.from_dict(json.loads(remote[path])) for path in sorted(remote)
+    ]
+    assert [record.sequence for record in records] == [1, 2]
+    assert records[0].previous_digest is None
+    assert records[1].previous_digest == digest_record(records[0].to_dict())
+    assert deferred.committed is True
+    assert progress_io._PROGRESS_SEQUENCE == 2
+    assert digest_record(records[1].to_dict()) == progress_io._PROGRESS_PREVIOUS_DIGEST
+    assert len({path for path in remote if "/progress/00000000000000000001-" in path}) == 1
+    assert not progress_io._PROGRESS_QUEUE
+    assert progress_io._PROGRESS_FATAL_ERROR is None
+
+
+def test_required_boundary_fails_closed_on_unresolved_optional_predecessor(monkeypatch) -> None:
+    _reset(monkeypatch)
+    attempts = []
+
+    def upload(record, *, required):
+        attempts.append((record, required))
+        raise progress_io._ProgressUploadDeferred("optional readback unavailable")
+
+    monkeypatch.setattr(progress_io, "_upload_record", upload)
+
+    assert progress_io.publish_optional_progress("model_prefetching", initial=True) is False
+    with pytest.raises(progress_io._ProgressUploadDeferred, match="optional readback unavailable"):
+        progress_io.publish_progress("boot", initial=True)
+
+    assert attempts[0][0].to_dict() == attempts[1][0].to_dict()
+    assert [required for _record, required in attempts] == [False, True]
+    assert progress_io._PROGRESS_SEQUENCE == 0
+    assert progress_io._PROGRESS_PREVIOUS_DIGEST is None
+    assert isinstance(progress_io._PROGRESS_FATAL_ERROR, progress_io._ProgressUploadDeferred)
+    assert not progress_io._PROGRESS_QUEUE
+
+
+def test_required_boundary_fails_closed_on_conflicting_promoted_predecessor(
+    monkeypatch,
+) -> None:
+    _reset(monkeypatch)
+    monkeypatch.setattr(progress_io.worker_state, "HF_REPO", "org/repo")
+    remote = {}
+    uploads = []
+    verification_calls = {"count": 0}
+
+    def upload(local, path, *, required):
+        with open(local, "rb") as handle:
+            payload = handle.read()
+        uploads.append((path, payload, required))
+        if len(uploads) == 1:
+            remote[path] = payload
+        return False
+
+    def verify(path):
+        verification_calls["count"] += 1
+        if verification_calls["count"] == 1:
+            raise ConnectionError("temporary readback failure")
+        remote[path] = b'{"conflicting":"immutable record"}'
+        return remote[path]
+
+    monkeypatch.setattr(progress_io.hf_io, "hf_upload_absolute", upload)
+    monkeypatch.setattr(progress_io, "_remote_record_payload", verify)
+
+    assert progress_io.publish_optional_progress("model_prefetching", initial=True) is False
+    with pytest.raises(RuntimeError, match="immutable progress path contains different bytes"):
+        progress_io.publish_progress("boot", initial=True)
+
+    assert uploads[0][:2] == uploads[1][:2]
+    assert [required for _path, _payload, required in uploads] == [False, True]
+    assert len({path for path, _payload, _required in uploads}) == 1
+    assert len(remote) == 1
+    assert progress_io._PROGRESS_SEQUENCE == 0
+    assert progress_io._PROGRESS_PREVIOUS_DIGEST is None
+    assert isinstance(progress_io._PROGRESS_FATAL_ERROR, RuntimeError)
+    assert not progress_io._PROGRESS_QUEUE
+
+
+def test_required_deferred_upload_fails_closed(monkeypatch) -> None:
+    _reset(monkeypatch)
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            progress_io._ProgressUploadDeferred("required readback unavailable")
+        ),
+    )
+
+    with pytest.raises(progress_io._ProgressUploadDeferred, match="required readback unavailable"):
+        progress_io.publish_progress("boot", initial=True)
+    assert isinstance(progress_io._PROGRESS_FATAL_ERROR, progress_io._ProgressUploadDeferred)
+
+
+def test_required_false_upload_latches_fatal_and_clears_queue(monkeypatch) -> None:
+    _reset(monkeypatch)
+    blocked = progress_io._PendingProgress("phase_observed", False, False, {})
+
+    def upload(*_args, **_kwargs):
+        with progress_io._PROGRESS_LOCK:
+            progress_io._PROGRESS_QUEUE.append(blocked)
+        return False
+
+    monkeypatch.setattr(progress_io, "_upload_record", upload)
+
+    with pytest.raises(
+        RuntimeError, match="required progress record was not verified as committed"
+    ):
+        progress_io.publish_progress("boot", initial=True)
+
+    fatal = progress_io._PROGRESS_FATAL_ERROR
+    assert isinstance(fatal, RuntimeError)
+    assert blocked.error is fatal
+    assert not progress_io._PROGRESS_QUEUE
+    with pytest.raises(
+        RuntimeError, match="required progress record was not verified as committed"
+    ):
+        progress_io.publish_progress("phase_observed")
+
+
+def test_optional_permanent_upload_failure_is_observational(monkeypatch) -> None:
+    _reset(monkeypatch)
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+
+    assert progress_io.publish_optional_progress("model_prefetching", initial=True) is False
+    assert progress_io._PROGRESS_FATAL_ERROR is None
+    assert not progress_io._PROGRESS_QUEUE
+
+
+def test_required_permanent_upload_failure_remains_fatal(monkeypatch) -> None:
+    _reset(monkeypatch)
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+
+    with pytest.raises(PermissionError, match="denied"):
+        progress_io.publish_progress("model_prefetching", initial=True)
+    assert isinstance(progress_io._PROGRESS_FATAL_ERROR, PermissionError)
+
+
 def test_deferred_boundary_retries_when_next_step_coalesces(monkeypatch) -> None:
     _reset(monkeypatch)
     records = []

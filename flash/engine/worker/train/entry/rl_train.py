@@ -280,7 +280,7 @@ def run_rl_train():
             caps=caps,
         )
         expected_steps, loggers = configured["expected_steps"], configured["loggers"]
-        _worker_progress.publish_progress("rl_step", step=0, initial=True)
+        _worker_progress.publish_optional_progress("rl_step", step=0, initial=True)
         state = _StepMetricState(resume_step=int(files["resume_step"]))
         resume_uploader = _start_resume_uploader(
             local_dir=files["local_dir"],

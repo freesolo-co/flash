@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import json
 import tempfile
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -873,7 +876,12 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
         )
     )
     runner_state._save_status(
-        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            source_snapshot=_SOURCE_SNAPSHOT,
+        ),
         _next_attempt=0,
     )
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
@@ -889,6 +897,7 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
         ),
     )
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
+    monkeypatch.setattr(lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
 
     class FakeProvider:
         supports_weight_cache = False
@@ -953,7 +962,12 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
         )
     )
     runner_state._save_status(
-        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            source_snapshot=_SOURCE_SNAPSHOT,
+        ),
         _next_attempt=0,
     )
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
@@ -1026,8 +1040,10 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
             gpu=GpuSpec(type="", max_wall_seconds=200, max_retries=1),
         )
     )
+    status = provisioned_status(spec, state="running", created_at=100.0)
+    status.source_snapshot = _SOURCE_SNAPSHOT
     runner_state._save_status(
-        provisioned_status(spec, state="running", created_at=100.0),
+        status,
         _run_deadline_at=300.0,
         _next_attempt=0,
     )
@@ -1048,6 +1064,7 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
 
     monkeypatch.setattr(allocator, "allocate", fake_allocate)
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
+    monkeypatch.setattr(lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
 
     class FakeProvider:
         supports_weight_cache = False
@@ -2106,7 +2123,304 @@ def test_attach_expired_run_adopts_current_fenced_result_at_deadline(monkeypatch
     assert "adopted a completed attempt at the wall deadline" in log.getvalue()
 
 
-def test_attach_failed_current_fence_result_is_terminal_without_teardown(monkeypatch, tmp_path):
+def test_attach_oom_retry_plan_escalates_and_reconstructs_budget(monkeypatch):
+    import flash.runner.supervise.attach as attach
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import JobHandle
+
+    monkeypatch.setattr(
+        runner_deadlines,
+        "_spec_with_remaining_wall",
+        lambda spec, **_kwargs: spec,
+    )
+    spec = JobSpec(
+        run_id="attach-oom-plan",
+        model="Qwen/Qwen3.5-9B",
+        gpu=GpuSpec(max_retries=2),
+    )
+    remote = _vast_remote(
+        instance_id=7,
+        attempt=0,
+        allocated_gpu="A100 SXM 40GB",
+        allocated_gpu_count=1,
+    )
+    context = attach._AttachContext(
+        worker_spec=spec,
+        persisted_remote=remote,
+        handle=JobHandle.from_dict(remote),
+        seed=spec.seed,
+        recovered_attempt=0,
+        next_attempt=1,
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+
+    retry_budget, oom_vram_floor, drop_cache = attach._attach_retry_plan(context, "oom")
+
+    assert retry_budget.oom_used == 1
+    assert retry_budget.infra_used == 0
+    assert oom_vram_floor == pytest.approx(40.0)
+    assert drop_cache is False
+    exhausted = replace(
+        context,
+        recovered_attempt=2,
+        next_attempt=3,
+        retry_counters={"infra": 0, "oom": 2, "cache": 0},
+    )
+    assert attach._attach_retry_plan(exhausted, "oom") is None
+
+
+def test_attach_mixed_retry_history_reconstructs_exact_categories(monkeypatch):
+    import flash.runner.supervise.attach as attach
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import JobHandle
+
+    monkeypatch.setattr(
+        runner_deadlines,
+        "_spec_with_remaining_wall",
+        lambda spec, **_kwargs: spec,
+    )
+    spec = JobSpec(
+        run_id="attach-mixed-retries",
+        model="Qwen/Qwen3.5-9B",
+        gpu=GpuSpec(max_retries=2),
+    )
+    remote = _vast_remote(
+        instance_id=7,
+        attempt=7,
+        allocated_gpu="A100 SXM 40GB",
+        allocated_gpu_count=1,
+    )
+    context = attach._AttachContext(
+        worker_spec=spec,
+        persisted_remote=remote,
+        handle=JobHandle.from_dict(remote),
+        seed=spec.seed,
+        recovered_attempt=7,
+        next_attempt=8,
+        source_snapshot=_SOURCE_SNAPSHOT,
+        retry_counters={"infra": 1, "oom": 1, "cache": 0},
+    )
+
+    retry_budget, _oom_vram_floor, drop_cache = attach._attach_retry_plan(context, "oom")
+
+    assert retry_budget.infra_used == 1
+    assert retry_budget.oom_used == 2
+    assert retry_budget.cache_used == 0
+    assert drop_cache is False
+    assert (
+        attach._attach_retry_plan(
+            replace(context, retry_counters=retry_budget.counters()),
+            "oom",
+        )
+        is None
+    )
+
+
+def test_retry_counters_persist_atomically_with_remote_clear_and_reload(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="retry-counter-clear", model="Qwen/Qwen3.5-9B")
+    remote = _vast_remote(instance_id=7, attempt=2, fence=9)
+    status = provisioned_status(spec, state="running", created_at=100.0, remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status, _run_deadline_at=400.0, _next_attempt=3)
+
+    counters = {"infra": 1, "oom": 1, "cache": 1}
+    assert runner_reconciliation._compare_and_clear_remote(
+        spec.run_id,
+        remote,
+        retry_counters=counters,
+    )
+
+    reloaded = runner_status.get_status(spec.run_id)
+    assert reloaded.remote is None
+    assert reloaded.retry_counters == counters
+    assert "retry_counters" not in reloaded.to_dict()
+
+
+def test_attach_oom_floor_uses_executed_width_not_rented_count(monkeypatch):
+    import flash.runner.supervise.attach as attach
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core.base import JobHandle
+
+    monkeypatch.setattr(
+        runner_deadlines,
+        "_spec_with_remaining_wall",
+        lambda spec, **_kwargs: spec,
+    )
+    spec = JobSpec(
+        run_id="attach-executed-width",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        train=TrainSpec(batch_size=1, max_examples=1),
+        gpu=GpuSpec(max_retries=1),
+    )
+    remote = _vast_remote(
+        instance_id=7,
+        attempt=0,
+        allocated_gpu="A100 SXM 40GB",
+        allocated_gpu_count=4,
+    )
+    context = attach._AttachContext(
+        worker_spec=spec,
+        persisted_remote=remote,
+        handle=JobHandle.from_dict(remote),
+        seed=spec.seed,
+        recovered_attempt=0,
+        next_attempt=1,
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+
+    _retry_budget, oom_vram_floor, drop_cache = attach._attach_retry_plan(context, "oom")
+
+    assert oom_vram_floor == pytest.approx(40.0)
+    assert drop_cache is False
+
+
+def test_attach_reconstructs_cache_fallback_without_spending_infra(monkeypatch):
+    import flash.runner.supervise.attach as attach
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import JobHandle
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
+
+    monkeypatch.setattr(
+        runner_deadlines,
+        "_spec_with_remaining_wall",
+        lambda spec, **_kwargs: spec,
+    )
+    monkeypatch.setattr(
+        "flash.providers.core.registry.get_provider",
+        lambda _name: SimpleNamespace(supports_weight_cache=True),
+    )
+    spec = JobSpec(
+        run_id="attach-cache-fallback",
+        model="Qwen/Qwen3.5-9B",
+        gpu=GpuSpec(max_retries=1, network_volume=WEIGHT_CACHE_VOLUME_NAME),
+    )
+    remote = _vast_remote(instance_id=7, attempt=0)
+    context = attach._AttachContext(
+        worker_spec=spec,
+        persisted_remote=remote,
+        handle=JobHandle.from_dict(remote),
+        seed=spec.seed,
+        recovered_attempt=0,
+        next_attempt=1,
+        source_snapshot=_SOURCE_SNAPSHOT,
+        retry_counters={"infra": 0, "oom": 0, "cache": 0},
+    )
+
+    retry_budget, oom_vram_floor, drop_cache = attach._attach_retry_plan(context, "poll_error")
+
+    assert retry_budget.infra_used == 0
+    assert retry_budget.cache_used == 1
+    assert oom_vram_floor == 0.0
+    assert drop_cache is True
+
+
+def test_attach_artifact_transport_uses_infra_budget_and_single_shot_exhausts(monkeypatch):
+    import flash.runner.supervise.attach as attach
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import JobHandle
+
+    monkeypatch.setattr(
+        runner_deadlines,
+        "_spec_with_remaining_wall",
+        lambda spec, **_kwargs: spec,
+    )
+    remote = _vast_remote(instance_id=7, attempt=0)
+    retrying_spec = JobSpec(
+        run_id="attach-artifact-plan",
+        model="Qwen/Qwen3.5-9B",
+        gpu=GpuSpec(max_retries=1),
+    )
+    context = attach._AttachContext(
+        worker_spec=retrying_spec,
+        persisted_remote=remote,
+        handle=JobHandle.from_dict(remote),
+        seed=retrying_spec.seed,
+        recovered_attempt=0,
+        next_attempt=1,
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+
+    retry_budget, oom_vram_floor, drop_cache = attach._attach_retry_plan(
+        context, "artifact_transport"
+    )
+
+    assert retry_budget.infra_used == 1
+    assert retry_budget.oom_used == 0
+    assert oom_vram_floor == 0.0
+    assert drop_cache is False
+    single_shot = replace(
+        context,
+        worker_spec=replace(
+            retrying_spec,
+            gpu=replace(retrying_spec.gpu, max_retries=0),
+        ),
+    )
+    assert attach._attach_retry_plan(single_shot, "artifact_transport") is None
+
+
+def test_attach_authoritative_retry_orders_teardown_cleanup_clear_then_replacement(monkeypatch):
+    import flash.runner.supervise.attach as attach
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import JobHandle
+
+    spec = JobSpec(
+        run_id="attach-order",
+        model="Qwen/Qwen3.5-9B",
+        gpu=GpuSpec(max_retries=1),
+    )
+    remote = _vast_remote(instance_id=7, attempt=0, allocated_gpu="RTX 4090")
+    context = attach._AttachContext(
+        worker_spec=spec,
+        persisted_remote=remote,
+        handle=JobHandle.from_dict(remote),
+        seed=spec.seed,
+        recovered_attempt=0,
+        next_attempt=1,
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+    events = []
+    budget = lifecycle._new_retry_budget(1)
+    lifecycle._failure_disposition(budget, "oom")
+    monkeypatch.setattr(attach, "_attach_retry_plan", lambda *_args: (budget, 24.0, False))
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args: events.append("teardown") or False,
+    )
+    monkeypatch.setattr(lifecycle, "_worker_provably_gone", lambda *_args: True)
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_record_cleanup_remote",
+        lambda *_args: events.append("cleanup") or True,
+    )
+
+    def resume(*_args, **kwargs):
+        events.extend(("cas-clear", "replacement"))
+        assert kwargs["retry_budget"] is budget
+        assert kwargs["oom_vram_floor"] == 24.0
+        return SimpleNamespace(state="running")
+
+    monkeypatch.setattr(attach, "_resume_after_confirmed_teardown", resume)
+
+    observed = attach._dispose_authoritative_failure(
+        spec.run_id,
+        context,
+        PollResult(False, failure="oom", detail="cuda out of memory"),
+        io.StringIO(),
+    )
+
+    assert observed.state == "running"
+    assert events == ["teardown", "cleanup", "cas-clear", "replacement"]
+
+
+def test_attach_failed_current_fence_result_tears_down_and_persists_cleanup_before_terminal(
+    monkeypatch, tmp_path
+):
     import io
 
     import flash.runner.supervise.lifecycle as lifecycle
@@ -2134,21 +2448,87 @@ def test_attach_failed_current_fence_result_is_terminal_without_teardown(monkeyp
             detail="cuda out of memory",
         ),
     )
+    events = []
     monkeypatch.setattr(
         lifecycle,
         "_strict_teardown_handle",
-        lambda *_args, **_kwargs: pytest.fail(
-            "authoritative failed result must not be treated as absent"
-        ),
+        lambda *_args, **_kwargs: events.append("teardown") or False,
     )
+    monkeypatch.setattr(lifecycle, "_worker_provably_gone", lambda *_args: True)
+    real_cleanup = runner_reconciliation._record_cleanup_remote
+
+    def record_cleanup(*args):
+        events.append("cleanup")
+        return real_cleanup(*args)
+
+    monkeypatch.setattr(runner_reconciliation, "_record_cleanup_remote", record_cleanup)
+    real_fail = runner_reconciliation._compare_and_fail_remote
+
+    def terminalize(*args):
+        events.append("terminal")
+        return real_fail(*args)
+
+    monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", terminalize)
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
 
     observed = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
 
+    assert events == ["teardown", "cleanup", "terminal"]
     assert observed.state == "failed"
     assert observed.error == "oom: cuda out of memory"
     assert observed.remote == remote
     assert runner_status._current_attempt(observed).state == "settled"
+
+
+def test_attach_authoritative_failure_stays_nonterminal_when_absence_is_uncertain(monkeypatch):
+    import flash.runner.supervise.attach as attach
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import JobHandle
+
+    spec = JobSpec(
+        run_id="attach-uncertain-failure",
+        model="Qwen/Qwen3.5-9B",
+        gpu=GpuSpec(max_retries=0),
+    )
+    remote = _vast_remote(instance_id=7, attempt=0)
+    context = attach._AttachContext(
+        worker_spec=spec,
+        persisted_remote=remote,
+        handle=JobHandle.from_dict(remote),
+        seed=spec.seed,
+        recovered_attempt=0,
+        next_attempt=1,
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+    events = []
+    monkeypatch.setattr(attach, "_attach_retry_plan", lambda *_args: None)
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("uncertain teardown")),
+    )
+    monkeypatch.setattr(lifecycle, "_worker_provably_gone", lambda *_args: False)
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_record_cleanup_remote",
+        lambda *_args: events.append("cleanup") or True,
+    )
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_compare_and_fail_remote",
+        lambda *_args: pytest.fail("uncertain worker absence must block terminalization"),
+    )
+
+    observed = attach._dispose_authoritative_failure(
+        spec.run_id,
+        context,
+        PollResult(False, failure="worker", detail="worker failed"),
+        io.StringIO(),
+    )
+
+    assert observed is None
+    assert events == ["cleanup"]
 
 
 def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp_path):
@@ -2260,6 +2640,104 @@ def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
         "a polled vast run reached persistence with no provider, so its wall is priced at "
         "whichever provider offers the class rather than the one that billed it"
     )
+
+
+def test_attach_transient_result_read_stops_at_persisted_deadline(monkeypatch):
+    import flash.runner.supervise.attach as attach
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.providers.core.base import JobHandle
+
+    remote = _vast_remote(instance_id=7, attempt=0)
+    handle = JobHandle.from_dict(remote)
+    sleeps = []
+    monkeypatch.setattr(attach.time, "time", lambda: 99.0)
+    monkeypatch.setattr(attach.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args: pytest.fail("a pre-deadline transient read must not tear down"),
+    )
+
+    assert attach._defer_transient_result("run-deadline", remote, handle, 100.0) is False
+    assert sleeps == [1.0]
+
+    events = []
+    monkeypatch.setattr(attach.time, "time", lambda: 100.0)
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args: events.append("teardown") or True,
+    )
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_record_cleanup_remote",
+        lambda *_args: events.append("cleanup") or True,
+    )
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_compare_and_fail_remote",
+        lambda *_args: events.append("terminal") or True,
+    )
+
+    assert attach._defer_transient_result("run-deadline", remote, handle, 100.0) is True
+    assert events == ["teardown", "cleanup", "terminal"]
+
+
+def test_attach_normal_and_expired_reconciliation_bound_transient_result_reads(monkeypatch):
+    import flash.runner.supervise.attach as attach
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import JobSpec
+    from flash.providers.core.base import JobHandle
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    spec = JobSpec(run_id="expired-result-read", model="Qwen/Qwen3.5-9B")
+    remote = _vast_remote(instance_id=7, attempt=0)
+    attempt = AttemptRecord(0, 1, "active", 1.0, 2.0, 3.0, 5.0, 4.0)
+    status = SimpleNamespace(state="running", remote=remote, attempt=attempt.to_dict())
+    monkeypatch.setattr(runner_status, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 4.0)
+    monkeypatch.setattr(
+        lifecycle,
+        "_attempt_result",
+        lambda *_args: (_ for _ in ()).throw(OSError("temporary result outage")),
+    )
+    observed = []
+    monkeypatch.setattr(
+        attach,
+        "_defer_transient_result",
+        lambda run_id, expected, handle, deadline: (
+            observed.append((run_id, expected, handle.to_dict(), deadline)) or True
+        ),
+    )
+
+    handle = JobHandle.from_dict(remote)
+    assert (
+        attach._reconcile_expired_remote(
+            spec.run_id,
+            spec,
+            remote,
+            handle,
+            1,
+            _SOURCE_SNAPSHOT,
+            4.0,
+            io.StringIO(),
+            "deadline",
+        )
+        is True
+    )
+    attach._reconcile_attached_remote(
+        spec.run_id,
+        remote,
+        spec,
+        1,
+        _SOURCE_SNAPSHOT,
+        io.StringIO(),
+        "deadline",
+    )
+    assert observed == [
+        (spec.run_id, remote, handle.to_dict(), 5.0),
+        (spec.run_id, remote, handle.to_dict(), 5.0),
+    ]
 
 
 def test_attach_transient_current_fence_result_read_stays_pending(monkeypatch, tmp_path):

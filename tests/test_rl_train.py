@@ -301,11 +301,89 @@ def test_run_rl_train_reaches_the_executable_grpo_subprocess_stream():
     assert "return child_stream.wait_and_classify()" in source
 
 
-def test_verl_uses_canonical_progress_stage_contracts():
-    source = inspect.getsource(rl_train.run_rl_train)
-    assert '_worker_progress.publish_progress("rl_step", step=0, initial=True)' in source
-    assert 'with observe_phase( "rl_step"' in " ".join(source.split())
-    assert 'with observe_phase( "rl_finalizing"' in " ".join(source.split())
+def test_grpo_progress_transport_outage_does_not_block_child_start(monkeypatch):
+    from flash.engine.worker.io import progress as progress_io
+
+    progress_io._PROGRESS_QUEUE.clear()
+    monkeypatch.setattr(progress_io, "_PROGRESS_FATAL_ERROR", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COALESCED", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COALESCE_STARTED_AT", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_SEQUENCE", 0)
+    monkeypatch.setattr(progress_io, "_PROGRESS_PREVIOUS_DIGEST", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_LAST_COMMITTED_OCCURRED_AT", 0.0)
+    monkeypatch.setattr(progress_io, "_PROGRESS_TRAINING_ENTERED", False)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COMPLETED_STEPS", 0)
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("permanent progress upload rejection")
+        ),
+    )
+    inp = {"model_id": "model", "model_revision": "revision", "steps": 1}
+    files = {"workdir": "/dev/shm", "resume_step": 0, "local_dir": "/dev/shm"}
+    reward_runtime = SimpleNamespace(
+        reward_url="http://127.0.0.1:9/",
+        observability=SimpleNamespace(progress_fields=dict, parent_work=object()),
+    )
+    monkeypatch.setattr(
+        rl_train,
+        "_prepare_rl_inputs",
+        lambda: (0.0, inp, object(), object(), object(), [], 0.0),
+    )
+    monkeypatch.setattr(rl_train, "_cached_model_path", lambda *_args: "/dev/shm/model")
+    monkeypatch.setattr(
+        rl_train,
+        "_prepare_rl_runtime",
+        lambda *_args: (files, reward_runtime),
+    )
+    monkeypatch.setattr(
+        rl_train,
+        "_initialize_teardown_state",
+        lambda: (None, object(), None),
+    )
+    monkeypatch.setattr(rl_train, "resolve_verl_python", lambda *_args, **_kwargs: "python")
+    monkeypatch.setattr(rl_train, "model_is_gdn_hybrid", lambda *_args: False)
+    monkeypatch.setattr(rl_train, "probe_verl_capabilities", lambda *_args: {})
+    monkeypatch.setattr(
+        rl_train,
+        "_configure_rl_child",
+        lambda **_kwargs: {
+            "expected_steps": 1,
+            "loggers": [],
+            "overrides": [],
+            "setup_seconds": 0.0,
+            "t_train": 0.0,
+            "fp8_kv": False,
+            "project_name": "project",
+            "experiment_name": "experiment",
+        },
+    )
+    monkeypatch.setattr(rl_train, "_start_resume_uploader", lambda **_kwargs: None)
+    monkeypatch.setattr(rl_train, "_build_rl_child_env", lambda *_args: {})
+    started = []
+    monkeypatch.setattr(
+        rl_train,
+        "_execute_rl_child",
+        lambda **_kwargs: started.append(True) or 0,
+    )
+
+    class StopAfterChild(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        rl_train,
+        "_validate_rl_child",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(StopAfterChild),
+    )
+    monkeypatch.setattr(rl_train, "_shutdown_rl_runtime", lambda *_args: None)
+
+    with pytest.raises(StopAfterChild):
+        rl_train.run_rl_train()
+
+    assert started == [True]
+    assert progress_io._PROGRESS_FATAL_ERROR is None
+    progress_io._PROGRESS_QUEUE.clear()
 
 
 def test_reward_observability_reaches_progress_records():

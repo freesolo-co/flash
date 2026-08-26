@@ -1407,6 +1407,92 @@ def test_authoritative_failed_result_settles_exactly_when_not_retryable(monkeypa
     assert ctx.retry_budget.oom_used == 0
 
 
+def test_live_transient_result_read_waits_for_landed_success(monkeypatch):
+    import flash.providers.runpod.execution.jobs as jobs
+    import flash.runner.lifecycle.status as status_ops
+    from flash.runner.supervise import seed_submission
+
+    ctx = _failure_context()
+    ctx.last_handle = _runpod_handle_dict(jobs)
+    attempt = _attempt_record(
+        work_deadline_at=105.0,
+        result_deadline_at=110.0,
+    ).to_dict()
+    monkeypatch.setattr(status_ops, "get_status", lambda _run_id: SimpleNamespace(attempt=attempt))
+    observations = iter(
+        (
+            OSError("temporary artifact outage"),
+            PollResult(True, metrics={"wall_seconds": 1.0}),
+        )
+    )
+
+    def observe(*_args):
+        value = next(observations)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    clock = {"now": 100.0}
+    sleeps = []
+    monkeypatch.setattr(runner_lifecycle, "_attempt_result", observe)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: clock["now"])
+
+    def advance(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(runner_lifecycle.time, "sleep", advance)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args: pytest.fail("transient observation must not tear down the current remote"),
+    )
+
+    result = seed_submission._cleanup_previous_attempt(ctx, 1)
+
+    assert result.ok
+    assert sleeps == [5.0]
+    assert ctx.last_handle
+
+
+def test_live_permanent_result_verification_fails_closed(monkeypatch):
+    import flash.providers.runpod.execution.jobs as jobs
+    from flash.providers.artifacts.attempts import AttemptArtifactError
+    from flash.runner.supervise import seed_submission
+
+    ctx = _failure_context()
+    ctx.last_handle = _runpod_handle_dict(jobs)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args: (_ for _ in ()).throw(
+            AttemptArtifactError("result manifest is invalid or unverifiable")
+        ),
+    )
+    failed = []
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_fail_permanent_result_artifact",
+        lambda run_id, remote, error: failed.append((run_id, remote, str(error))) or True,
+    )
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args: pytest.fail("permanent verification failure is not result absence"),
+    )
+
+    with pytest.raises(RuntimeError, match="verification failed permanently"):
+        seed_submission._cleanup_previous_attempt(ctx, 1)
+
+    assert failed == [
+        (
+            ctx.spec.run_id,
+            ctx.last_handle,
+            "result manifest is invalid or unverifiable",
+        )
+    ]
+
+
 def test_authoritative_result_is_reread_before_teardown_and_cleanup_tracking(monkeypatch):
     import flash.providers.runpod.execution.jobs as jobs
     from flash.runner.accounting import reconciliation
@@ -2916,16 +3002,11 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
             def get_paths_info(self, **_kwargs):
                 return []
 
-            def list_repo_tree(self, **_kwargs):
+            def list_repo_files(self, **_kwargs):
                 return []
 
         fake_private_hf = FakePrivateHf()
         monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: fake_private_hf)
-        monkeypatch.setattr(
-            huggingface_hub,
-            "hf_hub_download",
-            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("no marker is present")),
-        )
 
         spec = JobSpec(
             run_id="oom-walk",
@@ -4105,6 +4186,8 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
             runtime_secrets=None,
             source_snapshot=None,
             attempt_start,
+            retry_budget=None,
+            oom_vram_floor=0.0,
         ):
             seen["remote"] = runner_status.get_status(spec.run_id).remote
             seen["source_snapshot"] = source_snapshot
@@ -4212,6 +4295,8 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
             runtime_secrets=None,
             source_snapshot=None,
             attempt_start,
+            retry_budget=None,
+            oom_vram_floor=0.0,
         ):
             seen["prior_cost"] = prior_cost
             seen["source_snapshot"] = source_snapshot
@@ -4289,6 +4374,8 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
             runtime_secrets=None,
             source_snapshot=None,
             attempt_start,
+            retry_budget=None,
+            oom_vram_floor=0.0,
         ):
             assert source_snapshot == _SOURCE_SNAPSHOT
             # the training submit re-runs the run; a genuinely broken run fails there (matches

@@ -152,6 +152,8 @@ class RunStatus:
     progress: dict | None = None
     resource: dict | None = None
     result: dict | None = None
+    # exact consumed retry categories survive supervisor restart; private in to_dict().
+    retry_counters: dict | None = None
     workload_profile_input_digest: str | None = None
     workload_profile: dict | None = None
     # submit-time derived grpo/opd prompt budget from flash.engine.plan.prompt_budget. workers drop
@@ -172,6 +174,7 @@ class RunStatus:
         data.pop("report_sequence", None)
         # internal warm-start preparation (storage locators, digests) never leaves the server
         data.pop("effective_preparation", None)
+        data.pop("retry_counters", None)
         source_snapshot = data.pop("source_snapshot", None)
         data.pop("source_verified_attempt", None)
         for lifecycle_field in ("attempt", "progress", "resource", "result"):

@@ -64,6 +64,7 @@ class _ProgressUploadDeferred(RuntimeError):
 class _PendingProgress:
     stage: str
     initial: bool
+    required: bool
     fields: dict
     committed: bool = False
     record: ProgressRecord | None = None
@@ -258,6 +259,12 @@ def _upload_record(record: ProgressRecord, *, required: bool) -> bool:
         try:
             remote = _remote_record_payload(path)
         except Exception as verify_error:
+            from flash.snapshot.archive import is_transient_fetch_error
+
+            if not required and is_transient_fetch_error(verify_error):
+                raise _ProgressUploadDeferred(
+                    "optional progress upload outcome is deferred until immutable readback succeeds"
+                ) from verify_error
             raise _ProgressUploadAmbiguous(
                 "progress upload outcome is ambiguous because its immutable path could not be verified"
             ) from verify_error
@@ -277,7 +284,9 @@ def _upload_record(record: ProgressRecord, *, required: bool) -> bool:
             raise _ProgressUploadDeferred(
                 "optional progress upload outcome is deferred until immutable readback succeeds"
             ) from verify_error
-        raise
+        raise _ProgressUploadAmbiguous(
+            "progress upload outcome is ambiguous because its immutable path could not be verified"
+        ) from verify_error
     if remote == payload:
         return True
     if remote is not None:
@@ -344,8 +353,17 @@ def _build_pending_record(pending: _PendingProgress) -> ProgressRecord:
     )
 
 
+def _latch_progress_failure(error: Exception) -> None:
+    global _PROGRESS_FATAL_ERROR
+
+    _PROGRESS_FATAL_ERROR = error
+    while _PROGRESS_QUEUE:
+        blocked = _PROGRESS_QUEUE.popleft()
+        blocked.error = error
+
+
 def _drain_progress_until(target: _PendingProgress) -> None:
-    global _PROGRESS_FATAL_ERROR, _PROGRESS_LAST_COMMITTED_OCCURRED_AT
+    global _PROGRESS_LAST_COMMITTED_OCCURRED_AT
     global _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE
 
     with _PROGRESS_DRAIN_LOCK:
@@ -356,19 +374,35 @@ def _drain_progress_until(target: _PendingProgress) -> None:
                 pending = _PROGRESS_QUEUE[0]
                 record = pending.record or _build_pending_record(pending)
                 pending.record = record
+                required = pending.required or (target.required and pending is not target)
             try:
-                committed = _upload_record(record, required=pending.initial)
-            except _ProgressUploadDeferred:
+                committed = _upload_record(record, required=required)
+            except _ProgressUploadDeferred as exc:
+                with _PROGRESS_LOCK:
+                    if required:
+                        _latch_progress_failure(exc)
+                    else:
+                        return
+                return
+            except _ProgressUploadAmbiguous as exc:
+                with _PROGRESS_LOCK:
+                    _latch_progress_failure(exc)
                 return
             except Exception as exc:
                 with _PROGRESS_LOCK:
-                    pending.error = exc
-                    _PROGRESS_FATAL_ERROR = exc
-                    while _PROGRESS_QUEUE:
-                        blocked = _PROGRESS_QUEUE.popleft()
-                        blocked.error = exc
+                    if required:
+                        _latch_progress_failure(exc)
+                    else:
+                        _PROGRESS_QUEUE.popleft()
+                        pending.committed = False
+                if not required and pending is not target:
+                    continue
                 return
             with _PROGRESS_LOCK:
+                if required and not committed:
+                    error = RuntimeError("required progress record was not verified as committed")
+                    _latch_progress_failure(error)
+                    return
                 _PROGRESS_QUEUE.popleft()
                 pending.committed = committed
                 if committed:
@@ -406,11 +440,16 @@ def flush_progress() -> bool:
     return target.committed
 
 
-def publish_progress(stage: str, *, initial: bool = False, **fields):
-    """Publish immediate boundaries and coalesce cumulative per-step observations."""
+def _publish_progress(
+    stage: str,
+    *,
+    initial: bool,
+    required: bool,
+    fields: dict,
+):
     global _PROGRESS_COALESCED, _PROGRESS_COALESCE_STARTED_AT
 
-    pending = _PendingProgress(stage, initial, dict(fields))
+    pending = _PendingProgress(stage, initial, required, fields)
     step_coalesced = False
     with _PROGRESS_LOCK:
         if _PROGRESS_FATAL_ERROR is not None:
@@ -440,6 +479,16 @@ def publish_progress(stage: str, *, initial: bool = False, **fields):
         if target.error is not None:
             raise target.error
     return False if step_coalesced else pending.committed
+
+
+def publish_progress(stage: str, *, initial: bool = False, **fields):
+    """Publish immediate boundaries and coalesce cumulative per-step observations."""
+    return _publish_progress(stage, initial=initial, required=initial, fields=dict(fields))
+
+
+def publish_optional_progress(stage: str, *, initial: bool = False, **fields):
+    """Publish observational progress without making training depend on its transport."""
+    return _publish_progress(stage, initial=initial, required=False, fields=dict(fields))
 
 
 _REWARD_METRIC_NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9_.-]")

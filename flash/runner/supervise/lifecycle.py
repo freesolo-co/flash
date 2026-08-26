@@ -72,6 +72,86 @@ class _RetryBudget:
         elif failure in INFRA_RETRY_FAILURES:
             self.infra_used += 1
 
+    def counters(self) -> dict[str, int]:
+        return {"infra": self.infra_used, "oom": self.oom_used, "cache": self.cache_used}
+
+
+@dataclass(frozen=True)
+class _FailureDisposition:
+    retry: bool
+    category: str | None
+
+
+def _new_retry_budget(max_retries: int, *, cache_fallbacks: int = 0) -> _RetryBudget:
+    retries = max(0, int(max_retries))
+    infra_retries = max(retries, INFRA_RETRY_FLOOR) if retries else 0
+    return _RetryBudget(infra_retries, retries, max(0, int(cache_fallbacks)))
+
+
+def _reconstructed_retry_budget(
+    max_retries: int,
+    *,
+    counters: dict | None,
+    cache_fallbacks: int = 0,
+) -> _RetryBudget:
+    """rebuild the exact persisted category budget after supervisor restart."""
+    budget = _new_retry_budget(max_retries, cache_fallbacks=cache_fallbacks)
+    values = counters or {"infra": 0, "oom": 0, "cache": 0}
+    if set(values) != {"infra", "oom", "cache"} or any(
+        type(value) is not int or value < 0 for value in values.values()
+    ):
+        raise RuntimeError("persisted retry counters are invalid")
+    budget.infra_used = values["infra"]
+    budget.oom_used = values["oom"]
+    budget.cache_used = values["cache"]
+    return budget
+
+
+def _failure_disposition(
+    budget: _RetryBudget,
+    failure: str | None,
+    *,
+    cache_drop: bool = False,
+    allow_retry: bool = True,
+) -> _FailureDisposition:
+    """classify and consume one retry through the shared live/recovery policy boundary."""
+    category = (
+        "cache"
+        if cache_drop
+        else "oom"
+        if failure == "oom"
+        else "infra"
+        if failure in INFRA_RETRY_FAILURES
+        else None
+    )
+    retry = allow_retry and budget.can_retry(failure, cache_drop=cache_drop)
+    if retry:
+        budget.record_retry(failure, cache_drop=cache_drop)
+    return _FailureDisposition(retry, category)
+
+
+def _result_transport_is_transient(error: BaseException) -> bool:
+    from flash.snapshot.archive import is_transient_fetch_error
+
+    return isinstance(error, OSError) or is_transient_fetch_error(error)
+
+
+def _fail_permanent_result_artifact(
+    run_id: str,
+    expected_remote: dict,
+    error: BaseException,
+) -> bool:
+    """preserve cleanup authority and fail one exact unverifiable result closed."""
+    from flash.runner.accounting.reconciliation import (
+        _compare_and_fail_remote,
+        _record_cleanup_remote,
+    )
+
+    if not _record_cleanup_remote(run_id, expected_remote):
+        raise RuntimeError("permanent result rejection cleanup identity could not be persisted")
+    _compare_and_fail_remote(run_id, expected_remote, str(error))
+    return True
+
 
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
     from flash.content.multimodal import preflight_validate_image_opd
@@ -171,6 +251,8 @@ def _submit_seed_supervised(
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     attempt_start: int = 0,
+    retry_budget: _RetryBudget | None = None,
+    oom_vram_floor: float = 0.0,
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures.
 
@@ -187,6 +269,8 @@ def _submit_seed_supervised(
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         attempt_start=attempt_start,
+        retry_budget=retry_budget,
+        oom_vram_floor=oom_vram_floor,
     )
 
 
@@ -253,6 +337,8 @@ def _run_training(
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     attempt_start: int = 0,
+    retry_budget: _RetryBudget | None = None,
+    oom_vram_floor: float = 0.0,
 ) -> None:
     """Train the run's single adapter under supervision; finalize the run.
 
@@ -303,6 +389,8 @@ def _run_training(
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         attempt_start=attempt_start,
+        retry_budget=retry_budget,
+        oom_vram_floor=oom_vram_floor,
     )
     metrics, verified_attempt = validate_terminal_source_metrics(get_status(spec.run_id), metrics)
     # measured wall x $/hr is recorded in metrics.json for analytics, but is not what we charge.
