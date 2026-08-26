@@ -51,36 +51,31 @@ def _capture_urlopen(monkeypatch, responses):
     return calls
 
 
-class _LogResp:
-    """A log-fetch HTTP response usable as a context manager (bytes body)."""
+class _FakeResultRequest:
+    """Sequence-backed result transport for instance_logs polling tests."""
 
-    def __init__(self, data: bytes):
-        self._data = data
+    def __init__(self, seq):
+        self._items = iter(seq)
+        self.deadlines = []
 
-    def read(self):
-        return self._data
+    def fetch(self, *, deadline_at):
+        from flash.providers.vast.client.result import VastResultResponse
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-def _fake_log_urlopen(monkeypatch, seq):
-    """Mock the direct ``urlopen(result_url)`` log poll; items are bytes (a body) or an Exception."""
-    from flash.providers.vast.client import api as vast_api
-
-    it = iter(seq)
-
-    def fake(url, timeout=None):
-        item = next(it)
+        self.deadlines.append(deadline_at)
+        item = next(self._items)
         if isinstance(item, Exception):
             raise item
-        return _LogResp(item)
+        status, body = item
+        return VastResultResponse(status=status, body=body)
 
-    monkeypatch.setattr(vast_api.urllib.request, "urlopen", fake)
-    monkeypatch.setattr(vast_api.time, "sleep", lambda s: None)
+
+def _fake_result_request(monkeypatch, seq):
+    from flash.providers.vast.client import api as vast_api
+
+    request = _FakeResultRequest(seq)
+    monkeypatch.setattr(vast_api, "prepare_result_request", lambda _url: request)
+    monkeypatch.setattr(vast_api.time, "sleep", lambda _seconds: None)
+    return request
 
 
 # ---------------------------------------------------------------------------
@@ -194,9 +189,11 @@ def test_instance_logs_returns_body_on_first_poll(monkeypatch):
     from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(
-        vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
+        vast_api,
+        "request_with_retries",
+        lambda *a, **k: {"result_url": "https://s3.amazonaws.com/logs/x"},
     )
-    _fake_log_urlopen(monkeypatch, [b"boot ok\ntrainer started\n"])
+    _fake_result_request(monkeypatch, [(200, b"boot ok\ntrainer started\n")])
     assert vast_api.instance_logs(42) == "boot ok\ntrainer started\n"
 
 
@@ -215,11 +212,14 @@ def test_instance_logs_none_on_non_404_http_error(monkeypatch):
     """A non-404 HTTP error while fetching the result URL is terminal (not 'not materialized yet')
     -> stop polling and return None."""
     from flash.providers.vast.client import api as vast_api
+    from flash.providers.vast.client.result import VastResultError
 
     monkeypatch.setattr(
-        vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
+        vast_api,
+        "request_with_retries",
+        lambda *a, **k: {"result_url": "https://s3.amazonaws.com/logs/x"},
     )
-    _fake_log_urlopen(monkeypatch, [_http_error(500)])
+    _fake_result_request(monkeypatch, [VastResultError("HTTP 500")])
     assert vast_api.instance_logs(42) is None
 
 
@@ -229,11 +229,33 @@ def test_instance_logs_polls_past_404_and_empty_then_returns_body(monkeypatch):
     from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(
-        vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
+        vast_api,
+        "request_with_retries",
+        lambda *a, **k: {"result_url": "https://s3.amazonaws.com/logs/x"},
     )
     # poll 1: 404 (not ready) -> continue; poll 2: whitespace-only body -> continue; poll 3: real logs
-    _fake_log_urlopen(monkeypatch, [_http_error(404), b"   \n", b"the real logs"])
+    _fake_result_request(
+        monkeypatch,
+        [(404, b""), (200, b"   \n"), (200, b"the real logs")],
+    )
     assert vast_api.instance_logs(42) == "the real logs"
+
+
+def test_instance_logs_preserves_per_fetch_timeout_cap(monkeypatch):
+    from flash.providers.vast.client import api as vast_api
+
+    monkeypatch.setattr(
+        vast_api,
+        "request_with_retries",
+        lambda *a, **k: {"result_url": "https://s3.amazonaws.com/logs/x"},
+    )
+    from flash.providers.vast.client.result import VastResultError
+
+    request = _fake_result_request(monkeypatch, [(200, b""), VastResultError("stop")])
+    monkeypatch.setattr(vast_api.time, "time", lambda: 100.0)
+
+    assert vast_api.instance_logs(42) is None
+    assert request.deadlines == [115.0, 115.0]
 
 
 def test_instance_logs_caps_requests_and_sleep_at_run_deadline(monkeypatch):
@@ -241,29 +263,26 @@ def test_instance_logs_caps_requests_and_sleep_at_run_deadline(monkeypatch):
 
     clock = {"now": 100.0}
     request_kwargs = {}
-    fetch_timeouts = []
     sleeps = []
 
     def request(*_args, **kwargs):
         request_kwargs.update(kwargs)
-        return {"result_url": "http://logs/x"}
+        return {"result_url": "https://s3.amazonaws.com/logs/x"}
 
-    def urlopen(_url, timeout=None):
-        fetch_timeouts.append(timeout)
-        return _LogResp(b"")
+    result_request = _FakeResultRequest([(200, b"")])
 
     def sleep(seconds):
         sleeps.append(seconds)
         clock["now"] += seconds
 
     monkeypatch.setattr(vast_api, "request_with_retries", request)
-    monkeypatch.setattr(vast_api.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(vast_api, "prepare_result_request", lambda _url: result_request)
     monkeypatch.setattr(vast_api.time, "time", lambda: clock["now"])
     monkeypatch.setattr(vast_api.time, "sleep", sleep)
 
     assert vast_api.instance_logs(42, deadline_at=101.0) is None
     assert request_kwargs["deadline_at"] == 101.0
-    assert fetch_timeouts == [1.0]
+    assert result_request.deadlines == [101.0]
     assert sleeps == [1.0]
 
 
@@ -273,26 +292,23 @@ def test_instance_logs_none_when_deadline_exhausted(monkeypatch):
     from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setattr(
-        vast_api, "request_with_retries", lambda *a, **k: {"result_url": "http://logs/x"}
+        vast_api,
+        "request_with_retries",
+        lambda *a, **k: {"result_url": "https://s3.amazonaws.com/logs/x"},
     )
 
-    # First time() call sets deadline = now + 20; the loop-condition time() jumps well past it.
+    # first time() call sets deadline = now + 20; the loop-condition time() jumps well past it.
     stamps = [1000.0, 9999.0]
 
     def fake_time():
         return stamps.pop(0) if len(stamps) > 1 else stamps[0]
 
     monkeypatch.setattr(vast_api.time, "time", fake_time)
-    fetched = {"n": 0}
-
-    def never(url, timeout=None):
-        fetched["n"] += 1
-        return _LogResp(b"unreached")
-
-    monkeypatch.setattr(vast_api.urllib.request, "urlopen", never)
-    monkeypatch.setattr(vast_api.time, "sleep", lambda s: None)
+    request = _FakeResultRequest([(200, b"unreached")])
+    monkeypatch.setattr(vast_api, "prepare_result_request", lambda _url: request)
+    monkeypatch.setattr(vast_api.time, "sleep", lambda _seconds: None)
     assert vast_api.instance_logs(42) is None
-    assert fetched["n"] == 0  # deadline already past -> no fetch
+    assert request.deadlines == []  # deadline already past -> no fetch
 
 
 def test_instance_logs_never_raises_when_request_fails(monkeypatch):

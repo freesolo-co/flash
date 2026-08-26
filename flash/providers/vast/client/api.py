@@ -22,6 +22,7 @@ from flash.providers._lifecycle.net.deadline import (
     require_deadline_at,
 )
 from flash.providers._lifecycle.net.http import RestClient, is_not_found
+from flash.providers.vast.client.result import VastResultError, prepare_result_request
 
 logger = get_logger(__name__)
 
@@ -399,18 +400,20 @@ def instance_logs(instance_id: int, *, deadline_at: float | None = None) -> str 
         poll_deadline = time.time() + 20.0
         if absolute_deadline is not None:
             poll_deadline = min(poll_deadline, absolute_deadline)
+        result_request = prepare_result_request(url)
         while True:
             remaining = remaining_seconds(poll_deadline)
             if remaining <= 0:
                 break
             try:
-                with urllib.request.urlopen(url, timeout=min(15.0, remaining)) as resp:
-                    body = resp.read().decode(errors="replace")
+                fetch_deadline = min(poll_deadline, time.time() + 15.0)
+                result = result_request.fetch(deadline_at=fetch_deadline)
+            except VastResultError:
+                return None
+            if result.status == 200:
+                body = result.body.decode(errors="replace")
                 if body.strip():
                     return body
-            except urllib.error.HTTPError as e:
-                if e.code != 404:  # 404 = not materialized yet
-                    return None
             sleep_for = min(2.0, remaining_seconds(poll_deadline))
             if sleep_for <= 0:
                 break
