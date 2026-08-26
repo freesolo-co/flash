@@ -382,138 +382,47 @@ def test_chat_keeps_stdout_empty_when_a_styled_stream_carries_no_text(monkeypatc
     assert "no response text from flash-1" in captured.err
 
 
-def test_superseded_attempt_heartbeats_are_tagged_in_the_log_stream(capsys) -> None:
-    """`runs log | grep HEARTBEAT | tail -1` must not silently return a dead attempt's heartbeat.
-
-    The plane appends the highest UPLOADED attempt after the chronological log, so during a retry
-    the last heartbeat on screen belongs to the attempt that just died. The section heading says
-    so, but a heading does not survive a pipe: the reporter's monitor read
-    ``step 0, 0 completions, device H200`` for twenty minutes while the run was live on B200,
-    because H200 was the card that had already OOMed and been torn down.
-    """
+def test_worker_output_labels_previous_attempt_without_rewriting_content(capsys) -> None:
     commands._print_worker_output(
-        {
-            "console_rl_attempt0.txt": (
-                'HEARTBEAT {"stage":"rl_step","step":76,"attempt":0,"device_name":"H200"}\n'
-                "Traceback (most recent call last):\n"
-            )
-        },
+        {"console_rl_attempt0.txt": "worker: stage=rl_step step=76\n"},
         printed_any=True,
         current_attempt=1,
     )
 
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if "HEARTBEAT" in line]
-    assert lines, "the dead attempt's console dump must still be printed"
-    # the stale line carries its own provenance, so it cannot be mistaken for the live attempt
-    assert "[superseded attempt=0; current attempt=1]" in lines[-1]
-    # and the failure dump itself is preserved -- it is why the retry exists
-    assert "Traceback (most recent call last):" in out
+    output = capsys.readouterr().out
+    assert "attempt=0, previous attempt; current attempt=1" in output
+    assert "worker: stage=rl_step step=76" in output
 
 
-def test_filtering_superseded_heartbeats_leaves_the_live_attempt_last(capsys) -> None:
-    """A consumer that drops tagged lines gets the LIVE attempt's heartbeat, not the dead one."""
-    print('HEARTBEAT {"stage":"rl_step","step":1,"attempt":1,"device_name":"B200"}')
+def test_worker_output_labels_current_attempt(capsys) -> None:
     commands._print_worker_output(
-        {
-            "console_rl_attempt0.txt": (
-                'HEARTBEAT {"stage":"rl_step","step":76,"attempt":0,"device_name":"H200"}\n'
-            )
-        },
+        {"console_rl_attempt1.txt": "worker: stage=rl_step step=4\n"},
         printed_any=True,
         current_attempt=1,
     )
 
-    heartbeats = [line for line in capsys.readouterr().out.splitlines() if "HEARTBEAT" in line]
-    live = [line for line in heartbeats if "[superseded" not in line]
-    assert live[-1].endswith('{"stage":"rl_step","step":1,"attempt":1,"device_name":"B200"}')
+    output = capsys.readouterr().out
+    assert "attempt=1, current attempt" in output
 
 
-def test_the_canonical_console_cannot_reach_the_pipe_untagged(capsys) -> None:
-    """The unscoped ``console_<phase>.txt`` encodes no attempt, so it must not escape tagging.
-
-    The plane fetches BOTH console names and appends the canonical one last, so it is the final
-    section on screen. Its filename carries no ``_attemptN``, which is exactly what the tagging
-    predicate keys on -- so a name-derived rule leaves it unmarked and
-    ``runs log | grep HEARTBEAT | tail -1`` trusts it. On a retry whose terminal upload never ran
-    (``os._exit(124)`` runs no ``finally`` blocks) that file belongs to an OLDER attempt, which is
-    the precise failure ``_mark_superseded_heartbeats`` exists to prevent.
-
-    Unknown provenance is not proof of liveness: when the live attempt is known and the artifact
-    cannot name its own, it must be treated as superseded rather than silently trusted.
-    """
-    commands._print_worker_output(
-        {
-            "console_rl.txt": (
-                'HEARTBEAT {"stage":"rl_step","step":76,"attempt":0,"device_name":"H200"}\n'
-            )
-        },
-        printed_any=True,
-        current_attempt=1,
-    )
-
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if "HEARTBEAT" in line]
-    assert lines, "the canonical console must still be printed"
-    assert "[superseded" in lines[-1], (
-        f"the canonical console's heartbeat reached the pipe unmarked: {lines[-1]}"
-    )
-
-
-def test_current_attempt_heartbeats_are_left_untouched(capsys) -> None:
-    """Only a SUPERSEDED attempt is tagged; the live attempt's own artifact must read normally."""
-    commands._print_worker_output(
-        {"console_rl_attempt1.txt": 'HEARTBEAT {"stage":"rl_step","step":4,"attempt":1}\n'},
-        printed_any=True,
-        current_attempt=1,
-    )
-
-    out = capsys.readouterr().out
-    assert "[superseded" not in out
-
-
-def test_teardown_window_still_tags_the_dead_workers_heartbeat(capsys) -> None:
-    """An explicitly null ``remote`` is PROOF no worker is live, so every heartbeat is a dead one.
-
-    ``live_attempt`` answers ``None`` both for "the worker is torn down" and for "no attempt is
-    known", and collapsing the two disabled tagging exactly during the retry window the tagging
-    exists for -- the dead attempt's heartbeat reached ``grep HEARTBEAT | tail -1`` unmarked while
-    replacement capacity was still being acquired.
-    """
+def test_worker_output_labels_teardown_window(capsys) -> None:
     from flash.cli.commands.ops.worker_output import _NO_LIVE_WORKER
 
     commands._print_worker_output(
-        {
-            "console_rl_attempt0.txt": (
-                'HEARTBEAT {"stage":"rl_step","step":76,"attempt":0,"device_name":"H200"}\n'
-            )
-        },
+        {"console_rl_attempt0.txt": "worker: stage=rl_step step=76\n"},
         printed_any=True,
         current_attempt=_NO_LIVE_WORKER,
     )
 
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if "HEARTBEAT" in line]
-    assert lines, "the dead attempt's console dump must still be printed"
-    assert "[superseded attempt=0; worker torn down]" in lines[-1], (
-        f"a torn-down worker's heartbeat reached the pipe unmarked: {lines[-1]}"
-    )
-    assert "worker torn down; no live attempt" in out, "the heading must say so too"
+    output = capsys.readouterr().out
+    assert "attempt=0, worker torn down; no live attempt" in output
 
 
-def test_follow_also_tags_a_teardown_it_ends_inside(capsys) -> None:
-    """``--follow`` must derive the live attempt by the same rule the one-shot path uses.
-
-    The two log paths reach ``_print_worker_output`` differently: the one-shot path snapshots the
-    status through ``_snapshot_live_attempt``, while ``--follow`` carries the attempt it saw while
-    streaming. When that stream ends mid-teardown, the raw ``live_attempt`` is ``None`` -- so the
-    follow printed the dead worker's heartbeats unmarked, which is the exact failure the tagging
-    exists to prevent, reachable through the more common of the two commands.
-    """
+def test_follow_carries_fenced_attempt_identity_through_teardown() -> None:
     terminal = {
         "state": "failed",
         "remote": None,
-        "last_heartbeat": {"attempt": 0},
+        "attempt": {"attempt_id": 0, "fence": 1},
     }
 
     class _Client:
@@ -523,31 +432,11 @@ def test_follow_also_tags_a_teardown_it_ends_inside(capsys) -> None:
         def get_run(self, _run_id):
             return terminal
 
-        def get_worker_output(self, _run_id):
-            return {
-                "console_rl_attempt0.txt": (
-                    'HEARTBEAT {"stage":"rl_step","step":76,"attempt":0,"device_name":"H200"}\n'
-                )
-            }
-
     result = commands._poll_logs(_Client(), "flash-1", interval=0.0)
     assert result.live_attempt == commands.live_attempt_of(terminal)
 
-    commands._print_worker_output(
-        _Client().get_worker_output("flash-1"),
-        printed_any=result.printed_any,
-        current_attempt=result.live_attempt,
-    )
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if "HEARTBEAT" in line]
-    assert lines, "the dead attempt's console dump must still be printed"
-    assert "[superseded attempt=0; worker torn down]" in lines[-1], (
-        f"a follow that ended mid-teardown leaked an unmarked dead heartbeat: {lines[-1]}"
-    )
-
 
 def test_snapshot_distinguishes_teardown_from_an_unknown_attempt() -> None:
-    """``remote: null`` means torn down; a failed lookup means unknown. They are not the same."""
     from flash.cli.commands.ops.worker_output import _NO_LIVE_WORKER, _snapshot_live_attempt
     from flash.client import ClientError
 
@@ -560,22 +449,21 @@ def test_snapshot_distinguishes_teardown_from_an_unknown_attempt() -> None:
                 raise self._payload
             return self._payload
 
-    torn_down = {"state": "running", "remote": None, "last_heartbeat": {"attempt": 0}}
+    torn_down = {
+        "state": "running",
+        "remote": None,
+        "attempt": {"attempt_id": 0, "fence": 1},
+    }
     assert _snapshot_live_attempt(_Run(torn_down), "flash-1") == _NO_LIVE_WORKER
-    live = {"state": "running", "remote": {"attempt": 1}, "last_heartbeat": {"attempt": 0}}
+    live = {
+        "state": "running",
+        "remote": {"provider": "runpod"},
+        "attempt": {"attempt_id": 1, "fence": 2},
+    }
     assert _snapshot_live_attempt(_Run(live), "flash-1") == 1
-    # a lookup failure must NOT claim there is no live worker
     assert _snapshot_live_attempt(_Run(ClientError("boom")), "flash-1") is None
-    # nor must a payload that simply carries no remote key
-    no_remote = {"state": "running", "last_heartbeat": {"attempt": 0}}
-    assert _snapshot_live_attempt(_Run(no_remote), "flash-1") == 0
-
-
-def test_heartbeat_tagging_is_idempotent() -> None:
-    """Re-printing an already-tagged dump must not stack a second marker onto the line."""
-    from flash.cli.commands.ops.worker_output import _mark_superseded_heartbeats
-
-    once = _mark_superseded_heartbeats('HEARTBEAT {"step":1}\n', 0, 1)
-    twice = _mark_superseded_heartbeats(once, 0, 1)
-    assert once == twice
-    assert once.count("[superseded") == 1
+    no_remote = {
+        "state": "running",
+        "attempt": {"attempt_id": 2, "fence": 3},
+    }
+    assert _snapshot_live_attempt(_Run(no_remote), "flash-1") == 2
