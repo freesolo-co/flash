@@ -338,6 +338,48 @@ def test_string_enum_rejects_unrepresentable_structural_delimiter(enum_value: st
         normalize_tools([declaration])
 
 
+def _property_name_tool(property_name: str, *, nested: bool) -> list[dict[str, object]]:
+    property_schema: dict[str, object] = {"type": "string"}
+    if nested:
+        property_schema = {
+            "type": "object",
+            "properties": {property_name: {"type": "string"}},
+            "required": [property_name],
+            "additionalProperties": False,
+        }
+        property_name = "outer"
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "store",
+                "parameters": {
+                    "type": "object",
+                    "properties": {property_name: property_schema},
+                    "required": [property_name],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["root", "nested"])
+def test_tool_declarations_reject_unpaired_surrogate_property_names(nested: bool) -> None:
+    with pytest.raises(ValueError, match="properties keys cannot contain an unpaired surrogate"):
+        normalize_tools(_property_name_tool("\ud800", nested=nested))
+
+
+def test_tool_declarations_preserve_valid_non_bmp_nested_property_names() -> None:
+    property_name = "forecast_🌦"
+
+    tools = normalize_tools(_property_name_tool(property_name, nested=True))
+
+    nested = tools[0].parameters["properties"]["outer"]
+    assert nested["required"] == [property_name]
+    assert nested["properties"] == {property_name: {"type": "string"}}
+
+
 def _enum_tool(enum: list[object]) -> list[dict[str, object]]:
     return [
         {

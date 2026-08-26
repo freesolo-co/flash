@@ -555,6 +555,58 @@ def test_multimodal_prompt_failure_closes_decoded_images(monkeypatch) -> None:
     assert closed == [True]
 
 
+def _unicode_property_tools():
+    return normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": "prévisions météo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "object",
+                                "properties": {
+                                    "forecast_🌦": {
+                                        "type": "string",
+                                        "description": "réponse détaillée",
+                                        "enum": ["ensoleillé", "nuageux ☁"],
+                                    }
+                                },
+                                "required": ["forecast_🌦"],
+                                "additionalProperties": False,
+                            }
+                        },
+                        "required": ["location"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+
+
+def test_packaged_prompt_cache_key_utf8_encodes_accepted_tool_declarations() -> None:
+    request = GenerationRequest(
+        messages=[{"role": "user", "content": "weather"}],
+        tools=_unicode_property_tools(),
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    )
+    preparer = PromptPreparer(
+        EngineConfig(model="model", prompt_cache_size=1),
+        _Tokenizer(),
+        None,
+    )
+
+    key = preparer._cache_key(request, request.messages, False)
+
+    assert key is not None
+    assert key == preparer._cache_key(request, request.messages, False)
+
+
 def _runtime_tools():
     return normalize_tools(
         [

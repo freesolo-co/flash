@@ -55,6 +55,52 @@ def _tools():
     ]
 
 
+def _tools_with_property_name(property_name: str, *, nested: bool):
+    tools = _tools()
+    parameters = tools[0]["function"]["parameters"]
+    if nested:
+        parameters["properties"] = {
+            "location": {
+                "type": "object",
+                "properties": {property_name: {"type": "string"}},
+                "required": [property_name],
+                "additionalProperties": False,
+            }
+        }
+        parameters["required"] = ["location"]
+    else:
+        parameters["properties"] = {property_name: {"type": "string"}}
+        parameters["required"] = [property_name]
+    return tools
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["root", "nested"])
+def test_canonical_request_rejects_unpaired_surrogate_tool_property_names(nested):
+    with pytest.raises(
+        OpenAIRequestError,
+        match="properties keys cannot contain an unpaired surrogate",
+    ):
+        parse_chat_request(
+            _payload(tools=_tools_with_property_name("\ud800", nested=nested)),
+            require_model=True,
+            allow_managed_selectors=False,
+        )
+
+
+def test_canonical_request_accepts_valid_non_bmp_nested_tool_property_names():
+    property_name = "forecast_🌦"
+
+    request = parse_chat_request(
+        _payload(tools=_tools_with_property_name(property_name, nested=True)),
+        require_model=True,
+        allow_managed_selectors=False,
+    )
+
+    nested = request.tools[0].parameters["properties"]["location"]
+    assert nested["required"] == [property_name]
+    assert nested["properties"] == {property_name: {"type": "string"}}
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

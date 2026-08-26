@@ -334,6 +334,50 @@ def test_lora_engine_cache_key_uses_adapter_thinking_default(modal_app_module):
     assert calls == [True, False]
 
 
+def test_hosted_prompt_cache_key_utf8_encodes_accepted_tool_declarations(modal_app_module):
+    engine = object.__new__(modal_app_module._LoraEngineImpl)
+    engine._prompt_cache_size = 1
+
+    class _Payload:
+        messages: ClassVar[list[dict[str, str]]] = [{"role": "user", "content": "weather"}]
+        prompt = None
+        chat_template_kwargs: ClassVar[dict[str, object]] = {}
+        tool_choice = "auto"
+        tools: ClassVar[list[dict[str, object]]] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": "prévisions météo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "object",
+                                "properties": {
+                                    "forecast_🌦": {
+                                        "type": "string",
+                                        "description": "réponse détaillée",
+                                        "enum": ["ensoleillé", "nuageux ☁"],
+                                    }
+                                },
+                                "required": ["forecast_🌦"],
+                                "additionalProperties": False,
+                            }
+                        },
+                        "required": ["location"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
+    key = engine._prompt_cache_key(_Payload(), thinking_default=False)
+
+    assert key is not None
+    assert key == engine._prompt_cache_key(_Payload(), thinking_default=False)
+
+
 def test_lora_engine_requires_trained_thinking_default(modal_app_module):
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine._prompt_cache_size = 4

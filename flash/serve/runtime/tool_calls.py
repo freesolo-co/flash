@@ -430,11 +430,13 @@ def _normalize_schema(
             raise error_type(f"{path}.properties must be an object and required must be an array")
         if raw.get("additionalProperties") is not False:
             raise error_type(f"{path}.additionalProperties must be false")
+        if any(type(name) is not str or not name for name in properties):
+            raise error_type(f"{path}.properties keys must be nonempty strings")
+        if any(_contains_unpaired_surrogate(name) for name in properties):
+            raise error_type(f"{path}.properties keys cannot contain an unpaired surrogate")
         if root:
             for name in properties:
                 _identifier_name(name, f"{path}.properties key", error_type)
-        elif any(type(name) is not str or not name for name in properties):
-            raise error_type(f"{path}.properties keys must be nonempty strings")
         if any(type(name) is not str for name in required) or len(required) != len(set(required)):
             raise error_type(f"{path}.required must contain unique property names")
         if not set(required) <= set(properties):
