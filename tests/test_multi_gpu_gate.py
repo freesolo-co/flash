@@ -21,7 +21,9 @@ from types import SimpleNamespace
 import pytest
 
 import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
 import flash.runner.lifecycle.submit as runner_submit
+from flash.runner.lifecycle.protocol import AttemptRecord
 from tests._helpers.profile import satisfy_sft_profile
 from tests._helpers.source_snapshot import valid_source_snapshot
 from tests._helpers.teacher import configure_managed_teacher
@@ -31,6 +33,18 @@ _SOURCE_SNAPSHOT = valid_source_snapshot()
 # the only managed class all three providers stock. a parity test needs one class every provider can
 # actually provision, or the spec is rejected on catalog grounds before parity is ever exercised.
 _TRI_PROVIDER_GPU = "H100"
+
+
+def _install_attempt(monkeypatch, run_id: str) -> AttemptRecord:
+    attempt = AttemptRecord(0, 1, "reserved", 1.0, 2.0, 3.0, 5.0, 4.0)
+    monkeypatch.setattr(
+        runner_status,
+        "get_status",
+        lambda requested_run_id: SimpleNamespace(
+            attempt=attempt.to_dict() if requested_run_id == run_id else None
+        ),
+    )
+    return attempt
 
 
 # a fake Lambda catalog covering the counts the tests ask for. Lambda names the count in the type,
@@ -542,6 +556,7 @@ def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
     spec = _submittable("grpo", count=4, provider="lambda")
     monkey = pytest.MonkeyPatch()
     try:
+        attempt = _install_attempt(monkey, spec.run_id)
         monkey.setattr(lj, "resolve_ssh_key_names", lambda **_k: ["jk"])
         monkey.setattr(lambda_api, "launch_instance", fake_launch)
         monkey.setattr(lj, "usable_instances", fake_usable)
@@ -549,6 +564,8 @@ def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
             spec,
             seed=spec.seed,
             instances=[_inst("us-east-1")],
+            attempt=attempt.attempt_id,
+            fence=attempt.fence,
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=9_999_999_999.0,
         )
@@ -595,12 +612,15 @@ def test_vast_capacity_refresh_keeps_the_allocated_card_count():
     spec = _submittable("grpo", count=4, provider="vast")
     monkey = pytest.MonkeyPatch()
     try:
+        attempt = _install_attempt(monkey, spec.run_id)
         monkey.setattr(vast_api, "create_instance", fake_create)
         monkey.setattr(vj, "usable_offers", fake_usable)
         handle = vj.deploy_and_submit(
             spec,
             seed=spec.seed,
             offers=[_offer(1)],
+            attempt=attempt.attempt_id,
+            fence=attempt.fence,
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=9_999_999_999.0,
         )
@@ -638,12 +658,15 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
         spec = _submittable("grpo", count=cards, provider="lambda")
         monkey = pytest.MonkeyPatch()
         try:
+            attempt = _install_attempt(monkey, spec.run_id)
             monkey.setattr(lj, "resolve_ssh_key_names", lambda **_k: ["jk"])
             monkey.setattr(lambda_api, "launch_instance", lambda **_kw: "i-1")
             handle = lj.launch_and_submit(
                 spec,
                 seed=spec.seed,
                 instances=[inst],
+                attempt=attempt.attempt_id,
+                fence=attempt.fence,
                 source_snapshot=_SOURCE_SNAPSHOT,
                 deadline_at=9_999_999_999.0,
             )
@@ -670,11 +693,14 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
         spec = _submittable("grpo", count=cards, provider="vast")
         monkey = pytest.MonkeyPatch()
         try:
+            attempt = _install_attempt(monkey, spec.run_id)
             monkey.setattr(vast_api, "create_instance", lambda *_a, **_kw: 4242)
             handle = vj.deploy_and_submit(
                 spec,
                 seed=spec.seed,
                 offers=[offer],
+                attempt=attempt.attempt_id,
+                fence=attempt.fence,
                 source_snapshot=_SOURCE_SNAPSHOT,
                 deadline_at=9_999_999_999.0,
             )

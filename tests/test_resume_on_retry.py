@@ -1189,8 +1189,8 @@ def test_terminal_runpod_job_allows_retry_and_persists_leaked_endpoint(
         "job_status",
         lambda *_args, **_kwargs: {"status": terminal_status},
     )
-    # a COMPLETED job whose output never lands makes _await_runpod_completed_metrics poll for the
-    # bounded metrics-lag grace window before falling through to a retry. drive a fake clock that
+    # a completed job whose immutable result never lands remains bounded by the result grace before
+    # falling through to a retry. drive a fake clock that
     # advances on sleep so that ~120s window elapses in fake time instead of real seconds (and the
     # loop can never wall-clock hang the suite). the fail/cancel/timeout statuses are not terminal-ok,
     # so they never enter the pending poll and this is inert for them.
@@ -1213,76 +1213,67 @@ def test_terminal_runpod_job_allows_retry_and_persists_leaked_endpoint(
     assert runner_status.get_status(spec.run_id).remote["endpoint_id"] == "ep1"
 
 
-def test_await_runpod_completed_metrics_bounds_pending_poll_to_grace(monkeypatch):
-    # a terminal-ok runpod job whose output never becomes readable must not pin the supervisor for
-    # the remainder of a (default 24h) run wall deadline: the synchronous metrics-lag poll is bounded
-    # to ~the grace window measured from first observation, not the run deadline that callers pass in.
-    import time as _time
+def test_reconcile_completed_remote_bounds_wait_to_current_result_deadline(monkeypatch):
+    from types import SimpleNamespace
 
+    import flash.runner.lifecycle.status as status_ops
+    import flash.runner.supervise.attach as attach
     import flash.runner.supervise.lifecycle as lifecycle
+    from flash.runner.lifecycle.protocol import AttemptRecord
 
-    fake_clock = {"now": 1_000.0}
-    monkeypatch.setattr(_time, "time", lambda: fake_clock["now"])
+    now = 1_000.0
+    attempt = AttemptRecord(0, 1, "active", 900.0, 950.0, 990.0, 1_007.0, 1_005.0)
     monkeypatch.setattr(
-        _time, "sleep", lambda seconds: fake_clock.__setitem__("now", fake_clock["now"] + seconds)
+        status_ops,
+        "get_status",
+        lambda _run_id: SimpleNamespace(attempt=attempt.to_dict()),
     )
-    probes = {"n": 0}
+    monkeypatch.setattr(lifecycle, "_adopt_completed_attempt", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(attach.time, "time", lambda: now)
+    sleeps = []
+    monkeypatch.setattr(attach.time, "sleep", sleeps.append)
 
-    def always_pending(_handle, *, deadline_at):
-        # mirror _runpod_completed_metrics' grace decision against the deadline it is handed.
-        probes["n"] += 1
-        if (
-            deadline_at is not None
-            and _time.time() >= deadline_at + lifecycle._RECOVERY_MARKER_GRACE_S
-        ):
-            return  # grace expired: signal "no metrics" like _runpod_completed_metrics
-        raise lifecycle._CompletedAttemptPending("output metrics not readable yet")
-
-    monkeypatch.setattr(lifecycle, "_runpod_completed_metrics", always_pending)
-    far_deadline = fake_clock["now"] + 24 * 3600.0
-
-    result = lifecycle._await_runpod_completed_metrics(object(), far_deadline)
-
-    assert result is None
-    # bounded to ~grace/poll-interval probes and ~grace of elapsed time, not the 24h deadline.
-    max_probes = lifecycle._RECOVERY_MARKER_GRACE_S / lifecycle._RECOVERY_METRICS_POLL_S + 2
-    assert probes["n"] <= max_probes
-    assert (
-        fake_clock["now"] - 1_000.0
-        <= lifecycle._RECOVERY_MARKER_GRACE_S + lifecycle._RECOVERY_METRICS_POLL_S
+    completed = attach._reconcile_completed_remote(
+        "run-current-result",
+        _spec(run_id="run-current-result"),
+        _runpod_handle(attempt=attempt.attempt_id),
+        {"train_tokens": 4096},
+        attempt.run_deadline_at,
+        io.StringIO(),
     )
 
+    assert completed is False
+    assert sleeps == [min(attach._ATTACH_RECONCILE_INTERVAL_S, attempt.result_deadline_at - now)]
 
-def test_await_runpod_completed_metrics_checks_cancellation_before_sleep(monkeypatch):
-    import flash.runner.supervise.lifecycle as lifecycle
-    from flash.runner.supervise.errors import _RunCancelled
 
+def test_reconcile_attached_remote_checks_cancellation_before_sleep(monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.runner.lifecycle.status as status_ops
+    import flash.runner.supervise.attach as attach
+
+    run_id = "run-cancelled-recovery"
+    remote = _runpod_handle(attempt=0)
     monkeypatch.setattr(
-        lifecycle,
-        "_runpod_completed_metrics",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            lifecycle._CompletedAttemptPending("output metrics not readable yet")
-        ),
+        status_ops,
+        "get_status",
+        lambda _run_id: SimpleNamespace(state="cancelled", remote=remote),
     )
     monkeypatch.setattr(
-        lifecycle.time,
+        attach.time,
         "sleep",
-        lambda _seconds: pytest.fail("cancelled pending wait must not sleep"),
+        lambda _seconds: pytest.fail("cancelled recovery must not sleep"),
     )
-    checks = []
 
-    def check_cancelled():
-        checks.append(True)
-        raise _RunCancelled("run was cancelled")
-
-    with pytest.raises(_RunCancelled, match="was cancelled"):
-        lifecycle._await_runpod_completed_metrics(
-            object(),
-            lifecycle.time.time() + 1_000.0,
-            check_cancelled=check_cancelled,
-        )
-
-    assert checks == [True]
+    attach._reconcile_attached_remote(
+        run_id,
+        remote,
+        _spec(run_id=run_id),
+        1,
+        _SOURCE_SNAPSHOT,
+        io.StringIO(),
+        "job_preempted",
+    )
 
 
 @pytest.mark.parametrize(

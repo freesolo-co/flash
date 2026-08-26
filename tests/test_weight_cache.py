@@ -31,6 +31,20 @@ _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
+def _install_attempt(monkeypatch, run_id: str, *, attempt_id: int = 0, fence: int = 1):
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    attempt = AttemptRecord(attempt_id, fence, "reserved", 1.0, 2.0, 3.0, 5.0, 4.0)
+    monkeypatch.setattr(
+        runner_status,
+        "get_status",
+        lambda requested_run_id: types.SimpleNamespace(
+            attempt=attempt.to_dict() if requested_run_id == run_id else None
+        ),
+    )
+    return attempt
+
+
 def _oversized_model_info():
     """A synthetic catalog entry too large for the shared cache.
 
@@ -543,7 +557,7 @@ def test_strip_runpod_volume_env_removes_only_mount_rooted_vars():
     assert out == {"KEEP": "v", "HF_TOKEN": "t"}  # non-/runpod-volume vars preserved
 
 
-def test_instance_payload_strips_runpod_volume_redirect():
+def test_instance_payload_strips_runpod_volume_redirect(monkeypatch):
     # The RunPod weight-cache base-model redirect must NOT leak into a Lambda payload —
     # those instances never mount /runpod-volume. (build_worker_env DOES set it; the instance strips.)
     from flash.providers._lifecycle.instances import instance as _instance
@@ -557,11 +571,13 @@ def test_instance_payload_strips_runpod_volume_redirect():
     assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"].startswith(
         "/runpod-volume"
     )  # leak source
+    attempt = _install_attempt(monkeypatch, spec.run_id)
     for arm in ("lambda",):
         env = _instance.build_payload(
             spec,
             seed=0,
-            attempt=0,
+            attempt=attempt.attempt_id,
+            fence=attempt.fence,
             arm=arm,
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=10_000_000_000.0,
@@ -1628,14 +1644,16 @@ def _preload_spec():
     )
 
 
-def test_instance_build_payload_preload_mode():
+def test_instance_build_payload_preload_mode(monkeypatch):
     from flash.providers._lifecycle.instances import instance as _instance
 
     spec = _preload_spec()
+    attempt = _install_attempt(monkeypatch, spec.run_id)
     p = _instance.build_payload(
         spec,
         spec.seed,
-        0,
+        attempt.attempt_id,
+        attempt.fence,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=10_000_000_000.0,
@@ -1652,14 +1670,16 @@ def test_instance_build_payload_preload_mode():
     assert "HF_HOME" not in p["env"]
 
 
-def test_instance_build_payload_no_mode_by_default():
+def test_instance_build_payload_no_mode_by_default(monkeypatch):
     from flash.providers._lifecycle.instances import instance as _instance
 
     spec = _preload_spec()
+    attempt = _install_attempt(monkeypatch, spec.run_id)
     p = _instance.build_payload(
         spec,
         spec.seed,
-        0,
+        attempt.attempt_id,
+        attempt.fence,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=10_000_000_000.0,
@@ -1809,16 +1829,18 @@ def test_instance_preload_nfs_warms_when_sentinel_present(tmp_path, monkeypatch)
     assert r["preloaded"] == ["a/b"]
 
 
-def test_build_payload_carries_mount_marker_for_nfs_cache():
+def test_build_payload_carries_mount_marker_for_nfs_cache(monkeypatch):
     """a cache-attached Lambda preload payload carries cache_mount_marker so the in-container check
     can require the NFS mount sentinel."""
     from flash.providers._lifecycle.instances import instance as _instance
 
     spec = _preload_spec()
+    attempt = _install_attempt(monkeypatch, spec.run_id)
     p = _instance.build_payload(
         spec,
         spec.seed,
-        0,
+        attempt.attempt_id,
+        attempt.fence,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=10_000_000_000.0,

@@ -47,7 +47,11 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             captured["source_snapshot"] = kwargs["source_snapshot"]
             persisted = runner_status.get_status(spec.run_id)
             assert persisted.source_snapshot == SOURCE_SNAPSHOT
-            attempt = runner_attempts._reserve_attempt(spec.run_id)
+            from flash.runner.lifecycle.protocol import AttemptRecord
+
+            reserved = runner_attempts._reserve_attempt_record(spec.run_id)
+            attempt = AttemptRecord.from_dict(runner_status.get_status(spec.run_id).attempt)
+            assert attempt == reserved
             return {
                 "arm": "runpod",
                 "phase": spec.phase,
@@ -61,7 +65,8 @@ def test_run_job_persists_flash_metrics(monkeypatch):
                 TERMINAL_ATTESTATION_KEY: source_attestation(
                     SOURCE_SNAPSHOT,
                     run_id=spec.run_id,
-                    attempt=attempt,
+                    attempt=attempt.attempt_id,
+                    fence=attempt.fence,
                 ),
             }
 
