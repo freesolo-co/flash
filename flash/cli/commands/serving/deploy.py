@@ -188,8 +188,8 @@ def _runtime_secrets():
 def _deployment_bundle(args):
     """rebuild the exact immutable deployment input shared by deploy and undeploy."""
 
-    from flash.serve.contract.profiles import get_profile, placement_for
     from flash.serve.control import DeploymentRequest
+    from flash.serve.deployment.profiles import get_profile, placement_for
     from flash.serve.deployment.resolve import (
         execution_inputs,
         resolve_adapter,

@@ -14,7 +14,7 @@ from flash.cli.commands.serving import deploy as serve_deploy
 from flash.cli.commands.serving.deploy import cmd_serve_deploy
 from flash.cli.commands.serving.identity import encode_deployment_identity
 from flash.cli.parsing.serve_parser import _add_serve_commands
-from flash.serve.contract.profiles import get_profile, placement_for
+from flash.serve.deployment.profiles import get_profile, placement_for
 from flash.serve.provisioning import InterruptedProvisioning
 
 DIGEST = "sha256:" + "a" * 64
