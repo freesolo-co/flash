@@ -331,6 +331,130 @@ def test_installed_handler_list_mutation_rebuilds_private_opener() -> None:
     assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
 
 
+def test_installed_https_context_replacement_rebuilds_private_opener() -> None:
+    first_context = ssl.create_default_context()
+    second_context = ssl.create_default_context()
+    observed: list[object] = []
+
+    class RecordingHttpsHandler(urllib.request.HTTPSHandler):
+        def https_open(self, request):
+            observed.append(self._context)
+            return _response(request.full_url)
+
+    handler = RecordingHttpsHandler(context=first_context)
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(urllib.request.Request("https://source.invalid/first"), timeout=1.0):
+        pass
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    handler._context = second_context
+    with _urlopen_no_redirect(urllib.request.Request("https://source.invalid/second"), timeout=1.0):
+        pass
+
+    assert observed == [first_context, second_context]
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
+    assert handler.parent is opener
+    assert handler._context is second_context
+
+
+def test_installed_scalar_configuration_change_rebuilds_private_opener() -> None:
+    observed: list[str] = []
+
+    class GatewayHandler(urllib.request.BaseHandler):
+        def __init__(self, token: str):
+            self.token = token
+
+        def custom_open(self, request):
+            observed.append(self.token)
+            return _response(request.full_url)
+
+    handler = GatewayHandler("token-a")
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/a"), timeout=1.0):
+        pass
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    handler.token = "token-b"
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/b"), timeout=1.0):
+        pass
+
+    assert observed == ["token-a", "token-b"]
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
+    assert handler.parent is opener
+    assert handler.token == "token-b"
+
+
+def test_installed_container_configuration_mutation_rebuilds_private_opener() -> None:
+    observed: list[tuple[str, ...]] = []
+
+    class GatewayHandler(urllib.request.BaseHandler):
+        def __init__(self):
+            self.config = {"tokens": ["token-a"]}
+
+        def custom_open(self, request):
+            observed.append(tuple(self.config["tokens"]))
+            return _response(request.full_url)
+
+    handler = GatewayHandler()
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/a"), timeout=1.0):
+        pass
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    handler.config["tokens"].append("token-b")
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/b"), timeout=1.0):
+        pass
+
+    assert observed == [("token-a",), ("token-a", "token-b")]
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
+    assert handler.parent is opener
+    assert handler.config == {"tokens": ["token-a", "token-b"]}
+
+
+def test_concurrent_installed_configuration_refresh_is_singleton() -> None:
+    barrier = threading.Barrier(8)
+    observed: list[tuple[str, object]] = []
+    observed_lock = threading.Lock()
+
+    class GatewayHandler(urllib.request.BaseHandler):
+        def __init__(self, token: str):
+            self.token = token
+
+        def custom_open(self, request):
+            with observed_lock:
+                observed.append((self.token, self.parent))
+            return _response(request.full_url)
+
+    handler = GatewayHandler("token-a")
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/first"), timeout=1.0):
+        pass
+    observed.clear()
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    handler.token = "token-b"
+
+    def request(index: int) -> bytes:
+        barrier.wait()
+        with _urlopen_no_redirect(
+            urllib.request.Request(f"custom://source.invalid/{index}"), timeout=1.0
+        ) as response:
+            return response.read()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(request, range(8)))
+
+    parents = {id(parent) for _token, parent in observed}
+    assert results == [b"ok"] * 8
+    assert [token for token, _parent in observed] == ["token-b"] * 8
+    assert len(parents) == 1
+    assert observed[0][1] is http_transport._INSTALLED_OPENER_CACHE.private
+    assert observed[0][1] is not first_private
+
+
 def test_installed_digest_handler_state_survives_across_requests() -> None:
     password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
     password_manager.add_password("realm", "https://source.invalid", "user", "pass")
@@ -365,11 +489,13 @@ def test_installed_digest_handler_state_survives_across_requests() -> None:
     opener = urllib.request.build_opener(DigestSource(), digest)
     urllib.request.install_opener(opener)
 
+    private_openers: list[object] = []
     for suffix in ("a", "b"):
         with _urlopen_no_redirect(
             urllib.request.Request(f"https://source.invalid/{suffix}"), timeout=1.0
         ) as response:
             assert response.read() == b"ok"
+        private_openers.append(http_transport._INSTALLED_OPENER_CACHE.private)
 
     private_digest = next(
         handler
@@ -377,6 +503,7 @@ def test_installed_digest_handler_state_survives_across_requests() -> None:
         if isinstance(handler, urllib.request.HTTPDigestAuthHandler)
     )
     assert seen_nonce_counts == [1, 2]
+    assert private_openers[0] is private_openers[1]
     assert private_digest.nonce_count == 2
     assert private_digest.last_nonce == "nonce-a"
     assert digest.nonce_count == 0
@@ -647,6 +774,35 @@ def test_urlopen_helper_preserves_explicit_injected_transport() -> None:
 
     assert actual is response
     assert seen == [("https://source.invalid/data", 3.0)]
+
+
+def test_unsnapshotable_installed_handler_fails_before_transport() -> None:
+    contacted: list[str] = []
+
+    class CyclicHandler(urllib.request.BaseHandler):
+        def __init__(self):
+            self.config = []
+            self.config.append(self.config)
+
+        def default_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = CyclicHandler()
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+    original_parent = handler.parent
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib opener cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+    assert urllib.request._opener is opener
+    assert handler.parent is original_parent
+    assert len(handler.config) == 1
+    assert handler.config[0] is handler.config
 
 
 def test_uncopyable_installed_handler_fails_before_transport() -> None:

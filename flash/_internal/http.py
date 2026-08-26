@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import struct
 import threading
 import urllib.error
 import urllib.request
@@ -16,6 +17,8 @@ _ORIGINAL_URLOPEN = urllib.request.urlopen
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _HANDLER_COPY_ERROR = "installed urllib handler cannot be copied safely"
 _OPENER_COPY_ERROR = "installed urllib opener cannot be copied safely"
+_SNAPSHOT_DEPTH_MAX = 8
+_SNAPSHOT_ITEMS_MAX = 256
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -46,7 +49,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 @dataclass(frozen=True)
 class _InstalledOpenerCache:
     installed: urllib.request.OpenerDirector
-    handler_signature: tuple[int, tuple[int, ...]]
+    handler_signature: tuple[int, tuple[tuple[int, object], ...]]
     addheader_signature: tuple[int, tuple[tuple[str, str], ...]]
     private: urllib.request.OpenerDirector
 
@@ -79,6 +82,47 @@ def _handles_redirect_error(handler: urllib.request.BaseHandler) -> bool:
         raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
 
 
+def _snapshot_value(value: object, depth: int = 0) -> object:
+    value_type = type(value)
+    if depth > _SNAPSHOT_DEPTH_MAX:
+        raise ValueError
+    if value is None or value_type in (bool, int, str, bytes):
+        return (value_type, value)
+    if value_type is float:
+        return (float, struct.pack("!d", value))
+    if value_type in (list, tuple):
+        if len(value) > _SNAPSHOT_ITEMS_MAX:
+            raise ValueError
+        return (value_type, tuple(_snapshot_value(item, depth + 1) for item in value))
+    if value_type is dict:
+        if len(value) > _SNAPSHOT_ITEMS_MAX:
+            raise ValueError
+        return (
+            dict,
+            frozenset(
+                (_snapshot_value(key, depth + 1), _snapshot_value(item, depth + 1))
+                for key, item in value.items()
+            ),
+        )
+    if value_type in (set, frozenset):
+        if len(value) > _SNAPSHOT_ITEMS_MAX:
+            raise ValueError
+        return (value_type, frozenset(_snapshot_value(item, depth + 1) for item in value))
+    return ("opaque", id(value_type), id(value))
+
+
+def _handler_config_signature(handler: urllib.request.BaseHandler) -> object:
+    try:
+        state = object.__getattribute__(handler, "__dict__")
+        if type(state) is not dict or any(type(name) is not str for name in state):
+            raise TypeError
+        return frozenset(
+            (name, _snapshot_value(value)) for name, value in state.items() if name != "parent"
+        )
+    except Exception:
+        raise urllib.error.URLError(_OPENER_COPY_ERROR) from None
+
+
 def _copy_installed_handler(
     handler: urllib.request.BaseHandler,
     opener: urllib.request.OpenerDirector,
@@ -105,7 +149,7 @@ def _installed_config(
 ) -> tuple[
     tuple[urllib.request.BaseHandler, ...],
     list[tuple[str, str]],
-    tuple[int, tuple[int, ...]],
+    tuple[int, tuple[tuple[int, object], ...]],
     tuple[int, tuple[tuple[str, str], ...]],
 ]:
     try:
@@ -118,7 +162,10 @@ def _installed_config(
             addheaders.append((name, value))
     except Exception:
         raise urllib.error.URLError(_OPENER_COPY_ERROR) from None
-    handler_signature = (id(opener.handlers), tuple(id(handler) for handler in handlers))
+    handler_signature = (
+        id(opener.handlers),
+        tuple((id(handler), _handler_config_signature(handler)) for handler in handlers),
+    )
     addheader_signature = (id(opener.addheaders), tuple(addheaders))
     return handlers, addheaders, handler_signature, addheader_signature
 
