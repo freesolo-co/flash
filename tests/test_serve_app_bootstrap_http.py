@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from flash.serve.app import __main__ as app_main
+from flash.serve.app import bootstrap as bootstrap_module
 from flash.serve.app import http as http_module
 from flash.serve.app.bootstrap import (
     PublishedAdapter,
@@ -37,7 +38,7 @@ from flash.serve.runtime import (
     StreamFinished,
     StreamReady,
 )
-from tests.test_serve_app_manifest import _spec_and_inputs
+from tests.test_serve_app_manifest import _profile_spec_and_inputs, _spec_and_inputs
 
 AUTH_TOKEN = "inference-token-sentinel"
 
@@ -181,6 +182,34 @@ def test_engine_config_loads_served_checkpoint_not_logical_provenance() -> None:
     assert config.model_revision == manifest.engine.model_revision
 
 
+@pytest.mark.parametrize(
+    "model_id",
+    ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"],
+)
+def test_profile_fields_reach_the_runtime_engine_config(model_id: str) -> None:
+    manifest = build_serving_manifest(*_profile_spec_and_inputs(model_id))
+
+    config = engine_config_from_manifest(manifest)
+
+    assert config.model == manifest.engine.served_model
+    assert config.model_revision == manifest.engine.model_revision
+    assert config.tokenizer_model == manifest.engine.tokenizer_model
+    assert config.tokenizer_revision == manifest.engine.tokenizer_revision
+    if model_id == "Qwen/Qwen3.8-27B":
+        assert config.model_revision != config.tokenizer_revision
+    assert config.engine_args["max_model_len"] == manifest.engine.max_model_len
+    assert config.engine_args["max_num_seqs"] == manifest.engine.max_num_seqs
+    assert config.max_loras == manifest.engine.max_loras
+    assert config.max_cpu_loras == manifest.engine.max_cpu_loras
+    assert config.max_lora_rank == manifest.engine.max_lora_rank
+    assert config.image_limit == manifest.engine.image_limit
+    assert config.enable_tower_connector_lora is manifest.engine.enable_tower_connector_lora
+    if manifest.engine.max_num_batched_tokens is None:
+        assert "max_num_batched_tokens" not in config.engine_args
+    else:
+        assert config.engine_args["max_num_batched_tokens"] == 4096
+
+
 def test_unset_engine_knobs_are_omitted_rather_than_passed_as_none() -> None:
     """an optional knob left unset must not reach vllm as None.
 
@@ -244,6 +273,62 @@ def test_bootstrap_registers_every_revision_before_atomic_publish(
     asyncio.run(owner.close())
     assert runtime.closed is True
     assert owner.models == {}
+
+
+def test_filesystem_usage_follows_engine_start_and_readiness_publish(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manifest = _manifest()
+    paths = {
+        adapter.adapter_revision: tmp_path / adapter.adapter_revision
+        for adapter in manifest.adapters
+    }
+    monkeypatch.setattr(bootstrap_module, "locked_manifest_cache", _locked_paths(paths))
+    runtime = _FakeRuntime()
+    events: list[str] = []
+    owners: list[ServingBootstrap] = []
+    real_owner_type = ServingBootstrap
+
+    async def start() -> None:
+        runtime.started = True
+        events.append("runtime-started")
+
+    async def register_adapter(spec) -> bool:
+        events.append("adapter-registered")
+        runtime.registered.append(spec)
+        return True
+
+    def build_owner(owner_manifest, owner_runtime):
+        owner = real_owner_type(owner_manifest, owner_runtime)
+        owners.append(owner)
+        return owner
+
+    def filesystem_usage(stage, cache_root) -> None:
+        assert cache_root == tmp_path
+        if stage == "engine-constructed":
+            assert runtime.started is True
+            assert runtime.registered == []
+        if stage == "serving-ready":
+            assert owners[0]._ready is True
+            assert len(runtime.registered) == len(manifest.adapters)
+        events.append(f"usage:{stage}")
+
+    runtime.start = start
+    runtime.register_adapter = register_adapter
+    monkeypatch.setattr(bootstrap_module, "ServingBootstrap", build_owner)
+    monkeypatch.setattr(bootstrap_module, "emit_filesystem_usage", filesystem_usage)
+
+    owner = asyncio.run(
+        bootstrap_serving(manifest, tmp_path, runtime_factory=lambda _config: runtime)
+    )
+
+    assert owner is owners[0]
+    assert events == [
+        "runtime-started",
+        "usage:engine-constructed",
+        "adapter-registered",
+        "usage:serving-ready",
+    ]
 
 
 def test_bootstrap_validation_and_registration_fail_closed(monkeypatch, tmp_path: Path) -> None:
