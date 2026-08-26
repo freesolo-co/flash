@@ -212,6 +212,55 @@ def test_integer_enum_uses_json_schema_mathematical_integer_semantics() -> None:
     assert tools[0].parameters["properties"]["count"]["enum"] == [1.0]
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "accepted"),
+    [("null", True), ("NULL", False), ("Null", False)],
+)
+def test_null_schema_accepts_only_the_exact_json_literal_buffered(
+    raw_value: str,
+    accepted: bool,
+) -> None:
+    text = _exact_call().replace(
+        "<parameter=empty>null</parameter>",
+        f"<parameter=empty>{raw_value}</parameter>",
+    )
+
+    result = parse_qwen3_coder_output(text, _exact_tools(), id_factory=lambda: "call_fixed")
+
+    if accepted:
+        assert result.content is None
+        assert json.loads(result.calls[0].arguments)["empty"] is None
+    else:
+        assert result.content == text
+        assert result.calls == ()
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "accepted"),
+    [("null", True), ("NULL", False), ("Null", False)],
+)
+def test_null_schema_casing_survives_arbitrary_stream_splits(
+    raw_value: str,
+    accepted: bool,
+) -> None:
+    text = _exact_call().replace(
+        "<parameter=empty>null</parameter>",
+        f"<parameter=empty>{raw_value}</parameter>",
+    )
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(_exact_tools(), id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        if accepted:
+            assert result.content is None
+            assert json.loads(result.calls[0].arguments)["empty"] is None
+        else:
+            assert result.content == text
+            assert result.calls == ()
+
+
 @pytest.mark.parametrize("raw_value", ["1", "0", "TRUE", "False"])
 def test_boolean_schema_rejects_non_json_boolean_literals_exactly(raw_value: str) -> None:
     text = _exact_call().replace(

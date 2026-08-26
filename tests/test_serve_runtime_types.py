@@ -953,6 +953,45 @@ def test_detached_history_arguments_preserve_exact_decimals() -> None:
     assert messages[0]["tool_calls"][0]["function"]["arguments"] == arguments
 
 
+def test_cached_qwen35_template_renders_boundary_nested_history_without_mutation() -> None:
+    from transformers import AutoTokenizer
+
+    arguments = '{"exact":9007199254740993.0,"nested":{"items":[{"values":[{"leaf":[[0]]}]}]}}'
+    messages = [
+        {"role": "user", "content": "weather"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": arguments},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+    original = json.loads(json.dumps(messages))
+    request = GenerationRequest(messages=messages)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-9B", local_files_only=True)
+    except OSError:
+        pytest.skip("Qwen3.5 tokenizer is not cached locally")
+
+    rendered = tokenizer.apply_chat_template(
+        detached_template_messages(request.messages),
+        tokenize=False,
+        add_generation_prompt=True,
+        tools=[tool.wire() for tool in _runtime_tools()],
+        enable_thinking=False,
+    )
+
+    assert "<parameter=exact>\n9007199254740993.0\n</parameter>" in rendered
+    assert '"leaf": [[0]]' in rendered
+    assert messages == original
+
+
 def test_a_multimodal_template_rejection_is_a_client_error_not_an_unavailable_engine(
     monkeypatch,
 ) -> None:

@@ -268,7 +268,10 @@ def validate_tool_history(
                     f"message {message_index} starts a new turn before all tool calls were resolved"
                 )
             calls = _validate_history_calls(
-                message.get("tool_calls"), message_index, all_ids, error_type
+                message.get("tool_calls"),
+                message_index,
+                all_ids,
+                error_type,
             )
             pending = dict(calls)
             resolved.clear()
@@ -407,6 +410,7 @@ def _normalize_schema(
                 error_type,
                 budget=enum_budget,
                 max_nodes=_MAX_ENUM_NODES,
+                kind="enum value",
             )
         detached = _json_copy(enum, path, error_type)
         if any(not _matches_type(item, schema_type) for item in detached):
@@ -492,9 +496,19 @@ def _validate_history_calls(
         if type(arguments) is not str:
             raise error_type(f"{path} function arguments must be a JSON string")
         try:
-            _decode_json_object(arguments)
+            decoded = _decode_json_object(arguments)
+        except RecursionError as exc:
+            raise error_type(f"{path} exceeds the supported tool argument complexity") from exc
         except ValueError as exc:
             raise error_type(f"{path} function arguments must encode a JSON object") from exc
+        _validate_json_value_complexity(
+            decoded,
+            path,
+            error_type,
+            budget=[0],
+            max_nodes=_MAX_SCHEMA_NODES,
+            kind="tool argument",
+        )
         calls.append((call_id, name))
     return calls
 
@@ -657,7 +671,7 @@ def _coerce_value(value: str, schema_type: str) -> Any:
     if schema_type == "string":
         return value
     if schema_type == "null":
-        return None if value.strip().lower() == "null" else value
+        return None if value.strip() == "null" else value
     if schema_type == "boolean":
         stripped = value.strip()
         if stripped == "true":
@@ -872,13 +886,14 @@ def _validate_json_value_complexity(
     *,
     budget: list[int],
     max_nodes: int,
+    kind: str,
 ) -> None:
     stack = [(value, 0)]
     while stack:
         nested, depth = stack.pop()
         budget[0] += 1
         if depth > _MAX_SCHEMA_DEPTH or budget[0] > max_nodes:
-            raise error_type(f"{path} exceeds the supported enum value complexity")
+            raise error_type(f"{path} exceeds the supported {kind} complexity")
         if type(nested) is list:
             stack.extend((item, depth + 1) for item in nested)
         elif type(nested) is dict:

@@ -568,6 +568,67 @@ def test_tool_history_is_strict_and_does_not_mutate_caller_messages() -> None:
     ]
 
 
+def _historical_tool_messages(argument: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": argument},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"value":' + "[" * 600 + "0" + "]" * 600 + "}",
+        json.dumps({"values": [0] * 511}),
+    ],
+    ids=["depth", "aggregate-nodes"],
+)
+def test_historical_tool_argument_complexity_is_a_request_error(argument: str) -> None:
+    messages = _historical_tool_messages(argument)
+    original = json.loads(json.dumps(messages))
+
+    with pytest.raises(OpenAIRequestError, match="tool argument complexity"):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+    assert messages == original
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"value":' + "[" * 7 + "0" + "]" * 7 + "}",
+        json.dumps({"values": [0] * 510}),
+    ],
+    ids=["depth", "aggregate-nodes"],
+)
+def test_historical_tool_argument_complexity_boundary_succeeds(argument: str) -> None:
+    messages = _historical_tool_messages(argument)
+    original = json.loads(json.dumps(messages))
+
+    request = parse_chat_request(
+        {"messages": messages},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    assert request.messages == original
+    assert messages == original
+
+
 @pytest.mark.parametrize(
     "argument",
     [
