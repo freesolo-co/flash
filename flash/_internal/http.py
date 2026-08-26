@@ -331,6 +331,11 @@ _STDLIB_HANDLER_CALLBACK_SIGNATURES = tuple(
 )
 _STANDARD_DO_OPEN = urllib.request.AbstractHTTPHandler.do_open
 _STANDARD_DO_OPEN_SIGNATURE = _function_implementation_signature(_STANDARD_DO_OPEN)
+_STANDARD_PROXY_CALLBACK_CODE = next(
+    value
+    for value in urllib.request.ProxyHandler.__init__.__code__.co_consts
+    if type(value) is types.CodeType and value.co_name == "<lambda>"
+)
 
 
 def _slot_names(declaration: object) -> tuple[str, ...]:
@@ -530,6 +535,13 @@ def _proxy_callback(
     return callback
 
 
+_REBUILT_PROXY_CALLBACK_CODE = next(
+    value
+    for value in _proxy_callback.__code__.co_consts
+    if type(value) is types.CodeType and value.co_name == "callback"
+)
+
+
 def _rebuild_proxy_callbacks(
     copied: urllib.request.BaseHandler,
     copied_state: dict[str, object],
@@ -580,6 +592,71 @@ def _validate_callback_helpers(handler: urllib.request.BaseHandler) -> None:
             raise TypeError
 
 
+def _proxy_callback_names(
+    handler: urllib.request.BaseHandler,
+    state: dict[str, object],
+) -> frozenset[str]:
+    if not isinstance(handler, urllib.request.ProxyHandler):
+        return frozenset()
+    proxies = state.get("proxies", _ABSENT_SLOT)
+    if type(proxies) is not dict or any(
+        type(name) is not str or type(url) is not str for name, url in proxies.items()
+    ):
+        raise TypeError
+    return frozenset(f"{str.lower(name)}_open" for name in proxies)
+
+
+def _validate_proxy_instance_callback(
+    handler: urllib.request.BaseHandler,
+    name: str,
+    callback: object,
+    state: dict[str, object],
+) -> bool:
+    if name not in _proxy_callback_names(handler, state):
+        return False
+    if type(callback) is not types.FunctionType:
+        raise TypeError
+    code = object.__getattribute__(callback, "__code__")
+    defaults = object.__getattribute__(callback, "__defaults__")
+    if (
+        code not in {_STANDARD_PROXY_CALLBACK_CODE, _REBUILT_PROXY_CALLBACK_CODE}
+        or type(defaults) is not tuple
+        or len(defaults) != 3
+    ):
+        raise TypeError
+    proxy, proxy_type, method = defaults
+    expected_type = name.removesuffix("_open")
+    expected_proxy = _ABSENT_SLOT
+    for configured_type, configured_proxy in state["proxies"].items():
+        if str.lower(configured_type) == expected_type:
+            expected_proxy = configured_proxy
+    if (
+        type(proxy) is not str
+        or proxy != expected_proxy
+        or proxy_type != expected_type
+        or type(method) is not types.MethodType
+        or object.__getattribute__(method, "__self__") is not handler
+        or object.__getattribute__(method, "__func__")
+        is not _getattr_type_static(type(handler), "proxy_open", _ABSENT_SLOT)
+    ):
+        raise TypeError
+    return True
+
+
+def _registered_instance_callbacks(
+    handler: urllib.request.BaseHandler,
+    state: dict[str, object],
+) -> tuple[object, ...]:
+    callbacks = []
+    for name, value in state.items():
+        if not _is_registered_callback_name(name):
+            continue
+        if _validate_proxy_instance_callback(handler, name, value, state):
+            continue
+        callbacks.append(value)
+    return tuple(callbacks)
+
+
 def _registered_class_callbacks(
     handler: urllib.request.BaseHandler,
     state: dict[str, object],
@@ -600,6 +677,25 @@ def _registered_class_callbacks(
                 continue
             callbacks.append(value)
     return tuple(callbacks)
+
+
+def _validate_instance_callbacks(
+    handler: urllib.request.BaseHandler,
+    state: dict[str, object],
+    targets: tuple[object, ...],
+) -> None:
+    seen: set[int] = set()
+    active: set[int] = set()
+    budget = [0]
+    for callback in _registered_instance_callbacks(handler, state):
+        if _references_target(
+            callback,
+            targets,
+            seen=seen,
+            active=active,
+            budget=budget,
+        ):
+            raise TypeError
 
 
 def _validate_class_callbacks(
@@ -656,8 +752,13 @@ def _copy_installed_handler(
         if copied_state is handler_state or copied_state.get("parent", _ABSENT_SLOT) is not opener:
             raise TypeError
         _validate_callback_helpers(copied)
+        _validate_instance_callbacks(copied, copied_state, (handler, opener))
         copied_values = (
-            tuple(value for name, value in copied_state.items() if name != "parent")
+            tuple(
+                value
+                for name, value in copied_state.items()
+                if name != "parent" and not _is_registered_callback_name(name)
+            )
             + tuple(
                 value
                 for _owner_id, _slot_name, value in _slot_values(copied)
@@ -804,9 +905,11 @@ def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
                 try:
                     for handler in handlers:
                         if not _handles_redirect_error(handler):
+                            state = _handler_state(handler)
+                            _validate_instance_callbacks(handler, state, (handler, installed))
                             _validate_class_callbacks(
                                 handler,
-                                _handler_state(handler),
+                                state,
                                 (handler, installed),
                                 (cached.private, *cached.private.handlers),
                                 (cached.private, *cached.private.handlers),

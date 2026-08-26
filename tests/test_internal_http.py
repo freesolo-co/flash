@@ -233,6 +233,55 @@ def test_installed_proxy_and_auth_handler_state_is_preserved() -> None:
     assert {handler: handler.__dict__ for handler in original_states} == original_states
 
 
+def test_installed_proxy_callback_remains_supported_on_cache_hit() -> None:
+    proxy_calls: list[tuple[object, str, str]] = []
+    terminal_calls: list[str] = []
+
+    class RecordingProxyHandler(urllib.request.ProxyHandler):
+        def proxy_open(self, request, proxy, proxy_type):
+            proxy_calls.append((self, proxy, proxy_type))
+            return super().proxy_open(request, proxy, proxy_type)
+
+    class TerminalHandler(urllib.request.BaseHandler):
+        handler_order = 150
+
+        def custom_open(self, request):
+            terminal_calls.append(request.full_url)
+            return _response(request.full_url)
+
+    proxy_url = "custom://proxy.invalid:8080"
+    proxy = RecordingProxyHandler({"custom": proxy_url})
+    opener = urllib.request.build_opener(proxy, TerminalHandler())
+    urllib.request.install_opener(opener)
+
+    private_openers = []
+    for suffix in ("first", "second"):
+        with _urlopen_no_redirect(
+            urllib.request.Request(
+                f"custom://source.invalid/{suffix}",
+                headers={"Authorization": "Bearer secret"},
+            ),
+            timeout=1.0,
+        ) as response:
+            assert response.read() == b"ok"
+        private_openers.append(http_transport._INSTALLED_OPENER_CACHE.private)
+
+    copied_proxy = next(
+        handler
+        for handler in private_openers[0].handlers
+        if isinstance(handler, urllib.request.ProxyHandler)
+    )
+    assert private_openers[0] is private_openers[1]
+    assert proxy_calls == [
+        (copied_proxy, proxy_url, "custom"),
+        (copied_proxy, proxy_url, "custom"),
+    ]
+    assert terminal_calls == [
+        "custom://source.invalid/first",
+        "custom://source.invalid/second",
+    ]
+
+
 def test_default_opener_discovers_proxy_environment_on_first_request(monkeypatch) -> None:
     monkeypatch.setattr(urllib.request, "_opener", None)
     monkeypatch.setenv("HTTPS_PROXY", "http://late-proxy.invalid:8080")
@@ -1485,6 +1534,52 @@ def test_builtin_bound_method_retaining_target_fails_before_transport(target_kin
 
     assert contacted == []
     assert holder == [target]
+
+
+def test_mutated_instance_callback_holder_fails_before_cached_transport() -> None:
+    safe = "custom://safe.invalid/data"
+    source = "custom://source.invalid/data"
+    sink = "custom://sink.invalid/steal"
+    contacted: list[tuple[str, str | None]] = []
+
+    class Holder:
+        target = None
+
+        def callback(self, request):
+            authorization = request.get_header("Authorization")
+            contacted.append((request.full_url, authorization))
+            if request.full_url == source:
+                redirected = urllib.request.Request(
+                    sink,
+                    headers={"Authorization": authorization},
+                )
+                return self.target.open(redirected, timeout=request.timeout)
+            return _response(request.full_url)
+
+    class InstanceCallbackHandler(urllib.request.BaseHandler):
+        pass
+
+    holder = Holder()
+    handler = InstanceCallbackHandler()
+    handler.custom_open = holder.callback
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request(safe), timeout=1.0) as response:
+        assert response.read() == b"ok"
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    holder.target = opener
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert contacted == [(safe, None)]
+    assert all(url != sink for url, _authorization in contacted)
+    assert http_transport._INSTALLED_OPENER_CACHE.private is first_private
 
 
 def test_copied_handler_callback_bound_to_original_fails_before_transport() -> None:
