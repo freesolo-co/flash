@@ -12,7 +12,7 @@ from flash.serve.runtime import AdapterSpec, EngineConfig, VllmLoraRuntime
 
 from .manifest import ManifestAdapter, ServingManifest
 from .materialize import locked_manifest_cache
-from .progress import emit_boot_progress
+from .progress import emit_boot_progress, emit_filesystem_usage
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,8 +113,7 @@ async def bootstrap_serving(
 
     `on_engine_death` is forwarded to the runtime so a dead vllm engine core can take the
     container down with it. without a handler the runtime only records the death and the http
-    process stays bound, answering 503 forever, and neither the modal container nor the runpod
-    pod is ever replaced.
+    process stays bound, answering 503 forever, and the provider container is never replaced.
     """
 
     config = engine_config_from_manifest(manifest)
@@ -132,6 +131,7 @@ async def bootstrap_serving(
                 revision=manifest.engine.model_revision,
             )
             await runtime.start()
+            emit_filesystem_usage("engine-constructed", cache_root)
             emit_boot_progress(
                 "engine-constructed",
                 model=manifest.engine.served_model,
@@ -166,6 +166,7 @@ async def bootstrap_serving(
             )
         owner._models = MappingProxyType(dict(sorted(published.items())))
         owner._ready = True
+        emit_filesystem_usage("serving-ready", cache_root)
         return owner
     except BaseException:
         await owner.close()

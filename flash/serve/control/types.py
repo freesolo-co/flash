@@ -13,9 +13,9 @@ from typing import Literal, TypeAlias
 from flash.serve.contract.protocol import ADAPTER_REVISION_PATTERN
 
 from ._canonical import canonical_json
-from ._urls import validate_modal_public_url, validate_runpod_pod_id, validate_runpod_public_url
+from ._urls import validate_modal_public_url
 
-Provider: TypeAlias = Literal["modal", "runpod"]
+Provider: TypeAlias = Literal["modal"]
 RepoType: TypeAlias = Literal["model", "dataset"]
 Modality: TypeAlias = Literal["text", "multimodal"]
 DeploymentStatus: TypeAlias = Literal[
@@ -26,12 +26,9 @@ DeploymentStatus: TypeAlias = Literal[
     "absent",
 ]
 DeploymentErrorCode: TypeAlias = Literal[
-    "artifact_cleanup_timeout",
     "authentication_failed",
-    "capacity_unavailable",
     "conflict",
     "invalid_request",
-    "not_found",
     "provider_rejected",
     "readiness_failed",
     "resource_ambiguous",
@@ -41,36 +38,16 @@ DeploymentErrorReason: TypeAlias = Literal[
     "artifact_cleanup_conflict",
     "artifact_cleanup_delete_rejected",
     "artifact_cleanup_delete_unknown",
-    "artifact_cleanup_identity_drift",
     "artifact_cleanup_observation_failed",
-    "artifact_cleanup_patch_rejected",
-    "artifact_cleanup_patch_unknown",
-    "artifact_cleanup_unproven",
-    "create_cleanup_unconfirmed",
-    "mutation_outcome_unknown",
-    "readiness_artifact_present",
-    "readiness_deadline_cleanup_unconfirmed",
     "readiness_deadline_unproven",
-    "readiness_observation_cleanup_unconfirmed",
-    "readiness_observation_failed",
-    "readiness_resource_conflict",
-    "readiness_resource_conflict_cleanup_unconfirmed",
-    "readiness_status_invalid",
-    "readiness_status_invalid_cleanup_unconfirmed",
-    "readiness_terminal",
-    "readiness_terminal_cleanup_unconfirmed",
-    "teardown_cleanup_unconfirmed",
 ]
 
 _DEPLOYMENT_STATUSES = frozenset({"ready", "provisioning", "failed", "outcome_unknown", "absent"})
 _DEPLOYMENT_ERROR_CODES = frozenset(
     {
-        "artifact_cleanup_timeout",
         "authentication_failed",
-        "capacity_unavailable",
         "conflict",
         "invalid_request",
-        "not_found",
         "provider_rejected",
         "readiness_failed",
         "resource_ambiguous",
@@ -82,25 +59,8 @@ _DEPLOYMENT_ERROR_REASONS = frozenset(
         "artifact_cleanup_conflict",
         "artifact_cleanup_delete_rejected",
         "artifact_cleanup_delete_unknown",
-        "artifact_cleanup_identity_drift",
         "artifact_cleanup_observation_failed",
-        "artifact_cleanup_patch_rejected",
-        "artifact_cleanup_patch_unknown",
-        "artifact_cleanup_unproven",
-        "create_cleanup_unconfirmed",
-        "mutation_outcome_unknown",
-        "readiness_artifact_present",
-        "readiness_deadline_cleanup_unconfirmed",
         "readiness_deadline_unproven",
-        "readiness_observation_cleanup_unconfirmed",
-        "readiness_observation_failed",
-        "readiness_resource_conflict",
-        "readiness_resource_conflict_cleanup_unconfirmed",
-        "readiness_status_invalid",
-        "readiness_status_invalid_cleanup_unconfirmed",
-        "readiness_terminal",
-        "readiness_terminal_cleanup_unconfirmed",
-        "teardown_cleanup_unconfirmed",
     }
 )
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -451,46 +411,13 @@ def validate_modal_placement(placement: ModalPlacement) -> None:
     _require_optional_nonempty(placement.region, "modal region")
 
 
-@dataclass(frozen=True, slots=True)
-class RunPodPlacement:
-    """persistent runpod pod placement with an exact runpod gpu type."""
-
-    account_id: str
-    gpu_type_id: str
-    gpu_count: int
-    data_center_id: str
-    container_disk_gb: int
-    volume_size_gb: int
-
-    def __post_init__(self) -> None:
-        validate_runpod_placement(self)
-
-    @property
-    def provider(self) -> Literal["runpod"]:
-        return "runpod"
-
-
-def validate_runpod_placement(placement: RunPodPlacement) -> None:
-    if type(placement) is not RunPodPlacement:
-        raise ValueError("runpod requests require RunPodPlacement")
-    _require_nonempty(placement.account_id, "runpod account_id")
-    _require_nonempty(placement.gpu_type_id, "runpod gpu_type_id")
-    _require_positive_int(placement.gpu_count, "runpod gpu_count")
-    _require_nonempty(placement.data_center_id, "runpod data_center_id")
-    _require_positive_int(placement.container_disk_gb, "runpod container_disk_gb")
-    _require_positive_int(placement.volume_size_gb, "runpod volume_size_gb")
-
-
-Placement: TypeAlias = ModalPlacement | RunPodPlacement
+Placement: TypeAlias = ModalPlacement
 
 
 def _validate_provider_placement(provider: object, placement: object) -> Placement:
-    if provider == "modal":
-        validate_modal_placement(placement)
-    elif provider == "runpod":
-        validate_runpod_placement(placement)
-    else:
-        raise ValueError("provider must be modal or runpod")
+    if provider != "modal":
+        raise ValueError("provider must be modal")
+    validate_modal_placement(placement)
     return placement
 
 
@@ -683,55 +610,7 @@ def validate_modal_handle(handle: ModalProviderHandle) -> None:
     validate_modal_public_url(handle.public_url)
 
 
-@dataclass(frozen=True, slots=True)
-class RunPodProviderHandle:
-    """sanitized exact persistent pod resources and managed proxy url."""
-
-    deployment_id: str
-    generation: int
-    engine_id: str
-    account_id: str
-    pod_id: str
-    pod_name: str
-    network_volume_id: str
-    network_volume_name: str
-    template_id: str
-    template_name: str
-    inference_secret_id: str
-    inference_secret_name: str
-    data_center_id: str
-    image_digest: str
-    public_url: str
-    provider: Literal["runpod"] = field(default="runpod", init=False)
-
-    def __post_init__(self) -> None:
-        validate_runpod_handle(self)
-
-
-def validate_runpod_handle(handle: RunPodProviderHandle) -> None:
-    if type(handle) is not RunPodProviderHandle:
-        raise ValueError("handle must be an exact RunPodProviderHandle")
-    for name in (
-        "deployment_id",
-        "account_id",
-        "pod_name",
-        "network_volume_id",
-        "network_volume_name",
-        "template_id",
-        "template_name",
-        "inference_secret_id",
-        "inference_secret_name",
-        "data_center_id",
-    ):
-        _require_nonempty(getattr(handle, name), name)
-    _require_exact_digest(handle.engine_id, "engine_id", _HEX_64_RE)
-    _require_exact_digest(handle.image_digest, "image_digest", _IMAGE_DIGEST_RE)
-    validate_runpod_pod_id(handle.pod_id)
-    _require_positive_int(handle.generation, "generation")
-    validate_runpod_public_url(handle.public_url, handle.pod_id)
-
-
-ProviderHandle: TypeAlias = ModalProviderHandle | RunPodProviderHandle
+ProviderHandle: TypeAlias = ModalProviderHandle
 
 
 def _validate_handle_against_plan(
@@ -744,23 +623,15 @@ def _validate_handle_against_plan(
     image_digest: str,
     handle: ProviderHandle,
 ) -> None:
-    if provider == "modal":
-        validate_modal_handle(handle)
-        assert type(placement) is ModalPlacement
-        if (
-            handle.workspace_name != placement.workspace_name
-            or handle.environment != placement.environment
-            or handle.region != placement.region
-        ):
-            raise ValueError("provider handle placement does not match the planned deployment")
-    else:
-        validate_runpod_handle(handle)
-        assert type(placement) is RunPodPlacement
-        if (
-            handle.account_id != placement.account_id
-            or handle.data_center_id != placement.data_center_id
-        ):
-            raise ValueError("provider handle placement does not match the planned deployment")
+    validate_modal_handle(handle)
+    if type(placement) is not ModalPlacement:
+        raise ValueError("provider handle placement must be an exact ModalPlacement")
+    if (
+        handle.workspace_name != placement.workspace_name
+        or handle.environment != placement.environment
+        or handle.region != placement.region
+    ):
+        raise ValueError("provider handle placement does not match the planned deployment")
     if (
         handle.deployment_id != deployment_id
         or handle.generation != generation
@@ -874,8 +745,8 @@ def validate_deployment_result(result: DeploymentResult) -> None:
         raise ValueError("deployment error_reason requires an error_code")
 
     if result.handle is not None:
-        if type(result.handle) not in {ModalProviderHandle, RunPodProviderHandle}:
-            raise ValueError("provider handle must be an exact sanitized handle type")
+        if type(result.handle) is not ModalProviderHandle:
+            raise ValueError("provider handle must be an exact ModalProviderHandle")
         _validate_handle_against_plan(
             deployment_id=result.deployment_id,
             generation=result.generation,

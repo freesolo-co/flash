@@ -3,10 +3,23 @@
 `flash models deploy`, `chat`, and `undeploy` use an HTTP serving backend. `flash/serve/` owns the
 client, shared runtime, and customer-owned provider deployment. Freesolo's hosted backend
 (`flash/serving/`) is another implementation of this contract.
-A deployment serves one base model and its LoRA adapters. Use `flash serve deploy` to provision one
-in your own Modal or RunPod account, or implement these endpoints and run the conformance suite
-below. The maintained customer-owned profile supports only `Qwen/Qwen3.5-9B`; Qwen3.6 27B is
-retired and Qwen3.8 27B is available only through the separately managed hosted-serving catalog.
+A deployment serves one exact base model and its compatible LoRA adapters. A different base model
+requires a separate deployment. Use `flash serve deploy --provider modal` to provision one in your
+own Modal account, or implement these endpoints and run the conformance suite below.
+
+Customer-owned Modal is live-qualified for `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
+`Qwen/Qwen3.6-35B-A3B`. The 27B and 35B-A3B qualifications are bound to the exact certified serving
+image digest; another digest remains available for offline planning but cannot allocate Modal.
+Hosted Qwen3.8 27B remains inactive. Its customer-owned engine runs on
+`H100!` and serves the pinned `Qwen/Qwen3.8-27B-FP8` checkpoint while preserving
+`Qwen/Qwen3.8-27B` as the distinct logical base and tokenizer provenance. The 35B-A3B engine serves
+BF16 weights on one H200 with FP8 KV cache,
+a 32K context, eight sequences, a 4096 batched-token cap, and six rank-64 LoRA slots.
+
+Customer-owned `flash serve` is Modal-only and requires the explicit provider argument. Historical
+customer-serving RunPod deployment identities are unsupported, with no migration, status, undeploy,
+or teardown shim. Managed RunPod training remains supported and unchanged. Retired Qwen3.6 27B is
+never translated into Qwen3.8 27B.
 
 ## Identity model
 

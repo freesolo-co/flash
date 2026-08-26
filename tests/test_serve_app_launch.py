@@ -97,13 +97,29 @@ def test_launcher_uses_cache_first_without_reading_artifact_token(
     def hydrate(*_args, **_kwargs):
         raise AssertionError("cache-first restart must not hydrate")
 
+    real_seal_hub_offline = launch._seal_hub_offline
+
+    def seal_hub_offline(environment):
+        calls.append("seal")
+        real_seal_hub_offline(environment)
+
     monkeypatch.setattr(launch, "validate_manifest_cache", validate)
     monkeypatch.setattr(launch, "hydrate_manifest", hydrate)
+    monkeypatch.setattr(
+        launch,
+        "emit_filesystem_usage",
+        lambda stage, cache_root: calls.append(f"usage:{stage}:{cache_root}"),
+    )
+    monkeypatch.setattr(launch, "_seal_hub_offline", seal_hub_offline)
     monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
 
     _run_with_environment(environment)
 
-    assert calls == ["validate"]
+    assert calls == [
+        "validate",
+        f"usage:cache-prepared:{environment['FLASH_SERVING_CACHE_ROOT']}",
+        "seal",
+    ]
     assert captured["inference_token"] == INFERENCE_TOKEN
     assert "FLASH_INFERENCE_TOKEN" not in environment
     assert "FLASH_ARTIFACT_TOKEN" not in environment
