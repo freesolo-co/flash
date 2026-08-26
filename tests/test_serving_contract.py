@@ -121,6 +121,7 @@ def test_adapter_artifact_metadata_reads_the_exported_modality_marker(
 
 
 def _stub_deploy_preconditions(monkeypatch, deploy_mod) -> None:
+    monkeypatch.setattr(deploy_mod, "_registered_adapter", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(deploy_mod, "resolve_artifact_revision", lambda repo: "a" * 40)
     monkeypatch.setattr(
         adapter_check,

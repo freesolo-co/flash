@@ -1093,6 +1093,7 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
     assert run_serving_org_id(status) == auth.STANDALONE_SERVING_ORG_ID
 
     registrations: list[dict] = []
+    monkeypatch.setattr(serving_deploy, "_registered_adapter", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(serving_deploy, "resolve_artifact_revision", lambda _repo: "a" * 40)
     monkeypatch.setattr(
         serving_deploy.adapter_check,
