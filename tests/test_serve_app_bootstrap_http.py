@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 from contextlib import contextmanager, suppress
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
@@ -51,6 +52,7 @@ class _FakeRuntime:
         self.fail_registration_at: int | None = None
         self.generation_requests = []
         self.generate_error: BaseException | None = None
+        self.result_thinking = True
         self.stream_events = []
         self.stream_closed = False
 
@@ -89,7 +91,7 @@ class _FakeRuntime:
             completion_tokens=2,
             cached_tokens=3,
             cached_tokens_reported=True,
-            thinking=True,
+            thinking=self.result_thinking,
         )
 
     def stream(self, request):
@@ -112,12 +114,17 @@ def _manifest():
     return build_serving_manifest(*_spec_and_inputs())
 
 
-def _published_owner() -> tuple[ServingBootstrap, _FakeRuntime]:
+def _published_owner(
+    *, thinking_default: bool | None = None
+) -> tuple[ServingBootstrap, _FakeRuntime]:
     manifest = _manifest()
     runtime = _FakeRuntime()
     runtime.started = True
     owner = ServingBootstrap(manifest, runtime)
     adapter = manifest.adapters[0]
+    if thinking_default is not None:
+        adapter = replace(adapter, thinking_default=thinking_default)
+        runtime.result_thinking = thinking_default
     revision = PublishedAdapter(adapter.adapter_revision, adapter)
     alias = PublishedAdapter("run-1", adapter)
     owner._models = MappingProxyType({adapter.adapter_revision: revision, "run-1": alias})
@@ -845,13 +852,32 @@ def test_a_chat_request_may_override_the_registered_grammar_for_its_own_call() -
     rather than a mutation of an immutable revision.
     """
 
-    owner, runtime = _published_owner()
+    owner, runtime = _published_owner(thinking_default=False)
     assert owner.models["run-1"].adapter.structured_outputs_default == {"json_object": True}
     app = create_app(owner, bearer_token=AUTH_TOKEN)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
 
     for override, expected in (
         ({"structured_outputs": {"regex": "[ab]+"}}, {"regex": "[ab]+"}),
         ({"response_format": {"type": "text"}}, {}),
+        (
+            {"response_format": {"type": "text"}, "tools": tools},
+            {},
+        ),
+        ({"structured_outputs": {}, "tools": tools}, {}),
         ({}, None),
     ):
         response = asyncio.run(
@@ -903,6 +929,45 @@ def test_non_finite_json_constants_are_rejected_as_invalid_json(body: str) -> No
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_json"
     assert runtime.generation_requests == []
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
+def test_effective_structured_tool_conflict_is_a_client_error(stream: bool) -> None:
+    owner, runtime = _published_owner(thinking_default=False)
+    failure = PromptError("tools cannot be combined with logprobs or structured outputs")
+    if stream:
+        runtime.stream_events = [failure]
+    else:
+        runtime.generate_error = failure
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers=_auth(),
+            json=_chat_body(tools=tools, stream=stream),
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert len(runtime.generation_requests) == 1
 
 
 @pytest.mark.parametrize("stream", [False, True])

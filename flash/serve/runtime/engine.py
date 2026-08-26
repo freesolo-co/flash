@@ -336,6 +336,7 @@ class VllmLoraRuntime:
                 raise PromptError("logprobs are not supported for thinking-enabled generation")
             self._validate_tools(request, thinking)
             structured = self._structured_state(request, adapter, thinking)
+            self._reject_tools_with_structured_outputs(request, structured)
             sampling = self._sampling_params(request, structured, streaming=False)
             prompt = await self._prepare_prompt(request, thinking)
             final_output = None
@@ -390,6 +391,7 @@ class VllmLoraRuntime:
                 raise PromptError("logprobs are not supported for thinking-enabled generation")
             self._validate_tools(request, thinking)
             structured = self._structured_state(request, adapter, thinking)
+            self._reject_tools_with_structured_outputs(request, structured)
             sampling = self._sampling_params(request, structured, streaming=True)
             prompt = await self._prepare_prompt(request, thinking)
             output_stream = self._generate_stream(
@@ -575,6 +577,18 @@ class VllmLoraRuntime:
             raise PromptError("tools are not supported for thinking-enabled generation")
         if self.config.tool_parser != "qwen3_coder":
             raise PromptError("this serving engine is not qualified for tool calling")
+
+    @staticmethod
+    def _reject_tools_with_structured_outputs(
+        request: GenerationRequest,
+        structured: _StructuredState,
+    ) -> None:
+        if (
+            request.tools is not None
+            and request.tool_choice == "auto"
+            and structured.params is not None
+        ):
+            raise PromptError("tools cannot be combined with logprobs or structured outputs")
 
     def _structured_state(
         self,

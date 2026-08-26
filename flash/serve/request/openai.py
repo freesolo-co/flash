@@ -166,7 +166,7 @@ def parse_chat_request(
     if tools is not None:
         if logprobs:
             raise OpenAIRequestError("tools cannot be combined with logprobs")
-        if "structured_outputs" in payload and payload["structured_outputs"] is not None:
+        if structured_outputs:
             raise OpenAIRequestError("tools cannot be combined with structured outputs")
         response_format = payload.get("response_format")
         if response_format is not None and response_format != {"type": "text"}:

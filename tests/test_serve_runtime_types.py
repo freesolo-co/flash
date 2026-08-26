@@ -645,6 +645,141 @@ def test_qwen3_coder_parser_validates_schema_and_exact_fallback() -> None:
     assert parse_qwen3_coder_output(malformed, _runtime_tools()).content == malformed
 
 
+def _delimiter_value_tools():
+    return normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "string_value": {"type": "string"},
+                            "object_value": {
+                                "type": "object",
+                                "properties": {
+                                    "nested": {
+                                        "type": "object",
+                                        "properties": {"text": {"type": "string"}},
+                                        "required": ["text"],
+                                        "additionalProperties": False,
+                                    }
+                                },
+                                "required": ["nested"],
+                                "additionalProperties": False,
+                            },
+                            "array_value": {
+                                "type": "array",
+                                "items": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "count": {"type": "integer"},
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("parameter_name", "raw_value", "expected"),
+    [
+        ("string_value", "before </parameter> after", "before </parameter> after"),
+        (
+            "object_value",
+            '{"nested":{"text":"before </parameter> after"}}',
+            {"nested": {"text": "before </parameter> after"}},
+        ),
+        (
+            "array_value",
+            '[["before </parameter> after"]]',
+            [["before </parameter> after"]],
+        ),
+    ],
+    ids=["string", "nested-object", "nested-array"],
+)
+def test_qwen3_coder_parser_preserves_parameter_delimiters_inside_values(
+    parameter_name: str,
+    raw_value: str,
+    expected: object,
+) -> None:
+    text = (
+        "<tool_call><function=store>"
+        f"<parameter={parameter_name}>{raw_value}</parameter>"
+        "</function></tool_call>"
+    )
+    result = parse_qwen3_coder_output(
+        text,
+        _delimiter_value_tools(),
+        id_factory=lambda: "call_fixed",
+    )
+    assert json.loads(result.calls[0].arguments) == {parameter_name: expected}
+
+
+def test_qwen3_coder_parser_preserves_embedded_delimiter_before_another_parameter() -> None:
+    text = (
+        "<tool_call><function=store>"
+        "<parameter=string_value>before </parameter> after</parameter>"
+        "<parameter=count>2</parameter>"
+        "</function></tool_call>"
+    )
+    result = parse_qwen3_coder_output(
+        text,
+        _delimiter_value_tools(),
+        id_factory=lambda: "call_fixed",
+    )
+    assert json.loads(result.calls[0].arguments) == {
+        "string_value": "before </parameter> after",
+        "count": 2,
+    }
+
+
+def test_qwen3_coder_stream_parser_handles_split_embedded_and_structural_closes() -> None:
+    parser = ToolCallStreamParser(_delimiter_value_tools(), id_factory=lambda: "call_fixed")
+    pieces = [
+        "<tool_call><function=store><parameter=string_value>before </para",
+        "meter> after</para",
+        "meter><parameter=count>2</parameter></function></tool_call>",
+    ]
+    assert [parser.feed(piece) for piece in pieces] == ["", "", ""]
+    result = parser.finish()
+    assert json.loads(result.calls[0].arguments) == {
+        "string_value": "before </parameter> after",
+        "count": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        (
+            "<tool_call><function=store>"
+            '<parameter=object_value>{"nested":{"text":"before </parameter> after"}'
+            "</parameter></function></tool_call>"
+        ),
+        (
+            "<tool_call><function=store>"
+            "<parameter=string_value>before </parameter>"
+            "<parameter=count>not-an-int</parameter> after</parameter>"
+            "</function></tool_call>"
+        ),
+    ],
+    ids=["malformed-json", "ambiguous-grammar"],
+)
+def test_qwen3_coder_parser_returns_malformed_delimiter_candidate_exactly(
+    malformed: str,
+) -> None:
+    result = parse_qwen3_coder_output(malformed, _delimiter_value_tools())
+    assert result.content == malformed
+    assert result.calls == ()
+
+
 def test_qwen3_coder_parser_accepts_boundary_property_names() -> None:
     longest = "x" * 64
     tools = normalize_tools(

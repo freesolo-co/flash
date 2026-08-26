@@ -507,20 +507,13 @@ def _parse_function_body(
         if name_end < 0:
             return None
         parameter_name = parameters_text[cursor + len(_PARAMETER_START) : name_end]
-        value_end = parameters_text.find(_PARAMETER_END, name_end + 1)
-        if value_end < 0 or parameter_name in values:
-            return None
-        raw_value = parameters_text[name_end + 1 : value_end]
-        if raw_value.startswith("\n"):
-            raw_value = raw_value[1:]
-        if raw_value.endswith("\n"):
-            raw_value = raw_value[:-1]
         schema = tool.parameters["properties"].get(parameter_name)
-        if schema is None:
+        if schema is None or parameter_name in values:
             return None
-        value = _coerce_value(raw_value, schema["type"])
-        if not _validate_value(value, schema):
+        parsed_value = _parse_parameter_value(parameters_text, name_end + 1, schema)
+        if parsed_value is None:
             return None
+        value_end, value = parsed_value
         values[parameter_name] = value
         cursor = value_end + len(_PARAMETER_END)
     if set(tool.parameters["required"]) - set(values):
@@ -528,6 +521,34 @@ def _parse_function_body(
     if not _validate_value(values, tool.parameters):
         return None
     return name, values
+
+
+def _parse_parameter_value(
+    parameters_text: str,
+    value_start: int,
+    schema: Mapping[str, Any],
+) -> tuple[int, Any] | None:
+    search_from = value_start
+    while True:
+        value_end = parameters_text.find(_PARAMETER_END, search_from)
+        if value_end < 0:
+            return None
+        following = value_end + len(_PARAMETER_END)
+        while following < len(parameters_text) and parameters_text[following].isspace():
+            following += 1
+        if following == len(parameters_text) or parameters_text.startswith(
+            _PARAMETER_START, following
+        ):
+            raw_value = parameters_text[value_start:value_end]
+            if raw_value.startswith("\n"):
+                raw_value = raw_value[1:]
+            if raw_value.endswith("\n"):
+                raw_value = raw_value[:-1]
+            value = _coerce_value(raw_value, schema["type"])
+            if not _validate_value(value, schema):
+                return None
+            return value_end, value
+        search_from = value_end + len(_PARAMETER_END)
 
 
 def _coerce_value(value: str, schema_type: str) -> Any:

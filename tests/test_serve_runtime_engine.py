@@ -19,6 +19,7 @@ from flash.serve.runtime import (
     GenerationRequest,
     PromptError,
     RuntimeNotReadyError,
+    StaleIncarnationError,
     StreamChoiceFinished,
     StreamDelta,
     StreamFinished,
@@ -124,7 +125,10 @@ class _Logprob:
 
 
 class _SamplingParams:
+    created: ClassVar[int] = 0
+
     def __init__(self, **kwargs: Any) -> None:
+        type(self).created += 1
         self.kwargs = kwargs
 
 
@@ -217,6 +221,7 @@ def _no_hub_credential(monkeypatch):
 def _fake_modules(monkeypatch):
     _Tokenizer.calls = []
     _Processor.calls = []
+    _SamplingParams.created = 0
     _Engine.latest = None
     _Engine.args = None
 
@@ -582,6 +587,63 @@ def test_nonstream_generation_binds_thinking_structured_outputs_and_accounting(
     assert call["reasoning_parser_kwargs"] == {"chat_template_kwargs": {"enable_thinking": False}}
     assert call["lora_request"] is engine.added[0]
     assert runtime.health().prompt_cache_entries == 1
+    asyncio.run(runtime.close())
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["buffered", "streaming"])
+def test_effective_structured_default_rejects_automatic_tools_after_adapter_resolution(
+    adapter_dir: Path,
+    streaming: bool,
+) -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model", tool_parser="qwen3_coder"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    asyncio.run(
+        runtime.register_adapter(
+            AdapterSpec(
+                adapter_id="adapter",
+                path=str(adapter_dir),
+                incarnation="incarnation-1",
+                structured_outputs=SCHEMA,
+            )
+        )
+    )
+
+    def invoke(expected_incarnation: str, structured_outputs=None) -> None:
+        request = GenerationRequest(
+            adapter_id="adapter",
+            expected_incarnation=expected_incarnation,
+            messages=[{"role": "user", "content": "weather"}],
+            structured_outputs=structured_outputs,
+            tools=TOOLS,
+            tool_choice="auto",
+            parallel_tool_calls=True,
+        )
+        if streaming:
+
+            async def first_event() -> None:
+                await anext(runtime.stream(request))
+
+            asyncio.run(first_event())
+        else:
+            asyncio.run(runtime.generate(request))
+
+    with pytest.raises(StaleIncarnationError):
+        invoke("stale-incarnation")
+    with pytest.raises(
+        PromptError,
+        match="tools cannot be combined with logprobs or structured outputs",
+    ):
+        invoke("incarnation-1")
+    assert _SamplingParams.created == 0
+    assert engine.generate_calls == []
+    assert runtime._tokenizer.template_calls == []
+
+    engine.responses.append([_output("plain text", [1])])
+    invoke("incarnation-1", {})
+    assert _SamplingParams.created == 1
+    assert len(engine.generate_calls) == 1
     asyncio.run(runtime.close())
 
 
