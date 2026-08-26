@@ -4673,6 +4673,146 @@ def test_attach_reconciler_retries_verified_result_after_confirmed_teardown(
         assert runner_status.get_status(spec.run_id).state == "running"
 
 
+def test_attach_terminal_retry_survives_transient_resume_and_consumes_policy_once(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.execution.jobs as jobs
+        import flash.runner.supervise.attach as attach_mod
+        import flash.runner.supervise.lifecycle as lifecycle_mod
+        from flash.envs.loading.staged import StagedEnvironmentTransientError
+        from flash.providers.core.base import PollResult
+
+        remote = {
+            **_runpod_handle_dict(jobs),
+            "allocated_gpu": "RTX 4090",
+            "allocated_gpu_count": 1,
+        }
+        spec = _spec("runpod-terminal-resume-transient")
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                attempt=_attempt_record_for_remote(remote),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1_000.0)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_attempt_result",
+            lambda *_args, **_kwargs: PollResult(False, failure="job_preempted", detail="retry me"),
+        )
+        monkeypatch.setattr(lifecycle_mod, "_strict_teardown_handle", lambda *_args: True)
+        sleeps = []
+        monkeypatch.setattr(attach_mod.time, "sleep", sleeps.append)
+        resume_calls = []
+        active_during_resume = []
+
+        def resume(*_args, **_kwargs):
+            resume_calls.append(True)
+            with attach_mod._ATTACH_RECONCILING_LOCK:
+                active_during_resume.append(spec.run_id in attach_mod._ATTACH_RECONCILING)
+            if len(resume_calls) == 1:
+                raise StagedEnvironmentTransientError("artifact store temporarily unavailable")
+            assert runner_reconciliation._compare_and_clear_remote(
+                spec.run_id,
+                remote,
+                expected_attempt=(0, 1),
+            )
+
+        monkeypatch.setattr(attach_mod, "_resume_after_confirmed_teardown", resume)
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                assert daemon is True
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        monkeypatch.setattr(attach_mod.threading, "Thread", ImmediateThread)
+
+        assert attach_mod._schedule_attach_reconciliation(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            _SOURCE_SNAPSHOT,
+            io.StringIO(),
+            "job_preempted: host vanished",
+        )
+
+        from flash.runner.lifecycle.retry_policy import load_retry_policy
+
+        policy = load_retry_policy(spec.run_id)
+        assert resume_calls == [True, True]
+        assert active_during_resume == [True, True]
+        assert sleeps
+        assert all(delay == attach_mod._ATTACH_RECONCILE_INTERVAL_S for delay in sleeps)
+        assert policy.infra_used == 1
+        assert policy.consumed_attempt == (0, 1)
+        with attach_mod._ATTACH_RECONCILING_LOCK:
+            assert spec.run_id not in attach_mod._ATTACH_RECONCILING
+
+
+def test_attach_terminal_retry_stops_after_resume_terminalizes(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.execution.jobs as jobs
+        import flash.runner.supervise.attach as attach_mod
+        import flash.runner.supervise.lifecycle as lifecycle_mod
+        from flash.envs.loading.staged import StagedEnvironmentTransientError
+        from flash.providers.core.base import PollResult
+
+        remote = {
+            **_runpod_handle_dict(jobs),
+            "allocated_gpu": "RTX 4090",
+            "allocated_gpu_count": 1,
+        }
+        spec = _spec("runpod-terminal-resume-cancelled")
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                attempt=_attempt_record_for_remote(remote),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1_000.0)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_attempt_result",
+            lambda *_args, **_kwargs: PollResult(False, failure="job_preempted", detail="retry me"),
+        )
+        monkeypatch.setattr(lifecycle_mod, "_strict_teardown_handle", lambda *_args: True)
+        sleeps = []
+        monkeypatch.setattr(attach_mod.time, "sleep", sleeps.append)
+        resume_calls = []
+
+        def terminalize_then_raise(*_args, **_kwargs):
+            resume_calls.append(True)
+            assert runner_status._update(spec.run_id, "cancelled")
+            raise StagedEnvironmentTransientError("terminalized during staging")
+
+        monkeypatch.setattr(attach_mod, "_resume_after_confirmed_teardown", terminalize_then_raise)
+
+        attach_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            _SOURCE_SNAPSHOT,
+            io.StringIO(),
+            "job_preempted: host vanished",
+        )
+
+        assert resume_calls == [True]
+        assert sleeps == [attach_mod._ATTACH_RECONCILE_INTERVAL_S]
+        assert runner_status.get_status(spec.run_id).state == "cancelled"
+
+
 def test_attach_reconciler_does_not_retry_verified_result_without_worker_absence(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)

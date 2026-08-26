@@ -88,14 +88,18 @@ def reconcile_terminal_result(
         if not cleanup_preserved:
             time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
             return False
-    _resume_after_confirmed_teardown(
-        run_id,
-        worker_spec,
-        expected_remote,
-        next_attempt,
-        source_snapshot,
-        log,
-        failure=terminal_failure,
-        expected_attempt=expected_attempt,
-    )
+    try:
+        _resume_after_confirmed_teardown(
+            run_id,
+            worker_spec,
+            expected_remote,
+            next_attempt,
+            source_snapshot,
+            log,
+            failure=terminal_failure,
+            expected_attempt=expected_attempt,
+        )
+    except Exception:
+        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+        return False
     return True
