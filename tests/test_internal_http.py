@@ -23,11 +23,12 @@ from flash._internal.http import _build_no_redirect_opener, _urlopen_no_redirect
 
 
 @pytest.fixture(autouse=True)
-def _restore_http_globals():
+def _restore_http_globals(monkeypatch):
     opener = urllib.request._opener
     default = http_transport._DEFAULT_NO_REDIRECT_OPENER
     cached = http_transport._INSTALLED_OPENER_CACHE
-    proxy_env = {key: os.environ.get(key) for key in ("HTTPS_PROXY", "https_proxy", "NO_PROXY")}
+    for key in ("HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(key, raising=False)
     http_transport._DEFAULT_NO_REDIRECT_OPENER = None
     http_transport._INSTALLED_OPENER_CACHE = None
     try:
@@ -36,11 +37,6 @@ def _restore_http_globals():
         urllib.request._opener = opener
         http_transport._DEFAULT_NO_REDIRECT_OPENER = default
         http_transport._INSTALLED_OPENER_CACHE = cached
-        for key, value in proxy_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
 
 def _response(url: str, body: bytes = b"ok"):
@@ -234,6 +230,7 @@ def test_default_opener_discovers_proxy_environment_on_first_request(monkeypatch
     monkeypatch.setenv("HTTPS_PROXY", "http://late-proxy.invalid:8080")
     monkeypatch.delenv("https_proxy", raising=False)
     monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.delenv("no_proxy", raising=False)
     observed: list[tuple[str, str | None]] = []
 
     def fake_https_open(self, request):
