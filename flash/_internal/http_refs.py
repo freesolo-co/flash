@@ -299,6 +299,53 @@ def _function_reference_roots(
     }
 
 
+def _function_capture_values(function: types.FunctionType) -> tuple[object, ...]:
+    roots = _function_reference_roots(function)
+    return (*roots["default"].values(), *roots["binding"].values())
+
+
+def _function_append_only_capture_values(function: types.FunctionType) -> tuple[object, ...]:
+    code = object.__getattribute__(function, "__code__")
+    roots = _function_reference_roots(function)
+    captures = {**roots["default"], **roots["binding"]}
+    usage = {name: [False, True] for name in captures}
+    instructions = tuple(dis.get_instructions(code))
+    for index, instruction in enumerate(instructions):
+        name = instruction.argval
+        if name not in usage or instruction.opname not in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}:
+            continue
+        usage[name][0] = True
+        if index + 1 >= len(instructions):
+            usage[name][1] = False
+            continue
+        following = instructions[index + 1]
+        if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"} or following.argval != "append":
+            usage[name][1] = False
+    return tuple(
+        captures[name] for name, (loaded, append_only) in usage.items() if loaded and append_only
+    )
+
+
+def _function_bound_reference_values(
+    function: types.FunctionType,
+    bound_self: object,
+) -> tuple[object, ...]:
+    code = object.__getattribute__(function, "__code__")
+    roots = _function_reference_roots(function, bound_self)
+    root_origins = {name: ("bound", name) for name in roots["bound"]}
+    values = []
+    for root_kind, name, attributes in _loaded_reference_paths(code, root_origins):
+        if root_kind != "bound":
+            continue
+        root_value = roots["bound"][name]
+        if attributes[:1] == ("parent",):
+            if not _has_rebound_parent_field(root_value):
+                raise ValueError
+            continue
+        values.append(_resolve_reference_path(root_value, attributes))
+    return tuple(values)
+
+
 def _function_reference_values(
     function: types.FunctionType,
     bound_self: object = _ABSENT_SLOT,
@@ -310,7 +357,7 @@ def _function_reference_values(
         for root_kind in ("default", "binding", "bound")
         for name in roots[root_kind]
     }
-    values = []
+    values = [*roots["default"].values(), *roots["binding"].values()]
     for root_kind, name, attributes in _loaded_reference_paths(code, root_origins):
         if root_kind == "global" and name in _DYNAMIC_NAMESPACE_NAMES:
             raise ValueError

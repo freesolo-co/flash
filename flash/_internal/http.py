@@ -17,6 +17,9 @@ from typing import Any
 from .http_refs import (
     _SNAPSHOT_ITEMS_MAX,
     _TRAVERSAL_NODES_MAX,
+    _function_append_only_capture_values,
+    _function_bound_reference_values,
+    _function_capture_values,
     _function_reference_values,
     _getattr_type_static,
 )
@@ -84,6 +87,48 @@ _STANDARD_HANDLER_METHODS = tuple(
         inspect.getattr_static(urllib.request.BaseHandler, name, _ABSENT_SLOT),
     )
     for name in _HANDLER_COPY_METHODS
+)
+
+
+def _is_registered_callback_name(name: str) -> bool:
+    if name in {"redirect_request", "do_open", "proxy_open"} or "_" not in name:
+        return False
+    condition = name.split("_", 1)[1]
+    return (
+        condition == "open"
+        or condition == "request"
+        or condition == "response"
+        or condition.startswith("error")
+    )
+
+
+_STDLIB_HANDLER_TYPES = (
+    urllib.request.BaseHandler,
+    urllib.request.HTTPErrorProcessor,
+    urllib.request.HTTPDefaultErrorHandler,
+    urllib.request.HTTPRedirectHandler,
+    urllib.request.ProxyHandler,
+    urllib.request.AbstractBasicAuthHandler,
+    urllib.request.AbstractDigestAuthHandler,
+    urllib.request.HTTPBasicAuthHandler,
+    urllib.request.ProxyBasicAuthHandler,
+    urllib.request.HTTPDigestAuthHandler,
+    urllib.request.ProxyDigestAuthHandler,
+    urllib.request.AbstractHTTPHandler,
+    urllib.request.HTTPHandler,
+    urllib.request.HTTPSHandler,
+    urllib.request.HTTPCookieProcessor,
+    urllib.request.UnknownHandler,
+    urllib.request.FileHandler,
+    urllib.request.FTPHandler,
+    urllib.request.CacheFTPHandler,
+    urllib.request.DataHandler,
+)
+_STDLIB_HANDLER_CALLBACKS = tuple(
+    value
+    for handler_type in _STDLIB_HANDLER_TYPES
+    for name, value in type.__getattribute__(handler_type, "__dict__").items()
+    if _is_registered_callback_name(name) and type(value) is types.FunctionType
 )
 
 
@@ -249,6 +294,44 @@ def _snapshot_value(
     return ("opaque", id(value_type), id(value))
 
 
+def _function_implementation_signature(function: types.FunctionType) -> tuple[object, ...]:
+    code = object.__getattribute__(function, "__code__")
+    defaults = object.__getattribute__(function, "__defaults__")
+    kwdefaults = object.__getattribute__(function, "__kwdefaults__")
+    closure = object.__getattribute__(function, "__closure__")
+    if (
+        type(code) is not types.CodeType
+        or (defaults is not None and type(defaults) is not tuple)
+        or (kwdefaults is not None and type(kwdefaults) is not dict)
+        or (closure is not None and type(closure) is not tuple)
+    ):
+        raise TypeError
+    seen: set[int] = set()
+    active: set[int] = set()
+    budget = [0]
+    closure_values = []
+    for cell in closure or ():
+        try:
+            value = object.__getattribute__(cell, "cell_contents")
+        except ValueError:
+            value = _ABSENT_SLOT
+        closure_values.append(_snapshot_value(value, seen, active, budget))
+    return (
+        code,
+        _snapshot_value(defaults, seen, active, budget),
+        _snapshot_value(kwdefaults, seen, active, budget),
+        tuple(closure_values),
+    )
+
+
+_STDLIB_HANDLER_CALLBACK_SIGNATURES = tuple(
+    (callback, _function_implementation_signature(callback))
+    for callback in _STDLIB_HANDLER_CALLBACKS
+)
+_STANDARD_DO_OPEN = urllib.request.AbstractHTTPHandler.do_open
+_STANDARD_DO_OPEN_SIGNATURE = _function_implementation_signature(_STANDARD_DO_OPEN)
+
+
 def _slot_names(declaration: object) -> tuple[str, ...]:
     if type(declaration) is str:
         names = (declaration,)
@@ -368,6 +451,14 @@ def _validate_handler_copy_protocol(
             raise TypeError
 
 
+def _redirect_config_signature(handler: urllib.request.BaseHandler) -> tuple[tuple[int, bool], ...]:
+    return tuple(
+        (id(value), callable(value))
+        for status in _REDIRECT_STATUSES
+        for value in (_getattr_handler_static(handler, f"http_error_{status}", None),)
+    )
+
+
 def _handler_config_signature(handler: urllib.request.BaseHandler) -> object:
     try:
         state = _handler_state(handler)
@@ -384,7 +475,11 @@ def _handler_config_signature(handler: urllib.request.BaseHandler) -> object:
         )
     except Exception:
         raise urllib.error.URLError(_OPENER_COPY_ERROR) from None
-    return (dictionary, _slot_config_signature(handler, seen, active, budget))
+    return (
+        dictionary,
+        _slot_config_signature(handler, seen, active, budget),
+        _redirect_config_signature(handler),
+    )
 
 
 def _references_target(
@@ -458,6 +553,32 @@ def _rebuild_proxy_callbacks(
         )
 
 
+def _is_trusted_stdlib_callback(value: types.FunctionType) -> bool:
+    for callback, signature in _STDLIB_HANDLER_CALLBACK_SIGNATURES:
+        if value is callback:
+            if _function_implementation_signature(value) != signature:
+                raise TypeError
+            return True
+    return False
+
+
+def _validate_callback_helpers(handler: urllib.request.BaseHandler) -> None:
+    handler_type = type(handler)
+    for callback_name, standard in (
+        ("http_open", urllib.request.HTTPHandler.http_open),
+        ("https_open", urllib.request.HTTPSHandler.https_open),
+    ):
+        callback = _getattr_type_static(handler_type, callback_name, _ABSENT_SLOT)
+        if callback is not standard:
+            continue
+        helper = _getattr_handler_static(handler, "do_open", _ABSENT_SLOT)
+        if (
+            helper is not _STANDARD_DO_OPEN
+            or _function_implementation_signature(helper) != _STANDARD_DO_OPEN_SIGNATURE
+        ):
+            raise TypeError
+
+
 def _registered_class_callbacks(
     handler: urllib.request.BaseHandler,
     state: dict[str, object],
@@ -466,28 +587,53 @@ def _registered_class_callbacks(
     seen = set(state)
     for owner in type.__getattribute__(type(handler), "__mro__"):
         namespace = type.__getattribute__(owner, "__dict__")
-        if namespace.get("__module__") == urllib.request.__name__:
-            continue
         for name, value in namespace.items():
             if name in seen:
                 continue
             seen.add(name)
-            if name in {"redirect_request", "do_open", "proxy_open"} or "_" not in name:
-                continue
-            condition = name.split("_", 1)[1]
-            if not (
-                condition == "open"
-                or condition == "request"
-                or condition == "response"
-                or condition.startswith("error")
-            ):
+            if not _is_registered_callback_name(name):
                 continue
             if type(value) is not types.FunctionType:
                 raise TypeError
-            if object.__getattribute__(value, "__module__") == urllib.request.__name__:
+            if _is_trusted_stdlib_callback(value):
                 continue
             callbacks.append(value)
     return tuple(callbacks)
+
+
+def _validate_class_callbacks(
+    handler: urllib.request.BaseHandler,
+    state: dict[str, object],
+    targets: tuple[object, ...],
+    trusted_objects: tuple[object, ...] = (),
+    private_targets: tuple[object, ...] = (),
+) -> None:
+    seen: set[int] = set()
+    active: set[int] = set()
+    budget = [0]
+    _validate_callback_helpers(handler)
+    for callback in _registered_class_callbacks(handler, state):
+        for reference in _function_reference_values(callback, handler):
+            if _references_target(
+                reference,
+                targets,
+                seen=seen,
+                active=active,
+                budget=budget,
+                trusted_objects=trusted_objects,
+            ):
+                raise TypeError
+        if not private_targets:
+            continue
+        append_only = _function_append_only_capture_values(callback)
+        for capture in _function_capture_values(callback):
+            if _references_target(capture, private_targets) and not (
+                type(capture) is list and any(capture is observer for observer in append_only)
+            ):
+                raise TypeError
+        for reference in _function_bound_reference_values(callback, handler):
+            if _references_target(reference, private_targets):
+                raise TypeError
 
 
 def _copy_installed_handler(
@@ -505,6 +651,7 @@ def _copy_installed_handler(
             _rebuild_proxy_callbacks(copied, copied_state)
         if copied_state is handler_state or copied_state.get("parent", _ABSENT_SLOT) is not opener:
             raise TypeError
+        _validate_callback_helpers(copied)
         copied_values = (
             tuple(value for name, value in copied_state.items() if name != "parent")
             + tuple(
@@ -650,6 +797,18 @@ def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
                 and cached.installed is installed
                 and cached.handler_signature == handler_signature
             ):
+                try:
+                    for handler in handlers:
+                        if not _handles_redirect_error(handler):
+                            _validate_class_callbacks(
+                                handler,
+                                _handler_state(handler),
+                                (handler, installed),
+                                (cached.private, *cached.private.handlers),
+                                (cached.private, *cached.private.handlers),
+                            )
+                except Exception:
+                    raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
                 if cached.addheader_signature != addheader_signature:
                     cached.private.addheaders = list(addheaders)
                     cached = _InstalledOpenerCache(

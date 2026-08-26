@@ -2798,6 +2798,433 @@ def test_passive_holder_bound_method_retaining_target_fails_before_transport(
     assert contacted == []
 
 
+def test_cached_class_callback_dependency_mutation_fails_before_transport() -> None:
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        retained = None
+
+        def custom_open(self, request):
+            retained = self.retained
+            contacted.append(request.full_url)
+            return _response(request.full_url, str(retained).encode())
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/first"), timeout=1.0
+    ) as response:
+        assert response.read() == b"None"
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    type.__setattr__(CallbackHandler, "retained", opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/second"), timeout=1.0)
+
+    assert contacted == ["custom://source.invalid/first"]
+    assert http_transport._INSTALLED_OPENER_CACHE.private is first_private
+
+
+def test_cached_private_opener_dependency_cannot_enable_redirect_transport() -> None:
+    safe = "https://safe.invalid/data"
+    source = "https://source.invalid/data"
+    sink = "https://sink.invalid/steal"
+    observed: list[tuple[str, str | None]] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        handler_order = 100
+        retained = None
+
+        def https_open(self, request):
+            observed.append((request.full_url, request.get_header("Authorization")))
+            if request.full_url == source:
+                private = self.retained
+                blocker = next(
+                    handler
+                    for handler in private.handlers
+                    if isinstance(handler, http_transport._NoRedirectHandler)
+                )
+                private.handlers.remove(blocker)
+                private.process_response["https"].remove(blocker)
+                for status in http_transport._REDIRECT_STATUSES:
+                    private.handle_error["http"][status].remove(blocker)
+                private.add_handler(urllib.request.HTTPRedirectHandler())
+                headers = email.message.Message()
+                headers["Location"] = sink
+                response = urllib.response.addinfourl(
+                    io.BytesIO(b""), headers, request.full_url, code=302
+                )
+                response.msg = "redirect"
+                return response
+            return _response(request.full_url)
+
+    opener = urllib.request.build_opener(CallbackHandler())
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request(safe), timeout=1.0) as response:
+        assert response.read() == b"ok"
+    type.__setattr__(
+        CallbackHandler,
+        "retained",
+        http_transport._INSTALLED_OPENER_CACHE.private,
+    )
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert observed == [(safe, None)]
+    assert all(url != sink for url, _authorization in observed)
+
+
+@pytest.mark.parametrize("capture_kind", ["default", "kwdefault", "closure"])
+def test_cached_private_opener_capture_cannot_enable_redirect_transport(
+    capture_kind: str,
+) -> None:
+    safe = "https://safe.invalid/data"
+    source = "https://source.invalid/data"
+    sink = "https://sink.invalid/steal"
+    observed: list[tuple[str, str | None]] = []
+
+    def dispatch(request, private):
+        observed.append((request.full_url, request.get_header("Authorization")))
+        if request.full_url == source:
+            blocker = next(
+                handler
+                for handler in private.handlers
+                if isinstance(handler, http_transport._NoRedirectHandler)
+            )
+            private.handlers.remove(blocker)
+            private.process_response["https"].remove(blocker)
+            for status in http_transport._REDIRECT_STATUSES:
+                private.handle_error["http"][status].remove(blocker)
+            private.add_handler(urllib.request.HTTPRedirectHandler())
+            headers = email.message.Message()
+            headers["Location"] = sink
+            response = urllib.response.addinfourl(
+                io.BytesIO(b""), headers, request.full_url, code=302
+            )
+            response.msg = "redirect"
+            return response
+        return _response(request.full_url)
+
+    if capture_kind == "default":
+
+        def callback(self, request, retained=None):
+            return dispatch(request, retained)
+
+    elif capture_kind == "kwdefault":
+
+        def callback(self, request, *, retained=None):
+            return dispatch(request, retained)
+
+    else:
+        retained = None
+
+        def callback(self, request):
+            return dispatch(request, retained)
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        handler_order = 100
+        https_open = callback
+
+    opener = urllib.request.build_opener(CallbackHandler())
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request(safe), timeout=1.0) as response:
+        assert response.read() == b"ok"
+    private = http_transport._INSTALLED_OPENER_CACHE.private
+    if capture_kind == "default":
+        callback.__defaults__ = (private,)
+    elif capture_kind == "kwdefault":
+        callback.__kwdefaults__ = {"retained": private}
+    else:
+        retained_index = callback.__code__.co_freevars.index("retained")
+        callback.__closure__[retained_index].cell_contents = private
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert observed == [(safe, None)]
+    assert all(url != sink for url, _authorization in observed)
+
+
+@pytest.mark.parametrize("capture_kind", ["default", "kwdefault", "closure"])
+@pytest.mark.parametrize("indirection", ["container", "holder"])
+def test_indirect_cached_private_opener_capture_cannot_enable_redirect_transport(
+    capture_kind: str,
+    indirection: str,
+) -> None:
+    safe = "https://safe.invalid/data"
+    source = "https://source.invalid/data"
+    sink = "https://sink.invalid/steal"
+    observed: list[tuple[str, str | None]] = []
+
+    class Holder:
+        pass
+
+    def dispatch(request, retained):
+        observed.append((request.full_url, request.get_header("Authorization")))
+        if request.full_url == source:
+            private = retained["private"] if indirection == "container" else retained.private
+            blocker = next(
+                handler
+                for handler in private.handlers
+                if isinstance(handler, http_transport._NoRedirectHandler)
+            )
+            private.handlers.remove(blocker)
+            private.process_response["https"].remove(blocker)
+            for status in http_transport._REDIRECT_STATUSES:
+                private.handle_error["http"][status].remove(blocker)
+            private.add_handler(urllib.request.HTTPRedirectHandler())
+            headers = email.message.Message()
+            headers["Location"] = sink
+            response = urllib.response.addinfourl(
+                io.BytesIO(b""), headers, request.full_url, code=302
+            )
+            response.msg = "redirect"
+            return response
+        return _response(request.full_url)
+
+    if capture_kind == "default":
+
+        def callback(self, request, retained=None):
+            return dispatch(request, retained)
+
+    elif capture_kind == "kwdefault":
+
+        def callback(self, request, *, retained=None):
+            return dispatch(request, retained)
+
+    else:
+        retained = None
+
+        def callback(self, request):
+            return dispatch(request, retained)
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        handler_order = 100
+        https_open = callback
+
+    opener = urllib.request.build_opener(CallbackHandler())
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request(safe), timeout=1.0) as response:
+        assert response.read() == b"ok"
+    private = http_transport._INSTALLED_OPENER_CACHE.private
+    if indirection == "container":
+        retained_value = {"private": private}
+    else:
+        retained_value = Holder()
+        retained_value.private = private
+    if capture_kind == "default":
+        callback.__defaults__ = (retained_value,)
+    elif capture_kind == "kwdefault":
+        callback.__kwdefaults__ = {"retained": retained_value}
+    else:
+        retained_index = callback.__code__.co_freevars.index("retained")
+        callback.__closure__[retained_index].cell_contents = retained_value
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert observed == [(safe, None)]
+    assert all(url != sink for url, _authorization in observed)
+
+
+@pytest.mark.parametrize("change", ["add", "remove"])
+def test_redirect_callback_eligibility_change_rebuilds_cached_topology(change: str) -> None:
+    observed: list[str] = []
+
+    class MutableHandler(urllib.request.BaseHandler):
+        handler_order = 100
+
+        def custom_open(self, request):
+            observed.append("mutable")
+            return _response(request.full_url)
+
+    class TerminalHandler(urllib.request.BaseHandler):
+        handler_order = 200
+
+        def custom_open(self, request):
+            observed.append("terminal")
+            return _response(request.full_url)
+
+    def redirect(self, request, fp, code, msg, headers):
+        raise AssertionError("redirect callback executed")
+
+    if change == "remove":
+        type.__setattr__(MutableHandler, "http_error_302", redirect)
+    opener = urllib.request.build_opener(MutableHandler(), TerminalHandler())
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/first"), timeout=1.0):
+        pass
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+
+    if change == "add":
+        type.__setattr__(MutableHandler, "http_error_302", redirect)
+    else:
+        type.__delattr__(MutableHandler, "http_error_302")
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/second"), timeout=1.0
+    ):
+        pass
+
+    expected = ["mutable", "terminal"] if change == "add" else ["terminal", "mutable"]
+    assert observed == expected
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
+
+
+@pytest.mark.parametrize("component", ["code", "defaults", "kwdefaults"])
+def test_mutated_stdlib_callback_implementation_fails_before_transport(
+    monkeypatch,
+    component: str,
+) -> None:
+    contacted: list[str] = []
+    callback = urllib.request.HTTPHandler.http_open
+
+    if component == "code":
+        monkeypatch.setitem(callback.__globals__, "retained_contacts", contacted)
+
+        replacement_module = compile(
+            "def replacement(self, request):\n    retained_contacts.append(request.full_url)\n",
+            "<mutated-stdlib-callback>",
+            "exec",
+        )
+        replacement_code = next(
+            value for value in replacement_module.co_consts if type(value) is types.CodeType
+        )
+        monkeypatch.setattr(callback, "__code__", replacement_code)
+    elif component == "defaults":
+        monkeypatch.setattr(callback, "__defaults__", (contacted,))
+    else:
+        monkeypatch.setattr(callback, "__kwdefaults__", {"retained": contacted})
+    opener = urllib.request.build_opener(urllib.request.HTTPHandler())
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("http://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+def test_stdlib_http_callback_helper_override_fails_before_transport() -> None:
+    contacted: list[str] = []
+
+    class HelperOverrideHandler(urllib.request.HTTPHandler):
+        def do_open(self, http_class, request, retained=None, **kwargs):
+            contacted.append(request.full_url)
+            return _response(request.full_url, str(retained).encode())
+
+    handler = HelperOverrideHandler()
+    opener = urllib.request.build_opener(handler)
+    HelperOverrideHandler.do_open.__defaults__ = (opener,)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("http://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("spoof_kind", ["class", "function"])
+def test_spoofed_stdlib_class_callback_provenance_fails_before_transport(
+    spoof_kind: str,
+) -> None:
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        pass
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener()
+
+    def callback(self, request, retained=opener):
+        contacted.append(request.full_url)
+        return _response(request.full_url, str(retained).encode())
+
+    if spoof_kind == "class":
+        type.__setattr__(CallbackHandler, "__module__", urllib.request.__name__)
+    else:
+        callback.__module__ = urllib.request.__name__
+    type.__setattr__(CallbackHandler, "custom_open", callback)
+    opener.add_handler(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("target_kind", ["handler", "opener"])
+@pytest.mark.parametrize("capture_kind", ["default", "kwdefault", "closure"])
+def test_unused_class_callback_capture_fails_before_transport(
+    target_kind: str,
+    capture_kind: str,
+) -> None:
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        pass
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener()
+    target = handler if target_kind == "handler" else opener
+    if capture_kind == "default":
+
+        def callback(self, request, retained=target):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    elif capture_kind == "kwdefault":
+
+        def callback(self, request, *, retained=target):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    else:
+        retained = target
+
+        def callback(self, request):
+            if False:
+                return retained
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    type.__setattr__(CallbackHandler, "custom_open", callback)
+    opener.add_handler(handler)
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+
+
 @pytest.mark.parametrize("target_kind", ["handler", "opener"])
 @pytest.mark.parametrize("capture_kind", ["global", "default", "closure", "namespace"])
 def test_class_registered_callback_retaining_target_fails_before_transport(
