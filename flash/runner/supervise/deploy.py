@@ -6,7 +6,7 @@ import contextlib
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 from flash.core.spec import JobSpec
@@ -665,6 +665,9 @@ def _refresh_cancellation_result(run_id: str, effective_spec) -> None:
         except Exception:
             artifacts = None
         if artifacts is not None:
+            if artifacts.result is not None and artifacts.result.get("outcome") != "cancelled":
+                persist_attempt_artifacts(run_id, replace(artifacts, result=None))
+                return
             persist_attempt_artifacts(run_id, artifacts)
             if artifacts.result is not None:
                 persisted = get_status(run_id).result

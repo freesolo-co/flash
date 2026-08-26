@@ -3433,18 +3433,38 @@ def test_cancellation_refresh_rejects_preexisting_failed_result(monkeypatch):
         assert persisted.state == "cancelled"
 
 
-def test_cancellation_result_refresh_rejects_unpersisted_projection(monkeypatch):
+def test_cancellation_result_refresh_ignores_unpersisted_failed_projection(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         from flash.providers.artifacts import attempts as artifact_attempts
 
         spec = _spec("cancel-result-rejected")
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep-cancel-result-rejected",
+            "endpoint_name": "flash-cancel-result-rejected",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "job-cancel-result-rejected",
+            "attempt": 0,
+            "fence": 1,
+            "started_ts": 1.0,
+            "allocated_gpu": "B200",
+            "allocated_gpu_count": 1,
+        }
         runner_state._save_status(
             runner_state.RunStatus(
                 run_id=spec.run_id,
-                state="cancelled",
+                state="running",
                 spec=spec.to_dict(),
+                billing_context={"org_id": "org-a"},
+                remote=remote,
                 attempt=_attempt_record().to_dict(),
+                progress={
+                    "attempt_id": 0,
+                    "fence": 1,
+                    "completed_steps": 3,
+                    "training_entered": True,
+                },
                 source_snapshot=_SOURCE_SNAPSHOT,
             )
         )
@@ -3466,6 +3486,69 @@ def test_cancellation_result_refresh_rejects_unpersisted_projection(monkeypatch)
                 "revision", 100.0, None, result
             ),
         )
+
+        def teardown_remote(
+            _run_id,
+            *,
+            confirmed_cleanup_identities,
+            clear_exact_remote,
+        ):
+            assert confirmed_cleanup_identities == set()
+            assert clear_exact_remote(remote)
+
+        monkeypatch.setattr(runner_deploy, "_teardown_persisted_remotes", teardown_remote)
+        monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+        priced_steps = []
+
+        def charge_from_steps(_spec, **kwargs):
+            priced_steps.append(kwargs["steps"])
+            return kwargs["steps"]
+
+        monkeypatch.setattr(runner_costs, "charge_usd_for_spec", charge_from_steps)
+
+        persisted = runner_deploy.cancel_run(spec.run_id)
+
+        assert persisted.state == "cancelled"
+        assert persisted.cost_usd == 3
+        assert persisted.result is None
+        assert persisted.progress["completed_steps"] == 3
+        assert priced_steps == [3]
+
+
+def test_cancellation_result_refresh_rejects_unpersisted_cancelled_projection(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        from flash.providers.artifacts import attempts as artifact_attempts
+
+        spec = _spec("cancel-result-unpersisted-cancelled")
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="cancelled",
+                spec=spec.to_dict(),
+                attempt=_attempt_record().to_dict(),
+                source_snapshot=_SOURCE_SNAPSHOT,
+            )
+        )
+        result = {
+            "attempt_id": 0,
+            "fence": 1,
+            "outcome": "cancelled",
+            "completed_steps": 7,
+            "receipt": {
+                "path": "attempt/result.json",
+                "revision": "revision",
+                "digest": "c" * 64,
+            },
+        }
+        monkeypatch.setattr(
+            artifact_attempts,
+            "read_attempt_artifacts",
+            lambda *_args, **_kwargs: artifact_attempts.AttemptArtifacts(
+                "revision", 100.0, None, result
+            ),
+        )
+        monkeypatch.setattr(runner_status, "record_result", lambda *_args, **_kwargs: False)
 
         with pytest.raises(RuntimeError, match="not durably persisted"):
             runner_deploy._refresh_cancellation_result(spec.run_id, spec)
