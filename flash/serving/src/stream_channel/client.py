@@ -149,7 +149,13 @@ class _DispatchDeadlineContext:
         if not self._entered:
             return None
         self._entered = False
-        return await self._context.__aexit__(*exc_info)
+        try:
+            return await _bounded_shield(
+                self._context.__aexit__(*exc_info),
+                CLEANUP_SECONDS,
+            )
+        except TimeoutError:
+            return None
 
 
 async def _cancel_or_retain_spawn(
@@ -286,6 +292,26 @@ async def _clear_partition(queue: Any, partition: str) -> None:
         )
 
 
+async def _get_data(queue: Any, *, block: bool = True) -> Any:
+    options: dict[str, Any] = {"partition": DATA_PARTITION}
+    local_timeout = CLEANUP_SECONDS
+    if block:
+        options["timeout"] = DATA_GET_SECONDS
+        local_timeout += DATA_GET_SECONDS
+    else:
+        options["block"] = False
+    try:
+        return await _bounded_shield(
+            queue.get.aio(**options),
+            local_timeout,
+        )
+    except TimeoutError as exc:
+        raise StreamChannelError(
+            ChannelErrorCode.CHANNEL_FAULT,
+            "data channel read timed out",
+        ) from exc
+
+
 class CancellableStreamChannel:
     """Own the queue, exact FunctionCall, heartbeat lease, validation, and cleanup."""
 
@@ -389,7 +415,11 @@ class CancellableStreamChannel:
                         ChannelErrorCode.CHANNEL_FAULT,
                         "spawn returned no function call id",
                     )
-                await control.bind_and_start(function_call_id)
+                await _dispatch_bounded(
+                    control.bind_and_start(function_call_id),
+                    self._dispatch_deadline_unix,
+                    "bound lease publication",
+                )
                 validator = DataSequenceValidator(
                     generation_id=self._generation_id,
                     invocation_nonce=self._invocation_nonce,
@@ -400,10 +430,7 @@ class CancellableStreamChannel:
                 while True:
                     raw = None
                     with contextlib.suppress(stdlib_queue.Empty):
-                        raw = await queue.get.aio(
-                            timeout=DATA_GET_SECONDS,
-                            partition=DATA_PARTITION,
-                        )
+                        raw = await _get_data(queue)
                     control.check()
                     if raw is not None:
                         envelope = validator.accept(raw)
@@ -426,10 +453,7 @@ class CancellableStreamChannel:
                             validator.reconcile(manifest)
                             extra = None
                             with contextlib.suppress(stdlib_queue.Empty):
-                                extra = await queue.get.aio(
-                                    block=False,
-                                    partition=DATA_PARTITION,
-                                )
+                                extra = await _get_data(queue, block=False)
                             if extra is not None:
                                 validator.accept(extra)
                             completed = True

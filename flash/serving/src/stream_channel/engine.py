@@ -102,10 +102,19 @@ class _LeaseWatch:
                 options["block"] = False
             elif timeout is not None:
                 options["timeout"] = timeout
+            local_timeout = (timeout or CONTROL_POLL_SECONDS) + CLEANUP_SECONDS
             try:
-                raw = await self._queue.get.aio(**options)
+                raw = await _bounded_operation(
+                    self._queue.get.aio(**options),
+                    local_timeout,
+                )
             except stdlib_queue.Empty:
                 return False
+            except TimeoutError as exc:
+                raise StreamChannelError(
+                    ChannelErrorCode.CHANNEL_FAULT,
+                    "control channel read timed out",
+                ) from exc
             if raw is None:
                 return False
             self._latest = self._validator.accept(raw)

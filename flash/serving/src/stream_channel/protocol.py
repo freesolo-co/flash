@@ -229,7 +229,7 @@ def _sequence(value: Any) -> int:
 
 
 def _version(value: Any) -> int:
-    if value != PROTOCOL_VERSION:
+    if type(value) is not int or value != PROTOCOL_VERSION:
         raise StreamChannelError(ChannelErrorCode.PROTOCOL_ERROR, "unsupported protocol version")
     return PROTOCOL_VERSION
 
