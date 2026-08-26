@@ -411,19 +411,32 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     return attempted
 
 
+def _cleanup_records_with(raw: dict, record: dict) -> list[dict] | None:
+    """Append one strict record while preserving every existing cleanup sibling verbatim."""
+    value = raw.get(state._CLEANUP_REMOTES_KEY, [])
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        return None
+    records = list(value)
+    key = _cleanup_remote_key(record)
+    if key is None:
+        return None
+    if all(_teardown_removal_key(existing) != key for existing in records):
+        records.append(record)
+    return records
+
+
 def _record_cleanup_remote(run_id: str, remote: dict) -> bool:
     """Persist one exact cleanup identity without changing the active remote."""
     record = _canonical_cleanup_remote(remote)
-    key = _cleanup_remote_key(record)
-    if record is None or key is None:
+    if record is None:
         return False
     report_status: RunStatus | None = None
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
         status = status_ops._runstatus_from_json(raw)
-        records = _cleanup_remotes_from_raw(raw)
-        if all(_cleanup_remote_key(existing) != key for existing in records):
-            records.append(record)
+        records = _cleanup_records_with(raw, record)
+        if records is None:
+            return False
         status.updated_at = time.time()
         state._save_status_unlocked(status, _cleanup_remotes=records)
         report_status = status

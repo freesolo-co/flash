@@ -1244,6 +1244,48 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     assert "walking past the cheapest class" in log.getvalue()
 
 
+def test_success_preserves_uncanonical_cleanup_sibling_and_returns_metrics(orch, monkeypatch):
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import job_execution as rp_jobs
+
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda _endpoint, _fingerprint: True,
+    )
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
+        on_handle(_runpod_handle("ep-current", "job-current", attempt))
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(run_id="uncanonical-cleanup-sibling", type="H100")
+    status = _seed_status(orch, spec)
+    legacy = _runpod_handle("ep-legacy", "job-legacy")
+    legacy["key_fingerprint"] = "rpk-" + "a" * 12
+    runner_state._save_status(status, _cleanup_remotes=[legacy])
+
+    metrics = runner_lifecycle._submit_seed_supervised(
+        spec,
+        spec.seed,
+        io.StringIO(),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+
+    assert metrics["train_tokens"] == 4096
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [legacy]
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.remote is None
+    assert persisted.realized_cost_remote["endpoint_id"] == "ep-current"
+
+
 def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch, monkeypatch):
     """A fixed multi-class market stops when the projected class refuses twice."""
     from flash.providers.core import allocator

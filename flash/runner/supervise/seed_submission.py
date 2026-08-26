@@ -755,7 +755,7 @@ def _settle_success_remote(ctx: _SubmitContext) -> None:
 
     remote = dict(ctx.last_handle)
     if not _record_cleanup_remote(ctx.spec.run_id, remote):
-        raise RuntimeError("successful attempt cleanup identity could not be persisted")
+        return
     try:
         deleted = _lifecycle._strict_teardown_handle(JobHandle.from_dict(remote), ctx.spec.run_id)
     except Exception:

@@ -3310,7 +3310,8 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         assert st.state == "done"
         assert calls["n"] == 2
         assert source_snapshots == [_SOURCE_SNAPSHOT, _SOURCE_SNAPSHOT]
-        assert st.remote["job_id"] == "j2"  # latest handle persisted
+        assert st.remote is None
+        assert st.realized_cost_remote["job_id"] == "j2"
 
 
 def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch):
@@ -4717,9 +4718,10 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
         # attempt 0: cheaper class, a next-best still exists -> False; attempts 1 & 2: on the last
         # candidate (and clamped onto it) -> True.
         assert last_flags == [False, True, True]
-        # The winning (last) attempt persisted on_last_gpu into the handle so a reattach reproduces
-        # its stall tuning (see test_reattach_poll_reproduces_persisted_on_last_gpu).
-        assert runner_status.get_status("lastgpu").remote.get("on_last_gpu") is True
+        # the winning attempt retains on_last_gpu in its billing identity after confirmed teardown.
+        status = runner_status.get_status("lastgpu")
+        assert status.remote is None
+        assert status.realized_cost_remote.get("on_last_gpu") is True
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):

@@ -311,7 +311,8 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             )
             step = hb.get("step")
             if (
-                hb.get("stage") == expected_stage
+                hb.get("stage") in {expected_stage, "done"}
+                and expected_stage is not None
                 and attempt == remote_attempt
                 and isinstance(attempt, int)
                 and not isinstance(attempt, bool)
