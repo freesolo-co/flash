@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import sys
 import time
@@ -33,6 +35,26 @@ def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
         (worker_perf.RetriableInfraError, StagedEnvironmentTransientError, GitHubTransientError),
     )
     return {"retriable": retriable, "oom": (not retriable and worker_perf.is_cuda_oom(exc))}
+
+
+def _publish_kernel_cache_observation(mega_cache_loaded: bool) -> None:
+    artifact_name = hf_io.kernel_cache_artifact_name(state.RUN_MODE, state.ATTEMPT)
+    local_path = f"/tmp/{artifact_name}"
+    payload = {
+        "attempt": state.ATTEMPT,
+        "format_version": 1,
+        "mega_cache_loaded": mega_cache_loaded,
+    }
+    with open(local_path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, sort_keys=True, separators=(",", ":"))
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
+    try:
+        hf_io.hf_upload_file(local_path, artifact_name, required=True)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(local_path)
 
 
 def _preflight_gpu_occupancy_for_spec() -> None:
@@ -147,7 +169,8 @@ def _run_worker_mode() -> None:
     # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
     worker_perf._restrict_fla_gdn_autotune_on_blackwell()
     heartbeat_io.heartbeat("boot", gpu=worker_perf.gpu_diagnostics(include_torch=False))
-    kernel_warmup.load_mega_cache()
+    mega_cache_loaded = kernel_warmup.load_mega_cache()
+    _publish_kernel_cache_observation(mega_cache_loaded)
     try:
         handler()
     finally:

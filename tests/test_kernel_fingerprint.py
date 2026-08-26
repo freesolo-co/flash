@@ -107,6 +107,8 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
         "dockerfile_sha256",
         "runpod_pod_launcher_sha256",
         "bake_pod_entry_sha256",
+        "worker_entry_sha256",
+        "worker_hf_io_sha256",
         "build_instance_capsule_sha256",
         "instance_capsule_sha256",
         "runtime_capsule_init_sha256",
@@ -130,14 +132,33 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
     [
         "runpod_pod_launcher_sha256",
         "bake_pod_entry_sha256",
+        "worker_entry_sha256",
+        "worker_hf_io_sha256",
         "build_instance_capsule_sha256",
     ],
 )
-def test_pod_launcher_inputs_move_the_worker_base_fingerprint(input_name):
+def test_baked_worker_source_inputs_move_the_worker_base_fingerprint(input_name):
     cache_inputs, base_partial = kf.collect_inputs(ROOT)
     fp_cache0, fp_base0, _ = kf.compute_fingerprints(cache_inputs, base_partial)
     changed = {**base_partial, input_name: base_partial[input_name] + "x"}
     fp_cache1, fp_base1, _ = kf.compute_fingerprints(cache_inputs, changed)
+    assert fp_cache1 == fp_cache0
+    assert fp_base1 != fp_base0
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "flash/engine/worker/entry/worker.py",
+        "flash/engine/worker/io/hf.py",
+    ],
+)
+def test_each_cache_evidence_source_moves_only_fp_base(tmp_path, path):
+    _copy_fingerprint_inputs(tmp_path)
+    fp_cache0, fp_base0, _, _ = kf.fingerprints(tmp_path)
+    target = tmp_path / path
+    target.write_bytes(target.read_bytes() + b"\n# fingerprint mutation\n")
+    fp_cache1, fp_base1, _, _ = kf.fingerprints(tmp_path)
     assert fp_cache1 == fp_cache0
     assert fp_base1 != fp_base0
 
@@ -153,6 +174,8 @@ def _copy_fingerprint_inputs(destination: Path) -> None:
         "flash/_internal/__init__.py",
         "flash/_internal/channel.py",
         "flash/_internal/version.py",
+        "flash/engine/worker/entry/worker.py",
+        "flash/engine/worker/io/hf.py",
         "flash/engine/worker/runtime/kernel_warmup.py",
         *INSTANCE_PROFILE_SOURCES,
         "flash/runtime_capsule/__init__.py",

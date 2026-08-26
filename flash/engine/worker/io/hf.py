@@ -50,6 +50,12 @@ def ray_log_artifact_name(mode: str, attempt: int = 0) -> str:
     return attempt_scoped_artifact_name("raylogs", mode, attempt)
 
 
+def kernel_cache_artifact_name(mode: str, attempt: int = 0) -> str:
+    """Per-mode, per-attempt immutable kernel-cache observation filename."""
+    text_name = attempt_scoped_artifact_name("kernel_cache", mode, attempt)
+    return f"{text_name.removesuffix('.txt')}.json"
+
+
 def _disable_xet_upload_staging() -> None:
     """Route this process's hf uploads through the streaming lfs path instead of xet.
 

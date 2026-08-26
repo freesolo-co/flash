@@ -15,9 +15,10 @@ Two fingerprints, because "out of date" has two flavors with very different cost
     itself (it decides which kernels get compiled).
 
   * fp_base = hash of everything else baked into :cu128 that is NOT in the cache (FA2 wheel spec
-    AND their sha256 digests, causal-conv1d, the non-kernel pip stack, and the baked Pod launcher
-    plus shared instance-capsule builder). Changing one of these leaves the cache valid but means the
-    per-arch tag is sitting on an old base, so it just needs a cheap re-layer (no GPU). fp_base folds
+    AND their sha256 digests, causal-conv1d, the non-kernel pip stack, the baked Pod launcher,
+    shared instance-capsule builder, and worker cache-evidence sources). Changing one of these leaves
+    the cache valid but means the per-arch tag is sitting on an old base, so it just needs a cheap
+    re-layer (no GPU). fp_base folds
     fp_cache in, so it always moves when fp_cache does.
 
 A stale baked cache is a SILENT cold-JIT (the worker only validates by SM, then torch.compiler
@@ -253,6 +254,10 @@ def collect_inputs(
         "dockerfile_sha256": _sha256_file(root / "Dockerfile.worker"),
         "runpod_pod_launcher_sha256": _sha256_file(root / "docker" / "runpod_pod_launcher.py"),
         "bake_pod_entry_sha256": _sha256_file(root / "docker" / "bake_pod_entry.py"),
+        "worker_entry_sha256": _sha256_file(
+            root / "flash" / "engine" / "worker" / "entry" / "worker.py"
+        ),
+        "worker_hf_io_sha256": _sha256_file(root / "flash" / "engine" / "worker" / "io" / "hf.py"),
         "build_instance_capsule_sha256": _sha256_file(
             root / "docker" / "build_instance_capsule.py"
         ),
