@@ -95,6 +95,8 @@ def _reserve_attempt_record(
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
         status = status_ops._runstatus_from_json(raw)
+        if status.state in state.TERMINAL_STATES:
+            raise RuntimeError("cannot reserve an attempt for a terminal run")
         current = _infer_next_attempt(raw)
         if expected is not None and current != expected:
             raise RuntimeError("stored next attempt identity changed after retry verification")

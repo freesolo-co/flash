@@ -97,6 +97,32 @@ def _settle_terminal_attempt(status: RunStatus, expected_remote: dict | None) ->
     )
 
 
+def _settled_attempt_identity(status: RunStatus) -> tuple[int, int] | None:
+    if status.attempt is None:
+        return None
+    attempt = status_ops._current_attempt(status)
+    if attempt.state != "settled":
+        raise RuntimeError("terminal attempt was not settled")
+    return attempt.attempt_id, attempt.fence
+
+
+def _confirmed_settled_attempt_matches(
+    confirmed: RunStatus,
+    expected_attempt: tuple[int, int] | None,
+) -> bool:
+    if expected_attempt is None:
+        return confirmed.attempt is None
+    try:
+        attempt = status_ops._current_attempt(confirmed)
+    except (TypeError, ValueError):
+        return False
+    return (
+        attempt.attempt_id == expected_attempt[0]
+        and attempt.fence == expected_attempt[1]
+        and attempt.state == "settled"
+    )
+
+
 def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
     """Clear only the nonterminal remote that still names the destroyed resource."""
     if _remote_resource_identity(expected_remote) is None:
@@ -149,6 +175,7 @@ def _compare_and_fail_remote(
 ) -> bool:
     """CAS a nonterminal expected remote to failed and confirm the durable write."""
     report_status: RunStatus | None = None
+    settled_attempt: tuple[int, int] | None = None
     with state._status_guard(run_id):
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
@@ -157,6 +184,7 @@ def _compare_and_fail_remote(
             return False
         if not _settle_terminal_attempt(status, expected_remote):
             return False
+        settled_attempt = _settled_attempt_identity(status)
         status.state = "failed"
         status.error = error
         status.updated_at = time.time()
@@ -170,6 +198,7 @@ def _compare_and_fail_remote(
         confirmed.state != "failed"
         or not _expected_terminal_remote_matches(confirmed.remote, expected_after)
         or confirmed.error != error
+        or not _confirmed_settled_attempt_matches(confirmed, settled_attempt)
     ):
         raise RuntimeError("terminal recovery failure was not durably confirmed")
     if report_status is not None:
@@ -185,6 +214,7 @@ def _compare_and_complete_remote(
 ) -> bool:
     """Adopt strict completed artifacts only while the captured remote still owns the run."""
     report_status: RunStatus | None = None
+    settled_attempt: tuple[int, int] | None = None
     with state._status_guard(run_id):
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
@@ -210,6 +240,7 @@ def _compare_and_complete_remote(
             return False
         if not _settle_terminal_attempt(status, expected_remote):
             return False
+        settled_attempt = _settled_attempt_identity(status)
         measured = float(status.cost_usd or 0.0) + recovered_cost
         charge_usd = costs._status_estimated_charge(status, spec, fallback=measured)
         status.state = "done"
@@ -222,8 +253,10 @@ def _compare_and_complete_remote(
         state._save_status_unlocked(status)
         report_status = status
     confirmed = status_ops.get_status(run_id)
-    if confirmed.state != "done" or not _expected_terminal_remote_matches(
-        confirmed.remote, expected_remote
+    if (
+        confirmed.state != "done"
+        or not _expected_terminal_remote_matches(confirmed.remote, expected_remote)
+        or not _confirmed_settled_attempt_matches(confirmed, settled_attempt)
     ):
         raise RuntimeError("terminal recovery completion was not durably confirmed")
     if report_status is not None:

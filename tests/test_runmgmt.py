@@ -1125,6 +1125,27 @@ def test_save_status_cleans_temp_when_replace_fails(monkeypatch, tmp_path):
     assert all(not os.path.exists(path) for path in temp_paths)
 
 
+@pytest.mark.parametrize("terminal_state", sorted(runner_state.TERMINAL_STATES))
+def test_attempt_reservation_rejects_terminal_run(monkeypatch, tmp_path, terminal_state):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id=f"terminal-reservation-{terminal_state}",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+    )
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state=terminal_state, spec=spec.to_dict())
+    )
+    before = runner_status._load_status_json(spec.run_id)
+
+    with pytest.raises(RuntimeError, match="cannot reserve an attempt for a terminal run"):
+        runner_attempts._reserve_attempt_record(spec.run_id)
+
+    assert runner_status._load_status_json(spec.run_id) == before
+
+
 def test_concurrent_attempt_reservations_are_unique_and_monotonic(monkeypatch, tmp_path):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1392,6 +1413,82 @@ def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, 
     assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
         remote
     ]
+
+
+def test_recovered_failure_rejects_reservation_after_terminal_save(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="failure-reservation-race", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-active", "job-active", attempt=3, fence=1)
+    original = _persist_active_attempt(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        remote,
+    )
+    real_get_status = runner_status.get_status
+    reservation_attempted = False
+
+    def reserve_after_terminal_save(run_id):
+        nonlocal reservation_attempted
+        confirmed = real_get_status(run_id)
+        if confirmed.state == "failed" and not reservation_attempted:
+            reservation_attempted = True
+            with pytest.raises(RuntimeError, match="cannot reserve an attempt for a terminal run"):
+                runner_attempts._reserve_attempt_record(run_id)
+            confirmed = real_get_status(run_id)
+        return confirmed
+
+    monkeypatch.setattr(runner_status, "get_status", reserve_after_terminal_save)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+
+    assert (
+        runner_reconciliation._compare_and_fail_remote(spec.run_id, remote, "provider failed")
+        is True
+    )
+    assert reservation_attempted
+    confirmed = real_get_status(spec.run_id)
+    assert confirmed.attempt["attempt_id"] == original.attempt_id
+    assert confirmed.attempt["fence"] == original.fence
+    assert confirmed.attempt["state"] == "settled"
+
+
+def test_recovered_completion_rejects_reservation_after_terminal_save(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="completion-reservation-race",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+    )
+    remote = _runpod_remote("endpoint-active", "job-active", attempt=3, fence=1)
+    original = _persist_active_attempt(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        remote,
+    )
+    real_get_status = runner_status.get_status
+    reservation_attempted = False
+
+    def reserve_after_terminal_save(run_id):
+        nonlocal reservation_attempted
+        confirmed = real_get_status(run_id)
+        if confirmed.state == "done" and not reservation_attempted:
+            reservation_attempted = True
+            with pytest.raises(RuntimeError, match="cannot reserve an attempt for a terminal run"):
+                runner_attempts._reserve_attempt_record(run_id)
+            confirmed = real_get_status(run_id)
+        return confirmed
+
+    monkeypatch.setattr(runner_status, "get_status", reserve_after_terminal_save)
+    monkeypatch.setattr(runner_status, "_persist_metrics", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+
+    assert runner_reconciliation._compare_and_complete_remote(spec.run_id, remote, spec, {}) is True
+    assert reservation_attempted
+    confirmed = real_get_status(spec.run_id)
+    assert confirmed.attempt["attempt_id"] == original.attempt_id
+    assert confirmed.attempt["fence"] == original.fence
+    assert confirmed.attempt["state"] == "settled"
 
 
 @pytest.mark.parametrize("terminal_state", ["done", "failed"])
