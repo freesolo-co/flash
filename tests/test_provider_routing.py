@@ -394,10 +394,12 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(
         resource_created.set()
         assert allow_handle.wait(timeout=5)
         on_handle(_runpod_handle("ep-handshake", "job-handshake", **kwargs))
-        persisted_remote = runner_status.get_status(spec.run_id).remote
+        persisted_status = runner_status.get_status(spec.run_id)
+        persisted_remote = persisted_status.remote
         assert persisted_remote["endpoint_id"] == "ep-handshake"
         assert persisted_remote["job_id"] == "job-handshake"
         assert "seed" not in persisted_remote
+        assert persisted_status.lifecycle_started_attempt == 0
         handle_persisted.set()
         polling.set()
         assert allow_poll.wait(timeout=5)
@@ -1249,9 +1251,117 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     metrics = runner_lifecycle._run_attempts_supervised(spec, log, source_snapshot=_SOURCE_SNAPSHOT)
     assert metrics["train_tokens"] == 4096
     assert submitted_gpus == ["RTX 4090", "H100"]
-    assert cancelled == [("ep1", "j1")]
-    assert "ep1" in deleted
+    assert cancelled == [("ep1", "j1"), ("ep2", "j2")]
+    assert deleted == ["ep1", "ep2"]
     assert "walking past the cheapest class" in log.getvalue()
+
+
+def test_success_preserves_uncanonical_cleanup_sibling_and_returns_metrics(orch, monkeypatch):
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import job_execution as rp_jobs
+
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda _endpoint, _fingerprint: True,
+    )
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
+        on_handle(_runpod_handle("ep-current", "job-current", attempt))
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(run_id="uncanonical-cleanup-sibling", type="H100")
+    status = _seed_status(orch, spec)
+    legacy = _runpod_handle("ep-legacy", "job-legacy")
+    legacy["key_fingerprint"] = "rpk-" + "a" * 12
+    runner_state._save_status(status, _cleanup_remotes=[legacy])
+
+    metrics = runner_lifecycle._submit_seed_supervised(
+        spec,
+        spec.seed,
+        io.StringIO(),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+
+    assert metrics["train_tokens"] == 4096
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [legacy]
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.remote is None
+    assert persisted.realized_cost_remote["endpoint_id"] == "ep-current"
+
+
+@pytest.mark.parametrize("teardown_confirmed", [False, True])
+def test_success_attempts_teardown_when_cleanup_recording_fails(
+    orch, monkeypatch, teardown_confirmed
+):
+    import flash.runner.supervise.seed_submission as seed_submission
+
+    import flash.runner.accounting.reconciliation as reconciliation
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.execution import job_execution as rp_jobs
+
+    monkeypatch.setattr(reconciliation, "_record_cleanup_remote", lambda *_args: False)
+    torn_down = []
+
+    def fake_teardown(handle, run_id):
+        torn_down.append((handle.data["endpoint_id"], run_id))
+        return teardown_confirmed
+
+    monkeypatch.setattr(seed_submission._lifecycle, "_strict_teardown_handle", fake_teardown)
+
+    def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
+        on_handle(_runpod_handle("ep-record-failed", "job-record-failed", attempt))
+        return PollResult(True, metrics={"train_tokens": 4096})
+
+    monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
+    spec = _spec(run_id=f"cleanup-record-failed-{teardown_confirmed}", type="H100")
+    _seed_status(orch, spec)
+
+    metrics = runner_lifecycle._submit_seed_supervised(
+        spec,
+        spec.seed,
+        io.StringIO(),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+
+    assert metrics["train_tokens"] == 4096
+    assert torn_down == [("ep-record-failed", spec.run_id)]
+    persisted = runner_status.get_status(spec.run_id)
+    if teardown_confirmed:
+        assert persisted.remote is None
+        assert persisted.cleanup_confirmed_remote["endpoint_id"] == "ep-record-failed"
+        assert persisted.realized_cost_remote["endpoint_id"] == "ep-record-failed"
+    else:
+        assert persisted.remote["endpoint_id"] == "ep-record-failed"
+        assert persisted.cleanup_confirmed_remote is None
+        assert persisted.realized_cost_remote is None
+
+
+def test_new_provider_handle_replaces_retained_accounting_identity(orch):
+    from flash.runner.supervise.seed_submission import _build_context
+
+    spec = _spec(run_id="replacement-handle", type="H100")
+    status = _seed_status(orch, spec)
+    prior = _runpod_handle("ep-prior", "job-prior", attempt=0)
+    status.realized_cost_remote = prior
+    runner_state._save_status(status)
+    ctx = _build_context(spec, spec.seed, io.StringIO(), None, _SOURCE_SNAPSHOT, 1)
+    ctx.current_attempt = 1
+    ctx.current_gpu = {"provider": "runpod", "name": "H100", "count": 2}
+
+    ctx.on_handle(_runpod_handle("ep-current", "job-current", attempt=1))
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.remote["endpoint_id"] == "ep-current"
+    assert persisted.realized_cost_remote is None
 
 
 def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch, monkeypatch):
@@ -1294,6 +1404,10 @@ def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch,
     # attempts saved are 900s of capacity grace each. every named class still got a look first,
     # which is what separates this from writing a run off on one refusal.
     assert submitted_gpus == ["A100 PCIe", "A100 SXM", "A100 PCIe"]
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.remote is None
+    assert persisted.cleanup_confirmed_remote["endpoint_id"] == "ep2"
+    assert persisted.realized_cost_remote["endpoint_id"] == "ep2"
     out = log.getvalue()
     assert "has already refused capacity twice" in out
     assert "drop the gpu.type pin" in out
@@ -1780,7 +1894,9 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     assert lam_gpus == ["A10"]  # broken Lambda instance tried once...
     assert rp_gpus == ["H100"]  # ...then escaped cross-provider to RunPod
     assert "i-broken" in terminated  # sick instance torn down before the retry
-    assert runner_status.get_status(spec.run_id).remote["provider"] == "runpod"
+    status = runner_status.get_status(spec.run_id)
+    assert status.remote is None
+    assert status.realized_cost_remote["provider"] == "runpod"
 
 
 def test_no_liveness_preemption_escapes_to_other_provider(orch, monkeypatch):
@@ -1832,7 +1948,9 @@ def test_no_liveness_preemption_escapes_to_other_provider(orch, monkeypatch):
     assert metrics["train_tokens"] == 4096
     assert lam_gpus == ["H100"]  # sick region tried once...
     assert rp_gpus == ["H100"]  # ...then escaped cross-provider to RunPod
-    assert runner_status.get_status(spec.run_id).remote["provider"] == "runpod"
+    status = runner_status.get_status(spec.run_id)
+    assert status.remote is None
+    assert status.realized_cost_remote["provider"] == "runpod"
 
 
 def test_genuine_worker_error_does_not_retry(orch, monkeypatch):

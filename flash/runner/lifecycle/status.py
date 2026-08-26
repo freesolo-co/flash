@@ -296,6 +296,60 @@ def settle_current_attempt(status: RunStatus) -> bool:
     )
 
 
+def record_heartbeat(run_id: str, heartbeat: dict) -> None:
+    """Record conservative progress evidence without replacing immutable attempt projections."""
+    if not run_id or not isinstance(heartbeat, dict):
+        return
+    if not os.path.exists(state.runs_file_path(run_id, ".json")):
+        return
+    from flash.runner.lifecycle.protocol import bounded_json
+
+    hb = bounded_json(heartbeat)
+    gpu = hb.get("gpu") if isinstance(hb, dict) else None
+    with state._status_guard(run_id):
+        try:
+            status = get_status(run_id)
+        except FileNotFoundError:
+            return
+        previous = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else None
+        same_attempt = previous is not None and previous.get("attempt") == hb.get("attempt")
+        if isinstance(hb, dict) and not hb.get("metrics_last"):
+            previous_metrics = previous.get("metrics_last") if isinstance(previous, dict) else None
+            if same_attempt and isinstance(previous_metrics, list) and previous_metrics:
+                hb["metrics_last"] = previous_metrics
+        if status.lifecycle_progressed_attempt is None:
+            expected_stage = {
+                "sft": "sft_step",
+                "grpo": "rl_step",
+                "opd": "opd_step",
+            }.get(status.spec.get("algorithm"))
+            attempt_id = hb.get("attempt")
+            remote_attempt = (
+                status.remote.get("attempt") if isinstance(status.remote, dict) else None
+            )
+            step = hb.get("step")
+            if (
+                hb.get("stage") in {expected_stage, "done"}
+                and expected_stage is not None
+                and attempt_id == remote_attempt
+                and isinstance(attempt_id, int)
+                and not isinstance(attempt_id, bool)
+                and attempt_id >= 0
+                and isinstance(step, int)
+                and not isinstance(step, bool)
+                and step >= 1
+            ):
+                status.lifecycle_progressed_attempt = attempt_id
+        status.last_heartbeat = hb
+        if isinstance(gpu, dict):
+            status.gpu_status = gpu
+        elif not same_attempt:
+            status.gpu_status = None
+        status.updated_at = time.time()
+        state._save_status_unlocked(status)
+    reporting._report_status(status)
+
+
 def _record_projection(
     run_id: str,
     field: str,
@@ -320,7 +374,8 @@ def _record_projection(
             and _remote_resource_identity(status.remote) != resource_identity
         ):
             return False
-        setattr(status, field, bounded_json(value))
+        projection = bounded_json(value)
+        setattr(status, field, projection)
         if attempt_state is not None and not transition_attempt_state(
             status,
             attempt_state,
@@ -328,6 +383,16 @@ def _record_projection(
             expected_fence=fence,
         ):
             return False
+        if status.lifecycle_progressed_attempt is None and field in {"progress", "result"}:
+            training_entered = projection.get("training_entered")
+            completed_steps = projection.get("completed_steps")
+            if (
+                training_entered is True
+                and isinstance(completed_steps, int)
+                and not isinstance(completed_steps, bool)
+                and completed_steps >= 1
+            ):
+                status.lifecycle_progressed_attempt = attempt_id
         status.updated_at = time.time()
         state._save_status_unlocked(status)
     reporting._report_status(status)
@@ -359,6 +424,9 @@ def record_attempt_handle(
             resource=resource,
         ).to_dict()
         status.remote = resource
+        status.realized_cost_remote = None
+        if status.lifecycle_started_attempt is None:
+            status.lifecycle_started_attempt = attempt_id
         status.state = "running"
         status.updated_at = time.time()
         state._save_status_unlocked(status)
@@ -518,6 +586,11 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
         if new_state in {"done", "failed", "cancelled"}:
             settle_current_attempt(status)
         for key, value in updates.items():
+            if (
+                key in {"lifecycle_started_attempt", "lifecycle_progressed_attempt"}
+                and getattr(status, key) is not None
+            ):
+                continue
             setattr(status, key, value)
         state._save_status_unlocked(status)
         report_status = status

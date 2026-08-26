@@ -302,6 +302,69 @@ def test_terminal_charge_uses_the_selected_fallback_after_remote_cleanup(monkeyp
     assert captured["body"]["gpu"] == "A100 PCIe"
 
 
+def test_late_cancellation_uses_retained_rented_basis(tmp_path, monkeypatch):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-9B",
+            "algorithm": "sft",
+            "gpu": {"type": "RTX 5090"},
+            "run_id": "flash-late-cancel-basis",
+        }
+    )
+    retained = {
+        **_remote("endpoint-finished", "job-finished", 0),
+        "allocated_gpu": "A100 PCIe",
+        "allocated_gpu_count": 4,
+    }
+    status = provisioned_status(spec, state="running", remote=None)
+    status.billing_context = {"org_id": "org-1"}
+    status.realized_cost_remote = retained
+    runner_state._save_status(status)
+    captured = []
+
+    def cancellation_billing(run_id, effective_spec, *, bill_cancel, rented_remote):
+        captured.append((run_id, bill_cancel, rented_remote))
+        return 0.5, {}
+
+    monkeypatch.setattr(runner_deploy, "_cancellation_billing", cancellation_billing)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+
+    cancelled = runner_deploy.cancel_run(spec.run_id)
+
+    assert cancelled.state == "cancelled"
+    assert captured == [(spec.run_id, True, retained)]
+
+
+def test_terminal_charge_uses_retained_remote_after_confirmed_cleanup(monkeypatch):
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.server.billing import charges
+
+    captured: dict[str, object] = {}
+
+    def post_billing(*, token, path, body):
+        captured.update(token=token, path=path, body=body)
+        return {"ok": True}
+
+    monkeypatch.setattr(charges, "_post_billing", post_billing)
+    status = RunStatus(
+        run_id="flash-billed-cleanup",
+        state="done",
+        spec={"algorithm": "sft", "model": "m", "gpu": {"type": "RTX 5090"}},
+        remote=None,
+        realized_cost_remote={"provider": "runpod", "allocated_gpu": "A100 PCIe"},
+        billing_context={"org_id": "org-1"},
+        cost_usd=1.25,
+    )
+
+    charges.charge_completed_run(internal_key="internal", status=status)
+
+    assert captured["body"]["provider"] == "runpod"
+    assert captured["body"]["gpu"] == "A100 PCIe"
+
+
 def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     # Cancelling a deployed run tears down its serve endpoint; the deployment record
     # must flip to "undeployed" so /v1/deployments and /chat stop treating the

@@ -177,7 +177,7 @@ def attributed_gpu_type(status: Any) -> str:
     def field(name: str) -> Any:
         return status.get(name) if isinstance(status, dict) else getattr(status, name, None)
 
-    remote = field("remote")
+    remote = field("remote") or field("realized_cost_remote")
     allocated = remote.get("allocated_gpu") if isinstance(remote, dict) else None
     if isinstance(allocated, str) and allocated:
         return allocated
