@@ -110,11 +110,12 @@ def test_build_rollout_sample_carries_loss_scalar_for_opd() -> None:
 
 @pytest.mark.parametrize("scalar", ["reward", "loss"])
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_a_non_finite_scalar_is_omitted_so_the_heartbeat_stays_parseable(scalar, value) -> None:
+def test_a_non_finite_scalar_is_omitted_so_progress_stays_parseable(scalar, value) -> None:
     """A diverged step must not publish a scalar json cannot represent.
 
     ``json.dumps`` writes bare ``NaN``/``Infinity`` by default -- not json. A strict reader rejects
-    the whole heartbeat over one such field, so the step's OTHER diagnostics die with it. Assert on
+    the whole progress record over one such field, so the step's other diagnostics die with it.
+    Assert on
     ``allow_nan=False``, which is exactly the strict reader's behaviour: a plain ``json.dumps`` here
     would serialize the defect happily and the test could never fail."""
     sample = build_rollout_sample("prompt", "completion", generated_at_step=2, **{scalar: value})

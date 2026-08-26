@@ -23,17 +23,6 @@ from flash.cli.commands.ops import traces as cli_traces
 from flash.cli.commands.ops import train as train_commands
 from flash.cli.ui import cost as cost_ui
 from flash.client.config import DEFAULT_API_URL
-from flash.providers._lifecycle.instances.poll import _format_heartbeat
-
-
-def test_format_heartbeat_appends_named_reward_metrics() -> None:
-    heartbeat = {"stage": "rl_step", "step": 4, "reward": 0.65}
-    base_line = _format_heartbeat(heartbeat)
-
-    assert base_line == "worker: stage=rl_step step=4 reward=0.650"
-    assert _format_heartbeat({**heartbeat, "reward_metrics": {"success": 0.8, "format": 0.5}}) == (
-        base_line + " success=0.800 format=0.500"
-    )
 
 
 class _FakeClient:
@@ -1567,32 +1556,21 @@ def test_status_runs_and_log_command(fake_client, capsys, monkeypatch) -> None:
 def test_log_labels_previous_attempt_artifacts_after_the_live_attempt_log(
     fake_client, capsys, monkeypatch
 ) -> None:
-    live_heartbeat = {
-        "stage": "rl_step",
-        "step": 4,
-        "ts": 456.0,
-        "attempt": 1,
-        "gpu": {"device_name": "NVIDIA B200"},
-    }
-    fake_client.log_text = _format_heartbeat(live_heartbeat) + "\n"
+    fake_client.log_text = "current attempt log\n"
     monkeypatch.setattr(
         fake_client,
         "get_run",
         lambda _run_id: {
             "run_id": "flash-1",
             "state": "running",
-            "remote": {"attempt": 1},
-            "last_heartbeat": live_heartbeat,
+            "attempt": {"attempt_id": 1, "fence": 7, "state": "active"},
         },
     )
     monkeypatch.setattr(
         fake_client,
         "get_worker_output",
         lambda _run_id: {
-            "console_rl_attempt0.txt": (
-                'HEARTBEAT {"stage":"rl_step","step":0,"attempt":0,'
-                '"gpu":{"device_name":"NVIDIA H200"}}\n'
-            ),
+            "console_rl_attempt0.txt": "previous attempt log\n",
             "error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n",
             "raylogs_rl_attempt0.txt": "raylet exited\n",
         },
@@ -1601,7 +1579,7 @@ def test_log_labels_previous_attempt_artifacts_after_the_live_attempt_log(
     assert _run(["runs", "log", "flash-1"]) == 0
     out = capsys.readouterr().out
 
-    live_line = "worker: stage=rl_step attempt=1 step=4"
+    live_line = "current attempt log"
     previous_header = (
         "----- console_rl_attempt0.txt (attempt=0, previous attempt; current attempt=1) -----"
     )
@@ -1615,10 +1593,16 @@ def test_log_labels_previous_attempt_artifacts_after_the_live_attempt_log(
         in out
     )
     assert out.index(live_line) < out.index(previous_header)
-    # the dead attempt's heartbeat is still printed -- it explains why a retry exists -- but it
-    # carries its provenance inline, because a section heading does not survive
-    # `grep HEARTBEAT | tail -1`.
-    assert 'HEARTBEAT [superseded attempt=0; current attempt=1] {"stage":"rl_step"' in out
+
+
+def test_worker_artifact_attempt_parser_is_provider_neutral_and_bounded() -> None:
+    from flash.adapters.artifacts import MAX_ATTEMPT_ID
+    from flash.cli.commands.ops.worker_output import _artifact_attempt
+
+    assert _artifact_attempt("error_rl_attempt0.txt") == 0
+    assert _artifact_attempt(f"error_rl_attempt{MAX_ATTEMPT_ID}.txt") == MAX_ATTEMPT_ID
+    assert _artifact_attempt(f"error_rl_attempt{MAX_ATTEMPT_ID + 1}.txt") is None
+    assert _artifact_attempt("error_rl.txt") is None
 
 
 def test_log_still_prints_artifacts_when_the_attempt_lookup_fails(
@@ -1706,7 +1690,11 @@ def test_log_labels_artifacts_against_a_retry_that_starts_mid_command(
 
     def get_run(_run_id):
         events.append("status")
-        return {"run_id": "flash-1", "state": "running", "remote": {"attempt": 1}}
+        return {
+            "run_id": "flash-1",
+            "state": "running",
+            "attempt": {"attempt_id": 1, "fence": 8, "state": "active"},
+        }
 
     monkeypatch.setattr(fake_client, "get_worker_output", get_worker_output)
     monkeypatch.setattr(fake_client, "get_run", get_run)
@@ -1877,7 +1865,11 @@ def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> 
             return {"run_id": run_id, "logs": "", "offset": 0, "state": "done"}
 
         def get_run(self, run_id: str) -> dict:
-            return {"run_id": run_id, "state": "done", "remote": {"attempt": 1}}
+            return {
+                "run_id": run_id,
+                "state": "done",
+                "attempt": {"attempt_id": 1, "fence": 5, "state": "result_committed"},
+            }
 
     result = run_commands._poll_logs(_AttemptClient(), "flash-attempt", interval=0)
 
@@ -1899,13 +1891,30 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
                     {
                         "run_id": "flash-lag",
                         "state": "running",
-                        "last_heartbeat": {"stage": "rl_step", "step": 42},
+                        "attempt": {"attempt_id": 2, "fence": 9, "state": "active"},
+                        "progress": {
+                            "attempt_id": 2,
+                            "fence": 9,
+                            "sequence": 4,
+                            "phase": "rl_step",
+                            "completed_steps": 42,
+                        },
+                        "resource": {
+                            "attempt_id": 2,
+                            "fence": 9,
+                            "state": "running",
+                        },
                         "realized_cost_usd": 1.23456,
                     },
                     {
                         "run_id": "flash-lag",
                         "state": "done",
-                        "last_heartbeat": {"stage": "rl_train_done"},
+                        "attempt": {
+                            "attempt_id": 2,
+                            "fence": 9,
+                            "state": "result_committed",
+                        },
+                        "result": {"attempt_id": 2, "fence": 9, "outcome": "done"},
                         "realized_cost_usd": 1.5,
                     },
                 ]
@@ -1928,14 +1937,17 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
     assert printed_any is False
     assert capsys.readouterr().out == ""
     err = stderr.getvalue()
-    assert "stage=rl_step" in err
-    assert "step=42" in err
+    assert "attempt=2" in err
+    assert "fence=9" in err
+    assert "phase=rl_step" in err
+    assert "steps=42" in err
+    assert "resource=running" in err
     assert "realized_cost=$1.2346" in err
 
 
-def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys) -> None:
+def test_follow_logs_prints_current_progress_metrics_once_per_sequence(monkeypatch, capsys) -> None:
+    identity = {"attempt_id": 1, "fence": 7}
     metric_one = {
-        "step": 1,
         "reward": 0.75,
         "reward_std": 0.12,
         "grad_norm": 1.5,
@@ -1948,7 +1960,6 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
         "max_completion_tokens": 256,
     }
     metric_two = {
-        "step": 2,
         "reward": 0.8,
         "reward_std": 0.1,
         "grad_norm": 1.25,
@@ -1969,20 +1980,36 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
                     {
                         "run_id": "flash-metrics",
                         "state": "running",
-                        "last_heartbeat": {"stage": "rl_step", "metrics_last": [metric_one]},
+                        "attempt": {**identity, "state": "active"},
+                        "progress": {
+                            **identity,
+                            "sequence": 1,
+                            "completed_steps": 1,
+                            "metrics": metric_one,
+                        },
                     },
                     {
                         "run_id": "flash-metrics",
                         "state": "running",
-                        "last_heartbeat": {
-                            "stage": "rl_step",
-                            "metrics_last": [metric_one, metric_two],
+                        "attempt": {**identity, "state": "active"},
+                        "progress": {
+                            **identity,
+                            "sequence": 2,
+                            "completed_steps": 2,
+                            "metrics": metric_two,
                         },
                     },
                     {
                         "run_id": "flash-metrics",
                         "state": "done",
-                        "last_heartbeat": {"stage": "rl_step", "metrics_last": [metric_two]},
+                        "attempt": {**identity, "state": "result_committed"},
+                        "progress": {
+                            **identity,
+                            "sequence": 2,
+                            "completed_steps": 2,
+                            "metrics": metric_two,
+                        },
+                        "result": {**identity, "outcome": "done"},
                     },
                 ]
             )
@@ -2000,40 +2027,19 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
     assert state == "done"
     assert printed_any is False
     metric_lines = [
-        line for line in capsys.readouterr().err.splitlines() if line.startswith("step=")
+        line for line in capsys.readouterr().err.splitlines() if line.startswith("progress_seq=")
     ]
     assert metric_lines == [
         (
-            "step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 entropy=0.82 "
-            "frac_zero_std=0.25 comp_len=48.5 trunc=0.125 discarded=1 max_comp_tokens=256"
+            "progress_seq=1 step=1 reward=0.75 reward_std=0.12 grad_norm=1.5 kl=0.03 "
+            "entropy=0.82 frac_zero_std=0.25 comp_len=48.5 trunc=0.125 discarded=1 "
+            "max_comp_tokens=256"
         ),
         (
-            "step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 frac_zero_std=0 "
-            "comp_len=51 trunc=0.25 discarded=2 max_comp_tokens=256"
+            "progress_seq=2 step=2 reward=0.8 reward_std=0.1 grad_norm=1.25 entropy=0.79 "
+            "frac_zero_std=0 comp_len=51 trunc=0.25 discarded=2 max_comp_tokens=256"
         ),
     ]
-
-
-def test_log_follow_metric_dedup_is_attempt_aware() -> None:
-    from flash.cli.commands.ops.log_follow import _log_follow_metric_rows
-
-    seen = set()
-    attempt_one = {
-        "last_heartbeat": {
-            "attempt": 1,
-            "metrics_last": [{"step": 7, "reward": 0.5}],
-        }
-    }
-    attempt_two = {
-        "last_heartbeat": {
-            "attempt": 2,
-            "metrics_last": [{"step": 7, "reward": 0.6}],
-        }
-    }
-
-    assert _log_follow_metric_rows(attempt_one, seen) == ["step=7 reward=0.5"]
-    assert _log_follow_metric_rows(attempt_one, seen) == []
-    assert _log_follow_metric_rows(attempt_two, seen) == ["step=7 reward=0.6"]
 
 
 def test_cancel_surfaces_surviving_checkpoints(fake_client, capsys) -> None:
@@ -4573,298 +4579,59 @@ def test_deploy_wait_skips_polling_for_a_dry_run(fake_client, monkeypatch, capsy
     assert "ctrl-c stops waiting" not in capsys.readouterr().err
 
 
-def test_log_follow_progress_includes_heartbeat_age() -> None:
-    """The follow spinner must show a live heartbeat age so a long quiet phase reads as
-    "alive, throttled" instead of a frozen line."""
-    import time as _time
-
+def test_log_follow_progress_uses_only_current_fenced_progress() -> None:
     from flash.cli.commands.ops.runs import _log_follow_progress
 
     status = {
         "state": "running",
-        "last_heartbeat": {"stage": "sft_initializing", "step": 3, "ts": _time.time() - 41},
-    }
-    state, progress = _log_follow_progress(status, "unknown")
-    assert state == "running"
-    assert "stage=sft_initializing" in progress
-    assert "step=3" in progress
-    assert "hb=<1m" in progress
-
-    status["last_heartbeat"]["ts"] = _time.time() - 500
-    _, progress = _log_follow_progress(status, "unknown")
-    assert "hb=8m" in progress
-
-    state, progress = _log_follow_progress({"state": "running"}, "unknown")
-    assert "hb=" not in progress  # no heartbeat yet -> no fabricated age
-
-    malformed = {"state": "running", "last_heartbeat": {"stage": "sft_step", "ts": "oops"}}
-    _, progress = _log_follow_progress(malformed, "unknown")
-    assert "hb=" not in progress  # non-numeric ts -> no fabricated age
-
-
-def test_log_follow_progress_names_the_attempt_after_a_relaunch() -> None:
-    """A preemption relaunch rewinds the step counter while the state stays "running", so the
-    follow line must name the attempt or the rewind reads as lost progress with no cause."""
-    import time as _time
-
-    from flash.cli.commands.ops.runs import _log_follow_progress
-
-    # attempts are 0-based, so a first attempt must stay unannotated.
-    first = {
-        "state": "running",
-        "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
-    }
-    _, progress = _log_follow_progress(first, "unknown")
-    assert "step=455" in progress
-    assert "attempt=" not in progress
-
-    # relaunched on fresh hardware: same state, step back to 0, attempt incremented.
-    relaunched = {
-        "state": "running",
-        "remote": {"attempt": 1},
-        "last_heartbeat": {"stage": "boot", "step": 0, "ts": _time.time(), "attempt": 1},
-    }
-    state, progress = _log_follow_progress(relaunched, "unknown")
-    assert state == "running"
-    assert "step=0" in progress
-    assert "attempt=1" in progress
-
-    malformed = {
-        "state": "running",
-        "last_heartbeat": {"stage": "sft_step", "ts": _time.time(), "attempt": "two"},
-    }
-    _, progress = _log_follow_progress(malformed, "unknown")
-    assert "attempt=" not in progress  # non-integer attempt -> no fabricated identity
-
-    # the relaunch window this line exists to explain: `remote.attempt` has advanced but the
-    # replacement worker has not published a heartbeat yet, so `last_heartbeat` is still the
-    # superseded attempt's ping. reading the heartbeat here leaves the first preemption entirely
-    # unlabelled (its stale attempt is 0) and names the previous attempt on every later one.
-    mid_relaunch = {
-        "state": "running",
-        "remote": {"attempt": 1},
-        "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
-    }
-    _, progress = _log_follow_progress(mid_relaunch, "unknown")
-    assert "attempt=1" in progress
-    # ...and the step it is printed next to belongs to attempt 0, so it must not read as attempt
-    # 1's progress. see test_log_follow_progress_marks_a_stale_heartbeats_fields.
-    assert "(prev attempt)" in progress
-
-    # `remote` is absent on planes that do not surface it, so the heartbeat still has to answer.
-    no_remote = {
-        "state": "running",
-        "last_heartbeat": {"stage": "sft_step", "step": 12, "ts": _time.time(), "attempt": 2},
-    }
-    _, progress = _log_follow_progress(no_remote, "unknown")
-    assert "attempt=2" in progress
-
-
-@pytest.mark.parametrize("heartbeat_attempt", [0, 1])
-def test_log_follow_progress_does_not_trust_a_ping_left_by_a_cleared_remote(
-    heartbeat_attempt: int,
-) -> None:
-    """A supervised retry publishes `remote: null` for its whole allocation window.
-
-    `flash/runner/supervise/lifecycle.py` clears `remote` before reserving the replacement attempt and does
-    not persist the new one until the provider handle lands, so throughout that window flash serves
-    a running record whose only attempt identity is the superseded worker's ping. Falling back to it
-    there reintroduced exactly what preferring `remote` was meant to fix: the first retry unlabelled
-    (its stale attempt is 0), later ones naming the *previous* attempt.
-
-    Both parametrizations are the same window one retry apart, and both must refuse the ping.
-
-    Keyed on an explicit null rather than a missing key, which is what makes it decidable:
-    `on_handle` persists `remote` in the same `_update` that sets `running`, so a running flash
-    record with a heartbeat and no remote is a worker already torn down. An ABSENT `remote` still
-    falls back -- that is a plane which never surfaces the field, covered above.
-    """
-    import time as _time
-
-    from flash.cli.commands.ops.runs import _log_follow_progress
-
-    _, progress = _log_follow_progress(
-        {
-            "state": "running",
-            "remote": None,
-            "last_heartbeat": {
-                "stage": "sft_step",
-                "step": 455,
-                "ts": _time.time(),
-                "attempt": heartbeat_attempt,
-            },
+        "attempt": {"attempt_id": 3, "fence": 11, "state": "active"},
+        "progress": {
+            "attempt_id": 3,
+            "fence": 11,
+            "sequence": 4,
+            "phase": "sft_step",
+            "completed_steps": 9,
         },
-        "unknown",
-    )
-    # no identity is claimed: the replacement is not reserved yet, and a wrong number is worse than
-    # none for the one field that exists to explain the rewind.
-    assert "attempt=" not in progress, progress
-    # ...and the ping it did print belongs to the torn-down worker, so it must not read as the
-    # replacement's progress.
-    assert "step=455" in progress, progress
-    assert "(prev attempt)" in progress, progress
-    assert progress.index("step=455") < progress.index("(prev attempt)"), progress
+        "resource": {"attempt_id": 3, "fence": 11, "state": "running"},
+    }
+
+    state, progress = _log_follow_progress(status, "unknown")
+
+    assert state == "running"
+    assert "attempt=3" in progress
+    assert "fence=11" in progress
+    assert "resource=running" in progress
+    assert "phase=sft_step" in progress
+    assert "steps=9" in progress
+    assert "progress_seq=4" in progress
 
 
-def test_log_follow_progress_names_the_attempt_before_the_first_heartbeat() -> None:
-    """The relaunch has to be named while the replacement worker is still cold.
-
-    An attempt preempted before it published a ping leaves `last_heartbeat` absent while
-    `remote.attempt` has already advanced. Resolving the attempt inside the heartbeat block made
-    the line print a bare `running` for the whole cold start -- silent through exactly the window
-    the attempt counter exists to explain, and the window a user is most likely to be watching.
-    """
+def test_log_follow_progress_ignores_a_previous_fence() -> None:
     from flash.cli.commands.ops.runs import _log_follow_progress
 
     state, progress = _log_follow_progress(
-        {"state": "running", "remote": {"attempt": 1}, "last_heartbeat": None},
-        "running",
+        {
+            "state": "running",
+            "attempt": {"attempt_id": 3, "fence": 12, "state": "active"},
+            "progress": {
+                "attempt_id": 3,
+                "fence": 11,
+                "sequence": 99,
+                "phase": "rl_step",
+                "completed_steps": 88,
+            },
+            "resource": {"attempt_id": 3, "fence": 12, "state": "running"},
+        },
+        "unknown",
     )
+
     assert state == "running"
-    assert "attempt=1" in progress, progress
-    # nothing heartbeat-sourced exists to qualify, so the marker would have nothing to cover.
-    assert "(prev attempt)" not in progress, progress
-
-    # still 0-based with no heartbeat: a first attempt stays unannotated.
-    _, first = _log_follow_progress(
-        {"state": "running", "remote": {"attempt": 0}, "last_heartbeat": None},
-        "running",
-    )
-    assert "attempt=" not in first, first
-
-
-def test_log_follow_progress_marks_a_stale_heartbeats_fields() -> None:
-    """stage/step come from the heartbeat, attempt from `remote` -- during a relaunch those differ.
-
-    Printed unqualified, `stage=sft_step step=455 attempt=1` says the replacement worker has run
-    455 steps. It has not: it restarted from zero, and 455 is the superseded worker's last ping.
-    That is the exact rewind the attempt counter was added to explain, reported as if it never
-    happened.
-
-    Marked rather than suppressed: the run did reach step 455, and dropping the fields entirely
-    would read as a worker that has produced nothing.
-    """
-    import time as _time
-
-    from flash.cli.commands.ops.runs import _log_follow_progress
-
-    _, progress = _log_follow_progress(
-        {
-            "state": "running",
-            "remote": {"attempt": 1},
-            "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 0},
-        },
-        "unknown",
-    )
-    assert "step=455" in progress
-    assert "attempt=1" in progress
-    assert "(prev attempt)" in progress, progress
-
-    # the marker's scope is positional, so ordering is the contract: everything before it came
-    # from the superseded ping, everything after is live. `hb=` has to sit inside that span --
-    # the age is the old worker's ping too, so a fresh `hb=<1m` printed past the marker reads as
-    # the replacement worker being alive when nothing has been heard from it at all.
-    assert progress.index("step=455") < progress.index("(prev attempt)"), progress
-    assert progress.index("hb=") < progress.index("(prev attempt)"), progress
-    assert progress.index("(prev attempt)") < progress.index("attempt=1"), progress
-
-    # a heartbeat from the live attempt is not stale, so nothing is marked.
-    _, current = _log_follow_progress(
-        {
-            "state": "running",
-            "remote": {"attempt": 1},
-            "last_heartbeat": {"stage": "sft_step", "step": 455, "ts": _time.time(), "attempt": 1},
-        },
-        "unknown",
-    )
-    assert "step=455" in current
-    assert "(prev attempt)" not in current, current
-
-    # no `remote` means the live attempt is unknown, so staleness is unprovable -- marking there
-    # would label every ordinary heartbeat on a plane that does not surface `remote`.
-    _, no_remote = _log_follow_progress(
-        {
-            "state": "running",
-            "last_heartbeat": {"stage": "sft_step", "step": 12, "ts": _time.time(), "attempt": 2},
-        },
-        "unknown",
-    )
-    assert "(prev attempt)" not in no_remote, no_remote
-
-
-@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
-def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
-    import time as _time
-
-    from flash.cli.commands.ops.runs import _log_follow_progress
-
-    status = {"state": "running", "last_heartbeat": {"stage": stage, "ts": _time.time()}}
-    _, progress = _log_follow_progress(status, "unknown")
-
-    assert f"warming up (stage={stage})" in progress
-    assert "typically several minutes, sometimes 15-20 min" in progress
-    assert "setup is not billed" in progress
-    assert "do not cancel" in progress
-
-    status["last_heartbeat"]["stage"] = "rl_step"
-    _, progress = _log_follow_progress(status, "unknown")
-    assert "warming up" not in progress
-    assert "not billed" not in progress
-
-
-@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
-def test_log_follow_progress_omits_warmup_claim_for_stale_heartbeat(stage: str) -> None:
-    import time as _time
-
-    from flash.cli.commands.ops.runs import _log_follow_progress
-
-    status = {
-        "state": "running",
-        "last_heartbeat": {"stage": stage, "ts": _time.time() - 1201},
-    }
-    _, progress = _log_follow_progress(status, "unknown")
-
-    assert f"stage={stage}" in progress
-    assert "hb=20m" in progress
-    assert "warming up" not in progress
-    assert "do not cancel" not in progress
-
-
-@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
-def test_log_follow_progress_omits_warmup_claim_for_prior_attempt_heartbeat(stage: str) -> None:
-    import time as _time
-
-    from flash.cli.commands.ops.runs import _log_follow_progress
-
-    # remote is on attempt 1 while last_heartbeat is the previous attempt's fresh setup ping: the
-    # warmup reassurance must not fire against a superseded attempt before the new worker publishes.
-    status = {
-        "state": "running",
-        "remote": {"attempt": 1},
-        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 0},
-    }
-    _, progress = _log_follow_progress(status, "unknown")
-
-    assert f"stage={stage}" in progress
-    assert "warming up" not in progress
-    assert "do not cancel" not in progress
-
-
-@pytest.mark.parametrize("stage", ["rl_train_start", "rl_initializing"])
-def test_log_follow_progress_explains_warmup_when_heartbeat_matches_attempt(stage: str) -> None:
-    import time as _time
-
-    from flash.cli.commands.ops.runs import _log_follow_progress
-
-    status = {
-        "state": "running",
-        "remote": {"attempt": 3},
-        "last_heartbeat": {"stage": stage, "ts": _time.time(), "attempt": 3},
-    }
-    _, progress = _log_follow_progress(status, "unknown")
-
-    assert f"warming up (stage={stage})" in progress
-    assert "do not cancel" in progress
+    assert "attempt=3" in progress
+    assert "fence=12" in progress
+    assert "resource=running" in progress
+    assert "phase=" not in progress
+    assert "steps=" not in progress
+    assert "progress_seq=" not in progress
 
 
 # --------------------------------------------------------------------------- live-run cost (MP-022/LS-016)
@@ -5227,7 +4994,7 @@ def test_follow_survives_a_transient_502_instead_of_reporting_a_failed_submit(
 
     captured = capsys.readouterr()
     assert "trained" in captured.out
-    # the retry is announced, so a paused stream does not read as a stalled run.
+    # the retry is announced, so a paused stream does not read as an interrupted run.
     assert "retrying" in captured.err
     assert "the run is unaffected" in captured.err
 

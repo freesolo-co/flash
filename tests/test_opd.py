@@ -980,8 +980,8 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
     monkeypatch.setattr(opd_mod, "_load_opd_model", _boom)
     monkeypatch.setattr(opd_mod, "_probe_gpu_in_subprocess", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod._worker_perf, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(opd_mod._worker_progress, "heartbeat", lambda *a, **k: None)
-    monkeypatch.setattr(opd_train_runner._worker_progress, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod._worker_progress, "publish_progress", lambda *a, **k: None)
+    monkeypatch.setattr(opd_train_runner._worker_progress, "publish_progress", lambda *a, **k: None)
 
     import transformers
 
@@ -1793,7 +1793,7 @@ def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
             gpu=SimpleNamespace(type=None),
         ),
     )
-    monkeypatch.setattr(worker_progress, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_progress, "publish_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         teacher_mod,
         "TeacherClient",

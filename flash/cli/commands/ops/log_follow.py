@@ -104,7 +104,7 @@ class _FollowRetry:
 def _warn_follow_retry(
     spinner: _LogFollowSpinner | None, run_id: str, reason: str, retry: _FollowRetry
 ) -> None:
-    """Say once that the stream is retrying, so a stalled follow is not read as a stalled run.
+    """Say once that the stream is retrying, so an interrupted follow is not read as a stopped run.
 
     Once per outage, not once per attempt: a plane down for five minutes would otherwise bury the
     logs already printed under a wall of identical warnings.
@@ -171,7 +171,9 @@ _FOLLOW_METRIC_FIELDS = (
 def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
     """return one unseen immutable progress row keyed by attempt, fence, and sequence."""
     progress = (status or {}).get("progress")
-    if not isinstance(progress, dict) or not lifecycle_ui.progress_is_current(status or {}, progress):
+    if not isinstance(progress, dict) or not lifecycle_ui.progress_is_current(
+        status or {}, progress
+    ):
         return []
     key = (progress.get("attempt_id"), progress.get("fence"), progress.get("sequence"))
     if key in seen_steps:

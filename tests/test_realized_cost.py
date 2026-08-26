@@ -94,7 +94,7 @@ def test_due_requires_billable_terminal_settled_unreconciled_with_handle():
 
 def test_due_anchors_settle_and_window_to_finished_at_not_bumped_updated_at():
     """_due bases the settle delay and the 7-day window on the frozen finished_at (teardown), not
-    the mutable updated_at that deploy / late heartbeat move past teardown. So a run finished long
+    the mutable updated_at that deploy or late reporting move past teardown. So a run finished long
     enough ago is due even if updated_at was just bumped, and one finished outside the window is
     NOT resurrected by a recent bump."""
     now = 1_000_000.0

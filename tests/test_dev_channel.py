@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -257,9 +258,6 @@ def test_operator_hints_follow_flash_cli_invocation():
             outputs = {
                 "flash/cli/ui/render.py:login_ok": render.login_ok(None),
                 "flash/cli/ui/render.py:login_failed": render.login_failed("bad key"),
-                # _QUIET_HEARTBEAT_HINT is deliberately absent: it now points at the age on the
-                # panel rather than at `flash runs log`, so it names no command to rename. Add it
-                # back here only if it starts spelling one again.
                 "flash/cli/ui/render.py:env_setup": render.env_setup(
                     ["environment.py"], "11111111-1111-4111-8111-111111111111"
                 ),
@@ -747,3 +745,20 @@ def test_channels_are_at_the_same_version():
 
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     assert data["project"]["version"] == data["tool"]["flash-dev"]["version"]
+
+
+def test_release_cutover_version_matches_package_and_lockfile():
+    import tomllib
+
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    version = data["project"]["version"]
+    lock = (REPO_ROOT / "uv.lock").read_text()
+    changelog = (REPO_ROOT / "CHANGELOG.md").read_text()
+
+    editable = re.search(
+        r'\[\[package\]\]\nname = "freesolo-flash"\nversion = "([^"]+)"\nsource = \{ editable = "\." \}',
+        lock,
+    )
+    assert editable is not None
+    assert editable.group(1) == version
+    assert f"together at version `{version}`" in changelog

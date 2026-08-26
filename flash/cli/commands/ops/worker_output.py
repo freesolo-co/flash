@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from flash.adapters.artifacts import MAX_ATTEMPT_ID
 from flash.cli.ui import lifecycle as lifecycle_ui
 from flash.cli.ui import render
 from flash.client import ClientError
@@ -22,10 +23,11 @@ _NO_LIVE_WORKER = "no-live-worker"
 
 def _artifact_attempt(name: str) -> int | None:
     """Return the bounded attempt encoded by a worker artifact name."""
-    from flash.providers._lifecycle.instances.poll import _attempt_int
-
     match = re.search(r"_attempt(\d+)\.txt$", name)
-    return _attempt_int(int(match.group(1))) if match else None
+    if match is None:
+        return None
+    attempt = int(match.group(1))
+    return attempt if attempt <= MAX_ATTEMPT_ID else None
 
 
 def _worker_section_name(name: str, current_attempt: int | str | None) -> str:

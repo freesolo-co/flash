@@ -2240,6 +2240,67 @@ def test_logs_offset_paging(api):
     assert page2["logs"] == "line two\n"
 
 
+def _private_lifecycle_projections() -> dict[str, dict]:
+    identity = {"attempt_id": 2, "fence": 7}
+    provenance = {"repository": "private/source", "path": "training/config.toml"}
+    return {
+        "attempt": {**identity, "state": "active", "source_provenance": provenance},
+        "progress": {
+            **identity,
+            "sequence": 3,
+            "completed_steps": 2,
+            "source_provenance": provenance,
+        },
+        "resource": {**identity, "state": "running", "source_provenance": provenance},
+        "result": {**identity, "outcome": "done", "source_provenance": provenance},
+    }
+
+
+def test_run_status_to_dict_sanitizes_every_lifecycle_projection() -> None:
+    projections = _private_lifecycle_projections()
+    status = runner_state.RunStatus(
+        run_id="projection-sanitize",
+        state="done",
+        spec={"project": "11111111-1111-4111-8111-111111111111"},
+        **projections,
+    )
+
+    public = status.to_dict()
+
+    assert "source_provenance" not in json.dumps(public)
+    assert public["attempt"] == {"attempt_id": 2, "fence": 7, "state": "active"}
+    assert public["progress"]["sequence"] == 3
+    assert public["resource"]["state"] == "running"
+    assert public["result"]["outcome"] == "done"
+    assert all("source_provenance" in value for value in projections.values())
+
+
+def test_status_list_and_logs_sanitize_every_lifecycle_projection(api) -> None:
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner_status.get_status(run_id)
+    for field, value in _private_lifecycle_projections().items():
+        setattr(status, field, value)
+    runner_state._save_status(status)
+
+    direct = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    listed = next(
+        item
+        for item in api.get("/v1/runs", headers=_bearer(key)).json()["runs"]
+        if item["run_id"] == run_id
+    )
+    logs = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
+
+    for projection in (direct, listed, logs):
+        assert "source_provenance" not in json.dumps(projection)
+        assert projection["attempt"]["attempt_id"] == 2
+        assert projection["progress"]["sequence"] == 3
+        assert projection["resource"]["state"] == "running"
+        assert projection["result"]["outcome"] == "done"
+
+
 def test_worker_output_route(api, monkeypatch):
     # /worker surfaces the train-subprocess stdout/traceback from the run's HF repo (operator
     # token, server-side). Best-effort: no artifacts -> empty dict; present -> passed through.
@@ -2391,7 +2452,7 @@ def test_latest_error_artifact_name_picks_highest_attempt(monkeypatch):
         f"{prefix}/error_sft_attempt0.txt",
         f"{prefix}/error_sft_attempt2.txt",
         f"{prefix}/error_sft_attempt1.txt",
-        f"{prefix}/heartbeat.json",
+        f"{prefix}/attempts/2-9/result/deadbeef.json",
         "other/run/error_sft_attempt9.txt",  # different prefix -> ignored
     ]
 
@@ -2730,7 +2791,7 @@ def test_worker_artifacts_keep_previous_attempt_evidence_until_the_retry_uploads
         train=types.SimpleNamespace(hf_repo="org/repo"),
     )
     content = {
-        "rl/r1/console_rl_attempt0.txt": "HEARTBEAT attempt=0 device=NVIDIA H200\n",
+        "rl/r1/console_rl_attempt0.txt": "PROGRESS attempt=0 device=NVIDIA H200\n",
         "rl/r1/error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n",
         "rl/r1/raylogs_rl_attempt0.txt": "raylet exited after OOM\n",
     }
@@ -2753,7 +2814,7 @@ def test_worker_artifacts_keep_previous_attempt_evidence_until_the_retry_uploads
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
 
     assert _worker_artifacts(spec) == {
-        "console_rl_attempt0.txt": "HEARTBEAT attempt=0 device=NVIDIA H200\n",
+        "console_rl_attempt0.txt": "PROGRESS attempt=0 device=NVIDIA H200\n",
         "error_rl_attempt0.txt": "torch.OutOfMemoryError: CUDA OOM\n",
         "raylogs_rl_attempt0.txt": "raylet exited after OOM\n",
     }
@@ -2782,10 +2843,10 @@ def test_worker_artifacts_surface_the_terminal_console_tail_not_only_the_snapsho
     )
     content = {
         # mid-run snapshot: healthy, and the highest-ranked name.
-        "rl/r1/console_rl_attempt0.txt": "HEARTBEAT attempt=0 step=3\n",
+        "rl/r1/console_rl_attempt0.txt": "PROGRESS attempt=0 step=3\n",
         # terminal tail: the same stream, 56k further on, ending in the crash.
         "rl/r1/console_rl.txt": (
-            "HEARTBEAT attempt=0 step=3\nCUDA error: an illegal memory access\n"
+            "PROGRESS attempt=0 step=3\nCUDA error: an illegal memory access\n"
         ),
     }
 
@@ -2810,7 +2871,7 @@ def test_worker_artifacts_surface_the_terminal_console_tail_not_only_the_snapsho
     assert "illegal memory access" in out["console_rl.txt"]
     # the snapshot stays: on a retry whose terminal upload never ran, the canonical name can belong
     # to an OLDER attempt, and the scoped one is then the only evidence for the live attempt.
-    assert out["console_rl_attempt0.txt"] == "HEARTBEAT attempt=0 step=3\n"
+    assert out["console_rl_attempt0.txt"] == "PROGRESS attempt=0 step=3\n"
 
 
 def test_local_env_path_rejected(api):
