@@ -2722,6 +2722,7 @@ def test_default_opener_reset_rediscovers_environment_and_releases_identity(monk
         return _response(request.full_url)
 
     monkeypatch.setattr(urllib.request.HTTPSHandler, "https_open", fake_https_open)
+    urllib.request.install_opener(None)
     monkeypatch.setenv("HTTPS_PROXY", "http://first-proxy.invalid:8080")
     monkeypatch.setenv("NO_PROXY", "")
     with _urlopen_no_redirect(urllib.request.Request("https://source.invalid/first"), timeout=1.0):
