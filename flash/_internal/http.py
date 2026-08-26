@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import enum
 import inspect
 import os
@@ -14,6 +13,15 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+from .http_refs import (
+    _SNAPSHOT_ITEMS_MAX,
+    _TRAVERSAL_NODES_MAX,
+    _getattr_type_static,
+)
+from .http_refs import (
+    _references_target as _find_references_target,
+)
 
 _UrlOpen = Callable[..., Any]
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
@@ -45,6 +53,19 @@ _STDLIB_URLOPEN_NAMES = (
 _HANDLER_COPY_ERROR = "installed urllib handler cannot be copied safely"
 _OPENER_COPY_ERROR = "installed urllib opener cannot be copied safely"
 _URLOPEN_CLASSIFICATION_ERROR = "stdlib urllib transport cannot be classified safely"
+_HANDLER_COPY_METHODS = (
+    "__copy__",
+    "__getattribute__",
+    "__getattr__",
+    "__getnewargs__",
+    "__getnewargs_ex__",
+    "__getstate__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__setstate__",
+    "__setattr__",
+    "add_parent",
+)
 _OPENER_REQUEST_METHODS = (
     "__getattribute__",
     "__getattr__",
@@ -53,9 +74,35 @@ _OPENER_REQUEST_METHODS = (
     "_call_chain",
     "error",
 )
-_SNAPSHOT_DEPTH_MAX = 8
-_SNAPSHOT_ITEMS_MAX = 256
 _ABSENT_SLOT = object()
+_BASE_HANDLER_DICT_DESCRIPTOR = inspect.getattr_static(urllib.request.BaseHandler, "__dict__")
+_OPENER_DICT_DESCRIPTOR = inspect.getattr_static(urllib.request.OpenerDirector, "__dict__")
+_STANDARD_HANDLER_METHODS = tuple(
+    (
+        name,
+        inspect.getattr_static(urllib.request.BaseHandler, name, _ABSENT_SLOT),
+    )
+    for name in _HANDLER_COPY_METHODS
+)
+
+
+def _getattr_handler_static(handler: object, name: str, default: object) -> object:
+    state = types.GetSetDescriptorType.__get__(
+        _BASE_HANDLER_DICT_DESCRIPTOR,
+        handler,
+        type(handler),
+    )
+    if type(state) is not dict:
+        raise TypeError
+    if name in state:
+        return state[name]
+    return _getattr_type_static(type(handler), name, default)
+
+
+def _require_standard_add_parent(handler: object) -> None:
+    standard = urllib.request.BaseHandler.add_parent
+    if _getattr_handler_static(handler, "add_parent", _ABSENT_SLOT) is not standard:
+        raise urllib.error.URLError(_HANDLER_COPY_ERROR)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -106,12 +153,15 @@ def _build_no_redirect_opener(
     """build a private opener that returns redirects as httperrors."""
 
     blocker = _NoRedirectHandler()
+    for handler in handlers:
+        _require_standard_add_parent(handler)
     if add_default_handlers:
         opener = urllib.request.build_opener(blocker, *handlers)
     else:
         opener = urllib.request.OpenerDirector()
         opener.add_handler(blocker)
         for handler in handlers:
+            _require_standard_add_parent(handler)
             opener.add_handler(handler)
     for protocol in ("http", "https"):
         processors = opener.process_response.get(protocol)
@@ -129,39 +179,59 @@ _INSTALLED_OPENER_CACHE: _InstalledOpenerCache | None = None
 def _handles_redirect_error(handler: urllib.request.BaseHandler) -> bool:
     try:
         return any(
-            callable(inspect.getattr_static(handler, f"http_error_{status}", None))
+            callable(_getattr_handler_static(handler, f"http_error_{status}", None))
             for status in _REDIRECT_STATUSES
         )
     except Exception:
         raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
 
 
-def _snapshot_value(value: object, depth: int = 0) -> object:
-    value_type = type(value)
-    if depth > _SNAPSHOT_DEPTH_MAX:
+def _snapshot_value(
+    value: object,
+    seen: set[int] | None = None,
+    active: set[int] | None = None,
+    budget: list[int] | None = None,
+) -> object:
+    if seen is None:
+        seen = set()
+    if active is None:
+        active = set()
+    if budget is None:
+        budget = [0]
+    budget[0] += 1
+    if budget[0] > _TRAVERSAL_NODES_MAX:
         raise ValueError
+    value_type = type(value)
     if value is None or value_type in (bool, int, str, bytes):
         return (value_type, value)
     if value_type is float:
         return (float, struct.pack("!d", value))
-    if value_type in (list, tuple):
-        if len(value) > _SNAPSHOT_ITEMS_MAX:
+    if value_type in (list, tuple, dict, set, frozenset):
+        value_id = id(value)
+        if value_id in active:
             raise ValueError
-        return (value_type, tuple(_snapshot_value(item, depth + 1) for item in value))
-    if value_type is dict:
-        if len(value) > _SNAPSHOT_ITEMS_MAX:
-            raise ValueError
-        return (
-            dict,
-            frozenset(
-                (_snapshot_value(key, depth + 1), _snapshot_value(item, depth + 1))
-                for key, item in value.items()
-            ),
-        )
-    if value_type in (set, frozenset):
-        if len(value) > _SNAPSHOT_ITEMS_MAX:
-            raise ValueError
-        return (value_type, frozenset(_snapshot_value(item, depth + 1) for item in value))
+        if value_id in seen:
+            return ("alias", value_id)
+        seen.add(value_id)
+        active.add(value_id)
+        try:
+            if len(value) > _SNAPSHOT_ITEMS_MAX:
+                raise ValueError
+            if value_type in (list, tuple):
+                snapshot = tuple(_snapshot_value(item, seen, active, budget) for item in value)
+            elif value_type is dict:
+                snapshot = frozenset(
+                    (
+                        _snapshot_value(key, seen, active, budget),
+                        _snapshot_value(item, seen, active, budget),
+                    )
+                    for key, item in value.items()
+                )
+            else:
+                snapshot = frozenset(_snapshot_value(item, seen, active, budget) for item in value)
+        finally:
+            active.remove(value_id)
+        return (value_type, snapshot)
     return ("opaque", id(value_type), id(value))
 
 
@@ -187,9 +257,9 @@ def _mangled_slot_name(owner: type, name: str) -> str:
     return name
 
 
-def _slot_values(
+def _slot_entries(
     handler: urllib.request.BaseHandler,
-) -> tuple[tuple[int, str, object], ...]:
+) -> tuple[tuple[int, str, types.MemberDescriptorType, object], ...]:
     found = []
     seen: set[int] = set()
     handler_type = type(handler)
@@ -210,17 +280,42 @@ def _slot_values(
                 value = types.MemberDescriptorType.__get__(descriptor, handler, handler_type)
             except AttributeError:
                 value = _ABSENT_SLOT
-            found.append((id(owner), slot_name, value))
+            found.append((id(owner), slot_name, descriptor, value))
     return tuple(found)
 
 
-def _slot_config_signature(handler: urllib.request.BaseHandler) -> tuple[object, ...]:
+def _slot_values(
+    handler: urllib.request.BaseHandler,
+) -> tuple[tuple[int, str, object], ...]:
+    return tuple(
+        (owner_id, slot_name, value)
+        for owner_id, slot_name, _descriptor, value in _slot_entries(handler)
+    )
+
+
+def _copy_slot_state(
+    handler: urllib.request.BaseHandler,
+    copied: urllib.request.BaseHandler,
+) -> None:
+    for _owner_id, _slot_name, descriptor, value in _slot_entries(handler):
+        if value is not _ABSENT_SLOT:
+            types.MemberDescriptorType.__set__(descriptor, copied, value)
+
+
+def _slot_config_signature(
+    handler: urllib.request.BaseHandler,
+    seen: set[int],
+    active: set[int],
+    budget: list[int],
+) -> tuple[object, ...]:
     try:
         return tuple(
             (
                 owner_id,
                 slot_name,
-                value if value is _ABSENT_SLOT else _snapshot_value(value),
+                value
+                if value is _ABSENT_SLOT
+                else _snapshot_value(value, seen=seen, active=active, budget=budget),
             )
             for owner_id, slot_name, value in _slot_values(handler)
         )
@@ -228,17 +323,123 @@ def _slot_config_signature(handler: urllib.request.BaseHandler) -> tuple[object,
         raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
 
 
+def _handler_state(handler: urllib.request.BaseHandler) -> dict[str, object]:
+    state = types.GetSetDescriptorType.__get__(
+        _BASE_HANDLER_DICT_DESCRIPTOR,
+        handler,
+        type(handler),
+    )
+    if type(state) is not dict or any(type(name) is not str for name in state):
+        raise TypeError
+    return state
+
+
+def _validate_handler_copy_protocol(
+    handler: urllib.request.BaseHandler,
+    state: dict[str, object],
+) -> None:
+    handler_type = type(handler)
+    metaclass = type(handler_type)
+    if (
+        _getattr_type_static(metaclass, "__getattribute__", _ABSENT_SLOT)
+        is not type.__getattribute__
+    ):
+        raise TypeError
+    for name, standard in _STANDARD_HANDLER_METHODS:
+        if (
+            name in state
+            or _getattr_type_static(handler_type, name, _ABSENT_SLOT) is not standard
+            or _getattr_handler_static(handler, name, _ABSENT_SLOT) is not standard
+        ):
+            raise TypeError
+
+
 def _handler_config_signature(handler: urllib.request.BaseHandler) -> object:
     try:
-        state = object.__getattribute__(handler, "__dict__")
-        if type(state) is not dict or any(type(name) is not str for name in state):
-            raise TypeError
+        state = _handler_state(handler)
+        seen: set[int] = set()
+        active: set[int] = set()
+        budget = [0]
         dictionary = frozenset(
-            (name, _snapshot_value(value)) for name, value in state.items() if name != "parent"
+            (
+                name,
+                _snapshot_value(value, seen=seen, active=active, budget=budget),
+            )
+            for name, value in state.items()
+            if name != "parent"
         )
     except Exception:
         raise urllib.error.URLError(_OPENER_COPY_ERROR) from None
-    return (dictionary, _slot_config_signature(handler))
+    return (dictionary, _slot_config_signature(handler, seen, active, budget))
+
+
+def _references_target(
+    value: object,
+    targets: tuple[object, ...],
+    seen: set[int] | None = None,
+    active: set[int] | None = None,
+    budget: list[int] | None = None,
+    inspect_global_object: bool = False,
+) -> bool:
+    return _find_references_target(
+        value,
+        targets,
+        seen,
+        active,
+        budget,
+        inspect_global_object,
+        _TRAVERSAL_NODES_MAX,
+    )
+
+
+def _trusted_shallow_clone(
+    handler: urllib.request.BaseHandler,
+    state: dict[str, object],
+) -> tuple[urllib.request.BaseHandler, dict[str, object]]:
+    copied = object.__new__(type(handler))
+    copied_state = dict.copy(state)
+    types.GetSetDescriptorType.__set__(
+        _BASE_HANDLER_DICT_DESCRIPTOR,
+        copied,
+        copied_state,
+    )
+    _copy_slot_state(handler, copied)
+    return copied, copied_state
+
+
+def _proxy_callback(
+    method: types.MethodType,
+    proxy: str,
+    proxy_type: str,
+) -> types.FunctionType:
+    def callback(request, proxy=proxy, proxy_type=proxy_type, method=method):
+        return method(request, proxy, proxy_type)
+
+    return callback
+
+
+def _rebuild_proxy_callbacks(
+    copied: urllib.request.BaseHandler,
+    copied_state: dict[str, object],
+) -> None:
+    proxies = copied_state.get("proxies", _ABSENT_SLOT)
+    if type(proxies) is not dict or any(
+        type(name) is not str or type(url) is not str for name, url in proxies.items()
+    ):
+        raise TypeError
+    if "proxy_open" in copied_state:
+        raise TypeError
+    proxy_open = _getattr_type_static(type(copied), "proxy_open", _ABSENT_SLOT)
+    if type(proxy_open) is not types.FunctionType:
+        raise TypeError
+    method = types.MethodType(proxy_open, copied)
+    for proxy_type, proxy in proxies.items():
+        normalized_type = str.lower(proxy_type)
+        copied_state[f"{normalized_type}_open"] = _proxy_callback(
+            method,
+            proxy,
+            normalized_type,
+        )
 
 
 def _copy_installed_handler(
@@ -246,36 +447,60 @@ def _copy_installed_handler(
     opener: urllib.request.OpenerDirector,
 ) -> urllib.request.BaseHandler:
     try:
-        copied = copy.copy(handler)
+        handler_state = _handler_state(handler)
+        _validate_handler_copy_protocol(handler, handler_state)
+        if handler_state.get("parent", _ABSENT_SLOT) is not opener:
+            raise TypeError
+        copied, copied_state = _trusted_shallow_clone(handler, handler_state)
+        _validate_handler_copy_protocol(copied, copied_state)
         if isinstance(handler, urllib.request.ProxyHandler):
-            urllib.request.ProxyHandler.__init__(copied, handler.proxies)
-        copied_state = object.__getattribute__(copied, "__dict__")
-        copied_values = tuple(copied_state.values()) + tuple(
-            value for _owner_id, _slot_name, value in _slot_values(copied)
+            _rebuild_proxy_callbacks(copied, copied_state)
+        if copied_state is handler_state or copied_state.get("parent", _ABSENT_SLOT) is not opener:
+            raise TypeError
+        copied_values = tuple(
+            value for name, value in copied_state.items() if name != "parent"
+        ) + tuple(
+            value
+            for _owner_id, _slot_name, value in _slot_values(copied)
+            if value is not _ABSENT_SLOT
         )
-        retains_original_method = any(
-            type(value) is types.MethodType
-            and object.__getattribute__(value, "__self__") is handler
-            for value in copied_values
-        )
-        invalid = (
-            copied is handler
-            or type(copied) is not type(handler)
-            or copied_state is handler.__dict__
-            or getattr(copied, "parent", None) is not opener
-            or retains_original_method
-        )
+        reference_seen: set[int] = set()
+        reference_active: set[int] = set()
+        reference_budget = [0]
+        retains_target = False
+        for value in copied_values:
+            retains_target = (
+                _references_target(
+                    value,
+                    (handler, opener),
+                    seen=reference_seen,
+                    active=reference_active,
+                    budget=reference_budget,
+                )
+                or retains_target
+            )
+        if retains_target:
+            raise TypeError
     except Exception:
         raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
-    if invalid:
-        raise urllib.error.URLError(_HANDLER_COPY_ERROR)
     return copied
+
+
+def _opener_state(opener: urllib.request.OpenerDirector) -> dict[str, object]:
+    state = types.GetSetDescriptorType.__get__(
+        _OPENER_DICT_DESCRIPTOR,
+        opener,
+        type(opener),
+    )
+    if type(state) is not dict:
+        raise TypeError
+    return state
 
 
 def _validate_installed_opener(opener: urllib.request.OpenerDirector) -> None:
     try:
-        state = object.__getattribute__(opener, "__dict__")
-        if type(state) is not dict or any(name in state for name in _OPENER_REQUEST_METHODS):
+        state = _opener_state(opener)
+        if any(name in state for name in _OPENER_REQUEST_METHODS):
             raise TypeError
         for name in _OPENER_REQUEST_METHODS:
             standard = inspect.getattr_static(urllib.request.OpenerDirector, name, _ABSENT_SLOT)
@@ -298,20 +523,28 @@ def _installed_config(
 ]:
     _validate_installed_opener(opener)
     try:
-        handlers = tuple(opener.handlers)
+        state = _opener_state(opener)
+        raw_handlers = state["handlers"]
+        raw_addheaders = state["addheaders"]
+        if type(raw_handlers) is not list or type(raw_addheaders) is not list:
+            raise TypeError
+        handlers = tuple(raw_handlers)
         addheaders = []
-        for item in opener.addheaders:
-            name, value = item
-            if not isinstance(name, str) or not isinstance(value, str):
+        for item in raw_addheaders:
+            if type(item) is not tuple or len(item) != 2:
+                raise TypeError
+            name = item[0]
+            value = item[1]
+            if type(name) is not str or type(value) is not str:
                 raise TypeError
             addheaders.append((name, value))
     except Exception:
         raise urllib.error.URLError(_OPENER_COPY_ERROR) from None
     handler_signature = (
-        id(opener.handlers),
+        id(raw_handlers),
         tuple((id(handler), _handler_config_signature(handler)) for handler in handlers),
     )
-    addheader_signature = (id(opener.addheaders), tuple(addheaders))
+    addheader_signature = (id(raw_addheaders), tuple(addheaders))
     return handlers, addheaders, handler_signature, addheader_signature
 
 
@@ -326,6 +559,13 @@ def _clone_installed_opener(
         if not _handles_redirect_error(handler)
     ]
     private = _build_no_redirect_opener(*copied, add_default_handlers=False)
+    try:
+        if any(
+            _handler_state(handler).get("parent", _ABSENT_SLOT) is not private for handler in copied
+        ):
+            raise TypeError
+    except Exception:
+        raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
     private.addheaders = list(addheaders)
     return private
 
@@ -345,6 +585,7 @@ def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
         for _attempt in range(3):
             installed = urllib.request._opener
             if installed is None:
+                _INSTALLED_OPENER_CACHE = None
                 return _default_no_redirect_opener()
             handlers, addheaders, handler_signature, addheader_signature = _installed_config(
                 installed
