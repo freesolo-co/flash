@@ -627,6 +627,42 @@ def test_poll_attempt_rejects_result_first_observed_after_terminal_cutoff(monkey
     assert clock["now"] == 221.0
 
 
+def test_poll_attempt_final_probe_accepts_result_visible_during_cutoff_sleep(monkeypatch):
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(work_deadline_at=140.0, result_deadline_at=150.0),
+    )
+    clock, now, sleep = _manual_poll_clock(100.0)
+    monkeypatch.setattr(polling.time, "time", now)
+    monkeypatch.setattr(polling.time, "sleep", sleep)
+    observations = []
+
+    def observe(_context):
+        observations.append(clock["now"])
+        if clock["now"] >= 150.0:
+            return PollResult(True, metrics={"optimizer_steps": 2})
+        return None
+
+    monkeypatch.setattr(polling, "_observe_artifacts", observe)
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda *_args, **_kwargs: {"status": "FAILED"},
+    )
+
+    result = polling.poll_attempt(_runpod_handle(jobs), _poll_spec(), interval_s=30.0)
+
+    assert result.ok
+    assert result.metrics == {"optimizer_steps": 2}
+    assert observations == [100.0, 130.0, 150.0]
+    assert clock["sleeps"] == [30.0, 20.0]
+    assert clock["now"] == 150.0
+
+
 def test_poll_attempt_accepts_result_inside_terminal_visibility_window(monkeypatch):
     from flash.providers.core.base import PollResult
     from flash.providers.runpod.client import api as runpod_api

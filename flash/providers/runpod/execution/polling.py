@@ -215,9 +215,24 @@ def poll_attempt(
     poll_errors = PollErrorTracker(context.say, interval_s)
     terminal_status: str | None = None
     terminal_result_deadline_at: float | None = None
+    terminal_final_probe_pending = False
     artifact_error: str | None = None
     while True:
         if terminal_result_deadline_at is not None:
+            if terminal_final_probe_pending:
+                try:
+                    result = _observe_artifacts(context)
+                    artifact_error = None
+                except AttemptArtifactError as exc:
+                    return PollResult(False, failure="job_failed", detail=str(exc))
+                except Exception as exc:
+                    result = None
+                    artifact_error = type(exc).__name__
+                return (
+                    result
+                    if result is not None
+                    else _missing_result(terminal_status, artifact_error)
+                )
             if time.time() >= terminal_result_deadline_at:
                 return _missing_result(terminal_status, artifact_error)
             try:
@@ -233,9 +248,12 @@ def poll_attempt(
                 return _missing_result(terminal_status, artifact_error)
             if result is not None:
                 return result
-            delay = min(interval_s, terminal_result_deadline_at - observed_at)
-            if delay > 0:
-                time.sleep(delay)
+            remaining = terminal_result_deadline_at - observed_at
+            if interval_s >= remaining:
+                terminal_final_probe_pending = True
+                time.sleep(remaining)
+            elif interval_s > 0:
+                time.sleep(interval_s)
             continue
         try:
             result = _observe_artifacts(context)
@@ -286,9 +304,12 @@ def poll_attempt(
                 attempt.result_deadline_at,
                 terminal_observed_at + _RESULT_VISIBILITY_ALLOWANCE_S,
             )
-            delay = min(interval_s, max(0.0, terminal_result_deadline_at - terminal_observed_at))
-            if delay > 0:
-                time.sleep(delay)
+            remaining = max(0.0, terminal_result_deadline_at - terminal_observed_at)
+            if interval_s >= remaining and remaining > 0:
+                terminal_final_probe_pending = True
+                time.sleep(remaining)
+            elif remaining > 0 and interval_s > 0:
+                time.sleep(interval_s)
             continue
         now = time.time()
         failure = _queue_failure(context, state, status, now)

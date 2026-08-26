@@ -2135,6 +2135,36 @@ def test_poll_lambda_rejects_result_first_observed_after_terminal_cutoff(monkeyp
     assert clock["now"] == 221.0
 
 
+def test_poll_lambda_final_probe_accepts_result_visible_during_cutoff_sleep(monkeypatch):
+    from flash.providers.core.base import PollResult
+
+    jobs, poll_instance = _wire_lambda_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="lambda", work=140.0, result=150.0),
+        instances=[{"status": "terminated"}],
+    )
+    clock, now, sleep = _manual_instance_clock(100.0)
+    monkeypatch.setattr(poll_instance.time, "time", now)
+    monkeypatch.setattr(poll_instance.time, "sleep", sleep)
+    observations = []
+
+    def observe(_adapter):
+        observations.append(clock["now"])
+        if clock["now"] >= 150.0:
+            return PollResult(True, metrics={"wall_seconds": 5.0})
+        return None
+
+    monkeypatch.setattr(poll_instance, "_observe_result", observe)
+
+    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=30.0)
+
+    assert result.ok
+    assert result.metrics == {"wall_seconds": 5.0}
+    assert observations == [100.0, 130.0, 150.0]
+    assert clock["sleeps"] == [30.0, 20.0]
+    assert clock["now"] == 150.0
+
+
 def test_poll_lambda_accepts_result_inside_terminal_visibility_window(monkeypatch):
     from flash.providers.core.base import PollResult
 

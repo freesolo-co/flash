@@ -1169,6 +1169,36 @@ def test_poll_vast_dead_instance_uses_bounded_result_visibility(
     assert clock["now"] == expected_return
 
 
+def test_poll_vast_final_probe_accepts_result_visible_during_cutoff_sleep(monkeypatch):
+    from flash.providers.core.base import PollResult
+
+    vast, poll_instance = _wire_vast_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="vast", work=140.0, result=150.0),
+        instances=[{"actual_status": "exited"}],
+    )
+    clock, now, sleep = _manual_instance_clock(100.0)
+    monkeypatch.setattr(poll_instance.time, "time", now)
+    monkeypatch.setattr(poll_instance.time, "sleep", sleep)
+    observations = []
+
+    def observe(_adapter):
+        observations.append(clock["now"])
+        if clock["now"] >= 150.0:
+            return PollResult(True, metrics={"wall_seconds": 5.0})
+        return None
+
+    monkeypatch.setattr(poll_instance, "_observe_result", observe)
+
+    result = vast.poll_vast_attempt(_handle(), _spec(), interval_s=30.0)
+
+    assert result.ok
+    assert result.metrics == {"wall_seconds": 5.0}
+    assert observations == [100.0, 130.0, 150.0]
+    assert clock["sleeps"] == [30.0, 20.0]
+    assert clock["now"] == 150.0
+
+
 def test_poll_vast_accepts_result_inside_terminal_visibility_window(monkeypatch):
     from flash.providers.core.base import PollResult
 
