@@ -1297,8 +1297,9 @@ def _train_config(tmp_path, *, extra_train: str = ""):
     ],
 )
 def test_train_dry_run_keeps_compatibility_on_stderr(
-    fake_client, tmp_path, capsys, compatibility, expected
+    fake_client, tmp_path, capsys, monkeypatch, compatibility, expected
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     if compatibility is None:
         original_create_run = fake_client.create_run
 
@@ -1457,6 +1458,7 @@ def test_published_rows_keep_their_published_labels(monkeypatch) -> None:
 def test_train_dry_run_sends_declared_runtime_secrets(
     fake_client, tmp_path, capsys, monkeypatch
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     config = tmp_path / "train.toml"
     config.write_text(
         'model = "Qwen/Qwen3.5-9B"\n'

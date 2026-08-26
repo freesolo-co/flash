@@ -89,7 +89,7 @@ def test_persisted_checkpoint_identity_failures(overrides: dict[str, object], me
 
 
 def test_generate_request_rejects_whitespace_adapter_id() -> None:
-    with pytest.raises(ValidationError, match="adapter_id must be"):
+    with pytest.raises(ValidationError, match="value must not be empty"):
         GenerateRequest.model_validate({"adapter_id": "   ", "prompt": "hi"})
 
 
