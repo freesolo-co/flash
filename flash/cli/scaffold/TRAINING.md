@@ -406,83 +406,44 @@ flash runs list                  # all your runs and their state/cost
 flash runs cancel <run-id>            # stop a run
 ```
 
-Live GRPO metrics update at the managed HEARTBEAT cadence, not after every optimizer step.
-The terminal heartbeat carries the latest bounded metric backlog so short runs still surface data.
+Live metrics are cumulative progress observations, not a per-step ledger. A worker publishes
+immutable progress records when useful state changes, so several optimizer steps can be represented
+by one later record. The terminal result manifest carries the final metrics and checkpoint outcome.
 
-**A run that looks frozen usually is not.** Reporting is on a fixed multi-minute cycle, and
-some stages are announced once and then do un-instrumented work — so an unchanging stage
-label, a flat step counter, or an idle GPU **prove nothing on their own**. Two distinct
-situations produce an identical-looking `status`:
+`flash runs status` separates four kinds of information:
 
-- _Normal quiet._ The last heartbeat is recent; the worker is simply between reports.
-- _Preemption._ The worker died mid-stage and stopped heartbeating. The control plane keeps
-  serving the **last** heartbeat it received, so `status` still reports `running` at
-  whatever stage was announced, with a stale GPU snapshot attached.
+- `attempt`: the current attempt, fence, state, and fixed deadlines;
+- `progress`: the latest cumulative worker observation, including completed steps and metrics;
+- `resource`: the latest provider observation, including provider state and transport availability;
+- `result`: the terminal worker outcome once the immutable result manifest is visible.
 
-**Heartbeat _age_ is the useful signal — but it is not proof on its own, and quiet is
-normal.** Uploads are deliberately throttled: during training the worker publishes at most
-about once every **900 s** (15 min), so a timestamp that has not moved for several minutes
-is the _expected_ steady state, not a symptom. Upload failures can stretch the gap further.
-`flash runs status` says so itself once the heartbeat passes 5 minutes — _"heartbeat uploads
-are throttled; quiet is not dead"_.
+**Progress age is informational only.** Missing, sparse, or old progress never proves a failure and
+never causes Flash to terminate a worker, retry, tear down a resource, or extend a deadline. Provider
+observations keep the CLI visibly active while progress is quiet. A provider transition such as a
+new queue or running observation is activity even when the worker has published no new progress.
 
-**The threshold is algorithm-dependent: OPD is far tighter than 15 min.** The 900 s figure is
-the throttle for an ordinary stage ping. OPD's post-update ping is issued with `force=True`,
-which bypasses that throttle and is instead bounded by the forced-commit floor of **60 s**
-(`_HB_FORCE_MIN_INTERVAL_S`), gated on the step having advanced. So an OPD run that is still
-applying updates re-publishes roughly every optimizer step, subject only to that 60 s floor —
-and an OPD heartbeat stuck for several minutes already means updates have stopped, which is
-exactly the window the 15 min guidance below would tell you to ignore on a billed run.
+Provider state describes the resource, not whether training succeeded. A provider reporting
+`COMPLETED`, `FAILED`, or another terminal state does not by itself settle the run. Flash waits within
+the fixed result visibility window for the fenced result manifest, which is the terminal authority
+for success, OOM, retry classification, checkpoint publication, final metrics, and source
+attestation.
 
-So treat age as a threshold, not a verdict, and pick the threshold for the algorithm:
+The fixed deadlines do not move when progress arrives:
 
-- _OPD, past ~2-3 min in a stepping stage (`opd_step`):_ act. Updates should be re-publishing
-  at the 60 s floor, so a multi-minute gap is already anomalous rather than expected quiet.
-  (Setup and rollout stages — `opd_model_load`, `opd_filtering_prompts`, `opd_vllm_initializing`
-  — are liveness-driven and legitimately quieter; the tight threshold is for stepping.)
-- _Otherwise, under ~15 min:_ tells you nothing is wrong. Do not act.
-- _Otherwise, well past ~15 min:_ suspicious, still not conclusive. Corroborate before deciding —
-  check the provider/attempt state, and your `[wandb]` run if you configured one. A retry that has
-  already started will show a new attempt.
+- the grant deadline bounds provider scheduling;
+- the work deadline bounds the supervised worker process group;
+- the result deadline bounds terminal manifest visibility;
+- the run deadline bounds the accepted run wall contract.
 
-**`flash runs log` is not a live feed of worker stdout, and it is not the whole log.** The
-orchestration lines stream as they happen, but the worker's own console output is snapshotted to
-the artifact repo about **once an hour**, plus a final flush when the run ends. Each snapshot
-uploads only the **last 64 KB** of console and overwrites the previous one, so a chatty run loses
-its earlier output permanently, including setup.
+`flash runs log` combines orchestration output with the most recent bounded worker console tail. A
+quiet console is not proof of a frozen worker, and repeated child output is diagnostics rather than
+lifecycle authority. Use `flash runs status` for attempt and provider movement, W&B for live metric
+curves when configured, and the terminal result for the final verdict.
 
-Two consequences worth knowing before you read a quiet log as a broken run:
-
-- A run shorter than the upload interval shows almost no worker output until it finishes, then
-  delivers a batch at the end. A healthy short run can legitimately produce a couple of dozen
-  lines that jump straight from `sft_model_load` to a late step. That is the upload cadence, not
-  a resumed or skipped run.
-- On a long or verbose run, early lines are simply gone. Their absence is the 64 KB window, not
-  evidence the stage never ran.
-
-For progress _while_ a run is live, use the `status` panel's heartbeat age and W&B. Use
-`runs log` for the most recent console tail and a terminating traceback.
-
-**Exception — startup is exempt from all of the above.** While the run is warming up
-(`status` shows a `warmup` row: initializing the model, vLLM, and training kernels) a long
-quiet stretch at 0% GPU is the normal case, not a stall. `status` itself calls this out and
-says _"setup is not billed; do not cancel"_. It can run far longer than the panel's
-"typically several minutes, sometimes 15-20 min" — 40+ minutes before the first step is
-something we have measured on a real run. Do not start the ~15 min clock until you have seen
-step 0 advance to step 1; before that, the only thing worth watching is the `status` panel's
-heartbeat age (and W&B, if configured) — not worker stdout, which lands only on the hourly snapshot
-described above.
-
-Never derive seconds-per-step from total elapsed time (early steps include one-time warmup
-that can dominate a short run).
-
-> **Even on a genuinely stale heartbeat, do NOT cancel.** Flash **auto-retries a preempted job from its
-> last checkpoint**, and the provider's `job_preempted` notice can lag the freeze by ~10
-> minutes. Cancelling races that retry and kills a run that was recovering on its own.
-> Wait for either the automatic retry or a genuine terminal state. Cancel only when a run
-> is confirmed dead with no retry pending, or is burning money on a definite unrecoverable
-> fault. An idle GPU during model load is also not evidence of a hang — and it is not
-> evidence that your GPU class is unhealthy, so do not "fix" it by pinning another one.
+Never derive seconds per step from total elapsed time because early steps include one-time model,
+kernel, and rollout setup. Cancel only for an explicit user decision or a definite unrecoverable
+fault. Do not cancel merely because progress is old or the GPU looks idle during model load; Flash
+handles explicit provider preemption and resource loss through the fenced retry contract.
 
 ### 6. Deploy & chat
 
@@ -711,7 +672,7 @@ spending another GPU run:
 - **Read the model's outputs, not just the metrics.** A rising reward (or falling loss)
   can come from reward-hacking or a degenerate output the metric still credits — metrics
   alone never establish that the model got better. For GRPO and OPD, `flash runs log` surfaces a
-  handful of full (untruncated) sample completions at the heartbeat cadence — GRPO shows
+  handful of full (untruncated) sample completions in bounded progress records — GRPO shows
   each completion's reward, OPD its distillation loss — with the first sample-bearing update
   forced through, so you can catch skipped reasoning or a parroted prompt placeholder by
   step 1-2. These are bounded diagnostics, not every rollout or a held-out
@@ -799,7 +760,7 @@ def score_response(self, example, response_text) -> RewardResult:
 
 `score` is what GRPO optimizes (it becomes the run's `total`). In standard (single-turn)
 GRPO, each `RewardMetric` is averaged across scored completions and logged by name at
-the managed heartbeat cadence, which is not guaranteed to be every optimizer step. That
+the managed progress publication cadence, which is not guaranteed to be every optimizer step. That
 is how the clean success rate becomes visible. Multi-turn scoring currently reports only
 the scalar reward. Use the shaped `score` to confirm the model is learning _at all_, and
 judge the run on the explicit `success` metric.
@@ -1158,12 +1119,10 @@ context budget rather than the turn cap.
 > noisier per-step gradients. Compare concrete `--cost` estimates before and after the
 > change and let those numbers, not the ratio, decide.
 
-Multi-turn generation requests carry no per-request deadline or retry. Neither GRPO nor OPD
-times out an individual generation, an environment call, or a teacher call, and there is no
-episode elapsed-time cutoff. A wedged generation is caught by the training stall watchdog,
-which tears the run down after 25 minutes without progress. That watchdog measures whether
-training is advancing rather than how long one request has taken, so a slow-but-live engine
-is never killed for being slow.
+Multi-turn generation requests carry no independent per-request lifecycle authority. Neither GRPO
+nor OPD infers attempt failure from one quiet generation, environment call, teacher call, or child
+output stream. The fixed work deadline bounds the supervised worker process group, while bounded
+silence diagnostics help explain what the child and parent were doing without triggering teardown.
 
 > **The reward-hacking signature:** a smoothed reward rising while mean generated
 > length collapses. Whenever any shortness or format pressure is active, verify the
@@ -1592,13 +1551,13 @@ truncated, ends the episode, and is dropped before teacher scoring. If every rol
 dropped, the step fails with `produced no aligned teacher signal`. Partial dropping is more dangerous:
 it can silently bias training toward shorter episodes, so monitor the per-step `truncation_rate` and
 `discarded_rollouts` metrics rather than relying on the loss alone. Read them as a sampled indicator,
-not a ledger: heartbeats are throttled, so a step that finishes shortly after the previous one does
-not publish its own values, and a nonzero reading means truncation pressure around that point in the
-run rather than an exact count for that step.
+not a ledger: progress is cumulative and observational, so a step can be represented by a later
+record rather than publishing its own values. A nonzero reading means truncation pressure around
+that point in the run rather than an exact count for that step.
 
 ---
 
-## When a run stalls
+## When learning plateaus
 
 A plateau is not automatically a capability ceiling. Before you call it one:
 
@@ -1729,11 +1688,9 @@ there for the life of the run. A single card is spelled without the `Nx` prefix.
 
 Do **not** read the allocated count off `spec.gpu.count` in `flash runs status`. It echoes an
 authored ceiling, and an auto-sized public spec retains the digest-stable integer placeholder rather
-than the selected shape. `gpu_status.device_count` is a genuine worker-side observation, but it is
-not a reliable place to look either: the mid-run heartbeats
-(`sft_train`, `opd_step`, `rl_step`) collect diagnostics without torch, and each heartbeat _replaces_
-`gpu_status` wholesale, so the field is usually absent while a run is live and reappears only on the
-terminal heartbeat.
+than the selected shape. Use the allocation line in `flash runs log` and the current `resource`
+projection instead. Worker GPU diagnostics are bounded observations and are not the allocation or
+terminal authority.
 
 GRPO, SFT and OPD all shard across the selected count with no backend key to set, and all three shard
 by **data**: one rank per card, with each rank holding whole sequences. Sequence parallelism is not
