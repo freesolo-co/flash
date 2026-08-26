@@ -287,13 +287,13 @@ def test_generate_request_accepts_a_raw_json_schema():
     assert req.structured_outputs == {"json": SCHEMA}
 
 
-def test_generate_request_ignores_a_response_format_key():
-    # response_format is no longer an accepted alias: a top-level response_format key is not the
-    # structured-outputs spec, so the field stays unset (None = inherit the adapter default).
-    req = GenerateRequest.model_validate(
-        {"adapter_id": "a", "prompt": "hi", "response_format": {"type": "json_object"}}
-    )
-    assert req.structured_outputs is None
+def test_generate_request_rejects_a_response_format_key():
+    # response_format belongs only to the strict openai chat boundary. raw generation must reject
+    # it rather than silently dispatching an unconstrained request.
+    with pytest.raises(ValueError, match="extra_forbidden"):
+        GenerateRequest.model_validate(
+            {"adapter_id": "a", "prompt": "hi", "response_format": {"type": "json_object"}}
+        )
 
 
 def test_generate_request_keeps_explicit_off_distinct_from_absent():

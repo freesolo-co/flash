@@ -27,7 +27,7 @@ def usage_facts(result: Mapping[str, Any]) -> UsageFacts:
     completion_tokens = result.get("completion_tokens")
     if isinstance(prompt_ids, list) and prompt_ids:
         prompt_tokens = len(prompt_ids)
-    if isinstance(completion_ids, list) and completion_ids:
+    if isinstance(completion_ids, list) and completion_ids and completion_tokens is None:
         completion_tokens = len(completion_ids)
     if not isinstance(prompt_tokens, int) or not isinstance(completion_tokens, int):
         raise UsageOutboxError("native_token_ids_unavailable")

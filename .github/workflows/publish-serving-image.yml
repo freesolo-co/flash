@@ -85,7 +85,8 @@ jobs:
       # while the tags keep pointing at the old one. that is the whole COPY set -- `flash`, the
       # lockfile, the launcher, and the files copied alongside them -- plus `.dockerignore`, which
       # decides what the build context contains at all, and this workflow file, so a change to the
-      # build here republishes rather than leaving the old image serving under the same tags.
+      # build here republishes rather than leaving the old image serving under the same tags. the
+      # build-time vllm repair lives outside flash/, so its exact path is an explicit image input.
       - name: Decide whether to publish
         id: gate
         working-directory: .
@@ -127,7 +128,7 @@ jobs:
             publish=true
           elif ! changed="$(git diff --name-only "$last_published_sha" "$CURRENT_SHA" 2>/dev/null)"; then
             publish=true
-          elif grep -qE "^(flash/|Dockerfile\.serve$|\.dockerignore$|serve_launch\.py$|pyproject\.toml$|uv\.lock$|README\.md$|LICENSE$|NOTICE$|\.github/workflows/publish-serving-image\.yml$)" <<< "$changed"; then
+          elif grep -qE "^(flash/|docker/patch_vllm_moe_lora\.py$|Dockerfile\.serve$|\.dockerignore$|serve_launch\.py$|pyproject\.toml$|uv\.lock$|README\.md$|LICENSE$|NOTICE$|\.github/workflows/publish-serving-image\.yml$)" <<< "$changed"; then
             publish=true
           fi
           echo "publish=$publish" >> "$GITHUB_OUTPUT"

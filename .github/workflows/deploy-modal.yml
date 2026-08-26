@@ -118,8 +118,9 @@ jobs:
           # any `flash/` change, not just `flash/serving/`: the image ships the whole package via
           # `add_local_python_source("flash")`, so a change anywhere under flash/ can alter what runs
           # in the container. narrowing this to flash/serving/ would let the deployed app drift from
-          # the merged source. pyproject/uv.lock gate the image's dependency bounds.
-          elif grep -qE "^(flash/|pyproject\.toml$|uv\.lock$|\.github/workflows/deploy-modal\.yml$)" <<< "$changed"; then
+          # the merged source. pyproject/uv.lock gate dependency bounds, and the build-time vllm
+          # repair lives outside flash/, so its exact path must trigger a rebuild too.
+          elif grep -qE "^(flash/|docker/patch_vllm_moe_lora\.py$|pyproject\.toml$|uv\.lock$|\.github/workflows/deploy-modal\.yml$)" <<< "$changed"; then
             deploy=true
           fi
           echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
