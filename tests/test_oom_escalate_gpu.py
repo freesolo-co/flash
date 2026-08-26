@@ -359,9 +359,7 @@ def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
         candidates=(failed,),
         run_spec=types.SimpleNamespace(gpu=types.SimpleNamespace(network_volume=None)),
     )
-    monkeypatch.setattr(
-        seed_submission._lifecycle, "_await_runpod_completed_metrics", lambda *a, **k: None
-    )
+    monkeypatch.setattr(seed_submission._lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
     monkeypatch.setattr(
         "flash.runner.lifecycle.deadlines._load_run_deadline_at", lambda _run_id: None
     )
@@ -401,139 +399,40 @@ def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
     assert single_96 in _oom_escalated([single_96], _candidate_usable_vram_gb(triple_40))
 
 
-def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
-    from flash.providers.runpod.execution.jobs import surfaced_worker_flags
+def test_verified_result_manifest_maps_oom_to_escalation_failure():
+    from flash.providers.artifacts.attempts import poll_result_from_manifest
+    from flash.runner.lifecycle.protocol import ResultManifest
 
-    say = lambda _m: None  # noqa: E731
-    reads = {"n": 0}
-
-    def reader(force=False):
-        reads["n"] += 1
-        return {"oom": True, "attempt": 0, "retriable": False, "stage": "rl_train"}
-
-    _key, retriable, oom = surfaced_worker_flags(reader, None, say, 0, launch_ts=1.0)
-    assert (retriable, oom) == (False, True)
-    assert reads["n"] == 1
-    assert surfaced_worker_flags(
-        lambda force=False: {"retriable": True, "attempt": 0, "ts": 10_500.0},
-        None,
-        say,
-        0,
-        launch_ts=10_000.0,
-    )[1:] == (True, False)
-    assert surfaced_worker_flags(
-        lambda force=False: {"retriable": True, "attempt": 1, "ts": 10_500.0},
-        None,
-        say,
-        0,
-        launch_ts=10_000.0,
-    )[1:] == (False, False)
-    assert surfaced_worker_flags(None, None, say)[1:] == (False, False)
-
-
-def test_heartbeat_oom_for_attempt_gates_stale_flag():
-    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
-
-    assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, 0) is True
-    assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, 1) is False
-    assert heartbeat_oom_for_attempt({"oom": True, "attempt": 1}, 1) is True
-    assert heartbeat_oom_for_attempt({"oom": True}, 1) is False
-    assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, None) is False
-    assert heartbeat_oom_for_attempt(None, 0) is False
-    assert heartbeat_oom_for_attempt({"retriable": True}, 0) is False
-
-
-@pytest.mark.parametrize(
-    ("heartbeat_attempt", "current_attempt"),
-    [(0, 0), (7, 7)],
-)
-def test_heartbeat_oom_accepts_only_canonical_attempt_identities(
-    heartbeat_attempt, current_attempt
-):
-    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
-
-    assert heartbeat_oom_for_attempt({"oom": True, "attempt": heartbeat_attempt}, current_attempt)
-
-
-@pytest.mark.parametrize(
-    "malformed_attempt",
-    [
-        True,
-        False,
-        1.0,
-        -1,
-        "0",
-        "7",
-        "007",
-        "-1",
-        "+1",
-        " 1",
-        "1 ",
-        "",
-        chr(0x661),
-        chr(0xFF11),
-        object(),
-    ],
-)
-def test_heartbeat_oom_rejects_malformed_heartbeat_attempt(malformed_attempt):
-    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
-
-    assert heartbeat_oom_for_attempt({"oom": True, "attempt": malformed_attempt}, 1) is False
-
-
-@pytest.mark.parametrize(
-    "malformed_attempt",
-    [
-        True,
-        False,
-        1.0,
-        -1,
-        "0",
-        "7",
-        "007",
-        "-1",
-        "+1",
-        " 1",
-        "1 ",
-        "",
-        chr(0x661),
-        chr(0xFF11),
-        object(),
-    ],
-)
-def test_heartbeat_oom_rejects_malformed_current_attempt(malformed_attempt):
-    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
-
-    assert heartbeat_oom_for_attempt({"oom": True, "attempt": 1}, malformed_attempt) is False
-
-
-def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
-    from flash.providers.runpod.client import api as runpod_api
-    from flash.providers.runpod.execution import jobs, polling
-
-    monkeypatch.setattr(polling.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(
-        runpod_api,
-        "job_status",
-        lambda _eid, _jid, **_kw: {"status": "FAILED", "error": "x"},
+    manifest = ResultManifest(
+        run_id="run-1",
+        phase_namespace="rl",
+        attempt_id=2,
+        fence=9,
+        outcome="failed",
+        failure_class="oom",
+        started_at=100.0,
+        finished_at=120.0,
+        training_entered=True,
+        completed_steps=1,
+        metrics={},
+        checkpoint={},
+        artifacts={},
+        source_attestation={
+            "kind": "flash-source-attestation",
+            "format_version": 1,
+            "sha256": "a" * 64,
+            "revision": "b" * 40,
+            "run_id": "run-1",
+            "attempt": 2,
+            "fence": 9,
+        },
+        diagnostics={"error": "cuda out of memory"},
     )
-    handle = jobs.JobHandle("ep", "name", "rpk-" + "0" * 64, "job", 2, 1.0)
 
-    res = polling.poll_job(
-        handle,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: {"oom": True, "attempt": 2},
-        current_attempt=2,
-    )
-    assert res.failure == "oom"
+    result = poll_result_from_manifest(manifest.to_dict())
 
-    res = polling.poll_job(
-        handle,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: {"oom": True, "attempt": 1},
-        current_attempt=2,
-    )
-    assert res.failure == "job_failed"
+    assert result.failure == "oom"
+    assert result.detail == "cuda out of memory"
 
 
 def test_worker_failure_flags_prioritize_retriable_over_oom(monkeypatch):

@@ -10,6 +10,7 @@ import contextlib
 import logging
 import os
 import threading
+import time
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
 from flash.core.spec import JobSpec
@@ -233,18 +234,12 @@ def _fail_blocked_recovery(
     expected_remote: dict | None = None,
 ) -> bool:
     from flash.runner.accounting.reconciliation import _compare_and_fail_remote
-    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-    from flash.runner.supervise.lifecycle import _adopt_completed_attempt, _CompletedAttemptPending
+    from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
     status = get_status(spec.run_id)
     if status.remote is None:
-        try:
-            deadline_at = _load_run_deadline_at(spec.run_id)
-        except RuntimeError:
-            deadline_at = float(status.created_at) + float(spec.gpu.max_wall_seconds)
-        try:
-            metrics = _handleless_completed_metrics(spec, status, deadline_at)
-        except _CompletedAttemptPending:
+        metrics, pending, _attempt = _handleless_attempt_resolution(spec, status)
+        if pending:
             return False
         if metrics is not None:
             applied = _adopt_completed_attempt(
@@ -319,6 +314,25 @@ def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | No
     return _attempt_result_metrics(spec.run_id)
 
 
+def _handleless_attempt_resolution(spec, status):
+    """resolve current-fence success or report that authoritative observation is pending."""
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    try:
+        attempt = AttemptRecord.from_dict(status.attempt)
+    except (TypeError, ValueError):
+        return None, False, None
+    if not isinstance(status.source_snapshot, dict):
+        return None, False, attempt
+    try:
+        metrics = _handleless_completed_metrics(spec, status, attempt.result_deadline_at)
+    except Exception:
+        return None, True, attempt
+    if metrics is not None:
+        return metrics, False, attempt
+    return None, time.time() < attempt.result_deadline_at, attempt
+
+
 def _deferred_resubmit_loop(spec) -> None:
     """Reconcile a handle-less maybe-live instance through the run wall deadline."""
     import time
@@ -347,9 +361,8 @@ def _deferred_resubmit_loop(spec) -> None:
                 continue
             return
         if time.time() >= deadline_at:
-            try:
-                metrics = _handleless_completed_metrics(spec, status, deadline_at)
-            except Exception:
+            metrics, pending, _attempt = _handleless_attempt_resolution(spec, status)
+            if pending:
                 time.sleep(_DEFERRED_RECOVERY_RETRY_S)
                 continue
             if metrics is not None:

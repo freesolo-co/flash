@@ -38,7 +38,7 @@ _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
-def _remote(endpoint_id, job_id, attempt):
+def _remote(endpoint_id, job_id, attempt, fence=None):
     return {
         "provider": "runpod",
         "endpoint_id": endpoint_id,
@@ -46,8 +46,29 @@ def _remote(endpoint_id, job_id, attempt):
         "key_fingerprint": _RUNPOD_FINGERPRINT,
         "job_id": job_id,
         "attempt": attempt,
+        "fence": attempt + 1 if fence is None else fence,
         "started_ts": float(attempt + 1),
     }
+
+
+def _provisioned_status(spec, *, state="running", remote=None, **kwargs):
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    status = provisioned_status(spec, state=state, remote=remote, **kwargs)
+    if remote is not None:
+        status.attempt = AttemptRecord(
+            remote["attempt"],
+            remote["fence"],
+            "active",
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            3.0,
+            provider=remote["provider"],
+            resource=remote,
+        ).to_dict()
+    return status
 
 
 def _res(name):
@@ -155,7 +176,7 @@ def test_cancel_run_revocation_failure_defers_until_after_fence_and_teardown(
             "run_id": f"flash-revoke-failure-{failed_revocation_call}",
         }
     )
-    status = provisioned_status(
+    status = _provisioned_status(
         spec,
         state="running",
         remote=_remote("endpoint-1", "job-1", 1),
@@ -203,7 +224,7 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
             "run_id": "flash-9-feedface",
         }
     )
-    st = provisioned_status(spec, state="running")
+    st = _provisioned_status(spec, state="running")
     runner_state._save_status(st)
 
     calls = {}
@@ -236,7 +257,7 @@ def test_cancel_tears_down_every_acceptable_class_of_an_ordered_pin(tmp_path, mo
             "run_id": "flash-9-feedface",
         }
     )
-    runner_state._save_status(provisioned_status(spec, state="running"))
+    runner_state._save_status(_provisioned_status(spec, state="running"))
 
     terminated: list[str] = []
     monkeypatch.setattr(
@@ -638,7 +659,7 @@ def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-retry"})
     remote = {**_remote("endpoint-exact", "job-exact", 7), "seed": 42}
-    runner_state._save_status(provisioned_status(spec, state="running", remote=remote))
+    runner_state._save_status(_provisioned_status(spec, state="running", remote=remote))
     events = []
 
     class Provider:
@@ -776,8 +797,15 @@ def _make_poll_provider(monkeypatch, *, on_poll):
     Also no-ops _gc_run_endpoints so attach_run's teardown doesn't reach the real SDK.
     """
     from flash.providers.core import registry as providers
+    from flash.providers.runpod.client import api as runpod_api
 
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda *a, **k: None)
+    monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_args: None)
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda _endpoint_id, _fingerprint: True,
+    )
 
     class _StubProvider:
         def poll(self, handle, spec, seed, *, log=None, _deadline_at=None):
@@ -826,7 +854,11 @@ def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkey
         # (top of attach_run) but BEFORE the not-ok recovery resume below.
         runner_status._update(spec.run_id, "failed", error="raced terminal by another thread")
         assert runner_status.get_status(spec.run_id).state == "failed"  # the race landed
-        return PollResult(False, failure="stalled", detail="control plane was down")
+        return PollResult(
+            False,
+            failure="job_preempted",
+            detail="provider reported worker loss",
+        )
 
     _make_poll_provider(monkeypatch, on_poll=racing_poll)
 
@@ -846,7 +878,7 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
     from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-recover-active"})
-    st = provisioned_status(spec, state="running", remote=_remote("ep-1", "job-1", 0))
+    st = _provisioned_status(spec, state="running", remote=_remote("ep-1", "job-1", 0))
     st.source_snapshot = _SOURCE_SNAPSHOT
     runner_state._save_status(st)
 
@@ -860,7 +892,11 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
 
     _make_poll_provider(
         monkeypatch,
-        on_poll=lambda h, s, seed: PollResult(False, failure="stalled", detail="redeploy"),
+        on_poll=lambda h, s, seed: PollResult(
+            False,
+            failure="job_preempted",
+            detail="provider reported worker loss",
+        ),
     )
 
     out = runner_attach.attach_run(spec.run_id)

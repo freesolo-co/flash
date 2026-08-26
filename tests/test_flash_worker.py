@@ -31,10 +31,14 @@ def _spec():
 def _run_deadline_fields() -> dict[str, float | int]:
     run_created_at = time.time()
     run_max_wall_seconds = 3600
+    work_deadline_at = run_created_at + run_max_wall_seconds
     return {
         "run_created_at": run_created_at,
         "run_max_wall_seconds": run_max_wall_seconds,
-        "deadline_at": run_created_at + run_max_wall_seconds,
+        "deadline_at": work_deadline_at,
+        "work_deadline_at": work_deadline_at,
+        "result_deadline_at": work_deadline_at + 900,
+        "fence": 1,
     }
 
 
@@ -1253,10 +1257,11 @@ def _serialized_sft_console():
 def test_train_body_uploads_console_on_missing_metrics(
     monkeypatch, tmp_path, console_lines, terminated
 ):
-    """The 'crashed before finishing' path (no /tmp/metrics.json) MUST upload the captured console
-    even when the worker exited 0 — run_mode only uploads on a non-zero exit, so an OOM/segfault or
-    silent early-exit otherwise leaves the failure undebuggable (no metrics, often no error_<phase>,
-    and the message points at a console that was never uploaded)."""
+    """A clean provider exit without inline metrics still uploads the captured console.
+
+    The immutable result manifest is terminal authority, so the provider response only attests the
+    result transport. The console remains necessary for diagnosing a worker that did not publish it.
+    """
     import contextlib
     import os
     import subprocess
@@ -1312,6 +1317,14 @@ def test_train_body_uploads_console_on_missing_metrics(
             "    threading.Thread(target=late, daemon=True).start()\n"
             "    stop.wait()\n"
         )
+        processes = target / "flash/providers/_lifecycle/bootstrapping/processes.py"
+        processes.write_text(
+            "import subprocess\n"
+            "def start_process_group(command, **kwargs):\n"
+            "    return subprocess.Popen(command, **kwargs), 1\n"
+            "def terminate_process_group(process, *, process_group_id):\n"
+            "    return None\n"
+        )
         artifacts = target / "flash/adapters/artifacts.py"
         artifacts.parent.mkdir(parents=True, exist_ok=True)
         artifacts.write_text(
@@ -1362,9 +1375,9 @@ def test_train_body_uploads_console_on_missing_metrics(
     }
 
     try:
-        with pytest.raises(RuntimeError, match=r"produced no /tmp/metrics\.json"):
-            endpoints._train_body(input_data)
+        result = endpoints._train_body(input_data)
 
+        assert result == {"attempt": 7, "fence": 1, "result_transport": "hf"}
         paths = [upload["path_in_repo"] for upload in uploads]
         assert paths == [
             "sft/flash-test-run/exact_console_sft_attempt7.txt",
@@ -1433,23 +1446,19 @@ def test_train_body_rejects_malformed_source_descriptor_before_download(monkeypa
         )
 
 
-def test_first_console_snapshot_precedes_stall_teardown():
-    import importlib
-    import inspect
-
+def test_console_uploads_an_early_snapshot_before_hourly_cadence():
     from flash.providers._lifecycle.bootstrapping import console as bootstrap_console
 
-    importlib.import_module("flash.providers.runpod.execution.jobs")
-    poll_job = importlib.import_module("flash.providers.runpod.execution.polling").poll_job
-    defaults = inspect.signature(poll_job).parameters
-    training_stall_s = defaults["stall_after_s"].default
-    setup_grace_s = defaults["setup_grace_s"].default
-
-    # the serverless handler loads this exact module rather than shipping its own copy, so these
-    # constants have one home and both providers are bound by the same margin.
-    assert training_stall_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    assert setup_grace_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    assert training_stall_s > 2 * bootstrap_console._CONSOLE_UPLOAD_POLL_S
+    # both provider paths share this module, so the first snapshot remains available well before the
+    # normal hourly upload while polling often enough to observe the boundary without a long delay.
+    assert (
+        bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+        < bootstrap_console._CONSOLE_UPLOAD_INTERVAL_S
+    )
+    assert (
+        bootstrap_console._CONSOLE_UPLOAD_POLL_S
+        < bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
+    )
 
 
 def test_min_cuda_for_uses_the_gpu_class_floor():

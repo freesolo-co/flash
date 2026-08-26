@@ -117,11 +117,12 @@ def _lambda_handle(instance_id="i1", attempt=0):
         "gpu": "A100",
         "hourly_usd": 1.0,
         "attempt": attempt,
+        "fence": attempt + 1,
         "started_ts": float(attempt + 1),
     }
 
 
-def _runpod_handle(endpoint_id="ep", job_id="j", attempt=0):
+def _runpod_handle(endpoint_id="ep", job_id="j", attempt=0, fence=None):
     return {
         "provider": "runpod",
         "endpoint_id": endpoint_id,
@@ -129,6 +130,7 @@ def _runpod_handle(endpoint_id="ep", job_id="j", attempt=0):
         "key_fingerprint": _RUNPOD_FINGERPRINT,
         "job_id": job_id,
         "attempt": attempt,
+        "fence": attempt + 1 if fence is None else fence,
         "started_ts": float(attempt + 1),
     }
 
@@ -480,10 +482,12 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(
     assert not resource_live["value"]
 
 
-def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch, monkeypatch):
+def test_concurrent_supervisors_keep_only_the_current_fenced_provider(orch, monkeypatch):
     from flash.providers.core import allocator
     from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import job_execution as rp_jobs
+    from flash.runner.supervise.errors import _TerminalHandleRace
 
     spec = _spec(run_id="flash-concurrent-supervisors", max_retries=0)
     runner_state._save_status(
@@ -495,24 +499,43 @@ def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch,
         return _alloc(gpu=gpu)
 
     monkeypatch.setattr(allocator, "allocate", allocate_for_supervisor)
+    cancelled = []
+    deleted = []
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda endpoint_id, job_id, **_kwargs: cancelled.append((endpoint_id, job_id))
+        or {"status": "CANCELLED"},
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda endpoint_id, _fingerprint: deleted.append(endpoint_id) or True,
+    )
 
-    resource_created = threading.Event()
-    allow_handle = threading.Event()
-    polling = threading.Event()
-    allow_poll = threading.Event()
+    first_resource_created = threading.Event()
+    allow_first_handle = threading.Event()
     provider_gpus = []
 
     def fake_runpod_submit(run_spec, seed, *, on_handle, **kwargs):
         provider_gpus.append(run_spec.gpu.type)
-        resource_created.set()
-        assert allow_handle.wait(timeout=5)
-        on_handle(_runpod_handle("ep-first", "job-first"))
-        polling.set()
-        assert allow_poll.wait(timeout=5)
+        if threading.current_thread().name == "supervisor-a":
+            first_resource_created.set()
+            assert allow_first_handle.wait(timeout=5)
+            endpoint_id, job_id = "ep-first", "job-first"
+        else:
+            endpoint_id, job_id = "ep-second", "job-second"
+        on_handle(
+            _runpod_handle(
+                endpoint_id,
+                job_id,
+                attempt=kwargs["attempt"],
+                fence=kwargs["fence"],
+            )
+        )
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
-
     results = {}
 
     def submit(name):
@@ -526,28 +549,27 @@ def test_concurrent_supervisors_preserve_first_effective_spec_and_provider(orch,
     first = threading.Thread(target=submit, args=("first",), name="supervisor-a")
     second = threading.Thread(target=submit, args=("second",), name="supervisor-b")
     first.start()
-    assert resource_created.wait(timeout=5)
+    assert first_resource_created.wait(timeout=5)
     second.start()
     second.join(timeout=0.1)
     assert second.is_alive()
 
-    allow_handle.set()
-    assert polling.wait(timeout=5)
+    allow_first_handle.set()
+    first.join(timeout=5)
     second.join(timeout=5)
+
+    assert not first.is_alive()
     assert not second.is_alive()
-    assert isinstance(results["second"], runner_errors._RunCancelled)
-    assert provider_gpus == ["RTX 4090"]
+    assert isinstance(results["first"], _TerminalHandleRace)
+    assert results["second"]["train_tokens"] == 4096
+    assert provider_gpus == ["RTX 4090", "RTX 5090"]
+    assert cancelled == [("ep-first", "job-first")]
+    assert deleted == ["ep-first", "ep-second"]
 
     status = runner_status.get_status(spec.run_id)
     worker_spec = status.effective_preparation["worker_spec"]
-    assert worker_spec["gpu"]["type"] == "RTX 4090"
-    assert status.remote["endpoint_id"] == "ep-first"
-
-    allow_poll.set()
-    first.join(timeout=5)
-    assert not first.is_alive()
-    assert results["first"]["train_tokens"] == 4096
-    assert provider_gpus == ["RTX 4090"]
+    assert worker_spec["gpu"]["type"] == "RTX 5090"
+    assert status.remote["endpoint_id"] == "ep-second"
 
 
 @pytest.mark.parametrize(
@@ -1224,7 +1246,7 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
         submitted_gpus.append(run_spec.gpu.type)
         if attempt == 0:
             on_handle(_runpod_handle("ep1", "j1", attempt))
-            return PollResult(False, failure="stalled", detail="no worker progress")
+            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
         on_handle(_runpod_handle("ep2", "j2", attempt))
         return PollResult(True, metrics={"train_tokens": 4096})
 
@@ -1372,7 +1394,7 @@ def test_unconfirmed_runpod_teardown_retains_handle_and_blocks_retry(orch, monke
     def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         submitted_attempts.append(attempt)
         on_handle(_runpod_handle("ep-unconfirmed", "job-unconfirmed", attempt))
-        return PollResult(False, failure="stalled", detail="no worker progress")
+        return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_runpod_submit)
     spec = _spec(run_id="flash-unconfirmed-runpod-teardown")
@@ -1781,11 +1803,8 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     assert runner_status.get_status(spec.run_id).remote["provider"] == "runpod"
 
 
-def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
-    """The new fast first-liveness failover returns failure='stalled' (a sick region where the box
-    reached 'active' but the worker never booted). It is infra-shaped, so the retry ESCAPES to a
-    different provider rather than re-rolling the same sick substrate — the observed us-east-1 /
-    CANADA-1 case, now caught in ~15 min instead of ~50."""
+def test_explicit_provider_loss_escapes_to_other_provider(orch, monkeypatch):
+    """An explicit provider loss is infra-shaped and escapes the failed substrate."""
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, PollResult
     from flash.providers.lambda_ import jobs as lambda_jobs
@@ -1810,8 +1829,8 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
             on_handle(_lambda_handle(attempt=attempt))
         return PollResult(
             False,
-            failure="stalled",
-            detail="no worker liveness (boot.log/heartbeat) within 900s of instance active",
+            failure="job_preempted",
+            detail="provider reported instance loss",
         )
 
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
@@ -1935,7 +1954,7 @@ def _retry_block(log_text: str, attempt: int) -> str:
 def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monkeypatch):
     """LS-008/AT-013: a capacity failure on the LAST fitting class used to say the run was 'retrying
     on the next-best GPU' while the picker had nowhere to walk and re-selected that same class. The
-    log must describe the retry that actually happens. A stalled failure now exercises the same
+    log must describe the retry that actually happens. An explicit provider loss exercises the same
     last-class retry message because ordinary exhausted capacity stops instead."""
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, PollResult
@@ -1958,7 +1977,7 @@ def test_no_capacity_retry_message_names_the_class_it_actually_reuses(orch, monk
         gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt == 0:
-            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
+            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -1984,8 +2003,8 @@ def test_retry_message_admits_when_the_projected_provider_already_failed(orch, m
     True for all of them and the escape degrades to plain cheapest-first. The line then reads as
     recovery while the run loops on the substrate that is failing -- the shape of a 46-attempt
     profile loop that printed a failover target it never acted on. The operator's fix is another
-    provider, not more waiting, so the message has to say the pool is exhausted. A stalled failure
-    keeps the retry-message path active while preserving the same provider topology.
+    provider, not more waiting, so the message has to say the pool is exhausted. An explicit provider
+    loss keeps the retry-message path active while preserving the same provider topology.
     """
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, PollResult
@@ -2008,7 +2027,7 @@ def test_retry_message_admits_when_the_projected_provider_already_failed(orch, m
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt < 2:
-            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
+            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -2149,7 +2168,7 @@ def test_last_gpu_retry_message_names_the_clamped_back_class_not_the_current_one
         gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt < 2:
-            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
+            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -2278,8 +2297,8 @@ def test_cache_drop_failure_detail_does_not_contradict_the_action_line(orch, mon
 def test_projected_retry_class_is_worded_as_a_projection_not_a_promise(orch, monkeypatch):
     """The projection reads the CURRENT candidate list, but the next attempt calls allocate() again.
     Providers that rebuild candidates from live capacity can drop the named class or surface a
-    cheaper one, so the log must not claim this is the class the retry will certainly use. A stalled
-    failure keeps this projection observable after exhausted capacity became terminal."""
+    cheaper one, so the log must not claim this is the class the retry will certainly use. An explicit
+    provider loss keeps this projection observable after exhausted capacity became terminal."""
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, PollResult
     from flash.providers.runpod.client import api as runpod_api
@@ -2306,7 +2325,7 @@ def test_projected_retry_class_is_worded_as_a_projection_not_a_promise(orch, mon
         gpus.append(run_spec.gpu.type)
         on_handle(_runpod_handle("ep1", "j1", attempt))
         if attempt == 0:
-            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
+            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -2375,7 +2394,7 @@ def test_sole_class_cache_drop_does_not_claim_the_class_is_exhausted(orch, monke
 def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
     """The complement of the cache-drop case: a plain infra retry DOES mark the class tried, so with
     one fitting class the clause is accurate and must survive. Guards against fixing the false
-    positive by deleting the clause outright. A stalled failure exercises this ordinary infra retry.
+    positive by deleting the clause outright. An explicit provider loss exercises this infra retry.
     """
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, PollResult
@@ -2394,7 +2413,7 @@ def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
     def fake_rp(run_spec, seed, log=None, on_handle=None, attempt=0, **kw):
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         if attempt == 0:
-            return PollResult(False, failure="stalled", detail="worker stopped reporting progress")
+            return PollResult(False, failure="job_preempted", detail="provider reported worker loss")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_rp)
@@ -2408,21 +2427,29 @@ def test_sole_class_infra_retry_still_reports_exhaustion(orch, monkeypatch):
     assert "no untried GPU class fits this run" in action, action
 
 
-def test_submit_supplies_the_worker_pip_when_the_author_declared_none() -> None:
+def test_submit_supplies_the_worker_pip_when_the_author_declared_none(monkeypatch) -> None:
     """``worker_pip_for_env`` is the baseline every worker needs to run a Freesolo environment.
 
     Shipping a worker with no Freesolo SDK fails only once a GPU is already rented, so the baseline
     must be present whether or not the author declared anything.
     """
     from flash.providers._lifecycle.instances.instance import build_payload
+    from flash.runner.lifecycle.protocol import AttemptRecord
 
     spec = _spec()
+    attempt = AttemptRecord(0, 1, "active", 1.0, 2.0, 3.0, 4.0, 3.0)
+    monkeypatch.setattr(
+        runner_status,
+        "get_status",
+        lambda _run_id: type("Status", (), {"attempt": attempt.to_dict()})(),
+    )
     assert not spec.environment.pip
 
     payload = build_payload(
         spec,
         spec.seed,
         0,
+        1,
         arm="a",
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=1_800_000_000.0,
@@ -2431,7 +2458,7 @@ def test_submit_supplies_the_worker_pip_when_the_author_declared_none() -> None:
     assert payload["extra_pip"] == ["freesolo>=0.4.2"]
 
 
-def test_submit_appends_authored_pip_without_displacing_the_worker_spec() -> None:
+def test_submit_appends_authored_pip_without_displacing_the_worker_spec(monkeypatch) -> None:
     """The author's scorer deps are additional to the worker requirement, never a replacement.
 
     Substituting instead of appending would drop ``freesolo>=0.4.2`` the moment anyone declared a
@@ -2440,14 +2467,22 @@ def test_submit_appends_authored_pip_without_displacing_the_worker_spec() -> Non
     from dataclasses import replace
 
     from flash.providers._lifecycle.instances.instance import build_payload
+    from flash.runner.lifecycle.protocol import AttemptRecord
 
     spec = _spec()
+    attempt = AttemptRecord(0, 1, "active", 1.0, 2.0, 3.0, 4.0, 3.0)
+    monkeypatch.setattr(
+        runner_status,
+        "get_status",
+        lambda _run_id: type("Status", (), {"attempt": attempt.to_dict()})(),
+    )
     spec = replace(spec, environment=replace(spec.environment, pip=("pymongo>=4.6", "rapidfuzz")))
 
     payload = build_payload(
         spec,
         spec.seed,
         0,
+        1,
         arm="a",
         source_snapshot=_SOURCE_SNAPSHOT,
         deadline_at=1_800_000_000.0,
@@ -2508,7 +2543,11 @@ def _submit_failure(provider_obj):
             started_with_shared_cache=False,
         )
         prepared = _ss._PreparedAttempt(
-            local_attempt=0, attempt=0, attempt_spec=spec, runtime_secrets={}
+            local_attempt=0,
+            attempt=0,
+            fence=1,
+            attempt_spec=spec,
+            runtime_secrets={},
         )
         plan = _ss._CandidatePlan(
             allocation=None,
@@ -2822,7 +2861,7 @@ def test_a_provisioned_attempt_resets_the_class_capacity_refusals(orch, monkeypa
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_a, **_k: True)
 
     submitted_gpus = []
-    failures = ("no_capacity", "stalled", "no_capacity")
+    failures = ("no_capacity", "job_preempted", "no_capacity")
 
     def fake_runpod_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **kwargs):
         submitted_gpus.append(run_spec.gpu.type)

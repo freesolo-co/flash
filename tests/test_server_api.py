@@ -7437,10 +7437,11 @@ def test_deploy_lock_is_usable_and_weakly_cleaned():
 
 
 def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
-    # a pre-feature run with neither a handle nor persisted source identity cannot be replaced safely.
-    # recovery still reaps possible provider remnants, then fails it without starting another worker.
+    # a fenced attempt without persisted source identity cannot be replaced or attested safely.
+    # recovery still reaps provider remnants, then fails without starting another worker.
 
     import flash.server.platform.db as db_mod
+    from flash.runner.lifecycle.protocol import AttemptRecord
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
@@ -7457,8 +7458,24 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
         "gpu": {},
         "run_id": "nohandle-1",
     }
+    attempt = AttemptRecord(
+        attempt_id=0,
+        fence=1,
+        state="active",
+        reserved_at=100.0,
+        grant_deadline_at=110.0,
+        work_deadline_at=120.0,
+        run_deadline_at=120.0,
+        result_deadline_at=130.0,
+    )
     runner_state._save_status(
-        runner_state.RunStatus(run_id="nohandle-1", state="provisioning", spec=spec, remote=None)
+        runner_state.RunStatus(
+            run_id="nohandle-1",
+            state="provisioning",
+            spec=spec,
+            remote=None,
+            attempt=attempt.to_dict(),
+        ),
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-1"}])
     gced = []
@@ -7545,6 +7562,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
     import flash.server.platform.db as db_mod
     from flash.core.spec import GpuSpec, JobSpec
     from flash.providers.core import registry as providers_mod
+    from flash.runner.lifecycle.protocol import AttemptRecord
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
@@ -7561,6 +7579,16 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
     )
     created_at = 100.0
     deadline = created_at + float(spec.gpu.max_wall_seconds)
+    attempt = AttemptRecord(
+        attempt_id=0,
+        fence=1,
+        state="active",
+        reserved_at=created_at,
+        grant_deadline_at=created_at + 30.0,
+        work_deadline_at=deadline - 10.0,
+        run_deadline_at=deadline - 10.0,
+        result_deadline_at=deadline + 60.0,
+    )
     runner_state._save_status(
         runner_state.RunStatus(
             run_id=spec.run_id,
@@ -7575,6 +7603,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
                 "adapter_identity": None,
                 "preparation_digest": None,
             },
+            attempt=attempt.to_dict(),
         ),
         _run_deadline_at=deadline,
         _next_attempt=0,
@@ -7594,8 +7623,9 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
 
     recovered = runner_status.get_status(spec.run_id)
     assert submitted == []
-    assert recovered.state == "failed"
-    assert "deadline exhausted" in recovered.error
+    assert recovered.state == "provisioning"
+    assert recovered.error is None
+    assert recovered.attempt == attempt.to_dict()
 
 
 def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeypatch, tmp_path):

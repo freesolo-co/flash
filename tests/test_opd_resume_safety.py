@@ -109,7 +109,7 @@ def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
     return state
 
 
-def _remote(*, attempt: int = 0) -> dict:
+def _remote(*, attempt: int = 0, fence: int | None = None) -> dict:
     return {
         "provider": "runpod",
         "endpoint_id": f"endpoint-{attempt}",
@@ -117,6 +117,7 @@ def _remote(*, attempt: int = 0) -> dict:
         "key_fingerprint": _RUNPOD_FINGERPRINT,
         "job_id": f"job-{attempt}",
         "attempt": attempt,
+        "fence": attempt + 1 if fence is None else fence,
         "started_ts": float(attempt + 1),
     }
 
@@ -147,6 +148,23 @@ def _save_status(
     if contracted:
         kwargs["_opd_retry_contract_version"] = OPD_RETRY_CONTRACT_VERSION
     status = provisioned_status(spec, state=state, remote=remote)
+    if remote is not None:
+        from flash.runner.lifecycle.protocol import AttemptRecord
+
+        attempt = remote["attempt"]
+        fence = remote["fence"]
+        status.attempt = AttemptRecord(
+            attempt,
+            fence,
+            "active",
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            3.0,
+            provider=remote["provider"],
+            resource=remote,
+        ).to_dict()
     status.source_snapshot = source_snapshot
     runner_state._save_status(status, **kwargs)
 
@@ -653,7 +671,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
         def submit_run(self, _spec, _seed, *, attempt, on_handle, **_kwargs):
             self.attempts.append(attempt)
             self.events.append(("submit", attempt))
-            on_handle(_remote(attempt=attempt))
+            on_handle(_remote(attempt=attempt, fence=_kwargs["fence"]))
             if attempt == 0:
                 return PollResult(False, failure="poll_error", detail="transient")
             return PollResult(True, metrics={"train_tokens": 1})
@@ -686,8 +704,15 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     retry_submit = provider.events.index(("submit", 1))
     assert provider.events.index(("cancel", 0)) < retry_submit
     assert provider.events.index(("destroy", 0)) < retry_submit
-    assert [name for name, _kwargs in private_hf.calls] == ["repo_info", "get_paths_info"]
-    assert private_hf.calls[1][1]["paths"] == [opd_optimizer_start_marker_path(spec.run_id, 0)]
+    assert [name for name, _kwargs in private_hf.calls] == [
+        "repo_info",
+        "list_repo_files",
+        "repo_info",
+        "list_repo_files",
+        "repo_info",
+        "get_paths_info",
+    ]
+    assert private_hf.calls[5][1]["paths"] == [opd_optimizer_start_marker_path(spec.run_id, 0)]
 
 
 def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch, tmp_path):
@@ -728,7 +753,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
             secrets = kwargs.get("runtime_secrets")
             self.runtime_secrets.append(secrets)
             self.worker_envs.append(build_worker_env(_spec, _seed, runtime_secrets=secrets))
-            on_handle(_remote(attempt=attempt))
+            on_handle(_remote(attempt=attempt, fence=kwargs["fence"]))
             if attempt == 0:
                 marker_path = opd_optimizer_start_marker_path(spec.run_id, 0)
                 private_hf.files[marker_path] = canonical_opd_optimizer_start_json(
@@ -819,7 +844,11 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
 
     class Provider:
         def poll(self, *_args, **_kwargs):
-            return PollResult(False, failure="stalled", detail="worker stopped")
+            return PollResult(
+                False,
+                failure="job_preempted",
+                detail="provider reported worker loss",
+            )
 
         def cancel(self, _handle):
             events.append("cancel")
@@ -843,11 +872,13 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
     assert "replacement is blocked" in status.error
     assert [name for name, _kwargs in private_hf.calls] == [
         "repo_info",
+        "list_repo_files",
+        "repo_info",
         "get_paths_info",
         "download",
         "list_repo_files",
     ]
-    assert private_hf.calls[2][1]["revision"] == "private-pinned-sha"
+    assert private_hf.calls[4][1]["revision"] == "private-pinned-sha"
 
 
 def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_path):
