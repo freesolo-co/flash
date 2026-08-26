@@ -45,6 +45,14 @@ _STDLIB_URLOPEN_NAMES = (
 _HANDLER_COPY_ERROR = "installed urllib handler cannot be copied safely"
 _OPENER_COPY_ERROR = "installed urllib opener cannot be copied safely"
 _URLOPEN_CLASSIFICATION_ERROR = "stdlib urllib transport cannot be classified safely"
+_OPENER_REQUEST_METHODS = (
+    "__getattribute__",
+    "__getattr__",
+    "open",
+    "_open",
+    "_call_chain",
+    "error",
+)
 _SNAPSHOT_DEPTH_MAX = 8
 _SNAPSHOT_ITEMS_MAX = 256
 _ABSENT_SLOT = object()
@@ -57,6 +65,8 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
     def http_response(self, request, response):
+        if response is None:
+            return None
         if 300 <= response.code < 400:
             raise urllib.error.HTTPError(
                 request.full_url,
@@ -89,11 +99,20 @@ class _InstalledOpenerCache:
     private: urllib.request.OpenerDirector
 
 
-def _build_no_redirect_opener(*handlers: object) -> urllib.request.OpenerDirector:
+def _build_no_redirect_opener(
+    *handlers: object,
+    add_default_handlers: bool = True,
+) -> urllib.request.OpenerDirector:
     """build a private opener that returns redirects as httperrors."""
 
     blocker = _NoRedirectHandler()
-    opener = urllib.request.build_opener(blocker, *handlers)
+    if add_default_handlers:
+        opener = urllib.request.build_opener(blocker, *handlers)
+    else:
+        opener = urllib.request.OpenerDirector()
+        opener.add_handler(blocker)
+        for handler in handlers:
+            opener.add_handler(handler)
     for protocol in ("http", "https"):
         processors = opener.process_response.get(protocol)
         if processors is not None:
@@ -235,18 +254,17 @@ def _copy_installed_handler(
 def _validate_installed_opener(opener: urllib.request.OpenerDirector) -> None:
     try:
         state = object.__getattribute__(opener, "__dict__")
-        class_open = inspect.getattr_static(type(opener), "open", None)
-        instance_open = inspect.getattr_static(opener, "open", None)
+        if type(state) is not dict or any(name in state for name in _OPENER_REQUEST_METHODS):
+            raise TypeError
+        for name in _OPENER_REQUEST_METHODS:
+            standard = inspect.getattr_static(urllib.request.OpenerDirector, name, _ABSENT_SLOT)
+            if (
+                inspect.getattr_static(type(opener), name, _ABSENT_SLOT) is not standard
+                or inspect.getattr_static(opener, name, _ABSENT_SLOT) is not standard
+            ):
+                raise TypeError
     except Exception:
         raise urllib.error.URLError(_OPENER_COPY_ERROR) from None
-    standard_open = urllib.request.OpenerDirector.open
-    if (
-        type(state) is not dict
-        or "open" in state
-        or class_open is not standard_open
-        or instance_open is not standard_open
-    ):
-        raise urllib.error.URLError(_OPENER_COPY_ERROR)
 
 
 def _installed_config(
@@ -286,7 +304,7 @@ def _clone_installed_opener(
         for handler in handlers
         if not _handles_redirect_error(handler)
     ]
-    private = _build_no_redirect_opener(*copied)
+    private = _build_no_redirect_opener(*copied, add_default_handlers=False)
     private.addheaders = list(addheaders)
     return private
 

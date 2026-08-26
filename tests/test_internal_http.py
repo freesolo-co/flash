@@ -936,6 +936,68 @@ def test_installed_opener_subclass_override_fails_before_transport() -> None:
     assert urllib.request._opener is opener
 
 
+def test_installed_opener_internal_open_override_fails_before_transport() -> None:
+    contacted: list[str] = []
+
+    class OverrideOpener(urllib.request.OpenerDirector):
+        def _open(self, request, data=None):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    opener = OverrideOpener()
+    request = urllib.request.Request("custom://source.invalid/data")
+    with opener.open(request, timeout=1.0) as response:
+        assert response.read() == b"ok"
+    contacted.clear()
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib opener cannot be copied safely"
+    ):
+        _urlopen_no_redirect(request, timeout=1.0)
+
+    assert contacted == []
+    assert urllib.request._opener is opener
+
+
+def test_installed_opener_dynamic_open_override_fails_before_transport() -> None:
+    dispatch_calls: list[str] = []
+    handler_calls: list[str] = []
+
+    class DynamicOpener(urllib.request.OpenerDirector):
+        def __getattribute__(self, name):
+            if name == "_open":
+
+                def override(request, data=None):
+                    dispatch_calls.append(request.full_url)
+                    return _response(request.full_url)
+
+                return override
+            return super().__getattribute__(name)
+
+    class UnexpectedHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            handler_calls.append(request.full_url)
+            return _response(request.full_url)
+
+    opener = DynamicOpener()
+    opener.add_handler(UnexpectedHandler())
+    request = urllib.request.Request("custom://source.invalid/data")
+    with opener.open(request, timeout=1.0) as response:
+        assert response.read() == b"ok"
+    dispatch_calls.clear()
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib opener cannot be copied safely"
+    ):
+        _urlopen_no_redirect(request, timeout=1.0)
+
+    assert dispatch_calls == []
+    assert handler_calls == []
+    assert urllib.request._opener is opener
+
+
 def test_installed_opener_instance_override_fails_before_transport() -> None:
     contacted: list[str] = []
     opener = urllib.request.build_opener()
@@ -955,6 +1017,32 @@ def test_installed_opener_instance_override_fails_before_transport() -> None:
     assert contacted == []
     assert urllib.request._opener is opener
     assert opener.open is override
+
+
+def test_manually_assembled_opener_does_not_gain_default_handlers() -> None:
+    contacted: list[str] = []
+
+    class RecordingHttpHandler(urllib.request.HTTPHandler):
+        def http_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    original_http_handler = urllib.request.HTTPHandler
+    urllib.request.HTTPHandler = RecordingHttpHandler
+    try:
+        opener = urllib.request.OpenerDirector()
+        urllib.request.install_opener(opener)
+
+        response = _urlopen_no_redirect(
+            urllib.request.Request("http://source.invalid/data"), timeout=1.0
+        )
+    finally:
+        urllib.request.HTTPHandler = original_http_handler
+
+    assert response is None
+    assert contacted == []
+    assert urllib.request._opener is opener
+    assert not any(isinstance(handler, RecordingHttpHandler) for handler in opener.handlers)
 
 
 def test_installed_opener_inheriting_standard_open_is_supported() -> None:
