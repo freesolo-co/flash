@@ -299,6 +299,18 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             prev_metrics = prev.get("metrics_last") if isinstance(prev, dict) else None
             if same_attempt and isinstance(prev_metrics, list) and prev_metrics:
                 hb["metrics_last"] = prev_metrics
+        if isinstance(hb, dict) and same_attempt:
+            previous_progress = prev.get(state._LIFECYCLE_PROGRESS_KEY)
+            if isinstance(previous_progress, dict):
+                hb[state._LIFECYCLE_PROGRESS_KEY] = previous_progress
+        if isinstance(hb, dict) and hb.get("stage") in state._TRAINING_STAGES:
+            step = hb.get("step")
+            if isinstance(step, int) and not isinstance(step, bool) and step >= 1:
+                hb[state._LIFECYCLE_PROGRESS_KEY] = {
+                    "attempt": hb.get("attempt"),
+                    "stage": hb.get("stage"),
+                    "step": step,
+                }
         status.last_heartbeat = hb
         # carried forward on the same rule as the metric backlog above, and for the same reason: most
         # heartbeats carry no `gpu` at all -- only the periodic liveness tick and the terminal ones do

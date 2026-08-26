@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+import flash.runner.lifecycle.reporting as runner_reporting
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 from flash.core.spec import JobSpec
@@ -116,11 +117,18 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
     }
     assert all(isinstance(value, bool) for value in body["lifecycle"].values())
 
+    status.state = "deployed"
+    runner_state._save_status(status)
+    assert _report(monkeypatch, status)["lifecycle"]["artifactsComplete"] is True
+
+    status.state = "done"
+    status.realized_cost_remote = status.remote
     status.remote = None
     runner_state._save_status(status, _cleanup_remotes=None)
+    assert "realized_cost_remote" not in status.to_dict()
     assert _report(monkeypatch, status)["lifecycle"] == {
-        "started": False,
-        "progressed": False,
+        "started": True,
+        "progressed": True,
         "artifactsComplete": True,
         "cleanupComplete": True,
     }
@@ -178,6 +186,61 @@ def test_progress_requires_exact_algorithm_attempt_and_positive_integer_step(
     lifecycle = _report(monkeypatch, status)["lifecycle"]
     assert lifecycle["started"] is True
     assert lifecycle["progressed"] is False
+
+
+def test_checkpoint_heartbeat_preserves_exact_progress_evidence(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    spec = _spec(algorithm="grpo")
+    status = _status(spec)
+    status.state = "running"
+    status.remote = _remote()
+    runner_state._save_status(status)
+
+    runner_status.record_heartbeat(
+        spec.run_id,
+        {"attempt": 0, "stage": "rl_step", "step": 1},
+    )
+    runner_status.record_heartbeat(
+        spec.run_id,
+        {"attempt": 0, "stage": "checkpoint_uploaded", "step": 1},
+    )
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert _report(monkeypatch, persisted)["lifecycle"]["progressed"] is True
+    assert "lifecycle_progress" not in persisted.to_dict()["last_heartbeat"]
+
+
+def test_checkpoint_heartbeat_rejects_stale_or_mismatched_progress_evidence(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    spec = _spec(algorithm="opd")
+    status = _status(spec)
+    status.state = "running"
+    status.remote = _remote(attempt=1)
+    runner_state._save_status(status)
+
+    runner_status.record_heartbeat(
+        spec.run_id,
+        {"attempt": 0, "stage": "opd_step", "step": 1},
+    )
+    runner_status.record_heartbeat(
+        spec.run_id,
+        {"attempt": 1, "stage": "checkpoint_uploaded", "step": 1},
+    )
+    persisted = runner_status.get_status(spec.run_id)
+    assert _report(monkeypatch, persisted)["lifecycle"]["progressed"] is False
+
+    runner_status.record_heartbeat(
+        spec.run_id,
+        {"attempt": 1, "stage": "rl_step", "step": 1},
+    )
+    runner_status.record_heartbeat(
+        spec.run_id,
+        {"attempt": 1, "stage": "checkpoint_uploaded", "step": 1},
+    )
+    persisted = runner_status.get_status(spec.run_id)
+    assert _report(monkeypatch, persisted)["lifecycle"]["progressed"] is False
 
 
 def test_lifecycle_fails_closed_without_exact_durable_snapshot(monkeypatch, tmp_path):

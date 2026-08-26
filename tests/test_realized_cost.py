@@ -88,6 +88,16 @@ def test_due_requires_billable_terminal_settled_unreconciled_with_handle():
     assert not reconcile._due(
         _status(state="done", updated_at=settled, remote=handle, reconciled_at=now - 1), now
     )
+    # a confirmed teardown moves the handle out of the active remote while retaining exact COGS evidence.
+    assert reconcile._due(
+        _status(
+            state="done",
+            updated_at=settled,
+            remote=None,
+            realized_cost_remote=handle,
+        ),
+        now,
+    )
     # no provider handle to attribute cost
     assert not reconcile._due(_status(state="done", updated_at=settled, remote=None), now)
 
@@ -354,6 +364,7 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
     assert persisted.deployment == {"state": "active"}
     assert persisted.realized_cost_usd == 3.3
     assert persisted.reconciled_at == now
+    assert persisted.realized_cost_remote is None
 
 
 def test_reconcile_once_disabled_without_internal_key(monkeypatch):

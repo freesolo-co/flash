@@ -106,14 +106,18 @@ def _progressed(raw: dict[str, Any], remote_attempt: int | None) -> bool:
         "grpo": "rl_step",
         "opd": "opd_step",
     }.get(spec.get("algorithm"))
-    stage = heartbeat.get("stage")
-    attempt = heartbeat.get("attempt")
-    if expected_stage is None or stage != expected_stage:
+    if expected_stage is None:
         return False
+    from flash.runner.lifecycle.state import _LIFECYCLE_PROGRESS_KEY
+
+    evidence = heartbeat.get(_LIFECYCLE_PROGRESS_KEY, heartbeat)
+    if not isinstance(evidence, dict) or evidence.get("stage") != expected_stage:
+        return False
+    attempt = evidence.get("attempt")
     try:
         from flash.providers._lifecycle.instances.poll import is_training_heartbeat
 
-        step_complete = is_training_heartbeat(stage, heartbeat.get("step"))
+        step_complete = is_training_heartbeat(expected_stage, evidence.get("step"))
     except Exception:
         return False
     return (
@@ -152,14 +156,14 @@ def _lifecycle_projection(status: Any, public_status: dict[str, Any]) -> dict[st
     if raw is None:
         return lifecycle
 
-    remote_attempt = _canonical_remote_attempt(raw.get("remote"))
+    remote_attempt = _canonical_remote_attempt(raw.get("remote") or raw.get("realized_cost_remote"))
     lifecycle["started"] = remote_attempt is not None
     lifecycle["progressed"] = _progressed(raw, remote_attempt)
 
     adapter_ref = public_status.get("adapter_ref")
     artifacts_dir = raw.get("artifacts_dir")
     lifecycle["artifactsComplete"] = (
-        raw.get("state") == "done"
+        raw.get("state") in {"done", "deployed"}
         and _validated_terminal_source(raw)
         and isinstance(adapter_ref, str)
         and bool(adapter_ref.strip())

@@ -1483,6 +1483,15 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     assert status.remote == remote
     assert reconcile._due(status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0)
 
+    if terminal_state == "failed":
+        assert runner_reconciliation._record_cleanup_remote(spec.run_id, remote) is True
+    assert runner_reconciliation._compare_and_remove_cleanup_remote(spec.run_id, remote) is True
+
+    status = runner_status.get_status(spec.run_id)
+    assert status.remote is None
+    assert status.realized_cost_remote == remote
+    assert reconcile._due(status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0)
+
 
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):
     from flash.core.spec import JobSpec
@@ -1545,6 +1554,7 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     raw = runner_status._load_status_json(spec.run_id)
     assert raw[runner_state._CLEANUP_REMOTES_KEY] == [unconfirmed]
     assert raw["remote"] is None
+    assert raw["realized_cost_remote"] == confirmed
     assert [report.remote for report in reports] == [None, None]
 
 
@@ -1694,6 +1704,7 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypat
         different_attempt,
     ]
     assert raw["remote"] is None
+    assert raw["realized_cost_remote"] == confirmed
 
 
 def test_next_attempt_requires_persisted_integer_identity():

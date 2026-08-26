@@ -15,6 +15,7 @@ from flash.runner.lifecycle.state import RunStatus
 # above: runpod carries `endpoint_id`, lambda and vast carry `instance_id`. a record holding one of
 # these still has something to delete even when the rest of it fails strict validation.
 _RESOURCE_ID_FIELDS = ("endpoint_id", "instance_id")
+_REALIZED_COST_STATES = frozenset({"done", "failed", "cancelled", "deployed"})
 
 
 def _remote_resource_identity(remote: object) -> tuple | None:
@@ -279,6 +280,8 @@ def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bo
             if len(remaining) == len(records):
                 return False
         if _teardown_removal_key(status.remote) == expected_key:
+            if status.state in _REALIZED_COST_STATES and status.reconciled_at is None:
+                status.realized_cost_remote = dict(status.remote)
             status.remote = None
         status.updated_at = time.time()
         state._save_status_unlocked(status, _cleanup_remotes=remaining or None)

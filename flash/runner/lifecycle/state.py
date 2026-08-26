@@ -114,6 +114,7 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
 # GRPO rollout can be ~17 min, an opd step waits on the teacher round-trips) streams one of these
 # stages with NO step yet -- still real GPU time.
 _TRAINING_STAGES = frozenset({"rl_step", "sft_step", "opd_step"})
+_LIFECYCLE_PROGRESS_KEY = "lifecycle_progress"
 
 
 @dataclass
@@ -133,6 +134,9 @@ class RunStatus:
     adapter_ref: str | None = None
     deployment: dict | None = None
     remote: dict | None = None
+    # exact torn-down provider handle retained only until delayed realized-cost reconciliation. it is
+    # private, is not an active resource, and is cleared when reconciliation succeeds.
+    realized_cost_remote: dict | None = None
     # Instance providers (lambda/vast) configured WHEN THIS RUN WAS SUBMITTED — the set that could have
     # owned a pre-handle non-idempotent create. Recovery's phantom guard (_confirm_run_clear) fails
     # closed for any of these that is no longer configurable (so it can't ENUMERATE to prove clear),
@@ -173,11 +177,13 @@ class RunStatus:
         data = _status_storage_dict(self)
         data["spec"] = _public_status_spec(data.get("spec"))
         data.pop("report_sequence", None)
+        data.pop("realized_cost_remote", None)
         # internal warm-start preparation (storage locators, digests) never leaves the server
         data.pop("effective_preparation", None)
         heartbeat = data.get("last_heartbeat")
         if isinstance(heartbeat, dict):
             heartbeat.pop("source_provenance", None)
+            heartbeat.pop(_LIFECYCLE_PROGRESS_KEY, None)
         source_snapshot = data.pop("source_snapshot", None)
         data.pop("source_verified_attempt", None)
         if source_snapshot is not None:

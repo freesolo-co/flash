@@ -378,6 +378,7 @@ def record_realized_cost(run_id: str, *, realized_cost_usd: float, reconciled_at
             return
         status.realized_cost_usd = realized_cost_usd
         status.reconciled_at = reconciled_at
+        status.realized_cost_remote = None
         status.updated_at = time.time()
         state._save_status_unlocked(status)
     reporting._report_status(status)
