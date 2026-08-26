@@ -62,8 +62,7 @@ def _prime_worker(monkeypatch, recorder, *, repo="org/test-runs", phase="rl", ru
     monkeypatch.setattr(worker._worker_state, "RUN_ID", run)
     monkeypatch.setattr(worker._worker_state, "SEED", 0)
     monkeypatch.setattr(worker_hf, "hf_api", lambda: recorder)
-    # heartbeat would otherwise commit to hf; silence it for the unit test.
-    monkeypatch.setattr(worker._worker_heartbeat, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(worker._worker_progress, "publish_progress", lambda *a, **k: None)
     return worker
 
 
@@ -310,7 +309,7 @@ def test_list_checkpoints_parses_and_sorts(monkeypatch):
         # noise that must NOT be picked up:
         f"{base}/checkpoint/checkpoint-90/optimizer.pt",
         f"{base}/adapter/adapter_config.json",
-        f"{base}/heartbeat.json",
+        f"{base}/attempts/0-1/progress/00000000000000000001-deadbeef.json",
     ]
     _patch_hf_files(monkeypatch, files)
 

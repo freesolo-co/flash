@@ -1152,6 +1152,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
             attempt={"attempt_id": 0, "fence": 1},
             progress={"attempt_id": 0, "fence": 1, "phase": "sft_step"},
             resource={"attempt_id": 0, "fence": 1, "state": "running"},
+            result={"attempt_id": 0, "fence": 1, "outcome": "done"},
         )
     )
 
@@ -1168,8 +1169,10 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     assert body["model"] == "Qwen/Qwen3.5-9B"
     assert "lastHeartbeat" not in body
     assert "gpuStatus" not in body
+    assert "attempt" not in body
     assert "progress" not in body
     assert "resource" not in body
+    assert "result" not in body
     assert "source_snapshot" not in json.dumps(body)
     assert "source_provenance" not in json.dumps(body)
 

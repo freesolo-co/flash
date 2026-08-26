@@ -46,8 +46,7 @@ def test_running_resource_observation_keeps_sparse_progress_visibly_active(monke
     assert "running" in output
     assert "observed 3s ago" in output
     assert "progress observed" in output
-    assert "stalled" not in output.lower()
-    assert "heartbeat" not in output.lower()
+    assert "failure" not in output.lower()
 
 
 def test_progress_from_a_previous_fence_is_not_rendered() -> None:
@@ -135,11 +134,53 @@ def test_progress_age_never_creates_a_failure_or_health_inference(monkeypatch) -
         }
     )
 
-    rendered = " ".join(value for _label, value in pairs).lower()
-    assert "2.8h ago" in rendered
-    assert "stalled" not in rendered
-    assert "failed" not in rendered
-    assert "retry" not in rendered
+    assert pairs == [
+        ("attempt", "1 / fence 2"),
+        ("progress", "opd_step · 1 completed steps"),
+        ("progress occurred", "2.8h ago"),
+        ("progress observed", "2.8h ago"),
+    ]
+
+
+def test_progress_metric_rows_are_fenced_and_sequence_deduped() -> None:
+    from flash.cli.commands.ops.log_follow import _log_follow_metric_rows
+
+    seen: set[tuple[object, object, object]] = set()
+    current = {
+        "attempt": {"attempt_id": 1, "fence": 4},
+        "progress": {
+            "attempt_id": 1,
+            "fence": 4,
+            "sequence": 7,
+            "completed_steps": 3,
+            "metrics": {"reward": 0.5},
+        },
+    }
+    previous_fence = {
+        "attempt": {"attempt_id": 1, "fence": 5},
+        "progress": {
+            "attempt_id": 1,
+            "fence": 4,
+            "sequence": 8,
+            "completed_steps": 4,
+            "metrics": {"reward": 0.6},
+        },
+    }
+    new_attempt = {
+        "attempt": {"attempt_id": 2, "fence": 6},
+        "progress": {
+            "attempt_id": 2,
+            "fence": 6,
+            "sequence": 7,
+            "completed_steps": 1,
+            "metrics": {"reward": 0.7},
+        },
+    }
+
+    assert _log_follow_metric_rows(current, seen) == ["progress_seq=7 step=3 reward=0.5"]
+    assert _log_follow_metric_rows(current, seen) == []
+    assert _log_follow_metric_rows(previous_fence, seen) == []
+    assert _log_follow_metric_rows(new_attempt, seen) == ["progress_seq=7 step=1 reward=0.7"]
 
 
 def test_malformed_attempt_identity_does_not_bind_observations() -> None:
