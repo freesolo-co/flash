@@ -63,15 +63,19 @@ def immutable_binding_projection(value: Mapping[str, Any] | Any) -> dict[str, An
             return value.get(name)
         return getattr(value, name, None)
 
+    org_id = get("org_id")
     run_id = get("run_id")
     step = get("checkpoint_step")
-    checkpoint_id = get("adapter_id") or get("checkpoint_id") or get("checkpoint")
-    if isinstance(run_id, str) and (step is None or isinstance(step, int)):
-        canonical = format_checkpoint_ref(run_id, step)
-        if checkpoint_id != canonical:
-            raise ValueError("checkpoint binding has inconsistent permanent identity")
+    checkpoint_id = get("adapter_id")
+    if not isinstance(org_id, str) or not org_id.strip():
+        raise ValueError("checkpoint binding requires org_id")
+    if not isinstance(run_id, str):
+        raise ValueError("checkpoint binding requires run_id")
+    if isinstance(step, bool) or (step is not None and not isinstance(step, int)):
+        raise ValueError("checkpoint binding has invalid checkpoint_step")
+    if checkpoint_id != format_checkpoint_ref(run_id, step):
+        raise ValueError("checkpoint binding has inconsistent permanent identity")
     projection = {field: get(field) for field in _BINDING_FIELDS}
-    projection["adapter_id"] = checkpoint_id
     projection["repo_type"] = projection["repo_type"] or "model"
     projection["structured_outputs"] = projection["structured_outputs"] or None
     return projection

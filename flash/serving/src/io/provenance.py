@@ -9,7 +9,7 @@ from flash.serving.src.io.schemas import AdapterRecord
 
 
 def _active_checkpoint_ref(record: AdapterRecord) -> str:
-    return record.checkpoint or ""
+    return record.adapter_id if record.is_checkpoint else ""
 
 
 def require_attested_checkpoint(result: dict[str, Any], target: AdapterRecord) -> None:
@@ -37,7 +37,7 @@ def require_attested_checkpoint(result: dict[str, Any], target: AdapterRecord) -
 def _checkpoint_provenance(target: AdapterRecord, active_checkpoint: Any) -> dict[str, str] | None:
     if not target.is_checkpoint:
         return None
-    checkpoint = str(active_checkpoint or target.checkpoint or "").strip()
+    checkpoint = str(active_checkpoint or "").strip()
     if checkpoint != target.adapter_id:
         return None
     return {"checkpoint_id": checkpoint}

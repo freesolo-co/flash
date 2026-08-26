@@ -279,9 +279,10 @@ def _checkpoint_step_from_subfolder(
             )
         return None
 
-    # non-flash layouts predate this convention, so they keep the authored selection rather than
-    # becoming a new resolution failure merely because their checkpoint cannot be inferred.
-    return checkpoint_step
+    raise ResolveError(
+        f"--artifact-subfolder {artifact_subfolder!r} does not identify a canonical Flash final "
+        "adapter or checkpoints/step-N/adapter path"
+    )
 
 
 def resolve_adapter(

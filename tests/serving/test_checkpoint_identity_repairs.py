@@ -169,15 +169,29 @@ def test_artifact_digest_and_binding_fingerprint_are_distinct() -> None:
         )
 
 
+@pytest.mark.parametrize("alias", ["checkpoint_id", "checkpoint"])
+def test_binding_fingerprint_rejects_identity_aliases(alias: str) -> None:
+    payload = internal_adapter_payload(_record("org-a"))
+    payload[alias] = payload.pop("adapter_id")
+
+    with pytest.raises(ValueError, match="inconsistent permanent identity"):
+        immutable_binding_fingerprint(payload)
+
+
+def test_binding_fingerprint_rejects_malformed_identity_types() -> None:
+    payload = internal_adapter_payload(_record("org-a"))
+
+    with pytest.raises(ValueError, match="requires org_id"):
+        immutable_binding_fingerprint({**payload, "org_id": None})
+    with pytest.raises(ValueError, match="requires run_id"):
+        immutable_binding_fingerprint({**payload, "run_id": None})
+    with pytest.raises(ValueError, match="invalid checkpoint_step"):
+        immutable_binding_fingerprint({**payload, "checkpoint_step": True})
+
+
 def test_active_checkpoint_uses_only_shared_permanent_identity_grammar() -> None:
     record = _record("org-a")
     assert active_checkpoint_ref(record) == "shared/final"
-    legacy = SimpleNamespace(
-        adapter_id="shared",
-        checkpoint=None,
-        subfolder="checkpoints/step-20",
-    )
-    assert active_checkpoint_ref(legacy) == ""
 
 
 def test_ambiguous_registration_matches_every_flat_immutable_field() -> None:

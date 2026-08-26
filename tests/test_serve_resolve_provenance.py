@@ -241,18 +241,15 @@ def test_checkpoint_provenance_is_derived_from_an_agreeing_step_subfolder(
     assert resolved.adapter.artifact_revision == ARTIFACT_REVISION
 
 
-def test_unrecognized_artifact_layout_keeps_the_authored_checkpoint(monkeypatch, tmp_path) -> None:
-    # older or external layouts cannot attest a step from their path. refusing them would add a new
-    # deployment failure unrelated to the mismatch this guard can prove, so they remain pass-through.
-    _install_hub(
-        monkeypatch,
-        tmp_path,
-        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": BASE},
+def test_unrecognized_artifact_layout_is_rejected_before_hub_access(monkeypatch) -> None:
+    monkeypatch.setattr(
+        resolve_module,
+        "_hub_api",
+        lambda: pytest.fail("an unattested checkpoint path must fail before hub access"),
     )
 
-    resolved = _resolve(artifact_subfolder="sft/run-1-step-2", checkpoint_step=2)
-
-    assert resolved.adapter.checkpoint_id == "run1/step-2"
+    with pytest.raises(ResolveError, match="does not identify a canonical Flash"):
+        _resolve(artifact_subfolder="sft/run-1-step-2", checkpoint_step=2)
 
 
 @pytest.mark.parametrize(

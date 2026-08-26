@@ -99,17 +99,17 @@ def deployment_record(
     *,
     state: str = "ready",
     checkpoint_step: int | None = None,
-    checkpoint_id: str | None = None,
 ) -> Deployment:
     subfolder = f"{adapter_prefix}/adapter"
     base = serving_urls.serving_base_url()
     openai_url = transport.serving_openai_base_url()
+    checkpoint_id = format_checkpoint_ref(run_id, checkpoint_step)
     return Deployment(
         run_id=run_id,
         model=model,
         adapter_hf_prefix=subfolder,
-        openai_model=format_checkpoint_ref(run_id, checkpoint_step),
-        checkpoint_id=checkpoint_id or format_checkpoint_ref(run_id, checkpoint_step),
+        openai_model=checkpoint_id,
+        checkpoint_id=checkpoint_id,
         checkpoint_step=checkpoint_step,
         endpoint_name=base,
         openai_base_url=openai_url,

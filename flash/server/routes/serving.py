@@ -34,7 +34,6 @@ from flash.runner.supervise.transitions import (
 # `serving.RetryableServingUnavailable`, so it stays reachable here even though the smoke path
 # that catches it now lives in `.serving_smoke`.
 from flash.serve.contract.errors import (  # noqa: F401
-    ActivationOutcomeUnknown,
     AdapterConfigMissing,
     RetryableServingUnavailable,
     ServingError,

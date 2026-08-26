@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
+from flash.schema import parse_checkpoint_ref
 from flash.serve.request.runtime_support import (
     argument_names,
     is_adapter_tensor_file,
@@ -211,9 +211,8 @@ def _engine_is_dead(engine: Any) -> bool:
 def active_checkpoint_ref(record: Any) -> str:
     """return the canonical permanent checkpoint the record explicitly serves."""
 
-    checkpoint = str(getattr(record, "checkpoint", "") or "").strip()
-    parsed = parse_checkpoint_ref(checkpoint)
-    return "" if parsed is None else format_checkpoint_ref(*parsed)
+    checkpoint_id = str(getattr(record, "adapter_id", "") or "").strip()
+    return checkpoint_id if parse_checkpoint_ref(checkpoint_id) is not None else ""
 
 
 def enforce_expected_checkpoint(record: Any, expected_checkpoint: str | None) -> str:
