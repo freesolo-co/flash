@@ -611,7 +611,11 @@ def test_poll_job_preserves_provider_health_observations(monkeypatch, workers, g
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs
 
-    polling = _wire_runpod_poll(monkeypatch, results=[None, None, None])
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(grant_deadline_at=100.0),
+        results=[None, None, None],
+    )
     monkeypatch.setattr(polling.time, "time", _stepped_clock())
     monkeypatch.setattr(
         runpod_api,
@@ -671,6 +675,54 @@ def test_poll_job_unhealthy_queue_does_not_latch_grant_or_expire_queue_first(mon
 
     assert result.failure == "job_preempted"
     assert result.detail == "RunPod worker remained unhealthy"
+
+
+def test_poll_job_queue_health_reset_cannot_extend_grant_deadline(monkeypatch):
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(
+            grant_deadline_at=5.0,
+            work_deadline_at=200.0,
+            result_deadline_at=220.0,
+        ),
+        results=[None] * 10,
+    )
+    observed_times = []
+    clock = _stepped_clock(step=1.0)
+
+    def now():
+        value = clock()
+        observed_times.append(value)
+        return value
+
+    health = iter(({"workers": {"unhealthy": 1}}, {"workers": {}}))
+    health_calls = []
+    monkeypatch.setattr(polling.time, "time", now)
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda *_args, **_kwargs: {"status": "IN_QUEUE"},
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *_args, **_kwargs: health_calls.append(True) or next(health, {"workers": {}}),
+    )
+
+    result = polling.poll_job(
+        _runpod_handle(jobs),
+        _poll_spec(),
+        interval_s=0,
+        queue_grace_s=100.0,
+        unhealthy_grace_s=100.0,
+    )
+
+    assert result.failure == "no_capacity"
+    assert max(observed_times) == 5.0
+    assert len(health_calls) == 2
 
 
 def test_poll_job_recovers_transient_result_download_to_current_fenced_success(monkeypatch):
@@ -3833,6 +3885,7 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
 
         monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_a, **_k: None)
         resumed = []
         monkeypatch.setattr(
             runner_lifecycle,
@@ -3902,6 +3955,62 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
         assert len(calls) == 2
         assert status.state == "failed"
         assert status.remote == remote
+        assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
+            remote
+        ]
+
+
+def test_attach_reconciler_fails_permanent_result_artifact_without_retry(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        import flash.runner.supervise.attach as attach_mod
+        import flash.runner.supervise.lifecycle as lifecycle_mod
+        from flash.providers.artifacts.attempts import AttemptArtifactError
+
+        remote = _vast_recovery_remote()
+        spec = _spec("vast-reconcile-invalid-result")
+        attempt = _attempt_record(
+            grant_deadline_at=900.0,
+            work_deadline_at=1_000.0,
+            result_deadline_at=1_020.0,
+        )
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                attempt=attempt.to_dict(),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(attach_mod.time, "time", lambda: 1_021.0)
+        monkeypatch.setattr(
+            attach_mod.time,
+            "sleep",
+            lambda _seconds: pytest.fail("permanent artifact errors must not retry"),
+        )
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_attempt_result_metrics",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AttemptArtifactError("result manifest is invalid or unverifiable")
+            ),
+        )
+
+        attach_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            _SOURCE_SNAPSHOT,
+            io.StringIO(),
+            "job_preempted: host vanished",
+        )
+
+        status = runner_status.get_status(spec.run_id)
+        assert status.state == "failed"
+        assert status.remote == remote
+        assert "invalid or unverifiable" in (status.error or "")
         assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
             remote
         ]

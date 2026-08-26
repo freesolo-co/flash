@@ -500,6 +500,8 @@ def test_real_verl_line_reaches_progress_metrics_and_cli_row(monkeypatch):
     monkeypatch.setattr(worker_progress, "_PROGRESS_COMPLETED_STEPS", 0)
     monkeypatch.setattr(worker_progress, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
     monkeypatch.setattr(worker_progress, "_PROGRESS_FATAL_ERROR", None)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_COALESCED", None)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_COALESCE_STARTED_AT", None)
     worker_progress._PROGRESS_QUEUE.clear()
     records = []
     monkeypatch.setattr(
@@ -514,6 +516,7 @@ def test_real_verl_line_reaches_progress_metrics_and_cli_row(monkeypatch):
 
     state = _StepMetricState()
     _ingest_step_metrics(_STEP_LINE, {"max_completion": 512}, state, dict)
+    worker_progress.flush_progress()
 
     record = records[-1]
     assert record.metrics == {

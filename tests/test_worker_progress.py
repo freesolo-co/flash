@@ -21,6 +21,8 @@ def _reset(monkeypatch) -> None:
     monkeypatch.setattr(progress_io, "_PROGRESS_COMPLETED_STEPS", 0)
     monkeypatch.setattr(progress_io, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
     monkeypatch.setattr(progress_io, "_PROGRESS_FATAL_ERROR", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COALESCED", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COALESCE_STARTED_AT", None)
     progress_io._PROGRESS_QUEUE.clear()
 
 
@@ -85,7 +87,7 @@ def test_concurrent_publish_serializes_uploads_and_reuses_failed_sequence(monkey
 
     def publish(index):
         barrier.wait()
-        progress_io.publish_progress("rl_step", step=index)
+        progress_io.publish_progress("phase_observed", step=index)
 
     threads = [threading.Thread(target=publish, args=(index,)) for index in range(4)]
     for thread in threads:
@@ -120,7 +122,7 @@ def test_progress_network_upload_does_not_hold_bookkeeping_lock(monkeypatch) -> 
     first = threading.Thread(target=progress_io.publish_progress, args=("boot",))
     second = threading.Thread(
         target=progress_io.publish_progress,
-        args=("rl_step",),
+        args=("phase_observed",),
         kwargs={"step": 1},
     )
     first.start()
@@ -161,12 +163,82 @@ def test_ambiguous_upload_verifies_landed_record_before_advancing(monkeypatch) -
     monkeypatch.setattr(progress_io, "_remote_record_payload", landed.get)
 
     assert progress_io.publish_progress("boot") is True
-    assert progress_io.publish_progress("rl_step", step=1) is True
+    assert progress_io.publish_progress("rl_step", step=1) is False
+    assert progress_io.flush_progress() is True
 
     paths = sorted(landed)
     records = [progress_io.ProgressRecord.from_dict(json.loads(landed[path])) for path in paths]
     assert [record.sequence for record in records] == [1, 2]
     assert records[1].previous_digest == digest_record(records[0].to_dict())
+
+
+def test_optional_upload_verification_blip_retries_identical_record(monkeypatch) -> None:
+    _reset(monkeypatch)
+    monkeypatch.setattr(progress_io.worker_state, "HF_REPO", "org/repo")
+    uploads = []
+    upload_outcomes = iter((False, True, True))
+    verification_calls = {"count": 0}
+
+    def upload(local, path, *, required):
+        with open(local, "rb") as handle:
+            uploads.append((path, handle.read(), required))
+        return next(upload_outcomes)
+
+    def verify(_path):
+        verification_calls["count"] += 1
+        raise ConnectionError("temporary readback failure")
+
+    monkeypatch.setattr(progress_io.hf_io, "hf_upload_absolute", upload)
+    monkeypatch.setattr(progress_io, "_remote_record_payload", verify)
+
+    assert progress_io.publish_progress("model_prefetching") is False
+    assert progress_io._PROGRESS_FATAL_ERROR is None
+    assert len(progress_io._PROGRESS_QUEUE) == 1
+
+    monkeypatch.setattr(progress_io, "_remote_record_payload", lambda _path: None)
+    assert progress_io.publish_progress("phase_observed", step=1) is True
+
+    assert len(uploads) == 3
+    assert uploads[0] == uploads[1]
+    first = progress_io.ProgressRecord.from_dict(json.loads(uploads[1][1]))
+    second = progress_io.ProgressRecord.from_dict(json.loads(uploads[2][1]))
+    assert first.sequence == 1
+    assert second.sequence == 2
+    assert second.previous_digest == digest_record(first.to_dict())
+    assert verification_calls["count"] == 1
+    assert not progress_io._PROGRESS_QUEUE
+
+
+def test_step_progress_coalesces_by_window_and_terminal_stays_dedicated(monkeypatch) -> None:
+    _reset(monkeypatch)
+    now = {"value": 0.0}
+    records = []
+    monkeypatch.setattr(progress_io.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda record, *, required: records.append((record, required)) or True,
+    )
+
+    for step in range(1, 1001):
+        assert progress_io.publish_progress("rl_step", step=step) is False
+    assert records == []
+    assert progress_io.flush_progress() is True
+    assert [record.completed_steps for record, _required in records] == [1000]
+
+    now["value"] = progress_io._PROGRESS_STEP_CADENCE_S
+    for step in range(1001, 2001):
+        assert progress_io.publish_progress("rl_step", step=step) is False
+    assert progress_io.flush_progress() is True
+    progress_io.publish_progress("result_published", step=2000)
+
+    assert [record.completed_steps for record, _required in records] == [1000, 2000, 2000]
+    assert [record.phase for record, _required in records] == [
+        "rl_step",
+        "rl_step",
+        "result_published",
+    ]
+    assert [record.sequence for record, _required in records] == [1, 2, 3]
 
 
 def test_checkpoint_failure_is_sticky_until_a_successful_checkpoint(monkeypatch) -> None:

@@ -163,6 +163,7 @@ class _PreparedAttempt:
     fence: int
     attempt_spec: JobSpec
     runtime_secrets: dict[str, str]
+    expected_next_attempt: int | None = None
     # the rank count a pinned opd resume checkpoint was written at, or None when this attempt
     # resumes from nothing. allocation is pinned to it: the worker refuses a pinned checkpoint
     # whose fsdp width differs from the attempt's, so re-ranking onto another shape would strand
@@ -356,7 +357,7 @@ def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
 
 
 def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOutcome:
-    from flash.runner.lifecycle.attempts import _reserve_attempt_record, _verified_opd_retry_state
+    from flash.runner.lifecycle.attempts import _next_attempt_snapshot, _verified_opd_retry_state
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
 
     attempt = ctx.attempt_start + local_attempt
@@ -374,16 +375,13 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
         expected_next_attempt, opd_resume_revision, resume_world_size = _verified_opd_retry_state(
             ctx.spec.run_id
         )
+        attempt = expected_next_attempt
     else:
-        expected_next_attempt, opd_resume_revision, resume_world_size = None, None, None
-    attempt_record = _reserve_attempt_record(
-        ctx.spec.run_id,
-        minimum_attempt=ctx.attempt_start if local_attempt == 0 else 0,
-        expected_next_attempt=expected_next_attempt,
-    )
-    attempt = attempt_record.attempt_id
-    ctx.current_attempt = attempt
-    _mark_attempt_boundary(ctx, attempt)
+        expected_next_attempt, attempt = _next_attempt_snapshot(
+            ctx.spec.run_id,
+            minimum_attempt=ctx.attempt_start if local_attempt == 0 else 0,
+        )
+        opd_resume_revision, resume_world_size = None, None
     attempt_runtime_secrets = dict(ctx.runtime_secrets or {})
     attempt_runtime_secrets.pop(OPD_RESUME_REVISION_ENV, None)
     if opd_resume_revision is not None:
@@ -392,9 +390,10 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
         prepared=_PreparedAttempt(
             local_attempt,
             attempt,
-            attempt_record.fence,
+            0,
             attempt_spec,
             attempt_runtime_secrets,
+            expected_next_attempt,
             # only a pinned resume constrains the shape; without one the retry re-ranks freely.
             resume_world_size=resume_world_size if opd_resume_revision is not None else None,
         )
@@ -595,8 +594,6 @@ def _build_candidate_plan(
         provider=chosen.provider,
         count=int(getattr(chosen, "gpu_count", 1) or 1),
     )
-    ctx.current_attempt = prepared.attempt
-    ctx.current_fence = prepared.fence
     return _CandidatePlan(allocation, candidates, chosen, on_last_gpu, effective_spec, run_spec)
 
 
@@ -687,6 +684,34 @@ def _submit_provider(
         )
 
 
+def _reserve_candidate_attempt(
+    ctx: _SubmitContext,
+    prepared: _PreparedAttempt,
+    plan: _CandidatePlan,
+) -> _PreparedAttempt:
+    """reserve one fixed candidate-specific grant budget before provider creation."""
+    from flash.runner.lifecycle.attempts import _reserve_attempt_record
+
+    grant_allowance_s = 900.0
+    if plan.chosen.provider == "runpod":
+        from flash.providers.runpod.execution.jobs import capacity_wait_kwargs
+
+        grant_allowance_s = capacity_wait_kwargs(
+            on_last_gpu=plan.on_last_gpu,
+            gpu_count=int(getattr(plan.chosen, "gpu_count", 1) or 1),
+        )["queue_grace_s"]
+    record = _reserve_attempt_record(
+        ctx.spec.run_id,
+        minimum_attempt=ctx.attempt_start if prepared.local_attempt == 0 else 0,
+        expected_next_attempt=prepared.expected_next_attempt,
+        grant_allowance_s=grant_allowance_s,
+    )
+    ctx.current_attempt = record.attempt_id
+    ctx.current_fence = record.fence
+    _mark_attempt_boundary(ctx, record.attempt_id)
+    return replace(prepared, attempt=record.attempt_id, fence=record.fence)
+
+
 def _submit_candidate(
     ctx: _SubmitContext,
     prepared: _PreparedAttempt,
@@ -738,6 +763,8 @@ def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOut
     plan = _build_candidate_plan(ctx, prepared, allocation)
     if plan is None:
         return _AttemptOutcome(stop=True)
+    ctx.raise_if_cancelled()
+    prepared = _reserve_candidate_attempt(ctx, prepared, plan)
     result = _submit_candidate(ctx, prepared, plan)
     return _AttemptOutcome(
         result=result,

@@ -74,11 +74,22 @@ def _verified_opd_next_attempt(run_id: str) -> int:
     return _verified_opd_retry_state(run_id)[0]
 
 
+def _next_attempt_snapshot(run_id: str, *, minimum_attempt: int = 0) -> tuple[int, int]:
+    """return the stored identity and planned attempt for a later atomic reservation."""
+    minimum = _attempt_int(minimum_attempt)
+    if minimum is None:
+        raise RuntimeError("minimum attempt identity is invalid")
+    with state._status_guard(run_id):
+        current = _infer_next_attempt(status_ops._load_status_json(run_id))
+    return current, max(current, minimum)
+
+
 def _reserve_attempt_record(
     run_id: str,
     *,
     minimum_attempt: int = 0,
     expected_next_attempt: int | None = None,
+    grant_allowance_s: float = 900.0,
 ):
     """Durably reserve an attempt and monotonic fence before provider creation."""
     from flash.runner.lifecycle.deadlines import _derive_attempt_deadlines
@@ -95,6 +106,8 @@ def _reserve_attempt_record(
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
         status = status_ops._runstatus_from_json(raw)
+        if status.state in state.TERMINAL_STATES:
+            raise RuntimeError("run became terminal before attempt reservation")
         current = _infer_next_attempt(raw)
         if expected is not None and current != expected:
             raise RuntimeError("stored next attempt identity changed after retry verification")
@@ -122,6 +135,7 @@ def _reserve_attempt_record(
         grant, work, result, run = _derive_attempt_deadlines(
             raw,
             reserved_at=reserved_at,
+            grant_allowance_s=grant_allowance_s,
         )
         record = AttemptRecord(
             attempt_id=attempt_id,

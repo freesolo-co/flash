@@ -130,6 +130,26 @@ def _queue_failure(
         state.unhealthy.expired(False, now, context.unhealthy_grace_s)
         state.throttled.expired(False, now, context.throttled_grace_s)
         return None
+    if now >= context.attempt.grant_deadline_at:
+        unhealthy_since = state.unhealthy.since
+        if (
+            unhealthy_since is not None
+            and unhealthy_since + context.unhealthy_grace_s < context.attempt.grant_deadline_at
+            and now - unhealthy_since > context.unhealthy_grace_s
+        ):
+            return PollResult(
+                False,
+                failure="job_preempted",
+                detail="RunPod worker remained unhealthy",
+            )
+        return PollResult(
+            False,
+            failure="no_capacity",
+            detail=(
+                "never scheduled: job remained IN_QUEUE until its immutable grant deadline; "
+                f"{capacity_escalation_note(context.on_last_gpu)}"
+            ),
+        )
     try:
         health = runpod_api.endpoint_health_for_fingerprint(
             context.handle.endpoint_id,

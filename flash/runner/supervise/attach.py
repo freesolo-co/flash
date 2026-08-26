@@ -216,6 +216,21 @@ def _reconcile_completed_remote(
     return False
 
 
+def _fail_permanent_result_artifact(
+    run_id: str, expected_remote: dict, error: BaseException
+) -> bool:
+    """preserve cleanup identity and fail one exact remote after permanent artifact rejection."""
+    from flash.runner.accounting.reconciliation import (
+        _compare_and_fail_remote,
+        _record_cleanup_remote,
+    )
+
+    if not _record_cleanup_remote(run_id, expected_remote):
+        raise RuntimeError("permanent result rejection cleanup identity could not be persisted")
+    _compare_and_fail_remote(run_id, expected_remote, str(error))
+    return True
+
+
 def _reconcile_expired_remote(
     run_id: str,
     worker_spec: JobSpec,
@@ -238,9 +253,11 @@ def _reconcile_expired_remote(
 
     try:
         metrics = _attempt_result_metrics(run_id, expected_remote)
-    except Exception:
-        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-        return False
+    except Exception as exc:
+        if _result_transport_is_transient(exc):
+            time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+            return False
+        return _fail_permanent_result_artifact(run_id, expected_remote, exc)
     if metrics is not None:
         _carry_allocation_stamp(metrics, expected_remote)
         try:
@@ -351,8 +368,13 @@ def _reconcile_attached_remote(
         result_deadline_at = attempt_record.result_deadline_at
         try:
             completed_metrics = _attempt_result_metrics(run_id, expected_remote)
-        except Exception:
-            completed_metrics = None
+        except Exception as exc:
+            if _result_transport_is_transient(exc):
+                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+                continue
+            if _fail_permanent_result_artifact(run_id, expected_remote, exc):
+                return
+            continue
         if completed_metrics is not None:
             _carry_allocation_stamp(completed_metrics, expected_remote)
             if _reconcile_completed_remote(

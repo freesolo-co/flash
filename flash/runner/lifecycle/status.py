@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import time
 from dataclasses import replace
@@ -382,14 +383,46 @@ def record_resource(
     fence: int,
     resource_identity: tuple | None = None,
 ) -> bool:
-    return _record_projection(
-        run_id,
-        "resource",
-        value,
-        attempt_id=attempt_id,
-        fence=fence,
-        resource_identity=resource_identity,
-    )
+    """persist only monotonic observations for the exact current resource."""
+    from flash.runner.accounting.reconciliation import _remote_resource_identity
+    from flash.runner.lifecycle.protocol import bounded_json
+
+    incoming = bounded_json(value)
+    observed_at = incoming.get("observed_at")
+    if (
+        isinstance(observed_at, bool)
+        or not isinstance(observed_at, (int, float))
+        or not math.isfinite(observed_at)
+    ):
+        return False
+    with state._status_guard(run_id):
+        status = get_status(run_id)
+        attempt = _current_attempt(status)
+        if attempt.attempt_id != attempt_id or attempt.fence != fence:
+            return False
+        if (
+            resource_identity is not None
+            and _remote_resource_identity(status.remote) != resource_identity
+        ):
+            return False
+        current = status.resource if isinstance(status.resource, dict) else None
+        if current is not None:
+            current_observed_at = current.get("observed_at")
+            if (
+                isinstance(current_observed_at, bool)
+                or not isinstance(current_observed_at, (int, float))
+                or not math.isfinite(current_observed_at)
+            ):
+                return False
+            if observed_at < current_observed_at:
+                return False
+            if observed_at == current_observed_at:
+                return incoming == current
+        status.resource = incoming
+        status.updated_at = time.time()
+        state._save_status_unlocked(status)
+    reporting._report_status(status)
+    return True
 
 
 def record_result(run_id: str, value: dict, *, attempt_id: int, fence: int) -> bool:

@@ -246,6 +246,10 @@ def publish_result(
     diagnostics: dict | None = None,
 ) -> ResultManifest:
     """publish the only worker terminal authority for the current attempt."""
+    from flash.engine.worker.io import progress as progress_io
+
+    with contextlib.suppress(Exception):
+        progress_io.flush_progress()
     manifest = ResultManifest(
         run_id=state.RUN_ID,
         phase_namespace=state.PHASE,

@@ -36,12 +36,22 @@ _PROGRESS_COMPLETED_STEPS = 0
 _PROGRESS_PENDING_CHECKPOINT_FAILURE: dict[str, int | str] | None = None
 _PROGRESS_FATAL_ERROR: Exception | None = None
 _PROGRESS_QUEUE = deque()
+_PROGRESS_COALESCED: _PendingProgress | None = None
+_PROGRESS_COALESCE_STARTED_AT: float | None = None
+# four cumulative commits per run-hour leaves the shared 128/hour repository budget bounded at
+# 32 simultaneous training attempts; phase, checkpoint, and terminal boundaries remain immediate.
+_PROGRESS_STEP_CADENCE_S = 900.0
+_STEP_PROGRESS_STAGES = frozenset({"opd_step", "rl_step", "sft_step"})
 LATEST_GRPO_METRICS: list = []
 GRPO_METRIC_HISTORY_LIMIT = 1024
 
 
 class _ProgressUploadAmbiguous(RuntimeError):
     """an upload may have committed, but its exact immutable path could not be read back."""
+
+
+class _ProgressUploadDeferred(RuntimeError):
+    """an optional upload returned false and transient readback could not resolve its outcome."""
 
 
 @dataclass
@@ -178,7 +188,16 @@ def _upload_record(record: ProgressRecord, *, required: bool) -> bool:
         raise upload_error
     if committed or not worker_state.HF_REPO:
         return committed
-    remote = _remote_record_payload(path)
+    try:
+        remote = _remote_record_payload(path)
+    except Exception as verify_error:
+        from flash.snapshot.archive import is_transient_fetch_error
+
+        if not required and is_transient_fetch_error(verify_error):
+            raise _ProgressUploadDeferred(
+                "optional progress upload outcome is deferred until immutable readback succeeds"
+            ) from verify_error
+        raise
     if remote == payload:
         return True
     if remote is not None:
@@ -196,16 +215,21 @@ def pending_checkpoint_failure() -> dict[str, int | str] | None:
         )
 
 
-def _build_pending_record(pending: _PendingProgress) -> ProgressRecord:
-    global _PROGRESS_COMPLETED_STEPS, _PROGRESS_PENDING_CHECKPOINT_FAILURE
-    global _PROGRESS_TRAINING_ENTERED
+def _observe_cumulative_progress(pending: _PendingProgress) -> None:
+    global _PROGRESS_COMPLETED_STEPS, _PROGRESS_TRAINING_ENTERED
 
-    fields = dict(pending.fields)
-    step = fields.get("step")
+    step = pending.fields.get("step")
     if isinstance(step, (int, float)) and not isinstance(step, bool) and step >= 0:
         _PROGRESS_COMPLETED_STEPS = max(_PROGRESS_COMPLETED_STEPS, int(step))
-    if pending.stage in {"rl_step", "sft_step", "opd_step"}:
+    if pending.stage in _STEP_PROGRESS_STAGES:
         _PROGRESS_TRAINING_ENTERED = True
+
+
+def _build_pending_record(pending: _PendingProgress) -> ProgressRecord:
+    global _PROGRESS_PENDING_CHECKPOINT_FAILURE
+
+    _observe_cumulative_progress(pending)
+    fields = dict(pending.fields)
     if pending.stage == "checkpoint_upload_failed":
         failure = fields.get("checkpoint_failure")
         if isinstance(failure, dict):
@@ -245,10 +269,12 @@ def _drain_progress_until(target: _PendingProgress) -> None:
                 if not any(item is target for item in _PROGRESS_QUEUE):
                     return
                 pending = _PROGRESS_QUEUE[0]
-                record = _build_pending_record(pending)
+                record = pending.record or _build_pending_record(pending)
                 pending.record = record
             try:
                 committed = _upload_record(record, required=pending.initial)
+            except _ProgressUploadDeferred:
+                return
             except Exception as exc:
                 with _PROGRESS_LOCK:
                     pending.error = exc
@@ -268,17 +294,62 @@ def _drain_progress_until(target: _PendingProgress) -> None:
                 return
 
 
+def _queue_coalesced_progress() -> _PendingProgress | None:
+    global _PROGRESS_COALESCED, _PROGRESS_COALESCE_STARTED_AT
+
+    pending = _PROGRESS_COALESCED
+    if pending is None:
+        return None
+    _PROGRESS_COALESCED = None
+    _PROGRESS_COALESCE_STARTED_AT = None
+    _PROGRESS_QUEUE.append(pending)
+    return pending
+
+
+def flush_progress() -> bool:
+    """flush the latest cumulative step without making terminal publication depend on it."""
+    with _PROGRESS_LOCK:
+        if _PROGRESS_FATAL_ERROR is not None:
+            raise _PROGRESS_FATAL_ERROR
+        target = _queue_coalesced_progress()
+    if target is None:
+        return True
+    _drain_progress_until(target)
+    if target.error is not None:
+        raise target.error
+    return target.committed
+
+
 def publish_progress(stage: str, *, initial: bool = False, **fields):
-    """Publish one immutable cumulative progress record for observed work only."""
+    """Publish immediate boundaries and coalesce cumulative per-step observations."""
+    global _PROGRESS_COALESCED, _PROGRESS_COALESCE_STARTED_AT
+
     pending = _PendingProgress(stage, initial, dict(fields))
     with _PROGRESS_LOCK:
         if _PROGRESS_FATAL_ERROR is not None:
             raise _PROGRESS_FATAL_ERROR
-        _PROGRESS_QUEUE.append(pending)
-    _drain_progress_until(pending)
-    if pending.error is not None:
-        raise pending.error
-    return pending.committed
+        if stage in _STEP_PROGRESS_STAGES and not initial:
+            _observe_cumulative_progress(pending)
+            now = time.monotonic()
+            if _PROGRESS_COALESCED is None:
+                _PROGRESS_COALESCED = pending
+                _PROGRESS_COALESCE_STARTED_AT = now
+                return False
+            if now - _PROGRESS_COALESCE_STARTED_AT < _PROGRESS_STEP_CADENCE_S:
+                _PROGRESS_COALESCED = pending
+                return False
+            target = _PROGRESS_COALESCED
+            _PROGRESS_QUEUE.append(target)
+            _PROGRESS_COALESCED = pending
+            _PROGRESS_COALESCE_STARTED_AT = now
+        else:
+            _queue_coalesced_progress()
+            _PROGRESS_QUEUE.append(pending)
+            target = pending
+    _drain_progress_until(target)
+    if target.error is not None:
+        raise target.error
+    return target.committed
 
 
 _REWARD_METRIC_NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9_.-]")

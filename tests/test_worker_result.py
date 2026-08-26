@@ -86,6 +86,38 @@ def test_exactly_once_publish_adopts_matching_concurrent_result(monkeypatch, tmp
     assert api.created == 1
 
 
+def test_result_publication_continues_after_optional_progress_flush_failure(
+    monkeypatch, tmp_path
+) -> None:
+    from flash.engine.worker.io import progress as progress_io
+
+    _set_identity(monkeypatch)
+    monkeypatch.setattr(
+        progress_io,
+        "flush_progress",
+        lambda: (_ for _ in ()).throw(ConnectionError("optional progress unavailable")),
+    )
+    monkeypatch.setattr(result_io.time, "time", lambda: 120.0)
+    monkeypatch.setattr(result_io, "_source_attestation", lambda: ATTESTATION)
+    monkeypatch.setattr(
+        result_io, "_write_immutable", lambda _payload: str(tmp_path / "result.json")
+    )
+    monkeypatch.setattr(result_io, "_publish_exactly_once", lambda manifest, _path: manifest)
+
+    published = result_io.publish_result(
+        outcome="succeeded",
+        failure_class=None,
+        started_at=100.0,
+        training_entered=True,
+        completed_steps=4,
+        metrics={"step": 4},
+        artifacts={"adapter": "published"},
+    )
+
+    assert published.outcome == "succeeded"
+    assert published.completed_steps == 4
+
+
 def test_cancelled_result_uses_latest_current_fence_progress(monkeypatch) -> None:
     _set_identity(monkeypatch)
     captured = []

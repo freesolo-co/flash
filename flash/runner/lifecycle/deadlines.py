@@ -18,7 +18,10 @@ _RESULT_VISIBILITY_ALLOWANCE_S = 120.0
 
 
 def _derive_attempt_deadlines(
-    raw: dict, *, reserved_at: float
+    raw: dict,
+    *,
+    reserved_at: float,
+    grant_allowance_s: float = _ATTEMPT_GRANT_ALLOWANCE_S,
 ) -> tuple[float, float, float, float]:
     """Derive immutable grant, work, result, and outer deadlines for one reservation."""
     _status, canonical = _canonical_run_deadline(raw)
@@ -26,9 +29,10 @@ def _derive_attempt_deadlines(
         raise RuntimeError("persisted run wall deadline is missing; no provisioning is allowed")
     run_deadline = _checked_stored_run_deadline(raw[state._RUN_DEADLINE_AT_KEY], canonical)
     reserved = _require_valid_deadline(reserved_at)
+    grant_allowance = _require_valid_deadline(grant_allowance_s)
     if reserved >= run_deadline:
         raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
-    grant_deadline = min(run_deadline, reserved + _ATTEMPT_GRANT_ALLOWANCE_S)
+    grant_deadline = min(run_deadline, reserved + grant_allowance)
     work_deadline = run_deadline
     result_deadline = run_deadline + _RESULT_VISIBILITY_ALLOWANCE_S
     return grant_deadline, work_deadline, result_deadline, run_deadline
