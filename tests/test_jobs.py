@@ -542,6 +542,146 @@ def test_poll_job_terminal_resource_waits_for_result_deadline(monkeypatch):
     assert "without a result manifest" in result.detail
 
 
+@pytest.mark.parametrize("provider", ["lambda", "vast"])
+def test_instance_terminal_resource_uses_bounded_result_visibility_window(monkeypatch, provider):
+    from flash.providers._lifecycle.instances import poll_instance
+
+    attempt = _attempt_record(work_deadline_at=10_000.0, result_deadline_at=10_120.0)
+    monkeypatch.setattr(poll_instance, "_current_attempt", lambda _adapter: attempt)
+    monkeypatch.setattr(poll_instance, "_record_resource", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(poll_instance, "_observe_result", lambda _adapter: None)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(poll_instance.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(
+        poll_instance.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    adapter = poll_instance.InstancePollAdapter(
+        provider=provider,
+        instance_id="instance-1",
+        run_id="run-poll",
+        current_attempt=0,
+        fence=1,
+        launch_ts=1.0,
+        hf_repo="org/repo",
+        phase="sft",
+        source_snapshot=dict(_SOURCE_SNAPSHOT),
+        fetch_instance=lambda: {"status": "terminated"},
+        poll_error_exceptions=(RuntimeError,),
+        status_field="status",
+        running_status="running",
+        dead_states=frozenset({"terminated"}),
+        missing_dead_threshold=2,
+        stamp_cost_and_notes=lambda *_args, **_kwargs: None,
+    )
+
+    result = poll_instance.poll_instance_job(adapter, interval_s=20.0)
+
+    assert result.failure == "job_preempted"
+    assert clock["now"] == 220.0
+
+
+def test_instance_terminal_manifest_inside_visibility_window_wins(monkeypatch):
+    from flash.providers._lifecycle.instances import poll_instance
+    from flash.providers.core.base import PollResult
+
+    attempt = _attempt_record(work_deadline_at=10_000.0, result_deadline_at=10_120.0)
+    observations = iter((None, PollResult(True, metrics={"optimizer_steps": 7})))
+    monkeypatch.setattr(poll_instance, "_current_attempt", lambda _adapter: attempt)
+    monkeypatch.setattr(poll_instance, "_record_resource", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(poll_instance, "_observe_result", lambda _adapter: next(observations))
+    clock = {"now": 100.0}
+    monkeypatch.setattr(poll_instance.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(
+        poll_instance.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    adapter = poll_instance.InstancePollAdapter(
+        provider="lambda",
+        instance_id="instance-1",
+        run_id="run-poll",
+        current_attempt=0,
+        fence=1,
+        launch_ts=1.0,
+        hf_repo="org/repo",
+        phase="sft",
+        source_snapshot=dict(_SOURCE_SNAPSHOT),
+        fetch_instance=lambda: {"status": "terminated"},
+        poll_error_exceptions=(RuntimeError,),
+        status_field="status",
+        running_status="running",
+        dead_states=frozenset({"terminated"}),
+        missing_dead_threshold=2,
+        stamp_cost_and_notes=lambda *_args, **_kwargs: None,
+    )
+
+    result = poll_instance.poll_instance_job(adapter, interval_s=20.0)
+
+    assert result.ok
+    assert result.metrics == {"optimizer_steps": 7}
+    assert clock["now"] == 120.0
+
+
+def test_runpod_terminal_resource_uses_bounded_result_visibility_window(monkeypatch):
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(work_deadline_at=10_000.0, result_deadline_at=10_120.0),
+        results=[None] * 20,
+    )
+    clock = {"now": 100.0}
+    monkeypatch.setattr(polling.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(
+        polling.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda *_args, **_kwargs: {"status": "FAILED"},
+    )
+
+    result = polling.poll_job(_runpod_handle(jobs), _poll_spec(), interval_s=20.0)
+
+    assert result.failure == "job_preempted"
+    assert clock["now"] == 220.0
+
+
+def test_runpod_terminal_manifest_inside_visibility_window_wins(monkeypatch):
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(work_deadline_at=10_000.0, result_deadline_at=10_120.0),
+        results=[None, PollResult(True, metrics={"optimizer_steps": 7})],
+    )
+    clock = {"now": 100.0}
+    monkeypatch.setattr(polling.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(
+        polling.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda *_args, **_kwargs: {"status": "FAILED"},
+    )
+
+    result = polling.poll_job(_runpod_handle(jobs), _poll_spec(), interval_s=20.0)
+
+    assert result.ok
+    assert result.metrics == {"optimizer_steps": 7}
+    assert clock["now"] == 120.0
+
+
 def test_poll_job_running_without_progress_uses_fixed_attempt_deadline(monkeypatch):
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs
@@ -2722,6 +2862,59 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
 # ---------------------------------------------------------------------------
 # Cross-process cancel via REST handle + attach
 # ---------------------------------------------------------------------------
+def test_cancellation_billing_prefers_newer_verified_current_fence_result(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        from flash.providers.artifacts import attempts as artifact_attempts
+
+        spec = _spec("cancel-result")
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                billing_context={"org_id": "org-a"},
+                attempt=_attempt_record().to_dict(),
+                progress={
+                    "attempt_id": 0,
+                    "fence": 1,
+                    "completed_steps": 1,
+                    "training_entered": True,
+                },
+                source_snapshot=_SOURCE_SNAPSHOT,
+            )
+        )
+        result = {
+            "attempt_id": 0,
+            "fence": 1,
+            "completed_steps": 7,
+            "training_entered": True,
+        }
+        observations = iter((result,))
+
+        def read(*_args, **_kwargs):
+            current = next(observations)
+            return artifact_attempts.AttemptArtifacts("revision", 100.0, None, current)
+
+        monkeypatch.setattr(artifact_attempts, "read_attempt_artifacts", read)
+        monkeypatch.setattr(runner_deploy.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(
+            runner_costs, "charge_usd_for_spec", lambda _spec, **kwargs: kwargs["steps"]
+        )
+
+        runner_deploy._refresh_cancellation_result(spec.run_id, spec)
+        charge, diagnostic = runner_deploy._cancellation_billing(
+            spec.run_id,
+            spec,
+            bill_cancel=True,
+            rented_remote={"provider": "runpod", "gpu_type": "B200", "gpu_count": 1},
+        )
+
+        assert charge == 7
+        assert diagnostic == {}
+        assert runner_status.get_status(spec.run_id).result["completed_steps"] == 7
+
+
 def test_cancel_prices_and_cleans_up_with_effective_warmstart_spec(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)

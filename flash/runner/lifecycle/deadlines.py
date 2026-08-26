@@ -14,7 +14,7 @@ from flash.runner.lifecycle.state import RunStatus
 
 MIN_PROVIDER_WALL_SECONDS = 60
 _ATTEMPT_GRANT_ALLOWANCE_S = 900.0
-_RESULT_VISIBILITY_ALLOWANCE_S = 120.0
+RESULT_VISIBILITY_ALLOWANCE_S = 120.0
 
 
 def _derive_attempt_deadlines(
@@ -34,7 +34,7 @@ def _derive_attempt_deadlines(
         raise RuntimeError("run wall deadline exhausted; no further provisioning is allowed")
     grant_deadline = min(run_deadline, reserved + grant_allowance)
     work_deadline = run_deadline
-    result_deadline = run_deadline + _RESULT_VISIBILITY_ALLOWANCE_S
+    result_deadline = run_deadline + RESULT_VISIBILITY_ALLOWANCE_S
     return grant_deadline, work_deadline, result_deadline, run_deadline
 
 

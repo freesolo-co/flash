@@ -19,6 +19,7 @@ if __package__:
     from flash.providers._lifecycle.bootstrapping import console as _bootstrap_console
     from flash.providers._lifecycle.bootstrapping import pip as bootstrap_pip
     from flash.providers._lifecycle.bootstrapping import processes as bootstrap_processes
+    from flash.providers._lifecycle.bootstrapping import result_publication as bootstrap_results
     from flash.providers._lifecycle.bootstrapping.secrets import (
         _payload_secrets,
         _read_console_tail,
@@ -31,6 +32,7 @@ else:
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
     import bootstrap_processes  # type: ignore[no-redef]
+    import bootstrap_results  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
         _read_console_tail,
@@ -49,6 +51,9 @@ _HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
 _HF_RETRY_AFTER_MAX_S = 60.0
 _TERMINAL_BOOKKEEPING_RESERVE_S = 0.25
 _MAX_ATTEMPT_ID = (1 << 63) - 1
+_publish_deadline_result = bootstrap_results.publish_deadline_result
+_publish_cancelled_result = bootstrap_results.publish_cancelled_result
+_publish_bootstrap_failure_result = bootstrap_results.publish_bootstrap_failure_result
 
 
 class RetriableBootstrapError(RuntimeError):
@@ -587,80 +592,6 @@ def _request_cancellation(*_args) -> None:
     raise _CancellationRequested
 
 
-def _publish_supervisor_result(
-    payload: dict,
-    env: dict,
-    *,
-    code_dir: str,
-    started_at: float,
-    publisher: str,
-    label: str,
-) -> None:
-    result_deadline = _finite_positive_number(
-        payload.get("result_deadline_at"), "result visibility deadline"
-    )
-    remaining = result_deadline - _finite_positive_number(time.time(), "current clock")
-    if remaining <= 0:
-        raise TimeoutError(f"result visibility deadline expired before {label} publication")
-    result_env = {
-        **env,
-        "FLASH_RUN_DEADLINE_AT": str(result_deadline),
-    }
-    command = (
-        f"from flash.engine.worker.io.result import {publisher}; "
-        f"{publisher}(started_at={started_at!r})"
-    )
-    process, process_group_id = bootstrap_processes.start_process_group(
-        [sys.executable, "-c", command],
-        cwd=code_dir,
-        env=result_env,
-    )
-    try:
-        process.wait(timeout=remaining)
-    except subprocess.TimeoutExpired:
-        bootstrap_processes.terminate_process_group(
-            process,
-            process_group_id=process_group_id,
-        )
-        raise TimeoutError(f"{label} result publication exceeded its visibility window") from None
-    if process.returncode != 0:
-        raise RuntimeError(f"{label} result publication failed")
-
-
-def _publish_deadline_result(
-    payload: dict,
-    env: dict,
-    *,
-    code_dir: str,
-    started_at: float,
-) -> None:
-    _publish_supervisor_result(
-        payload,
-        env,
-        code_dir=code_dir,
-        started_at=started_at,
-        publisher="publish_deadline_result",
-        label="deadline",
-    )
-
-
-def _publish_cancelled_result(
-    payload: dict,
-    env: dict,
-    *,
-    code_dir: str,
-    started_at: float,
-) -> None:
-    _publish_supervisor_result(
-        payload,
-        env,
-        code_dir=code_dir,
-        started_at=started_at,
-        publisher="publish_cancelled_result",
-        label="cancellation",
-    )
-
-
 def _finish_run_mode(
     payload: dict,
     env: dict,
@@ -966,8 +897,30 @@ def main() -> int:
             return 0
         deadline_watchdog = list(arm_deadline_watchdog(deadline, payload))
         fetch_code(payload)
-        install_extra_pip(payload)
         env = build_worker_env(payload)
+        try:
+            install_extra_pip(payload)
+        except RetriableBootstrapError as exc:
+            detail = _safe_detail(exc, 1800, secrets=_payload_secrets(payload))
+            _publish_bootstrap_failure_result(
+                payload,
+                env,
+                code_dir=_code_dir(payload),
+                started_at=_finite_positive_number(time.time(), "current clock"),
+                error=detail,
+                failure_class="artifact_transport",
+            )
+            raise
+        except Exception as exc:
+            detail = _safe_detail(exc, 1800, secrets=_payload_secrets(payload))
+            _publish_bootstrap_failure_result(
+                payload,
+                env,
+                code_dir=_code_dir(payload),
+                started_at=_finite_positive_number(time.time(), "current clock"),
+                error=detail,
+            )
+            raise
         phase = payload["phase"]
         rc = run_mode(
             payload,

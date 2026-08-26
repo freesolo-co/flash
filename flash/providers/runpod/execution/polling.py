@@ -21,6 +21,7 @@ from flash.providers.runpod.execution.jobs import (
     GraceTimer,
     capacity_escalation_note,
 )
+from flash.runner.lifecycle.deadlines import RESULT_VISIBILITY_ALLOWANCE_S
 from flash.runner.lifecycle.protocol import AttemptRecord
 
 if TYPE_CHECKING:
@@ -207,6 +208,7 @@ def poll_job(
     state = _PollState(None, False, GraceTimer(), GraceTimer(), GraceTimer())
     poll_errors = PollErrorTracker(context.say, interval_s)
     terminal_status: str | None = None
+    terminal_result_deadline_at: float | None = None
     artifact_error: str | None = None
     while True:
         now = time.time()
@@ -220,7 +222,8 @@ def poll_job(
             artifact_error = type(exc).__name__
         if result is not None:
             return result
-        if now >= attempt.result_deadline_at:
+        result_deadline = terminal_result_deadline_at or attempt.result_deadline_at
+        if now >= result_deadline:
             state_detail = (
                 f"resource ended with {terminal_status}"
                 if terminal_status is not None
@@ -235,7 +238,7 @@ def poll_job(
                 ),
             )
         if now >= attempt.work_deadline_at:
-            delay = min(interval_s, max(0.0, attempt.result_deadline_at - time.time()))
+            delay = min(interval_s, max(0.0, result_deadline - time.time()))
             if delay > 0:
                 time.sleep(delay)
             continue
@@ -262,11 +265,20 @@ def poll_job(
         if status in _GRANT_PROVING_STATUSES:
             state.granted = True
         if status in TERMINAL_OK | TERMINAL_FAIL:
+            if terminal_status is None:
+                terminal_result_deadline_at = min(
+                    attempt.result_deadline_at,
+                    now + RESULT_VISIBILITY_ALLOWANCE_S,
+                )
             terminal_status = status
         failure = _queue_failure(context, state, status, now)
         if failure is not None:
             return failure
-        sleep_until = attempt.result_deadline_at if terminal_status else attempt.work_deadline_at
+        sleep_until = (
+            terminal_result_deadline_at or attempt.result_deadline_at
+            if terminal_status
+            else attempt.work_deadline_at
+        )
         delay = min(interval_s, max(0.0, sleep_until - time.time()))
         if delay > 0:
             time.sleep(delay)

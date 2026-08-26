@@ -2048,7 +2048,7 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
     )
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: events.append("install"))
     monkeypatch.setattr(b, "fetch_code", lambda _payload: events.append("code"))
-    monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
+    monkeypatch.setattr(b, "build_worker_env", lambda _payload: events.append("env") or {})
     monkeypatch.setattr(
         b,
         "run_mode",
@@ -2059,13 +2059,112 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
     monkeypatch.setattr(b.os.path, "exists", lambda path: path == "/tmp/metrics.json")
 
     assert b.main() == 0
-    assert events[:4] == [
+    assert events[:5] == [
         ("watchdog", 500.0),
         "code",
+        "env",
         "install",
         ("training", 500.0),
     ]
     assert events[-2:] == ["deadline_done", "deadline_cancel"]
+
+
+def test_main_deterministic_post_source_pip_failure_publishes_fenced_result(monkeypatch):
+    events = []
+    payload = {
+        **_source_payload(),
+        "job_spec_json": "{}",
+        "phase": "sft",
+        "seed": 0,
+        "flash_arm": "lambda",
+        "extra_pip": ["invalid requirement @@@"],
+        "work_deadline_at": 450.0,
+        "result_deadline_at": 500.0,
+    }
+
+    class _Done:
+        def set(self):
+            return None
+
+    class _Timer:
+        def cancel(self):
+            return None
+
+    monkeypatch.setattr(b.time, "time", lambda: 100.0)
+    monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "arm_deadline_watchdog", lambda *_args: (_Timer(), _Done()))
+    monkeypatch.setattr(b, "fetch_code", lambda _payload: events.append("code"))
+    worker_env = {"RUN_ID": "run-1", "ATTEMPT": "0", "FENCE": "1"}
+    monkeypatch.setattr(b, "build_worker_env", lambda _payload: events.append("env") or worker_env)
+    monkeypatch.setattr(
+        b,
+        "install_extra_pip",
+        lambda _payload: (
+            events.append("pip") or (_ for _ in ()).throw(RuntimeError("invalid requirement"))
+        ),
+    )
+    monkeypatch.setattr(
+        b,
+        "_publish_bootstrap_failure_result",
+        lambda _payload, env, **kwargs: events.append(("result", env, kwargs)),
+    )
+    monkeypatch.setattr(
+        b,
+        "run_mode",
+        lambda *_args, **_kwargs: pytest.fail("training must not start after pip failure"),
+    )
+
+    assert b.main() == 1
+    assert events[:3] == ["code", "env", "pip"]
+    result_event = events[3]
+    assert result_event[0] == "result"
+    assert result_event[1] == worker_env
+    assert result_event[2]["code_dir"] == "/runcode/run-1-attempt-0"
+    assert result_event[2]["error"] == "RuntimeError: invalid requirement"
+
+
+def test_main_transient_post_source_pip_failure_remains_retriable(monkeypatch):
+    events = []
+    payload = {
+        **_source_payload(),
+        "job_spec_json": "{}",
+        "phase": "sft",
+        "seed": 0,
+        "flash_arm": "lambda",
+        "extra_pip": ["package"],
+        "work_deadline_at": 450.0,
+        "result_deadline_at": 500.0,
+    }
+
+    class _Done:
+        def set(self):
+            return None
+
+    class _Timer:
+        def cancel(self):
+            return None
+
+    monkeypatch.setattr(b.time, "time", lambda: 100.0)
+    monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "arm_deadline_watchdog", lambda *_args: (_Timer(), _Done()))
+    monkeypatch.setattr(b, "fetch_code", lambda _payload: events.append("code"))
+    monkeypatch.setattr(b, "build_worker_env", lambda _payload: events.append("env") or {})
+    monkeypatch.setattr(
+        b,
+        "install_extra_pip",
+        lambda _payload: (_ for _ in ()).throw(b.RetriableBootstrapError("index unavailable")),
+    )
+    monkeypatch.setattr(
+        b,
+        "_publish_bootstrap_failure_result",
+        lambda _payload, _env, **kwargs: events.append(("result", kwargs)),
+    )
+
+    assert b.main() == 1
+    assert events[:2] == ["code", "env"]
+    assert events[2][0] == "result"
+    assert events[2][1]["failure_class"] == "artifact_transport"
+    assert events[2][1]["error"] == "RetriableBootstrapError: index unavailable"
 
 
 def test_main_source_verification_failure_prevents_pip(monkeypatch):

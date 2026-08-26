@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 # reads the TOP-LEVEL `status.state`, where `deployed` is a live value this build writes.
 _FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
+_CANCELLATION_RESULT_VISIBILITY_S = 5.0
 # reads the NESTED `status.deployment["state"]`, a different vocabulary: no build has ever written
 # `deployed` there. the cli keeps both spellings on purpose, because it reads this field back from
 # a remote control plane whose version it does not control.
@@ -612,6 +613,53 @@ def _revoke_serving(
     return None, None
 
 
+def _refresh_cancellation_result(run_id: str, effective_spec) -> None:
+    """persist a newly visible verified current-fence result before cancellation billing."""
+    from flash.providers.artifacts.attempts import (
+        AttemptArtifactError,
+        persist_attempt_artifacts,
+        read_attempt_artifacts,
+    )
+    from flash.runner.lifecycle.protocol import AttemptRecord
+    from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
+
+    status = get_status(run_id)
+    attempt = AttemptRecord.from_dict(status.attempt)
+    existing = status.result if isinstance(status.result, dict) else {}
+    if existing.get("attempt_id") == attempt.attempt_id and existing.get("fence") == attempt.fence:
+        return
+    try:
+        source_snapshot = source_snapshot_from_status(status, required=True)
+    except Exception:
+        return
+    deadline_at = min(
+        attempt.result_deadline_at,
+        time.time() + _CANCELLATION_RESULT_VISIBILITY_S,
+    )
+    while True:
+        try:
+            artifacts = read_attempt_artifacts(
+                effective_spec.train.hf_repo,
+                phase=effective_spec.phase,
+                run_id=run_id,
+                attempt_id=attempt.attempt_id,
+                fence=attempt.fence,
+                source_snapshot=source_snapshot,
+            )
+        except AttemptArtifactError:
+            return
+        except Exception:
+            artifacts = None
+        if artifacts is not None:
+            persist_attempt_artifacts(run_id, artifacts)
+            if artifacts.result is not None:
+                return
+        remaining = deadline_at - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(2.0, remaining))
+
+
 def _cancellation_billing(
     run_id: str,
     effective_spec,
@@ -782,6 +830,8 @@ def cancel_run(run_id: str) -> RunStatus:
                 run_id, status, active_deployment=active_deployment
             )
 
+        if bill_cancel and effective_spec is not None and rented_remote:
+            _refresh_cancellation_result(run_id, effective_spec)
         cancel_charge_usd, billing_diagnostic = _cancellation_billing(
             run_id, effective_spec, bill_cancel=bill_cancel, rented_remote=rented_remote
         )

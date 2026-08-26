@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import inspect
 import itertools
 import json
+import os
 import threading
 import time
 
@@ -11,14 +13,18 @@ from flash.runner.lifecycle.protocol import digest_record
 
 
 def _reset(monkeypatch) -> None:
+    with contextlib.suppress(OSError):
+        os.unlink(progress_io.supervisor_snapshot_path("run-1", "rl", 2, 9))
     monkeypatch.setattr(progress_io.worker_state, "RUN_ID", "run-1")
     monkeypatch.setattr(progress_io.worker_state, "PHASE", "rl")
     monkeypatch.setattr(progress_io.worker_state, "ATTEMPT", 2)
     monkeypatch.setattr(progress_io.worker_state, "FENCE", 9)
     monkeypatch.setattr(progress_io, "_PROGRESS_SEQUENCE", 0)
     monkeypatch.setattr(progress_io, "_PROGRESS_PREVIOUS_DIGEST", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_LAST_COMMITTED_OCCURRED_AT", 0.0)
     monkeypatch.setattr(progress_io, "_PROGRESS_TRAINING_ENTERED", False)
     monkeypatch.setattr(progress_io, "_PROGRESS_COMPLETED_STEPS", 0)
+    monkeypatch.setattr(progress_io, "_PROGRESS_LATEST_METRICS", {})
     monkeypatch.setattr(progress_io, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
     monkeypatch.setattr(progress_io, "_PROGRESS_FATAL_ERROR", None)
     monkeypatch.setattr(progress_io, "_PROGRESS_COALESCED", None)
@@ -207,6 +213,58 @@ def test_optional_upload_verification_blip_retries_identical_record(monkeypatch)
     assert second.previous_digest == digest_record(first.to_dict())
     assert verification_calls["count"] == 1
     assert not progress_io._PROGRESS_QUEUE
+
+
+def test_deferred_boundary_retries_when_next_step_coalesces(monkeypatch) -> None:
+    _reset(monkeypatch)
+    records = []
+    outcomes = iter((_ProgressUploadDeferredForTest, True, True))
+
+    def upload(record, *, required):
+        records.append((record, required))
+        outcome = next(outcomes)
+        if outcome is _ProgressUploadDeferredForTest:
+            raise progress_io._ProgressUploadDeferred("readback unavailable")
+        return outcome
+
+    monkeypatch.setattr(progress_io, "_upload_record", upload)
+
+    assert progress_io.publish_progress("model_prefetching") is False
+    assert len(progress_io._PROGRESS_QUEUE) == 1
+    boundary = progress_io._PROGRESS_QUEUE[0].record
+
+    assert progress_io.publish_progress("rl_step", step=7) is False
+
+    assert records[0][0].to_dict() == records[1][0].to_dict() == boundary.to_dict()
+    assert not progress_io._PROGRESS_QUEUE
+    assert progress_io._PROGRESS_COALESCED is not None
+    assert progress_io.flush_progress() is True
+    assert [record.sequence for record, _required in records] == [1, 1, 2]
+    assert records[-1][0].previous_digest == digest_record(boundary.to_dict())
+
+
+_ProgressUploadDeferredForTest = object()
+
+
+def test_progress_occurred_at_never_moves_backward(monkeypatch) -> None:
+    _reset(monkeypatch)
+    times = iter((100.0, 90.0, 95.0, 110.0))
+    records = []
+    monkeypatch.setattr(progress_io.time, "time", lambda: next(times))
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda record, *, required: records.append(record) or True,
+    )
+
+    progress_io.publish_progress("boot")
+    progress_io.publish_progress("phase_observed")
+    progress_io.publish_progress("checkpoint_uploaded")
+    progress_io.publish_progress("result_published")
+
+    assert [record.occurred_at for record in records] == [100.0, 100.0, 100.0, 110.0]
+    assert [record.sequence for record in records] == [1, 2, 3, 4]
+    assert records[2].previous_digest == digest_record(records[1].to_dict())
 
 
 def test_step_progress_coalesces_by_window_and_terminal_stays_dedicated(monkeypatch) -> None:

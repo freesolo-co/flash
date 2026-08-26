@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import os
 import re
+import tempfile
 import threading
 import time
 from collections import deque
@@ -31,8 +33,10 @@ _PROGRESS_LOCK = threading.Lock()
 _PROGRESS_DRAIN_LOCK = threading.Lock()
 _PROGRESS_SEQUENCE = 0
 _PROGRESS_PREVIOUS_DIGEST: str | None = None
+_PROGRESS_LAST_COMMITTED_OCCURRED_AT = 0.0
 _PROGRESS_TRAINING_ENTERED = False
 _PROGRESS_COMPLETED_STEPS = 0
+_PROGRESS_LATEST_METRICS: dict = {}
 _PROGRESS_PENDING_CHECKPOINT_FAILURE: dict[str, int | str] | None = None
 _PROGRESS_FATAL_ERROR: Exception | None = None
 _PROGRESS_QUEUE = deque()
@@ -41,6 +45,8 @@ _PROGRESS_COALESCE_STARTED_AT: float | None = None
 # four cumulative commits per run-hour leaves the shared 128/hour repository budget bounded at
 # 32 simultaneous training attempts; phase, checkpoint, and terminal boundaries remain immediate.
 _PROGRESS_STEP_CADENCE_S = 900.0
+_SUPERVISOR_SNAPSHOT_SCHEMA_VERSION = 1
+_SUPERVISOR_SNAPSHOT_DIRECTORY = "/tmp/flash-progress-current"
 _STEP_PROGRESS_STAGES = frozenset({"opd_step", "rl_step", "sft_step"})
 LATEST_GRPO_METRICS: list = []
 GRPO_METRIC_HISTORY_LIMIT = 1024
@@ -150,6 +156,70 @@ def _write_local_immutable(payload: bytes) -> str:
             os.unlink(temporary)
 
 
+def supervisor_snapshot_path(run_id: str, phase: str, attempt: int, fence: int) -> str:
+    """return the overwriteable current-fence supervisor snapshot path."""
+    identity = canonical_bytes(
+        {
+            "run_id": run_id,
+            "phase_namespace": phase,
+            "attempt_id": attempt,
+            "fence": fence,
+        }
+    )
+    return os.path.join(
+        _SUPERVISOR_SNAPSHOT_DIRECTORY, hashlib.sha256(identity).hexdigest() + ".json"
+    )
+
+
+def _persist_supervisor_snapshot(fields: dict) -> None:
+    global _PROGRESS_LATEST_METRICS
+
+    metrics, _samples, _timing, checkpoint, _gpu, _diagnostics = _progress_sections(fields)
+    if metrics:
+        _PROGRESS_LATEST_METRICS = bounded_json(metrics)
+    if _PROGRESS_PENDING_CHECKPOINT_FAILURE and not checkpoint:
+        checkpoint = dict(_PROGRESS_PENDING_CHECKPOINT_FAILURE)
+    payload = canonical_bytes(
+        {
+            "schema_version": _SUPERVISOR_SNAPSHOT_SCHEMA_VERSION,
+            "run_id": worker_state.RUN_ID,
+            "phase_namespace": worker_state.PHASE,
+            "attempt_id": worker_state.ATTEMPT,
+            "fence": worker_state.FENCE,
+            "training_entered": _PROGRESS_TRAINING_ENTERED,
+            "completed_steps": _PROGRESS_COMPLETED_STEPS,
+            "metrics": bounded_json(_PROGRESS_LATEST_METRICS),
+            "checkpoint": bounded_json(checkpoint),
+        }
+    )
+    os.makedirs(_SUPERVISOR_SNAPSHOT_DIRECTORY, mode=0o700, exist_ok=True)
+    final = supervisor_snapshot_path(
+        worker_state.RUN_ID,
+        worker_state.PHASE,
+        worker_state.ATTEMPT,
+        worker_state.FENCE,
+    )
+    fd, temporary = tempfile.mkstemp(
+        dir=_SUPERVISOR_SNAPSHOT_DIRECTORY,
+        prefix="current-",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, final)
+        directory_fd = os.open(_SUPERVISOR_SNAPSHOT_DIRECTORY, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
 def _remote_record_payload(path: str) -> bytes | None:
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import RemoteEntryNotFoundError
@@ -223,6 +293,7 @@ def _observe_cumulative_progress(pending: _PendingProgress) -> None:
         _PROGRESS_COMPLETED_STEPS = max(_PROGRESS_COMPLETED_STEPS, int(step))
     if pending.stage in _STEP_PROGRESS_STAGES:
         _PROGRESS_TRAINING_ENTERED = True
+    _persist_supervisor_snapshot(pending.fields)
 
 
 def _build_pending_record(pending: _PendingProgress) -> ProgressRecord:
@@ -238,6 +309,7 @@ def _build_pending_record(pending: _PendingProgress) -> ProgressRecord:
         _PROGRESS_PENDING_CHECKPOINT_FAILURE = None
     if _PROGRESS_PENDING_CHECKPOINT_FAILURE and "checkpoint_failure" not in fields:
         fields["checkpoint_failure"] = dict(_PROGRESS_PENDING_CHECKPOINT_FAILURE)
+    _persist_supervisor_snapshot(fields)
     metrics, samples, timing, checkpoint, gpu, diagnostics = _progress_sections(fields)
     return ProgressRecord(
         run_id=worker_state.RUN_ID,
@@ -246,7 +318,7 @@ def _build_pending_record(pending: _PendingProgress) -> ProgressRecord:
         fence=worker_state.FENCE,
         sequence=_PROGRESS_SEQUENCE + 1,
         previous_digest=_PROGRESS_PREVIOUS_DIGEST,
-        occurred_at=time.time(),
+        occurred_at=max(time.time(), _PROGRESS_LAST_COMMITTED_OCCURRED_AT),
         kind=_progress_kind(pending.stage),
         phase=pending.stage,
         training_entered=_PROGRESS_TRAINING_ENTERED,
@@ -261,7 +333,8 @@ def _build_pending_record(pending: _PendingProgress) -> ProgressRecord:
 
 
 def _drain_progress_until(target: _PendingProgress) -> None:
-    global _PROGRESS_FATAL_ERROR, _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE
+    global _PROGRESS_FATAL_ERROR, _PROGRESS_LAST_COMMITTED_OCCURRED_AT
+    global _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE
 
     with _PROGRESS_DRAIN_LOCK:
         while True:
@@ -289,6 +362,7 @@ def _drain_progress_until(target: _PendingProgress) -> None:
                 if committed:
                     _PROGRESS_SEQUENCE = record.sequence
                     _PROGRESS_PREVIOUS_DIGEST = digest_record(record.to_dict())
+                    _PROGRESS_LAST_COMMITTED_OCCURRED_AT = record.occurred_at
             print("PROGRESS", json.dumps(record.to_dict(), allow_nan=False, sort_keys=True))
             if pending is target:
                 return
@@ -325,31 +399,35 @@ def publish_progress(stage: str, *, initial: bool = False, **fields):
     global _PROGRESS_COALESCED, _PROGRESS_COALESCE_STARTED_AT
 
     pending = _PendingProgress(stage, initial, dict(fields))
+    step_coalesced = False
     with _PROGRESS_LOCK:
         if _PROGRESS_FATAL_ERROR is not None:
             raise _PROGRESS_FATAL_ERROR
         if stage in _STEP_PROGRESS_STAGES and not initial:
             _observe_cumulative_progress(pending)
             now = time.monotonic()
+            step_coalesced = True
             if _PROGRESS_COALESCED is None:
                 _PROGRESS_COALESCED = pending
                 _PROGRESS_COALESCE_STARTED_AT = now
-                return False
-            if now - _PROGRESS_COALESCE_STARTED_AT < _PROGRESS_STEP_CADENCE_S:
+                target = _PROGRESS_QUEUE[0] if _PROGRESS_QUEUE else None
+            elif now - _PROGRESS_COALESCE_STARTED_AT < _PROGRESS_STEP_CADENCE_S:
                 _PROGRESS_COALESCED = pending
-                return False
-            target = _PROGRESS_COALESCED
-            _PROGRESS_QUEUE.append(target)
-            _PROGRESS_COALESCED = pending
-            _PROGRESS_COALESCE_STARTED_AT = now
+                target = _PROGRESS_QUEUE[0] if _PROGRESS_QUEUE else None
+            else:
+                target = _PROGRESS_COALESCED
+                _PROGRESS_QUEUE.append(target)
+                _PROGRESS_COALESCED = pending
+                _PROGRESS_COALESCE_STARTED_AT = now
         else:
             _queue_coalesced_progress()
             _PROGRESS_QUEUE.append(pending)
             target = pending
-    _drain_progress_until(target)
-    if target.error is not None:
-        raise target.error
-    return target.committed
+    if target is not None:
+        _drain_progress_until(target)
+        if target.error is not None:
+            raise target.error
+    return False if step_coalesced else pending.committed
 
 
 _REWARD_METRIC_NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9_.-]")

@@ -86,6 +86,121 @@ def test_exactly_once_publish_adopts_matching_concurrent_result(monkeypatch, tmp
     assert api.created == 1
 
 
+def test_cancelled_result_recovers_coalesced_supervisor_snapshot(monkeypatch, tmp_path) -> None:
+    from flash.engine.worker.io import progress as progress_io
+
+    _set_identity(monkeypatch)
+    monkeypatch.setattr(progress_io, "_SUPERVISOR_SNAPSHOT_DIRECTORY", str(tmp_path))
+    monkeypatch.setattr(progress_io.worker_state, "RUN_ID", "run-1")
+    monkeypatch.setattr(progress_io.worker_state, "PHASE", "rl")
+    monkeypatch.setattr(progress_io.worker_state, "ATTEMPT", 2)
+    monkeypatch.setattr(progress_io.worker_state, "FENCE", 9)
+    progress_io._PROGRESS_QUEUE.clear()
+    monkeypatch.setattr(progress_io, "_PROGRESS_COALESCED", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COALESCE_STARTED_AT", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_SEQUENCE", 0)
+    monkeypatch.setattr(progress_io, "_PROGRESS_PREVIOUS_DIGEST", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_LAST_COMMITTED_OCCURRED_AT", 0.0)
+    monkeypatch.setattr(progress_io, "_PROGRESS_TRAINING_ENTERED", False)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COMPLETED_STEPS", 0)
+    monkeypatch.setattr(progress_io, "_PROGRESS_LATEST_METRICS", {})
+    monkeypatch.setattr(progress_io, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_FATAL_ERROR", None)
+    uploads = []
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda record, *, required: uploads.append(record) or True,
+    )
+
+    assert progress_io.publish_progress("boot") is True
+    assert progress_io.publish_progress("rl_step", step=7, loss=0.25) is False
+    assert len(uploads) == 1
+
+    progress_io._PROGRESS_QUEUE.clear()
+    monkeypatch.setattr(progress_io, "_PROGRESS_COALESCED", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COALESCE_STARTED_AT", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_SEQUENCE", 0)
+    monkeypatch.setattr(progress_io, "_PROGRESS_PREVIOUS_DIGEST", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_LAST_COMMITTED_OCCURRED_AT", 0.0)
+    monkeypatch.setattr(progress_io, "_PROGRESS_TRAINING_ENTERED", False)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COMPLETED_STEPS", 0)
+    monkeypatch.setattr(progress_io, "_PROGRESS_LATEST_METRICS", {})
+    monkeypatch.setattr(result_io, "_source_attestation", lambda: ATTESTATION)
+    monkeypatch.setattr(result_io.time, "time", lambda: 120.0)
+    monkeypatch.setattr(result_io, "_write_immutable", lambda _payload: str(tmp_path / "result"))
+    monkeypatch.setattr(result_io, "_publish_exactly_once", lambda manifest, _path: manifest)
+
+    manifest = result_io.publish_cancelled_result(started_at=100.0)
+
+    assert manifest.training_entered is True
+    assert manifest.completed_steps == 7
+    assert manifest.metrics == {"loss": 0.25}
+    assert len(uploads) == 1
+
+
+def test_supervisor_snapshot_rejects_foreign_fence(monkeypatch, tmp_path) -> None:
+    from flash.engine.worker.io import progress as progress_io
+
+    _set_identity(monkeypatch)
+    monkeypatch.setattr(progress_io, "_SUPERVISOR_SNAPSHOT_DIRECTORY", str(tmp_path))
+    path = progress_io.supervisor_snapshot_path("run-1", "rl", 2, 9)
+    with open(path, "w") as handle:
+        handle.write(
+            '{"schema_version":1,"run_id":"run-1","phase_namespace":"rl",'
+            '"attempt_id":2,"fence":8,"training_entered":true,"completed_steps":99,'
+            '"metrics":{},"checkpoint":{}}'
+        )
+
+    assert result_io._supervisor_snapshot() == {}
+
+
+def test_bootstrap_failure_result_is_fenced_worker_failure(monkeypatch, tmp_path) -> None:
+    from flash.providers.artifacts.attempts import poll_result_from_manifest
+
+    _set_identity(monkeypatch)
+    monkeypatch.setenv("FLASH_BOOTSTRAP_ERROR", "invalid requirement")
+    monkeypatch.setattr(result_io, "_source_attestation", lambda: ATTESTATION)
+    monkeypatch.setattr(result_io.time, "time", lambda: 120.0)
+    monkeypatch.setattr(result_io, "_write_immutable", lambda _payload: str(tmp_path / "result"))
+    publications = []
+    monkeypatch.setattr(
+        result_io,
+        "_publish_exactly_once",
+        lambda manifest, _path: publications.append(manifest) or manifest,
+    )
+
+    manifest = result_io.publish_bootstrap_failure_result(started_at=100.0)
+    projection = poll_result_from_manifest(manifest.to_dict())
+
+    assert len(publications) == 1
+    assert manifest.failure_class == "worker"
+    assert manifest.training_entered is False
+    assert manifest.completed_steps == 0
+    assert manifest.source_attestation == ATTESTATION
+    assert projection.failure == "job_failed"
+    assert projection.detail == "invalid requirement"
+
+
+def test_transient_bootstrap_failure_result_remains_retriable(monkeypatch, tmp_path) -> None:
+    from flash.providers.artifacts.attempts import poll_result_from_manifest
+
+    _set_identity(monkeypatch)
+    monkeypatch.setenv("FLASH_BOOTSTRAP_ERROR", "index unavailable")
+    monkeypatch.setenv("FLASH_BOOTSTRAP_FAILURE_CLASS", "artifact_transport")
+    monkeypatch.setattr(result_io, "_source_attestation", lambda: ATTESTATION)
+    monkeypatch.setattr(result_io.time, "time", lambda: 120.0)
+    monkeypatch.setattr(result_io, "_write_immutable", lambda _payload: str(tmp_path / "result"))
+    monkeypatch.setattr(result_io, "_publish_exactly_once", lambda manifest, _path: manifest)
+
+    manifest = result_io.publish_bootstrap_failure_result(started_at=100.0)
+    projection = poll_result_from_manifest(manifest.to_dict())
+
+    assert manifest.failure_class == "artifact_transport"
+    assert projection.failure == "job_preempted"
+    assert projection.detail == "index unavailable"
+
+
 def test_result_publication_continues_after_optional_progress_flush_failure(
     monkeypatch, tmp_path
 ) -> None:

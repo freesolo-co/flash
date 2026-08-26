@@ -164,7 +164,53 @@ def _publish_exactly_once(manifest: ResultManifest, local_path: str) -> ResultMa
     ) from last_error
 
 
+def _supervisor_snapshot() -> dict:
+    from flash.engine.worker.io import progress as progress_io
+
+    path = progress_io.supervisor_snapshot_path(
+        state.RUN_ID,
+        state.PHASE,
+        state.ATTEMPT,
+        state.FENCE,
+    )
+    try:
+        with open(path, "rb") as handle:
+            value = json.loads(handle.read())
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return {}
+    expected_keys = {
+        "schema_version",
+        "run_id",
+        "phase_namespace",
+        "attempt_id",
+        "fence",
+        "training_entered",
+        "completed_steps",
+        "metrics",
+        "checkpoint",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        return {}
+    if (
+        value.get("schema_version") != progress_io._SUPERVISOR_SNAPSHOT_SCHEMA_VERSION
+        or value.get("run_id") != state.RUN_ID
+        or value.get("phase_namespace") != state.PHASE
+        or value.get("attempt_id") != state.ATTEMPT
+        or value.get("fence") != state.FENCE
+        or type(value.get("training_entered")) is not bool
+        or type(value.get("completed_steps")) is not int
+        or value["completed_steps"] < 0
+        or not isinstance(value.get("metrics"), dict)
+        or not isinstance(value.get("checkpoint"), dict)
+    ):
+        return {}
+    return value
+
+
 def _latest_local_progress() -> dict:
+    snapshot = _supervisor_snapshot()
+    if snapshot:
+        return snapshot
     directory = "/tmp/flash-progress"
     candidates: list[dict] = []
     with contextlib.suppress(OSError):
@@ -230,6 +276,22 @@ def publish_cancelled_result(*, started_at: float) -> ResultManifest:
         failure_class=None,
         started_at=started_at,
         error="worker attempt cancelled",
+    )
+
+
+def publish_bootstrap_failure_result(*, started_at: float) -> ResultManifest:
+    """publish a post-source bootstrap failure for the fenced attempt."""
+    failure_class = os.environ.get("FLASH_BOOTSTRAP_FAILURE_CLASS", "worker")
+    if failure_class not in {"worker", "artifact_transport"}:
+        raise RuntimeError("bootstrap failure class is invalid")
+    return publish_result(
+        outcome="failed",
+        failure_class=failure_class,
+        started_at=started_at,
+        training_entered=False,
+        completed_steps=0,
+        artifacts={"console": f"console_{state.PHASE}.txt"},
+        diagnostics={"error": os.environ.get("FLASH_BOOTSTRAP_ERROR", "bootstrap failed")},
     )
 
 
