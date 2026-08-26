@@ -12,7 +12,7 @@ from flash.serve.runtime import AdapterSpec, EngineConfig, VllmLoraRuntime
 
 from .manifest import ManifestAdapter, ServingManifest
 from .materialize import locked_manifest_cache
-from .progress import emit_boot_progress
+from .progress import emit_boot_progress, emit_filesystem_usage
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +131,7 @@ async def bootstrap_serving(
                 revision=manifest.engine.model_revision,
             )
             await runtime.start()
+            emit_filesystem_usage("engine-constructed", cache_root)
             emit_boot_progress(
                 "engine-constructed",
                 model=manifest.engine.served_model,
@@ -165,6 +166,7 @@ async def bootstrap_serving(
             )
         owner._models = MappingProxyType(dict(sorted(published.items())))
         owner._ready = True
+        emit_filesystem_usage("serving-ready", cache_root)
         return owner
     except BaseException:
         await owner.close()

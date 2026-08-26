@@ -15,7 +15,7 @@ from pathlib import Path
 from types import FrameType, SimpleNamespace
 from typing import Any, Protocol, Self
 
-from .progress import emit_boot_progress
+from .progress import emit_boot_progress, emit_filesystem_usage
 
 _MANIFEST_ENV = "FLASH_SERVING_MANIFEST"
 _MANIFEST_ID_ENV = "FLASH_SERVING_MANIFEST_ID"
@@ -532,6 +532,7 @@ def _run_with_secrets(
     _bind_hub_cache(environment, cache_root)
     inference_token, artifact_token = secrets._reveal_for_launch()
     _prepare_cache(manifest, cache_root, artifact_token)
+    emit_filesystem_usage("cache-prepared", cache_root)
     _seal_hub_offline(environment)
     args = SimpleNamespace(
         cache_root=cache_root,

@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from flash.serve.app import __main__ as app_main
+from flash.serve.app import bootstrap as bootstrap_module
 from flash.serve.app import http as http_module
 from flash.serve.app.bootstrap import (
     PublishedAdapter,
@@ -272,6 +273,62 @@ def test_bootstrap_registers_every_revision_before_atomic_publish(
     asyncio.run(owner.close())
     assert runtime.closed is True
     assert owner.models == {}
+
+
+def test_filesystem_usage_follows_engine_start_and_readiness_publish(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manifest = _manifest()
+    paths = {
+        adapter.adapter_revision: tmp_path / adapter.adapter_revision
+        for adapter in manifest.adapters
+    }
+    monkeypatch.setattr(bootstrap_module, "locked_manifest_cache", _locked_paths(paths))
+    runtime = _FakeRuntime()
+    events: list[str] = []
+    owners: list[ServingBootstrap] = []
+    real_owner_type = ServingBootstrap
+
+    async def start() -> None:
+        runtime.started = True
+        events.append("runtime-started")
+
+    async def register_adapter(spec) -> bool:
+        events.append("adapter-registered")
+        runtime.registered.append(spec)
+        return True
+
+    def build_owner(owner_manifest, owner_runtime):
+        owner = real_owner_type(owner_manifest, owner_runtime)
+        owners.append(owner)
+        return owner
+
+    def filesystem_usage(stage, cache_root) -> None:
+        assert cache_root == tmp_path
+        if stage == "engine-constructed":
+            assert runtime.started is True
+            assert runtime.registered == []
+        if stage == "serving-ready":
+            assert owners[0]._ready is True
+            assert len(runtime.registered) == len(manifest.adapters)
+        events.append(f"usage:{stage}")
+
+    runtime.start = start
+    runtime.register_adapter = register_adapter
+    monkeypatch.setattr(bootstrap_module, "ServingBootstrap", build_owner)
+    monkeypatch.setattr(bootstrap_module, "emit_filesystem_usage", filesystem_usage)
+
+    owner = asyncio.run(
+        bootstrap_serving(manifest, tmp_path, runtime_factory=lambda _config: runtime)
+    )
+
+    assert owner is owners[0]
+    assert events == [
+        "runtime-started",
+        "usage:engine-constructed",
+        "adapter-registered",
+        "usage:serving-ready",
+    ]
 
 
 def test_bootstrap_validation_and_registration_fail_closed(monkeypatch, tmp_path: Path) -> None:
