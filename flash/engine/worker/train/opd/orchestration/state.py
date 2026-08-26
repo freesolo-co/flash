@@ -92,7 +92,6 @@ class _ChildCallbacks:
     on_line: Any
     on_step: Any
     child_progress: Any
-    liveness_fields: Any
     progress: dict[str, Any]
     wandb_link: dict[str, str | None]
     child_tail: Any

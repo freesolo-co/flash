@@ -390,7 +390,9 @@ def publish_deployable_checkpoint(
                 ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
             )
             if _emit_progress:
-                _worker_progress.publish_progress("checkpoint_deployable", step=step, subfolder=subfolder)
+                _worker_progress.publish_progress(
+                    "checkpoint_deployable", step=step, subfolder=subfolder
+                )
             return subfolder
         except Exception as e:
             last_error = e
@@ -504,9 +506,7 @@ def upload_resume_checkpoint(
         if skip_upload is not None and skip_upload():
             return True
         progress_context = (
-            observe_phase(
-                "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
-            )
+            observe_phase("checkpoint_uploading", progress=lambda: step, progress_step=True)
             if emit_progress
             else contextlib.nullcontext()
         )

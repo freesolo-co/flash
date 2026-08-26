@@ -1,8 +1,8 @@
 """What the verl child said before it died, and where ray wrote the rest of it.
 
 A wedged or crashed child is diagnosed from two places: the tail of its own stdout, which
-`ChildOutputTail` retains in a bounded ring buffer and `ChildTailStaleness` times, and ray's
-per-session log directory, which holds the raylet and worker output the child never printed. Both
+`ChildOutputTail` retains in a bounded ring buffer, and ray's per-session log directory, which holds
+the raylet and worker output the child never printed. Both
 end up on a progress payload, so both are size-capped and sanitized.
 
 Split out of `flash.engine.worker.train.entry.backend_common` to keep that module under the file-size limit.
@@ -23,16 +23,15 @@ from collections.abc import Callable
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
 
-# how many of the child's most recent output lines to retain for stall reporting. the child's last
-# words before it wedges are the whole diagnostic, and a stall is usually preceded by a short burst
-# (a ray warning, a placement-group notice, a partial traceback), so a small window suffices.
+# how many of the child's most recent output lines to retain for diagnostics. the child's last
+# words before a failure or prolonged silence are usually preceded by a short burst, so a small
+# window captures the useful evidence without growing the progress payload.
 CHILD_TAIL_LINES = 60
 # per-line cap when rendering the retained tail. verl prints resolved-config blocks thousands of
 # characters wide; an unbounded tail would blow the progress payload it has to travel inside.
 _CHILD_TAIL_LINE_CHARS = 300
-# how many retained lines ride along on a pre-first-step progress. narrower than what is retained:
-# this payload is uploaded every tick, so it stays small enough not to bloat the snapshot.
-STALL_TAIL_LINES = 15
+# how many retained lines ride in one diagnostics-only silence report.
+_CHILD_TAIL_DIAGNOSTIC_LINES = 15
 _RETRIABLE_VERL_CHILD_SIGNATURES = (
     "cudaErrorDevicesUnavailable",
     "CUDA-capable device(s) is/are busy or unavailable",
@@ -56,7 +55,7 @@ class ChildOutputTail:
     """bounded ring buffer of a subprocess's most recent output lines.
 
     child stdout is absent from collected logs; only progress markers survive. retain the tail so
-    setup stalls can report the child's last words (ISSUES VERL-061).
+    setup diagnostics can report the child's last words (issues verl-061).
     """
 
     def __init__(self, limit: int = CHILD_TAIL_LINES) -> None:
@@ -127,7 +126,7 @@ class ChildOutputTail:
 
         monotonic and independent of the retention limit. consecutive duplicate lines remain in the
         retained tail but do not advance this counter, so a frozen warning loop is silence rather
-        than progress while a genuinely new line resets the stall window.
+        than progress while a genuinely new line resets the observation window.
         """
         return self._written
 
@@ -194,62 +193,6 @@ def raise_for_classified_verl_exit(return_code: int, tail: ChildOutputTail) -> N
     )
 
 
-class ChildTailStaleness:
-    """tracks how long a child has been silent, across the ticks that sample its tail.
-
-    the tail alone cannot answer the question a stall actually poses. a child still loading shards
-    and a child wedged forever both present a fully populated tail whose newest line is plausible,
-    so the only thing separating them is whether the tail CHANGED between two dumps -- and a
-    stateless report throws that comparison away, leaving it to be reconstructed by hand from
-    consecutive progresss after the money is already spent (ISSUES VERL-067). holding the previous
-    line count here turns that into a number the first dump already carries.
-    """
-
-    def __init__(self) -> None:
-        self._written = -1
-        self._since = 0
-
-    def observe(self, written: int) -> int:
-        """record this tick's line count; return consecutive ticks with no new output.
-
-        0 means the child spoke since the last observation. n>0 means it has been silent for n
-        ticks, which is the signal that separates a slow start from a wedge.
-        """
-        if written != self._written:
-            self._written = written
-            self._since = 0
-        else:
-            self._since += 1
-        return self._since
-
-
-def stall_tail_fields(
-    step: int,
-    tail: ChildOutputTail,
-    limit: int = STALL_TAIL_LINES,
-    staleness: ChildTailStaleness | None = None,
-) -> dict[str, object]:
-    """progress fields carrying the child's last words, but only while it has made no progress.
-
-    before the first step, the tail is the only collected setup-stall evidence. with ``staleness``,
-    include silent ticks to distinguish a slow start from a wedge. return empty after progress or
-    before any child output.
-    """
-    if step > 0:
-        return {}
-    recent = tail.tail(limit=limit)
-    if not recent:
-        # observed even with nothing to report, so a child that starts talking later is measured
-        # from its first line rather than from whenever the payload happened to become non-empty.
-        if staleness is not None:
-            staleness.observe(tail.written)
-        return {}
-    fields: dict[str, object] = {"child_tail": recent}
-    if staleness is not None:
-        fields["child_tail_silent_ticks"] = staleness.observe(tail.written)
-    return fields
-
-
 def build_verl_line_handler(
     child_tail: ChildOutputTail,
     *,
@@ -266,10 +209,10 @@ def build_verl_line_handler(
     the process group down, and the line it raised on is still evidence the child was speaking.
     """
     step_re = re.compile(step_pattern)
-    last_hb = 0.0
+    last_progress_at = 0.0
 
     def handle_line(line: str) -> None:
-        nonlocal last_hb
+        nonlocal last_progress_at
         print(line, end="", flush=True)
         child_tail.record(line)
         if silence_observer is not None:
@@ -285,9 +228,9 @@ def build_verl_line_handler(
                 on_step(step)
         if progress is not None:
             now = time.monotonic()
-            if now - last_hb >= progress_interval_s:
+            if now - last_progress_at >= progress_interval_s:
                 progress()
-                last_hb = now
+                last_progress_at = now
 
     return handle_line
 
@@ -379,7 +322,12 @@ class VerlChildSilenceObserver:
         with self._lock:
             alive = self._child_alive is not None and self._child_alive()
             elapsed = time.monotonic() - self._last_activity
-            if not self._armed or not alive or elapsed < VERL_CHILD_SILENCE_SECONDS or self._reported:
+            if (
+                not self._armed
+                or not alive
+                or elapsed < VERL_CHILD_SILENCE_SECONDS
+                or self._reported
+            ):
                 return
             self._reported = True
             snapshot = self._parent_snapshot()
@@ -388,7 +336,7 @@ class VerlChildSilenceObserver:
                 "elapsed_s": round(elapsed, 1),
                 "parent_completed": snapshot.completed,
                 "parent_depth": snapshot.depth,
-                "child_tail": self._tail.tail(limit=STALL_TAIL_LINES),
+                "child_tail": self._tail.tail(limit=_CHILD_TAIL_DIAGNOSTIC_LINES),
             }
         print("VERL DIAGNOSTIC", json.dumps(payload, sort_keys=True), flush=True)
         frames = sys._current_frames()

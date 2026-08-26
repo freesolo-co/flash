@@ -204,7 +204,7 @@ def test_resume_first_companion_retries_without_reuploading_full_state(monkeypat
 
     monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
     monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
-    monkeypatch.setattr(worker_progress, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_progress, "publish_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
     assert worker_hf.upload_resume_checkpoint(
@@ -213,11 +213,11 @@ def test_resume_first_companion_retries_without_reuploading_full_state(monkeypat
     assert calls == {"resume": 1, "deployable": 2}
 
 
-def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatch, tmp_path):
+def test_resume_checkpoint_failure_progress_surfaces_sanitized_error(monkeypatch, tmp_path):
 
     secret = "hf_checkpoint_upload_secret"
     calls = 0
-    heartbeats: list[tuple[str, dict]] = []
+    progress_records: list[tuple[str, dict]] = []
 
     class Api:
         def upload_folder(self, **_kwargs):
@@ -229,13 +229,15 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
     monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
     monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
     monkeypatch.setattr(
-        worker_progress, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+        worker_progress,
+        "publish_progress",
+        lambda stage, **kwargs: progress_records.append((stage, kwargs)),
     )
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
     assert not worker_hf.upload_resume_checkpoint(50, str(tmp_path))
 
-    failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
+    failed = [fields for stage, fields in progress_records if stage == "checkpoint_upload_failed"]
     assert calls == worker_hf._CKPT_UPLOAD_RETRIES
     assert len(failed) == 1
     assert failed[0]["step"] == 50
@@ -252,7 +254,7 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
 def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path, failure_stage):
 
     calls = {"resume": 0, "companion": 0}
-    heartbeats: list[tuple[str, dict]] = []
+    progress_records: list[tuple[str, dict]] = []
 
     class Api:
         def upload_folder(self, **_kwargs):
@@ -269,14 +271,16 @@ def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path,
     monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
     monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
     monkeypatch.setattr(
-        worker_progress, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+        worker_progress,
+        "publish_progress",
+        lambda stage, **kwargs: progress_records.append((stage, kwargs)),
     )
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
     with pytest.raises(RuntimeError, match=f"{failure_stage} companion failed"):
         worker_hf.upload_resume_checkpoint(50, str(tmp_path), **callbacks)
 
-    failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
+    failed = [fields for stage, fields in progress_records if stage == "checkpoint_upload_failed"]
     assert calls["companion"] == worker_hf._CKPT_UPLOAD_RETRIES
     assert calls["resume"] == (0 if failure_stage == "before" else 1)
     assert len(failed) == 1

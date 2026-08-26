@@ -116,8 +116,8 @@ def test_non_step_lines_are_ignored():
 def test_step_line_is_parsed_when_a_tqdm_bar_is_flushed_in_front_of_it():
     # VERL-134. verl's LocalLogger shares its stream with tqdm, which ends a bar with "]" and no
     # trailing newline, so the metric line arrives glued to it. anchoring the left edge on
-    # whitespace matched step 1 and missed every step after it: the sft heartbeat froze on step 1's
-    # metrics and the zero-grad guard never armed, so a run that trained nothing reported done.
+    # whitespace matched step 1 and missed every step after it: progress froze on step 1's metrics
+    # and the zero-grad guard never armed, so a run that trained nothing reported done.
     line = (
         "Epoch 1/1:  25%|##        | 1/4 [01:21<04:04, 81.49s/it]"
         "step:2 - critic/rewards/mean:0.5 - actor/grad_norm:0.0"
@@ -184,9 +184,8 @@ def test_backlog_is_bounded_to_the_most_recent_steps():
     assert backlog == [{"step": 6}, {"step": 7}, {"step": 8}, {"step": 9}]
 
 
-def test_backlog_is_mutated_in_place_for_the_heartbeat_reader():
-    # the liveness thread closes over this list while the stdout loop writes it. rebinding would
-    # leave that reader pinned to a stale, permanently empty list.
+def test_backlog_is_mutated_in_place_for_progress_observers():
+    # progress observers close over this list while the stdout loop writes it
     backlog: list[dict] = []
     alias = backlog
     for step in range(6):
@@ -196,15 +195,14 @@ def test_backlog_is_mutated_in_place_for_the_heartbeat_reader():
     assert alias == [{"step": 3}, {"step": 4}, {"step": 5}]
 
 
-def test_exact_advantage_bounds_are_retained_in_the_forced_step_heartbeat(monkeypatch):
+def test_exact_advantage_bounds_are_retained_in_step_progress(monkeypatch):
     calls = []
-    outcomes = iter((False, True))
 
-    def heartbeat(stage, **fields):
+    def publish_progress(stage, **fields):
         calls.append((stage, fields))
-        return next(outcomes)
+        return True
 
-    monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
+    monkeypatch.setattr(rl_train_runner._worker_progress, "publish_progress", publish_progress)
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     for step, minimum, maximum in ((1, -0.25, 0.75), (2, -0.5, 1.5)):
@@ -255,7 +253,7 @@ def test_masked_truncation_sequence_uses_grad_norm_as_publication_evidence(monke
     assert 1.0 - sum(response_mask) / len(response_mask) == 0.125
 
     monkeypatch.setattr(
-        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+        rl_train_runner._worker_progress, "publish_progress", lambda *_args, **_kwargs: True
     )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
@@ -288,7 +286,7 @@ def test_masked_truncation_sequence_uses_grad_norm_as_publication_evidence(monke
 
 def test_replayed_step_replaces_gradient_evidence(monkeypatch):
     monkeypatch.setattr(
-        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+        rl_train_runner._worker_progress, "publish_progress", lambda *_args, **_kwargs: True
     )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
@@ -304,7 +302,7 @@ def test_replayed_step_replaces_gradient_evidence(monkeypatch):
 
 def test_replayed_step_without_grad_norm_removes_stale_evidence(monkeypatch):
     monkeypatch.setattr(
-        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+        rl_train_runner._worker_progress, "publish_progress", lambda *_args, **_kwargs: True
     )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
@@ -320,7 +318,7 @@ def test_replayed_step_without_grad_norm_removes_stale_evidence(monkeypatch):
 
 def test_replayed_step_without_bounds_clears_stale_bounds_atomically(monkeypatch):
     monkeypatch.setattr(
-        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+        rl_train_runner._worker_progress, "publish_progress", lambda *_args, **_kwargs: True
     )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
@@ -343,7 +341,7 @@ def test_replayed_step_without_bounds_clears_stale_bounds_atomically(monkeypatch
 
 def test_pg_loss_only_training_replay_clears_all_stale_terminal_evidence(monkeypatch):
     monkeypatch.setattr(
-        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+        rl_train_runner._worker_progress, "publish_progress", lambda *_args, **_kwargs: True
     )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
@@ -362,7 +360,7 @@ def test_pg_loss_only_training_replay_clears_all_stale_terminal_evidence(monkeyp
 
 def test_validation_only_replay_does_not_clear_training_evidence(monkeypatch):
     monkeypatch.setattr(
-        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: True
+        rl_train_runner._worker_progress, "publish_progress", lambda *_args, **_kwargs: True
     )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
@@ -392,38 +390,34 @@ def _verl_rl_tree() -> ast.Module:
     return ast.parse(textwrap.dedent(source))
 
 
-def test_verl_rl_lifecycle_heartbeats_carry_latest_metrics():
-    # mirrors test_worker_init_heartbeat.test_rl_lifecycle_heartbeats_carry_latest_metrics, which
-    # pins only rl.run_rl (trl). that blind spot is exactly why verl shipped without metrics_last:
-    # the parity test could not see the backend that lacked it.
+def test_verl_rl_progress_records_carry_latest_metrics():
     tree = _verl_rl_tree()
 
-    terminal_calls = [
+    progress_calls = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "heartbeat"
+        and node.func.attr == "publish_progress"
         and node.args
         and isinstance(node.args[0], ast.Constant)
-        and node.args[0].value == "rl_trained"
+        and node.args[0].value in {"rl_step", "rl_trained"}
+        and any(keyword.arg == "metrics_last" for keyword in node.keywords)
     ]
-    assert len(terminal_calls) == 1
-    terminal_keywords = {kw.arg: kw.value for kw in terminal_calls[0].keywords}
-    assert "metrics_last" in terminal_keywords
+    assert [call.args[0].value for call in progress_calls] == ["rl_trained", "rl_step"]
 
-    liveness_calls = [
+    phase_calls = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == "liveness_heartbeat"
+        and node.func.id == "observe_phase"
         and node.args
         and isinstance(node.args[0], ast.Constant)
         and node.args[0].value in {"rl_step", "rl_finalizing"}
     ]
-    assert len(liveness_calls) == 2
-    for call in liveness_calls:
+    assert len(phase_calls) == 2
+    for call in phase_calls:
         keywords = {kw.arg: kw.value for kw in call.keywords}
         assert "fields" in keywords
         assert "metrics_last" in ast.unparse(keywords["fields"])
@@ -437,13 +431,13 @@ def test_verl_rl_lifecycle_heartbeats_carry_latest_metrics():
     ]
     assert len(write_calls) == 1
     write_keywords = {kw.arg: kw.value for kw in write_calls[0].keywords}
-    assert "heartbeat_fields" in write_keywords
-    assert "metrics_last" in ast.unparse(write_keywords["heartbeat_fields"])
+    assert "progress_fields" in write_keywords
+    assert "metrics_last" in ast.unparse(write_keywords["progress_fields"])
 
 
 def test_verl_rl_publishes_backlog_to_the_error_path_global():
-    # worker/__init__.py:_err_metrics reads LATEST_GRPO_METRICS_LAST so a run that dies mid-training
-    # still reports the steps it completed. trl's callback writes it; verl must too.
+    # worker.py reads the shared progress backlog so a run that dies mid-training still reports the
+    # steps it completed.
     tree = _verl_rl_tree()
 
     assigns = [
@@ -453,11 +447,11 @@ def test_verl_rl_publishes_backlog_to_the_error_path_global():
         and any(
             isinstance(target, ast.Subscript)
             and isinstance(target.value, ast.Name)
-            and target.value.id == "LATEST_GRPO_METRICS_LAST"
+            and target.value.id == "LATEST_GRPO_METRICS"
             for target in node.targets
         )
     ]
-    assert assigns, "verl rl must publish its backlog to LATEST_GRPO_METRICS_LAST"
+    assert assigns, "verl rl must publish its backlog to LATEST_GRPO_METRICS"
 
 
 def test_train_meta_series_are_collected_only_from_step_lines():
@@ -472,34 +466,24 @@ def test_train_meta_series_are_collected_only_from_step_lines():
         )
 
 
-def test_first_backlog_is_forced_past_the_rl_step_throttle():
-    # rl_train_start arms the 900s rl_step throttle and the liveness daemon never passes force=True,
-    # so without an explicit forced ping the first metrics row stays invisible for 15 minutes -- the
-    # exact window trl covers with force_first_samples (heartbeat.py). the retry-until-committed
-    # shape matters too: the daemon can claim the step first, and a bare `sent = True` would then
-    # mark a heartbeat that never committed as sent.
+def test_each_parsed_rl_step_publishes_cumulative_progress():
     tree = _verl_rl_tree()
 
-    forced = [
+    step_calls = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "publish_progress"
         and node.args
         and isinstance(node.args[0], ast.Constant)
         and node.args[0].value == "rl_step"
-        and any(kw.arg == "force" for kw in node.keywords)
+        and any(keyword.arg == "metrics_last" for keyword in node.keywords)
     ]
-    assert len(forced) == 1, "verl must force exactly one first rl_step metrics heartbeat"
-    keywords = {kw.arg for kw in forced[0].keywords}
-    assert "metrics_last" in keywords, "the forced ping must carry the backlog it exists to surface"
-
-    guard = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If) and "sent_first_metrics" in ast.unparse(node.test)
-    )
-    assert isinstance(guard.body[0], ast.Assign), "retry until a forced ping actually commits"
-    assert "heartbeat" in ast.unparse(guard.body[0].value)
+    assert len(step_calls) == 1
+    keywords = {kw.arg: kw.value for kw in step_calls[0].keywords}
+    assert set(keywords) == {"step", "metrics_last", "gpu", None}
+    assert any(keyword.arg is None for keyword in step_calls[0].keywords)
 
 
 def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():

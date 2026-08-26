@@ -468,7 +468,7 @@ def test_a_transient_wheel_download_failure_is_retried_rather_than_fatal(monkeyp
 def test_an_exhausted_wheel_install_hands_the_arm_back_instead_of_burning_it(monkeypatch, tmp_path):
     """The failure must reach the plane as RETRIABLE, which is a claim about _worker_failure_flags.
 
-    Assert the heartbeat flag, not only the exception type, because the poller routes on that flag.
+    assert the retry classification, not only the exception type, because the poller routes on it.
     """
     from flash.engine.worker.entry.worker import _worker_failure_flags
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
@@ -1621,20 +1621,20 @@ def test_resolve_verl_python_returns_preset_unmodified(monkeypatch, tmp_path):
 def test_run_verl_training_streams_steps_and_returns_code():
     seen: list[int] = []
     lines: list[str] = []
-    beats: list[int] = []
+    progress_calls: list[int] = []
     code = vc.run_verl_training(
         ["bash", "-c", "echo 'foo step: 1 bar'; echo 'step: 2'; echo done"],
         env=dict(os.environ),
         on_step=seen.append,
         on_line=lines.append,
-        heartbeat=lambda: beats.append(1),
-        heartbeat_interval_s=0.0,
+        progress=lambda: progress_calls.append(1),
+        progress_interval_s=0.0,
     )
     assert code == 0
     assert seen == [1, 2]
     assert lines[-1] == "done\n"
-    # heartbeat_interval_s=0 => fires on every scanned line (3 lines here).
-    assert len(beats) >= 1
+    # a zero interval permits a progress callback on every scanned line.
+    assert len(progress_calls) >= 1
 
 
 def test_run_verl_training_propagates_nonzero_exit():
@@ -1716,7 +1716,7 @@ def test_child_output_tail_drops_blank_lines_and_caps_line_width():
     widest = max(len(line) for line in kept)
     assert widest <= vc._CHILD_TAIL_LINE_CHARS, (
         f"retained a {widest}-char line; verl prints multi-KB config blocks and the tail "
-        "has to ride inside an uploaded heartbeat payload"
+        "has to ride inside an uploaded progress payload"
     )
 
 
@@ -1850,91 +1850,8 @@ def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     assert tail.tail() == ["filler-68", "filler-69", "filler-70"]
 
 
-def test_stall_tail_fields_reports_only_before_the_first_step():
-    tail = vc.ChildOutputTail()
-    tail.record("ray: placement group pending\n")
-
-    # pre-first-step: this is the blind window, so the child's words must be carried out.
-    fields = vc.stall_tail_fields(0, tail)
-    assert fields == {"child_tail": ["ray: placement group pending"]}
-
-    # once training progresses the step/loss stream is the diagnostic; the tail would be pure
-    # payload bloat on every tick.
-    assert vc.stall_tail_fields(1, tail) == {}
-    assert vc.stall_tail_fields(500, tail) == {}
-
-
-def test_stall_tail_fields_is_empty_when_the_child_has_said_nothing():
-    # an empty key would claim the child spoke and said nothing, which is a different fact from
-    # "the child has produced no output at all".
-    assert vc.stall_tail_fields(0, vc.ChildOutputTail()) == {}
-
-
-def test_stall_tail_fields_reports_how_long_the_child_has_been_silent():
-    # the whole point: a child still loading shards and a child wedged forever both present a fully
-    # populated tail whose newest line looks plausible. only whether the tail CHANGED separates them,
-    # and without this the comparison has to be reconstructed by hand from consecutive heartbeats.
-    tail = vc.ChildOutputTail()
-    staleness = vc.ChildTailStaleness()
-    tail.record("Started a local Ray instance\n")
-
-    first = vc.stall_tail_fields(0, tail, staleness=staleness)
-    assert first["child_tail_silent_ticks"] == 0
-
-    # two more ticks with the child saying nothing new: same tail, rising silence.
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 1
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 2
-
-    # the child speaks again, so it is slow rather than stuck and the counter resets.
-    tail.record("loading checkpoint shards 1/4\n")
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
-
-
-def test_child_tail_silence_survives_the_retention_limit():
-    # staleness is counted from lines WRITTEN, not from the retained window: once the ring buffer is
-    # full its contents can keep changing while its length does not, and a length-based comparison
-    # would then report a talking child as silent.
-    tail = vc.ChildOutputTail(limit=3)
-    staleness = vc.ChildTailStaleness()
-    for i in range(3):
-        tail.record(f"line{i}\n")
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
-    tail.record("line3\n")  # evicts line0; the deque stays length 3
-    assert len(tail.tail()) == 3
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
-
-
-def test_child_tail_silence_is_measured_from_the_childs_first_line():
-    # a child silent for the first ticks then talking must not be credited with the silence that
-    # preceded its first line -- otherwise a slow starter reports as long-wedged the moment it speaks.
-    tail = vc.ChildOutputTail()
-    staleness = vc.ChildTailStaleness()
-    for _ in range(4):
-        assert vc.stall_tail_fields(0, tail, staleness=staleness) == {}
-    tail.record("first words\n")
-    assert vc.stall_tail_fields(0, tail, staleness=staleness)["child_tail_silent_ticks"] == 0
-
-
-def test_stall_tail_fields_omits_silence_when_no_tracker_is_supplied():
-    # the field must not appear as a fabricated 0 for callers that do not track staleness: absent and
-    # "zero ticks silent" are different claims.
-    tail = vc.ChildOutputTail()
-    tail.record("only line\n")
-    assert vc.stall_tail_fields(0, tail) == {"child_tail": ["only line"]}
-
-
-def test_stall_tail_fields_narrows_to_the_most_recent_lines():
-    tail = vc.ChildOutputTail()
-    for i in range(vc.STALL_TAIL_LINES + 25):
-        tail.record(f"line{i}\n")
-    carried = vc.stall_tail_fields(0, tail)["child_tail"]
-    assert len(carried) == vc.STALL_TAIL_LINES
-    # the most recent lines are the ones that matter: they are what the child said last.
-    assert carried[-1] == f"line{vc.STALL_TAIL_LINES + 24}"
-
-
-def test_child_tail_redacts_credentials_before_they_reach_a_heartbeat(monkeypatch):
-    """the retained tail rides to heartbeat.json, the streamed run log and persisted status.
+def test_child_tail_redacts_credentials_before_diagnostic_reporting(monkeypatch):
+    """the retained tail reaches diagnostics, the streamed run log, and persisted status.
 
     the worker is the only side that knows the run's secret values, so redaction has to happen
     here; the plane-side formatter only neutralizes control characters.
@@ -1944,11 +1861,10 @@ def test_child_tail_redacts_credentials_before_they_reach_a_heartbeat(monkeypatc
     tail = vc.ChildOutputTail()
     tail.record(f"requests.HTTPError: 401 Unauthorized for hf.co (token {secret})\n")
 
-    carried = vc.stall_tail_fields(0, tail)["child_tail"]
+    carried = tail.tail()
 
     assert secret not in carried[0]
     assert "<redacted>" in carried[0]
-    # the diagnostic itself is what a setup stall is read from; only the credential goes.
     assert carried[0] == "requests.HTTPError: 401 Unauthorized for hf.co (token <redacted>)"
 
 
@@ -2518,17 +2434,14 @@ def test_child_exit_watchdog_does_not_kill_a_reader_inside_one_long_callback(mon
 
 @_needs_process_teardown
 def test_child_exit_watchdog_leaves_a_healthy_quiet_child_alone(quick_teardown_grace):
-    """The watchdog arms on the child's EXIT, never on silence.
-
-    Quiet shard loading or generation is valid; silence belongs to `ChildTailStaleness`.
-    """
+    """the watchdog arms on child exit, while silence remains diagnostics-only."""
     # a grace of 0 would fire the instant the child exits, so any teardown observed here is
     # attributable to quiet alone.
     script = "import time,sys; time.sleep(2); print('step: 1', flush=True); sys.exit(0)"
     code = vc.run_verl_training(
         [sys.executable, "-c", script],
         env=dict(os.environ),
-        heartbeat_interval_s=0.1,
+        progress_interval_s=0.1,
     )
 
     assert code == 0, "a healthy child that was merely quiet was torn down as if it had leaked"

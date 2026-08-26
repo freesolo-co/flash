@@ -158,7 +158,7 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
     )
     monkeypatch.setattr(
         prompt_preparation,
-        "liveness_heartbeat",
+        "observe_phase",
         lambda *_args, **_kwargs: nullcontext(),
     )
     monkeypatch.setattr(teacher_client, "TeacherClient", lambda *_args, **_kwargs: object())

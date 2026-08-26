@@ -256,9 +256,8 @@ def run_rl_train():
 
     resume_uploader, gpu_sampler, device_peak_gpu_gb = _initialize_teardown_state()
     try:
-        # provisioning and the cold verl capability probe can take minutes without step output. keep
-        # liveness running so the stall watchdog does not fail healthy setup (#442). there is no
-        # monotonic progress counter here, only the keepalive.
+        # provisioning and the cold verl capability probe can take minutes before a step exists.
+        # publish the phase boundary for visibility without treating silence as a lifecycle signal.
         with observe_phase("rl_configuring"):
             python_bin = resolve_verl_python(
                 files["workdir"], install_wandb=bool(os.environ.get("WANDB_API_KEY"))
@@ -312,7 +311,6 @@ def run_rl_train():
             progress=_progress,
             fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
             progress_step=True,
-            sample_off_thread=True,
         ):
             rc = _execute_rl_child(
                 python_bin=python_bin,
@@ -348,7 +346,6 @@ def run_rl_train():
         progress=lambda: steps_run,
         fields=lambda: {"metrics_last": list(metrics_last)},
         progress_step=True,
-        keepalive=True,
     ):
         _export_final_adapter(actor_dir, adapter_dir, inp, python_bin)
         preprocessor.save_pretrained(adapter_dir)

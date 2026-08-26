@@ -1027,7 +1027,7 @@ def test_image_observation_env_text_prompt_omits_empty_processor_images(monkeypa
     monkeypatch.setattr(opd_prompt_preparation, "seed_training_rngs", lambda _seed: None)
     monkeypatch.setattr(
         opd_prompt_preparation,
-        "liveness_heartbeat",
+        "observe_phase",
         lambda *_args, **_kwargs: nullcontext(),
     )
     prompt_rows, multimodal = _render_prompt_rows(
@@ -3595,8 +3595,8 @@ def test_opd_progress_truncation_rate_handles_zero_rollouts():
 def test_opd_progress_step_metrics_stay_out_of_the_persisted_resume_state(tmp_path):
     """checkpoint_state is spread verbatim into opd_state.json, whose schema is fail-closed.
 
-    a per-step display value is meaningless on resume and no consumer reads it back: the CLI
-    column reads metrics_last and the streamed log reads the heartbeat payload. persisting it
+    a per-step display value is meaningless on resume and no consumer reads it back: the cli
+    column and streamed log both read the progress payload. persisting it
     would add an unversioned key to the retry contract for every checkpoint this version writes.
     staged through the real writer rather than asserted on the dict, so the check covers what
     actually lands on disk.
@@ -6402,10 +6402,10 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
     callbacks = SimpleNamespace(
         on_step=lambda _step: None,
         on_line=lambda _line: None,
-        child_heartbeat=lambda: None,
-        liveness_fields=dict,
+        child_progress=lambda: None,
+        progress={"step": 0},
         child_tail=None,
-        silence_watchdog=None,
+        silence_observer=None,
         wandb_link={"wandb_url": None, "wandb_id": None},
     )
     reconciled = []
@@ -6416,8 +6416,8 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
     monkeypatch.setattr(opd_runner, "_build_child_env", lambda *_args: {})
     monkeypatch.setattr(opd_runner._sft, "_NvidiaSmiPeakSampler", GpuSampler)
     monkeypatch.setattr(
-        opd_runner._worker_heartbeat,
-        "liveness_heartbeat",
+        opd_runner._worker_progress,
+        "observe_phase",
         lambda *_args, **_kwargs: nullcontext(),
     )
     monkeypatch.setattr(
@@ -8041,13 +8041,13 @@ def test_on_line_parses_the_numpy2_distillation_loss_the_image_actually_prints()
     )
 
 
-def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch, tmp_path):
+def test_opd_step_progress_carries_truncation_rate(monkeypatch, tmp_path):
     import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     emitted = []
     monkeypatch.setattr(
-        opd_runner._worker_heartbeat,
-        "heartbeat",
+        opd_runner._worker_progress,
+        "publish_progress",
         lambda stage, **payload: emitted.append((stage, payload)),
     )
     callbacks = opd_runner._build_child_callbacks(
@@ -8075,13 +8075,13 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch, tmp_path):
     ]
 
 
-def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch, tmp_path):
+def test_opd_step_progress_omits_stale_truncation_rate(monkeypatch, tmp_path):
     import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     emitted = []
     monkeypatch.setattr(
-        opd_runner._worker_heartbeat,
-        "heartbeat",
+        opd_runner._worker_progress,
+        "publish_progress",
         lambda stage, **payload: emitted.append((stage, payload)),
     )
     callbacks = opd_runner._build_child_callbacks(
@@ -8104,12 +8104,12 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch, tmp_path):
     assert "discarded_rollouts" not in emitted[1][1]
 
 
-def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch, tmp_path):
+def test_opd_step_progress_carries_the_rate_on_real_child_line_shapes(monkeypatch, tmp_path):
     """the step-match guard must not silently disable the rate in production.
 
     on_line gates on verl_step_number, on_step on backend_common's own step_pattern. the two
-    parsers are different, so a shape where they disagree would omit the rate on every heartbeat
-    and leave the feature dead without failing anything. these are the shapes verl actually
+    parsers are different, so a shape where they disagree would omit the rate on every progress
+    record and leave the feature dead without failing anything. these are the shapes verl actually
     emits: ray tags worker stdout with a pid prefix, and LocalLogger shares its stream with tqdm,
     which ends a bar with "]" and no newline so the metric line arrives glued to it.
     """
@@ -8119,8 +8119,8 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
 
     emitted = []
     monkeypatch.setattr(
-        opd_runner._worker_heartbeat,
-        "heartbeat",
+        opd_runner._worker_progress,
+        "publish_progress",
         lambda stage, **payload: emitted.append((stage, payload)),
     )
     callbacks = opd_runner._build_child_callbacks(
@@ -8424,7 +8424,7 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
     )
     monkeypatch.setattr(
         prompt_preparation,
-        "liveness_heartbeat",
+        "observe_phase",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     import flash.engine.worker.teacher.client as teacher_client
@@ -8529,7 +8529,7 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
     )
     monkeypatch.setattr(
         prompt_preparation,
-        "liveness_heartbeat",
+        "observe_phase",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     import flash.engine.worker.teacher.client as teacher_client

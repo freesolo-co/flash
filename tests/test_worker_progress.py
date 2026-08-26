@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 from flash.engine.worker.io import progress as progress_io
 
 
@@ -15,18 +17,14 @@ def _reset(monkeypatch) -> None:
     monkeypatch.setattr(progress_io, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
 
 
-def test_liveness_only_observation_publishes_no_record(monkeypatch) -> None:
-    _reset(monkeypatch)
-    uploads = []
-    monkeypatch.setattr(
-        progress_io,
-        "_upload_record",
-        lambda record, *, required: uploads.append((record, required)) or True,
-    )
+def test_progress_api_exposes_only_initial_and_observed_fields() -> None:
+    signature = inspect.signature(progress_io.publish_progress)
+    assert list(signature.parameters) == ["stage", "initial", "fields"]
+    assert signature.parameters["initial"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["fields"].kind is inspect.Parameter.VAR_KEYWORD
 
-    assert progress_io.publish_progress("model_prefetching", liveness=True) is False
-    assert uploads == []
-    assert progress_io._PROGRESS_SEQUENCE == 0
+    phase_signature = inspect.signature(progress_io.observe_phase)
+    assert list(phase_signature.parameters) == ["stage", "progress", "fields", "progress_step"]
 
 
 def test_failed_upload_reuses_sequence_and_chain_head(monkeypatch) -> None:
@@ -60,9 +58,7 @@ def test_checkpoint_failure_is_sticky_until_a_successful_checkpoint(monkeypatch)
     )
     failure = {"step": 50, "operation": "resume", "error": "quota denied"}
 
-    progress_io.publish_progress(
-        "checkpoint_upload_failed", step=50, checkpoint_failure=failure
-    )
+    progress_io.publish_progress("checkpoint_upload_failed", step=50, checkpoint_failure=failure)
     progress_io.publish_progress("sft_step", step=60)
     assert records[-1].checkpoint == failure
 

@@ -980,13 +980,10 @@ from flash.engine.worker.verl.diagnostics import (  # noqa: E402,F401
     CHILD_TAIL_LINES,
     RAY_FAILURE_LOGS,
     RAY_LOG_TAIL_BYTES,
-    STALL_TAIL_LINES,
     ChildOutputTail,
-    ChildTailStaleness,
     VerlChildSilenceObserver,
     build_verl_line_handler,
     collect_ray_failure_logs,
     latest_ray_session_dir,
     raise_for_classified_verl_exit,
-    stall_tail_fields,
 )
