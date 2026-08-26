@@ -1,6 +1,26 @@
 # The Flash serving contract
 
-`flash models deploy`, `chat`, `evaluate`, and `undeploy` use one public identity for every run-backed adapter:
+`flash models deploy`, `chat`, `evaluate`, and `undeploy` use an HTTP serving backend and one public
+identity for every run-backed adapter. `flash/serve/` owns the client, shared runtime, and
+customer-owned provider deployment. Freesolo's hosted backend (`flash/serving/`) is another
+implementation of this contract. A deployment serves one exact base model and its compatible LoRA
+adapters. A different base model requires a separate deployment. Use
+`flash serve deploy --provider modal` to provision one in your own Modal account.
+
+Customer-owned Modal is live-qualified for `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
+`Qwen/Qwen3.6-35B-A3B`. The 27B and 35B-A3B qualifications are bound to the exact certified serving
+image digest; another digest remains available for offline planning but cannot allocate Modal.
+Hosted Qwen3.8 27B remains inactive. Its customer-owned engine runs on `H100!` and serves the pinned
+`Qwen/Qwen3.8-27B-FP8` checkpoint while preserving `Qwen/Qwen3.8-27B` as the distinct logical base
+and tokenizer provenance. The 35B-A3B engine serves BF16 weights on one H200 with FP8 KV cache, a
+32K context, eight sequences, a 4096 batched-token cap, and six rank-64 LoRA slots.
+
+Customer-owned `flash serve` is Modal-only and requires the explicit provider argument. Historical
+customer-serving RunPod deployment identities are unsupported, with no migration, status, undeploy,
+or teardown shim. Managed RunPod training remains supported and unchanged. Retired Qwen3.6 27B is
+never translated into Qwen3.8 27B.
+
+Run-backed adapters use only:
 
 - `<run_id>/final`
 - `<run_id>/step-N`
@@ -88,7 +108,7 @@ Sibling checkpoints remain independently ready and callable. Run-wide cleanup is
 
 Manifest schema v2 keys adapters by checkpoint id. It keeps the private source commit, exact file table, and aggregate digest for hydration and cache verification, but publishes only checkpoint identities through `/v1/models` and chat provenance. Manifest and deployment identity v1 are rejected rather than translated.
 
-Modal and persistent RunPod deployments retain their existing provider topology, lifecycle fencing, direct authenticated HTTPS endpoint, capacity validation, and teardown behavior.
+Modal deployments retain their existing provider topology, lifecycle fencing, direct authenticated HTTPS endpoint, capacity validation, and teardown behavior.
 
 ## Cross-repository schema dependency
 

@@ -1,7 +1,7 @@
 """import-light deterministic serving deployment control foundation."""
 
 from ._canonical import canonical_mapping_fingerprint
-from .credentials import ModalCredentials, RunPodCredentials
+from .credentials import ModalCredentials
 from .planning import PlanningError, plan_deployment
 from .types import (
     DeploymentErrorCode,
@@ -19,8 +19,6 @@ from .types import (
     ProviderHandle,
     RepoType,
     ResolvedAdapter,
-    RunPodPlacement,
-    RunPodProviderHandle,
 )
 
 __all__ = [
@@ -41,9 +39,6 @@ __all__ = [
     "ProviderHandle",
     "RepoType",
     "ResolvedAdapter",
-    "RunPodCredentials",
-    "RunPodPlacement",
-    "RunPodProviderHandle",
     "canonical_mapping_fingerprint",
     "plan_deployment",
 ]

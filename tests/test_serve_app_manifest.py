@@ -25,11 +25,15 @@ from flash.serve.control import (
     canonical_mapping_fingerprint,
     plan_deployment,
 )
+from flash.serve.deployment.profiles import get_profile, supported_models
+from flash.serve.provisioning import ServingImage
 
 MODEL_REVISION = "1" * 40
 TOKENIZER_REVISION = "2" * 40
 BASE_REVISION = "3" * 40
 SOURCE_REVISION = "4" * 40
+QWEN38_MODEL_REVISION = "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
+QWEN38_TOKENIZER_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
 IMAGE_DIGEST = "sha256:" + "5" * 64
 ENGINE_ARGS = {"enforce_eager": True}
 TOKENIZER_KWARGS = {"use_fast": True}
@@ -122,6 +126,53 @@ def _spec_and_inputs(
         adapters=(AdapterExecutionInput(adapter.checkpoint_id, files),),
     )
     return spec, inputs
+
+
+def _profile_spec_and_inputs(model_id: str):
+    original, inputs = _spec_and_inputs()
+    profile = get_profile(model_id)
+    image = ServingImage(
+        reference=f"registry.example/flash/serve@{IMAGE_DIGEST}",
+        digest=IMAGE_DIGEST,
+    )
+    model_revision = QWEN38_MODEL_REVISION if model_id == "Qwen/Qwen3.8-27B" else MODEL_REVISION
+    tokenizer_revision = (
+        QWEN38_TOKENIZER_REVISION if model_id == "Qwen/Qwen3.8-27B" else TOKENIZER_REVISION
+    )
+    engine = profile.engine(
+        model_revision=model_revision,
+        tokenizer_revision=tokenizer_revision,
+        image=image,
+    )
+    adapter = replace(
+        original.adapters[0],
+        base_model=model_id,
+        base_model_revision=BASE_REVISION,
+        lora_rank=min(original.adapters[0].lora_rank, profile.max_lora_rank),
+    )
+    spec = replace(original, engine=engine, adapters=(adapter,))
+    inputs = replace(
+        inputs,
+        engine_args=dict(profile.engine_args),
+        tokenizer_kwargs=dict(profile.tokenizer_kwargs),
+        processor_kwargs=dict(profile.processor_kwargs),
+    )
+    return spec, inputs
+
+
+@pytest.mark.parametrize("model_id", supported_models())
+def test_every_profile_engine_round_trips_through_the_manifest(model_id: str) -> None:
+    spec, inputs = _profile_spec_and_inputs(model_id)
+    manifest = build_serving_manifest(spec, inputs)
+    loaded = load_serving_manifest(manifest.canonical_json())
+
+    assert loaded.engine == spec.engine
+    assert loaded.logical_base_model == model_id
+    assert loaded.logical_base_revision == BASE_REVISION
+    if model_id == "Qwen/Qwen3.8-27B":
+        assert loaded.engine.model_revision == QWEN38_MODEL_REVISION
+        assert loaded.engine.tokenizer_revision == QWEN38_TOKENIZER_REVISION
+        assert loaded.engine.model_revision != loaded.engine.tokenizer_revision
 
 
 def test_manifest_round_trip_is_canonical_and_data_only() -> None:

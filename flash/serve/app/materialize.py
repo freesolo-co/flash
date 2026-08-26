@@ -566,8 +566,8 @@ def _validate_cache_ancestor_stat(
         raise MaterializationError(f"{name} is not a directory")
     owner = details.st_uid
     writable = bool(details.st_mode & 0o022)
-    # root-owned shared directories include sticky /tmp and runpod's non-sticky 0777 moosefs mount.
-    # only root can replace their entries, while every inner cache object must still be owned by us.
+    # root-owned shared directories may be sticky or expose fixed world-writable modes. only root can
+    # replace their entries, while every inner cache object must still be owned by us.
     # filesystems that cannot store modes rely on the manifest digest and before/after identity
     # checks instead; _permission_bits_are_enforceable distinguishes those mounts below.
     root_shared = owner == 0
@@ -585,7 +585,7 @@ def _validate_cache_ancestor_stat(
 def _permission_bits_are_enforceable(directory_fd: int) -> bool:
     """report whether this filesystem preserves a private mode on a probe directory.
 
-    runpod's moosefs mount reports fixed 0777/0666 modes, so a capability probe avoids an
+    some mounted filesystems report fixed 0777/0666 modes, so a capability probe avoids an
     unsatisfiable assertion without coupling the policy to a provider or filesystem name.
     """
 

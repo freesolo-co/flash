@@ -375,8 +375,8 @@ def test_manifest_codec_rejects_trailing_malformed_noncanonical_and_wrong_identi
 def test_inference_tokens_must_be_usable_as_bearer_credentials() -> None:
     """a key the endpoint can never accept must not reach the provider.
 
-    `_nonempty` strips only the ends, so an interior space passed this boundary and modal or
-    runpod created billable gpu resources -- while `flash/serve/app/http.py::_authorize` splits
+    `_nonempty` strips only the ends, so an interior space passed this boundary and the provider
+    created billable gpu resources, while `flash/serve/app/http.py::_authorize` splits
     `Authorization` on spaces and rejects any candidate containing whitespace. the deployment was
     therefore paid for and unusable by every client. non-ascii fails even earlier, while the
     header is being encoded.
