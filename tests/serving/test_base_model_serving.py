@@ -65,7 +65,7 @@ class FakePool:
                 "cached_tokens_reported": False,
                 "reasoning_tokens": 0,
                 "request_id": payload.generation_id,
-                "checkpoint": "",
+                "checkpoint": record.adapter_id if record.is_checkpoint else "",
             },
         )
 

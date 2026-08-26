@@ -101,11 +101,13 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
         record = _record()
 
         class Lookup:
-            async def resolve(self, _adapter_id: str):
+            async def resolve(self, _adapter_id: str, *, org_id: str | None = None):
+                del org_id
                 return record, record
 
         class Context:
             lookup = Lookup()
+            traffic_org_id = staticmethod(ServingContext.traffic_org_id)
 
             async def authorize_inference(self, *_args):
                 return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
@@ -176,7 +178,8 @@ def test_non_streaming_disconnect_after_engine_completion_finishes_finalization_
         store.finalize = blocking_finalize  # type: ignore[method-assign]
 
         class Lookup:
-            async def resolve(self, _adapter_id: str):
+            async def resolve(self, _adapter_id: str, *, org_id: str | None = None):
+                del org_id
                 return record, record
 
         class Context(ServingContext):

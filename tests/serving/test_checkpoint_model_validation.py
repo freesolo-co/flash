@@ -134,7 +134,10 @@ def test_unknown_checkpoint_reference_is_404_for_internal_caller() -> None:
     response = _chat(
         client,
         CHECKPOINT_MODEL,
-        headers={"X-Freesolo-Internal-Key": INTERNAL_KEY},
+        headers={
+            "X-Freesolo-Internal-Key": INTERNAL_KEY,
+            "X-Freesolo-Org-Id": "org-a",
+        },
     )
 
     assert response.status_code == 404

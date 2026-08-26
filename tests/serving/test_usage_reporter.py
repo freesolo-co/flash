@@ -830,6 +830,7 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
 ):
     import asyncio
 
+    from flash.serve.contract.provenance import engine_adapter_name
     from flash.serving.src.io.schemas import AdapterRecord
     from flash.serving.src.store.registry import AdapterRegistry, lora_int_id
 
@@ -872,8 +873,9 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
 
     asyncio.run(engine._preload_cached_loras())
 
-    assert [request.lora_name for request in engine.engine.added] == [cached.adapter_id]
-    assert engine.engine.pinned == [lora_int_id(cached.adapter_id)]
+    adapter_name = engine_adapter_name(cached.org_id, cached.adapter_id)
+    assert [request.lora_name for request in engine.engine.added] == [adapter_name]
+    assert engine.engine.pinned == [lora_int_id(adapter_name)]
     assert registry.local_path(cached) == cache_path
     assert registry.local_path(missing) is None
 
@@ -902,10 +904,9 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
     assert req_a.lora_int_id != req_b.lora_int_id
     # re-resolving an already-cached adapter returns the same request and id.
     assert engine._cached_lora_request_locked(record_a, tmp_path / "a") is req_a
-    entry_a = engine._lora_entries[record_a.adapter_id]
-    engine._lora_entries[record_a.adapter_id] = _LoraEntry(
-        entry_a.source_ident, req_a, "unconfirmed"
-    )
+    key_a = (record_a.org_id, record_a.adapter_id)
+    entry_a = engine._lora_entries[key_a]
+    engine._lora_entries[key_a] = _LoraEntry(entry_a.source_ident, req_a, "unconfirmed")
     req_c = engine._cached_lora_request_locked(_rec("c", "org/c"), tmp_path / "c")
     assert req_c.lora_int_id == 44
 
