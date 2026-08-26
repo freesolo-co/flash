@@ -48,19 +48,10 @@ def _worker_sections(client: ApiClient, run_id: str) -> dict[str, str]:
 
 
 def live_attempt_of(run: Mapping[str, object]) -> int | str | None:
-    """The live attempt, ``_NO_LIVE_WORKER`` during teardown, or ``None`` when unknown.
-
-    ``live_attempt`` answers ``None`` for two opposite situations: an explicitly null ``remote``,
-    which proves the attached worker is gone, and a run whose shape carries no attempt identity.
-    Keep the two apart so teardown can be labelled as what it is.
-
-    Takes the status dict rather than fetching it, because ``--follow`` already holds one: the two
-    log paths must derive this from the SAME rule, or a follow that ends mid-teardown prints the
-    unmarked output from a superseded attempt the non-follow path tags.
-    """
-    identity = lifecycle_ui.live_attempt(dict(run))
-    if identity is None and run.get("remote", False) is None:
+    """return the live attempt, the teardown sentinel, or none when identity is unknown."""
+    if run.get("remote", False) is None:
         return _NO_LIVE_WORKER
+    identity = lifecycle_ui.live_attempt(dict(run))
     return identity[0] if identity is not None else None
 
 
