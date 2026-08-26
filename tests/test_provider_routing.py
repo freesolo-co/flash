@@ -391,9 +391,11 @@ def test_cancel_waits_for_durable_provider_handle_then_tears_down(
         resource_created.set()
         assert allow_handle.wait(timeout=5)
         on_handle(_runpod_handle("ep-handshake", "job-handshake"))
-        persisted_remote = runner_status.get_status(spec.run_id).remote
+        persisted_status = runner_status.get_status(spec.run_id)
+        persisted_remote = persisted_status.remote
         assert persisted_remote["endpoint_id"] == "ep-handshake"
         assert persisted_remote["job_id"] == "job-handshake"
+        assert persisted_status.lifecycle_started_attempt == 0
         handle_persisted.set()
         polling.set()
         assert allow_poll.wait(timeout=5)

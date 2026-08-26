@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+import flash.runner.accounting.costs as runner_costs
 import flash.runner.lifecycle.reporting as runner_reporting
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
@@ -62,6 +63,7 @@ def _report(monkeypatch, status: RunStatus) -> dict:
 
 def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypatch, tmp_path):
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
     spec = _spec()
     status = _status(spec)
 
@@ -122,11 +124,27 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
     assert _report(monkeypatch, status)["lifecycle"]["artifactsComplete"] is True
 
     status.state = "done"
+    status.lifecycle_started_attempt = 0
     status.realized_cost_remote = status.remote
     status.remote = None
     runner_state._save_status(status, _cleanup_remotes=None)
+    assert "lifecycle_started_attempt" not in status.to_dict()
     assert "realized_cost_remote" not in status.to_dict()
     assert _report(monkeypatch, status)["lifecycle"] == {
+        "started": True,
+        "progressed": True,
+        "artifactsComplete": True,
+        "cleanupComplete": True,
+    }
+
+    runner_costs.record_realized_cost(
+        status.run_id,
+        realized_cost_usd=1.0,
+        reconciled_at=10.0,
+    )
+    reconciled = runner_status.get_status(status.run_id)
+    assert reconciled.realized_cost_remote is None
+    assert _report(monkeypatch, reconciled)["lifecycle"] == {
         "started": True,
         "progressed": True,
         "artifactsComplete": True,

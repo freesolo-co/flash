@@ -82,7 +82,12 @@ class _SubmitContext:
                 "allocated_gpu_count": self.current_gpu.get("count"),
                 "on_last_gpu": bool(self.current_on_last_gpu),
             }
-            if _update(self.spec.run_id, "running", remote=persisted_handle):
+            if _update(
+                self.spec.run_id,
+                "running",
+                remote=persisted_handle,
+                lifecycle_started_attempt=canonical_handle["attempt"],
+            ):
                 return
             resource_deleted = False
             with contextlib.suppress(Exception):

@@ -134,6 +134,8 @@ class RunStatus:
     adapter_ref: str | None = None
     deployment: dict | None = None
     remote: dict | None = None
+    # private canonical attempt proof stamped only with the first durable provider-handle write.
+    lifecycle_started_attempt: int | None = None
     # exact torn-down provider handle retained only until delayed realized-cost reconciliation. it is
     # private, is not an active resource, and is cleared when reconciliation succeeds.
     realized_cost_remote: dict | None = None
@@ -177,6 +179,7 @@ class RunStatus:
         data = _status_storage_dict(self)
         data["spec"] = _public_status_spec(data.get("spec"))
         data.pop("report_sequence", None)
+        data.pop("lifecycle_started_attempt", None)
         data.pop("realized_cost_remote", None)
         # internal warm-start preparation (storage locators, digests) never leaves the server
         data.pop("effective_preparation", None)

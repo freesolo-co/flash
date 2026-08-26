@@ -157,8 +157,15 @@ def _lifecycle_projection(status: Any, public_status: dict[str, Any]) -> dict[st
         return lifecycle
 
     remote_attempt = _canonical_remote_attempt(raw.get("remote") or raw.get("realized_cost_remote"))
-    lifecycle["started"] = remote_attempt is not None
-    lifecycle["progressed"] = _progressed(raw, remote_attempt)
+    started_attempt = raw.get("lifecycle_started_attempt")
+    if (
+        isinstance(started_attempt, bool)
+        or not isinstance(started_attempt, int)
+        or started_attempt < 0
+    ):
+        started_attempt = remote_attempt
+    lifecycle["started"] = started_attempt is not None
+    lifecycle["progressed"] = _progressed(raw, started_attempt)
 
     adapter_ref = public_status.get("adapter_ref")
     artifacts_dir = raw.get("artifacts_dir")
