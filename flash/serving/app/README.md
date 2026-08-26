@@ -68,6 +68,21 @@ Deploy the router and every exact-model engine atomically in one maintenance win
 a release must use the channel transport. Roll back the whole serving release, including the router and
 all engine classes, as one unit.
 
+### Accounting cutover
+
+The provider-neutral accounting contract intentionally does not decode or migrate rows authored under a
+superseded traffic-principal contract. Before replacing an existing serving release, gate all inference
+ingress and keep the previous whole release running until it settles the durable usage backlog. The
+database owner must authoritatively verify that the serving usage outbox contains zero `in_progress`,
+`pending`, and `leased` rows before the new router starts. Do not infer organization attribution, delete
+rows, quarantine chargeable usage, or start the new release while any nonterminal row remains.
+
+After the backlog reaches zero, deploy the router and exact-model engines atomically, verify the expected
+deployment identity with an authenticated streaming and accounting canary, and only then reopen traffic.
+If the backlog cannot drain, leave traffic gated and restore or retain the previous whole release until
+operations explicitly resolve the unsettled usage. This maintenance-window invariant replaces runtime
+legacy decoding; violating it can make accounting fail closed and keep readiness at 503.
+
 ### Production
 
 Production uses the default Modal environment, production Supabase, the production platform backend,
