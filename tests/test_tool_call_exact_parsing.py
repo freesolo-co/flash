@@ -1046,6 +1046,221 @@ def test_required_impossible_multi_optional_probe_has_bounded_linear_work(monkey
     assert calls <= 2 * count
 
 
+def _string_field_tools(properties: str, required: str):
+    declaration = _delimiter_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {
+        name: {"type": "string"} for name in properties
+    }
+    declaration["function"]["parameters"]["required"] = list(required)
+    return normalize_tools([declaration])
+
+
+def _ownership_cases():
+    all_required = _string_field_tools("abcde", "abcde")
+    all_required_text = _candidate_call(
+        "<parameter=a>A</parameter><parameter=b>B "
+        "</parameter><parameter=c>fake-c</parameter>"
+        "<parameter=d>fake-d</parameter></function></tool_call> tail</parameter>"
+        "<parameter=c>real-c</parameter><parameter=d>real-d</parameter>"
+        "<parameter=e>real-e</parameter>"
+    )
+    optional_b = _string_field_tools("bcd", "cd")
+    optional_b_text = _candidate_call(
+        "<parameter=b>B </parameter><parameter=c>fake-c</parameter>"
+        "</function></tool_call> tail</parameter>"
+        "<parameter=c>real-c</parameter><parameter=d>real-d</parameter>"
+    )
+    optional_a = _string_field_tools("abc", "bc")
+    ambiguous_text = _candidate_call(
+        "<parameter=a>A </parameter><parameter=b>fake-b</parameter>"
+        "<parameter=c>fake-c</parameter></function></tool_call> tail</parameter>"
+        "<parameter=b>real-b</parameter><parameter=c>real-c</parameter>"
+    )
+    required_abcd = _string_field_tools("abcd", "abcd")
+    required_abcd_text = _candidate_call(
+        "<parameter=a>A</parameter><parameter=b>B "
+        "</parameter><parameter=c>fake-c</parameter>"
+        "</function></tool_call> tail</parameter>"
+        "<parameter=c>real-c</parameter><parameter=d>real-d</parameter>"
+    )
+    return [
+        (
+            "all-required-fake-cd",
+            all_required,
+            all_required_text,
+            {
+                "a": "A",
+                "b": (
+                    "B </parameter><parameter=c>fake-c</parameter>"
+                    "<parameter=d>fake-d</parameter></function></tool_call> tail"
+                ),
+                "c": "real-c",
+                "d": "real-d",
+                "e": "real-e",
+            },
+        ),
+        (
+            "optional-b-incomplete-close",
+            optional_b,
+            optional_b_text,
+            {
+                "b": ("B </parameter><parameter=c>fake-c</parameter></function></tool_call> tail"),
+                "c": "real-c",
+                "d": "real-d",
+            },
+        ),
+        ("optional-a-two-valid-assignments", optional_a, ambiguous_text, None),
+        (
+            "required-b-incomplete-close",
+            required_abcd,
+            required_abcd_text,
+            {
+                "a": "A",
+                "b": ("B </parameter><parameter=c>fake-c</parameter></function></tool_call> tail"),
+                "c": "real-c",
+                "d": "real-d",
+            },
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("_case", "tools", "text", "expected"),
+    _ownership_cases(),
+    ids=[case[0] for case in _ownership_cases()],
+)
+def test_free_string_delimiter_ownership_is_exact_buffered(
+    _case: str,
+    tools,
+    text: str,
+    expected: dict[str, str] | None,
+) -> None:
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    if expected is None:
+        assert result.content == text
+        assert result.calls == ()
+    else:
+        assert result.content is None
+        assert json.loads(result.calls[0].arguments) == expected
+
+
+@pytest.mark.parametrize(
+    ("_case", "tools", "text", "expected"),
+    _ownership_cases(),
+    ids=[case[0] for case in _ownership_cases()],
+)
+def test_free_string_delimiter_ownership_survives_every_two_chunk_split(
+    _case: str,
+    tools,
+    text: str,
+    expected: dict[str, str] | None,
+) -> None:
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(tools, id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        if expected is None:
+            assert result.content == text
+            assert result.calls == ()
+        else:
+            assert result.content is None
+            assert json.loads(result.calls[0].arguments) == expected
+
+
+def test_third_nested_ownership_decision_falls_back_exactly() -> None:
+    tools = _string_field_tools("abcde", "abcde")
+    text = _candidate_call(
+        "<parameter=a>A </parameter><parameter=b>fake-b "
+        "</parameter><parameter=c>fake-c "
+        "</parameter><parameter=d>fake-d</parameter>"
+        "</function></tool_call> fake-c-tail</parameter>"
+        "<parameter=d>nested-real-d</parameter><parameter=e>nested-e</parameter>"
+        "</function></tool_call> fake-b-tail</parameter>"
+        "<parameter=c>real-c</parameter><parameter=d>real-d</parameter>"
+        "<parameter=e>real-e</parameter></function></tool_call> fake-a-tail</parameter>"
+        "<parameter=b>real-b</parameter><parameter=c>outer-c</parameter>"
+        "<parameter=d>outer-d</parameter><parameter=e>outer-e</parameter>"
+    )
+
+    result = parse_qwen3_coder_output(text, tools)
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+def _repeated_fake_continuation_case(repeats: int):
+    tools = _string_field_tools("abcde", "abcde")
+    fake = "".join(
+        f"chunk-{index}</parameter><parameter=c>fake-c-{index}</parameter>"
+        f"<parameter=d>fake-d-{index}</parameter></function></tool_call> tail-{index} "
+        for index in range(repeats)
+    )
+    text = _candidate_call(
+        f"<parameter=a>A</parameter><parameter=b>{fake}</parameter>"
+        "<parameter=c>real-c</parameter><parameter=d>real-d</parameter>"
+        "<parameter=e>real-e</parameter>"
+    )
+    return tools, text, fake
+
+
+def test_repeated_complete_fake_continuations_preserve_exact_string_bytes() -> None:
+    tools, text, fake = _repeated_fake_continuation_case(12)
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert json.loads(result.calls[0].arguments) == {
+        "a": "A",
+        "b": fake,
+        "c": "real-c",
+        "d": "real-d",
+        "e": "real-e",
+    }
+
+
+def test_repeated_fake_continuation_work_is_linear_without_prefix_materialization(
+    monkeypatch,
+) -> None:
+    originals = {
+        name: getattr(tool_calls_module, name)
+        for name in (
+            "_find_parameter_end",
+            "_materialize_span",
+            "_coerce_value",
+            "_validate_value",
+            "_parse_parameter_value",
+        )
+    }
+    counters = dict.fromkeys(originals, 0)
+
+    def counted(name):
+        def wrapper(*args, **kwargs):
+            counters[name] += 1
+            return originals[name](*args, **kwargs)
+
+        return wrapper
+
+    for name in originals:
+        monkeypatch.setattr(tool_calls_module, name, counted(name))
+
+    measurements = {}
+    for repeats in (32, 64):
+        counters.update(dict.fromkeys(counters, 0))
+        tools, text, fake = _repeated_fake_continuation_case(repeats)
+        result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+        assert json.loads(result.calls[0].arguments)["b"] == fake
+        measurements[repeats] = dict(counters)
+
+    for measured in measurements.values():
+        assert measured["_coerce_value"] == 0
+        assert measured["_materialize_span"] == 5
+        assert measured["_validate_value"] == 6
+    work_32 = measurements[32]["_find_parameter_end"] + measurements[32]["_parse_parameter_value"]
+    work_64 = measurements[64]["_find_parameter_end"] + measurements[64]["_parse_parameter_value"]
+    assert work_64 <= 2 * work_32
+
+
 def _wide_array_tools():
     declaration = _delimiter_tools()[0].wire()
     declaration["function"]["parameters"]["properties"] = {
@@ -1139,6 +1354,388 @@ def test_complete_multi_optional_continuation_remains_ambiguous_across_splits() 
         result = parser.finish()
         assert result.content == text
         assert result.calls == ()
+
+
+def _multi_call_scope_case(*, malformed_first: bool) -> tuple[object, str]:
+    declaration = _string_field_tools("abz", "abz")[0].wire()
+    declaration["function"]["parameters"]["properties"]["z"] = {"type": "integer"}
+    tools = normalize_tools([declaration])
+    first = "<parameter=a>first</parameter><parameter=b>first-b</parameter>"
+    if not malformed_first:
+        first += "<parameter=z>1</parameter>"
+    second = (
+        "<parameter=z>2</parameter><parameter=a>second-a</parameter>"
+        "<parameter=b>second-b</parameter>"
+    )
+    text = _candidate_call(first) + _candidate_call(second)
+    return tools, text
+
+
+def test_multiple_calls_use_only_their_own_parameter_openers_buffered() -> None:
+    tools, text = _multi_call_scope_case(malformed_first=False)
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert [json.loads(call.arguments) for call in result.calls] == [
+        {"a": "first", "b": "first-b", "z": 1},
+        {"z": 2, "a": "second-a", "b": "second-b"},
+    ]
+
+
+def test_multiple_calls_use_only_their_own_parameter_openers_across_splits() -> None:
+    tools, text = _multi_call_scope_case(malformed_first=False)
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(tools, id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        assert len(parser.finish().calls) == 2
+
+
+def _one_or_two_call_ambiguity_case() -> tuple[object, str]:
+    tools = _string_field_tools("ab", "ab")
+    text = _candidate_call(
+        "<parameter=a>before </parameter><parameter=b>fake-b</parameter>"
+    ) + _candidate_call("<parameter=a>apparent-a</parameter><parameter=b>real-b</parameter>")
+    return tools, text
+
+
+def test_valid_later_call_and_merged_prefix_ambiguity_falls_back_buffered() -> None:
+    tools, text = _one_or_two_call_ambiguity_case()
+
+    result = parse_qwen3_coder_output(text, tools)
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+def test_valid_later_call_and_merged_prefix_ambiguity_falls_back_across_splits() -> None:
+    tools, text = _one_or_two_call_ambiguity_case()
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(tools)
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert result.content == text
+        assert result.calls == ()
+
+
+def _three_call_wider_scope_ambiguity_case() -> tuple[object, str]:
+    def declaration(name: str, properties: dict[str, object], required: list[str]):
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    edge_properties = {
+        "a": {"type": "string"},
+        "z": {"type": "integer", "enum": [1]},
+    }
+    tools = normalize_tools(
+        [
+            declaration("outer", edge_properties, ["a", "z"]),
+            declaration("middle", {"m": {"type": "integer"}}, ["m"]),
+            declaration("last", edge_properties, ["a", "z"]),
+        ]
+    )
+    text = (
+        "<tool_call><function=outer><parameter=a>outer</parameter>"
+        "<parameter=z>1</parameter></function></tool_call>"
+        "<tool_call><function=middle><parameter=m>2</parameter></function></tool_call>"
+        "<tool_call><function=last><parameter=a>last</parameter>"
+        "<parameter=z>1</parameter></function></tool_call>"
+    )
+    return tools, text
+
+
+def test_first_call_absorbing_two_later_calls_falls_back_buffered() -> None:
+    tools, text = _three_call_wider_scope_ambiguity_case()
+
+    result = parse_qwen3_coder_output(text, tools)
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+def test_first_call_absorbing_two_later_calls_falls_back_in_every_two_chunk_split() -> None:
+    tools, text = _three_call_wider_scope_ambiguity_case()
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(tools)
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert result.content == text
+        assert result.calls == ()
+
+
+def _whitespace_separated_multi_call_case() -> tuple[object, str]:
+    tools, text = _multi_call_scope_case(malformed_first=False)
+    return tools, text.replace(
+        "</function></tool_call><tool_call>",
+        "</function> \n </tool_call> \n <tool_call>",
+        1,
+    )
+
+
+def test_multiple_calls_allow_whitespace_between_closing_tags_buffered() -> None:
+    tools, text = _whitespace_separated_multi_call_case()
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert [json.loads(call.arguments) for call in result.calls] == [
+        {"a": "first", "b": "first-b", "z": 1},
+        {"z": 2, "a": "second-a", "b": "second-b"},
+    ]
+
+
+def test_multiple_calls_allow_whitespace_between_closing_tags_in_every_two_chunk_split() -> None:
+    tools, text = _whitespace_separated_multi_call_case()
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(tools, id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        assert [json.loads(call.arguments) for call in parser.finish().calls] == [
+            {"a": "first", "b": "first-b", "z": 1},
+            {"z": 2, "a": "second-a", "b": "second-b"},
+        ]
+
+
+_EMBEDDED_TOOL_MARKERS = (
+    "<tool_call><function=store> inside",
+    "</function></tool_call><tool_call> inside",
+    "</function></tool_call><tool_call><function=store inside",
+    "</function></tool_call><tool_call><function=store> inside",
+    "</function></tool_call><tool_call><function=unknown> inside",
+)
+
+
+def _embedded_tool_call_marker_case(marker: str) -> tuple[object, str]:
+    tools = _string_field_tools("abc", "abc")
+    text = _candidate_call(
+        f"<parameter=a>before {marker}</parameter>"
+        "<parameter=b>real-b</parameter><parameter=c>real-c</parameter>"
+    )
+    return tools, text
+
+
+@pytest.mark.parametrize("marker", _EMBEDDED_TOOL_MARKERS)
+def test_embedded_tool_call_marker_remains_free_string_content_buffered(marker: str) -> None:
+    tools, text = _embedded_tool_call_marker_case(marker)
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert json.loads(result.calls[0].arguments) == {
+        "a": f"before {marker}",
+        "b": "real-b",
+        "c": "real-c",
+    }
+
+
+@pytest.mark.parametrize("marker", _EMBEDDED_TOOL_MARKERS)
+def test_embedded_tool_call_marker_remains_free_string_content_across_splits(marker: str) -> None:
+    tools, text = _embedded_tool_call_marker_case(marker)
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(tools, id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        assert f"before {marker}" in parser.finish().calls[0].arguments
+
+
+_INVALID_DECLARED_CALLS = (
+    "<parameter=unknown>x</parameter></function></tool_call> fake-tail",
+    "<parameter=b>incomplete",
+    "</function></tool_call> fake-tail",
+)
+
+
+def _invalid_declared_call_in_string_case(fake_call: str) -> tuple[object, str, str]:
+    tools = _string_field_tools("abc", "abc")
+    marker = "</function> \n </tool_call> \n <tool_call><function=store>" + fake_call
+    expected = f"before {marker}"
+    text = _candidate_call(
+        f"<parameter=a>{expected}</parameter>"
+        "<parameter=b>real-b</parameter><parameter=c>real-c</parameter>"
+    )
+    return tools, text, expected
+
+
+@pytest.mark.parametrize("fake_call", _INVALID_DECLARED_CALLS)
+def test_invalid_declared_call_remains_free_string_content_buffered(fake_call: str) -> None:
+    tools, text, expected = _invalid_declared_call_in_string_case(fake_call)
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].arguments)["a"] == expected
+
+
+@pytest.mark.parametrize("fake_call", _INVALID_DECLARED_CALLS)
+def test_invalid_declared_call_remains_free_string_content_in_every_two_chunk_split(
+    fake_call: str,
+) -> None:
+    tools, text, expected = _invalid_declared_call_in_string_case(fake_call)
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(tools, id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        assert json.loads(parser.finish().calls[0].arguments)["a"] == expected
+
+
+def test_later_call_cannot_complete_a_malformed_first_call_buffered() -> None:
+    tools, text = _multi_call_scope_case(malformed_first=True)
+
+    result = parse_qwen3_coder_output(text, tools)
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+def test_later_call_cannot_complete_a_malformed_first_call_across_splits() -> None:
+    tools, text = _multi_call_scope_case(malformed_first=True)
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(tools)
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert result.content == text
+        assert result.calls == ()
+
+
+def _optional_consumption_ambiguity_case() -> tuple[object, str]:
+    tools = _string_field_tools("abc", "ab")
+    text = _candidate_call(
+        "<parameter=a></parameter><parameter=c></parameter><parameter=b><parameter=b></parameter>"
+    )
+    return tools, text
+
+
+def test_optional_consumption_enumerates_both_valid_assignments_buffered() -> None:
+    tools, text = _optional_consumption_ambiguity_case()
+
+    result = parse_qwen3_coder_output(text, tools)
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+def test_optional_consumption_enumerates_both_valid_assignments_across_splits() -> None:
+    tools, text = _optional_consumption_ambiguity_case()
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(tools)
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert result.content == text
+        assert result.calls == ()
+
+
+def test_many_calls_scan_only_bounded_call_ranges(monkeypatch) -> None:
+    declaration = _string_field_tools("ab", "ab")[0].wire()
+    declaration["function"]["parameters"]["properties"] = {
+        "a": {"type": "integer"},
+        "b": {"type": "integer"},
+    }
+    tools = normalize_tools([declaration])
+    original = tool_calls_module._PARAMETER_OPEN_RE
+    examined = 0
+
+    class MeasuredOpeners:
+        def finditer(self, text: str, start: int, end: int):
+            nonlocal examined
+            examined += end - start
+            return original.finditer(text, start, end)
+
+    monkeypatch.setattr(tool_calls_module, "_PARAMETER_OPEN_RE", MeasuredOpeners())
+    measurements = {}
+    for count in (32, 64, 128):
+        examined = 0
+        text = "".join(
+            _candidate_call(f"<parameter=a>{index}</parameter><parameter=b>{index}</parameter>")
+            for index in range(count)
+        )
+        result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+        assert len(result.calls) == count
+        measurements[count] = examined
+
+    assert measurements[64] <= 2 * measurements[32] + 64
+    assert measurements[128] <= 2 * measurements[64] + 128
+
+
+def _integer_calls(count: int) -> tuple[object, str]:
+    declaration = _string_field_tools("a", "a")[0].wire()
+    declaration["function"]["parameters"]["properties"] = {"a": {"type": "integer"}}
+    tools = normalize_tools([declaration])
+    text = "".join(_candidate_call(f"<parameter=a>{index}</parameter>") for index in range(count))
+    return tools, text
+
+
+def test_exactly_512_calls_remain_supported() -> None:
+    tools, text = _integer_calls(512)
+    next_id = iter(f"call_{index}" for index in range(512)).__next__
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=next_id)
+
+    assert result.content is None
+    assert len(result.calls) == 512
+    assert result.calls[-1].id == "call_511"
+
+
+def test_513_calls_reject_before_call_id_creation() -> None:
+    tools, text = _integer_calls(513)
+    id_calls = 0
+
+    def make_id() -> str:
+        nonlocal id_calls
+        id_calls += 1
+        return "unexpected"
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=make_id)
+
+    assert result.content == text
+    assert result.calls == ()
+    assert id_calls == 0
+
+
+def test_dense_invalid_declared_candidates_have_bounded_segmentation_work(monkeypatch) -> None:
+    tools = _string_field_tools("abc", "abc")
+    examined = 0
+    original = tool_calls_module._parse_tool_call
+
+    def measured(text, start, scope_end, tool_map, opener_positions, work):
+        nonlocal examined
+        examined += scope_end - start
+        return original(text, start, scope_end, tool_map, opener_positions, work)
+
+    monkeypatch.setattr(tool_calls_module, "_parse_tool_call", measured)
+    fake = "".join(
+        "chunk</function></tool_call><tool_call><function=store>"
+        "<parameter=unknown>x</parameter></function></tool_call>tail"
+        for _ in range(128)
+    )
+    text = _candidate_call(
+        f"<parameter=a>{fake}</parameter><parameter=b>b</parameter><parameter=c>c</parameter>"
+    )
+
+    result = parse_qwen3_coder_output(text, tools)
+
+    assert result.content == text
+    assert result.calls == ()
+    assert examined <= 4 * len(text) + len(text)
 
 
 def test_tool_call_outer_closer_is_owned_after_function_grammar() -> None:

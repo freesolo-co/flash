@@ -1,44 +1,27 @@
 """strict tool parsing adapted from vllm 0.23.0's qwen3 coder parser under apache-2.0."""
 
-from __future__ import annotations
-
 import json
 import math
 import re
 import uuid
+from bisect import bisect_left
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, DecimalException
-from typing import Any
+from typing import Any, NamedTuple
 
 TOOL_PARSER_QWEN3_CODER = "qwen3_coder"
-TOOL_CALL_START = "<tool_call>"
-TOOL_CALL_END = "</tool_call>"
-_FUNCTION_START = "<function="
-_FUNCTION_END = "</function>"
-_PARAMETER_START = "<parameter="
-_PARAMETER_END = "</parameter>"
+TOOL_CALL_START, TOOL_CALL_END = "<tool_call>", "</tool_call>"
+_FUNCTION_START, _FUNCTION_END = "<function=", "</function>"
+_PARAMETER_START, _PARAMETER_END = "<parameter=", "</parameter>"
+_PARAMETER_OPEN_RE = re.compile(r"<parameter=([^>]+)>")
+_CALL_BOUNDARY_RE = re.compile(r"</function>\s*</tool_call>\s*(<tool_call>)\s*<function=([^>]+)>")
 _NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_TOOL_GRAMMAR_MARKERS = (
-    TOOL_CALL_START,
-    TOOL_CALL_END,
-    _FUNCTION_START,
-    _FUNCTION_END,
-    _PARAMETER_START,
-    _PARAMETER_END,
-)
-_MAX_TOOLS = 128
-_MAX_SCHEMA_DEPTH = 8
-_MAX_SCHEMA_NODES = 512
-_MAX_ENUM_VALUES = 128
-_MAX_ENUM_NODES = _MAX_ENUM_VALUES * _MAX_SCHEMA_NODES
+_MAX_TOOLS, _MAX_SCHEMA_DEPTH, _MAX_SCHEMA_NODES, _MAX_ENUM_VALUES = 128, 8, 512, 128
 _MAX_FIXED_DECIMAL_DIGITS = _MAX_NUMERIC_LITERAL_DIGITS = 1024
-_NUMERIC_LITERAL_ERROR = f"numeric literal exceeds {_MAX_NUMERIC_LITERAL_DIGITS}-digit limit"
-_MAX_TOOL_STOP_COMPARISON_CHARS = 16 * 1024 * 1024
-_SCHEMA_TYPES = frozenset({"array", "boolean", "integer", "null", "number", "object", "string"})
-_SCHEMA_KEYS = frozenset(
-    {"additionalProperties", "description", "enum", "items", "properties", "required", "type"}
-)
+_AMBIGUOUS, _EXHAUSTED = object(), object()
+_SCHEMA_TYPES = frozenset(["array", "boolean", "integer", "null", "number", "object", "string"])  # fmt: skip
+_SCHEMA_KEYS = frozenset(["additionalProperties", "description", "enum", "items", "properties", "required", "type"])  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,13 +66,10 @@ class ToolParseResult:
 
 
 def qualified_tool_parser(base_model: str) -> str | None:
-    """return the parser qualified for one exact logical base model."""
     return TOOL_PARSER_QWEN3_CODER if base_model == "Qwen/Qwen3.5-9B" else None
 
 
 class ToolCallStreamParser:
-    """retain possible tool XML until it can be accepted or returned exactly."""
-
     def __init__(
         self,
         tools: Sequence[FunctionTool],
@@ -102,8 +82,6 @@ class ToolCallStreamParser:
         self._candidate = False
 
     def feed(self, text: str) -> str:
-        """return text proven not to begin a tool candidate."""
-
         if not text:
             return ""
         self._pending += text
@@ -124,7 +102,6 @@ class ToolCallStreamParser:
         return emitted
 
     def finish(self) -> ToolParseResult:
-        """parse a complete candidate or return every retained byte as content."""
         pending, self._pending = self._pending, ""
         if not pending:
             return ToolParseResult(content=None, calls=())
@@ -139,7 +116,6 @@ class ToolCallStreamParser:
 def normalize_tools(
     value: object, *, error_type: type[Exception] = ValueError
 ) -> tuple[FunctionTool, ...]:
-    """validate and detach the supported closed function-tool declaration list."""
     if type(value) is not list or not value:
         raise error_type("tools must be a nonempty array of function declarations")
     if len(value) > _MAX_TOOLS:
@@ -186,12 +162,10 @@ def normalize_tools(
 
 
 def tools_wire(tools: Sequence[FunctionTool] | None) -> list[dict[str, Any]] | None:
-    """return a detached OpenAI wire representation."""
     return None if tools is None else [tool.wire() for tool in tools]
 
 
 def tools_active(tools: object, tool_choice: str | None) -> bool:
-    """report whether declared tools are active for this request."""
     return tools is not None and tool_choice == "auto"
 
 
@@ -202,8 +176,6 @@ def validate_tool_control_presence(
     *,
     error_type: type[Exception] = ValueError,
 ) -> None:
-    """reject tool controls when no tool declarations accompany them."""
-
     if tools is None and (tool_choice is not None or parallel_tool_calls is not None):
         raise error_type("tool controls require tools")
 
@@ -215,16 +187,15 @@ def validate_tool_stop_sequences(
     tool_choice: str | None,
     error_type: type[Exception] = ValueError,
 ) -> None:
-    """reject stop sequences that can consume active qwen tool grammar markers."""
     if not tools_active(tools, tool_choice):
         return
-    markers = list(_TOOL_GRAMMAR_MARKERS)
+    markers = [TOOL_CALL_START, TOOL_CALL_END, _FUNCTION_START, _FUNCTION_END, _PARAMETER_START, _PARAMETER_END]  # fmt: skip
     for tool in tools:
         markers.append(f"{_FUNCTION_START}{tool.name}>")
         markers.extend(f"{_PARAMETER_START}{name}>" for name in tool.parameters["properties"])
     marker_chars = sum(len(marker) for marker in markers)
     stop_chars = sum(len(stop_value) for stop_value in stop)
-    if len(stop) * marker_chars + len(markers) * stop_chars > _MAX_TOOL_STOP_COMPARISON_CHARS:
+    if len(stop) * marker_chars + len(markers) * stop_chars > 16 * 1024 * 1024:
         raise error_type("active tool stop validation exceeds the supported complexity")
     if any(
         _strings_overlap(stop_value, marker) for stop_value in stop for marker in markers
@@ -240,8 +211,6 @@ def validate_tool_stop_sequences(
 def validate_tool_history(
     messages: Sequence[Mapping[str, Any]], *, error_type: type[Exception] = ValueError
 ) -> None:
-    """validate strict assistant-call and immediately-following tool-result lifecycle."""
-
     pending: dict[str, str] = {}
     resolved: set[str] = set()
     all_ids: set[str] = set()
@@ -284,8 +253,6 @@ def validate_tool_history(
 
 
 def detached_template_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """clone history and decode assistant argument strings only for chat templates."""
-
     from flash.serve.request.validation import TEXT_TYPES
 
     detached: list[dict[str, Any]] = []
@@ -327,26 +294,37 @@ def parse_qwen3_coder_output(
     *,
     id_factory: Callable[[], str] | None = None,
 ) -> ToolParseResult:
-    """parse the exact qualified qwen3 coder XML grammar with exact fallback."""
-
     first = text.find(TOOL_CALL_START)
     if first < 0:
         return ToolParseResult(content=text, calls=())
     content = text[:first] or None
-    cursor = first
-    parsed: list[tuple[str, dict[str, Any]]] = []
     tool_map = {tool.name: tool for tool in tools}
-    while cursor < len(text):
-        cursor = _skip_whitespace(text, cursor)
-        if cursor == len(text):
-            break
-        parsed_call = _parse_tool_call(text, cursor, tool_map)
-        if parsed_call is None:
-            return ToolParseResult(content=text, calls=())
-        cursor, call = parsed_call
-        parsed.append(call)
-    if not parsed:
+    candidates = [match.start(1) for match in _CALL_BOUNDARY_RE.finditer(text, first) if match[2] in tool_map]  # fmt: skip
+    if len(candidates) >= 512:
         return ToolParseResult(content=text, calls=())
+    opener_positions: dict[str, list[int]] = {}
+    for match in _PARAMETER_OPEN_RE.finditer(text, first, len(text)):
+        opener_positions.setdefault(match[1], []).append(match.start())
+    work = [min(16 * 1024 * 1024, 4 * len(text))]
+    confirmed = [len(text)]
+    parsed: list[tuple[str, dict[str, Any]]] = []
+    for start in reversed([first, *candidates]):
+        parsed_call = _parse_tool_call(text, start, confirmed[-1], tool_map, opener_positions, work)
+        if parsed_call is _AMBIGUOUS or parsed_call is _EXHAUSTED:
+            return ToolParseResult(content=text, calls=())
+        if parsed_call is not None and _skip_whitespace(text, parsed_call[0]) == confirmed[-1]:
+            confirmed.append(start)
+            parsed.append(parsed_call[1])
+    if confirmed[-1] != first:
+        return ToolParseResult(content=text, calls=())
+    boundaries = confirmed[::-1]
+    parsed.reverse()
+    for index, (start, (name, _)) in enumerate(zip(boundaries, parsed, strict=False)):
+        if not any(schema["type"] == "string" and "enum" not in schema for schema in tool_map[name].parameters["properties"].values()):  # fmt: skip
+            continue
+        for scope_end in boundaries[index + 2 :]:
+            if (alternate := _parse_tool_call(text, start, scope_end, tool_map, opener_positions, work)) is _AMBIGUOUS or alternate is _EXHAUSTED or (alternate is not None and _skip_whitespace(text, alternate[0]) == scope_end):  # fmt: skip
+                return ToolParseResult(content=text, calls=())
     try:
         for _, arguments in parsed:
             _validate_tool_argument_complexity(arguments, "generated tool call", ValueError)
@@ -354,11 +332,7 @@ def parse_qwen3_coder_output(
         return ToolParseResult(content=text, calls=())
     make_id = id_factory or (lambda: f"call_{uuid.uuid4().hex[:24]}")
     calls = tuple(
-        ParsedToolCall(
-            id=_validated_call_id(make_id()),
-            name=name,
-            arguments=_dump_exact_json(arguments),
-        )
+        ParsedToolCall(_validated_call_id(make_id()), name, _dump_exact_json(arguments))
         for name, arguments in parsed
     )
     return ToolParseResult(content=content, calls=calls)
@@ -403,7 +377,7 @@ def _normalize_schema(
                 f"{path}.enum[{enum_index}]",
                 error_type,
                 budget=enum_budget,
-                max_nodes=_MAX_ENUM_NODES,
+                max_nodes=_MAX_ENUM_VALUES * _MAX_SCHEMA_NODES,
                 kind="enum value",
             )
         detached = _json_copy(enum, path, error_type)
@@ -548,129 +522,155 @@ def _validate_tool_result(
     resolved.add(call_id)
 
 
-def _parse_tool_call(
-    text: str,
-    cursor: int,
-    tools: Mapping[str, FunctionTool],
-) -> tuple[int, tuple[str, dict[str, Any]]] | None:
+class _FreeStringSpan(NamedTuple):
+    start: int
+    end: int
+
+
+def _parse_tool_call(text, cursor, scope_end, tools, opener_positions, work):
+    work[0] -= scope_end - cursor
+    if work[0] < 0:
+        return _EXHAUSTED
     if not text.startswith(TOOL_CALL_START, cursor):
         return None
     cursor = _skip_whitespace(text, cursor + len(TOOL_CALL_START))
     if not text.startswith(_FUNCTION_START, cursor):
         return None
     name_end = text.find(">", cursor + len(_FUNCTION_START))
-    if name_end < 0:
-        return None
     name = text[cursor + len(_FUNCTION_START) : name_end]
-    if (tool := tools.get(name)) is None:
+    if name_end < 0 or (tool := tools.get(name)) is None:
         return None
-    if (parsed_parameters := _parse_parameters(text, name_end + 1, tool)) is None:
-        return None
-    cursor, values, ambiguous, missing = parsed_parameters
-    if ambiguous or missing:
-        return None
-    cursor = _skip_whitespace(text, cursor)
-    if not text.startswith(TOOL_CALL_END, cursor):
-        return None
-    return cursor + len(TOOL_CALL_END), (name, values)
+    openers = {}
+    for parameter_name in tool.parameters["properties"]:
+        positions = opener_positions.get(parameter_name, ())
+        index = bisect_left(positions, scope_end)
+        if index and positions[index - 1] >= name_end:
+            openers[parameter_name] = positions[index - 1]
+    count, cursor, values, _ = _parse_parameters((text, tool, openers), name_end + 1, {}, None)
+    if count != 1 or cursor is None or values is None:
+        return _AMBIGUOUS if count == 2 else None
+    for key, value in values.items():
+        if isinstance(value, _FreeStringSpan):
+            values[key] = _materialize_span(text, value)
+            if values[key] is None:
+                return None
+    return (cursor, (name, values)) if _validate_value(values, tool.parameters) else None
 
 
-def _parse_parameters(
-    text: str,
-    cursor: int,
-    tool: FunctionTool,
-    initial_values: Mapping[str, Any] | None = None,
-    probe: int = 0,
-) -> tuple[int, dict[str, Any], bool, bool] | None:
-    values = dict(initial_values or {})
-    ambiguous = False
-    optional = set(tool.parameters["properties"]) - set(tool.parameters["required"])
-    optional_markers = tuple(f"{_PARAMETER_START}{name}>" for name in optional)
+def _parse_parameters(state, cursor, values, probe):
+    text, tool, _ = state
+    parsed_values = dict(values)
     while True:
         cursor = _skip_whitespace(text, cursor)
         if text.startswith(_FUNCTION_END, cursor):
-            cursor += len(_FUNCTION_END)
-            break
+            outer = _skip_whitespace(text, cursor + len(_FUNCTION_END))
+            if not text.startswith(TOOL_CALL_END, outer):
+                return 0, None, None, None
+            outer += len(TOOL_CALL_END)
+            if not set(tool.parameters["required"]) - set(parsed_values):
+                return 1, outer, parsed_values, None
+            return 0, None, None, outer if probe else None
         if not text.startswith(_PARAMETER_START, cursor):
-            return None
+            return 0, None, None, None
         name_end = text.find(">", cursor + len(_PARAMETER_START))
-        if name_end < 0:
-            return None
-        parameter_name = text[cursor + len(_PARAMETER_START) : name_end]
-        schema = tool.parameters["properties"].get(parameter_name)
-        if schema is None or parameter_name in values:
-            return None
-        free_string = schema["type"] == "string" and "enum" not in schema
-        follow = (tool, values, parameter_name, probe + 1) if free_string and probe < 2 else None
-        if (parsed_value := _parse_parameter_value(text, name_end + 1, schema, follow)) is None:
-            return None
-        cursor, values[parameter_name], continuation = parsed_value
-        following = _skip_whitespace(text, cursor)
-        ambiguous |= free_string and text.startswith(optional_markers, following)
-        if probe == 2 and text.startswith(_PARAMETER_START, following):
-            return cursor, values, ambiguous, False
-        if continuation is not None:
-            return continuation[0], continuation[1], ambiguous or continuation[2], continuation[3]
-    missing = bool(set(tool.parameters["required"]) - set(values))
-    if not missing and not _validate_value(values, tool.parameters):
-        return None
-    return cursor, values, ambiguous, missing
+        name = text[cursor + len(_PARAMETER_START) : name_end]
+        schema = tool.parameters["properties"].get(name) if name_end >= 0 else None
+        if schema is None or name in parsed_values:
+            return 0, None, None, None
+        parsed = _parse_parameter_value(state, name_end + 1, schema, parsed_values, name, probe)
+        if not isinstance(parsed, tuple) or len(parsed) == 4:
+            return parsed or (0, None, None, None)
+        cursor, parsed_values[name] = parsed
 
 
-def _parse_parameter_value(
-    text: str,
-    value_start: int,
-    schema: Mapping[str, Any],
-    follow: tuple[FunctionTool, Mapping[str, Any], str, int] | None = None,
-) -> tuple[int, Any, tuple[int, dict[str, Any], bool, bool] | None] | None:
+def _parse_parameter_value(state, value_start, schema, values, name, probe):
+    text, tool, _ = state
+    if schema["type"] == "string" and "enum" not in schema:
+        missing = frozenset(set(tool.parameters["required"]) - {*values, name})
+        return _classify_free_string(
+            state, value_start, values, name, probe or (value_start, 0, missing)
+        )
     search_from = value_start
     while True:
         value_end = (
             _find_json_container_end(text, search_from)
             if schema["type"] in {"array", "object"}
-            else text.find(_PARAMETER_END, search_from)
+            else _find_parameter_end(text, _PARAMETER_END, search_from)
         )
         if value_end < 0:
             return None
         following = _skip_whitespace(text, value_end + len(_PARAMETER_END))
-        if (
-            schema["type"] == "string"
-            and "enum" not in schema
-            and text.startswith(_FUNCTION_END, following)
-        ):
-            after_function = _skip_whitespace(text, following + len(_FUNCTION_END))
-            if not text.startswith(TOOL_CALL_END, after_function):
-                search_from = value_end + len(_PARAMETER_END)
-                continue
         if text.startswith((_PARAMETER_START, _FUNCTION_END), following):
-            raw_value = text[value_start:value_end]
-            raw_value = raw_value[1:] if raw_value.startswith("\n") else raw_value
-            raw_value = raw_value[:-1] if raw_value.endswith("\n") else raw_value
-            value = _coerce_value(raw_value, schema["type"])
-            if not _validate_value(value, schema):
-                return None
-            try:
-                value = _canonicalize_integer_values(value, schema)
-            except DecimalException:
-                return None
-            cursor = value_end + len(_PARAMETER_END)
-            if follow is None:
-                return cursor, value, None
-            tool, values, name, probe = follow
-            if (
-                parsed := _parse_parameters(text, cursor, tool, {**values, name: value}, probe)
-            ) is not None:
-                after_probe = _skip_whitespace(text, parsed[0])
-                if probe == 2 and text.startswith(_PARAMETER_START, after_probe):
-                    return cursor, value, None
-                if text.startswith(TOOL_CALL_END, after_probe):
-                    if parsed[3]:
-                        if probe == 2 and name not in tool.parameters["required"]:
-                            return None
-                        search_from = after_probe + len(TOOL_CALL_END)
-                        continue
-                    return cursor, value, None if probe == 2 else parsed
+            break
+        if schema["type"] in {"array", "object"}:
+            return None
         search_from = value_end + len(_PARAMETER_END)
+    raw = text[value_start:value_end]
+    raw = raw[1:] if raw.startswith("\n") else raw
+    raw = raw[:-1] if raw.endswith("\n") else raw
+    value = _coerce_value(raw, schema["type"])
+    if not _validate_value(value, schema):
+        return None
+    try:
+        return value_end + len(_PARAMETER_END), _canonicalize_integer_values(value, schema)
+    except DecimalException:
+        return None
+
+
+def _classify_free_string(state, value_start, values, name, probe):
+    text, tool, openers = state
+    origin, depth, origin_missing = probe
+    count, witness_cursor, witness_values = 0, None, None
+    search_from = value_start
+    while (value_end := _find_parameter_end(text, _PARAMETER_END, search_from)) >= 0:
+        cursor = value_end + len(_PARAMETER_END)
+        following = _skip_whitespace(text, cursor)
+        is_parameter = text.startswith(_PARAMETER_START, following)
+        is_function = text.startswith(_FUNCTION_END, following)
+        if not is_parameter and not is_function:
+            search_from = cursor
+            continue
+        if is_function and not text.startswith(
+            TOOL_CALL_END, _skip_whitespace(text, following + len(_FUNCTION_END))
+        ):
+            search_from = cursor
+            continue
+        next_values = {**values, name: _FreeStringSpan(value_start, value_end)}
+        missing = set(tool.parameters["required"]) - set(next_values)
+        content_viable = all(openers.get(field, -1) > following for field in missing) and (
+            is_parameter or bool(missing)
+        )
+        ownership = content_viable and is_parameter and not origin_missing <= set(next_values)
+        if ownership and depth >= 2:
+            return 2, None, None, None
+        branch_probe = (
+            (origin, depth + 1, origin_missing) if ownership else probe if is_function else None
+        )
+        branch_count, branch_cursor, branch_values, incomplete = _parse_parameters(
+            state, following, next_values, branch_probe
+        )
+        count = min(2, count + branch_count)
+        if count == 1 and branch_count:
+            witness_cursor, witness_values = branch_cursor, branch_values
+        elif count == 2:
+            return 2, None, None, None
+        if incomplete is not None and count == 0:
+            if origin != value_start:
+                return count, witness_cursor, witness_values, incomplete
+            search_from = incomplete
+        else:
+            search_from = cursor
+        if not content_viable:
+            return count, witness_cursor, witness_values, None
+    return count, witness_cursor, witness_values, None
+
+
+def _materialize_span(text: str, span: _FreeStringSpan) -> str | None:
+    value = text[span.start : span.end].removeprefix("\n").removesuffix("\n")
+    return None if _contains_unpaired_surrogate(value) else value
+
+
+_find_parameter_end = str.find
 
 
 def _find_json_container_end(text: str, cursor: int) -> int:
@@ -829,7 +829,7 @@ def _contains_unpaired_surrogate(value: Any) -> bool:
 def _parse_decimal_literal(value: str) -> Decimal:
     digits = value.lower().lstrip("-").partition("e")[0].replace(".", "")
     if len(digits) > _MAX_NUMERIC_LITERAL_DIGITS:
-        raise ValueError(_NUMERIC_LITERAL_ERROR)
+        raise ValueError(f"numeric literal exceeds {_MAX_NUMERIC_LITERAL_DIGITS}-digit limit")
     return Decimal(value)
 
 

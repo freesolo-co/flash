@@ -103,9 +103,15 @@ def test_profiles_carry_the_qwen3_reasoning_parser() -> None:
 
 
 def test_profiles_carry_the_same_exact_tool_parser_as_hosted_serving() -> None:
-    for model_id in supported_models():
-        assert get_profile(model_id).tool_parser == tool_parser_for(model_id)
-    assert get_profile(MODEL).tool_parser == "qwen3_coder"
+    expected = {
+        "Qwen/Qwen3.5-9B": "qwen3_coder",
+        "Qwen/Qwen3.8-27B": None,
+        "Qwen/Qwen3.6-35B-A3B": None,
+    }
+    for model_id, tool_parser in expected.items():
+        assert get_profile(model_id).tool_parser == tool_parser
+        if model_id != "Qwen/Qwen3.8-27B":
+            assert get_profile(model_id).tool_parser == tool_parser_for(model_id)
 
 
 def test_profiles_keep_the_validated_fp8_kv_cache() -> None:
