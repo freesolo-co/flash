@@ -79,9 +79,18 @@ def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
             return False
-        if not _expected_remote_matches(status.remote, expected_remote):
+        if _expected_remote_matches(status.remote, expected_remote):
+            status.remote = None
+        elif status.remote is None and _expected_remote_matches(
+            status.cleanup_confirmed_remote, expected_remote
+        ):
+            status.cleanup_confirmed_remote = None
+            if not _retain_remote_for_accounting(status) and _expected_remote_matches(
+                status.realized_cost_remote, expected_remote
+            ):
+                status.realized_cost_remote = None
+        else:
             return False
-        status.remote = None
         status.updated_at = time.time()
         state._save_status_unlocked(status)
         report_status = status
@@ -101,7 +110,10 @@ def _compare_and_fail_remote(
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
             return False
-        if not _expected_remote_matches(status.remote, expected_remote):
+        if not _expected_remote_matches(status.remote, expected_remote) and not (
+            status.remote is None
+            and _expected_remote_matches(status.cleanup_confirmed_remote, expected_remote)
+        ):
             return False
         status.state = "failed"
         status.error = error
@@ -112,11 +124,11 @@ def _compare_and_fail_remote(
         report_status = status
     confirmed = status_ops.get_status(run_id)
     expected_after = expected_remote
-    if (
-        confirmed.state != "failed"
-        or not _expected_remote_matches(confirmed.remote, expected_after)
-        or confirmed.error != error
-    ):
+    expected_still_owned = _expected_remote_matches(confirmed.remote, expected_after) or (
+        confirmed.remote is None
+        and _expected_remote_matches(confirmed.cleanup_confirmed_remote, expected_after)
+    )
+    if confirmed.state != "failed" or not expected_still_owned or confirmed.error != error:
         raise RuntimeError("terminal recovery failure was not durably confirmed")
     if report_status is not None:
         reporting._report_status(report_status)
@@ -135,7 +147,10 @@ def _compare_and_complete_remote(
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
             return False
-        if not _expected_remote_matches(status.remote, expected_remote):
+        confirmed_teardown = status.remote is None and _expected_remote_matches(
+            status.cleanup_confirmed_remote, expected_remote
+        )
+        if not _expected_remote_matches(status.remote, expected_remote) and not confirmed_teardown:
             return False
     expected_attempt = (
         expected_remote.get("attempt")
@@ -147,14 +162,22 @@ def _compare_and_complete_remote(
         metrics,
         expected_attempt=expected_attempt,
     )
-    if expected_remote is not None and not _record_cleanup_remote(run_id, expected_remote):
+    if (
+        expected_remote is not None
+        and not confirmed_teardown
+        and not _record_cleanup_remote(run_id, expected_remote)
+    ):
         return False
     recovered_cost = status_ops._persist_metrics(spec, metrics)
     with state._status_guard(run_id):
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
             return False
-        if not _expected_remote_matches(status.remote, expected_remote):
+        expected_still_owned = _expected_remote_matches(status.remote, expected_remote) or (
+            status.remote is None
+            and _expected_remote_matches(status.cleanup_confirmed_remote, expected_remote)
+        )
+        if not expected_still_owned:
             return False
         measured = float(status.cost_usd or 0.0) + recovered_cost
         charge_usd = costs._status_estimated_charge(status, spec, fallback=measured)
@@ -168,7 +191,11 @@ def _compare_and_complete_remote(
         state._save_status_unlocked(status)
         report_status = status
     confirmed = status_ops.get_status(run_id)
-    if confirmed.state != "done" or not _expected_remote_matches(confirmed.remote, expected_remote):
+    expected_still_owned = _expected_remote_matches(confirmed.remote, expected_remote) or (
+        confirmed.remote is None
+        and _expected_remote_matches(confirmed.cleanup_confirmed_remote, expected_remote)
+    )
+    if confirmed.state != "done" or not expected_still_owned:
         raise RuntimeError("terminal recovery completion was not durably confirmed")
     if report_status is not None:
         reporting._report_status(report_status)
@@ -233,39 +260,69 @@ def _snapshot_cleanup_remotes(run_id: str) -> list[dict]:
         return _cleanup_remotes_from_raw(status_ops._load_status_json(run_id))
 
 
+def _retain_remote_for_accounting(status: RunStatus) -> bool:
+    return status.reconciled_at is None or (
+        bool(status.billing_context) and status.billing_state != "charged"
+    )
+
+
+def _compare_and_confirm_remote_teardown(run_id: str, expected_remote: dict) -> bool:
+    """clear one exact active remote after its teardown was independently confirmed."""
+    if _remote_resource_identity(expected_remote) is None:
+        return False
+    report_status: RunStatus | None = None
+    with state._status_guard(run_id):
+        status = status_ops.get_status(run_id)
+        if not _expected_remote_matches(status.remote, expected_remote):
+            return False
+        status.cleanup_confirmed_remote = dict(status.remote)
+        if _retain_remote_for_accounting(status):
+            status.realized_cost_remote = dict(status.remote)
+        status.remote = None
+        status.updated_at = time.time()
+        state._save_status_unlocked(status)
+        report_status = status
+    if report_status is not None:
+        reporting._report_status(report_status)
+    return True
+
+
 def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bool:
+    """Remove one confirmed cleanup target and its exact active remote atomically."""
     expected_key = _teardown_removal_key(expected_remote)
     if expected_key is None:
         return False
+    report_status: RunStatus | None = None
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
+        status = status_ops._runstatus_from_json(raw)
         try:
             records = _cleanup_remotes_from_raw(raw)
         except Exception:
-            # the strict reader raises on the FIRST record it cannot canonicalize, and the drain
-            # suppresses that -- so one bad sibling made every CONFIRMED-DELETED record undeletable,
-            # and each sweep retried a resource that is already gone, forever. removing one record
-            # does not require understanding the others: keep the ones that cannot be parsed exactly
-            # as they are on disk, drop only the record whose teardown was confirmed. nothing is
-            # silently discarded, and the strict reader still guards every other write path.
+            # the strict reader raises on the first record it cannot canonicalize. preserve every
+            # unrecognized sibling verbatim and remove only the identity confirmed deleted.
             value = raw.get(state._CLEANUP_REMOTES_KEY, [])
             if not isinstance(value, list):
                 return False
             remaining = [item for item in value if _teardown_removal_key(item) != expected_key]
             if len(remaining) == len(value):
                 return False
-            state._save_status_unlocked(
-                status_ops._runstatus_from_json(raw),
-                _cleanup_remotes=remaining or None,
-            )
-            return True
-        remaining = [record for record in records if _teardown_removal_key(record) != expected_key]
-        if len(remaining) == len(records):
-            return False
-        state._save_status_unlocked(
-            status_ops._runstatus_from_json(raw),
-            _cleanup_remotes=remaining or None,
-        )
+        else:
+            remaining = [
+                record for record in records if _teardown_removal_key(record) != expected_key
+            ]
+            if len(remaining) == len(records):
+                return False
+        if _teardown_removal_key(status.remote) == expected_key:
+            status.cleanup_confirmed_remote = dict(status.remote)
+            if _retain_remote_for_accounting(status):
+                status.realized_cost_remote = dict(status.remote)
+            status.remote = None
+        status.updated_at = time.time()
+        state._save_status_unlocked(status, _cleanup_remotes=remaining or None)
+        report_status = status
+    if report_status is not None:
+        reporting._report_status(report_status)
     return True
 
 
@@ -379,19 +436,32 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     return attempted
 
 
+def _cleanup_records_with(raw: dict, record: dict) -> list[dict] | None:
+    """Append one strict record while preserving every existing cleanup sibling verbatim."""
+    value = raw.get(state._CLEANUP_REMOTES_KEY, [])
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        return None
+    records = list(value)
+    key = _cleanup_remote_key(record)
+    if key is None:
+        return None
+    if all(_teardown_removal_key(existing) != key for existing in records):
+        records.append(record)
+    return records
+
+
 def _record_cleanup_remote(run_id: str, remote: dict) -> bool:
     """Persist one exact cleanup identity without changing the active remote."""
     record = _canonical_cleanup_remote(remote)
-    key = _cleanup_remote_key(record)
-    if record is None or key is None:
+    if record is None:
         return False
     report_status: RunStatus | None = None
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
         status = status_ops._runstatus_from_json(raw)
-        records = _cleanup_remotes_from_raw(raw)
-        if all(_cleanup_remote_key(existing) != key for existing in records):
-            records.append(record)
+        records = _cleanup_records_with(raw, record)
+        if records is None:
+            return False
         status.updated_at = time.time()
         state._save_status_unlocked(status, _cleanup_remotes=records)
         report_status = status
