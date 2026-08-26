@@ -64,7 +64,8 @@ def teardown_reconciled_remote(
     if confirmed_teardown:
         return True, True
     try:
-        return True, _strict_teardown_handle(handle, run_id)
+        resource_deleted = _strict_teardown_handle(handle, run_id)
+        worker_gone = True
     except Exception:
         resource_deleted = False
         worker_gone = _worker_provably_gone(run_id, handle)

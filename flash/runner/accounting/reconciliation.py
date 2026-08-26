@@ -85,7 +85,9 @@ def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
             status.cleanup_confirmed_remote, expected_remote
         ):
             status.cleanup_confirmed_remote = None
-            if _expected_remote_matches(status.realized_cost_remote, expected_remote):
+            if not _retain_remote_for_accounting(status) and _expected_remote_matches(
+                status.realized_cost_remote, expected_remote
+            ):
                 status.realized_cost_remote = None
         else:
             return False
@@ -332,7 +334,7 @@ def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bo
                 return False
         if _teardown_removal_key(status.remote) == expected_key:
             status.cleanup_confirmed_remote = dict(status.remote)
-            if status.reconciled_at is None:
+            if _retain_remote_for_accounting(status):
                 status.realized_cost_remote = dict(status.remote)
             status.remote = None
         status.updated_at = time.time()

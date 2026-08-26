@@ -1332,6 +1332,25 @@ def test_success_attempts_teardown_when_cleanup_recording_fails(
         assert persisted.realized_cost_remote is None
 
 
+def test_new_provider_handle_replaces_retained_accounting_identity(orch):
+    from flash.runner.supervise.seed_submission import _build_context
+
+    spec = _spec(run_id="replacement-handle", type="H100")
+    status = _seed_status(orch, spec)
+    prior = _runpod_handle("ep-prior", "job-prior", attempt=0)
+    status.realized_cost_remote = prior
+    runner_state._save_status(status)
+    ctx = _build_context(spec, spec.seed, io.StringIO(), None, _SOURCE_SNAPSHOT, 1)
+    ctx.current_attempt = 1
+    ctx.current_gpu = {"provider": "runpod", "name": "H100", "count": 2}
+
+    ctx.on_handle(_runpod_handle("ep-current", "job-current", attempt=1))
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.remote["endpoint_id"] == "ep-current"
+    assert persisted.realized_cost_remote is None
+
+
 def test_ordered_pin_stops_once_the_class_it_would_reuse_has_refused_twice(orch, monkeypatch):
     """A fixed multi-class market stops when the projected class refuses twice."""
     from flash.providers.core import allocator

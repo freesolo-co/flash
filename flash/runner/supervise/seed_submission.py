@@ -86,6 +86,7 @@ class _SubmitContext:
                 self.spec.run_id,
                 "running",
                 remote=persisted_handle,
+                realized_cost_remote=None,
                 lifecycle_started_attempt=canonical_handle["attempt"],
             ):
                 return

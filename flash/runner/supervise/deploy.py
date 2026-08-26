@@ -748,7 +748,9 @@ def cancel_run(run_id: str) -> RunStatus:
         # teardown clears the active handle before cancellation pricing. successful work may already
         # have moved that exact rented basis into the retained private accounting identity.
         rented_basis = (
-            status.remote or status.realized_cost_remote or status.cleanup_confirmed_remote
+            status.remote
+            or getattr(status, "realized_cost_remote", None)
+            or getattr(status, "cleanup_confirmed_remote", None)
         )
         rented_remote = dict(rented_basis) if isinstance(rented_basis, dict) else None
 
