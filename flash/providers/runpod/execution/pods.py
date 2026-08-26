@@ -15,7 +15,6 @@ from flash.providers._lifecycle.instances.instance import (
     build_payload as build_instance_payload,
 )
 from flash.providers._lifecycle.instances.poll import (
-    FIRST_LIVENESS_S,
     LOAD_TIMEOUT_S,
     SETUP_GRACE_S,
     STALL_AFTER_S,
@@ -503,7 +502,7 @@ def poll_runpod_pod(
     interval_s: float = 15.0,
     setup_grace_s: float = SETUP_GRACE_S,
     stall_after_s: float = STALL_AFTER_S,
-    first_liveness_s: float = FIRST_LIVENESS_S,
+    first_liveness_s: float | None = None,
     deadline_at: float | None = None,
 ) -> PollResult:
     if handle.pending:
@@ -582,13 +581,14 @@ def poll_runpod_pod(
         stamp_cost_and_notes=stamp_cost_and_notes,
         failure_detail=failure_detail,
         load_timeout_detail=lambda status, elapsed: (
-            f"Pod stuck in '{status}' for {int(elapsed)}s (never became running)"
+            f"Pod desired status remained '{status}' for {int(elapsed)}s without worker startup"
         ),
         first_liveness_detail=lambda elapsed, limit: (
-            f"no worker heartbeat for {int(elapsed)}s after Pod became running "
-            f"(worker never started; limit {int(limit)}s)"
+            f"no worker heartbeat for {int(elapsed)}s while RunPod desired status was RUNNING "
+            f"(worker startup unconfirmed; limit {int(limit)}s)"
         ),
     )
+    effective_first_liveness_s = setup_grace_s if first_liveness_s is None else first_liveness_s
     return poll_instance_job(
         adapter,
         log=log,
@@ -596,7 +596,7 @@ def poll_runpod_pod(
         heartbeat_reader=heartbeat_reader,
         setup_grace_s=setup_grace_s,
         stall_after_s=stall_after_s,
-        first_liveness_s=first_liveness_s,
+        first_liveness_s=effective_first_liveness_s,
         load_timeout_s=LOAD_TIMEOUT_S,
         **deadline_kwargs(poll_instance_job, absolute_deadline),
     )

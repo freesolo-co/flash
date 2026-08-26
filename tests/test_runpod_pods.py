@@ -1447,6 +1447,81 @@ def test_poll_uses_pod_state_and_shared_instance_kernel(monkeypatch):
     assert captured["adapter"].early_liveness_alive() is False
 
 
+@pytest.mark.parametrize(
+    ("poll_kwargs", "expected_first_liveness_s"),
+    [
+        ({}, pods.SETUP_GRACE_S),
+        ({"setup_grace_s": 4321.0}, 4321.0),
+        ({"first_liveness_s": 777.0}, 777.0),
+    ],
+)
+def test_poll_forwards_runpod_first_liveness_policy(
+    monkeypatch, poll_kwargs, expected_first_liveness_s
+):
+    captured = {}
+    monkeypatch.setattr(pods, "_make_hf_file_reader", lambda *args, **kwargs: lambda **kw: None)
+
+    def fake_poll(adapter, **kwargs):
+        captured["adapter"] = adapter
+        captured["kwargs"] = kwargs
+        return PollResult(False, failure="stalled", detail="test")
+
+    monkeypatch.setattr(pods, "poll_instance_job", fake_poll)
+    pods.poll_runpod_pod(
+        _handle(exact=True),
+        _spec(count=2),
+        0,
+        heartbeat_reader=lambda **kwargs: None,
+        **poll_kwargs,
+    )
+
+    assert captured["kwargs"]["first_liveness_s"] == expected_first_liveness_s
+    detail = captured["adapter"].first_liveness_detail(932.0, expected_first_liveness_s)
+    assert "desired status was RUNNING" in detail
+    assert "became running" not in detail
+
+
+def test_poll_no_heartbeat_at_932_seconds_uses_setup_backstop(monkeypatch):
+    import flash.providers._lifecycle.instances.poll_instance as instance_poll
+
+    started_ts = 10_000.0
+    now = {"value": started_ts + 932.0}
+    forced_heartbeat_reads = []
+    handle = replace(_handle(exact=True), started_ts=started_ts)
+
+    monkeypatch.setattr(instance_poll.time, "time", lambda: now["value"])
+    monkeypatch.setattr(
+        instance_poll.time,
+        "sleep",
+        lambda seconds: now.__setitem__("value", now["value"] + seconds),
+    )
+    monkeypatch.setattr(pods, "_make_hf_file_reader", lambda *args, **kwargs: lambda **kw: None)
+    monkeypatch.setattr(
+        pod_api,
+        "get_pod_for_fingerprint",
+        lambda *args, **kwargs: _pod(pod_id=handle.pod_id, status="RUNNING"),
+    )
+
+    def heartbeat_reader(*, force=False, **kwargs):
+        if force:
+            forced_heartbeat_reads.append(now["value"])
+
+    result = pods.poll_runpod_pod(
+        handle,
+        _spec(count=2),
+        0,
+        interval_s=100.0,
+        heartbeat_reader=heartbeat_reader,
+    )
+
+    assert result.failure == "stalled"
+    assert "setup (pre-training)" in result.detail
+    assert "limit 3000s" in result.detail
+    assert "worker startup unconfirmed" not in result.detail
+    assert forced_heartbeat_reads
+    assert min(forced_heartbeat_reads) >= started_ts + pods.SETUP_GRACE_S
+
+
 @pytest.mark.parametrize("child_returncode", [0, 7])
 def test_launcher_invokes_child_once_and_parks_after_exit(child_returncode):
     path = Path(__file__).parents[1] / "docker" / "runpod_pod_launcher.py"
