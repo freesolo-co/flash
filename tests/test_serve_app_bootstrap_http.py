@@ -37,7 +37,7 @@ from flash.serve.runtime import (
     StreamFinished,
     StreamReady,
 )
-from tests.test_serve_app_manifest import _spec_and_inputs
+from tests.test_serve_app_manifest import _profile_spec_and_inputs, _spec_and_inputs
 
 AUTH_TOKEN = "inference-token-sentinel"
 
@@ -179,6 +179,34 @@ def test_engine_config_loads_served_checkpoint_not_logical_provenance() -> None:
     assert config.effective_served_model == manifest.engine.served_model
     assert config.model != manifest.logical_base_model
     assert config.model_revision == manifest.engine.model_revision
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"],
+)
+def test_profile_fields_reach_the_runtime_engine_config(model_id: str) -> None:
+    manifest = build_serving_manifest(*_profile_spec_and_inputs(model_id))
+
+    config = engine_config_from_manifest(manifest)
+
+    assert config.model == manifest.engine.served_model
+    assert config.model_revision == manifest.engine.model_revision
+    assert config.tokenizer_model == manifest.engine.tokenizer_model
+    assert config.tokenizer_revision == manifest.engine.tokenizer_revision
+    if model_id == "Qwen/Qwen3.8-27B":
+        assert config.model_revision != config.tokenizer_revision
+    assert config.engine_args["max_model_len"] == manifest.engine.max_model_len
+    assert config.engine_args["max_num_seqs"] == manifest.engine.max_num_seqs
+    assert config.max_loras == manifest.engine.max_loras
+    assert config.max_cpu_loras == manifest.engine.max_cpu_loras
+    assert config.max_lora_rank == manifest.engine.max_lora_rank
+    assert config.image_limit == manifest.engine.image_limit
+    assert config.enable_tower_connector_lora is manifest.engine.enable_tower_connector_lora
+    if manifest.engine.max_num_batched_tokens is None:
+        assert "max_num_batched_tokens" not in config.engine_args
+    else:
+        assert config.engine_args["max_num_batched_tokens"] == 4096
 
 
 def test_unset_engine_knobs_are_omitted_rather_than_passed_as_none() -> None:

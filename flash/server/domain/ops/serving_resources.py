@@ -1,7 +1,7 @@
 """credential-free serving deployment composition and preview."""
 
 from flash.serve.app import ExecutionInputs, build_serving_manifest
-from flash.serve.control import DeploymentRequest, plan_deployment
+from flash.serve.control import DeploymentRequest, ModalPlacement, RunPodPlacement, plan_deployment
 from flash.serve.provisioning import DeploymentBundle, ServingImage
 
 
@@ -18,16 +18,44 @@ def resolve_deployment_bundle(
 
 
 def dry_run_deployment(bundle: DeploymentBundle) -> dict[str, object]:
-    """return a credential-free identity and capacity preview."""
+    """return a credential-free identity, runtime, and provider-plan preview."""
 
-    return {
+    engine = bundle.spec.engine
+    placement = bundle.spec.placement
+    preview: dict[str, object] = {
         "deployment_id": bundle.spec.deployment_id,
         "generation": bundle.spec.generation,
         "provider": bundle.spec.provider,
         "spec_id": bundle.spec.spec_id,
         "manifest_id": bundle.manifest.manifest_id,
-        "engine_id": bundle.spec.engine.engine_id,
+        "engine_id": engine.engine_id,
         "image_digest": bundle.image.digest,
+        "served_model": engine.served_model,
+        "model_revision": engine.model_revision,
+        "tokenizer_model": engine.tokenizer_model,
+        "tokenizer_revision": engine.tokenizer_revision,
+        "runtime_family": engine.runtime_family,
+        "provider_gpu": placement.gpu
+        if type(placement) is ModalPlacement
+        else placement.gpu_type_id,
+        "provider_gpu_count": placement.gpu_count,
+        "max_model_len": engine.max_model_len,
+        "max_num_seqs": engine.max_num_seqs,
+        "max_num_batched_tokens": engine.max_num_batched_tokens,
+        "max_loras": engine.max_loras,
+        "max_cpu_loras": engine.max_cpu_loras,
+        "max_lora_rank": engine.max_lora_rank,
+        "modality": engine.modality,
+        "image_limit": engine.image_limit,
         "adapter_count": len(bundle.spec.adapters),
-        "adapter_capacity": bundle.spec.engine.adapter_capacity,
+        "adapter_capacity": engine.adapter_capacity,
     }
+    if type(placement) is RunPodPlacement:
+        preview.update(
+            {
+                "runpod_data_center": placement.data_center_id,
+                "runpod_container_disk_gb": placement.container_disk_gb,
+                "runpod_volume_size_gb": placement.volume_size_gb,
+            }
+        )
+    return preview

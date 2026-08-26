@@ -13,6 +13,7 @@ from dataclasses import replace
 import pytest
 
 from flash.serve.app.manifest import build_serving_manifest
+from flash.serve.contract.profiles import get_profile, placement_for, supported_models
 from flash.serve.control import (
     DeploymentSpec,
     RunPodCredentials,
@@ -42,6 +43,7 @@ from flash.serve.provisioning.runpod.probe import RunPodEndpointProbe, _provenan
 from flash.serve.provisioning.runpod.protocol import (
     CREATE_SECRET,
     DELETE_SECRET,
+    NETWORK_VOLUME_MOUNT,
     OBSERVE_ACCOUNT,
     PROXY_PORT_SPEC,
     parse_deleted_secret,
@@ -63,7 +65,7 @@ from flash.serve.provisioning.runpod.transport import (
     StdlibRunPodTransport,
     build_no_redirect_opener,
 )
-from tests.test_serve_app_manifest import _spec_and_inputs
+from tests.test_serve_app_manifest import _profile_spec_and_inputs, _spec_and_inputs
 
 PROVIDER_SECRET = "provider-api-secret-sentinel"
 INFERENCE_SECRET = "inference-secret-sentinel"
@@ -98,6 +100,63 @@ def _bundle() -> DeploymentBundle:
             digest=spec.engine.image_digest,
         ),
     )
+
+
+@pytest.mark.parametrize("model_id", supported_models())
+def test_profile_runpod_plan_preserves_exact_engine_storage_and_image(model_id: str) -> None:
+    spec, inputs = _profile_spec_and_inputs(model_id)
+    profile = get_profile(model_id)
+    placement = placement_for(
+        profile,
+        "runpod",
+        account_id="account-01",
+        data_center_id="US-KS-2",
+    )
+    runpod_spec = replace(spec, provider="runpod", placement=placement)
+    manifest = build_serving_manifest(runpod_spec, inputs)
+    bundle = DeploymentBundle(
+        spec=runpod_spec,
+        manifest=manifest,
+        image=ServingImage(
+            reference=f"registry.example/flash/serve@{runpod_spec.engine.image_digest}",
+            digest=runpod_spec.engine.image_digest,
+        ),
+    )
+
+    plan = build_runpod_create_plan(bundle)
+
+    assert plan.placement.gpu_type_id == profile.runpod_gpu.gpu_type_id
+    assert plan.placement.gpu_count == profile.tensor_parallel_size
+    assert plan.placement.container_disk_gb == profile.runpod_gpu.container_disk_gb
+    assert plan.placement.volume_size_gb == profile.runpod_gpu.volume_size_gb
+    assert plan.bundle.manifest == manifest
+    assert plan.bundle.image.reference.endswith(f"@{bundle.image.digest}")
+    assert plan.encoded_manifest
+
+    volume = plan.volume_payload()
+    template = plan.template_payload(False)
+    pod = plan.pod_payload(template_id="template-01", volume_id="volume-01")
+    assert volume == {
+        "dataCenterId": "US-KS-2",
+        "name": plan.names.volume,
+        "size": profile.runpod_gpu.volume_size_gb,
+    }
+    assert template["imageName"] == bundle.image.reference
+    assert template["containerDiskInGb"] == profile.runpod_gpu.container_disk_gb
+    assert template["isServerless"] is False
+    assert template["volumeInGb"] == 0
+    assert template["volumeMountPath"] == NETWORK_VOLUME_MOUNT
+    assert pod["gpuTypeIds"] == [profile.runpod_gpu.gpu_type_id]
+    assert pod["gpuCount"] == profile.tensor_parallel_size
+    assert pod["dataCenterIds"] == ["US-KS-2"]
+    assert pod["containerDiskInGb"] == profile.runpod_gpu.container_disk_gb
+    assert pod["imageName"] == bundle.image.reference
+    assert pod["networkVolumeId"] == "volume-01"
+    assert pod["templateId"] == "template-01"
+    rendered = json.dumps((volume, template, pod), sort_keys=True)
+    assert PROVIDER_SECRET not in rendered
+    assert INFERENCE_SECRET not in rendered
+    assert ARTIFACT_SECRET not in rendered
 
 
 def _oversized_bundle() -> DeploymentBundle:

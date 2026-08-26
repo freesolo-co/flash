@@ -161,17 +161,16 @@ def _report_identity(bundle) -> None:
         return
 
 
-def _build_provider_plan(provider: str, bundle) -> None:
-    """run the provider's own plan validation without contacting it."""
+def _build_provider_plan(provider: str, bundle):
+    """return the provider's validated plan without contacting it."""
 
     if provider == "modal":
         from flash.serve.provisioning.modal.planning.plan import build_modal_create_plan
 
-        build_modal_create_plan(bundle, phase="finalized")
-        return
+        return build_modal_create_plan(bundle, phase="finalized")
     from flash.serve.provisioning.runpod.plan import build_runpod_create_plan
 
-    build_runpod_create_plan(bundle)
+    return build_runpod_create_plan(bundle)
 
 
 def _runtime_secrets():
@@ -212,21 +211,36 @@ def _deployment_bundle(args):
         account_id=getattr(args, "runpod_account", "") or "",
         data_center_id=getattr(args, "runpod_data_center", "") or "",
     )
-    base_revision = resolve_base_revision(profile.served_model)
+    logical_base_revision = resolve_base_revision(args.model)
     resolved = resolve_adapter(
         run_id=args.run,
         artifact_repo_id=args.artifact_repo,
         artifact_subfolder=args.artifact_subfolder,
         artifact_repo_type=getattr(args, "artifact_repo_type", "dataset"),
         base_model=args.model,
-        base_model_revision=resolve_base_revision(args.model),
+        base_model_revision=logical_base_revision,
         lora_rank=args.lora_rank,
         checkpoint_step=getattr(args, "checkpoint_step", None),
         thinking_default=bool(getattr(args, "thinking", False)),
     )
+    logical_base_revision = resolved.adapter.base_model_revision
+    if profile.served_model == args.model:
+        model_revision = logical_base_revision
+    elif profile.served_model_revision is not None:
+        model_revision = profile.served_model_revision
+    else:
+        model_revision = resolve_base_revision(profile.served_model)
+
+    if profile.tokenizer_model == profile.served_model:
+        tokenizer_revision = model_revision
+    elif profile.tokenizer_model == args.model:
+        tokenizer_revision = logical_base_revision
+    else:
+        tokenizer_revision = resolve_base_revision(profile.tokenizer_model)
+
     engine = profile.engine(
-        model_revision=base_revision,
-        tokenizer_revision=base_revision,
+        model_revision=model_revision,
+        tokenizer_revision=tokenizer_revision,
         image=image,
     )
     request = DeploymentRequest(
@@ -247,6 +261,10 @@ def _deployment_bundle(args):
 def cmd_serve_deploy(args) -> int:
     provider = args.provider
     try:
+        if not getattr(args, "dry_run", False):
+            from flash.serve.contract.profiles import get_profile, require_live_qualification
+
+            require_live_qualification(get_profile(args.model), provider)
         bundle = _deployment_bundle(args)
     # resolver errors subclass valueerror. the wider catch also covers validation beneath the
     # resolver and bundle construction, so bad user input stays on the normal cli error path.

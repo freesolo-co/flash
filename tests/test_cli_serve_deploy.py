@@ -398,15 +398,164 @@ def test_removed_model_is_refused_before_resolution(
     assert cmd_serve_deploy(_args(model=retired_model)) == 1
 
 
-def test_qwen38_customer_owned_deploy_is_refused_before_resolution(
+@pytest.mark.parametrize("mutation", ["missing", "extra", "drifted", "structurally_invalid"])
+def test_registry_inconsistency_fails_before_artifact_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    from dataclasses import replace
+
+    from flash.serve.contract import profiles
+
+    def _explode(**_kwargs):
+        raise AssertionError("artifact resolution ran with an inconsistent profile registry")
+
+    monkeypatch.setattr("flash.serve.deployment.resolve.resolve_adapter", _explode)
+    if mutation == "missing":
+        monkeypatch.delitem(profiles._PROFILES, "Qwen/Qwen3.8-27B")
+    elif mutation == "extra":
+        monkeypatch.setitem(
+            profiles._PROFILES,
+            "extra/model",
+            replace(get_profile(MODEL), model_id="extra/model"),
+        )
+    elif mutation == "drifted":
+        monkeypatch.setitem(
+            profiles._PROFILES,
+            MODEL,
+            replace(get_profile(MODEL), max_model_len=65536),
+        )
+    else:
+        monkeypatch.setitem(
+            profiles._PROFILES,
+            MODEL,
+            replace(get_profile(MODEL), modal_live_qualified=1),
+        )
+
+    assert cmd_serve_deploy(_args(dry_run=True)) == 1
+
+
+@pytest.mark.parametrize(
+    ("model", "provider"),
+    [
+        ("Qwen/Qwen3.5-9B", "modal"),
+        ("Qwen/Qwen3.5-9B", "runpod"),
+        ("Qwen/Qwen3.8-27B", "modal"),
+        ("Qwen/Qwen3.8-27B", "runpod"),
+        ("Qwen/Qwen3.6-35B-A3B", "modal"),
+        ("Qwen/Qwen3.6-35B-A3B", "runpod"),
+    ],
+)
+def test_every_catalog_profile_builds_a_provider_free_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    model: str,
+    provider: str,
+) -> None:
+    _stub_resolution(monkeypatch)
+
+    assert cmd_serve_deploy(_args(model=model, provider=provider, dry_run=True)) == 0
+    output = capsys.readouterr().out
+    assert "dry run: no provider was contacted" in output
+    assert "engine_id" in output
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_calls", "expected_model_revision", "expected_tokenizer_revision"),
+    [
+        (
+            "Qwen/Qwen3.5-9B",
+            ["Qwen/Qwen3.5-9B", "Freesolo-Co/Qwen3.5-9B-FP8"],
+            "b" * 40,
+            "b" * 40,
+        ),
+        (
+            "Qwen/Qwen3.8-27B",
+            ["Qwen/Qwen3.8-27B"],
+            "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+            "a" * 40,
+        ),
+        (
+            "Qwen/Qwen3.6-35B-A3B",
+            ["Qwen/Qwen3.6-35B-A3B"],
+            "a" * 40,
+            "a" * 40,
+        ),
+    ],
+)
+def test_revision_resolution_reuses_only_matching_repositories(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    expected_calls: list[str],
+    expected_model_revision: str,
+    expected_tokenizer_revision: str,
+) -> None:
+    _stub_resolution(monkeypatch)
+    calls: list[str] = []
+    revisions = {
+        "Qwen/Qwen3.5-9B": "a" * 40,
+        "Freesolo-Co/Qwen3.5-9B-FP8": "b" * 40,
+        "Qwen/Qwen3.8-27B": "a" * 40,
+        "Qwen/Qwen3.6-35B-A3B": "a" * 40,
+    }
+
+    def _resolve(model_id: str) -> str:
+        calls.append(model_id)
+        return revisions[model_id]
+
+    monkeypatch.setattr("flash.serve.deployment.resolve.resolve_base_revision", _resolve)
+    bundle = serve_deploy._deployment_bundle(_args(model=model, dry_run=True))
+
+    assert calls == expected_calls
+    assert bundle.spec.engine.model_revision == expected_model_revision
+    assert bundle.spec.engine.tokenizer_revision == expected_tokenizer_revision
+
+
+def test_tokenizer_uses_the_adapter_resolved_logical_base_revision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from dataclasses import replace
+
+    _stub_resolution(monkeypatch)
+    from flash.serve.deployment import resolve as resolver
+
+    original = resolver.resolve_adapter
+
+    def _resolve(**kwargs):
+        resolved = original(**kwargs)
+        return replace(
+            resolved,
+            adapter=replace(resolved.adapter, base_model_revision="e" * 40),
+        )
+
+    monkeypatch.setattr(resolver, "resolve_adapter", _resolve)
+    bundle = serve_deploy._deployment_bundle(_args(model="Qwen/Qwen3.8-27B", dry_run=True))
+
+    assert bundle.manifest.logical_base_revision == "e" * 40
+    assert bundle.spec.engine.model_revision == "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
+    assert bundle.spec.engine.tokenizer_revision == "e" * 40
+
+
+@pytest.mark.parametrize(
+    ("model", "provider"),
+    [
+        ("Qwen/Qwen3.8-27B", "modal"),
+        ("Qwen/Qwen3.8-27B", "runpod"),
+        ("Qwen/Qwen3.6-35B-A3B", "modal"),
+        ("Qwen/Qwen3.6-35B-A3B", "runpod"),
+    ],
+)
+def test_unqualified_profile_fails_before_resolution_on_real_deploy(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    provider: str,
+) -> None:
     def _explode(**_kwargs):
-        raise AssertionError("resolution ran for a model without a customer-owned profile")
+        raise AssertionError("resolution ran before live qualification")
 
     monkeypatch.setattr("flash.serve.deployment.resolve.resolve_adapter", _explode)
 
-    assert cmd_serve_deploy(_args(model="Qwen/Qwen3.8-27B")) == 1
+    assert cmd_serve_deploy(_args(model=model, provider=provider)) == 1
 
 
 def test_runpod_provisioning_warns_that_the_pod_may_be_live_and_billing(

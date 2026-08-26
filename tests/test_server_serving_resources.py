@@ -11,14 +11,14 @@ from pathlib import Path
 import pytest
 
 from flash.serve.app import ManifestError
+from flash.serve.contract.profiles import get_profile, placement_for, supported_models
 from flash.serve.control import DeploymentRequest, DeploymentSpec, ModalPlacement
 from flash.serve.provisioning import ServingImage, serving_resource_names
 from flash.server.domain.ops.serving_resources import dry_run_deployment, resolve_deployment_bundle
-from tests.test_serve_app_manifest import IMAGE_DIGEST, _spec_and_inputs
+from tests.test_serve_app_manifest import IMAGE_DIGEST, _profile_spec_and_inputs, _spec_and_inputs
 
 ROOT = Path(__file__).resolve().parents[1]
 PROVIDER_SECRET_SENTINEL = "provider-secret-sentinel"
-RUNTIME_SECRET_SENTINEL = "runtime-secret-sentinel"
 OTHER_IMAGE_DIGEST = "sha256:" + "9" * 64
 
 
@@ -77,33 +77,67 @@ def test_resolve_reuses_existing_image_binding_validators() -> None:
         resolve_deployment_bundle(request, execution_inputs, _image(OTHER_IMAGE_DIGEST))
 
 
-def test_dry_run_preview_has_exact_keys_and_authoritative_values() -> None:
-    spec, execution_inputs = _spec_and_inputs()
+@pytest.mark.parametrize("model_id", supported_models())
+@pytest.mark.parametrize("provider", ["modal", "runpod"])
+def test_dry_run_preview_has_exact_safe_plan_facts(model_id: str, provider: str) -> None:
+    spec, execution_inputs = _profile_spec_and_inputs(model_id)
+    profile = get_profile(model_id)
+    if provider == "modal":
+        placement = placement_for(
+            profile,
+            provider,
+            workspace_name="workspace",
+            environment="dev",
+            region="us-east",
+        )
+    else:
+        placement = placement_for(
+            profile,
+            provider,
+            account_id="account",
+            data_center_id="US-KS-2",
+        )
+    spec = replace(spec, provider=provider, placement=placement)
     bundle = resolve_deployment_bundle(_request(spec), execution_inputs, _image())
 
     preview = dry_run_deployment(bundle)
 
-    assert set(preview) == {
-        "deployment_id",
-        "generation",
-        "provider",
-        "spec_id",
-        "manifest_id",
-        "engine_id",
-        "image_digest",
-        "adapter_count",
-        "adapter_capacity",
-    }
     assert preview == {
         "deployment_id": bundle.spec.deployment_id,
         "generation": bundle.spec.generation,
-        "provider": bundle.spec.provider,
+        "provider": provider,
         "spec_id": bundle.spec.spec_id,
         "manifest_id": bundle.manifest.manifest_id,
         "engine_id": bundle.spec.engine.engine_id,
         "image_digest": bundle.image.digest,
+        "served_model": spec.engine.served_model,
+        "model_revision": spec.engine.model_revision,
+        "tokenizer_model": spec.engine.tokenizer_model,
+        "tokenizer_revision": spec.engine.tokenizer_revision,
+        "runtime_family": spec.engine.runtime_family,
+        "provider_gpu": profile.modal_gpu_request
+        if provider == "modal"
+        else profile.runpod_gpu.gpu_type_id,
+        "provider_gpu_count": profile.tensor_parallel_size,
+        "max_model_len": profile.max_model_len,
+        "max_num_seqs": profile.max_num_seqs,
+        "max_num_batched_tokens": profile.max_num_batched_tokens,
+        "max_loras": profile.max_loras,
+        "max_cpu_loras": profile.max_cpu_loras,
+        "max_lora_rank": profile.max_lora_rank,
+        "modality": profile.modality,
+        "image_limit": profile.image_limit,
         "adapter_count": len(bundle.spec.adapters),
-        "adapter_capacity": bundle.spec.engine.adapter_capacity,
+        "adapter_capacity": spec.engine.adapter_capacity,
+        **(
+            {
+                "runpod_data_center": "US-KS-2",
+                "runpod_container_disk_gb": profile.runpod_gpu.container_disk_gb,
+                "runpod_volume_size_gb": profile.runpod_gpu.volume_size_gb,
+            }
+            if provider == "runpod"
+            else {}
+        ),
     }
 
 
@@ -115,7 +149,7 @@ def test_json_preview_excludes_nonallowlisted_bundle_data() -> None:
         gpu="placement-gpu-sentinel",
         region="placement-region-sentinel",
     )
-    engine = replace(spec.engine, served_model=RUNTIME_SECRET_SENTINEL)
+    engine = spec.engine
     request = DeploymentRequest(
         deployment_id=spec.deployment_id,
         generation=spec.generation,
@@ -137,14 +171,12 @@ def test_json_preview_excludes_nonallowlisted_bundle_data() -> None:
 
     forbidden_values = {
         PROVIDER_SECRET_SENTINEL,
-        RUNTIME_SECRET_SENTINEL,
         image.reference,
         bundle.spec.adapters[0].artifact_repo_id,
         bundle.spec.adapters[0].artifact_subfolder,
         bundle.spec.adapters[0].adapter_revision,
         bundle.manifest.canonical_json(),
         placement.environment,
-        placement.gpu,
         placement.region,
         *tuple(getattr(resource_names, name) for name in resource_names.__slots__),
     }
@@ -153,7 +185,6 @@ def test_json_preview_excludes_nonallowlisted_bundle_data() -> None:
         "placement",
         "workspace_name",
         "environment",
-        "gpu",
         "region",
         "image_reference",
         "reference",

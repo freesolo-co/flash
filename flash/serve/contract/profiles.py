@@ -72,9 +72,15 @@ class RunPodGpu:
 # serving fine. the pod proxy is the signal that discriminates -- a live pod answers
 # `https://{podId}-8000.proxy.runpod.net/` with 200 and an exited one with 404.
 _RUNPOD_L40S = RunPodGpu(gpu_type_id="NVIDIA L40S", container_disk_gb=100, volume_size_gb=120)
-# 24 GB card, so the VOLUME (weights and adapters) is sized down relative to the 9B set. the
-# container disk is NOT sized down: it holds the same image on either card. both ids are the exact
-# `gpuTypes.id` strings the runpod api returns ("NVIDIA L4", "NVIDIA L40S"), not display names.
+# these gpu ids already exist in the runpod-backed source, but the storage values are deliberately
+# oversized construction values, not measured claims. the new profiles remain blocked from real
+# deployment until live qualification replaces these values and marks each provider qualified.
+_PROVISIONAL_RUNPOD_H100 = RunPodGpu(
+    gpu_type_id="NVIDIA H100 80GB HBM3", container_disk_gb=150, volume_size_gb=250
+)
+_PROVISIONAL_RUNPOD_H200 = RunPodGpu(
+    gpu_type_id="NVIDIA H200", container_disk_gb=150, volume_size_gb=300
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +90,7 @@ class ServingProfile:
     model_id: str
     modality: Modality
     served_model: str
+    served_model_revision: str | None
     tokenizer_model: str
     dtype: str
     quantization: str | None
@@ -104,7 +111,10 @@ class ServingProfile:
     tokenizer_kwargs: Mapping[str, Any]
     processor_kwargs: Mapping[str, Any]
     modal_gpu: str
+    modal_gpu_request: str
     runpod_gpu: RunPodGpu
+    modal_live_qualified: bool
+    runpod_live_qualified: bool
     tensor_parallel_size: int = 1
 
     def __post_init__(self) -> None:
@@ -171,7 +181,7 @@ class ServingProfile:
         return ModalPlacement(
             workspace_name=workspace_name,
             environment=environment,
-            gpu=self.modal_gpu,
+            gpu=self.modal_gpu_request,
             region=region,
             gpu_count=self.tensor_parallel_size,
             web_suffix=web_suffix,
@@ -190,30 +200,17 @@ class ServingProfile:
         )
 
 
-# only models whose serving shape is validated on BOTH supported providers appear here. a catalog
-# entry alone is not enough: `serving.gpu` names a modal card, and the runpod id, container disk,
-# and volume size have no catalog source. an unlisted model raises rather than defaulting, because
-# a guessed placement is a real gpu rental in the customer's account.
+# every public catalog model has an explicit immutable profile. provider qualification remains a
+# separate fact: provisional placement data may build an offline plan, but cannot allocate a gpu.
 _PROFILES: dict[str, ServingProfile] = {
     "Qwen/Qwen3.5-9B": ServingProfile(
         model_id="Qwen/Qwen3.5-9B",
         modality="multimodal",
-        # the engine loads the freesolo-owned fp8 checkpoint, while adapters declare the base model
-        # they trained against. catalog `serving.serve_model_id` is the authority for that split.
         served_model="Freesolo-Co/Qwen3.5-9B-FP8",
+        served_model_revision=None,
         tokenizer_model="Freesolo-Co/Qwen3.5-9B-FP8",
         dtype="bfloat16",
-        # none, not "fp8": these checkpoints declare quant_method "compressed-tensors" in
-        # their own config, and vllm rejects a `quantization` argument that disagrees with
-        # the checkpoint rather than treating it as a hint. the checkpoint is the authority,
-        # so nothing is forced here.
         quantization=None,
-        # fp8, matching hosted serving's KV_CACHE_DTYPE for every base. unlike `quantization` above
-        # this is the engine's own cache, not a property of the checkpoint, so nothing rejects it.
-        # it halves KV bytes and is part of the shape the 32k/rank-128/16-hot-lora numbers below
-        # were validated against: leaving it unset lets vllm default to auto, so the same card
-        # holds half the cache blocks and preempts under load at the context this profile
-        # advertises. the customer's gpu is the same one the sweep measured.
         kv_cache_dtype="fp8",
         max_model_len=32768,
         max_num_seqs=8,
@@ -223,47 +220,181 @@ _PROFILES: dict[str, ServingProfile] = {
         max_lora_rank=128,
         gpu_memory_utilization=0.90,
         cpu_offload_gb=0.0,
-        # multimodal, not text: both served checkpoints are Qwen3_5ForConditionalGeneration with
-        # a vision_config, and flash trains image loras on both (catalog supports_image_training is
-        # true for each). declaring text here loaded no processor and passed no limit_mm_per_prompt,
-        # so a customer who trained an image adapter got an engine that rejected every image request.
-        #
-        # 4 matches _MAX_IMAGES, the ceiling the runtime already clamps to, so the engine advertises
-        # exactly what it will accept rather than a larger number it would silently trim.
         image_limit=4,
         mm_processor_cache_gb=0.0,
-        # true, because flash's own image adapters contain vision-tower weights. training targets
-        # "all-linear", which peft resolves to include model.visual.blocks.*.attn.{qkv,proj} and
-        # .mlp.linear_fc{1,2}; real image runs publish 196 such tensors out of 692. with this false
-        # vllm wraps no visual.* module, so those suffixes are missing from expected_lora_modules
-        # and from_local_checkpoint RAISES on them ("expected target modules in ... but received").
-        # a customer who trained on images would get a deployment that refuses to load the adapter.
         enable_tower_connector_lora=True,
-        # qwen3, as hosted serving configures for every Qwen3.5 base. these adapters carry a
-        # `thinking_default`, and the endpoint accepts per-request structured outputs; with no
-        # parser `_structured_state` raises on that exact combination, so a customer deploying a
-        # thinking adapter got a 400 on every structured-output request from a healthy engine.
         reasoning_parser="qwen3",
         engine_args={},
         tokenizer_kwargs={},
         processor_kwargs={},
         modal_gpu="L40S",
+        modal_gpu_request="L40S",
         runpod_gpu=_RUNPOD_L40S,
+        modal_live_qualified=True,
+        runpod_live_qualified=True,
+    ),
+    "Qwen/Qwen3.8-27B": ServingProfile(
+        model_id="Qwen/Qwen3.8-27B",
+        modality="multimodal",
+        served_model="Qwen/Qwen3.8-27B-FP8",
+        served_model_revision="017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+        tokenizer_model="Qwen/Qwen3.8-27B",
+        dtype="bfloat16",
+        quantization=None,
+        kv_cache_dtype="fp8",
+        max_model_len=32768,
+        max_num_seqs=8,
+        max_num_batched_tokens=None,
+        max_loras=16,
+        max_cpu_loras=16,
+        max_lora_rank=64,
+        gpu_memory_utilization=0.90,
+        cpu_offload_gb=0.0,
+        image_limit=4,
+        mm_processor_cache_gb=0.0,
+        enable_tower_connector_lora=True,
+        reasoning_parser="qwen3",
+        engine_args={"enforce_eager": False},
+        tokenizer_kwargs={},
+        processor_kwargs={},
+        modal_gpu="H100",
+        # modal's trailing `!` forbids automatic h200 substitution for an h100 request.
+        modal_gpu_request="H100!",
+        runpod_gpu=_PROVISIONAL_RUNPOD_H100,
+        modal_live_qualified=False,
+        runpod_live_qualified=False,
+    ),
+    "Qwen/Qwen3.6-35B-A3B": ServingProfile(
+        model_id="Qwen/Qwen3.6-35B-A3B",
+        modality="multimodal",
+        served_model="Qwen/Qwen3.6-35B-A3B",
+        served_model_revision=None,
+        tokenizer_model="Qwen/Qwen3.6-35B-A3B",
+        dtype="bfloat16",
+        quantization=None,
+        kv_cache_dtype="fp8",
+        max_model_len=32768,
+        max_num_seqs=8,
+        max_num_batched_tokens=4096,
+        max_loras=6,
+        max_cpu_loras=6,
+        max_lora_rank=64,
+        gpu_memory_utilization=0.90,
+        cpu_offload_gb=0.0,
+        image_limit=4,
+        mm_processor_cache_gb=0.0,
+        enable_tower_connector_lora=True,
+        reasoning_parser="qwen3",
+        engine_args={"enforce_eager": False},
+        tokenizer_kwargs={},
+        processor_kwargs={},
+        modal_gpu="H200",
+        modal_gpu_request="H200",
+        runpod_gpu=_PROVISIONAL_RUNPOD_H200,
+        modal_live_qualified=False,
+        runpod_live_qualified=False,
     ),
 }
 
 _CATALOG_CHECKED_FIELDS = (
     "max_model_len",
     "max_num_seqs",
+    "max_num_batched_tokens",
     "max_loras",
+    "max_cpu_loras",
     "max_lora_rank",
+    "tensor_parallel_size",
     "gpu_memory_utilization",
+    "image_limit",
 )
 
 
-def supported_models() -> tuple[str, ...]:
-    """return every model id with a complete profile, in catalog order."""
+def _public_catalog_models() -> frozenset[str]:
+    from flash.core.catalog import MODELS
 
+    return frozenset(MODELS)
+
+
+def _require_profile_string(value: object, name: str) -> None:
+    if type(value) is not str or not value or value != value.strip():
+        raise ProfileError(f"{name} must be a nonempty unpadded string")
+
+
+def _require_profile_structure(profile: ServingProfile) -> None:
+    """validate registry-only facts before any artifact or provider access."""
+
+    for name in (
+        "model_id",
+        "served_model",
+        "tokenizer_model",
+        "dtype",
+        "modal_gpu",
+        "modal_gpu_request",
+    ):
+        _require_profile_string(getattr(profile, name), f"{profile.model_id} {name}")
+    if profile.modal_gpu_request not in {profile.modal_gpu, f"{profile.modal_gpu}!"}:
+        raise ProfileError(
+            f"{profile.model_id} modal_gpu_request must match modal_gpu with an optional exact pin"
+        )
+    if type(profile.runpod_gpu) is not RunPodGpu:
+        raise ProfileError(f"{profile.model_id} runpod_gpu must use the exact RunPodGpu type")
+    _require_profile_string(
+        profile.runpod_gpu.gpu_type_id,
+        f"{profile.model_id} runpod gpu_type_id",
+    )
+    for name in ("container_disk_gb", "volume_size_gb"):
+        value = getattr(profile.runpod_gpu, name)
+        if type(value) is not int or value <= 0:
+            raise ProfileError(f"{profile.model_id} runpod {name} must be a positive integer")
+    for name in ("modal_live_qualified", "runpod_live_qualified"):
+        if type(getattr(profile, name)) is not bool:
+            raise ProfileError(f"{profile.model_id} {name} must be an exact bool")
+    revision = profile.served_model_revision
+    if revision is not None and (
+        type(revision) is not str
+        or len(revision) != 40
+        or any(character not in "0123456789abcdef" for character in revision)
+    ):
+        raise ProfileError(f"{profile.model_id} served_model_revision is not an immutable commit")
+    try:
+        profile.engine(
+            model_revision=revision or "0" * 40,
+            tokenizer_revision="1" * 40,
+            image=ServingImage(
+                reference="registry.example/flash/profile-validation@sha256:" + "2" * 64,
+                digest="sha256:" + "2" * 64,
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ProfileError(f"{profile.model_id} has invalid engine inputs: {exc}") from exc
+
+
+def _require_registry_complete() -> None:
+    expected = _public_catalog_models()
+    actual = frozenset(_PROFILES)
+    if actual != expected:
+        missing = ", ".join(sorted(expected - actual)) or "none"
+        extra = ", ".join(sorted(actual - expected)) or "none"
+        raise ProfileError(
+            f"customer-owned serving profile registry disagrees with the public catalog: "
+            f"missing={missing}; extra={extra}"
+        )
+    for key, profile in _PROFILES.items():
+        if type(profile) is not ServingProfile:
+            raise ProfileError(f"customer-owned serving profile {key!r} must use ServingProfile")
+        if key != profile.model_id:
+            raise ProfileError(
+                f"customer-owned serving profile key {key!r} disagrees with "
+                f"profile.model_id={profile.model_id!r}"
+            )
+        _require_profile_structure(profile)
+        _require_catalog_agreement(profile)
+
+
+def supported_models() -> tuple[str, ...]:
+    """return every public catalog model after validating the whole registry."""
+
+    _require_registry_complete()
     return tuple(sorted(_PROFILES))
 
 
@@ -275,9 +406,10 @@ def get_profile(model_id: str) -> ServingProfile:
     context or a higher lora rank than the catalog advertises would deploy a shape no gate checked.
     """
 
+    _require_registry_complete()
     profile = _PROFILES.get(model_id)
     if profile is None:
-        known = ", ".join(supported_models()) or "none"
+        known = ", ".join(sorted(_PROFILES)) or "none"
         raise ProfileError(
             f"no customer-owned serving profile for {model_id!r}. supported: {known}"
         )
@@ -295,6 +427,9 @@ def _require_catalog_agreement(profile: ServingProfile) -> None:
     for name in _CATALOG_CHECKED_FIELDS:
         expected = getattr(serving, name)
         actual = getattr(profile, name)
+        if name == "max_num_batched_tokens":
+            expected = expected or None
+            actual = actual or None
         if expected != actual:
             raise ProfileError(
                 f"{profile.model_id} serving profile {name}={actual!r} disagrees with the "
@@ -309,6 +444,22 @@ def _require_catalog_agreement(profile: ServingProfile) -> None:
                 f"{profile.model_id} serving profile {label}={actual!r} disagrees with the "
                 f"catalog capacity {expected!r}"
             )
+
+
+def require_live_qualification(profile: ServingProfile, provider: Provider) -> None:
+    """reject provider allocation for a profile whose exact live shape is still provisional."""
+
+    if provider == "modal":
+        qualified = profile.modal_live_qualified
+    elif provider == "runpod":
+        qualified = profile.runpod_live_qualified
+    else:
+        raise ProfileError("provider must be modal or runpod")
+    if not qualified:
+        raise ProfileError(
+            f"{profile.model_id} {provider} serving profile is pending exact live qualification; "
+            "offline dry-run construction is available, but provider allocation is disabled"
+        )
 
 
 def placement_for(

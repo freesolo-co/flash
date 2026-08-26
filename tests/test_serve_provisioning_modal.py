@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from flash.serve.app.manifest import build_serving_manifest
+from flash.serve.contract.profiles import get_profile, placement_for
 from flash.serve.control import (
     DeploymentSpec,
     ModalCredentials,
@@ -58,7 +59,7 @@ from flash.serve.provisioning.modal.readiness_checks.probe import (
     _provenance_matches,
 )
 from flash.serve.provisioning.modal.readiness_checks.readiness import ExpectedResources
-from tests.test_serve_app_manifest import _spec_and_inputs
+from tests.test_serve_app_manifest import _profile_spec_and_inputs, _spec_and_inputs
 
 PROVIDER_ID = "provider-id-sentinel"
 PROVIDER_SECRET = "provider-secret-sentinel"
@@ -106,6 +107,47 @@ def _bundle(
             digest=spec.engine.image_digest,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected_gpu_request"),
+    [
+        ("Qwen/Qwen3.5-9B", "L40S:1"),
+        ("Qwen/Qwen3.8-27B", "H100!:1"),
+        ("Qwen/Qwen3.6-35B-A3B", "H200:1"),
+    ],
+)
+def test_profile_modal_plan_preserves_exact_engine_and_placement(
+    model_id: str, expected_gpu_request: str
+) -> None:
+    spec, inputs = _profile_spec_and_inputs(model_id)
+    profile = get_profile(model_id)
+    placement = placement_for(
+        profile,
+        "modal",
+        workspace_name="workspace",
+        environment="main",
+        region="us-east",
+    )
+    modal_spec = replace(spec, provider="modal", placement=placement)
+    manifest = build_serving_manifest(modal_spec, inputs)
+    bundle = DeploymentBundle(
+        spec=modal_spec,
+        manifest=manifest,
+        image=ServingImage(
+            reference=f"registry.example/flash/serve@{modal_spec.engine.image_digest}",
+            digest=modal_spec.engine.image_digest,
+        ),
+    )
+
+    plan = build_modal_create_plan(bundle, phase="finalized")
+
+    assert plan.placement.gpu == profile.modal_gpu_request
+    assert plan.placement.gpu_count == profile.tensor_parallel_size
+    assert plan.gpu_request == expected_gpu_request
+    assert plan.bundle.manifest == manifest
+    assert plan.bundle.image.reference.endswith(f"@{bundle.image.digest}")
+    assert plan.encoded_manifest
 
 
 def _models_payload(bundle: DeploymentBundle) -> dict[str, object]:
