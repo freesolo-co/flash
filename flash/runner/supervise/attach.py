@@ -45,6 +45,23 @@ if TYPE_CHECKING:
     from flash.runner.lifecycle.state import RunStatus
 
 
+def _verified_attached_opd_next_attempt(
+    worker_spec: JobSpec, run_id: str, next_attempt: int
+) -> int:
+    """verify mutation safety before replacing or terminalizing an attached opd attempt."""
+    if worker_spec.algorithm != "opd":
+        return next_attempt
+    from flash.runner.lifecycle.attempts import _verified_opd_next_attempt
+
+    verified = _verified_opd_next_attempt(run_id)
+    if verified != next_attempt:
+        raise RuntimeError(
+            "persisted opd attempt identity does not match the attached worker; "
+            "replacement is blocked"
+        )
+    return verified
+
+
 def _resume_after_confirmed_teardown(
     run_id: str,
     worker_spec: JobSpec,
@@ -54,6 +71,8 @@ def _resume_after_confirmed_teardown(
     log,
     *,
     failure: str,
+    expected_attempt: tuple[int, int],
+    retry_failure: str | None = None,
 ) -> RunStatus:
     """CAS-clear one captured remote, then resume its next attempt exactly once."""
     from flash.runner.accounting.artifacts import stage_environment_package
@@ -62,7 +81,6 @@ def _resume_after_confirmed_teardown(
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
-    from flash.runner.lifecycle.attempts import _verified_opd_next_attempt
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at, _spec_with_remaining_wall
     from flash.runner.lifecycle.status import (
         _update,
@@ -72,10 +90,35 @@ def _resume_after_confirmed_teardown(
     )
     from flash.runner.lifecycle.submit import _persist_effective_worker_spec
     from flash.runner.supervise.errors import _RunCancelled
-    from flash.runner.supervise.lifecycle import _run_training
+    from flash.runner.supervise.lifecycle import (
+        _consume_recovered_retry_state,
+        _run_training,
+    )
 
+    if retry_failure is not None:
+        retry_policy = _consume_recovered_retry_state(
+            worker_spec,
+            get_status(run_id),
+            retry_failure,
+            expected_attempt,
+            persisted_remote,
+        )
+        if retry_policy is None:
+            _verified_attached_opd_next_attempt(worker_spec, run_id, next_attempt)
+            _compare_and_fail_remote(
+                run_id,
+                persisted_remote,
+                failure,
+                expected_attempt=expected_attempt,
+            )
+            return get_status(run_id)
     if int(worker_spec.gpu.max_retries) == 0:
-        _compare_and_fail_remote(run_id, persisted_remote, failure)
+        _compare_and_fail_remote(
+            run_id,
+            persisted_remote,
+            failure,
+            expected_attempt=expected_attempt,
+        )
         print(
             f"attach: {run_id} exhausted its one-shot retry budget; not resubmitting",
             file=log,
@@ -88,20 +131,23 @@ def _resume_after_confirmed_teardown(
             source_snapshot or source_snapshot_from_status(get_status(run_id), required=True)
         ).to_dict()
     except Exception as exc:
-        _compare_and_fail_remote(run_id, persisted_remote, str(exc))
+        _compare_and_fail_remote(
+            run_id,
+            persisted_remote,
+            str(exc),
+            expected_attempt=expected_attempt,
+        )
         return get_status(run_id)
-    if worker_spec.algorithm == "opd":
-        verified_next_attempt = _verified_opd_next_attempt(run_id)
-        if verified_next_attempt != next_attempt:
-            raise RuntimeError(
-                "persisted opd attempt identity does not match the attached worker; "
-                "replacement is blocked"
-            )
-        next_attempt = verified_next_attempt
+    next_attempt = _verified_attached_opd_next_attempt(worker_spec, run_id, next_attempt)
     try:
         _spec_with_remaining_wall(worker_spec, require_provider_minimum=True)
     except RuntimeError as exc:
-        _compare_and_fail_remote(run_id, persisted_remote, str(exc))
+        _compare_and_fail_remote(
+            run_id,
+            persisted_remote,
+            str(exc),
+            expected_attempt=expected_attempt,
+        )
         print(f"attach: {run_id} {exc}", file=log)
         return get_status(run_id)
     worker_spec = reallocation_spec_from_status(get_status(run_id), verify_source=True)
@@ -111,7 +157,11 @@ def _resume_after_confirmed_teardown(
     worker_spec = stage_environment_package(worker_spec, deadline_at=deadline_at)
     if not _persist_effective_worker_spec(worker_spec):
         raise _RunCancelled(f"run {run_id} went terminal before environment staging")
-    if not _compare_and_clear_remote(run_id, persisted_remote):
+    if not _compare_and_clear_remote(
+        run_id,
+        persisted_remote,
+        expected_attempt=expected_attempt,
+    ):
         print(
             f"attach: {run_id} persisted remote changed before clear; not resuming",
             file=log,
@@ -224,12 +274,14 @@ def _reconcile_attached_remote(
     source_snapshot: dict | None,
     log,
     failure: str,
+    retry_failure: str | None = None,
 ) -> None:
     """Reconcile one exact maybe-live attempt until it is gone or the wall deadline expires."""
     from flash.providers.core.base import JobHandle
     from flash.runner.accounting.reconciliation import (
         _compare_and_fail_remote,
         _record_cleanup_remote,
+        _remote_attempt_identity,
         _remote_resource_identity,
     )
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
@@ -243,6 +295,9 @@ def _reconcile_attached_remote(
     )
 
     expected_identity = _remote_resource_identity(expected_remote)
+    expected_attempt = _remote_attempt_identity(expected_remote)
+    if expected_attempt is None:
+        return
     handle = JobHandle.from_dict(expected_remote)
     while True:
         try:
@@ -258,43 +313,43 @@ def _reconcile_attached_remote(
             deadline_at = _load_run_deadline_at(run_id)
         except Exception as exc:
             try:
-                if _compare_and_fail_remote(run_id, expected_remote, str(exc)):
+                if _compare_and_fail_remote(
+                    run_id,
+                    expected_remote,
+                    str(exc),
+                    expected_attempt=expected_attempt,
+                ):
                     return
             except Exception:
                 time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
                 continue
             return
         attempt_record = AttemptRecord.from_dict(status.attempt)
+        if (attempt_record.attempt_id, attempt_record.fence) != expected_attempt:
+            return
         result_deadline_at = attempt_record.result_deadline_at
         try:
             terminal_result = _attempt_result(run_id, expected_remote)
         except Exception:
             terminal_result = None
         if terminal_result is not None:
-            if terminal_result.ok:
-                completed_metrics = terminal_result.metrics
-                _carry_allocation_stamp(completed_metrics, expected_remote)
-                if _reconcile_completed_remote(
-                    run_id,
-                    worker_spec,
-                    expected_remote,
-                    completed_metrics,
-                    deadline_at,
-                    log,
-                ):
-                    return
-                continue
-            terminal_failure = (
-                f"{terminal_result.failure or 'job_failed'}: "
-                f"{terminal_result.detail or 'worker attempt failed'}"
-            )
-            try:
-                if _compare_and_fail_remote(run_id, expected_remote, terminal_failure):
-                    return
-            except Exception:
-                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-                continue
-            return
+            from flash.runner.supervise.attach_retry import reconcile_terminal_result
+
+            if reconcile_terminal_result(
+                run_id,
+                worker_spec,
+                expected_remote,
+                expected_attempt,
+                handle,
+                terminal_result,
+                deadline_at,
+                next_attempt,
+                source_snapshot,
+                status,
+                log,
+            ):
+                return
+            continue
         now = time.time()
         if now < result_deadline_at:
             time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, result_deadline_at - now))
@@ -323,6 +378,8 @@ def _reconcile_attached_remote(
                 source_snapshot,
                 log,
                 failure=failure,
+                expected_attempt=expected_attempt,
+                retry_failure=retry_failure,
             )
         except Exception as exc:
             try:
@@ -355,6 +412,7 @@ def _schedule_attach_reconciliation(
     source_snapshot: dict | None,
     log,
     failure: str,
+    retry_failure: str | None = None,
 ) -> bool:
     """Schedule one in-process reconciler for a captured remote identity."""
     with _ATTACH_RECONCILING_LOCK:
@@ -372,6 +430,7 @@ def _schedule_attach_reconciliation(
                 source_snapshot,
                 log,
                 failure,
+                retry_failure,
             )
         finally:
             try:
@@ -404,6 +463,13 @@ class _AttachContext:
     next_attempt: int
     source_snapshot: dict | None
 
+    @property
+    def expected_attempt(self) -> tuple[int, int]:
+        fence = _attempt_int(self.persisted_remote.get("fence"))
+        if fence is None:
+            raise ValueError("persisted attempt fence is missing or invalid")
+        return self.recovered_attempt, fence
+
 
 def _build_attach_context(
     worker_spec: JobSpec,
@@ -420,7 +486,8 @@ def _build_attach_context(
     if not isinstance(provider_name, str) or not provider_name:
         raise ValueError("persisted provider identity is missing or invalid")
     recovered_attempt = _attempt_int(remote.get("attempt"))
-    if recovered_attempt is None:
+    recovered_fence = _attempt_int(remote.get("fence"))
+    if recovered_attempt is None or recovered_fence is None:
         raise ValueError("persisted attempt identity is missing or invalid")
     # strip the allocation stamp off the HANDLE copy only: `JobHandle.from_dict` round-trips
     # unknown keys, and the stamp belongs to `persisted_remote`, which `_carry_allocation_stamp`
@@ -616,13 +683,10 @@ def _handle_attach_wall_deadline(
     if persisted_status is not None:
         return persisted_status
     terminal_failure = terminal_result is not None and not terminal_result.ok
-    failure = (
-        f"{terminal_result.failure or 'job_failed'}: "
-        f"{terminal_result.detail or 'worker attempt failed'}"
-        if terminal_failure
-        else str(exc)
-    )
-    if not terminal_failure and time.time() < result_deadline_at:
+    if terminal_failure:
+        return _handle_failed_attach_poll(run_id, context, terminal_result, log)
+    failure = str(exc)
+    if time.time() < result_deadline_at:
         _schedule_attach_reconciliation(
             run_id,
             context.persisted_remote,
@@ -643,7 +707,12 @@ def _handle_attach_wall_deadline(
         resource_deleted = False
     if not resource_deleted:
         _record_cleanup_remote(run_id, context.persisted_remote)
-    _compare_and_fail_remote(run_id, context.persisted_remote, failure)
+    _compare_and_fail_remote(
+        run_id,
+        context.persisted_remote,
+        failure,
+        expected_attempt=context.expected_attempt,
+    )
     print(f"attach: {run_id} {failure}", file=log)
     return get_status(run_id)
 
@@ -723,6 +792,8 @@ def _handle_failed_attach_poll(
             context.source_snapshot,
             log,
             failure=failure,
+            expected_attempt=context.expected_attempt,
+            retry_failure=result.failure,
         )
     _schedule_attach_reconciliation(
         run_id,
@@ -732,6 +803,7 @@ def _handle_failed_attach_poll(
         context.source_snapshot,
         log,
         failure,
+        result.failure,
     )
     print(
         f"attach: {run_id} {context.handle.provider} teardown unconfirmed; "

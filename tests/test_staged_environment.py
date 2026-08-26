@@ -818,6 +818,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
         source_snapshot=valid_source_snapshot(),
         allocated_gpu=None,
         allocated_gpu_count=None,
+        expected_attempt=(0, 1),
     )
     calls = {"stage": 0, "clear": 0, "fail": 0, "train": 0, "allocate": 0}
     scheduled: list[tuple] = []

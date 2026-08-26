@@ -208,8 +208,6 @@ def _build_context(
     runtime_secrets: dict[str, str] | None,
     source_snapshot: dict | None,
     attempt_start: int,
-    retry_budget=None,
-    retry_placement=None,
 ) -> _SubmitContext:
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
@@ -219,12 +217,11 @@ def _build_context(
         source_snapshot or source_snapshot_from_status(get_status(spec.run_id), required=True)
     ).to_dict()
     attempt_start = max(0, int(attempt_start))
-    retry_budget = retry_budget or _lifecycle._retry_budget_for_spec(spec)
+    retry_budget, retry_placement = _lifecycle._load_durable_retry_state(spec)
     infra_budget = retry_budget.infra_retries
     started_with_shared_cache = (
         getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
     )
-    retry_placement = retry_placement or _lifecycle._RetryPlacement()
     # environment transport is already pinned and staged by the controller before allocation.
     return _SubmitContext(
         spec=spec,
@@ -238,6 +235,7 @@ def _build_context(
         failed_providers=set(retry_placement.failed_providers),
         tried_classes=set(retry_placement.tried_classes),
         oom_vram_floor=retry_placement.oom_vram_floor,
+        drop_weight_cache=retry_budget.cache_used > 0,
         current_attempt=attempt_start,
     )
 
@@ -846,6 +844,31 @@ def _handle_failure(
         refused_key = _capacity_refusal_key(ctx, outcome)
         if refused_key is not None:
             ctx.capacity_refusals[refused_key] = ctx.capacity_refusals.get(refused_key, 0) + 1
+    durable_retry_state = None
+    if result.failure in _lifecycle.RETRY_FAILURES:
+        from flash.runner.lifecycle.retry_policy import consume_retry
+
+        failed_providers = frozenset()
+        tried_classes = frozenset()
+        if not first_cache_drop and outcome.chosen is not None:
+            tried_classes = frozenset({_lifecycle._shape_key(outcome.chosen)})
+            if not oom_shaped:
+                failed_providers = frozenset({outcome.chosen.provider})
+        policy = consume_retry(
+            ctx.spec.run_id,
+            ctx.spec,
+            expected_attempt=(prepared.attempt, prepared.fence),
+            failure=result.failure,
+            cache_drop=first_cache_drop,
+            allow_retry=will_retry,
+            failed_providers=failed_providers,
+            tried_classes=tried_classes,
+            oom_vram_floor=ctx.oom_vram_floor,
+        )
+        if policy is None:
+            will_retry = False
+        else:
+            durable_retry_state = _lifecycle._retry_state_from_policy(ctx.spec, policy)
     retry_target = _retry_target(
         ctx,
         outcome,
@@ -869,6 +892,10 @@ def _handle_failure(
     )
     if not will_retry:
         return _FailureDecision(None, False)
+    ctx.retry_budget, retry_placement = durable_retry_state
+    ctx.failed_providers = set(retry_placement.failed_providers)
+    ctx.tried_classes = set(retry_placement.tried_classes)
+    ctx.oom_vram_floor = retry_placement.oom_vram_floor
     if first_cache_drop:
         ctx.drop_weight_cache = True
         # dropping the cache WIDENS the search: the weight-cache volume pins the run to the region
@@ -878,13 +905,6 @@ def _handle_failure(
         # reach two and stop the run, having heard the wider market refuse only once. Clear it so
         # the widened search gets its own pair of looks.
         ctx.capacity_refusals.clear()
-        ctx.retry_budget.record_retry(result.failure, cache_drop=True)
-    else:
-        ctx.retry_budget.record_retry(result.failure, cache_drop=False)
-        if outcome.chosen is not None:
-            if not oom_shaped:
-                ctx.failed_providers.add(outcome.chosen.provider)
-            ctx.tried_classes.add(_lifecycle._shape_key(outcome.chosen))
     return _FailureDecision(None, True)
 
 
@@ -894,8 +914,6 @@ def run_attempts_supervised(
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     attempt_start: int = 0,
-    retry_budget=None,
-    retry_placement=None,
 ) -> dict:
     """Run one run through bounded attempts on infra-shaped failures."""
     if spec.algorithm == "opd":
@@ -910,8 +928,6 @@ def run_attempts_supervised(
         runtime_secrets,
         source_snapshot,
         attempt_start,
-        retry_budget,
-        retry_placement,
     )
     _require_opd_configuration(ctx)
     for invocation_ordinal in range(ctx.retry_budget.max_attempts):

@@ -341,7 +341,11 @@ def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
     ctx = types.SimpleNamespace(
         raise_if_cancelled=lambda: None,
         last_handle=None,
-        spec=types.SimpleNamespace(run_id="run", seed=1),
+        spec=types.SimpleNamespace(
+            run_id="run",
+            seed=1,
+            gpu=types.SimpleNamespace(max_retries=1, network_volume=None),
+        ),
         last_detail="",
         oom_vram_floor=0.0,
         drop_weight_cache=False,
@@ -352,13 +356,28 @@ def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
         seed=1,
         log=io.StringIO(),
     )
-    prepared = types.SimpleNamespace(attempt=0)
+    prepared = types.SimpleNamespace(attempt=0, fence=1)
     outcome = attempt_supervision._AttemptOutcome(
         result=PollResult(False, failure="oom", detail="cuda oom"),
         chosen=failed,
         candidates=(failed,),
         run_spec=types.SimpleNamespace(gpu=types.SimpleNamespace(network_volume=None)),
     )
+    from flash.runner.lifecycle import retry_policy
+
+    monkeypatch.setattr(
+        retry_policy,
+        "consume_retry",
+        lambda *_args, **_kwargs: retry_policy.RetryPolicyState(
+            oom_used=1,
+            tried_classes=frozenset({("runpod", "RTX 4090", 4)}),
+            oom_vram_floor=35.2,
+            consumed_attempt=(0, 1),
+            consumed_failure="oom",
+            consumed_retry_allowed=True,
+        ),
+    )
+
     decision = attempt_supervision._handle_failure(ctx, prepared, outcome)
 
     assert decision.retry is True

@@ -144,8 +144,13 @@ def _confirmed_settled_attempt_matches(
     )
 
 
-def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
-    """Clear only the nonterminal remote that still names the destroyed resource."""
+def _compare_and_clear_remote(
+    run_id: str,
+    expected_remote: dict,
+    *,
+    expected_attempt: tuple[int, int] | None = None,
+) -> bool:
+    """Clear only the nonterminal remote and fenced attempt that owned the destroyed resource."""
     if _remote_resource_identity(expected_remote) is None:
         return False
     report_status: RunStatus | None = None
@@ -154,6 +159,18 @@ def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
         if status.state in state.TERMINAL_STATES:
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
+            return False
+        if status.attempt:
+            if not _attempt_identity_matches(
+                status,
+                expected_attempt,
+                expected_no_attempt=False,
+            ):
+                return False
+        elif (
+            expected_attempt is not None
+            and _remote_attempt_identity(status.remote) != expected_attempt
+        ):
             return False
         status.remote = None
         status.updated_at = time.time()

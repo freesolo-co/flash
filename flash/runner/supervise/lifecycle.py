@@ -20,8 +20,6 @@ _STAGED_ENVIRONMENT_RETRY_S = 5.0
 def _run_job_background(
     spec: JobSpec,
     runtime_secrets: dict[str, str] | None = None,
-    retry_budget: _RetryBudget | None = None,
-    retry_placement: _RetryPlacement | None = None,
 ) -> None:
     """run a supervised job without leaking a daemon-thread traceback."""
     import logging
@@ -30,14 +28,7 @@ def _run_job_background(
     from flash.runner.lifecycle.status import _update, get_status
 
     try:
-        if retry_budget is not None:
-            _run_job(
-                spec,
-                runtime_secrets=runtime_secrets,
-                retry_budget=retry_budget,
-                retry_placement=retry_placement,
-            )
-        elif runtime_secrets:
+        if runtime_secrets:
             _run_job(spec, runtime_secrets=runtime_secrets)
         else:
             _run_job(spec)
@@ -93,24 +84,108 @@ class _RetryPlacement:
     oom_vram_floor: float = 0.0
 
 
-def _retry_budget_for_spec(spec: JobSpec) -> _RetryBudget:
-    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
+def _recovered_retry_placement(
+    status,
+    failure: str | None,
+    persisted_remote: dict | None = None,
+) -> _RetryPlacement:
+    """reconstruct candidate exclusions from the current persisted attempt."""
+    from flash.cost.facts import gpu_vram_gb
+    from flash.cost.spec import sft_ranking_overrides
+    from flash.providers.core.allocator import _executed_gpu_count, _overridden_train
+    from flash.providers.core.sharding import combined_vram_gb
+    from flash.runner.lifecycle.protocol import AttemptRecord
+    from flash.runner.lifecycle.status import effective_spec_from_status
 
-    max_retries = int(spec.gpu.max_retries)
-    infra_retries = max(max_retries, INFRA_RETRY_FLOOR) if max_retries else 0
-    cache_fallbacks = (
-        1
-        if max_retries > 0 and getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
-        else 0
+    attempt = AttemptRecord.from_dict(status.attempt)
+    resource = attempt.resource if isinstance(attempt.resource, dict) else {}
+    if isinstance(persisted_remote, dict):
+        resource = {**resource, **persisted_remote}
+    provider = attempt.provider or resource.get("provider")
+    gpu = resource.get("allocated_gpu")
+    gpu_count = resource.get("allocated_gpu_count")
+    if (
+        not isinstance(provider, str)
+        or not provider
+        or not isinstance(gpu, str)
+        or not gpu
+        or isinstance(gpu_count, bool)
+        or not isinstance(gpu_count, int)
+        or gpu_count < 1
+    ):
+        return _RetryPlacement()
+    shape = (provider, gpu, gpu_count)
+    if failure == "oom":
+        effective_spec = effective_spec_from_status(status)
+        overrides = sft_ranking_overrides(effective_spec)
+        sized_train = _overridden_train(effective_spec.train, overrides)
+        executed_gpu_count = _executed_gpu_count(
+            effective_spec.algorithm,
+            sized_train,
+            overrides,
+            gpu_count,
+        )
+        return _RetryPlacement(
+            tried_classes=frozenset({shape}),
+            oom_vram_floor=combined_vram_gb(gpu_vram_gb(gpu), executed_gpu_count),
+        )
+    return _RetryPlacement(
+        failed_providers=frozenset({provider}),
+        tried_classes=frozenset({shape}),
     )
-    return _RetryBudget(infra_retries, max_retries, cache_fallbacks)
+
+
+def _retry_budget_for_spec(spec: JobSpec) -> _RetryBudget:
+    from flash.runner.lifecycle.retry_policy import retry_limits
+
+    infra_retries, oom_retries, cache_fallbacks = retry_limits(spec)
+    return _RetryBudget(infra_retries, oom_retries, cache_fallbacks)
+
+
+def _retry_state_from_policy(spec: JobSpec, policy):
+    retry_budget = _retry_budget_for_spec(spec)
+    retry_budget.infra_used = policy.infra_used
+    retry_budget.oom_used = policy.oom_used
+    retry_budget.cache_used = policy.cache_used
+    return retry_budget, _RetryPlacement(
+        failed_providers=policy.failed_providers,
+        tried_classes=policy.tried_classes,
+        oom_vram_floor=policy.oom_vram_floor,
+    )
+
+
+def _load_durable_retry_state(spec: JobSpec):
+    from flash.runner.lifecycle.retry_policy import load_retry_policy
+
+    return _retry_state_from_policy(spec, load_retry_policy(spec.run_id))
+
+
+def _consume_recovered_retry_state(
+    spec,
+    status,
+    failure,
+    expected_attempt,
+    persisted_remote=None,
+):
+    """consume one fenced retry allowance and preserve cumulative placement exclusions."""
+    from flash.runner.lifecycle.retry_policy import consume_retry
+
+    delta = _recovered_retry_placement(status, failure, persisted_remote)
+    return consume_retry(
+        spec.run_id,
+        spec,
+        expected_attempt=expected_attempt,
+        failure=failure,
+        cache_drop=False,
+        failed_providers=delta.failed_providers,
+        tried_classes=delta.tried_classes,
+        oom_vram_floor=delta.oom_vram_floor,
+    )
 
 
 def _run_job(
     spec: JobSpec,
     runtime_secrets: dict[str, str] | None = None,
-    retry_budget: _RetryBudget | None = None,
-    retry_placement: _RetryPlacement | None = None,
 ) -> None:
     from flash.content.multimodal import preflight_validate_image_opd
 
@@ -133,8 +208,6 @@ def _run_job(
                     spec,
                     log_path,
                     runtime_secrets=runtime_secrets,
-                    retry_budget=retry_budget,
-                    retry_placement=retry_placement,
                 )
                 break
             except Exception as exc:
@@ -214,8 +287,6 @@ def _run_attempts_supervised(
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     attempt_start: int = 0,
-    retry_budget: _RetryBudget | None = None,
-    retry_placement: _RetryPlacement | None = None,
 ) -> dict:
     """Run one run through bounded attempt retries on infra-shaped failures.
 
@@ -230,8 +301,6 @@ def _run_attempts_supervised(
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         attempt_start=attempt_start,
-        retry_budget=retry_budget,
-        retry_placement=retry_placement,
     )
 
 
@@ -256,8 +325,6 @@ def _run_job_inner(
     spec: JobSpec,
     log_path: str,
     runtime_secrets: dict[str, str] | None = None,
-    retry_budget: _RetryBudget | None = None,
-    retry_placement: _RetryPlacement | None = None,
 ) -> None:
     from flash.runner.accounting.artifacts import stage_environment_package
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
@@ -279,8 +346,6 @@ def _run_job_inner(
                 log,
                 prior_cost=0.0,
                 runtime_secrets=runtime_secrets,
-                retry_budget=retry_budget,
-                retry_placement=retry_placement,
             )
     except _RunCancelled:
         return  # cancel_run already set the terminal state
@@ -302,8 +367,6 @@ def _run_training(
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     attempt_start: int = 0,
-    retry_budget: _RetryBudget | None = None,
-    retry_placement: _RetryPlacement | None = None,
 ) -> None:
     """Train the run's single adapter under supervision; finalize the run.
 
@@ -353,8 +416,6 @@ def _run_training(
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         attempt_start=attempt_start,
-        retry_budget=retry_budget,
-        retry_placement=retry_placement,
     )
     metrics, verified_attempt = validate_terminal_source_metrics(get_status(spec.run_id), metrics)
     # measured wall x $/hr is recorded in metrics.json for analytics, but is not what we charge.

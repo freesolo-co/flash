@@ -445,6 +445,17 @@ def _attempt_record(
     )
 
 
+def _attempt_record_for_remote(remote, **kwargs):
+    attempt = _attempt_record(
+        attempt_id=remote["attempt"],
+        fence=remote["fence"],
+        **kwargs,
+    ).to_dict()
+    attempt["provider"] = remote["provider"]
+    attempt["resource"] = remote
+    return attempt
+
+
 def _stepped_clock(start=0.0, step=10.0):
     value = start - step
 
@@ -3290,6 +3301,7 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
             state="running",
             remote=stale_remote,
         )
+        status.attempt = _attempt_record_for_remote(stale_remote)
         status.source_snapshot = _SOURCE_SNAPSHOT
         runner_state._save_status(status)
         monkeypatch.setattr(
@@ -3402,6 +3414,32 @@ def test_attach_unparseable_spec_fails_closed_and_tears_down(monkeypatch):
         assert terminated == [("RTX 5090", "bad")]
 
 
+def _attached_retry_remote(jobs, *, attempt=0, fence=1, gpu="RTX 4090"):
+    return {
+        **_runpod_handle(
+            jobs,
+            endpoint_id=f"ep-{attempt}",
+            job_id=f"job-{attempt}",
+            attempt=attempt,
+            fence=fence,
+        ).to_dict(),
+        "allocated_gpu": gpu,
+        "allocated_gpu_count": 1,
+    }
+
+
+def _save_attached_retry_status(spec, remote, *, retry_policy=None):
+    status = provisioned_status(
+        spec,
+        state="running",
+        attempt=_attempt_record_for_remote(remote),
+        remote=remote,
+    )
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    kwargs = {"_retry_policy": retry_policy.to_dict()} if retry_policy is not None else {}
+    runner_state._save_status(status, **kwargs)
+
+
 def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
     # A recovered run whose remote job ended not-ok (it died while the control plane was down for
     # the redeploy) must NOT be failed — reattach resumes training on a fresh host (worker resumes
@@ -3429,6 +3467,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
                 "started_ts": 1.0,
             },
         )
+        status.attempt = _attempt_record_for_remote(status.remote)
         status.source_snapshot = _SOURCE_SNAPSHOT
         runner_state._save_status(status)
         # Poll reports a dead/abandoned job (the common redeploy-window outcome).
@@ -3513,6 +3552,271 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
         assert status.remote["endpoint_id"] == "epA"
 
 
+@pytest.mark.parametrize(
+    ("failure", "infra_used", "oom_used"),
+    [("oom", 0, 1), ("job_preempted", 5, 0)],
+)
+def test_ordinary_attached_failure_honors_exhausted_durable_budget(
+    monkeypatch,
+    failure,
+    infra_used,
+    oom_used,
+):
+    from dataclasses import replace
+
+    from flash.runner.lifecycle.retry_policy import RetryPolicyState, load_retry_policy
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
+        import flash.providers.runpod.execution.jobs as jobs
+
+        spec = _spec(f"attached-exhausted-{failure}")
+        spec = replace(spec, gpu=replace(spec.gpu, max_retries=1))
+        remote = _attached_retry_remote(jobs, attempt=1, fence=2)
+        _save_attached_retry_status(
+            spec,
+            remote,
+            retry_policy=RetryPolicyState(
+                infra_used=infra_used,
+                oom_used=oom_used,
+                consumed_attempt=(0, 1),
+                consumed_failure=failure,
+                consumed_retry_allowed=True,
+            ),
+        )
+        monkeypatch.setattr(
+            polling,
+            "poll_attempt",
+            lambda *_args, **_kwargs: jobs.PollResult(
+                False,
+                failure=failure,
+                detail="budget exhausted",
+            ),
+        )
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            runner_lifecycle,
+            "_run_training",
+            lambda *_a, **_k: pytest.fail("exhausted attached failure must not resume"),
+        )
+
+        status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+        assert status.state == "failed"
+        assert status.error == f"{failure}: budget exhausted"
+        policy = load_retry_policy(spec.run_id)
+        assert policy.infra_used == infra_used
+        assert policy.oom_used == oom_used
+        assert policy.consumed_attempt == (1, 2)
+        assert policy.consumed_failure == failure
+        assert policy.consumed_retry_allowed is False
+
+
+@pytest.mark.parametrize(
+    ("failure", "infra_used", "oom_used", "expected_infra", "expected_oom"),
+    [
+        ("job_preempted", 4, 1, 5, 1),
+        ("oom", 5, 0, 5, 1),
+    ],
+)
+def test_ordinary_attached_failure_uses_independent_retry_budgets(
+    monkeypatch,
+    failure,
+    infra_used,
+    oom_used,
+    expected_infra,
+    expected_oom,
+):
+    from dataclasses import replace
+
+    from flash.runner.lifecycle.retry_policy import RetryPolicyState, load_retry_policy
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
+        import flash.providers.runpod.execution.jobs as jobs
+
+        spec = _spec(f"attached-independent-{failure}")
+        spec = replace(spec, gpu=replace(spec.gpu, max_retries=1))
+        remote = _attached_retry_remote(jobs, attempt=1, fence=2)
+        _save_attached_retry_status(
+            spec,
+            remote,
+            retry_policy=RetryPolicyState(
+                infra_used=infra_used,
+                oom_used=oom_used,
+                consumed_attempt=(0, 1),
+                consumed_failure="oom" if oom_used else "job_preempted",
+                consumed_retry_allowed=True,
+            ),
+        )
+        monkeypatch.setattr(
+            polling,
+            "poll_attempt",
+            lambda *_args, **_kwargs: jobs.PollResult(
+                False,
+                failure=failure,
+                detail="retry independently",
+            ),
+        )
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_a, **_k: None)
+        resumed = []
+
+        def finish_replacement(spec, _log, **_kwargs):
+            resumed.append(spec.run_id)
+            runner_status._update(spec.run_id, "done")
+
+        monkeypatch.setattr(runner_lifecycle, "_run_training", finish_replacement)
+
+        status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+        assert status.state == "done"
+        assert resumed == [spec.run_id]
+        policy = load_retry_policy(spec.run_id)
+        assert policy.infra_used == expected_infra
+        assert policy.oom_used == expected_oom
+        assert policy.consumed_attempt == (1, 2)
+        assert policy.consumed_failure == failure
+        assert policy.consumed_retry_allowed is True
+
+
+def test_ordinary_attached_failure_preserves_cumulative_placement_exclusions(monkeypatch):
+    from flash.runner.lifecycle.retry_policy import RetryPolicyState, load_retry_policy
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
+        import flash.providers.runpod.execution.jobs as jobs
+
+        spec = _spec("attached-cumulative-placement")
+        remote = _attached_retry_remote(jobs, attempt=1, fence=2)
+        prior_shape = ("vast", "A100 SXM", 2)
+        current_shape = ("runpod", "RTX 4090", 1)
+        _save_attached_retry_status(
+            spec,
+            remote,
+            retry_policy=RetryPolicyState(
+                infra_used=1,
+                failed_providers=frozenset({"vast"}),
+                tried_classes=frozenset({prior_shape}),
+                consumed_attempt=(0, 1),
+                consumed_failure="job_preempted",
+                consumed_retry_allowed=True,
+            ),
+        )
+        monkeypatch.setattr(
+            polling,
+            "poll_attempt",
+            lambda *_args, **_kwargs: jobs.PollResult(
+                False,
+                failure="job_preempted",
+                detail="second provider vanished",
+            ),
+        )
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_a, **_k: None)
+
+        def finish_replacement(spec, _log, **_kwargs):
+            policy = load_retry_policy(spec.run_id)
+            assert policy.failed_providers == frozenset({"vast", "runpod"})
+            assert policy.tried_classes == frozenset({prior_shape, current_shape})
+            runner_status._update(spec.run_id, "done")
+
+        monkeypatch.setattr(runner_lifecycle, "_run_training", finish_replacement)
+
+        status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+        assert status.state == "done"
+        policy = load_retry_policy(spec.run_id)
+        assert policy.infra_used == 2
+        assert policy.failed_providers == frozenset({"vast", "runpod"})
+        assert policy.tried_classes == frozenset({prior_shape, current_shape})
+
+
+def test_ordinary_attached_failure_consumes_retry_after_deferred_teardown(monkeypatch):
+    from flash.runner.lifecycle.retry_policy import load_retry_policy
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.execution.jobs as jobs
+
+        spec = _spec("attached-deferred-consumption")
+        remote = _attached_retry_remote(jobs)
+        _save_attached_retry_status(spec, remote)
+        monkeypatch.setattr(
+            polling,
+            "poll_attempt",
+            lambda *_args, **_kwargs: jobs.PollResult(
+                False,
+                failure="job_preempted",
+                detail="host vanished",
+            ),
+        )
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_a, **_k: None)
+        teardown_calls = []
+
+        def teardown(*_args, **_kwargs):
+            teardown_calls.append(True)
+            if len(teardown_calls) == 1:
+                raise RuntimeError("deletion unconfirmed")
+            return True
+
+        monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", teardown)
+        monkeypatch.setattr(runner_lifecycle, "_worker_provably_gone", lambda *_args: False)
+        scheduled = {}
+
+        def capture_schedule(
+            run_id,
+            expected_remote,
+            worker_spec,
+            next_attempt,
+            source_snapshot,
+            log,
+            failure,
+            retry_failure=None,
+        ):
+            scheduled.update(
+                run_id=run_id,
+                expected_remote=expected_remote,
+                worker_spec=worker_spec,
+                next_attempt=next_attempt,
+                source_snapshot=source_snapshot,
+                log=log,
+                failure=failure,
+                retry_failure=retry_failure,
+            )
+            return True
+
+        monkeypatch.setattr(runner_attach, "_schedule_attach_reconciliation", capture_schedule)
+
+        status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+        assert status.state == "running"
+        assert scheduled["retry_failure"] == "job_preempted"
+        policy = load_retry_policy(spec.run_id)
+        assert policy.infra_used == 0
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_a, **_k: None)
+        monkeypatch.setattr(runner_attach.time, "time", lambda: 221.0)
+        monkeypatch.setattr(runner_deadlines.time, "time", lambda: 221.0)
+        monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1_000.0)
+
+        def finish_replacement(spec, _log, **_kwargs):
+            runner_status._update(spec.run_id, "done")
+
+        monkeypatch.setattr(runner_lifecycle, "_run_training", finish_replacement)
+
+        runner_attach._reconcile_attached_remote(**scheduled)
+
+        status = runner_status.get_status(spec.run_id)
+        assert status.state == "done"
+        assert len(teardown_calls) == 2
+        policy = load_retry_policy(spec.run_id)
+        assert policy.infra_used == 1
+        assert policy.consumed_attempt == (0, 1)
+        assert policy.consumed_failure == "job_preempted"
+        assert policy.consumed_retry_allowed is True
+
+
 def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
@@ -3574,102 +3878,36 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
         }
 
 
-def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
-    # The resume delegates the genuine-vs-infra decision to the training submit (unchanged): a run
-    # that is truly broken reproduces the failure on the resumed attempt, _run_training fails it, and
-    # attach surfaces that terminal `failed` — so a broken run still terminates (nothing hangs).
+def test_attach_nonretryable_poll_failure_fails_without_resubmitting(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.runpod.execution.jobs as jobs
-        import flash.providers.runpod.serverless.endpoints as flash_train
 
-        status = provisioned_status(
-            _spec("g1"),
-            state="running",
-            attempt=_attempt_record().to_dict(),
-            remote={
-                "provider": "runpod",
-                "endpoint_id": "epA",
-                "endpoint_name": "n",
-                "key_fingerprint": _RUNPOD_FINGERPRINT,
-                "job_id": "jA",
-                "on_last_gpu": False,
-                "attempt": 0,
-                "fence": 1,
-                "started_ts": 1.0,
-            },
-        )
-        status.source_snapshot = _SOURCE_SNAPSHOT
-        runner_state._save_status(status)
+        spec = _spec("g1")
+        remote = _attached_retry_remote(jobs)
+        _save_attached_retry_status(spec, remote)
         monkeypatch.setattr(
             polling,
             "poll_attempt",
-            lambda *a, **k: jobs.PollResult(
-                False, failure="job_failed", detail="Traceback ...\nRuntimeError: bad reward fn"
+            lambda *_args, **_kwargs: jobs.PollResult(
+                False,
+                failure="job_failed",
+                detail="bad reward function",
             ),
         )
-        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *a, **k: None)
-        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
-        monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-        resumed = {"called": False}
-        replacement_remote = {
-            "provider": "runpod",
-            "endpoint_id": "epB",
-            "endpoint_name": "replacement",
-            "key_fingerprint": _RUNPOD_FINGERPRINT,
-            "job_id": "jB",
-            "on_last_gpu": False,
-            "attempt": 1,
-            "fence": 1,
-            "started_ts": 2.0,
-        }
-
-        def fake_training(
-            spec,
-            log,
-            *,
-            prior_cost,
-            runtime_secrets=None,
-            source_snapshot=None,
-            attempt_start,
-        ):
-            assert source_snapshot == _SOURCE_SNAPSHOT
-            # the training submit re-runs the run; a genuinely broken run fails there (matches
-            # _run_attempts_supervised raising after a non-infra failure with no retries left).
-            resumed["called"] = True
-            resumed["attempt_start"] = attempt_start
-            runner_status._update(
-                spec.run_id,
-                "running",
-                attempt=_attempt_record(attempt_id=1).to_dict(),
-                remote=replacement_remote,
-            )
-            raise RuntimeError("run failed after retries: worker_error: bad reward fn")
-
-        monkeypatch.setattr(runner_lifecycle, "_run_training", fake_training)
-
-        st = runner_attach.attach_run("g1", log_stream=sys.stderr)
-
-        assert resumed["called"] is True, (
-            "attach must attempt a checkpoint resume on any non-ok poll"
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            runner_lifecycle,
+            "_run_training",
+            lambda *_a, **_k: pytest.fail("nonretryable failure must not resubmit"),
         )
-        assert st.state == "failed", "a resume that fails again must terminate the run"
-        assert st.remote == replacement_remote
-        assert "bad reward fn" in (st.error or "")
-        assert runner_status._load_status_json("g1")[runner_state._CLEANUP_REMOTES_KEY] == [
-            {key: value for key, value in replacement_remote.items() if key != "on_last_gpu"},
-            {
-                "provider": "runpod",
-                "endpoint_id": "epA",
-                "endpoint_name": "n",
-                "key_fingerprint": _RUNPOD_FINGERPRINT,
-                "job_id": "jA",
-                "attempt": 0,
-                "fence": 1,
-                "started_ts": 1.0,
-            },
-        ]
+
+        status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+        assert status.state == "failed"
+        assert status.error == "job_failed: bad reward function"
+        assert status.remote == remote
 
 
 @pytest.mark.parametrize(
@@ -4338,6 +4576,242 @@ def test_attach_reconciler_adopts_result_visible_before_result_deadline(monkeypa
         assert probes == [deadline - 1.0, deadline]
 
 
+@pytest.mark.parametrize(
+    ("failure", "provider", "expected_infra_used", "expected_oom_used"),
+    [("job_preempted", "runpod", 1, 0), ("oom", "vast", 0, 1)],
+)
+def test_attach_reconciler_retries_verified_result_after_confirmed_teardown(
+    monkeypatch,
+    failure,
+    provider,
+    expected_infra_used,
+    expected_oom_used,
+):
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.execution.jobs as jobs
+        import flash.runner.supervise.attach as attach_mod
+        import flash.runner.supervise.lifecycle as lifecycle_mod
+        from flash.providers.core.base import PollResult
+
+        base_remote = _runpod_handle_dict(jobs) if provider == "runpod" else _vast_recovery_remote()
+        remote = {
+            **base_remote,
+            "allocated_gpu": "RTX 4090",
+            "allocated_gpu_count": 1,
+        }
+        spec = _spec(f"vast-reconcile-{failure}")
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                attempt=_attempt_record_for_remote(remote),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1_000.0)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_attempt_result",
+            lambda *_args, **_kwargs: PollResult(False, failure=failure, detail="retry me"),
+        )
+        order = []
+
+        def teardown(*_args, **_kwargs):
+            order.append("teardown")
+            if provider == "runpod":
+                raise RuntimeError("endpoint deletion unconfirmed")
+            return True
+
+        monkeypatch.setattr(lifecycle_mod, "_strict_teardown_handle", teardown)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_worker_provably_gone",
+            lambda *_args: order.append("absence") or True,
+        )
+        resumed = {}
+
+        def resume(*_args, **kwargs):
+            order.append("resume")
+            resumed.update(kwargs)
+
+        monkeypatch.setattr(attach_mod, "_resume_after_confirmed_teardown", resume)
+
+        attach_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            _SOURCE_SNAPSHOT,
+            io.StringIO(),
+            "job_preempted: host vanished",
+        )
+
+        assert order == (
+            ["teardown", "absence", "resume"] if provider == "runpod" else ["teardown", "resume"]
+        )
+        assert resumed["expected_attempt"] == (0, 1)
+        from flash.runner.lifecycle.retry_policy import load_retry_policy
+
+        policy = load_retry_policy(spec.run_id)
+        assert policy.infra_used == expected_infra_used
+        assert policy.oom_used == expected_oom_used
+        if failure == "oom":
+            assert policy.oom_vram_floor == pytest.approx(24.0)
+            assert policy.failed_providers == frozenset()
+        else:
+            assert policy.failed_providers == frozenset({"runpod"})
+            cleanup = runner_status._load_status_json(spec.run_id)[
+                runner_state._CLEANUP_REMOTES_KEY
+            ]
+            assert len(cleanup) == 1
+            assert runner_reconciliation._remote_resource_identity(cleanup[0]) == (
+                runner_reconciliation._remote_resource_identity(remote)
+            )
+        assert policy.tried_classes == frozenset({(provider, "RTX 4090", 1)})
+        assert runner_status.get_status(spec.run_id).state == "running"
+
+
+def test_attach_reconciler_does_not_retry_verified_result_without_worker_absence(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.execution.jobs as jobs
+        import flash.runner.supervise.attach as attach_mod
+        import flash.runner.supervise.lifecycle as lifecycle_mod
+        from flash.providers.core.base import PollResult
+
+        remote = {
+            **_runpod_handle_dict(jobs),
+            "allocated_gpu": "RTX 4090",
+            "allocated_gpu_count": 1,
+        }
+        spec = _spec("runpod-reconcile-unconfirmed-retry")
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                attempt=_attempt_record_for_remote(remote),
+                remote=remote,
+            )
+        )
+        monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1_000.0)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_attempt_result",
+            lambda *_args, **_kwargs: PollResult(
+                False,
+                failure="job_preempted",
+                detail="retry me",
+            ),
+        )
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_strict_teardown_handle",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("unconfirmed")),
+        )
+        monkeypatch.setattr(lifecycle_mod, "_worker_provably_gone", lambda *_args: False)
+        monkeypatch.setattr(
+            attach_mod,
+            "_resume_after_confirmed_teardown",
+            lambda *_args, **_kwargs: pytest.fail("unconfirmed worker must not be replaced"),
+        )
+        sleeps = []
+
+        def stop_after_retry(seconds):
+            sleeps.append(seconds)
+            runner_status._update(spec.run_id, "cancelled")
+
+        monkeypatch.setattr(attach_mod.time, "sleep", stop_after_retry)
+
+        attach_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            1,
+            _SOURCE_SNAPSHOT,
+            io.StringIO(),
+            "job_preempted: host vanished",
+        )
+
+        assert sleeps == [attach_mod._ATTACH_RECONCILE_INTERVAL_S]
+        status = runner_status.get_status(spec.run_id)
+        assert status.state == "cancelled"
+        assert status.remote == remote
+
+
+@pytest.mark.parametrize(
+    ("failure", "infra_used", "oom_used"),
+    [("oom", 0, 1), ("job_preempted", 5, 0)],
+)
+def test_attach_reconciler_keeps_exhausted_retry_policy_terminal(
+    monkeypatch,
+    failure,
+    infra_used,
+    oom_used,
+):
+    from dataclasses import replace
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        import flash.providers.runpod.execution.jobs as jobs
+        import flash.runner.supervise.attach as attach_mod
+        import flash.runner.supervise.lifecycle as lifecycle_mod
+        from flash.providers.core.base import PollResult
+        from flash.runner.lifecycle.retry_policy import RetryPolicyState
+
+        remote = _runpod_handle_dict(jobs, attempt=1, started_ts=2.0)
+        remote["fence"] = 2
+        spec = _spec(f"runpod-exhausted-{failure}")
+        spec = replace(spec, gpu=replace(spec.gpu, max_retries=1))
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                attempt=_attempt_record_for_remote(remote),
+                remote=remote,
+            ),
+            _retry_policy=RetryPolicyState(
+                infra_used=infra_used,
+                oom_used=oom_used,
+                consumed_attempt=(0, 1),
+                consumed_failure=failure,
+            ).to_dict(),
+        )
+        monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1_000.0)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_attempt_result",
+            lambda *_args, **_kwargs: PollResult(False, failure=failure, detail="exhausted"),
+        )
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "_strict_teardown_handle",
+            lambda *_args, **_kwargs: pytest.fail("exhausted failure must not be replaced"),
+        )
+        monkeypatch.setattr(
+            attach_mod,
+            "_resume_after_confirmed_teardown",
+            lambda *_args, **_kwargs: pytest.fail("exhausted failure must remain terminal"),
+        )
+
+        attach_mod._reconcile_attached_remote(
+            spec.run_id,
+            remote,
+            spec,
+            2,
+            _SOURCE_SNAPSHOT,
+            io.StringIO(),
+            "job_preempted: host vanished",
+        )
+
+        status = runner_status.get_status(spec.run_id)
+        assert status.state == "failed"
+        assert status.error == f"{failure}: exhausted"
+
+
 def test_attach_reconciler_fails_visible_terminal_result_without_teardown(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
@@ -4354,11 +4828,12 @@ def test_attach_reconciler_fails_visible_terminal_result_without_teardown(monkey
                 run_id=spec.run_id,
                 state="running",
                 spec=spec.to_dict(),
-                attempt=_attempt_record(
+                attempt=_attempt_record_for_remote(
+                    remote,
                     grant_deadline_at=900.0,
                     work_deadline_at=deadline,
                     result_deadline_at=deadline + 60.0,
-                ).to_dict(),
+                ),
                 remote=remote,
             )
         )

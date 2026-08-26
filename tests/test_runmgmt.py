@@ -1321,6 +1321,177 @@ def test_compare_and_clear_remote_preserves_newer_resource(monkeypatch, tmp_path
     assert runner_status.get_status(spec.run_id).remote == newer
 
 
+def test_compare_and_clear_remote_rejects_stale_attempt_fence(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="compare-fence", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote(attempt=2, fence=1)
+    _persist_active_attempt(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        remote,
+    )
+
+    assert (
+        runner_reconciliation._compare_and_clear_remote(
+            spec.run_id,
+            remote,
+            expected_attempt=(2, 2),
+        )
+        is False
+    )
+    assert runner_status.get_status(spec.run_id).remote == remote
+
+
+def test_retry_policy_consumption_is_fenced_cumulative_and_idempotent(monkeypatch, tmp_path):
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.runner.lifecycle import retry_policy
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="retry-policy-cas",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1),
+    )
+    first_remote = _runpod_remote(attempt=0, fence=1)
+    _persist_active_attempt(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        first_remote,
+    )
+
+    first = retry_policy.consume_retry(
+        spec.run_id,
+        spec,
+        expected_attempt=(0, 1),
+        failure="job_preempted",
+        cache_drop=False,
+        failed_providers=frozenset({"runpod"}),
+        tried_classes=frozenset({("runpod", "RTX 4090", 1)}),
+    )
+    repeated = retry_policy.consume_retry(
+        spec.run_id,
+        spec,
+        expected_attempt=(0, 1),
+        failure="job_preempted",
+        cache_drop=False,
+        failed_providers=frozenset({"runpod"}),
+        tried_classes=frozenset({("runpod", "RTX 4090", 1)}),
+    )
+    assert first == repeated
+    assert repeated.infra_used == 1
+
+    runner_status._update(spec.run_id, "running", remote=None)
+    second = runner_attempts._reserve_attempt_record(spec.run_id, minimum_attempt=1)
+    assert (second.attempt_id, second.fence) == (1, 2)
+    with pytest.raises(RuntimeError, match="current attempt changed"):
+        retry_policy.consume_retry(
+            spec.run_id,
+            spec,
+            expected_attempt=(0, 1),
+            failure="oom",
+            cache_drop=False,
+        )
+    current = retry_policy.consume_retry(
+        spec.run_id,
+        spec,
+        expected_attempt=(1, 2),
+        failure="oom",
+        cache_drop=False,
+        tried_classes=frozenset({("vast", "A100 SXM", 2)}),
+        oom_vram_floor=80.0,
+    )
+    assert current.infra_used == 1
+    assert current.oom_used == 1
+    assert current.failed_providers == frozenset({"runpod"})
+    assert current.tried_classes == frozenset({("runpod", "RTX 4090", 1), ("vast", "A100 SXM", 2)})
+    assert current.oom_vram_floor == 80.0
+
+
+def test_retry_policy_exhaustion_survives_later_attempts(monkeypatch, tmp_path):
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.runner.lifecycle import retry_policy
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="retry-policy-exhaustion",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1),
+    )
+    remote = _runpod_remote(attempt=0, fence=1)
+    _persist_active_attempt(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        remote,
+    )
+    assert retry_policy.consume_retry(
+        spec.run_id,
+        spec,
+        expected_attempt=(0, 1),
+        failure="oom",
+        cache_drop=False,
+    )
+    runner_status._update(spec.run_id, "running", remote=None)
+    second = runner_attempts._reserve_attempt_record(spec.run_id, minimum_attempt=1)
+    assert (
+        retry_policy.consume_retry(
+            spec.run_id,
+            spec,
+            expected_attempt=(second.attempt_id, second.fence),
+            failure="oom",
+            cache_drop=False,
+        )
+        is None
+    )
+
+    infra_spec = JobSpec(
+        run_id="retry-policy-infra-exhaustion",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1),
+    )
+    infra_remote = _runpod_remote(attempt=0, fence=1)
+    _persist_active_attempt(
+        runner_state.RunStatus(
+            run_id=infra_spec.run_id,
+            state="running",
+            spec=infra_spec.to_dict(),
+        ),
+        infra_remote,
+    )
+    current_attempt = (0, 1)
+    for index in range(5):
+        consumed = retry_policy.consume_retry(
+            infra_spec.run_id,
+            infra_spec,
+            expected_attempt=current_attempt,
+            failure="job_preempted",
+            cache_drop=False,
+            failed_providers=frozenset({f"provider-{index}"}),
+            tried_classes=frozenset({(f"provider-{index}", f"gpu-{index}", 1)}),
+        )
+        assert consumed.infra_used == index + 1
+        assert consumed.failed_providers == frozenset(
+            {f"provider-{prior}" for prior in range(index + 1)}
+        )
+        runner_status._update(infra_spec.run_id, "running", remote=None)
+        reserved = runner_attempts._reserve_attempt_record(
+            infra_spec.run_id,
+            minimum_attempt=index + 1,
+        )
+        current_attempt = (reserved.attempt_id, reserved.fence)
+    assert (
+        retry_policy.consume_retry(
+            infra_spec.run_id,
+            infra_spec,
+            expected_attempt=current_attempt,
+            failure="job_preempted",
+            cache_drop=False,
+        )
+        is None
+    )
+
+
 def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
     monkeypatch, tmp_path
 ):
@@ -2715,14 +2886,7 @@ def test_recovered_handleless_retryable_result_resubmits_with_remaining_budget(
     monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
     launched = {}
 
-    def run_background(
-        _spec,
-        _runtime_secrets=None,
-        retry_budget=None,
-        retry_placement=None,
-    ):
-        launched["budget"] = retry_budget
-        launched["placement"] = retry_placement
+    def run_background(_spec, _runtime_secrets=None):
         launched["attempt"] = runner_attempts._reserve_attempt_record(spec.run_id)
 
     monkeypatch.setattr(runner_lifecycle, "_run_job_background", run_background)
@@ -2737,15 +2901,21 @@ def test_recovered_handleless_retryable_result_resubmits_with_remaining_budget(
 
     monkeypatch.setattr(runtime.threading, "Thread", Thread)
 
+    first_recovery = runtime._adopt_handleless_result(spec)
+    second_recovery = runtime._adopt_handleless_result(spec)
+    assert isinstance(first_recovery, runtime._HandlelessRetry)
+    assert second_recovery == first_recovery
+
     runtime._resubmit_recovered_runs([(spec, "provisioning")])
 
     replacement = launched["attempt"]
-    budget = launched["budget"]
-    placement = launched["placement"]
     assert (observed.attempt_id, observed.fence) == (0, 1)
     assert (replacement.attempt_id, replacement.fence) == (1, 2)
-    assert budget.infra_used == expected_infra_used
-    assert budget.oom_used == expected_oom_used
+    from flash.runner.lifecycle.retry_policy import load_retry_policy
+
+    policy = load_retry_policy(spec.run_id)
+    assert policy.infra_used == expected_infra_used
+    assert policy.oom_used == expected_oom_used
     candidates = (
         Candidate("runpod", "RTX 4090", 0.5, 24),
         Candidate(expected_provider, expected_gpu, 1.0, 40),
@@ -2756,8 +2926,6 @@ def test_recovered_handleless_retryable_result_resubmits_with_remaining_budget(
         None,
         _SOURCE_SNAPSHOT,
         replacement.attempt_id,
-        budget,
-        placement,
     )
     plan = attempt_supervision._build_candidate_plan(
         context,
@@ -2844,7 +3012,10 @@ def test_recovered_handleless_multicard_sft_oom_uses_executed_width(monkeypatch,
     retry = runtime._adopt_handleless_result(spec)
 
     assert isinstance(retry, runtime._HandlelessRetry)
-    assert retry.retry_placement.oom_vram_floor == pytest.approx(combined_vram_gb(24, 2))
+    from flash.runner.lifecycle.retry_policy import load_retry_policy
+
+    policy = load_retry_policy(spec.run_id)
+    assert policy.oom_vram_floor == pytest.approx(combined_vram_gb(24, 2))
     replacement = runner_attempts._reserve_attempt_record(spec.run_id)
     context = attempt_supervision._build_context(
         spec,
@@ -2852,8 +3023,6 @@ def test_recovered_handleless_multicard_sft_oom_uses_executed_width(monkeypatch,
         None,
         _SOURCE_SNAPSHOT,
         replacement.attempt_id,
-        retry.retry_budget,
-        retry.retry_placement,
     )
     plan = attempt_supervision._build_candidate_plan(
         context,

@@ -536,7 +536,8 @@ def poll_vast_attempt(
     hf_repo = spec.train.hf_repo
     source_snapshot = source_snapshot_from_status(get_status(spec.run_id), required=True)
 
-    def stamp_cost_and_notes(metrics, *, end_ts, launch_ts) -> None:
+    def stamp_cost_and_notes(metrics, *, end_ts, launch_ts, observed_at=None) -> None:
+        del observed_at
         # customer cost is the worker training wall times the offer's live hourly rate.
         instance_wall_s = max(0.0, end_ts - launch_ts)
         try:

@@ -36,6 +36,7 @@ _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
 _NEXT_FENCE_KEY = "next_fence"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
+_RETRY_POLICY_KEY = "retry_policy"
 _OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
 _PRIVATE_STATUS_KEYS = frozenset(
     {
@@ -43,6 +44,7 @@ _PRIVATE_STATUS_KEYS = frozenset(
         _NEXT_ATTEMPT_KEY,
         _NEXT_FENCE_KEY,
         _CLEANUP_REMOTES_KEY,
+        _RETRY_POLICY_KEY,
         _OPD_RETRY_CONTRACT_KEY,
     }
 )
@@ -315,6 +317,7 @@ def _save_status(
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _next_fence: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
+    _retry_policy: dict | object = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import deadlines
@@ -338,12 +341,17 @@ def _save_status(
                 _next_attempt = 0
             if _next_fence is _PRIVATE_VALUE_UNSET:
                 _next_fence = 1
+            if _retry_policy is _PRIVATE_VALUE_UNSET:
+                from flash.runner.lifecycle.retry_policy import initial_retry_policy
+
+                _retry_policy = initial_retry_policy()
         _save_status_unlocked(
             status,
             _run_deadline_at=_run_deadline_at,
             _next_attempt=_next_attempt,
             _next_fence=_next_fence,
             _cleanup_remotes=_cleanup_remotes,
+            _retry_policy=_retry_policy,
             _opd_retry_contract_version=_opd_retry_contract_version,
         )
 
@@ -355,6 +363,7 @@ def _save_status_unlocked(
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _next_fence: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
+    _retry_policy: dict | object = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import reporting
@@ -379,6 +388,7 @@ def _save_status_unlocked(
         _NEXT_ATTEMPT_KEY: _next_attempt,
         _NEXT_FENCE_KEY: _next_fence,
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
+        _RETRY_POLICY_KEY: _retry_policy,
         _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
     }
     data = _status_storage_dict(status)

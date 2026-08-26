@@ -867,8 +867,7 @@ def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkey
 
 
 def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkeypatch):
-    """Happy-path guard: the TOCTOU fix must NOT regress a genuine recovery. A not-ok poll on a
-    run that is STILL active (no terminal race) must resume `_run_training` exactly as before."""
+    """A retryable failed poll on a still-active run resumes training exactly once."""
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     from flash.core.spec import JobSpec
@@ -894,7 +893,7 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
 
     _make_poll_provider(
         monkeypatch,
-        on_poll=lambda h, s: PollResult(False, failure="stalled", detail="redeploy"),
+        on_poll=lambda h, s: PollResult(False, failure="job_preempted", detail="redeploy"),
     )
 
     out = runner_attach.attach_run(spec.run_id)

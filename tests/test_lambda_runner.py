@@ -1981,7 +1981,20 @@ def test_poll_lambda_returns_current_fenced_result_before_status(monkeypatch):
     assert result.metrics == {"wall_seconds": 12.0}
 
 
-def test_poll_lambda_retries_result_download_and_costs_manifest_finished_at(monkeypatch):
+@pytest.mark.parametrize(
+    ("finished_at", "observed_at", "expected_wall_seconds"),
+    [
+        (8_900.0, 9_101.0, 0.0),
+        (9_200.0, 9_101.0, 101.0),
+        (9_100.0, 9_101.0, 100.0),
+    ],
+)
+def test_poll_lambda_bounds_manifest_finish_to_observable_interval(
+    monkeypatch,
+    finished_at,
+    observed_at,
+    expected_wall_seconds,
+):
     from flash.providers._lifecycle.instances import poll_instance as poll_module
     from flash.providers.artifacts.attempts import AttemptArtifacts
     from flash.runner.lifecycle.protocol import ResultManifest
@@ -2000,8 +2013,8 @@ def test_poll_lambda_retries_result_download_and_costs_manifest_finished_at(monk
         fence=1,
         outcome="succeeded",
         failure_class=None,
-        started_at=9_000.0,
-        finished_at=9_100.0,
+        started_at=8_800.0,
+        finished_at=finished_at,
         training_entered=True,
         completed_steps=1,
         metrics={"wall_seconds": 80.0},
@@ -2018,7 +2031,7 @@ def test_poll_lambda_retries_result_download_and_costs_manifest_finished_at(monk
     reads = iter(
         [
             OSError("temporary result download failure"),
-            AttemptArtifacts("revision", 9_101.0, None, manifest.to_dict()),
+            AttemptArtifacts("revision", observed_at, None, manifest.to_dict()),
         ]
     )
 
@@ -2040,7 +2053,7 @@ def test_poll_lambda_retries_result_download_and_costs_manifest_finished_at(monk
     )
 
     assert result.ok
-    assert result.metrics["cost_usd"] == round(100.0 / 3600.0 * 1.29, 6)
+    assert result.metrics["cost_usd"] == round(expected_wall_seconds / 3600.0 * 1.29, 6)
     assert result.metrics["notes"]["lambda_region"] == "us-east-1"
 
 

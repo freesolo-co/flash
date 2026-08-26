@@ -99,6 +99,7 @@ def _observe_result(adapter: InstancePollAdapter) -> PollResult | None:
             result.metrics,
             end_ts=float(artifacts.result["finished_at"]),
             launch_ts=adapter.launch_ts,
+            observed_at=float(artifacts.observed_at),
         )
     return result
 

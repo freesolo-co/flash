@@ -680,9 +680,11 @@ def poll_lambda_attempt(
     hf_repo = spec.train.hf_repo
     source_snapshot = source_snapshot_from_status(get_status(spec.run_id), required=True)
 
-    def stamp_cost_and_notes(metrics, *, end_ts, launch_ts) -> None:
+    def stamp_cost_and_notes(metrics, *, end_ts, launch_ts, observed_at=None) -> None:
         # Lambda bills the INSTANCE wall (launch -> completion), not the worker's train wall.
-        wall_h = (end_ts - launch_ts) / 3600.0
+        observed_at = end_ts if observed_at is None else observed_at
+        bounded_end_ts = max(launch_ts, min(end_ts, observed_at))
+        wall_h = (bounded_end_ts - launch_ts) / 3600.0
         metrics["cost_usd"] = round(wall_h * handle.hourly_usd, 6)
         notes = metrics.get("notes") if isinstance(metrics.get("notes"), dict) else {}
         notes.update(

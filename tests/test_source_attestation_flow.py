@@ -192,6 +192,7 @@ def test_attach_freezes_top_level_descriptor_and_discards_legacy_prefix(
         "key_fingerprint": "c" * 64,
         "job_id": "job",
         "attempt": 2,
+        "fence": 9,
         "started_ts": 100.0,
         "code_prefix": "code/legacy/flash",
     }
@@ -202,6 +203,7 @@ def test_attach_freezes_top_level_descriptor_and_discards_legacy_prefix(
             spec=spec.to_dict(),
             source_snapshot=SOURCE_SNAPSHOT,
             remote=remote,
+            attempt=_status().attempt,
         )
     )
 

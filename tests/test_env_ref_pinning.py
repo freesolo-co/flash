@@ -5,7 +5,9 @@ from __future__ import annotations
 import io
 
 import flash.runner.accounting.artifacts as runner_artifacts
+import flash.runner.lifecycle.state as runner_state
 from flash.core.spec import JobSpec
+from tests._helpers.runner import provisioned_status
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 _SHA = "a" * 40
@@ -43,7 +45,9 @@ def test_worker_retry_path_has_no_github_pin_fallback() -> None:
     assert not hasattr(lifecycle, "_spec_with_resolved_env_sha")
 
 
-def test_submit_context_preserves_controller_staged_identity_without_resolving(monkeypatch) -> None:
+def test_submit_context_preserves_controller_staged_identity_without_resolving(
+    monkeypatch, tmp_path
+) -> None:
     from flash.runner.supervise import attempt_supervision
 
     monkeypatch.setattr(
@@ -52,6 +56,14 @@ def test_submit_context_preserves_controller_staged_identity_without_resolving(m
         lambda _spec: (_ for _ in ()).throw(AssertionError("worker retry must not resolve github")),
     )
     spec = _staged_spec()
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    runner_state._save_status(
+        provisioned_status(
+            spec,
+            state="provisioning",
+            source_snapshot=valid_source_snapshot(),
+        )
+    )
     context = attempt_supervision._build_context(
         spec,
         io.StringIO(),

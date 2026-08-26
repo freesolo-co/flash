@@ -153,8 +153,6 @@ _DEFERRED_RECOVERY_RETRY_S = 120.0
 
 @dataclass(frozen=True)
 class _HandlelessRetry:
-    retry_budget: object
-    retry_placement: object
     expected_attempt: tuple[int, int]
 
 
@@ -334,10 +332,7 @@ def _start_resubmit(
             spec.run_id,
             "control plane restarted without a durable handle; resubmitting",
         )
-    thread_args = (
-        (spec, None, retry.retry_budget, retry.retry_placement) if retry is not None else (spec,)
-    )
-    threading.Thread(target=_run_job_background, args=thread_args, daemon=True).start()
+    threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
     return True
 
 
@@ -351,51 +346,6 @@ def _status_attempt_identity(status) -> tuple[int, int] | None:
     return attempt.attempt_id, attempt.fence
 
 
-def _recovered_retry_placement(status, failure: str | None):
-    from flash.cost.facts import gpu_vram_gb
-    from flash.cost.spec import sft_ranking_overrides
-    from flash.providers.core.allocator import _executed_gpu_count, _overridden_train
-    from flash.providers.core.sharding import combined_vram_gb
-    from flash.runner.lifecycle.protocol import AttemptRecord
-    from flash.runner.lifecycle.status import effective_spec_from_status
-    from flash.runner.supervise.lifecycle import _RetryPlacement
-
-    attempt = AttemptRecord.from_dict(status.attempt)
-    resource = attempt.resource if isinstance(attempt.resource, dict) else {}
-    provider = attempt.provider or resource.get("provider")
-    gpu = resource.get("allocated_gpu")
-    gpu_count = resource.get("allocated_gpu_count")
-    if (
-        not isinstance(provider, str)
-        or not provider
-        or not isinstance(gpu, str)
-        or not gpu
-        or isinstance(gpu_count, bool)
-        or not isinstance(gpu_count, int)
-        or gpu_count < 1
-    ):
-        return _RetryPlacement()
-    shape = (provider, gpu, gpu_count)
-    if failure == "oom":
-        effective_spec = effective_spec_from_status(status)
-        overrides = sft_ranking_overrides(effective_spec)
-        sized_train = _overridden_train(effective_spec.train, overrides)
-        executed_gpu_count = _executed_gpu_count(
-            effective_spec.algorithm,
-            sized_train,
-            overrides,
-            gpu_count,
-        )
-        return _RetryPlacement(
-            tried_classes=frozenset({shape}),
-            oom_vram_floor=combined_vram_gb(gpu_vram_gb(gpu), executed_gpu_count),
-        )
-    return _RetryPlacement(
-        failed_providers=frozenset({provider}),
-        tried_classes=frozenset({shape}),
-    )
-
-
 def _adopt_handleless_result(spec) -> bool | _HandlelessRetry | None:
     """adopt current fenced result, report absence, or retain retry authority."""
     from flash.runner.accounting.reconciliation import _compare_and_fail_remote
@@ -403,7 +353,7 @@ def _adopt_handleless_result(spec) -> bool | _HandlelessRetry | None:
     from flash.runner.supervise.lifecycle import (
         _adopt_completed_attempt,
         _attempt_result,
-        _retry_budget_for_spec,
+        _consume_recovered_retry_state,
     )
 
     try:
@@ -433,14 +383,14 @@ def _adopt_handleless_result(spec) -> bool | _HandlelessRetry | None:
                 expected_attempt=expected_attempt,
             )
         else:
-            retry_budget = _retry_budget_for_spec(spec)
-            if retry_budget.can_retry(result.failure, cache_drop=False):
-                retry_budget.record_retry(result.failure, cache_drop=False)
-                return _HandlelessRetry(
-                    retry_budget,
-                    _recovered_retry_placement(status, result.failure),
-                    expected_attempt,
-                )
+            retry_state = _consume_recovered_retry_state(
+                spec,
+                status,
+                result.failure,
+                expected_attempt,
+            )
+            if retry_state is not None:
+                return _HandlelessRetry(expected_attempt)
             reason = f"{result.failure or 'job_failed'}: {result.detail or 'worker attempt failed'}"
             applied = _compare_and_fail_remote(
                 spec.run_id,
