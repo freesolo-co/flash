@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 from types import SimpleNamespace
 from urllib.parse import quote
 
@@ -11,8 +10,8 @@ from fastapi.testclient import TestClient
 
 from flash.cli.commands.env.testing.eval import _resolve_evaluation_target
 from flash.schema import format_checkpoint_ref
-from flash.server.routes.serving_revisions import _authorized_chat_checkpoint
 from flash.serve.contract.responses import matches_revision_identity
+from flash.server.routes.serving_revisions import _authorized_chat_checkpoint
 from flash.serving.src.engine.support import active_checkpoint_ref
 from flash.serving.src.http.router import build_offline_serving_app
 from flash.serving.src.http.routing import AdapterRouter
@@ -159,9 +158,7 @@ def test_artifact_digest_and_binding_fingerprint_are_distinct() -> None:
     changed = record.model_copy(update={"base_model": "Qwen/Qwen3.5-4B"})
     assert immutable_binding_fingerprint(changed) != record.artifact_fingerprint
     payload = internal_adapter_payload(record)
-    registration = {
-        name: payload[name] for name in ImmutableCheckpointRegistration.model_fields
-    }
+    registration = {name: payload[name] for name in ImmutableCheckpointRegistration.model_fields}
     with pytest.raises(ValueError, match="immutable binding"):
         ImmutableCheckpointRegistration.model_validate(
             {**registration, "artifact_fingerprint": "d" * 64}
@@ -232,6 +229,7 @@ def test_evaluation_accepts_verified_sibling_without_latest_deployment_equality(
 
 def test_hosted_authorizer_uses_freesolo_model_id_schema(monkeypatch) -> None:
     import httpx
+
     from flash.serving.app import modal_app
 
     seen = {}

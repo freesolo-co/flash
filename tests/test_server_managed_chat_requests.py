@@ -62,15 +62,17 @@ def test_managed_chat_rejects_unverified_checkpoint() -> None:
         )
 
 
-def test_managed_chat_rejects_checkpoint_other_than_ready_deployment_record() -> None:
+def test_managed_chat_accepts_any_exact_verified_ready_sibling() -> None:
     sibling = f"{RUN_ID}/step-20"
-    with pytest.raises(HTTPException, match="not the active managed deployment record"):
+    assert (
         _authorized_chat_checkpoint(
             RUN_ID,
             _ready_deployment(),
             sibling,
             {CHECKPOINT_ID, sibling},
         )
+        == sibling
+    )
 
 
 def test_managed_provenance_contains_only_checkpoint_identity() -> None:

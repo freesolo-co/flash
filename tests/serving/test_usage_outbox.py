@@ -328,7 +328,8 @@ def test_nonstream_capture_is_awaited_before_successful_response() -> None:
     assert event.principal == FreesoloOrgTrafficPrincipal(orgId="org-1")
     assert event.target.public_model_id == record.adapter_id
     assert event.target.checkpoint_id == record.checkpoint
-    assert event.target.artifact_fingerprint == record.artifact_digest
+    assert event.target.artifact_fingerprint == record.artifact_fingerprint
+    assert event.target.artifact_fingerprint != record.artifact_digest
     assert event.facts.prompt_tokens == 2
     assert event.facts.completion_tokens == 1
     assert event.facts.cached_tokens == 1
