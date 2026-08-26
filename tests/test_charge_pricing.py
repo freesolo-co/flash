@@ -497,6 +497,81 @@ def _attempt_progress(
     return {"attempt": attempt.to_dict(), "progress": progress}
 
 
+def test_older_progress_projection_cannot_reduce_cancellation_steps(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _spec()
+    identity = _attempt_progress(None)
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id="run-monotonic", state="running", spec=spec.to_dict(), **identity
+        )
+    )
+    current = {
+        "attempt_id": 0,
+        "fence": 1,
+        "sequence": 7,
+        "completed_steps": 7,
+        "training_entered": True,
+        "receipt": {"path": "progress-7", "revision": "rev-7", "digest": "a" * 64},
+    }
+    older = {
+        **current,
+        "sequence": 6,
+        "completed_steps": 3,
+        "receipt": {"path": "progress-6", "revision": "rev-6", "digest": "b" * 64},
+    }
+    assert runner_status.record_progress("run-monotonic", current, attempt_id=0, fence=1)
+    assert not runner_status.record_progress("run-monotonic", older, attempt_id=0, fence=1)
+
+    status = runner_status.get_status("run-monotonic")
+    assert status.progress["sequence"] == 7
+    assert runner_costs.actual_steps_run(status) == 7
+
+
+def test_equal_progress_sequence_updates_observation_only_for_same_digest(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _spec()
+    identity = _attempt_progress(None)
+    runner_state._save_status(
+        runner_state.RunStatus(run_id="run-equal", state="running", spec=spec.to_dict(), **identity)
+    )
+    progress = {
+        "attempt_id": 0,
+        "fence": 1,
+        "sequence": 4,
+        "completed_steps": 4,
+        "metrics": {"reward": 0.5},
+        "observed_at": 10.0,
+        "receipt": {"path": "progress-4", "revision": "rev-1", "digest": "c" * 64},
+    }
+    assert runner_status.record_progress("run-equal", progress, attempt_id=0, fence=1)
+    assert runner_status.record_progress(
+        "run-equal",
+        {
+            **progress,
+            "completed_steps": 0,
+            "metrics": {"reward": -1.0},
+            "observed_at": 20.0,
+            "receipt": {**progress["receipt"], "revision": "rev-2"},
+        },
+        attempt_id=0,
+        fence=1,
+    )
+
+    conflicting = {
+        **progress,
+        "observed_at": 30.0,
+        "receipt": {**progress["receipt"], "digest": "d" * 64},
+    }
+    assert not runner_status.record_progress("run-equal", conflicting, attempt_id=0, fence=1)
+
+    stored = runner_status.get_status("run-equal").progress
+    assert stored["completed_steps"] == 4
+    assert stored["metrics"] == {"reward": 0.5}
+    assert stored["observed_at"] == 20.0
+    assert stored["receipt"]["revision"] == "rev-2"
+
+
 def test_cancel_run_prices_mid_training_cancel_at_actual_steps(monkeypatch, tmp_path):
     from flash.runner.supervise import deploy
 

@@ -497,6 +497,34 @@ def test_train_metadata_preserves_terminal_progress_fields(monkeypatch):
     assert finalized[0][1] == {"progress_fields": {"metrics_last": metrics_last}}
 
 
+def test_finalize_carries_latched_checkpoint_failure_into_success_result(monkeypatch):
+    from unittest.mock import mock_open
+
+    from flash.engine.result.accounting import RunMetrics
+    from flash.engine.worker.train.core.lifecycle import finalize
+
+    published = []
+    failure = {"step": 4, "operation": "resume", "error": "upload denied"}
+    monkeypatch.setattr(RunMetrics, "save", lambda self, path: None)
+    monkeypatch.setattr(finalize.progress_io, "pending_checkpoint_failure", lambda: failure)
+    monkeypatch.setattr(
+        finalize.result_io,
+        "publish_result",
+        lambda **kwargs: (
+            published.append(kwargs)
+            or SimpleNamespace(run_id="run-1", phase_namespace="rl", attempt_id=1, fence=1)
+        ),
+    )
+    monkeypatch.setattr(finalize.result_io, "result_path", lambda _manifest: "result.json")
+    monkeypatch.setattr(finalize.progress_io, "publish_progress", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
+    monkeypatch.setattr("builtins.open", mock_open())
+
+    finalize._finalize(RunMetrics(phase="rl"), progress_fields={"metrics_last": []})
+
+    assert published[0]["checkpoint"] == {"failure": failure}
+
+
 def test_finalize_publishes_result_receipt_progress(monkeypatch):
     from unittest.mock import mock_open
 

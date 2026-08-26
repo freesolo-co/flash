@@ -1992,6 +1992,58 @@ def test_attach_transient_current_fence_result_read_stays_pending(monkeypatch, t
     assert len(scheduled) == 1
 
 
+def test_failed_attach_poll_defers_transient_result_transport(monkeypatch):
+    import io
+    from types import SimpleNamespace
+
+    import flash.runner.supervise.attach as attach
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.providers.core.base import JobHandle, PollResult
+
+    remote = _runpod_remote("endpoint-transient", "job-transient", attempt=0)
+    context = attach._AttachContext(
+        worker_spec=object(),
+        persisted_remote=remote,
+        handle=JobHandle.from_dict(remote),
+        seed=0,
+        recovered_attempt=0,
+        next_attempt=1,
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+    current = SimpleNamespace(state="running", remote=remote)
+    monkeypatch.setattr(
+        lifecycle,
+        "_attempt_result_metrics",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("temporary result outage")),
+    )
+    monkeypatch.setattr(runner_status, "get_status", lambda _run_id: current)
+    scheduled = []
+    monkeypatch.setattr(
+        attach,
+        "_schedule_attach_reconciliation",
+        lambda *args, **kwargs: scheduled.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: pytest.fail(
+            "transient result transport must not trigger teardown"
+        ),
+    )
+
+    observed = attach._handle_failed_attach_poll(
+        "run-transient",
+        context,
+        PollResult(False, failure="job_preempted", detail="provider ended"),
+        io.StringIO(),
+    )
+
+    assert observed is current
+    assert observed.state == "running"
+    assert observed.remote == remote
+    assert len(scheduled) == 1
+
+
 def test_attach_invalid_current_fence_result_fails_closed(monkeypatch, tmp_path):
     import io
 

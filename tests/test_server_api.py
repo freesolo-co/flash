@@ -3544,6 +3544,52 @@ def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
+def test_public_run_routes_omit_result_attestation_and_repository_revision(api):
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner_status.get_status(run_id)
+    status.result = {
+        "attempt_id": 0,
+        "fence": 1,
+        "outcome": "succeeded",
+        "completed_steps": 3,
+        "metrics": {"train_tokens": 128},
+        "checkpoint": {"adapter": "published"},
+        "artifacts": {"metrics": "embedded"},
+        "source_attestation": {"private": "attestation"},
+        "receipt": {
+            "path": "sft/run/result/digest.json",
+            "revision": "a" * 40,
+            "digest": "b" * 64,
+        },
+    }
+    runner_state._save_status(status)
+
+    direct = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    listed = next(
+        row
+        for row in api.get("/v1/runs", headers=_bearer(key)).json()["runs"]
+        if row["run_id"] == run_id
+    )
+    logs = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
+    for body in (direct, listed, logs):
+        result = body["result"]
+        assert result["outcome"] == "succeeded"
+        assert result["completed_steps"] == 3
+        assert result["metrics"] == {"train_tokens": 128}
+        assert result["receipt"] == {
+            "path": "sft/run/result/digest.json",
+            "digest": "b" * 64,
+        }
+        assert "source_attestation" not in result
+
+    persisted = runner_status.get_status(run_id).result
+    assert persisted["source_attestation"] == {"private": "attestation"}
+    assert persisted["receipt"]["revision"] == "a" * 40
+
+
 def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
     import flash.server.asgi.app as app_mod
 

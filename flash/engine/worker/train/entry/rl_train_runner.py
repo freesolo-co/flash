@@ -616,10 +616,12 @@ def _ingest_step_metrics(
         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
         LATEST_GRPO_METRICS[:] = state.metrics_last
         progress_fields = _reward_observability()
+        scalar_metrics = {key: value for key, value in step_metrics.items() if key != "step"}
         _worker_progress.publish_progress(
             "rl_step",
             step=step_metrics["step"],
             metrics_last=list(state.metrics_last),
+            **scalar_metrics,
             **progress_fields,
             gpu=gpu_diagnostics(include_torch=False),
         )

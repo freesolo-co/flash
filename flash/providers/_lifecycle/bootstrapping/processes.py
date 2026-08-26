@@ -10,7 +10,24 @@ import time
 
 _TERM_GRACE_S = 10.0
 _KILL_GRACE_S = 5.0
+_TERMINATION_SCHEDULING_RESERVE_S = 1.0
 _POLL_S = 0.1
+
+
+def worker_execution_deadline(
+    upload_deadline_at: float,
+    console_stop_timeout_s: float,
+    console_final_timeout_s: float,
+) -> float:
+    """reserve complete worker teardown and console cleanup before the outer watchdog."""
+    return (
+        upload_deadline_at
+        - _TERM_GRACE_S
+        - _KILL_GRACE_S
+        - _TERMINATION_SCHEDULING_RESERVE_S
+        - console_stop_timeout_s
+        - console_final_timeout_s
+    )
 
 
 def _group_exists(process_group_id: int) -> bool:

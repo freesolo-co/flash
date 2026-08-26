@@ -635,6 +635,44 @@ def test_poll_job_preserves_provider_health_observations(monkeypatch, workers, g
     assert result.failure == failure
 
 
+def test_poll_job_unhealthy_queue_does_not_latch_grant_or_expire_queue_first(monkeypatch):
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(
+            grant_deadline_at=100.0,
+            work_deadline_at=200.0,
+            result_deadline_at=220.0,
+        ),
+        results=[None] * 10,
+    )
+    clock = iter((0.0, 0.0, 1.0, 1.0, 6.0, 6.0, 6.0, 6.0))
+    monkeypatch.setattr(polling.time, "time", lambda: next(clock, 6.0))
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda *_args, **_kwargs: {"status": "IN_QUEUE"},
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *_args, **_kwargs: {"workers": {"unhealthy": 1}},
+    )
+
+    result = polling.poll_job(
+        _runpod_handle(jobs),
+        _poll_spec(),
+        interval_s=0,
+        queue_grace_s=1.0,
+        unhealthy_grace_s=5.0,
+    )
+
+    assert result.failure == "job_preempted"
+    assert result.detail == "RunPod worker remained unhealthy"
+
+
 def test_poll_job_recovers_transient_result_download_to_current_fenced_success(monkeypatch):
     from flash.providers.core.base import PollResult
     from flash.providers.runpod.client import api as runpod_api

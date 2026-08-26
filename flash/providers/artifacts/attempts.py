@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from flash.providers.core.base import PollResult
@@ -21,6 +23,17 @@ from flash.snapshot.archive import TERMINAL_ATTESTATION_KEY, validate_attestatio
 
 _PROGRESS_NAME = re.compile(r"^(?P<sequence>[0-9]{20})-(?P<digest>[0-9a-f]{64})\.json$")
 _RESULT_NAME = re.compile(r"^(?P<digest>[0-9a-f]{64})\.json$")
+_PROGRESS_CACHE_LIMIT = 256
+_PROGRESS_CACHE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _ProgressCacheEntry:
+    record: ProgressRecord
+    identities: tuple[tuple[int, str, str], ...]
+
+
+_PROGRESS_CACHE: OrderedDict[tuple[str, str], _ProgressCacheEntry] = OrderedDict()
 
 
 class AttemptArtifactError(RuntimeError):
@@ -63,6 +76,29 @@ def _repo_snapshot(hf_repo: str) -> tuple[str, list[str]]:
     return revision, paths
 
 
+def _cached_progress(hf_repo: str, prefix: str) -> _ProgressCacheEntry | None:
+    key = (hf_repo, prefix)
+    with _PROGRESS_CACHE_LOCK:
+        entry = _PROGRESS_CACHE.get(key)
+        if entry is not None:
+            _PROGRESS_CACHE.move_to_end(key)
+        return entry
+
+
+def _cache_progress(
+    hf_repo: str,
+    prefix: str,
+    record: ProgressRecord,
+    identities: tuple[tuple[int, str, str], ...],
+) -> None:
+    key = (hf_repo, prefix)
+    with _PROGRESS_CACHE_LOCK:
+        _PROGRESS_CACHE[key] = _ProgressCacheEntry(record, identities)
+        _PROGRESS_CACHE.move_to_end(key)
+        while len(_PROGRESS_CACHE) > _PROGRESS_CACHE_LIMIT:
+            _PROGRESS_CACHE.popitem(last=False)
+
+
 def _decode_progress(
     hf_repo: str,
     paths: list[str],
@@ -81,10 +117,22 @@ def _decode_progress(
             continue
         sequence = int(match.group("sequence"))
         candidates.setdefault(sequence, []).append((path, match.group("digest")))
-    previous: ProgressRecord | None = None
-    selected_path = ""
-    selected_digest = ""
-    for sequence in range(1, max(candidates, default=0) + 1):
+    cached = _cached_progress(hf_repo, prefix)
+    previous = cached.record if cached is not None else None
+    start_sequence = 1
+    if cached is not None:
+        current_identities = tuple(
+            (sequence, path, digest)
+            for sequence in range(1, cached.record.sequence + 1)
+            for path, digest in candidates.get(sequence, ())
+        )
+        if current_identities == cached.identities:
+            start_sequence = cached.record.sequence + 1
+        else:
+            previous = None
+    selected_path = progress_path(previous) if previous is not None else ""
+    selected_digest = digest_record(previous.to_dict()) if previous is not None else ""
+    for sequence in range(start_sequence, max(candidates, default=0) + 1):
         choices = candidates.get(sequence)
         if choices is None or len(choices) != 1:
             break
@@ -104,6 +152,12 @@ def _decode_progress(
         selected_digest = expected_digest
     if previous is None:
         return None
+    identities = tuple(
+        (sequence, path, digest)
+        for sequence in range(1, previous.sequence + 1)
+        for path, digest in candidates.get(sequence, ())
+    )
+    _cache_progress(hf_repo, prefix, previous, identities)
     return {
         **previous.to_dict(),
         "observed_at": observed_at,

@@ -102,6 +102,12 @@ def _finalize(metrics: RunMetrics, *, progress_fields=None):
     metrics.save("/tmp/metrics.json")
     step = metrics.step
     completed_steps = int(step) if isinstance(step, (int, float)) and step > 0 else 0
+    progress_fields = progress_fields or {}
+    checkpoint_failure = (
+        progress_fields["checkpoint_failure"]
+        if "checkpoint_failure" in progress_fields
+        else progress_io.pending_checkpoint_failure()
+    )
     manifest = result_io.publish_result(
         outcome="succeeded",
         failure_class=None,
@@ -109,7 +115,7 @@ def _finalize(metrics: RunMetrics, *, progress_fields=None):
         training_entered=True,
         completed_steps=completed_steps,
         metrics=json.loads(metrics.to_json()),
-        checkpoint={"failure": (progress_fields or {}).get("checkpoint_failure")},
+        checkpoint={"failure": checkpoint_failure},
         artifacts={"metrics": "embedded", "adapter": "published"},
     )
     progress_io.publish_progress(

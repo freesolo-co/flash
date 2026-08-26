@@ -9,6 +9,8 @@ import os
 import re
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 from flash.engine.result.rollout_samples import (
@@ -26,13 +28,30 @@ from flash.runner.lifecycle.protocol import (
 )
 
 _PROGRESS_LOCK = threading.Lock()
+_PROGRESS_DRAIN_LOCK = threading.Lock()
 _PROGRESS_SEQUENCE = 0
 _PROGRESS_PREVIOUS_DIGEST: str | None = None
 _PROGRESS_TRAINING_ENTERED = False
 _PROGRESS_COMPLETED_STEPS = 0
 _PROGRESS_PENDING_CHECKPOINT_FAILURE: dict[str, int | str] | None = None
+_PROGRESS_FATAL_ERROR: Exception | None = None
+_PROGRESS_QUEUE = deque()
 LATEST_GRPO_METRICS: list = []
 GRPO_METRIC_HISTORY_LIMIT = 1024
+
+
+class _ProgressUploadAmbiguous(RuntimeError):
+    """an upload may have committed, but its exact immutable path could not be read back."""
+
+
+@dataclass
+class _PendingProgress:
+    stage: str
+    initial: bool
+    fields: dict
+    committed: bool = False
+    record: ProgressRecord | None = None
+    error: Exception | None = None
 
 
 def _progress_kind(stage: str) -> str:
@@ -48,6 +67,7 @@ def _progress_kind(stage: str) -> str:
 def _progress_sections(fields: dict) -> tuple[dict, list, dict, dict, dict, dict]:
     metrics_keys = {
         "epoch",
+        "discarded_rollouts",
         "entropy",
         "frac_reward_zero_std",
         "grad_norm",
@@ -120,56 +140,145 @@ def _write_local_immutable(payload: bytes) -> str:
             os.unlink(temporary)
 
 
+def _remote_record_payload(path: str) -> bytes | None:
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import RemoteEntryNotFoundError
+
+    try:
+        local = hf_hub_download(
+            repo_id=worker_state.HF_REPO,
+            repo_type="dataset",
+            filename=path,
+            token=os.environ.get("HF_TOKEN"),
+            force_download=True,
+        )
+    except RemoteEntryNotFoundError:
+        return None
+    with open(local, "rb") as handle:
+        return handle.read()
+
+
 def _upload_record(record: ProgressRecord, *, required: bool) -> bool:
-    local = _write_local_immutable(canonical_bytes(record.to_dict()))
-    return hf_io.hf_upload_absolute(local, progress_path(record), required=required)
+    payload = canonical_bytes(record.to_dict())
+    local = _write_local_immutable(payload)
+    path = progress_path(record)
+    try:
+        committed = hf_io.hf_upload_absolute(local, path, required=required)
+    except Exception as upload_error:
+        try:
+            remote = _remote_record_payload(path)
+        except Exception as verify_error:
+            raise _ProgressUploadAmbiguous(
+                "progress upload outcome is ambiguous because its immutable path could not be verified"
+            ) from verify_error
+        if remote == payload:
+            return True
+        if remote is not None:
+            raise RuntimeError("immutable progress path contains different bytes") from upload_error
+        raise upload_error
+    if committed or not worker_state.HF_REPO:
+        return committed
+    remote = _remote_record_payload(path)
+    if remote == payload:
+        return True
+    if remote is not None:
+        raise RuntimeError("immutable progress path contains different bytes")
+    return False
+
+
+def pending_checkpoint_failure() -> dict[str, int | str] | None:
+    """Return the checkpoint failure currently latched into cumulative progress."""
+    with _PROGRESS_LOCK:
+        return (
+            dict(_PROGRESS_PENDING_CHECKPOINT_FAILURE)
+            if _PROGRESS_PENDING_CHECKPOINT_FAILURE
+            else None
+        )
+
+
+def _build_pending_record(pending: _PendingProgress) -> ProgressRecord:
+    global _PROGRESS_COMPLETED_STEPS, _PROGRESS_PENDING_CHECKPOINT_FAILURE
+    global _PROGRESS_TRAINING_ENTERED
+
+    fields = dict(pending.fields)
+    step = fields.get("step")
+    if isinstance(step, (int, float)) and not isinstance(step, bool) and step >= 0:
+        _PROGRESS_COMPLETED_STEPS = max(_PROGRESS_COMPLETED_STEPS, int(step))
+    if pending.stage in {"rl_step", "sft_step", "opd_step"}:
+        _PROGRESS_TRAINING_ENTERED = True
+    if pending.stage == "checkpoint_upload_failed":
+        failure = fields.get("checkpoint_failure")
+        if isinstance(failure, dict):
+            _PROGRESS_PENDING_CHECKPOINT_FAILURE = dict(failure)
+    elif pending.stage == "checkpoint_uploaded":
+        _PROGRESS_PENDING_CHECKPOINT_FAILURE = None
+    if _PROGRESS_PENDING_CHECKPOINT_FAILURE and "checkpoint_failure" not in fields:
+        fields["checkpoint_failure"] = dict(_PROGRESS_PENDING_CHECKPOINT_FAILURE)
+    metrics, samples, timing, checkpoint, gpu, diagnostics = _progress_sections(fields)
+    return ProgressRecord(
+        run_id=worker_state.RUN_ID,
+        phase_namespace=worker_state.PHASE,
+        attempt_id=worker_state.ATTEMPT,
+        fence=worker_state.FENCE,
+        sequence=_PROGRESS_SEQUENCE + 1,
+        previous_digest=_PROGRESS_PREVIOUS_DIGEST,
+        occurred_at=time.time(),
+        kind=_progress_kind(pending.stage),
+        phase=pending.stage,
+        training_entered=_PROGRESS_TRAINING_ENTERED,
+        completed_steps=_PROGRESS_COMPLETED_STEPS,
+        metrics=bounded_json(metrics),
+        samples=bounded_json(samples),
+        timing=bounded_json(timing),
+        checkpoint=bounded_json(checkpoint),
+        gpu_observation=bounded_json(gpu),
+        diagnostics=bounded_json(diagnostics),
+    )
+
+
+def _drain_progress_until(target: _PendingProgress) -> None:
+    global _PROGRESS_FATAL_ERROR, _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE
+
+    with _PROGRESS_DRAIN_LOCK:
+        while True:
+            with _PROGRESS_LOCK:
+                if not any(item is target for item in _PROGRESS_QUEUE):
+                    return
+                pending = _PROGRESS_QUEUE[0]
+                record = _build_pending_record(pending)
+                pending.record = record
+            try:
+                committed = _upload_record(record, required=pending.initial)
+            except Exception as exc:
+                with _PROGRESS_LOCK:
+                    pending.error = exc
+                    _PROGRESS_FATAL_ERROR = exc
+                    while _PROGRESS_QUEUE:
+                        blocked = _PROGRESS_QUEUE.popleft()
+                        blocked.error = exc
+                return
+            with _PROGRESS_LOCK:
+                _PROGRESS_QUEUE.popleft()
+                pending.committed = committed
+                if committed:
+                    _PROGRESS_SEQUENCE = record.sequence
+                    _PROGRESS_PREVIOUS_DIGEST = digest_record(record.to_dict())
+            print("PROGRESS", json.dumps(record.to_dict(), allow_nan=False, sort_keys=True))
+            if pending is target:
+                return
 
 
 def publish_progress(stage: str, *, initial: bool = False, **fields):
     """Publish one immutable cumulative progress record for observed work only."""
-    global _PROGRESS_COMPLETED_STEPS, _PROGRESS_PENDING_CHECKPOINT_FAILURE
-    global _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE, _PROGRESS_TRAINING_ENTERED
+    pending = _PendingProgress(stage, initial, dict(fields))
     with _PROGRESS_LOCK:
-        step = fields.get("step")
-        if isinstance(step, (int, float)) and not isinstance(step, bool) and step >= 0:
-            _PROGRESS_COMPLETED_STEPS = max(_PROGRESS_COMPLETED_STEPS, int(step))
-        if stage in {"rl_step", "sft_step", "opd_step"}:
-            _PROGRESS_TRAINING_ENTERED = True
-        if stage == "checkpoint_upload_failed":
-            failure = fields.get("checkpoint_failure")
-            if isinstance(failure, dict):
-                _PROGRESS_PENDING_CHECKPOINT_FAILURE = dict(failure)
-        elif stage == "checkpoint_uploaded":
-            _PROGRESS_PENDING_CHECKPOINT_FAILURE = None
-        if _PROGRESS_PENDING_CHECKPOINT_FAILURE and "checkpoint_failure" not in fields:
-            fields["checkpoint_failure"] = dict(_PROGRESS_PENDING_CHECKPOINT_FAILURE)
-        sequence = _PROGRESS_SEQUENCE + 1
-        metrics, samples, timing, checkpoint, gpu, diagnostics = _progress_sections(fields)
-        record = ProgressRecord(
-            run_id=worker_state.RUN_ID,
-            phase_namespace=worker_state.PHASE,
-            attempt_id=worker_state.ATTEMPT,
-            fence=worker_state.FENCE,
-            sequence=sequence,
-            previous_digest=_PROGRESS_PREVIOUS_DIGEST,
-            occurred_at=time.time(),
-            kind=_progress_kind(stage),
-            phase=stage,
-            training_entered=_PROGRESS_TRAINING_ENTERED,
-            completed_steps=_PROGRESS_COMPLETED_STEPS,
-            metrics=bounded_json(metrics),
-            samples=bounded_json(samples),
-            timing=bounded_json(timing),
-            checkpoint=bounded_json(checkpoint),
-            gpu_observation=bounded_json(gpu),
-            diagnostics=bounded_json(diagnostics),
-        )
-        committed = _upload_record(record, required=initial)
-        if committed:
-            _PROGRESS_SEQUENCE = sequence
-            _PROGRESS_PREVIOUS_DIGEST = digest_record(record.to_dict())
-    print("PROGRESS", json.dumps(record.to_dict(), allow_nan=False, sort_keys=True))
-    return committed
+        if _PROGRESS_FATAL_ERROR is not None:
+            raise _PROGRESS_FATAL_ERROR
+        _PROGRESS_QUEUE.append(pending)
+    _drain_progress_until(pending)
+    if pending.error is not None:
+        raise pending.error
+    return pending.committed
 
 
 _REWARD_METRIC_NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9_.-]")

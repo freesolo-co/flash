@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import itertools
+import json
 import threading
 import time
 
@@ -19,6 +20,8 @@ def _reset(monkeypatch) -> None:
     monkeypatch.setattr(progress_io, "_PROGRESS_TRAINING_ENTERED", False)
     monkeypatch.setattr(progress_io, "_PROGRESS_COMPLETED_STEPS", 0)
     monkeypatch.setattr(progress_io, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_FATAL_ERROR", None)
+    progress_io._PROGRESS_QUEUE.clear()
 
 
 def test_progress_api_exposes_only_initial_and_observed_fields() -> None:
@@ -102,6 +105,70 @@ def test_concurrent_publish_serializes_uploads_and_reuses_failed_sequence(monkey
         assert current.previous_digest == digest_record(previous.to_dict())
 
 
+def test_progress_network_upload_does_not_hold_bookkeeping_lock(monkeypatch) -> None:
+    _reset(monkeypatch)
+    upload_started = threading.Event()
+    release_upload = threading.Event()
+
+    def upload(_record, *, required):
+        del required
+        upload_started.set()
+        assert release_upload.wait(1.0)
+        return True
+
+    monkeypatch.setattr(progress_io, "_upload_record", upload)
+    first = threading.Thread(target=progress_io.publish_progress, args=("boot",))
+    second = threading.Thread(
+        target=progress_io.publish_progress,
+        args=("rl_step",),
+        kwargs={"step": 1},
+    )
+    first.start()
+    assert upload_started.wait(1.0)
+    second.start()
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        with progress_io._PROGRESS_LOCK:
+            if len(progress_io._PROGRESS_QUEUE) == 2:
+                break
+        time.sleep(0.001)
+    else:
+        raise AssertionError("second progress publication could not enqueue during network upload")
+    release_upload.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert progress_io._PROGRESS_SEQUENCE == 2
+
+
+def test_ambiguous_upload_verifies_landed_record_before_advancing(monkeypatch) -> None:
+    _reset(monkeypatch)
+    monkeypatch.setattr(progress_io.worker_state, "HF_REPO", "org/repo")
+    landed = {}
+    calls = {"count": 0}
+
+    def upload(local, path, *, required):
+        del required
+        calls["count"] += 1
+        with open(local, "rb") as handle:
+            landed[path] = handle.read()
+        if calls["count"] == 1:
+            raise OSError("response lost after commit")
+        return True
+
+    monkeypatch.setattr(progress_io.hf_io, "hf_upload_absolute", upload)
+    monkeypatch.setattr(progress_io, "_remote_record_payload", landed.get)
+
+    assert progress_io.publish_progress("boot") is True
+    assert progress_io.publish_progress("rl_step", step=1) is True
+
+    paths = sorted(landed)
+    records = [progress_io.ProgressRecord.from_dict(json.loads(landed[path])) for path in paths]
+    assert [record.sequence for record in records] == [1, 2]
+    assert records[1].previous_digest == digest_record(records[0].to_dict())
+
+
 def test_checkpoint_failure_is_sticky_until_a_successful_checkpoint(monkeypatch) -> None:
     _reset(monkeypatch)
     records = []
@@ -117,6 +184,7 @@ def test_checkpoint_failure_is_sticky_until_a_successful_checkpoint(monkeypatch)
     assert records[-1].checkpoint == failure
 
     progress_io.publish_progress("checkpoint_uploaded", step=75)
+    assert progress_io.pending_checkpoint_failure() is None
     progress_io.publish_progress("sft_step", step=80)
     assert records[-1].checkpoint == {}
 

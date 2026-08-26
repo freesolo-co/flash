@@ -486,6 +486,56 @@ def test_each_parsed_rl_step_publishes_cumulative_progress():
     assert any(keyword.arg is None for keyword in step_calls[0].keywords)
 
 
+def test_real_verl_line_reaches_progress_metrics_and_cli_row(monkeypatch):
+    from flash.cli.commands.ops.log_follow import _log_follow_metric_rows
+    from flash.engine.worker.io import progress as worker_progress
+
+    monkeypatch.setattr(worker_progress.worker_state, "RUN_ID", "run-rl-metrics")
+    monkeypatch.setattr(worker_progress.worker_state, "PHASE", "rl")
+    monkeypatch.setattr(worker_progress.worker_state, "ATTEMPT", 2)
+    monkeypatch.setattr(worker_progress.worker_state, "FENCE", 9)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_SEQUENCE", 0)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_PREVIOUS_DIGEST", None)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_TRAINING_ENTERED", False)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_COMPLETED_STEPS", 0)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_FATAL_ERROR", None)
+    worker_progress._PROGRESS_QUEUE.clear()
+    records = []
+    monkeypatch.setattr(
+        worker_progress,
+        "_upload_record",
+        lambda record, *, required: records.append(record) or True,
+    )
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        rl_train_runner._worker_progress, "publish_progress", worker_progress.publish_progress
+    )
+
+    state = _StepMetricState()
+    _ingest_step_metrics(_STEP_LINE, {"max_completion": 512}, state, dict)
+
+    record = records[-1]
+    assert record.metrics == {
+        "entropy": 0.91,
+        "grad_norm": 1.5,
+        "kl": 0.002,
+        "max_completion_tokens": 512,
+        "mean_completion_tokens": 213.5,
+        "reward": 0.625,
+        "truncation_rate": 0.125,
+    }
+    status = {
+        "attempt": {"attempt_id": 2, "fence": 9},
+        "progress": record.to_dict(),
+    }
+    expected = (
+        "progress_seq=1 step=7 reward=0.625 grad_norm=1.5 kl=0.002 entropy=0.91 "
+        "comp_len=213.5 trunc=0.125 max_comp_tokens=512"
+    )
+    assert _log_follow_metric_rows(status, set()) == [expected]
+
+
 def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():
     # the payload schema belongs to the cli, not verl: a key the renderer does not know is dead
     # weight, so keep the mapping's flash-side names inside the rendered set.

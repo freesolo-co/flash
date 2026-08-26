@@ -8075,6 +8075,49 @@ def test_opd_step_progress_carries_truncation_rate(monkeypatch, tmp_path):
     ]
 
 
+def test_opd_progress_classifies_discarded_rollouts_as_rendered_metric(monkeypatch):
+    from flash.cli.commands.ops.log_follow import _log_follow_metric_rows
+    from flash.engine.worker.io import progress as worker_progress
+
+    monkeypatch.setattr(worker_progress.worker_state, "RUN_ID", "run-opd-progress")
+    monkeypatch.setattr(worker_progress.worker_state, "PHASE", "opd")
+    monkeypatch.setattr(worker_progress.worker_state, "ATTEMPT", 1)
+    monkeypatch.setattr(worker_progress.worker_state, "FENCE", 4)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_SEQUENCE", 0)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_PREVIOUS_DIGEST", None)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_TRAINING_ENTERED", False)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_COMPLETED_STEPS", 0)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_FATAL_ERROR", None)
+    worker_progress._PROGRESS_QUEUE.clear()
+    records = []
+    monkeypatch.setattr(
+        worker_progress,
+        "_upload_record",
+        lambda record, *, required: records.append(record) or True,
+    )
+
+    worker_progress.publish_progress(
+        "opd_step",
+        step=1,
+        loss=0.5,
+        truncation_rate=0.75,
+        discarded_rollouts=3,
+    )
+
+    record = records[-1]
+    assert record.metrics["truncation_rate"] == pytest.approx(0.75)
+    assert record.metrics["discarded_rollouts"] == 3
+    assert "discarded_rollouts" not in record.diagnostics
+    status = {
+        "attempt": {"attempt_id": 1, "fence": 4},
+        "progress": record.to_dict(),
+    }
+    assert _log_follow_metric_rows(status, set()) == [
+        "progress_seq=1 step=1 trunc=0.75 discarded=3"
+    ]
+
+
 def test_opd_step_progress_omits_stale_truncation_rate(monkeypatch, tmp_path):
     import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 

@@ -109,6 +109,19 @@ def _observe_artifacts(context: _PollContext) -> PollResult | None:
     return poll_result_from_manifest(artifacts.result) if artifacts.result is not None else None
 
 
+def _queued_too_long(context: _PollContext, state: _PollState, now: float) -> PollResult | None:
+    if not state.queued.expired(True, now, context.queue_grace_s):
+        return None
+    return PollResult(
+        False,
+        failure="no_capacity",
+        detail=(
+            f"never scheduled: job remained IN_QUEUE for {int(now - state.queued.since)}s; "
+            f"{capacity_escalation_note(context.on_last_gpu)}"
+        ),
+    )
+
+
 def _queue_failure(
     context: _PollContext, state: _PollState, status: str, now: float
 ) -> PollResult | None:
@@ -117,33 +130,29 @@ def _queue_failure(
         state.unhealthy.expired(False, now, context.unhealthy_grace_s)
         state.throttled.expired(False, now, context.throttled_grace_s)
         return None
-    if state.queued.expired(True, now, context.queue_grace_s):
-        return PollResult(
-            False,
-            failure="no_capacity",
-            detail=(
-                f"never scheduled: job remained IN_QUEUE for {int(now - state.queued.since)}s; "
-                f"{capacity_escalation_note(context.on_last_gpu)}"
-            ),
-        )
     try:
         health = runpod_api.endpoint_health_for_fingerprint(
             context.handle.endpoint_id,
             context.handle.key_fingerprint,
         )
     except Exception:
-        return None
+        return _queued_too_long(context, state, now)
     workers = health.get("workers") or {}
     usable = workers.get("running") or workers.get("ready") or workers.get("idle")
     initializing = workers.get("initializing")
-    if usable or initializing or workers.get("unhealthy"):
+    if usable or initializing:
         state.granted = True
         return None
-    if state.unhealthy.expired(bool(workers.get("unhealthy")), now, context.unhealthy_grace_s):
+    unhealthy = bool(workers.get("unhealthy"))
+    if state.unhealthy.expired(unhealthy, now, context.unhealthy_grace_s):
         return PollResult(False, failure="job_preempted", detail="RunPod worker remained unhealthy")
+    if unhealthy:
+        state.queued.expired(False, now, context.queue_grace_s)
+        state.throttled.expired(False, now, context.throttled_grace_s)
+        return None
     if state.throttled.expired(bool(workers.get("throttled")), now, context.throttled_grace_s):
         return PollResult(False, failure="no_capacity", detail="RunPod worker remained throttled")
-    return None
+    return _queued_too_long(context, state, now)
 
 
 def poll_job(

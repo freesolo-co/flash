@@ -314,8 +314,64 @@ def record_attempt_handle(
     return True
 
 
+def _same_progress_identity(current: dict, incoming: dict) -> bool:
+    current_receipt = current.get("receipt")
+    incoming_receipt = incoming.get("receipt")
+    if not isinstance(current_receipt, dict) or not isinstance(incoming_receipt, dict):
+        return False
+    current_path = current_receipt.get("path")
+    current_digest = current_receipt.get("digest")
+    return (
+        isinstance(current_path, str)
+        and bool(current_path)
+        and isinstance(current_digest, str)
+        and len(current_digest) == 64
+        and incoming_receipt.get("path") == current_path
+        and incoming_receipt.get("digest") == current_digest
+    )
+
+
 def record_progress(run_id: str, value: dict, *, attempt_id: int, fence: int) -> bool:
-    return _record_projection(run_id, "progress", value, attempt_id=attempt_id, fence=fence)
+    """Persist only monotonic progress for the exact current fenced attempt."""
+    from flash.runner.lifecycle.protocol import bounded_json
+
+    report_status: RunStatus | None = None
+    with state._status_guard(run_id):
+        status = get_status(run_id)
+        attempt = _current_attempt(status)
+        if attempt.attempt_id != attempt_id or attempt.fence != fence:
+            return False
+        incoming = bounded_json(value)
+        if incoming.get("attempt_id") != attempt_id or incoming.get("fence") != fence:
+            return False
+        current = status.progress if isinstance(status.progress, dict) else None
+        if current is not None:
+            current_sequence = current.get("sequence")
+            incoming_sequence = incoming.get("sequence")
+            if type(current_sequence) is not int or type(incoming_sequence) is not int:
+                return False
+            if incoming_sequence < current_sequence:
+                return False
+            if incoming_sequence == current_sequence:
+                if not _same_progress_identity(current, incoming):
+                    return False
+                merged = dict(current)
+                if "observed_at" in incoming:
+                    merged["observed_at"] = incoming["observed_at"]
+                current_receipt = dict(current["receipt"])
+                incoming_receipt = incoming["receipt"]
+                if "revision" in incoming_receipt:
+                    current_receipt["revision"] = incoming_receipt["revision"]
+                merged["receipt"] = current_receipt
+                incoming = merged
+            elif incoming.get("completed_steps", 0) < current.get("completed_steps", 0):
+                return False
+        status.progress = incoming
+        status.updated_at = time.time()
+        state._save_status_unlocked(status)
+        report_status = status
+    reporting._report_status(report_status)
+    return True
 
 
 def record_resource(

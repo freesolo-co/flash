@@ -22,6 +22,14 @@ SOURCE = {
     "size": 1,
     "revision": "b" * 40,
 }
+
+
+@pytest.fixture(autouse=True)
+def _clear_progress_cache():
+    with attempts._PROGRESS_CACHE_LOCK:
+        attempts._PROGRESS_CACHE.clear()
+
+
 ATTESTATION = {
     "kind": "flash-source-attestation",
     "format_version": 1,
@@ -101,6 +109,64 @@ def test_reads_latest_verified_progress_and_single_result(monkeypatch) -> None:
     assert observed.progress["observed_at"] == 130.0
     assert observed.result["outcome"] == "succeeded"
     assert observed.result["receipt"]["path"] == result_path(result)
+
+
+def test_progress_poll_reuses_verified_head_and_downloads_only_suffix(monkeypatch) -> None:
+    first = _progress(1)
+    second = _progress(2, first)
+    third = _progress(3, second)
+    payloads = {
+        progress_path(first): canonical_bytes(first.to_dict()),
+        progress_path(second): canonical_bytes(second.to_dict()),
+        progress_path(third): canonical_bytes(third.to_dict()),
+    }
+    paths = [progress_path(first), progress_path(second)]
+    revision = ["c" * 40]
+    downloads = []
+    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: (revision[0], list(paths)))
+
+    def download(_repo, path, *, revision):
+        downloads.append((path, revision))
+        return payloads[path]
+
+    monkeypatch.setattr(attempts, "_download_bytes", download)
+
+    first_poll = attempts.read_attempt_artifacts(
+        "org/repo",
+        phase="rl",
+        run_id="run-1",
+        attempt_id=2,
+        fence=9,
+        source_snapshot=SOURCE,
+    )
+    assert first_poll.progress["sequence"] == 2
+    assert [path for path, _revision in downloads] == [progress_path(first), progress_path(second)]
+
+    downloads.clear()
+    second_poll = attempts.read_attempt_artifacts(
+        "org/repo",
+        phase="rl",
+        run_id="run-1",
+        attempt_id=2,
+        fence=9,
+        source_snapshot=SOURCE,
+    )
+    assert second_poll.progress["sequence"] == 2
+    assert downloads == []
+
+    paths.append(progress_path(third))
+    revision[0] = "d" * 40
+    third_poll = attempts.read_attempt_artifacts(
+        "org/repo",
+        phase="rl",
+        run_id="run-1",
+        attempt_id=2,
+        fence=9,
+        source_snapshot=SOURCE,
+    )
+    assert third_poll.progress["sequence"] == 3
+    assert downloads == [(progress_path(third), "d" * 40)]
+    assert third_poll.progress["receipt"]["revision"] == "d" * 40
 
 
 def test_result_download_transport_error_remains_retriable(monkeypatch) -> None:

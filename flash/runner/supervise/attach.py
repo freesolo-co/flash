@@ -556,6 +556,12 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     return get_status(run_id)
 
 
+def _result_transport_is_transient(error: BaseException) -> bool:
+    from flash.snapshot.archive import is_transient_fetch_error
+
+    return isinstance(error, OSError) or is_transient_fetch_error(error)
+
+
 def _handle_attach_wall_deadline(
     run_id: str,
     context: _AttachContext,
@@ -579,9 +585,7 @@ def _handle_attach_wall_deadline(
     try:
         metrics = _attempt_result_metrics(run_id, context.persisted_remote)
     except Exception as artifact_error:
-        from flash.snapshot.archive import is_transient_fetch_error
-
-        if not isinstance(artifact_error, OSError) and not is_transient_fetch_error(artifact_error):
+        if not _result_transport_is_transient(artifact_error):
             raise
         _schedule_attach_reconciliation(
             run_id,
@@ -663,7 +667,26 @@ def _handle_failed_attach_poll(
 
     failure = f"{result.failure or 'job_failed'}: {result.detail or 'provider attempt failed'}"
     print(f"attach: {run_id} ended ({result.failure}); evaluating recovery", file=log)
-    completed_metrics = _attempt_result_metrics(run_id, context.persisted_remote)
+    try:
+        completed_metrics = _attempt_result_metrics(run_id, context.persisted_remote)
+    except Exception as artifact_error:
+        if not _result_transport_is_transient(artifact_error):
+            raise
+        _schedule_attach_reconciliation(
+            run_id,
+            context.persisted_remote,
+            context.worker_spec,
+            context.next_attempt,
+            context.source_snapshot,
+            log,
+            failure,
+        )
+        print(
+            f"attach: {run_id} current-fence result observation is temporarily unavailable; "
+            "deferring recovery",
+            file=log,
+        )
+        return get_status(run_id)
     if completed_metrics is not None:
         _carry_allocation_stamp(completed_metrics, context.persisted_remote)
         # the job completed. adoption may return False (a transient defer, e.g. a

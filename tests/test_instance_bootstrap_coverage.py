@@ -31,11 +31,25 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
-def _run_mode(payload, env, mode, *, deadline_ts):
+def _worker_execution_deadline(upload_deadline_at):
+    return b.bootstrap_processes.worker_execution_deadline(
+        upload_deadline_at,
+        b._CONSOLE_UPLOAD_STOP_TIMEOUT_S,
+        b._CONSOLE_UPLOAD_FINAL_TIMEOUT_S,
+    )
+
+
+def _run_mode(payload, env, mode, *, deadline_ts, deadline_watchdog=None):
     payload = dict(payload)
     payload.setdefault("work_deadline_at", deadline_ts)
     payload.setdefault("result_deadline_at", deadline_ts)
-    return b.run_mode(payload, env, mode, deadline_ts=deadline_ts)
+    return b.run_mode(
+        payload,
+        env,
+        mode,
+        deadline_ts=deadline_ts,
+        deadline_watchdog=deadline_watchdog,
+    )
 
 
 @pytest.mark.parametrize("arm", ["lambda", "vast"])
@@ -794,7 +808,7 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
     assert rc == 0
     assert popen_calls[0][0][0] == [sys.executable, "-m", "flash.engine.support.worker_entrypoint"]
     upload_deadline, _reaping_deadline = b._upload_cleanup_deadlines(deadline)
-    expected_worker_deadline = b._worker_execution_deadline(upload_deadline)
+    expected_worker_deadline = _worker_execution_deadline(upload_deadline)
     assert float(popen_calls[0][1]["env"]["FLASH_RUN_DEADLINE_AT"]) == pytest.approx(
         expected_worker_deadline
     )
@@ -930,7 +944,7 @@ def test_run_mode_caps_the_worker_at_the_declared_wall_budget(monkeypatch):
         "time became extra work time on a job priced for its wall alone"
     )
     # and the cap is the ONLY thing that shortened it -- not the cleanup reserves.
-    assert handed < b._worker_execution_deadline(b._upload_cleanup_deadlines(deadline)[0])
+    assert handed < _worker_execution_deadline(b._upload_cleanup_deadlines(deadline)[0])
 
 
 def test_run_mode_leaves_a_deadline_already_inside_the_budget_alone(monkeypatch):
@@ -961,7 +975,7 @@ def test_run_mode_leaves_a_deadline_already_inside_the_budget_alone(monkeypatch)
 
     upload_deadline, _reaping = b._upload_cleanup_deadlines(deadline)
     assert float(popen_calls[0][1]["env"]["FLASH_RUN_DEADLINE_AT"]) == pytest.approx(
-        b._worker_execution_deadline(upload_deadline)
+        _worker_execution_deadline(upload_deadline)
     )
 
 
@@ -1190,6 +1204,9 @@ def test_run_mode_reaps_final_uploader_before_result_bookkeeping_reserve(monkeyp
     clock = {"now": 100.0}
     deadline = (
         clock["now"]
+        + b.bootstrap_processes._TERM_GRACE_S
+        + b.bootstrap_processes._KILL_GRACE_S
+        + b.bootstrap_processes._TERMINATION_SCHEDULING_RESERVE_S
         + b._CONSOLE_UPLOAD_STOP_TIMEOUT_S
         + b._CONSOLE_UPLOAD_FINAL_TIMEOUT_S
         + b._CONSOLE_UPLOAD_REAP_RESERVE_S
@@ -1345,7 +1362,7 @@ def test_run_mode_drains_delayed_terminal_output_before_upload(monkeypatch):
         "run_id": "run-1",
     }
 
-    assert _run_mode(payload, {}, "sft", deadline_ts=b.time.time() + 20) == 0
+    assert _run_mode(payload, {}, "sft", deadline_ts=b.time.time() + 40) == 0
 
     assert final_write_attempt.wait(2.0)
     assert late_writes == []
@@ -1357,6 +1374,9 @@ def test_run_mode_reaps_periodic_uploader_before_result_bookkeeping_reserve(monk
     clock = {"now": 100.0}
     deadline = (
         clock["now"]
+        + b.bootstrap_processes._TERM_GRACE_S
+        + b.bootstrap_processes._KILL_GRACE_S
+        + b.bootstrap_processes._TERMINATION_SCHEDULING_RESERVE_S
         + b._CONSOLE_UPLOAD_STOP_TIMEOUT_S
         + b._CONSOLE_UPLOAD_FINAL_TIMEOUT_S
         + b._CONSOLE_UPLOAD_REAP_RESERVE_S
@@ -1438,20 +1458,30 @@ def test_run_mode_reserves_cleanup_before_deadline_result_with_real_timing(monke
     stop_timeout = 0.03
     final_timeout = 0.03
     terminate_timeout = 0.02
+    worker_term_grace = 0.03
+    worker_kill_grace = 0.02
+    scheduling_reserve = 0.01
     reap_reserve = 2 * terminate_timeout
     bookkeeping_reserve = 0.04
     monkeypatch.setattr(b, "_CONSOLE_UPLOAD_STOP_TIMEOUT_S", stop_timeout)
     monkeypatch.setattr(b, "_CONSOLE_UPLOAD_FINAL_TIMEOUT_S", final_timeout)
     monkeypatch.setattr(b, "_CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S", terminate_timeout)
     monkeypatch.setattr(b, "_CONSOLE_UPLOAD_REAP_RESERVE_S", reap_reserve)
+    monkeypatch.setattr(b.bootstrap_processes, "_TERM_GRACE_S", worker_term_grace)
+    monkeypatch.setattr(b.bootstrap_processes, "_KILL_GRACE_S", worker_kill_grace)
+    monkeypatch.setattr(
+        b.bootstrap_processes,
+        "_TERMINATION_SCHEDULING_RESERVE_S",
+        scheduling_reserve,
+    )
     monkeypatch.setattr(b, "_TERMINAL_BOOKKEEPING_RESERVE_S", bookkeeping_reserve)
     monkeypatch.setattr(b.signal, "signal", lambda *_args: None)
 
     events = []
     started_at = time.time()
-    deadline = started_at + 0.30
+    deadline = started_at + 0.35
     upload_deadline, reaping_deadline = b._upload_cleanup_deadlines(deadline)
-    worker_cutoff = upload_deadline - stop_timeout - final_timeout
+    worker_cutoff = _worker_execution_deadline(upload_deadline)
 
     class _TimedWorker:
         def __init__(self):
@@ -1509,6 +1539,8 @@ def test_run_mode_reserves_cleanup_before_deadline_result_with_real_timing(monke
     uploader = _TimedUploader()
     stop_upload = _RecordingStopEvent()
     results = []
+    teardown_allowances = []
+    watchdog_transitions = []
     payload = {
         "hf_repo": "org/repo",
         "job_spec_json": "{}",
@@ -1537,11 +1569,14 @@ def test_run_mode_reserves_cleanup_before_deadline_result_with_real_timing(monke
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
     monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
     monkeypatch.setattr(b.subprocess, "Popen", lambda *_args, **_kwargs: worker)
-    monkeypatch.setattr(
-        b.bootstrap_processes,
-        "terminate_process_group",
-        lambda proc, **_kwargs: proc.kill(),
-    )
+
+    def terminate(proc, **kwargs):
+        assert kwargs == {"process_group_id": worker.pid}
+        teardown_allowances.append((worker_term_grace, worker_kill_grace, time.time()))
+        time.sleep(worker_term_grace + worker_kill_grace)
+        proc.kill()
+
+    monkeypatch.setattr(b.bootstrap_processes, "terminate_process_group", terminate)
     monkeypatch.setattr(
         b,
         "_start_console_uploader",
@@ -1549,16 +1584,27 @@ def test_run_mode_reserves_cleanup_before_deadline_result_with_real_timing(monke
     )
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *_args: True)
     monkeypatch.setattr(b, "_publish_deadline_result", record_result)
+    monkeypatch.setattr(
+        b,
+        "_transition_deadline_watchdog",
+        lambda _watchdog, deadline_at, _payload: watchdog_transitions.append(deadline_at),
+    )
 
     with pytest.raises(TimeoutError, match="wall-clock cap"):
-        _run_mode(payload, {}, "sft", deadline_ts=deadline)
+        _run_mode(payload, {}, "sft", deadline_ts=deadline, deadline_watchdog=[object(), object()])
 
     assert worker.killed_at is not None
-    assert worker.killed_at <= worker_cutoff + 0.02
+    assert len(teardown_allowances) == 1
+    term_allowance, kill_allowance, teardown_started = teardown_allowances[0]
+    assert term_allowance == worker_term_grace
+    assert kill_allowance == worker_kill_grace
+    assert teardown_started == pytest.approx(worker_cutoff, abs=0.03)
+    assert worker.killed_at <= worker_cutoff + worker_term_grace + worker_kill_grace + 0.03
     assert stop_upload.set_at is not None
     assert worker.killed_at <= stop_upload.set_at
     assert uploader.is_alive() is False
     assert uploader.closed is True
+    assert watchdog_transitions == [payload["result_deadline_at"]]
     assert len(results) == 1
     result_at, uploader_alive = results[0]
     assert uploader_alive is False
@@ -1578,6 +1624,9 @@ b._CONSOLE_UPLOAD_STOP_TIMEOUT_S = 0.01
 b._CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 0.01
 b._CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 0.01
 b._CONSOLE_UPLOAD_REAP_RESERVE_S = 0.02
+b.bootstrap_processes._TERM_GRACE_S = 0.01
+b.bootstrap_processes._KILL_GRACE_S = 0.01
+b.bootstrap_processes._TERMINATION_SCHEDULING_RESERVE_S = 0.01
 b._TERMINAL_BOOKKEEPING_RESERVE_S = 0.01
 b.CODE_ROOT = "/dev/shm"
 b._upload_console_tail_bounded = lambda *_args, **_kwargs: True
