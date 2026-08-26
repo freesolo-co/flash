@@ -52,6 +52,54 @@ def _is_balance_error(exc: Exception) -> bool:
     return "account balance" in str(exc).lower()
 
 
+def _current_attempt_record(run_id: str, attempt_id: int, fence: int):
+    from flash.runner.lifecycle.protocol import AttemptRecord
+    from flash.runner.lifecycle.status import get_status
+
+    record = AttemptRecord.from_dict(get_status(run_id).attempt)
+    if record.attempt_id != attempt_id or record.fence != fence:
+        raise RuntimeError("RunPod payload does not match the current fenced attempt")
+    return record
+
+
+def _cleanup_unpersisted_endpoint(
+    endpoint_id: str,
+    name: str,
+    key_fingerprint: str,
+    attempt_id: int,
+    fence: int,
+    on_handle,
+    exc: BaseException,
+) -> None:
+    deletion_confirmed = False
+    with contextlib.suppress(Exception):
+        deletion_confirmed = (
+            runpod_api.delete_endpoint_for_fingerprint(endpoint_id, key_fingerprint) is True
+        )
+    if deletion_confirmed:
+        return
+    cleanup_handle = JobHandle(
+        endpoint_id,
+        name,
+        key_fingerprint,
+        None,
+        attempt_id,
+        fence,
+        time.time(),
+    ).to_dict()
+    if on_handle is not None:
+        try:
+            on_handle(cleanup_handle)
+        except Exception as persistence_error:
+            raise UnreconciledCreateError(
+                "RunPod endpoint creation could not be reconciled and cleanup handle "
+                "persistence failed"
+            ) from persistence_error
+    raise UnreconciledCreateError(
+        "RunPod endpoint creation could not be reconciled and deletion was unconfirmed"
+    ) from exc
+
+
 def submit_attempt(
     spec,
     log=None,
@@ -86,6 +134,7 @@ def submit_attempt(
         raise ValueError("RunPod fence identity is invalid")
     worker_env["ATTEMPT"] = str(attempt_id)
     worker_env["FENCE"] = str(fence)
+    _current_attempt_record(spec.run_id, attempt_id, fence)
     endpoint_id, name, key_fingerprint = deploy_train_endpoint(
         spec.gpu.type,
         execution_timeout_ms=timeout_s * 1000,
@@ -94,28 +143,23 @@ def submit_attempt(
         spec=spec,
         **deadline_kwargs(deploy_train_endpoint, deadline_at),
     )
-    from flash.runner.lifecycle.protocol import AttemptRecord
-    from flash.runner.lifecycle.status import get_status
-
-    attempt_record = AttemptRecord.from_dict(get_status(spec.run_id).attempt)
-    if attempt_record.attempt_id != attempt_id or attempt_record.fence != fence:
-        raise RuntimeError("RunPod payload does not match the current fenced attempt")
-    payload = {
-        "hf_repo": spec.train.hf_repo,
-        "job_spec_json": spec.to_json(),
-        "phase": spec.phase,
-        "run_id": spec.run_id,
-        "attempt": attempt_id,
-        "fence": fence,
-        "seed": spec.seed,
-        "env": worker_env,
-        "extra_pip": extra_pip,
-        "source_snapshot": source_descriptor.to_dict(),
-        "deadline_at": deadline_at,
-        "work_deadline_at": attempt_record.work_deadline_at,
-        "result_deadline_at": attempt_record.result_deadline_at,
-    }
     try:
+        attempt_record = _current_attempt_record(spec.run_id, attempt_id, fence)
+        payload = {
+            "hf_repo": spec.train.hf_repo,
+            "job_spec_json": spec.to_json(),
+            "phase": spec.phase,
+            "run_id": spec.run_id,
+            "attempt": attempt_id,
+            "fence": fence,
+            "seed": spec.seed,
+            "env": worker_env,
+            "extra_pip": extra_pip,
+            "source_snapshot": source_descriptor.to_dict(),
+            "deadline_at": deadline_at,
+            "work_deadline_at": attempt_record.work_deadline_at,
+            "result_deadline_at": attempt_record.result_deadline_at,
+        }
         require_create_allowance(deadline_at)
         submitted_ts = time.time()
         job_id = runpod_api.submit_job(
@@ -124,50 +168,36 @@ def submit_attempt(
             key_fingerprint=key_fingerprint,
             **deadline_kwargs(runpod_api.submit_job, deadline_at),
         )
-    except Exception as exc:
-        # the queue post is non-idempotent: only a positively confirmed endpoint deletion makes
-        # the original failure safe to retry. otherwise persist exact cleanup identity and stop.
-        deletion_confirmed = False
-        with contextlib.suppress(Exception):
-            deletion_confirmed = (
-                runpod_api.delete_endpoint_for_fingerprint(endpoint_id, key_fingerprint) is True
-            )
-        if deletion_confirmed:
-            raise
-        if on_handle is not None:
-            on_handle(
-                JobHandle(
-                    endpoint_id,
-                    name,
-                    key_fingerprint,
-                    None,
-                    attempt_id,
-                    fence,
-                    time.time(),
-                ).to_dict()
-            )
-        raise UnreconciledCreateError(
-            "RunPod queue submission could not be reconciled and endpoint deletion was unconfirmed"
-        ) from exc
-    handle = JobHandle(
-        endpoint_id,
-        name,
-        key_fingerprint,
-        job_id,
-        attempt_id,
-        fence,
-        submitted_ts,
-    )
-    if log is not None:
-        print(
-            f"submitted job: endpoint={name} ({endpoint_id}) job={job_id} "
-            f"run={spec.run_id} attempt={attempt_id} gpu={spec.gpu.type} "
-            f"phase={spec.phase} seed={spec.seed}",
-            file=log,
-            flush=True,
+        handle = JobHandle(
+            endpoint_id,
+            name,
+            key_fingerprint,
+            job_id,
+            attempt_id,
+            fence,
+            submitted_ts,
         )
-    if on_handle is not None:
-        on_handle(handle.to_dict())
+        if log is not None:
+            print(
+                f"submitted job: endpoint={name} ({endpoint_id}) job={job_id} "
+                f"run={spec.run_id} attempt={attempt_id} gpu={spec.gpu.type} "
+                f"phase={spec.phase} seed={spec.seed}",
+                file=log,
+                flush=True,
+            )
+        if on_handle is not None:
+            on_handle(handle.to_dict())
+    except Exception as exc:
+        _cleanup_unpersisted_endpoint(
+            endpoint_id,
+            name,
+            key_fingerprint,
+            attempt_id,
+            fence,
+            on_handle,
+            exc,
+        )
+        raise
     return runpod_polling.poll_attempt(
         handle,
         spec,

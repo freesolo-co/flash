@@ -538,7 +538,7 @@ def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypa
         assert runner_status.get_status("fa").finished_at == teardown
 
 
-def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
+def test_persist_metrics_preserves_authoritative_zero_provider_cost(monkeypatch):
     import json
     import os
 
@@ -548,18 +548,17 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
         from flash.core.spec import JobSpec
 
         spec = JobSpec(run_id="r0", model="Qwen/Qwen3.5-9B", algorithm="grpo")
-        # A zero placeholder is not a settled provider cost; use the wall-pricing fallback.
         metrics = {
             "cost_usd": 0.0,
             "wall_seconds": 1.0,
+            "allocated_provider": "lambda",
         }
         out = runner_status._persist_metrics(spec, metrics)
-        assert out == 1.0
+        assert out == 0.0
         with open(os.path.join(runner_state.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
-        assert on_disk["cost_usd"] == 1.0
-        # No allocated_provider stamped -> say so, rather than attributing the cost to RunPod.
-        assert on_disk["notes"]["provider"] == "unknown"
+        assert on_disk["cost_usd"] == 0.0
+        assert "gpu_rate_usd_hr" not in on_disk.get("notes", {})
 
 
 def test_persist_metrics_attributes_the_provider_that_billed_the_run(monkeypatch):
@@ -3153,6 +3152,117 @@ def test_recovered_handleless_nonretryable_or_exhausted_result_fails_terminally(
     assert persisted.attempt["fence"] == observed.fence
     assert persisted.attempt["state"] == "settled"
     assert persisted.error == f"{failure}: stop"
+
+
+@pytest.mark.parametrize("after_deadline", [False, True])
+def test_handleless_invalid_artifact_evidence_fails_and_settles_without_resubmit(
+    monkeypatch, tmp_path, after_deadline
+):
+    import time
+
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+    from flash.providers.artifacts.attempts import AttemptArtifactError
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id=f"invalid-evidence-{after_deadline}", model="Qwen/Qwen3.5-9B")
+    created_at = time.time()
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        ),
+        _run_deadline_at=created_at + spec.gpu.max_wall_seconds,
+        _next_attempt=0,
+    )
+    observed = runner_attempts._reserve_attempt_record(spec.run_id)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AttemptArtifactError("conflicting result manifests")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_recovery_wall_deadline_is_open",
+        lambda _spec: not after_deadline,
+    )
+    started = []
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            started.append((target, args, daemon))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    monkeypatch.setattr(
+        runtime,
+        "_confirm_run_clear",
+        lambda _spec: pytest.fail("invalid evidence must not reach replacement"),
+    )
+
+    runtime._resubmit_recovered_runs([(spec, "provisioning")])
+
+    status = runner_status.get_status(spec.run_id)
+    assert status.state == "failed"
+    assert status.attempt["state"] == "settled"
+    assert (status.attempt["attempt_id"], status.attempt["fence"]) == (
+        observed.attempt_id,
+        observed.fence,
+    )
+    assert status.error == ("attempt artifact evidence is invalid: conflicting result manifests")
+    assert started == []
+
+
+def test_handleless_invalid_artifact_evidence_retries_after_attempt_replacement(
+    monkeypatch, tmp_path
+):
+    import time
+
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+    from flash.providers.artifacts.attempts import AttemptArtifactError
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="invalid-evidence-race", model="Qwen/Qwen3.5-9B")
+    created_at = time.time()
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            created_at=created_at,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        ),
+        _run_deadline_at=created_at + spec.gpu.max_wall_seconds,
+        _next_attempt=0,
+    )
+    observed = runner_attempts._reserve_attempt_record(spec.run_id)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AttemptArtifactError("conflicting result manifests")
+        ),
+    )
+    compared = []
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_compare_and_fail_remote",
+        lambda *_args, **kwargs: compared.append(kwargs["expected_attempt"]) or False,
+    )
+
+    assert runtime._adopt_handleless_result(spec) is None
+    assert compared == [(observed.attempt_id, observed.fence)]
+    status = runner_status.get_status(spec.run_id)
+    assert status.state == "provisioning"
+    assert status.attempt["state"] == "reserved"
 
 
 def test_handleless_success_rejects_result_after_attempt_replacement(monkeypatch, tmp_path):

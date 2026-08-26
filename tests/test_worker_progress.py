@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import threading
 import time
 
@@ -24,6 +25,7 @@ def _reset(monkeypatch) -> None:
         progress_io._PROGRESS_COMPLETED_STEPS = 0
         progress_io._PROGRESS_PENDING_CHECKPOINT_FAILURE = None
         progress_io._PROGRESS_PENDING_UPLOAD = None
+        progress_io._PROGRESS_COMMITTED_LOCAL_PATH = None
         progress_io._PROGRESS_LATEST_OBSERVATION = None
         progress_io._PROGRESS_ACTIVE = False
         progress_io._PROGRESS_FLUSH_REQUIRED = False
@@ -163,6 +165,148 @@ def test_observation_during_failed_upload_retries_without_another_signal(monkeyp
     assert attempted[2].previous_digest == progress_io.digest_record(attempted[1].to_dict())
     assert attempted[2].completed_steps == 1
     assert progress_io._PROGRESS_PUBLISHER is None
+
+
+def _wait_for_publisher() -> None:
+    deadline = time.monotonic() + 2
+    while progress_io._PROGRESS_PUBLISHER is not None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert progress_io._PROGRESS_PUBLISHER is None
+
+
+def test_record_build_failure_restores_dequeued_observation(monkeypatch) -> None:
+    _reset(monkeypatch)
+    original = progress_io._progress_record
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("record build failed")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(progress_io, "_progress_record", fail_once)
+    progress_io.publish_progress("boot", gpu={"used_mb": 1})
+    _wait_for_publisher()
+
+    restored = progress_io._PROGRESS_LATEST_OBSERVATION
+    assert restored is not None
+    assert restored.stage == "boot"
+    assert restored.fields["gpu"] == {"used_mb": 1}
+
+
+def test_local_write_failure_restores_dequeued_observation(monkeypatch) -> None:
+    _reset(monkeypatch)
+    original = progress_io._write_local_immutable
+    calls = 0
+
+    def fail_once(payload):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("local write failed")
+        return original(payload)
+
+    monkeypatch.setattr(progress_io, "_write_local_immutable", fail_once)
+    progress_io.publish_progress("boot", gpu={"used_mb": 1})
+    _wait_for_publisher()
+
+    restored = progress_io._PROGRESS_LATEST_OBSERVATION
+    assert restored is not None
+    assert restored.stage == "boot"
+    assert restored.fields["gpu"] == {"used_mb": 1}
+
+
+def test_local_write_failure_merges_older_fields_under_newer_observation(monkeypatch) -> None:
+    _reset(monkeypatch)
+    write_started = threading.Event()
+    release_write = threading.Event()
+
+    def fail_after_newer(_payload):
+        write_started.set()
+        assert release_write.wait(timeout=2)
+        raise OSError("local write failed")
+
+    monkeypatch.setattr(progress_io, "_write_local_immutable", fail_after_newer)
+    progress_io.publish_progress("boot", gpu={"used_mb": 1}, shared="old")
+    assert write_started.wait(timeout=1)
+    progress_io.publish_progress("rl_step", step=2, reward=0.5, shared="new")
+    release_write.set()
+    _wait_for_publisher()
+
+    restored = progress_io._PROGRESS_LATEST_OBSERVATION
+    assert restored is not None
+    assert restored.stage == "rl_step"
+    assert restored.fields["gpu"] == {"used_mb": 1}
+    assert restored.fields["reward"] == 0.5
+    assert restored.fields["shared"] == "new"
+
+
+def test_restored_checkpoint_failure_does_not_override_newer_success(monkeypatch) -> None:
+    _reset(monkeypatch)
+    write_started = threading.Event()
+    release_write = threading.Event()
+
+    def fail_after_success(_payload):
+        write_started.set()
+        assert release_write.wait(timeout=2)
+        raise OSError("local write failed")
+
+    monkeypatch.setattr(progress_io, "_write_local_immutable", fail_after_success)
+    failure = {"reason": "upload failed", "step": 4}
+    progress_io.publish_progress("checkpoint_upload_failed", step=4, checkpoint_failure=failure)
+    assert write_started.wait(timeout=1)
+    progress_io.publish_progress("checkpoint_uploaded", step=4)
+    progress_io.publish_progress("sft_step", step=5, loss=0.2)
+    release_write.set()
+    _wait_for_publisher()
+
+    restored = progress_io._PROGRESS_LATEST_OBSERVATION
+    assert restored is not None
+    assert restored.stage == "sft_step"
+    assert restored.fields["step"] == 5
+    assert restored.fields["loss"] == 0.2
+    assert "checkpoint_failure" not in restored.fields
+
+
+def test_local_progress_retention_is_bounded_and_preserves_failed_retry(
+    monkeypatch, tmp_path
+) -> None:
+    _reset(monkeypatch)
+    directory = tmp_path / "progress"
+    monkeypatch.setattr(progress_io, "local_progress_directory", lambda: str(directory))
+    monkeypatch.setattr(progress_io, "_upload_record", lambda *_args, **_kwargs: True)
+
+    for step in range(1, 11):
+        progress_io.publish_progress("rl_step", step=step, reward=step / 10)
+        progress_io.flush_progress()
+    assert len(list(directory.glob("*.json"))) == 1
+    committed = progress_io._PROGRESS_COMMITTED_LOCAL_PATH
+
+    failed = threading.Event()
+    outcomes = iter([False, True])
+
+    def fail_then_commit(*_args, **_kwargs):
+        outcome = next(outcomes)
+        if not outcome:
+            failed.set()
+        return outcome
+
+    monkeypatch.setattr(progress_io, "_upload_record", fail_then_commit)
+    progress_io.publish_progress("rl_step", step=11, reward=1.1)
+    assert failed.wait(timeout=1)
+    pending = progress_io._PROGRESS_PENDING_UPLOAD
+    assert pending is not None
+    assert os.path.exists(pending[1])
+    assert os.path.exists(committed)
+    assert len(list(directory.glob("*.json"))) == 2
+
+    progress_io.flush_progress()
+    assert len(list(directory.glob("*.json"))) == 1
+    latest = result_io._latest_local_progress()
+    assert latest["sequence"] == 11
+    assert latest["completed_steps"] == 11
 
 
 def test_commit_landed_response_failed_retries_without_breaking_reader(monkeypatch) -> None:

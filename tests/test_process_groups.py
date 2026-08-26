@@ -6,10 +6,35 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 from flash.providers._lifecycle.bootstrapping.processes import (
     start_process_group,
     terminate_process_group,
 )
+
+
+@pytest.mark.wallclock
+def test_process_group_termination_reaps_exited_leader_without_full_grace() -> None:
+    process, group = start_process_group(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    started = time.monotonic()
+    try:
+        terminate_process_group(
+            process,
+            process_group_id=group,
+            term_grace_s=1.0,
+            kill_grace_s=1.0,
+        )
+        assert time.monotonic() - started < 0.8
+        assert process.returncode == -signal.SIGTERM
+    finally:
+        if process.poll() is None:
+            os.killpg(group, signal.SIGKILL)
+            process.wait(timeout=1)
 
 
 def test_process_group_termination_reaps_child_group() -> None:

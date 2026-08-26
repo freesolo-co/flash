@@ -147,6 +147,7 @@ def main():
             if progress_io.LATEST_GRPO_METRICS
             else {}
         )
+        progress_publication_error: Exception | None = None
         try:
             progress_io.publish_progress(
                 f"error_{state.RUN_MODE}",
@@ -155,10 +156,8 @@ def main():
                 **_err_metrics,
                 gpu=worker_perf.gpu_diagnostics(),
             )
-        except Exception:
-            progress_io.publish_progress(
-                f"error_{state.RUN_MODE}", error=detail, **flags, **_err_metrics
-            )
+        except Exception as progress_error:
+            progress_publication_error = progress_error
         result_publication_error: Exception | None = None
         try:
             result_io.publish_result(
@@ -172,7 +171,15 @@ def main():
                     "failure": progress_io._PROGRESS_PENDING_CHECKPOINT_FAILURE,
                 },
                 artifacts={"error": err_name if "err_name" in locals() else None},
-                diagnostics={"error": detail, "traceback": tb},
+                diagnostics={
+                    "error": detail,
+                    "traceback": tb,
+                    **(
+                        {"progress_publication_error": progress_publication_error}
+                        if progress_publication_error is not None
+                        else {}
+                    ),
+                },
             )
         except Exception as result_error:
             result_publication_error = result_error

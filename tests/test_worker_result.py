@@ -40,6 +40,12 @@ def _manifest(**updates) -> ResultManifest:
     return ResultManifest(**values)
 
 
+def _repo_file(path: str):
+    from huggingface_hub import RepoFile
+
+    return RepoFile(path=path, size=1, oid=path)
+
+
 def _set_identity(monkeypatch) -> None:
     monkeypatch.setattr(result_io.state, "HF_REPO", "org/repo")
     monkeypatch.setattr(result_io.state, "RUN_ID", "run-1")
@@ -64,8 +70,11 @@ def test_exactly_once_publish_adopts_matching_concurrent_result(monkeypatch, tmp
         def repo_info(self, **_kwargs):
             return SimpleNamespace(sha=self.revision)
 
+        def list_repo_tree(self, **_kwargs):
+            return [] if self.created == 0 else [_repo_file(result_path(existing))]
+
         def list_repo_files(self, **_kwargs):
-            return [] if self.created == 0 else [result_path(existing)]
+            raise AssertionError("whole-repository listing is forbidden")
 
         def create_commit(self, **kwargs):
             assert kwargs["parent_commit"] == "c" * 40
@@ -94,8 +103,11 @@ def test_exact_fence_terminal_lookup_validates_source_identity(monkeypatch) -> N
         def repo_info(self, **_kwargs):
             return SimpleNamespace(sha="c" * 40)
 
+        def list_repo_tree(self, **_kwargs):
+            return [_repo_file(result_path(existing))]
+
         def list_repo_files(self, **_kwargs):
-            return [result_path(existing)]
+            raise AssertionError("whole-repository listing is forbidden")
 
     monkeypatch.setattr(result_io.hf_io, "hf_api", Api)
     monkeypatch.setattr(result_io, "_download_result", lambda _path, *, revision: existing)
@@ -125,8 +137,11 @@ def test_exact_fence_terminal_lookup_fails_closed_on_malformed_result(
         def repo_info(self, **_kwargs):
             return SimpleNamespace(sha="c" * 40)
 
+        def list_repo_tree(self, **_kwargs):
+            return [_repo_file("rl/run-1/attempts/2-9/result/not-a-result.json")]
+
         def list_repo_files(self, **_kwargs):
-            return ["rl/run-1/attempts/2-9/result/not-a-result.json"]
+            raise AssertionError("whole-repository listing is forbidden")
 
     monkeypatch.setattr(result_io.hf_io, "hf_api", Api)
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: str(malformed))
@@ -157,8 +172,11 @@ def test_exact_fence_terminal_lookup_fails_closed_on_conflicts(monkeypatch) -> N
         def repo_info(self, **_kwargs):
             return SimpleNamespace(sha="c" * 40)
 
+        def list_repo_tree(self, **_kwargs):
+            return [_repo_file(result_path(first)), _repo_file(result_path(second))]
+
         def list_repo_files(self, **_kwargs):
-            return [result_path(first), result_path(second)]
+            raise AssertionError("whole-repository listing is forbidden")
 
     monkeypatch.setattr(result_io.hf_io, "hf_api", Api)
 
@@ -265,6 +283,85 @@ def test_cancelled_result_uses_latest_current_fence_progress(monkeypatch) -> Non
     ]
 
 
+def test_required_progress_failure_does_not_block_failed_terminal_result(monkeypatch) -> None:
+    from flash.engine.worker.entry import worker
+    from flash.engine.worker.io import progress as progress_io
+
+    with progress_io._PROGRESS_CONDITION:
+        assert progress_io._PROGRESS_PUBLISHER is None
+        monkeypatch.setattr(progress_io, "_PROGRESS_SEQUENCE", 0)
+        monkeypatch.setattr(progress_io, "_PROGRESS_PREVIOUS_DIGEST", None)
+        monkeypatch.setattr(progress_io, "_PROGRESS_PENDING_UPLOAD", None)
+        monkeypatch.setattr(progress_io, "_PROGRESS_COMMITTED_LOCAL_PATH", None)
+        monkeypatch.setattr(progress_io, "_PROGRESS_LATEST_OBSERVATION", None)
+        monkeypatch.setattr(progress_io, "_PROGRESS_ACTIVE", False)
+        monkeypatch.setattr(progress_io, "_PROGRESS_FLUSH_REQUIRED", False)
+        monkeypatch.setattr(progress_io, "_PROGRESS_GENERATION", 0)
+        monkeypatch.setattr(progress_io, "_PROGRESS_ERROR", None)
+    monkeypatch.setattr(progress_io.worker_state, "RUN_ID", "run-1")
+    monkeypatch.setattr(progress_io.worker_state, "PHASE", "rl")
+    monkeypatch.setattr(progress_io.worker_state, "ATTEMPT", 2)
+    monkeypatch.setattr(progress_io.worker_state, "FENCE", 9)
+    upload_error = worker.worker_perf.RetriableInfraError("required progress upload failed")
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(upload_error),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_run_worker_mode",
+        lambda: progress_io.publish_progress("rl_step", initial=True, step=0),
+    )
+    monkeypatch.setattr(worker.hf_io, "hf_upload_file", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker.backend_common, "collect_ray_failure_logs", lambda **_kwargs: "")
+    monkeypatch.setattr(worker.worker_perf, "gpu_diagnostics", dict)
+    monkeypatch.setattr(worker.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(result_io, "_source_attestation", lambda: ATTESTATION)
+    monkeypatch.setattr(result_io, "_write_immutable", lambda _payload: "/tmp/result.json")
+    published = []
+    monkeypatch.setattr(
+        result_io,
+        "_publish_exactly_once",
+        lambda manifest, _path: published.append(manifest) or manifest,
+    )
+
+    with pytest.raises(worker.worker_perf.RetriableInfraError) as exc_info:
+        worker.main()
+
+    assert exc_info.value is upload_error
+    assert len(published) == 1
+    assert published[0].outcome == "failed"
+    assert published[0].failure_class == "artifact_transport"
+    assert (
+        "required progress upload failed" in published[0].diagnostics["progress_publication_error"]
+    )
+
+
+def test_failed_result_does_not_ignore_an_unrelated_flush_failure(monkeypatch) -> None:
+    from flash.engine.worker.io import progress as progress_io
+
+    unrelated = RuntimeError("unrelated flush failure")
+    monkeypatch.setattr(progress_io, "flush_progress", lambda: (_ for _ in ()).throw(unrelated))
+    monkeypatch.setattr(progress_io, "progress_error", lambda: None)
+    monkeypatch.setattr(
+        result_io,
+        "_write_immutable",
+        lambda _payload: pytest.fail("unrelated flush failure must block result publication"),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        result_io.publish_result(
+            outcome="failed",
+            failure_class="worker",
+            started_at=100.0,
+            training_entered=False,
+            completed_steps=0,
+        )
+
+    assert exc_info.value is unrelated
+
+
 def test_worker_surfaces_required_result_publication_failure(monkeypatch) -> None:
     from flash.engine.worker.entry import worker
 
@@ -301,8 +398,11 @@ def test_exactly_once_publish_rejects_conflicting_existing_result(monkeypatch, t
         def repo_info(self, **_kwargs):
             return SimpleNamespace(sha="c" * 40)
 
+        def list_repo_tree(self, **_kwargs):
+            return [_repo_file(result_path(existing))]
+
         def list_repo_files(self, **_kwargs):
-            return [result_path(existing)]
+            raise AssertionError("whole-repository listing is forbidden")
 
         def create_commit(self, **_kwargs):
             raise AssertionError("conflicting result must be rejected before upload")

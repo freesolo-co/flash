@@ -93,15 +93,21 @@ def _download_result(path: str, *, revision: str) -> ResultManifest:
 
 
 def _existing_result(api, *, revision: str) -> ResultManifest | None:
-    base = f"{attempt_prefix(state.PHASE, state.RUN_ID, state.ATTEMPT, state.FENCE)}/result/"
-    repo_paths = api.list_repo_files(
-        repo_id=state.HF_REPO,
-        repo_type="dataset",
-        revision=revision,
-    )
-    if not isinstance(repo_paths, list) or any(not isinstance(path, str) for path in repo_paths):
-        raise _TerminalResultEvidenceError("artifact repository listing is malformed")
-    paths = [path for path in repo_paths if path.startswith(base)]
+    from huggingface_hub import RepoFile
+    from huggingface_hub.errors import RemoteEntryNotFoundError
+
+    prefix = f"{attempt_prefix(state.PHASE, state.RUN_ID, state.ATTEMPT, state.FENCE)}/result"
+    try:
+        entries = api.list_repo_tree(
+            repo_id=state.HF_REPO,
+            path_in_repo=prefix,
+            recursive=True,
+            revision=revision,
+            repo_type="dataset",
+        )
+        paths = [entry.path for entry in entries if isinstance(entry, RepoFile)]
+    except RemoteEntryNotFoundError:
+        return None
     if not paths:
         return None
     if len(paths) != 1:
@@ -199,7 +205,9 @@ def _publish_exactly_once(manifest: ResultManifest, local_path: str) -> ResultMa
 
 
 def _latest_local_progress() -> dict:
-    directory = "/tmp/flash-progress"
+    from flash.engine.worker.io.progress import local_progress_directory
+
+    directory = local_progress_directory()
     candidates: list[dict] = []
     with contextlib.suppress(OSError):
         for name in os.listdir(directory):
@@ -280,9 +288,18 @@ def publish_result(
     diagnostics: dict | None = None,
 ) -> ResultManifest:
     """publish the only worker terminal authority for the current attempt."""
-    from flash.engine.worker.io.progress import flush_progress
+    from flash.engine.worker.io.progress import flush_progress, progress_error
 
-    flush_progress()
+    progress_flush_error: Exception | None = None
+    try:
+        flush_progress()
+    except Exception as exc:
+        if outcome != "failed" or progress_error() is not exc:
+            raise
+        progress_flush_error = exc
+    terminal_diagnostics = dict(diagnostics or {})
+    if progress_flush_error is not None:
+        terminal_diagnostics["progress_publication_error"] = progress_flush_error
     manifest = ResultManifest(
         run_id=state.RUN_ID,
         phase_namespace=state.PHASE,
@@ -300,7 +317,7 @@ def publish_result(
         source_attestation=_source_attestation(),
         diagnostics={
             str(key)[:120]: sanitize_diagnostic(value, limit=1000)
-            for key, value in (diagnostics or {}).items()
+            for key, value in terminal_diagnostics.items()
         },
     )
     payload = canonical_bytes(manifest.to_dict())

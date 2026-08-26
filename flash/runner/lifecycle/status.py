@@ -468,8 +468,8 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     # fewer. Absent on records predating the stamp, where one card is the correct reading.
     gpu_count = max(1, int(metrics.get("allocated_gpu_count") or 1))
     cost = metrics.get("cost_usd")
-    if cost:
-        cost = float(cost or 0.0)
+    if cost is not None:
+        cost = float(cost)
     else:
         wall = float(metrics.get("wall_seconds") or 0.0)
         cost = wall / 3600.0 * rate * gpu_count

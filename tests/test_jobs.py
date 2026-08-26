@@ -6092,6 +6092,37 @@ def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
     assert "code_prefix" not in submitted["payload"]
 
 
+def test_submit_run_rejects_stale_attempt_before_endpoint_deploy(monkeypatch):
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.runpod.execution import job_execution
+
+    spec = JobSpec(
+        run_id="runpod-stale-before-deploy",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type=""),
+    )
+    _persist_runpod_attempt(spec, attempt_id=5, fence=2)
+    deployed = []
+    monkeypatch.setattr(
+        job_execution,
+        "deploy_train_endpoint",
+        lambda *_args, **_kwargs: deployed.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match="current fenced attempt"):
+        job_execution.submit_attempt(
+            spec,
+            attempt=4,
+            fence=1,
+            source_snapshot=_SOURCE_SNAPSHOT,
+            deadline_at=10_000_000_000.0,
+        )
+
+    assert deployed == []
+
+
 def test_submit_run_rejects_malformed_source_before_deploy(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.runpod.execution import job_execution
@@ -6165,6 +6196,59 @@ def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkey
     assert _submit(4) == 3600.0
     # and a single-card run on the identical path is untouched.
     assert _submit(1) == 900.0
+
+
+@pytest.mark.parametrize("deletion_confirmed", [True, False])
+def test_runpod_post_create_attempt_change_cleans_or_persists_endpoint(
+    monkeypatch, deletion_confirmed
+):
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core.base import UnreconciledCreateError
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import job_execution
+
+    spec = JobSpec(
+        run_id=f"runpod-post-create-stale-{deletion_confirmed}",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type=""),
+    )
+    _persist_runpod_attempt(spec, attempt_id=4)
+    deleted = []
+    handles = []
+
+    def deploy_then_replace(*_args, **_kwargs):
+        status = runner_status.get_status(spec.run_id)
+        status.attempt = _attempt_record(attempt_id=5, fence=2).to_dict()
+        runner_state._save_status(status)
+        return "endpoint", "name", _RUNPOD_FINGERPRINT
+
+    monkeypatch.setattr(job_execution, "deploy_train_endpoint", deploy_then_replace)
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda endpoint_id, _fingerprint: deleted.append(endpoint_id) or deletion_confirmed,
+    )
+
+    expected = RuntimeError if deletion_confirmed else UnreconciledCreateError
+    with pytest.raises(expected):
+        job_execution.submit_attempt(
+            spec,
+            attempt=4,
+            fence=1,
+            on_handle=handles.append,
+            source_snapshot=_SOURCE_SNAPSHOT,
+            deadline_at=10_000_000_000.0,
+        )
+
+    assert deleted == ["endpoint"]
+    if deletion_confirmed:
+        assert handles == []
+    else:
+        assert len(handles) == 1
+        assert handles[0]["endpoint_id"] == "endpoint"
+        assert "job_id" not in handles[0]
 
 
 def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deletion(monkeypatch):
@@ -6263,6 +6347,52 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
     assert handles[0]["endpoint_id"] == "endpoint"
     assert handles[0]["attempt"] == 4
     assert "job_id" not in handles[0]
+
+
+def test_runpod_unconfirmed_cleanup_surfaces_handle_persistence_failure(monkeypatch):
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core.base import UnreconciledCreateError
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import job_execution
+
+    spec = JobSpec(
+        run_id="runpod-cleanup-persistence-failed",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type=""),
+    )
+    _persist_runpod_attempt(spec, attempt_id=4)
+    persistence_error = RuntimeError("durable handle write failed")
+    monkeypatch.setattr(provider_worker, "build_worker_env", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        job_execution,
+        "deploy_train_endpoint",
+        lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT),
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "submit_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("ambiguous queue post")),
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *_args, **_kwargs: False,
+    )
+
+    with pytest.raises(
+        UnreconciledCreateError, match="cleanup handle persistence failed"
+    ) as exc_info:
+        job_execution.submit_attempt(
+            spec,
+            attempt=4,
+            on_handle=lambda _handle: (_ for _ in ()).throw(persistence_error),
+            source_snapshot=_SOURCE_SNAPSHOT,
+            deadline_at=10_000_000_000.0,
+        )
+
+    assert exc_info.value.__cause__ is persistence_error
 
 
 @pytest.mark.parametrize(

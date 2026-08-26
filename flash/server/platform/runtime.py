@@ -362,12 +362,30 @@ def _adopt_handleless_result(spec) -> bool | _HandlelessRetry | None:
         return None
     if not status.attempt:
         return False
+    from flash.providers.artifacts.attempts import AttemptArtifactError
+
     try:
         expected_attempt = _status_attempt_identity(status)
         if expected_attempt is None:
             return None
         _load_run_deadline_at(spec.run_id)
         result = _attempt_result(spec.run_id)
+    except AttemptArtifactError as exc:
+        try:
+            applied = _compare_and_fail_remote(
+                spec.run_id,
+                None,
+                f"attempt artifact evidence is invalid: {exc}",
+                expected_attempt=expected_attempt,
+            )
+        except Exception:
+            try:
+                from flash.runner.lifecycle.state import TERMINAL_STATES
+
+                return True if get_status(spec.run_id).state in TERMINAL_STATES else None
+            except Exception:
+                return None
+        return True if applied else None
     except Exception:
         return None
     if result is None:

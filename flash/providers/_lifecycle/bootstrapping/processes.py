@@ -23,6 +23,11 @@ def _group_exists(process_group_id: int) -> bool:
     return True
 
 
+def _group_exists_after_reaping(process: subprocess.Popen, process_group_id: int) -> bool:
+    process.poll()
+    return _group_exists(process_group_id)
+
+
 def terminate_process_group(
     process: subprocess.Popen,
     *,
@@ -34,13 +39,17 @@ def terminate_process_group(
     with contextlib.suppress(ProcessLookupError):
         os.killpg(process_group_id, signal.SIGTERM)
     term_deadline = time.monotonic() + max(0.0, term_grace_s)
-    while _group_exists(process_group_id) and time.monotonic() < term_deadline:
+    while (
+        _group_exists_after_reaping(process, process_group_id) and time.monotonic() < term_deadline
+    ):
         time.sleep(_POLL_S)
-    if _group_exists(process_group_id):
+    if _group_exists_after_reaping(process, process_group_id):
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process_group_id, signal.SIGKILL)
     kill_deadline = time.monotonic() + max(0.0, kill_grace_s)
-    while _group_exists(process_group_id) and time.monotonic() < kill_deadline:
+    while (
+        _group_exists_after_reaping(process, process_group_id) and time.monotonic() < kill_deadline
+    ):
         time.sleep(_POLL_S)
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=0)

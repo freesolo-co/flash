@@ -42,6 +42,7 @@ _PROGRESS_TRAINING_ENTERED = False
 _PROGRESS_COMPLETED_STEPS = 0
 _PROGRESS_PENDING_CHECKPOINT_FAILURE: dict[str, int | str] | None = None
 _PROGRESS_PENDING_UPLOAD: tuple[ProgressRecord, str, str, bool] | None = None
+_PROGRESS_COMMITTED_LOCAL_PATH: str | None = None
 _PROGRESS_LATEST_OBSERVATION: _ProgressObservation | None = None
 _PROGRESS_PUBLISHER: threading.Thread | None = None
 _PROGRESS_ACTIVE = False
@@ -122,12 +123,22 @@ def _progress_sections(fields: dict) -> tuple[dict, list, dict, dict, dict, dict
     return metrics, samples, timing, checkpoint, gpu, diagnostics
 
 
+def local_progress_directory() -> str:
+    """return the current fenced attempt's bounded local progress directory."""
+    import hashlib
+
+    identity = (
+        f"{worker_state.PHASE}\0{worker_state.RUN_ID}\0{worker_state.ATTEMPT}\0{worker_state.FENCE}"
+    ).encode()
+    return os.path.join("/tmp/flash-progress", hashlib.sha256(identity).hexdigest())
+
+
 def _write_local_immutable(payload: bytes) -> str:
     import hashlib
     import tempfile
 
     digest = hashlib.sha256(payload).hexdigest()
-    directory = "/tmp/flash-progress"
+    directory = local_progress_directory()
     os.makedirs(directory, exist_ok=True)
     final = os.path.join(directory, digest + ".json")
     if os.path.exists(final):
@@ -198,6 +209,26 @@ def _merge_latest_observation(stage: str, initial: bool, fields: dict) -> None:
     _PROGRESS_LATEST_OBSERVATION = _ProgressObservation(stage, initial, observed)
 
 
+def _restore_observation_locked(observation: _ProgressObservation) -> None:
+    """restore a dequeued observation without overwriting a newer stage or field value."""
+    global _PROGRESS_LATEST_OBSERVATION
+
+    newer = _PROGRESS_LATEST_OBSERVATION
+    if newer is None:
+        _PROGRESS_LATEST_OBSERVATION = observation
+        return
+    merged = bounded_json({**observation.fields, **newer.fields})
+    if not isinstance(merged, dict):
+        merged = newer.fields
+    if _PROGRESS_PENDING_CHECKPOINT_FAILURE is None:
+        merged.pop("checkpoint_failure", None)
+    _PROGRESS_LATEST_OBSERVATION = _ProgressObservation(
+        newer.stage,
+        observation.initial or newer.initial,
+        merged,
+    )
+
+
 def _progress_record(
     observation: _ProgressObservation,
     *,
@@ -229,11 +260,23 @@ def _progress_record(
 
 
 def _commit_progress_record(record: ProgressRecord) -> None:
-    global _PROGRESS_PENDING_UPLOAD, _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE
+    global _PROGRESS_COMMITTED_LOCAL_PATH, _PROGRESS_PENDING_UPLOAD
+    global _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE
 
+    pending = _PROGRESS_PENDING_UPLOAD
+    committed_path = pending[1] if pending is not None else None
     _PROGRESS_SEQUENCE = record.sequence
     _PROGRESS_PREVIOUS_DIGEST = digest_record(record.to_dict())
     _PROGRESS_PENDING_UPLOAD = None
+    if committed_path is not None:
+        _PROGRESS_COMMITTED_LOCAL_PATH = committed_path
+        directory = os.path.dirname(committed_path)
+        with contextlib.suppress(OSError):
+            for name in os.listdir(directory):
+                path = os.path.join(directory, name)
+                if path != committed_path and name.endswith(".json"):
+                    with contextlib.suppress(OSError):
+                        os.unlink(path)
 
 
 def _start_progress_publisher_locked() -> None:
@@ -298,6 +341,7 @@ def _progress_publisher_loop() -> None:
                 pending = (record, local_path, progress_path(record), observation.initial)
             except BaseException as exc:
                 with _PROGRESS_CONDITION:
+                    _restore_observation_locked(observation)
                     _PROGRESS_ACTIVE = False
                     _PROGRESS_ERROR = exc
                     _PROGRESS_PUBLISHER = None
@@ -328,6 +372,12 @@ def _progress_publisher_loop() -> None:
                 _PROGRESS_PENDING_UPLOAD = (record, local_path, remote_path, True)
             if upload_generation == _PROGRESS_GENERATION and not _PROGRESS_FLUSH_REQUIRED:
                 _PROGRESS_CONDITION.wait()
+
+
+def progress_error() -> BaseException | None:
+    """return the publisher's bounded terminal error, if one occurred."""
+    with _PROGRESS_CONDITION:
+        return _PROGRESS_ERROR
 
 
 def flush_progress() -> None:
