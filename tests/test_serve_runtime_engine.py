@@ -647,6 +647,83 @@ def test_effective_structured_default_rejects_automatic_tools_after_adapter_reso
     asyncio.run(runtime.close())
 
 
+def test_inactive_tools_allow_unqualified_thinking_generation(adapter_dir: Path) -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    asyncio.run(
+        runtime.register_adapter(
+            AdapterSpec(
+                adapter_id="adapter",
+                path=str(adapter_dir),
+                incarnation="incarnation-1",
+                thinking=True,
+            )
+        )
+    )
+    engine.responses.append([_output("plain text", [1])])
+
+    result = asyncio.run(
+        runtime.generate(
+            GenerationRequest(
+                adapter_id="adapter",
+                expected_incarnation="incarnation-1",
+                messages=[{"role": "user", "content": "weather"}],
+                tools=TOOLS,
+                tool_choice="none",
+                parallel_tool_calls=True,
+            )
+        )
+    )
+
+    assert result.thinking is True
+    assert "tools" not in runtime._tokenizer.template_calls[0]
+    asyncio.run(runtime.close())
+
+
+def test_inactive_tools_allow_effective_structured_default_and_logprobs(
+    adapter_dir: Path,
+) -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    asyncio.run(
+        runtime.register_adapter(
+            AdapterSpec(
+                adapter_id="adapter",
+                path=str(adapter_dir),
+                incarnation="incarnation-1",
+                structured_outputs=SCHEMA,
+            )
+        )
+    )
+    candidates = {1: _Logprob(-0.1, "a")}
+    engine.responses.append([_output("a", [1], logprobs=[candidates])])
+
+    asyncio.run(
+        runtime.generate(
+            GenerationRequest(
+                adapter_id="adapter",
+                expected_incarnation="incarnation-1",
+                messages=[{"role": "user", "content": "weather"}],
+                tools=TOOLS,
+                tool_choice="none",
+                parallel_tool_calls=True,
+                logprobs=True,
+                top_logprobs=1,
+            )
+        )
+    )
+
+    sampling = engine.generate_calls[0]["sampling"].kwargs
+    assert sampling["structured_outputs"].kwargs == {"json": SCHEMA}
+    assert sampling["logprobs"] == 1
+    assert "tools" not in runtime._tokenizer.template_calls[0]
+    asyncio.run(runtime.close())
+
+
 def test_adapterless_structured_generation_binds_default_thinking_false() -> None:
     runtime = VllmLoraRuntime(EngineConfig(model="model", reasoning_parser="qwen3"))
     asyncio.run(runtime.start())

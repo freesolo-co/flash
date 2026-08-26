@@ -19,6 +19,7 @@ from flash.serve.runtime.tool_calls import (
     ToolCallStreamParser,
     normalize_tools,
     parse_qwen3_coder_output,
+    tools_active,
 )
 from flash.serving.src.engine.support import (
     _cached_tokens_reported,
@@ -105,7 +106,7 @@ def _choice(index: int, output: Any, *, top_logprobs: int, tools: Any = None) ->
 
 
 def _validate_tool_request(owner: Any, payload: OpenAIGenerateRequest, thinking: bool) -> None:
-    if not _tools_active(payload):
+    if not tools_active(payload.tools, payload.tool_choice):
         return
     if thinking:
         raise ValueError("tools are not supported for thinking-enabled generation")
@@ -113,19 +114,15 @@ def _validate_tool_request(owner: Any, payload: OpenAIGenerateRequest, thinking:
         raise ValueError("this serving engine is not qualified for tool calling")
 
 
-def _tools_active(payload: OpenAIGenerateRequest) -> bool:
-    return payload.tools is not None and payload.tool_choice == "auto"
-
-
 def _active_tools(payload: OpenAIGenerateRequest) -> Any:
-    if not _tools_active(payload):
+    if not tools_active(payload.tools, payload.tool_choice):
         return None
     assert payload.tools is not None
     return normalize_tools(payload.tools)
 
 
 def _reject_tools_with_structured_outputs(payload: OpenAIGenerateRequest, structured: Any) -> None:
-    if _tools_active(payload) and structured is not None:
+    if tools_active(payload.tools, payload.tool_choice) and structured is not None:
         raise ValueError("tools cannot be combined with logprobs or structured outputs")
 
 

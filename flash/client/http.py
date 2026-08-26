@@ -32,6 +32,7 @@ from flash.client.streaming import (
 )
 from flash.core.spec import require_project_id
 from flash.serve.contract.urls import is_freesolo_hosted_url
+from flash.serve.runtime.tool_calls import validate_tool_control_presence
 
 
 class ClientError(RuntimeError):
@@ -227,6 +228,12 @@ def _prepare_chat_request(
 ) -> tuple[str, dict[str, Any]]:
     base_run_id, adapter_revision, step = _parse_chat_target(target)
     _validate_chat_messages(messages)
+    validate_tool_control_presence(
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+        error_type=ClientError,
+    )
     body: dict[str, Any] = {
         "messages": messages,
         "temperature": temperature,

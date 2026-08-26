@@ -429,6 +429,40 @@ def test_thinking_logprobs_policy_runs_after_adapter_resolution(app_setup):
     assert pool.generated == []
 
 
+def test_tool_choice_none_is_inactive_on_unqualified_thinking_route() -> None:
+    record = _rec("unqualified", QWEN_35B)
+    pool = FakePool()
+    client = _serve(pool, AdapterRouter([record, _alias(record)]))
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "unqualified",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+            "tool_choice": "none",
+            "parallel_tool_calls": True,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert pool.generated == [(QWEN_35B, _revision_id("unqualified"))]
+
+
 def test_base_model_false_thinking_override_allows_logprobs() -> None:
     record = AdapterRecord(
         adapter_id=QWEN,

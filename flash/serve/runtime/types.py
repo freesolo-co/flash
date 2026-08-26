@@ -23,7 +23,9 @@ from .tool_calls import (
     FunctionTool,
     ParsedToolCall,
     normalize_tools,
+    tools_active,
     tools_wire,
+    validate_tool_control_presence,
     validate_tool_stop_sequences,
 )
 
@@ -484,10 +486,13 @@ class GenerationRequest:
         object.__setattr__(
             self, "structured_outputs", normalize_structured_outputs(self.structured_outputs)
         )
-        if self.tools is None:
-            if self.tool_choice is not None or self.parallel_tool_calls is not None:
-                raise RuntimeConfigurationError("tool controls require tools")
-        else:
+        validate_tool_control_presence(
+            self.tools,
+            self.tool_choice,
+            self.parallel_tool_calls,
+            error_type=RuntimeConfigurationError,
+        )
+        if self.tools is not None:
             raw_tools = self.tools
             if (
                 isinstance(raw_tools, Sequence)
@@ -501,16 +506,17 @@ class GenerationRequest:
                 raise RuntimeConfigurationError("tool_choice must be auto or none")
             if self.parallel_tool_calls is not True:
                 raise RuntimeConfigurationError("parallel_tool_calls must be true")
-            if self.prompt is not None:
-                raise RuntimeConfigurationError("tools require chat messages")
-            from flash.serve.request.validation import has_image_blocks
+            if tools_active(normalized_tools, self.tool_choice):
+                if self.prompt is not None:
+                    raise RuntimeConfigurationError("tools require chat messages")
+                from flash.serve.request.validation import has_image_blocks
 
-            if has_image_blocks(self.messages, sequence_types=tuple):
-                raise RuntimeConfigurationError("tools cannot be combined with image messages")
-            if self.logprobs or self.structured_outputs:
-                raise RuntimeConfigurationError(
-                    "tools cannot be combined with logprobs or structured outputs"
-                )
+                if has_image_blocks(self.messages, sequence_types=tuple):
+                    raise RuntimeConfigurationError("tools cannot be combined with image messages")
+                if self.logprobs or self.structured_outputs:
+                    raise RuntimeConfigurationError(
+                        "tools cannot be combined with logprobs or structured outputs"
+                    )
         # an empty sequence and none both mean "no stop sequences", so they normalize together.
         stop = _normalize_stop(self.stop, "stop")
         validate_tool_stop_sequences(

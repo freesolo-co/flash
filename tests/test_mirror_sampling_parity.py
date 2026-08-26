@@ -157,6 +157,28 @@ def test_canonical_tool_choice_none_allows_tool_marker_stop_sequences():
 
 
 @pytest.mark.parametrize(
+    ("feature", "expected"),
+    [
+        ({"logprobs": True, "top_logprobs": 1}, (True, None)),
+        ({"response_format": {"type": "json_object"}}, (False, {"json_object": True})),
+        (
+            {"structured_outputs": {"choice": ["sunny", "rainy"]}},
+            (False, {"choice": ["sunny", "rainy"]}),
+        ),
+    ],
+    ids=["logprobs", "response-format", "structured-outputs"],
+)
+def test_canonical_tool_choice_none_allows_non_tool_features(feature, expected):
+    request = parse_chat_request(
+        _payload(tools=_tools(), tool_choice="none", **feature),
+        require_model=True,
+        allow_managed_selectors=False,
+    )
+
+    assert (request.logprobs, request.structured_outputs) == expected
+
+
+@pytest.mark.parametrize(
     "outputs",
     [
         [SimpleNamespace(index=0), SimpleNamespace(index=0)],

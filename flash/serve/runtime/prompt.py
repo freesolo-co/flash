@@ -13,7 +13,7 @@ from flash.content.reasoning_normalization import messages_for_chat_template
 
 from .errors import MultimodalRequestError, PromptError, ServingRuntimeError
 from .multimodal import has_image_blocks, normalize_text_messages, prepare_multimodal_request
-from .tool_calls import detached_template_messages, tools_wire
+from .tool_calls import detached_template_messages, tools_active, tools_wire
 from .types import AdapterSpec, EngineConfig, GenerationRequest
 
 _RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
@@ -75,7 +75,7 @@ def effective_chat_template_kwargs(
     kwargs = safe_chat_template_kwargs(request.chat_template_kwargs)
     if thinking is not None:
         kwargs["enable_thinking"] = thinking
-    if request.tools is not None and request.tool_choice == "auto":
+    if tools_active(request.tools, request.tool_choice):
         kwargs["tools"] = tools_wire(request.tools)
     return kwargs
 
@@ -188,7 +188,7 @@ class PromptPreparer:
                     sort_keys=True,
                     default=str,
                 )
-                if request.tools is not None:
+                if tools_active(request.tools, request.tool_choice):
                     raw += "\0" + json.dumps(
                         {
                             "tools": tools_wire(request.tools),

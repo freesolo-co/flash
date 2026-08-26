@@ -449,11 +449,27 @@ def test_tool_capability_rejection_uses_authoritative_thinking_and_parser() -> N
         require_model=False,
         allow_managed_selectors=True,
     ).tools
-    reject_tool_capability(tools=tools, thinking=False, tool_parser="qwen3_coder")
+    reject_tool_capability(
+        tools=tools,
+        tool_choice="auto",
+        thinking=False,
+        tool_parser="qwen3_coder",
+    )
+    reject_tool_capability(tools=tools, tool_choice="none", thinking=True, tool_parser=None)
     with pytest.raises(OpenAIRequestError, match="thinking-enabled"):
-        reject_tool_capability(tools=tools, thinking=True, tool_parser="qwen3_coder")
+        reject_tool_capability(
+            tools=tools,
+            tool_choice="auto",
+            thinking=True,
+            tool_parser="qwen3_coder",
+        )
     with pytest.raises(OpenAIRequestError, match="not qualified"):
-        reject_tool_capability(tools=tools, thinking=False, tool_parser=None)
+        reject_tool_capability(
+            tools=tools,
+            tool_choice="auto",
+            thinking=False,
+            tool_parser=None,
+        )
 
 
 def test_tool_history_is_strict_and_does_not_mutate_caller_messages() -> None:

@@ -17,7 +17,9 @@ from flash.serve.runtime.sampling import (
 )
 from flash.serve.runtime.tool_calls import (
     normalize_tools,
+    tools_active,
     tools_wire,
+    validate_tool_control_presence,
     validate_tool_stop_sequences,
 )
 from flash.serving.src.io.schemas import GenerateRequest
@@ -83,13 +85,12 @@ class OpenAIGenerateRequest(GenerateRequest):
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
         )
-        if self.tools is None and (
-            self.tool_choice is not None or self.parallel_tool_calls is not None
-        ):
-            raise ValueError("tool controls require tools")
-        if self.tools is not None:
-            if self.messages is None:
-                raise ValueError("tools require chat messages")
+        validate_tool_control_presence(
+            self.tools,
+            self.tool_choice,
+            self.parallel_tool_calls,
+        )
+        if self.tools is not None and self.messages is not None:
             normalize_messages(
                 self.messages,
                 sequence_types=list,
@@ -97,6 +98,9 @@ class OpenAIGenerateRequest(GenerateRequest):
                 error_type=ValueError,
                 max_source_chars=MAX_SOURCE_CHARS,
             )
+        if tools_active(self.tools, self.tool_choice):
+            if self.messages is None:
+                raise ValueError("tools require chat messages")
             if has_image_blocks(self.messages, sequence_types=list):
                 raise ValueError("tools cannot be combined with image messages")
             if self.logprobs or self.structured_outputs:

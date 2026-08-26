@@ -238,7 +238,11 @@ async def _produce_openai_chat_stream(
         )
         while True:
             try:
-                event = await _next_event_or_disconnect(guarded_events, disconnect_wait)
+                event = (
+                    await anext(guarded_events)
+                    if final is not None
+                    else await _next_event_or_disconnect(guarded_events, disconnect_wait)
+                )
             except StopAsyncIteration:
                 break
             if event is None:

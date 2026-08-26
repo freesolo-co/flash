@@ -37,6 +37,7 @@ _MAX_TOOLS = 128
 _MAX_SCHEMA_DEPTH = 8
 _MAX_SCHEMA_NODES = 512
 _MAX_ENUM_VALUES = 128
+_MAX_FIXED_DECIMAL_DIGITS = 1024
 _SCHEMA_TYPES = frozenset({"array", "boolean", "integer", "null", "number", "object", "string"})
 _SCHEMA_KEYS = frozenset(
     {"additionalProperties", "description", "enum", "items", "properties", "required", "type"}
@@ -201,6 +202,25 @@ def tools_wire(tools: Sequence[FunctionTool] | None) -> list[dict[str, Any]] | N
     return [tool.wire() for tool in tools]
 
 
+def tools_active(tools: object, tool_choice: str | None) -> bool:
+    """report whether declared tools are active for this request."""
+
+    return tools is not None and tool_choice == "auto"
+
+
+def validate_tool_control_presence(
+    tools: object,
+    tool_choice: str | None,
+    parallel_tool_calls: bool | None,
+    *,
+    error_type: type[Exception] = ValueError,
+) -> None:
+    """reject tool controls when no tool declarations accompany them."""
+
+    if tools is None and (tool_choice is not None or parallel_tool_calls is not None):
+        raise error_type("tool controls require tools")
+
+
 def validate_tool_stop_sequences(
     stop: Sequence[str],
     *,
@@ -210,7 +230,7 @@ def validate_tool_stop_sequences(
 ) -> None:
     """reject stop sequences that can consume active qwen tool grammar markers."""
 
-    if tools is None or tool_choice != "auto":
+    if not tools_active(tools, tool_choice):
         return
     markers = list(_TOOL_GRAMMAR_MARKERS)
     for tool in tools:
@@ -363,6 +383,10 @@ def _normalize_schema(
         detached = _json_copy(enum, path, error_type)
         if any(not _matches_type(item, schema_type) for item in detached):
             raise error_type(f"{path}.enum values must match {schema_type}")
+        if schema_type == "string" and any(
+            _string_enum_conflicts_with_tool_grammar(item) for item in detached
+        ):
+            raise error_type(f"{path}.enum contains an unrepresentable tool grammar delimiter")
         if any(
             _json_values_equal(item, prior)
             for index, item in enumerate(detached)
@@ -671,8 +695,10 @@ def _dump_exact_json(value: Any) -> str:
     if type(value) is Decimal:
         if not value.is_finite():
             raise ValueError("non-finite decimal")
-        rendered = format(value, "f") if value.as_tuple().exponent >= 0 else str(value)
-        return rendered.replace("E", "e")
+        exponent = value.as_tuple().exponent
+        if exponent >= 0 and len(value.as_tuple().digits) + exponent <= _MAX_FIXED_DECIMAL_DIGITS:
+            return format(value, "f")
+        return str(value).replace("E", "e")
     if type(value) is float:
         return json.dumps(value, allow_nan=False, separators=(",", ":"))
     if type(value) is str:
@@ -702,6 +728,18 @@ def _identifier_name(value: object, path: str, error_type: type[Exception]) -> s
     if type(value) is not str or _NAME_RE.fullmatch(value) is None:
         raise error_type(f"{path} is invalid")
     return value
+
+
+def _string_enum_conflicts_with_tool_grammar(value: str) -> bool:
+    cursor = 0
+    while True:
+        cursor = value.find(_PARAMETER_END, cursor)
+        if cursor < 0:
+            return False
+        following = _skip_whitespace(value, cursor + len(_PARAMETER_END))
+        if value.startswith((_PARAMETER_START, _FUNCTION_END), following):
+            return True
+        cursor += len(_PARAMETER_END)
 
 
 def _strings_overlap(left: str, right: str) -> bool:

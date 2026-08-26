@@ -167,6 +167,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         reject_thinking_logprobs(thinking=effective_thinking, logprobs=normalized.logprobs)
         reject_tool_capability(
             tools=normalized.tools,
+            tool_choice=normalized.tool_choice,
             thinking=effective_thinking,
             tool_parser=tool_parser_for(target.base_model),
         )

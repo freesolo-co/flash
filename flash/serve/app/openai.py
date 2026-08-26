@@ -52,6 +52,7 @@ def parse_chat_request(
     )
     reject_tool_capability(
         tools=request.tools,
+        tool_choice=request.tool_choice,
         thinking=resolved.adapter.thinking_default,
         tool_parser=tool_parser,
     )

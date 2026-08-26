@@ -27,7 +27,7 @@ from .prompt import (
     resolve_thinking,
 )
 from .sampling import complete_indexed_outputs, indexed_outputs, normalize_token_logprobs
-from .tool_calls import ParsedToolCall, ToolCallStreamParser, parse_qwen3_coder_output
+from .tool_calls import ParsedToolCall, ToolCallStreamParser, parse_qwen3_coder_output, tools_active
 from .types import (
     AdapterSpec,
     EngineConfig,
@@ -362,7 +362,7 @@ class VllmLoraRuntime:
                 index,
                 output,
                 top_logprobs=request.top_logprobs,
-                tools=request.tools if request.tool_choice == "auto" else None,
+                tools=request.tools if tools_active(request.tools, request.tool_choice) else None,
             )
             for index, output in sorted(complete_indexed_outputs(final_output, n=request.n).items())
         )
@@ -414,7 +414,7 @@ class VllmLoraRuntime:
                 state = _StreamState.create(
                     request.n,
                     request.top_logprobs,
-                    request.tools if request.tool_choice == "auto" else None,
+                    request.tools if tools_active(request.tools, request.tool_choice) else None,
                 )
                 output = first_output
                 while True:
@@ -571,7 +571,7 @@ class VllmLoraRuntime:
             yield binding
 
     def _validate_tools(self, request: GenerationRequest, thinking: bool | None) -> None:
-        if request.tools is None:
+        if not tools_active(request.tools, request.tool_choice):
             return
         if thinking:
             raise PromptError("tools are not supported for thinking-enabled generation")
@@ -583,11 +583,7 @@ class VllmLoraRuntime:
         request: GenerationRequest,
         structured: _StructuredState,
     ) -> None:
-        if (
-            request.tools is not None
-            and request.tool_choice == "auto"
-            and structured.params is not None
-        ):
+        if tools_active(request.tools, request.tool_choice) and structured.params is not None:
             raise PromptError("tools cannot be combined with logprobs or structured outputs")
 
     def _structured_state(

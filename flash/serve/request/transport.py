@@ -23,7 +23,11 @@ from flash.serve.contract.urls import (
     serving_base_url,
     serving_control_url,
 )
-from flash.serve.runtime.tool_calls import FunctionTool, tools_wire
+from flash.serve.runtime.tool_calls import (
+    FunctionTool,
+    tools_wire,
+    validate_tool_control_presence,
+)
 
 _INTERNAL_KEY_HEADER_NAME = "X-Freesolo-Internal-Key"
 _MAX_REDIRECTS = 100
@@ -226,6 +230,7 @@ def chat_request_body(
 ) -> dict[str, Any]:
     """serialize the supported serving request fields exactly once."""
 
+    validate_tool_control_presence(tools, tool_choice, parallel_tool_calls)
     body: dict[str, Any] = {
         "model": run_id,
         "messages": messages,

@@ -896,6 +896,42 @@ def test_a_chat_request_may_override_the_registered_grammar_for_its_own_call() -
     assert owner.models["run-1"].adapter.structured_outputs_default == {"json_object": True}
 
 
+def test_packaged_route_treats_tool_choice_none_as_inactive() -> None:
+    owner, runtime = _published_owner(thinking_default=True)
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers=_auth(),
+            json=_chat_body(
+                tools=tools,
+                tool_choice="none",
+                parallel_tool_calls=True,
+            ),
+        )
+    )
+
+    assert response.status_code == 200
+    assert runtime.generation_requests[-1].tool_choice == "none"
+
+
 @pytest.mark.parametrize(
     "body",
     [

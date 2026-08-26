@@ -354,6 +354,25 @@ def test_prepare_chat_request_defaults_tool_controls() -> None:
     assert body["parallel_tool_calls"] is True
 
 
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"tool_choice": "none"},
+        {"parallel_tool_calls": True},
+    ],
+    ids=["tool-choice", "parallel-tool-calls"],
+)
+def test_prepare_chat_request_rejects_tool_controls_without_tools(controls) -> None:
+    with pytest.raises(ClientError, match="tool controls require tools"):
+        _prepare_chat_request(
+            "run-abc",
+            [{"role": "user", "content": "weather"}],
+            0.0,
+            32,
+            **controls,
+        )
+
+
 def test_chat_omits_thinking_template_controls(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")

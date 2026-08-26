@@ -20,7 +20,12 @@ from typing import Any
 # _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
 # the vllm build probes engine_boot uses.
 from flash.content.thinking import messages_for_chat_template
-from flash.serve.runtime.tool_calls import detached_template_messages, normalize_tools, tools_wire
+from flash.serve.runtime.tool_calls import (
+    detached_template_messages,
+    normalize_tools,
+    tools_active,
+    tools_wire,
+)
 from flash.serving.src.engine.lora_entries import _LoraEntry, cached_lora_request, entries_for
 from flash.serving.src.engine.model_config import (
     engine_overrides_for,
@@ -431,7 +436,7 @@ class _LoraEngineImpl:
             "enable_thinking": thinking_default,
             "preserve_thinking": False,
         }
-        if getattr(payload, "tools", None) is not None and payload.tool_choice == "auto":
+        if tools_active(getattr(payload, "tools", None), getattr(payload, "tool_choice", None)):
             effective["tools"] = tools_wire(normalize_tools(payload.tools))
         return effective
 

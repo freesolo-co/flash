@@ -119,6 +119,7 @@ def _resolve_chat_request(
         )
         reject_tool_capability(
             tools=request.tools,
+            tool_choice=request.tool_choice,
             thinking=effective_spec.thinking,
             tool_parser=qualified_tool_parser(effective_spec.model),
         )

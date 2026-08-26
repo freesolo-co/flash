@@ -26,6 +26,7 @@ from flash.serve.runtime.sampling import (
 from flash.serve.runtime.tool_calls import (
     FunctionTool,
     normalize_tools,
+    tools_active,
     validate_tool_stop_sequences,
 )
 
@@ -163,7 +164,7 @@ def parse_chat_request(
         tool_choice=tool_choice,
         error_type=OpenAIRequestError,
     )
-    if tools is not None:
+    if tools_active(tools, tool_choice):
         if logprobs:
             raise OpenAIRequestError("tools cannot be combined with logprobs")
         if structured_outputs:
@@ -205,11 +206,15 @@ def reject_thinking_logprobs(*, thinking: bool, logprobs: bool) -> None:
 
 
 def reject_tool_capability(
-    *, tools: tuple[FunctionTool, ...] | None, thinking: bool, tool_parser: str | None
+    *,
+    tools: tuple[FunctionTool, ...] | None,
+    tool_choice: str | None,
+    thinking: bool,
+    tool_parser: str | None,
 ) -> None:
     """apply authoritative adapter and engine tool capability checks."""
 
-    if tools is None:
+    if not tools_active(tools, tool_choice):
         return
     if thinking:
         raise OpenAIRequestError("tools are not supported for thinking-enabled generation")

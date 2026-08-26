@@ -225,6 +225,34 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
 
 
+@pytest.mark.parametrize("helper_name", ["chat", "chat_sse"])
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"tool_choice": "none"},
+        {"parallel_tool_calls": True},
+    ],
+    ids=["tool-choice", "parallel-tool-calls"],
+)
+def test_public_chat_helpers_reject_tool_controls_without_tools(
+    monkeypatch, helper_name: str, controls: dict[str, object]
+) -> None:
+    import flash.serve.deployment.deploy as d
+
+    class Client:
+        def post(self, *_args, **_kwargs):
+            pytest.fail("invalid tool controls must not reach buffered transport")
+
+        def stream(self, *_args, **_kwargs):
+            pytest.fail("invalid tool controls must not reach streaming transport")
+
+    monkeypatch.setattr(transport, "_chat_http_client", Client)
+    helper = getattr(d, helper_name)
+
+    with pytest.raises(ValueError, match="tool controls require tools"):
+        helper("run-1", [{"role": "user", "content": "hi"}], **controls)
+
+
 def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkeypatch):
     import flash.serve.deployment.deploy as d
 

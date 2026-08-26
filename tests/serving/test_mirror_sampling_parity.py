@@ -13,7 +13,7 @@ from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 from flash.serving.src.engine.model_config import reasoning_parser_for, tool_parser_for
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.openai_request import OpenAIGenerateRequest
-from flash.serving.src.io.openai_stream import openai_chat_stream
+from flash.serving.src.io.openai_stream import _produce_openai_chat_stream, openai_chat_stream
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.store.registry import AdapterRegistry
 
@@ -735,4 +735,61 @@ def test_hosted_sse_rejects_every_event_after_final_before_output_or_usage(
         ({"type": "final", "prompt_tokens": 2, "completion_tokens": 1}, "stream_failed")
     ]
     assert all(b"late" not in chunk and b'"completion_tokens":99' not in chunk for chunk in chunks)
+    assert all(b'"usage"' not in chunk and chunk != b"data: [DONE]\n\n" for chunk in chunks)
+
+
+def test_disconnect_after_final_does_not_hide_a_delayed_late_event() -> None:
+    session = _UsageSession()
+    record = _record()
+    output: asyncio.Queue[tuple[bytes | None, Exception | None]] = asyncio.Queue()
+    disconnected = asyncio.Event()
+    final_observed = asyncio.Event()
+    release_late = asyncio.Event()
+
+    async def events():
+        yield {"type": "ready", "thinking": False, "prompt_tokens": 2, "completion_tokens": 0}
+        yield {
+            "type": "choice_finished",
+            "index": 0,
+            "finish_reason": "stop",
+            "prompt_tokens": 2,
+            "completion_tokens": 1,
+        }
+        yield {"type": "final", "prompt_tokens": 2, "completion_tokens": 1}
+        final_observed.set()
+        await release_late.wait()
+        yield {"type": "delta", "index": 0, "text": "late"}
+
+    async def exercise() -> list[tuple[bytes | None, Exception | None]]:
+        producer = asyncio.create_task(
+            _produce_openai_chat_stream(
+                AdapterRouter([record]),
+                output,
+                disconnected,
+                record=record,
+                events=events(),
+                adapter_id="adapter",
+                completion_id="chatcmpl-test",
+                created=123,
+                include_usage=True,
+                usage_session=session,  # type: ignore[arg-type]
+                thinking=False,
+            )
+        )
+        await final_observed.wait()
+        disconnected.set()
+        release_late.set()
+        await producer
+        queued = []
+        while not output.empty():
+            queued.append(output.get_nowait())
+        return queued
+
+    queued = asyncio.run(exercise())
+    chunks = [chunk for chunk, error in queued if chunk is not None and error is None]
+    assert session.finalized == []
+    assert session.failed == [
+        ({"type": "final", "prompt_tokens": 2, "completion_tokens": 1}, "stream_failed")
+    ]
+    assert all(b"late" not in chunk for chunk in chunks)
     assert all(b'"usage"' not in chunk and chunk != b"data: [DONE]\n\n" for chunk in chunks)

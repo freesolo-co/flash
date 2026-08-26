@@ -618,13 +618,23 @@ def test_generation_request_revalidates_tools_and_rejects_tool_images() -> None:
             stop="</tool_call>",
         )
     request = GenerationRequest(
-        messages=[{"role": "user", "content": "weather"}],
+        messages=[
+            {
+                "role": "user",
+                "content": [{"type": "image", "image": _data_uri()}],
+            }
+        ],
         tools=_runtime_tools(),
         tool_choice="none",
         parallel_tool_calls=True,
         stop="</tool_call>",
+        logprobs=True,
+        top_logprobs=1,
+        structured_outputs=SCHEMA,
     )
     assert request.stop == ("</tool_call>",)
+    assert request.logprobs is True
+    assert request.structured_outputs == {"json": SCHEMA}
 
 
 def test_qwen3_coder_parser_validates_schema_and_exact_fallback() -> None:
