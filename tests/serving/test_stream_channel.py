@@ -2019,6 +2019,58 @@ def test_dispatch_deadline_bounds_channel_setup_and_closes_late_entry(
     assert asyncio.run(scenario()) == (True, True)
 
 
+def test_cancelled_channel_setup_closes_late_ephemeral_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[bool, bool]:
+        monkeypatch.setattr(client, "CLEANUP_SECONDS", 0.01)
+        queue = _FakeQueue()
+        enter_started = asyncio.Event()
+        cancellation_received = asyncio.Event()
+        release = asyncio.Event()
+        exited = asyncio.Event()
+
+        class SlowContext:
+            async def __aenter__(self) -> _FakeQueue:
+                enter_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancellation_received.set()
+                    await release.wait()
+                    return queue
+
+            async def __aexit__(self, *_args: object) -> None:
+                exited.set()
+
+        method = _FakeSpawnMethod(None)
+        channel = client.CancellableStreamChannel(
+            spawn_method=method,
+            payload_dict={},
+            record_dict=None,
+            expected_checkpoint=None,
+            generation_id="generation-1",
+            dispatch_deadline_unix=time.time() + 5,
+            invocation_nonce="nonce-1",
+            queue_context=SlowContext,
+        )
+        task = asyncio.create_task(anext(channel))
+        await enter_started.wait()
+        task.cancel()
+        await cancellation_received.wait()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.2)
+        retained = bool(client._BACKGROUND_TASKS)
+        release.set()
+        await asyncio.wait_for(exited.wait(), timeout=0.2)
+        for retained_task in tuple(client._BACKGROUND_TASKS):
+            await retained_task
+        await asyncio.sleep(0)
+        return retained, not client._BACKGROUND_TASKS
+
+    assert asyncio.run(scenario()) == (True, True)
+
+
 def test_dispatch_deadline_bounds_initial_lease_before_spawn() -> None:
     async def scenario() -> tuple[ChannelErrorCode, int]:
         queue = _FakeQueue()

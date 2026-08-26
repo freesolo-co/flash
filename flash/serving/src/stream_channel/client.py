@@ -118,14 +118,7 @@ class _DispatchDeadlineContext:
         cleanup = asyncio.create_task(self._exit_late_entry(task))
         _retain_background_task(cleanup)
 
-    async def __aenter__(self) -> Any:
-        task = asyncio.create_task(self._context.__aenter__())
-        remaining = max(0.0, self._dispatch_deadline_unix - time.time())
-        done, _ = await asyncio.wait({task}, timeout=remaining)
-        if done:
-            value = task.result()
-            self._entered = True
-            return value
+    async def _cancel_entry(self, task: asyncio.Task[Any]) -> None:
         task.cancel()
         done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
         if done:
@@ -133,6 +126,20 @@ class _DispatchDeadlineContext:
         else:
             task.add_done_callback(self._schedule_late_exit)
             _retain_background_task(task)
+
+    async def __aenter__(self) -> Any:
+        task = asyncio.create_task(self._context.__aenter__())
+        remaining = max(0.0, self._dispatch_deadline_unix - time.time())
+        try:
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError:
+            await self._cancel_entry(task)
+            raise
+        if done:
+            value = task.result()
+            self._entered = True
+            return value
+        await self._cancel_entry(task)
         raise StreamChannelError(
             ChannelErrorCode.DISPATCH_DEADLINE,
             "dispatch deadline expired during channel setup",
