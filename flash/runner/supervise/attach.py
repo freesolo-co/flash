@@ -472,6 +472,65 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     return get_status(run_id)
 
 
+def _adopt_persisted_attach_result(
+    run_id: str,
+    context: _AttachContext,
+    attempt,
+    log,
+    failure: str,
+) -> tuple[PollResult | None, RunStatus | None]:
+    """decode and adopt the current fenced persisted success, or defer it safely."""
+    from flash.providers.artifacts.attempts import AttemptArtifactError, poll_result_from_manifest
+    from flash.runner.lifecycle.status import get_status
+    from flash.runner.supervise.lifecycle import _adopt_completed_attempt
+
+    status = get_status(run_id)
+    persisted_result = status.result if isinstance(status.result, dict) else None
+    if persisted_result is None:
+        return None, None
+    if (
+        persisted_result.get("attempt_id") != attempt.attempt_id
+        or persisted_result.get("fence") != attempt.fence
+    ):
+        raise AttemptArtifactError("persisted result does not match the current fenced attempt")
+    terminal_result = poll_result_from_manifest(persisted_result)
+    if not terminal_result.ok:
+        return terminal_result, None
+    completed_metrics = terminal_result.metrics
+    _carry_allocation_stamp(completed_metrics, context.persisted_remote)
+    try:
+        adopted = _adopt_completed_attempt(
+            run_id,
+            context.worker_spec,
+            context.persisted_remote,
+            completed_metrics,
+            log=log,
+        )
+    except Exception:
+        adopted = False
+    if adopted:
+        print(
+            f"attach: {run_id} adopted a persisted completed attempt at the wall deadline",
+            file=log,
+        )
+        return terminal_result, get_status(run_id)
+    _schedule_attach_reconciliation(
+        run_id,
+        context.persisted_remote,
+        context.worker_spec,
+        context.next_attempt,
+        context.source_snapshot,
+        log,
+        failure,
+    )
+    print(
+        f"attach: {run_id} persisted completed work at the wall deadline; "
+        "deferring adoption to reconciliation",
+        file=log,
+    )
+    return terminal_result, get_status(run_id)
+
+
 def _handle_attach_wall_deadline(
     run_id: str,
     context: _AttachContext,
@@ -479,10 +538,7 @@ def _handle_attach_wall_deadline(
     exc: RuntimeError,
 ) -> RunStatus:
     """Adopt finished work or fail and tear down an attempt whose wall time is exhausted."""
-    from flash.providers.artifacts.attempts import (
-        AttemptArtifactError,
-        poll_result_from_manifest,
-    )
+    from flash.providers.artifacts.attempts import AttemptArtifactError
     from flash.runner.accounting.reconciliation import (
         _compare_and_fail_remote,
         _record_cleanup_remote,
@@ -550,16 +606,15 @@ def _handle_attach_wall_deadline(
             file=log,
         )
         return get_status(run_id)
-    status = get_status(run_id)
-    persisted_result = status.result if isinstance(status.result, dict) else None
-    terminal_result = None
-    if persisted_result is not None:
-        if (
-            persisted_result.get("attempt_id") != attempt.attempt_id
-            or persisted_result.get("fence") != attempt.fence
-        ):
-            raise AttemptArtifactError("persisted result does not match the current fenced attempt")
-        terminal_result = poll_result_from_manifest(persisted_result)
+    terminal_result, persisted_status = _adopt_persisted_attach_result(
+        run_id,
+        context,
+        attempt,
+        log,
+        str(exc),
+    )
+    if persisted_status is not None:
+        return persisted_status
     terminal_failure = terminal_result is not None and not terminal_result.ok
     failure = (
         f"{terminal_result.failure or 'job_failed'}: "

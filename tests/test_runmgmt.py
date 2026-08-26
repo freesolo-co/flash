@@ -98,6 +98,52 @@ def _persist_active_attempt(status, remote, **save_kwargs):
     return attempt
 
 
+def _persist_successful_attempt_result(spec, remote):
+    from flash.runner.lifecycle.protocol import ResultManifest
+    from flash.snapshot.archive import source_attestation
+
+    attempt = _persist_active_attempt(
+        provisioned_status(
+            spec,
+            state="running",
+            created_at=100.0,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        ),
+        remote,
+        _run_deadline_at=220.0,
+        _next_attempt=0,
+    )
+    result = ResultManifest(
+        run_id=spec.run_id,
+        phase_namespace=spec.phase,
+        attempt_id=attempt.attempt_id,
+        fence=attempt.fence,
+        outcome="succeeded",
+        failure_class=None,
+        started_at=101.0,
+        finished_at=210.0,
+        training_entered=True,
+        completed_steps=1,
+        metrics={"wall_seconds": 5.0},
+        checkpoint={},
+        artifacts={"adapter": "published"},
+        source_attestation=source_attestation(
+            _SOURCE_SNAPSHOT,
+            run_id=spec.run_id,
+            attempt=attempt.attempt_id,
+            fence=attempt.fence,
+        ),
+        diagnostics={},
+    )
+    assert runner_status.record_result(
+        spec.run_id,
+        result.to_dict(),
+        attempt_id=attempt.attempt_id,
+        fence=attempt.fence,
+    )
+    return attempt
+
+
 @pytest.mark.parametrize("remote", [_runpod_remote(), _lambda_remote(), _vast_remote()])
 def test_provider_handles_reject_missing_fence(remote):
     remote.pop("fence")
@@ -2001,6 +2047,120 @@ def test_attach_expired_work_waits_for_open_result_visibility(monkeypatch, tmp_p
         lifecycle,
         "_strict_teardown_handle",
         lambda *_args, **_kwargs: pytest.fail("open result visibility must not tear down"),
+    )
+
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert status.state == "running"
+    assert status.remote == remote
+    assert len(scheduled) == 1
+
+
+@pytest.mark.parametrize("lookup_error", [None, OSError("temporary artifact read")])
+def test_attach_expired_work_adopts_persisted_current_fence_success(
+    monkeypatch, tmp_path, lookup_error
+):
+    import io
+    import os
+
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(
+        run_id="attach-persisted-terminal-success",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(max_wall_seconds=120),
+    )
+    remote = _vast_remote(
+        instance_id=7,
+        attempt=0,
+        fence=1,
+        started_ts=101.0,
+        allocated_gpu="RTX 4090",
+        allocated_gpu_count=4,
+    )
+    monkeypatch.setattr(runner_attempts.time, "time", lambda: 101.0)
+    attempt = _persist_successful_attempt_result(spec, remote)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 341.0)
+
+    def lookup(*_args, **_kwargs):
+        if lookup_error is not None:
+            raise lookup_error
+
+    monkeypatch.setattr(lifecycle, "_attempt_result_metrics", lookup)
+    monkeypatch.setattr(
+        runner_attach,
+        "_schedule_attach_reconciliation",
+        lambda *_args, **_kwargs: pytest.fail("persisted success must be adopted immediately"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: pytest.fail("persisted success must not be torn down"),
+    )
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_compare_and_fail_remote",
+        lambda *_args, **_kwargs: pytest.fail("persisted success must not fail the run"),
+    )
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert status.state == "done"
+    assert status.error is None
+    assert status.source_verified_attempt == attempt.attempt_id
+    with open(os.path.join(status.artifacts_dir, "metrics.json")) as handle:
+        metrics = json.load(handle)
+    assert metrics["wall_seconds"] == 5.0
+    assert metrics["notes"]["provider"] == "vast"
+    assert metrics["notes"]["gpu"] == "RTX 4090"
+    assert metrics["notes"]["gpu_count"] == 4
+
+
+def test_attach_persisted_success_defers_transient_adoption_failure(monkeypatch, tmp_path):
+    import io
+
+    import flash.runner.supervise.lifecycle as lifecycle
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-persisted-success-defer",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(max_wall_seconds=120),
+    )
+    remote = _runpod_remote("endpoint-old", "job-old", attempt=0, fence=1)
+    monkeypatch.setattr(runner_attempts.time, "time", lambda: 101.0)
+    _persist_successful_attempt_result(spec, remote)
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 341.0)
+    monkeypatch.setattr(lifecycle, "_attempt_result_metrics", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        lifecycle,
+        "_adopt_completed_attempt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("status store unavailable")),
+    )
+    scheduled = []
+    monkeypatch.setattr(
+        runner_attach,
+        "_schedule_attach_reconciliation",
+        lambda *args, **kwargs: scheduled.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: pytest.fail("unpersisted adoption must not tear down completion"),
+    )
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_compare_and_fail_remote",
+        lambda *_args, **_kwargs: pytest.fail("unpersisted adoption must not fail immediately"),
     )
 
     status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
