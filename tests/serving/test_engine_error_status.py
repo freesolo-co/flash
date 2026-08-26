@@ -12,11 +12,12 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from modal.exception import ExecutionError, FunctionTimeoutError
+from modal.exception import ExecutionError, FunctionTimeoutError, ResourceExhaustedError
 from test_router import QWEN, _allow, _router_for
 
 from flash.client.http import ClientError
 from flash.serve.request.streaming import _openai_stream_content
+from flash.serving.src.engine.dispatch import PreHeaderDispatchExpired
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 
 
@@ -135,6 +136,35 @@ def test_engine_timeout_is_504_not_500(stream: bool) -> None:
     resp = _chat(_client(exc), stream=stream)
     assert resp.status_code == 504
     assert "timeout" in resp.text.lower()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_expired_pre_header_dispatch_is_retryable_503(stream: bool) -> None:
+    resp = _chat(
+        _client(PreHeaderDispatchExpired("request expired before gpu generation began")),
+        stream=stream,
+    )
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == "1"
+    assert resp.json()["error"] == {
+        "message": "request expired before gpu generation began",
+        "type": "server_error",
+        "code": "serving_capacity_unavailable",
+    }
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_resource_exhaustion_is_retryable_pre_header_503(stream: bool) -> None:
+    resp = _chat(_client(ResourceExhaustedError("input queue is full")), stream=stream)
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == "1"
+    assert resp.json() == {
+        "error": {
+            "message": "The serving model could not accept this request before generation began.",
+            "type": "server_error",
+            "code": "serving_capacity_unavailable",
+        }
+    }
 
 
 @pytest.mark.parametrize("stream", [False, True])

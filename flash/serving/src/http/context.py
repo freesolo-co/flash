@@ -14,18 +14,12 @@ from flash.serving.src.accounting.usage import (
     principal_for_trusted_internal,
 )
 from flash.serving.src.accounting.usage_outbox import RequestIdentity, UsageStore
-from flash.serving.src.engine.model_config import hosted_traffic_policy_for
+from flash.serving.src.engine.dispatch import new_pre_header_dispatch_deadline
 from flash.serving.src.http.headers import _bearer_token, assert_internal, is_trusted_internal
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.streaming import generate_once, openai_chat_stream, prepare_stream
 from flash.serving.src.store.lookup import AdapterLookup
-from flash.serving.src.traffic.admission import AdmissionController, AdmissionLease
-from flash.serving.src.traffic.capacity import (
-    CAPACITY_POLL_INTERVAL_SECONDS,
-    CapacityProvider,
-    ConfiguredCapacityProvider,
-)
 
 APP_STATE_ATTR = "serving_context"
 
@@ -37,7 +31,6 @@ class ServingContext:
         router: AdapterRouter,
         lookup: AdapterLookup,
         usage: UsageStore,
-        capacity: CapacityProvider | None = None,
         *,
         internal_key: str | None,
         deployment_id: str,
@@ -50,11 +43,6 @@ class ServingContext:
         self.router = router
         self.lookup = lookup
         self.usage = usage
-        self.capacity = capacity or ConfiguredCapacityProvider()
-        self.admission = AdmissionController(
-            hosted_traffic_policy_for,
-            self.capacity.current_dispatch_capacity,
-        )
         self.internal_key = internal_key
         self.deployment_id = deployment_id
         self.serving_release = serving_release
@@ -62,9 +50,6 @@ class ServingContext:
         self.lookup_record = lookup_record
         self.chat_authorizer = chat_authorizer
         self.trusted_internal_keys = (internal_key,) if internal_key else ()
-        bind_capacity_changed = getattr(self.capacity, "bind_capacity_changed", None)
-        if bind_capacity_changed is not None:
-            bind_capacity_changed(self.admission.capacity_changed)
 
     @staticmethod
     def of(request: Request) -> "ServingContext":
@@ -101,6 +86,15 @@ class ServingContext:
             "serving auth did not return an attributable principal",
         )
 
+    def assert_accounting_healthy(self) -> None:
+        try:
+            self.usage.assert_healthy()
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "durable serving accounting unavailable",
+            ) from exc
+
     def reject_unsettleable_thinking(self, payload: Any, target: AdapterRecord) -> None:
         if not self.usage.enabled:
             return
@@ -120,43 +114,21 @@ class ServingContext:
         if self.reload_records is not None:
             await self.lookup.reload()
 
-    async def refresh_capacity_once(self) -> None:
-        await asyncio.gather(
-            *(
-                self.capacity.capacity_snapshot(model, self.admission.active_count(model))
-                for model in self.router.base_models()
-            ),
-            return_exceptions=True,
-        )
-
-    async def refresh_capacity_periodically(self) -> None:
-        while True:
-            await self.refresh_capacity_once()
-            await asyncio.sleep(CAPACITY_POLL_INTERVAL_SECONDS)
-
-    async def acquire_admission(self, model: str) -> AdmissionLease:
-        return await self.admission.acquire(model)
-
-    def admission_headers(self, model: str, lease: AdmissionLease) -> dict[str, str]:
-        snapshot = self.admission.snapshot(model)
-        return {
-            "X-Freesolo-Queue-Duration-Seconds": f"{lease.queue_duration_seconds:.6f}",
-            "X-Freesolo-Application-Active": str(snapshot.active),
-            "X-Freesolo-Application-Pending": str(snapshot.queued),
-        }
+    @staticmethod
+    def set_pre_header_dispatch_deadline(payload: Any) -> None:
+        payload._pre_header_dispatch_deadline = new_pre_header_dispatch_deadline()
 
     async def unregister_safe(
         self, base_model: str, adapter_id: str, expected_generation: str | None
     ) -> None:
-        # gpu cleanup may reach a replacement engine. the engine compares this deployment
-        # generation under its per-adapter lock so stale cleanup cannot remove a redeployment of the
-        # same immutable revision id. durable routing is already disabled, but an exact eviction
-        # failure must remain observable rather than making the successful api response imply it ran.
+        # this reaches one arbitrary engine replica only. durable routing disablement is the global
+        # correctness boundary; this call is best-effort replica-local memory cleanup.
         try:
             await self.pool.unregister(base_model, adapter_id, expected_generation)
         except Exception as error:
             print(
-                f"hosted adapter gpu cleanup failed for {adapter_id} on {base_model}: {error!r}",
+                f"hosted adapter replica-local gpu cleanup failed for {adapter_id} "
+                f"on {base_model}: {error!r}",
                 flush=True,
             )
 
@@ -171,6 +143,8 @@ class ServingContext:
         captured_at: Any,
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
+        self.assert_accounting_healthy()
+        self.set_pre_header_dispatch_deadline(payload)
         result = await generate_once(
             self.pool,
             self.router,
@@ -179,7 +153,9 @@ class ServingContext:
             target,
             generation_id=identity.request_id,
             require_generation_id=self.usage.enabled,
-            expected_checkpoint=expected_checkpoint,
+            expected_checkpoint=(
+                expected_checkpoint if expected_checkpoint is not None else target.checkpoint
+            ),
         )
         session = build_usage_session(
             self.usage,
@@ -230,6 +206,8 @@ class ServingContext:
         generation_id: str,
         expected_checkpoint: str | None,
     ) -> tuple[AsyncIterator[dict[str, Any]], dict[str, str], bool, dict[str, Any]]:
+        self.assert_accounting_healthy()
+        self.set_pre_header_dispatch_deadline(payload)
         return await prepare_stream(
             self.pool,
             self.router,
@@ -238,7 +216,9 @@ class ServingContext:
             target,
             generation_id=generation_id,
             require_generation_id=self.usage.enabled,
-            expected_checkpoint=expected_checkpoint,
+            expected_checkpoint=(
+                expected_checkpoint if expected_checkpoint is not None else target.checkpoint
+            ),
         )
 
     def chat_stream(

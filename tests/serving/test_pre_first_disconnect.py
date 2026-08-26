@@ -17,13 +17,13 @@ from flash.serving.src.accounting.usage_outbox import RequestIdentity
 from flash.serving.src.http import inference_routes
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.http.inference_routes import (
+    _ClosingStreamingResponse,
     _discard_prepared_stream,
     _stream_chat_completion,
 )
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.io.streaming import openai_chat_stream, prepare_stream
-from flash.serving.src.traffic.admission import AdmissionLease
 from tests.serving.conftest import RecordingUsageStore
 
 QWEN = "Qwen/Qwen3.5-9B"
@@ -49,22 +49,6 @@ def _record() -> AdapterRecord:
             },
         }
     )
-
-
-def _lease() -> AdmissionLease:
-    class Controller:
-        def _release(self, _model: str) -> None:
-            return None
-
-    return AdmissionLease(Controller(), QWEN, queue_duration_seconds=0.0)
-
-
-def _admission_headers() -> dict[str, str]:
-    return {
-        "X-Freesolo-Queue-Duration-Seconds": "0.000000",
-        "X-Freesolo-Application-Active": "1",
-        "X-Freesolo-Application-Pending": "0",
-    }
 
 
 def _request(receive) -> Request:
@@ -129,14 +113,6 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
 
             def reject_unsettleable_thinking(self, *_args) -> None:
                 return None
-
-            async def acquire_admission(self, _model: str) -> AdmissionLease:
-                return _lease()
-
-            def admission_headers(
-                self, _model: str, _admission_lease: AdmissionLease
-            ) -> dict[str, str]:
-                return _admission_headers()
 
             async def generate(self, *_args, **_kwargs):
                 entered.set()
@@ -363,9 +339,7 @@ def test_disconnect_before_first_event_closes_engine_without_starting_response_b
                 include_usage=True,
                 identity=_identity(),
                 traffic=_traffic(),
-                admitted_at=datetime.now(UTC),
-                lease=_lease(),
-                admission_headers=_admission_headers(),
+                captured_at=datetime.now(UTC),
             )
         )
         await _wait_event_or_task(entered, task)
@@ -456,6 +430,61 @@ def test_post_first_validation_failure_closes_engine_iterator(failure: str) -> N
     assert asyncio.run(scenario())
 
 
+def test_stream_send_failure_closes_stream_iterator_and_records_one_terminal_failure() -> None:
+    async def scenario() -> tuple[bool, RecordingUsageStore]:
+        closed = asyncio.Event()
+        record = _record()
+        store = RecordingUsageStore()
+        identity = _identity()
+        session = build_usage_session(
+            store,
+            identity,
+            _traffic().principal,
+            record,
+            record,
+            _ready(record, identity.request_id),
+            deployment_id="deployment-1",
+            serving_release="release-1",
+            captured_at=datetime.now(UTC),
+        )
+
+        async def events():
+            try:
+                yield _ready(record, identity.request_id)
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+
+        response = _ClosingStreamingResponse(
+            openai_chat_stream(
+                AdapterRouter([record]),
+                record=record,
+                events=events(),
+                adapter_id=record.adapter_id,
+                completion_id="chatcmpl-send-failure",
+                created=123,
+                include_usage=True,
+                usage_session=session,
+            ),
+            media_type="text/event-stream",
+        )
+
+        async def send(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.body" and message.get("body"):
+                raise RuntimeError("send failed")
+
+        with pytest.raises(RuntimeError, match="send failed"):
+            await response.stream_response(send)
+        return closed.is_set(), store
+
+    closed, store = asyncio.run(scenario())
+
+    assert closed
+    assert store.finalized == []
+    assert len(store.failed) == 1
+    assert store.failed[0][1] == "client_disconnected"
+
+
 def test_completed_preparation_wins_same_tick_disconnect() -> None:
     async def scenario() -> bool:
         record = _record()
@@ -484,9 +513,7 @@ def test_completed_preparation_wins_same_tick_disconnect() -> None:
             include_usage=True,
             identity=identity,
             traffic=_traffic(),
-            admitted_at=datetime.now(UTC),
-            lease=_lease(),
-            admission_headers=_admission_headers(),
+            captured_at=datetime.now(UTC),
         )
         return response.status_code == 200
 

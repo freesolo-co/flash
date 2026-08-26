@@ -9,7 +9,21 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
+from flash.serving.src.engine.dispatch import (
+    CAPACITY_RETRY_AFTER_SECONDS,
+    PreHeaderDispatchExpired,
+)
 from flash.serving.src.http.routing import AdapterRouter
+
+
+class ServingCapacityUnavailable(HTTPException):
+    """A pre-header engine dispatch could not start within available capacity."""
+
+    code = "serving_capacity_unavailable"
+
+    def __init__(self, message: str) -> None:
+        self.retry_after_seconds = CAPACITY_RETRY_AFTER_SECONDS
+        super().__init__(status.HTTP_503_SERVICE_UNAVAILABLE, message)
 
 
 def value_error_http(router: AdapterRouter, adapter_id: str, exc: ValueError) -> HTTPException:
@@ -28,7 +42,7 @@ def value_error_http(router: AdapterRouter, adapter_id: str, exc: ValueError) ->
 
 def engine_error_http(
     router: AdapterRouter, adapter_id: str, exc: Exception
-) -> HTTPException | None:
+) -> HTTPException | ServingCapacityUnavailable | None:
     """Map an engine dispatch failure to a client-meaningful status.
 
     Returns ``None`` when ``exc`` is not a failure this layer can identify, so the caller
@@ -49,11 +63,17 @@ def engine_error_http(
     ``modal`` is imported lazily so this module keeps the no-modal-at-import-scope contract in
     router.py's docstring, which is what lets the routing layer be unit-tested against a fake pool.
     """
+    if isinstance(exc, PreHeaderDispatchExpired):
+        return ServingCapacityUnavailable(str(exc))
     if isinstance(exc, ValueError):
         return value_error_http(router, adapter_id, exc)
     from modal.exception import Error as ModalError
-    from modal.exception import FunctionTimeoutError
+    from modal.exception import FunctionTimeoutError, ResourceExhaustedError
 
+    if isinstance(exc, ResourceExhaustedError):
+        return ServingCapacityUnavailable(
+            "The serving model could not accept this request before generation began."
+        )
     if isinstance(exc, FunctionTimeoutError):
         # checked before the ModalError branch below, which it subclasses. 504, not 500: the
         # request was well-formed and the upstream engine simply did not finish inside its

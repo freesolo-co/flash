@@ -469,6 +469,60 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
     assert pool.generation_id is None
 
 
+def test_fatal_usage_worker_failure_prevents_gpu_dispatch_and_fails_healthz() -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    record = _revision()
+    pool = _Pool()
+    rpc_client = _QueuedClient([(200, []), (200, []), (200, {"malformed": "claim"})])
+    outbox = DurableUsageOutbox(
+        _outbox_settings(),
+        client=rpc_client,
+        worker_id="worker-1",
+        poll_seconds=60,
+    )
+
+    async def authorize(_token: str, _adapter_id: str) -> str:
+        return "org-1"
+
+    app = build_serving_app(
+        pool,
+        AdapterRouter([record]),
+        usage_store=outbox,
+        chat_authorizer=authorize,
+    )
+
+    async def scenario() -> tuple[Any, Any]:
+        await outbox.start()
+        assert outbox._worker is not None
+        await outbox._worker
+        assert isinstance(outbox._background_error, UsageOutboxError)
+        assert str(outbox._background_error) == "usage_claim_invalid"
+        with pytest.raises(UsageOutboxError, match="usage_outbox_background_failure"):
+            outbox.assert_healthy()
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer user-key"},
+        ) as client:
+            health = await client.get("/healthz")
+            response = await client.post(
+                "/generate", json={"adapter_id": record.adapter_id, "prompt": "hello"}
+            )
+        with pytest.raises(UsageOutboxError, match="usage_outbox_shutdown_failed"):
+            await outbox.aclose()
+        return health, response
+
+    health, response = asyncio.run(scenario())
+
+    assert health.status_code == 503
+    assert health.json()["ok"] is False
+    assert health.json()["accounting_ok"] is False
+    assert response.status_code == 503
+    assert response.json() == {"detail": "durable serving accounting unavailable"}
+    assert pool.generation_id is None
+
+
 def test_nonstream_capture_failure_returns_controlled_503() -> None:
     record = _revision()
 
@@ -631,6 +685,53 @@ class _QueuedClient:
 
 async def _no_sleep(_seconds: float) -> None:
     return None
+
+
+def test_router_owner_epochs_are_isolated_for_capture_finalize_and_shutdown() -> None:
+    first_client = _QueuedClient(
+        [
+            (200, [{"state": "in_progress", "lease_seconds": 120, "heartbeat_seconds": 20}]),
+            (200, [{"state": "pending", "replay": False}]),
+        ]
+    )
+    second_client = _QueuedClient(
+        [
+            (200, [{"state": "in_progress", "lease_seconds": 120, "heartbeat_seconds": 20}]),
+            (200, []),
+        ]
+    )
+    first = DurableUsageOutbox(_outbox_settings(), client=first_client, worker_id="worker-a")
+    second = DurableUsageOutbox(_outbox_settings(), client=second_client, worker_id="worker-b")
+    first_event = _usage_event()
+    second_event = replace(
+        first_event,
+        identity=RequestIdentity(
+            request_id="fsgen-00000000000000000000000000000002",
+            correlation_id="correlation-2",
+        ),
+    )
+
+    async def run() -> None:
+        await first.capture(first_event)
+        await second.capture(second_event)
+        await first.finalize(first_event)
+        await second.aclose()
+
+    asyncio.run(run())
+
+    first_capture = first_client.calls[0][1]
+    second_capture = second_client.calls[0][1]
+    assert first_capture["p_generation_owner_id"] == second_capture["p_generation_owner_id"]
+    assert first_capture["p_generation_owner_epoch"] != second_capture["p_generation_owner_epoch"]
+    assert (
+        first_client.calls[1][1]["p_generation_owner_epoch"]
+        == first_capture["p_generation_owner_epoch"]
+    )
+    assert second_client.calls[1][0].endswith("/rpc/fail_serving_generation_session")
+    assert (
+        second_client.calls[1][1]["p_generation_owner_epoch"]
+        == second_capture["p_generation_owner_epoch"]
+    )
 
 
 def test_capture_uses_deployment_owner_process_epoch_and_server_timing() -> None:
@@ -1210,6 +1311,57 @@ def test_non_object_settlement_response_is_quarantined_and_releases_lease(
     assert outbox._active_leases == set()
 
 
+def test_transient_usage_worker_rpc_failure_retries_without_poisoning_health() -> None:
+    retry_started = asyncio.Event()
+    release_retry = asyncio.Event()
+    claim_reached = asyncio.Event()
+
+    async def controlled_sleep(_seconds: float) -> None:
+        retry_started.set()
+        await release_retry.wait()
+
+    async def empty_claim() -> tuple[int, Any]:
+        claim_reached.set()
+        return 200, []
+
+    client = _QueuedClient(
+        [
+            (200, []),
+            (503, {"error": "temporarily unavailable"}),
+            (200, []),
+            empty_claim,
+        ]
+    )
+    outbox = DurableUsageOutbox(
+        _outbox_settings(),
+        client=client,
+        worker_id="worker-1",
+        poll_seconds=60,
+        sleep=controlled_sleep,
+    )
+
+    async def scenario() -> None:
+        await outbox.start()
+        await asyncio.wait_for(retry_started.wait(), timeout=1)
+        assert outbox._background_error is None
+        assert not outbox._stopping.is_set()
+        release_retry.set()
+        outbox._wake.set()
+        await asyncio.wait_for(claim_reached.wait(), timeout=1)
+        outbox.assert_healthy()
+        await outbox.aclose()
+
+    asyncio.run(scenario())
+
+    assert outbox._background_error is None
+    assert [url.rsplit("/", 1)[-1] for url, _ in client.calls] == [
+        "recover_stale_serving_generations",
+        "recover_stale_serving_generations",
+        "recover_stale_serving_generations",
+        "claim_serving_usage_batch",
+    ]
+
+
 def test_startup_claim_recovers_expired_lease_and_delivers() -> None:
     row = _claimed_row(state="leased")
     delivered = asyncio.Event()
@@ -1235,6 +1387,7 @@ def test_startup_claim_recovers_expired_lease_and_delivers() -> None:
                 },
             ),
             acknowledge,
+            (200, []),
             (200, []),
         ]
     )

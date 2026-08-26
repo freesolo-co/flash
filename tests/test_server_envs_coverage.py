@@ -1596,27 +1596,6 @@ def test_run_deployment_smoke_retries_capacity_unavailable_within_deadline(monke
     assert all(0 < call["timeout_s"] <= 3.0 for call in calls)
 
 
-def test_run_deployment_smoke_retries_overload_within_deadline(monkeypatch):
-    calls = []
-    sleeps = []
-
-    def fake_serve_chat(**kwargs):
-        calls.append(kwargs)
-        if len(calls) == 1:
-            raise serving.RetryableServingUnavailable("serving_overloaded", 1.0)
-        return _smoke_response("The answer is 4")
-
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
-    monkeypatch.setattr(serving.time, "sleep", sleeps.append)
-
-    out = _run_smoke(_smoke_spec(thinking=False), budget_s=3.0)
-
-    assert out["verify_sample"] == "The answer is 4"
-    assert sleeps == [1.0]
-    assert len(calls) == 2
-    assert all(0 < call["timeout_s"] <= 3.0 for call in calls)
-
-
 def test_run_deployment_smoke_retry_stays_inside_wall_clock_budget(monkeypatch):
     clock = [100.0]
     calls = []

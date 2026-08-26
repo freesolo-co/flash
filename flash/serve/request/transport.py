@@ -184,7 +184,7 @@ def retryable_smoke_unavailable(
     code = error.get("code")
     exact_transient_server_error = (
         response.status_code == 503 and code == "serving_capacity_unavailable"
-    ) or (response.status_code == 429 and code == "serving_overloaded")
+    )
     if error.get("type") == "server_error" and exact_transient_server_error:
         raw_delay = response.headers.get("Retry-After")
         try:

@@ -14,6 +14,7 @@ from flash.serve.runtime.sampling import (
     indexed_outputs,
     normalize_token_logprobs,
 )
+from flash.serving.src.engine.dispatch import require_pre_header_dispatch_time
 from flash.serving.src.engine.support import (
     _cached_tokens_reported,
     _num_cached_tokens,
@@ -85,6 +86,22 @@ def _choice(index: int, output: Any, *, top_logprobs: int) -> dict[str, Any]:
     }
 
 
+async def _close_output_stream(output_stream: Any) -> None:
+    if output_stream is None:
+        return
+    close = getattr(output_stream, "aclose", None)
+    if close is None:
+        return
+    active_exception = sys.exc_info()[0] is not None
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        if not active_exception:
+            raise
+
+
 def _usage_fields(
     request_output: Any,
     completion_token_ids: list[int],
@@ -122,7 +139,10 @@ async def generate(
     record_dict: dict[str, Any] | None = None,
     expected_checkpoint: str | None = None,
     generation_id: str | None = None,
+    pre_header_dispatch_deadline: float | None = None,
 ) -> dict[str, Any]:
+    require_pre_header_dispatch_time(pre_header_dispatch_deadline)
+
     from vllm.sampling_params import RequestOutputKind
 
     payload, is_openai = _payload(payload_dict)
@@ -139,22 +159,29 @@ async def generate(
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
     start = time.time()
     final_output = None
+    output_stream = None
     prompt_input = await owner._prepare_prompt_input(payload, thinking)
     try:
-        async for output in owner.engine.generate(
-            prompt_input,
-            sampling,
-            request_id,
-            lora_request=lora_request,
-            reasoning_ended=reasoning_ended,
-            reasoning_parser_kwargs=parser_kwargs,
-        ):
-            final_output = output
-    except Exception:
-        owner._self_heal_if_dead("generate")
-        raise
+        require_pre_header_dispatch_time(pre_header_dispatch_deadline)
+        try:
+            output_stream = owner.engine.generate(
+                prompt_input,
+                sampling,
+                request_id,
+                lora_request=lora_request,
+                reasoning_ended=reasoning_ended,
+                reasoning_parser_kwargs=parser_kwargs,
+            )
+            async for output in output_stream:
+                final_output = output
+        except Exception:
+            owner._self_heal_if_dead("generate")
+            raise
     finally:
-        owner._close_prompt_images(prompt_input)
+        try:
+            await _close_output_stream(output_stream)
+        finally:
+            owner._close_prompt_images(prompt_input)
     if final_output is None:
         raise RuntimeError("vLLM returned no output")
     choices = [
@@ -189,7 +216,10 @@ async def stream_generate(
     record_dict: dict[str, Any] | None = None,
     expected_checkpoint: str | None = None,
     generation_id: str | None = None,
+    pre_header_dispatch_deadline: float | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
+    require_pre_header_dispatch_time(pre_header_dispatch_deadline)
+
     from vllm.sampling_params import RequestOutputKind
 
     payload, _ = _payload(payload_dict)
@@ -219,6 +249,7 @@ async def stream_generate(
         "thinking": thinking,
     }
     try:
+        require_pre_header_dispatch_time(pre_header_dispatch_deadline)
         try:
             output_stream = owner.engine.generate(
                 prompt_input,
@@ -301,16 +332,6 @@ async def stream_generate(
         }
     finally:
         try:
-            if output_stream is not None:
-                close = getattr(output_stream, "aclose", None)
-                if close is not None:
-                    active_exception = sys.exc_info()[0] is not None
-                    try:
-                        result = close()
-                        if inspect.isawaitable(result):
-                            await result
-                    except Exception:
-                        if not active_exception:
-                            raise
+            await _close_output_stream(output_stream)
         finally:
             owner._close_prompt_images(prompt_input)

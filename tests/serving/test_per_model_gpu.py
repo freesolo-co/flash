@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -23,13 +24,9 @@ import pytest
 
 from flash.serving.src.engine.model_config import (
     base_models,
-    configured_hard_gpu_ceiling,
-    configured_router_async_capacity,
     configured_warm_container_floor,
     gpu_for,
-    hosted_traffic_policy_for,
 )
-from flash.serving.src.traffic.admission import AdmissionController, ServingOverloaded
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -452,354 +449,6 @@ def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module)
         modal_app_module._engine_cls_for("Qwen/Qwen3.5-99B")
 
 
-def test_modal_capacity_snapshot_parses_exact_stats_and_identity(modal_app_module, monkeypatch):
-    model = "Qwen/Qwen3.5-9B"
-    stats = types.SimpleNamespace(
-        num_total_runners=1,
-        num_running_inputs=4,
-        input_headroom=4,
-        backlog=3,
-    )
-
-    class GetCurrentStats:
-        @staticmethod
-        async def aio():
-            return stats
-
-    class StatsMethod:
-        get_current_stats = GetCurrentStats
-
-    class Engine:
-        generate = StatsMethod()
-
-    monkeypatch.setattr(
-        modal_app_module, "_engine_cls_for", lambda _model: lambda **_kwargs: Engine()
-    )
-    pool = modal_app_module._ModalEnginePool(clock=lambda: 10.0)
-
-    snapshot = asyncio.run(pool.capacity_snapshot(model, observed_local_active=4))
-
-    assert snapshot.model == model
-    assert snapshot.deployment_identity == modal_app_module._capacity_deployment_identity(model)
-    assert snapshot.total_runners == 1
-    assert snapshot.running_inputs == 4
-    assert snapshot.input_headroom == 4
-    assert snapshot.backlog == 3
-    assert snapshot.observed_local_active == 4
-    assert snapshot.local_active_limit == 8
-    assert pool.current_dispatch_capacity(model) == 8
-
-
-def test_capacity_timestamp_is_taken_after_stats_rpc(modal_app_module, monkeypatch) -> None:
-    model = "Qwen/Qwen3.5-9B"
-    clock = {"now": 10.0}
-    stats = types.SimpleNamespace(
-        num_total_runners=1,
-        num_running_inputs=0,
-        input_headroom=8,
-        backlog=0,
-    )
-
-    class GetCurrentStats:
-        @staticmethod
-        async def aio():
-            clock["now"] = 10.75
-            return stats
-
-    class Engine:
-        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
-
-    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
-    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
-
-    snapshot = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
-
-    assert snapshot.observed_at == 10.75
-    assert pool.current_dispatch_capacity(model) == 8
-
-
-def test_transient_stats_failure_preserves_valid_snapshot_until_expiry(
-    modal_app_module, monkeypatch
-) -> None:
-    model = "Qwen/Qwen3.5-9B"
-    clock = {"now": 10.0}
-    fail = {"value": False}
-
-    class GetCurrentStats:
-        @staticmethod
-        async def aio():
-            if fail["value"]:
-                raise RuntimeError("stats unavailable")
-            return types.SimpleNamespace(
-                num_total_runners=1,
-                num_running_inputs=0,
-                input_headroom=8,
-                backlog=0,
-            )
-
-    class Engine:
-        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
-
-    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
-    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
-    first = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
-
-    fail["value"] = True
-    clock["now"] = 10.6
-    preserved = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
-    assert preserved is first
-    assert pool.current_dispatch_capacity(model) == 8
-
-    clock["now"] = 12.01
-    unavailable = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
-    assert unavailable.error == "stats_unavailable"
-    assert pool.current_dispatch_capacity(model) == 0
-
-
-def test_no_warm_runners_replaces_valid_snapshot_immediately(modal_app_module, monkeypatch) -> None:
-    model = "Qwen/Qwen3.5-9B"
-    clock = {"now": 10.0}
-    runners = {"value": 1}
-
-    class GetCurrentStats:
-        @staticmethod
-        async def aio():
-            return types.SimpleNamespace(
-                num_total_runners=runners["value"],
-                num_running_inputs=0,
-                input_headroom=8,
-                backlog=0,
-            )
-
-    class Engine:
-        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
-
-    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
-    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
-    asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
-
-    runners["value"] = 0
-    clock["now"] = 10.6
-    snapshot = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
-
-    assert snapshot.error == "no_warm_runners"
-    assert pool.current_dispatch_capacity(model) == 0
-
-
-def test_slow_success_does_not_trigger_immediate_serial_refresh(
-    modal_app_module, monkeypatch
-) -> None:
-    model = "Qwen/Qwen3.5-9B"
-    clock = {"now": 10.0}
-    calls = 0
-
-    class GetCurrentStats:
-        @staticmethod
-        async def aio():
-            nonlocal calls
-            calls += 1
-            clock["now"] += 0.9
-            return types.SimpleNamespace(
-                num_total_runners=1,
-                num_running_inputs=0,
-                input_headroom=8,
-                backlog=0,
-            )
-
-    class Engine:
-        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
-
-    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
-    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
-
-    first = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
-    second = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
-
-    assert second is first
-    assert calls == 1
-
-
-def test_fixed_stats_snapshot_never_self_inflates_admission_limit(
-    modal_app_module, monkeypatch
-) -> None:
-    model = "Qwen/Qwen3.5-9B"
-    stats = types.SimpleNamespace(
-        num_total_runners=1,
-        num_running_inputs=60,
-        input_headroom=4,
-        backlog=0,
-    )
-
-    class GetCurrentStats:
-        @staticmethod
-        async def aio():
-            return stats
-
-    class Engine:
-        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
-
-    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
-    pool = modal_app_module._ModalEnginePool(clock=lambda: 10.0)
-    admission = AdmissionController(hosted_traffic_policy_for, pool.current_dispatch_capacity)
-
-    async def scenario() -> tuple[list[object], bool, list[int]]:
-        snapshot = await pool.capacity_snapshot(model, admission.active_count(model))
-        leases = [await admission.acquire(model) for _ in range(4)]
-        waiters = [asyncio.create_task(admission.acquire(model)) for _ in range(2)]
-        await asyncio.sleep(0)
-        with pytest.raises(ServingOverloaded):
-            await admission.acquire(model)
-        limits = [snapshot.local_active_limit, admission.snapshot(model).current_dispatch_limit]
-        leases[0].release()
-        await asyncio.sleep(0)
-        first_fifo = waiters[0].done() and not waiters[1].done()
-        first = await waiters[0]
-        first.release()
-        await asyncio.sleep(0)
-        second = await waiters[1]
-        for lease in (*leases[1:], second):
-            lease.release()
-        limits.append(admission.snapshot(model).current_dispatch_limit)
-        return waiters, first_fifo, limits
-
-    waiters, first_fifo, limits = asyncio.run(scenario())
-    assert all(waiter.done() for waiter in waiters)
-    assert first_fifo
-    assert limits == [4, 4, 4]
-
-
-def test_modal_capacity_snapshot_fails_closed_on_invalid_or_mismatched_identity(
-    modal_app_module,
-) -> None:
-    model = "Qwen/Qwen3.5-9B"
-    identity = modal_app_module._capacity_deployment_identity(model)
-    snapshot = modal_app_module.CapacitySnapshot(
-        model=model,
-        deployment_identity=identity,
-        observed_at=10.0,
-        total_runners=1,
-        running_inputs=60,
-        input_headroom=4,
-        backlog=100,
-        observed_local_active=0,
-        local_active_limit=4,
-    )
-    clock = {"now": 10.0}
-    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
-    pool._capacity[model] = snapshot
-
-    assert pool.current_dispatch_capacity(model) == 4
-    clock["now"] = 13.0
-    assert pool.current_dispatch_capacity(model) == 0
-    clock["now"] = 10.0
-
-    pool._capacity[model] = modal_app_module.CapacitySnapshot(
-        model="Qwen/Qwen3.6-35B-A3B",
-        deployment_identity=identity,
-        observed_at=10.0,
-        total_runners=1,
-        running_inputs=0,
-        input_headroom=64,
-        backlog=0,
-        observed_local_active=0,
-        local_active_limit=64,
-    )
-    assert pool.current_dispatch_capacity(model) == 0
-
-    pool._capacity[model] = modal_app_module.CapacitySnapshot(
-        model=model,
-        deployment_identity=f"{identity}-other",
-        observed_at=10.0,
-        total_runners=1,
-        running_inputs=0,
-        input_headroom=64,
-        backlog=0,
-        observed_local_active=0,
-        local_active_limit=64,
-    )
-    assert pool.current_dispatch_capacity(model) == 0
-
-
-def test_modal_capacity_is_isolated_per_model(modal_app_module) -> None:
-    first, second = base_models()[:2]
-    pool = modal_app_module._ModalEnginePool(clock=lambda: 10.0)
-    pool._capacity[first] = modal_app_module.CapacitySnapshot(
-        model=first,
-        deployment_identity=modal_app_module._capacity_deployment_identity(first),
-        observed_at=10.0,
-        total_runners=1,
-        running_inputs=0,
-        input_headroom=5,
-        backlog=0,
-        observed_local_active=0,
-        local_active_limit=5,
-    )
-    pool._capacity[second] = modal_app_module.CapacitySnapshot(
-        model=second,
-        deployment_identity=modal_app_module._capacity_deployment_identity(second),
-        observed_at=10.0,
-        total_runners=1,
-        running_inputs=0,
-        input_headroom=7,
-        backlog=0,
-        observed_local_active=0,
-        local_active_limit=7,
-    )
-
-    assert pool.current_dispatch_capacity(first) == 5
-    assert pool.current_dispatch_capacity(second) == 7
-
-
-def test_new_function_stats_replace_fixed_limit_for_scale_up_and_down(
-    modal_app_module, monkeypatch
-) -> None:
-    model = "Qwen/Qwen3.5-9B"
-    clock = {"now": 10.0}
-    stats = {
-        "value": types.SimpleNamespace(
-            num_total_runners=1,
-            num_running_inputs=60,
-            input_headroom=4,
-            backlog=0,
-        )
-    }
-
-    class GetCurrentStats:
-        @staticmethod
-        async def aio():
-            return stats["value"]
-
-    class Engine:
-        generate = types.SimpleNamespace(get_current_stats=GetCurrentStats)
-
-    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _model: lambda: Engine())
-    pool = modal_app_module._ModalEnginePool(clock=lambda: clock["now"])
-
-    first = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
-    assert first.local_active_limit == 4
-
-    clock["now"] += modal_app_module.CAPACITY_POLL_INTERVAL_SECONDS + 0.01
-    stats["value"] = types.SimpleNamespace(
-        num_total_runners=2,
-        num_running_inputs=56,
-        input_headroom=8,
-        backlog=0,
-    )
-    scaled_up = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
-    assert scaled_up.local_active_limit == 8
-
-    clock["now"] += modal_app_module.CAPACITY_POLL_INTERVAL_SECONDS + 0.01
-    stats["value"] = types.SimpleNamespace(
-        num_total_runners=1,
-        num_running_inputs=62,
-        input_headroom=2,
-        backlog=0,
-    )
-    scaled_down = asyncio.run(pool.capacity_snapshot(model, observed_local_active=0))
-    assert scaled_down.local_active_limit == 2
-    assert pool.current_dispatch_capacity(model) == 2
-
-
 def test_model_classes_inherit_the_shared_impl(modal_app_module):
     for engine in modal_app_module.ENGINE_BY_MODEL.values():
         assert issubclass(engine, modal_app_module._LoraEngineImpl)
@@ -828,6 +477,7 @@ def test_installed_modal_registers_unparameterized_exact_warm_classes() -> None:
     code = """
 import inspect
 import json
+import modal
 
 import flash.serving.app.modal_app as modal_app
 
@@ -847,9 +497,20 @@ for model, engine_class in modal_app.ENGINE_BY_MODEL.items():
         "instance_model": instance.base_model,
         "class_model": user_class.base_model,
         "min_containers": registration["min_containers"],
+        "buffer_containers": registration["buffer_containers"],
         "max_containers": registration["max_containers"],
     }
-print(json.dumps(observed, sort_keys=True))
+router_registration = inspect.getclosurevars(registered["router"]._load).nonlocals
+router_policy = {
+    "min_containers": router_registration["min_containers"],
+    "buffer_containers": router_registration["buffer_containers"],
+    "max_containers": router_registration["max_containers"],
+}
+print(json.dumps({
+    "modal_version": modal.__version__,
+    "engines": observed,
+    "router": router_policy,
+}, sort_keys=True))
 """
     env = os.environ.copy()
     env["SERVING_DEPLOYMENT_MODE"] = "production"
@@ -864,7 +525,14 @@ print(json.dumps(observed, sort_keys=True))
     )
 
     assert result.returncode == 0, result.stderr
-    observed = json.loads(result.stdout)
+    payload = json.loads(result.stdout)
+    assert payload["modal_version"] == "1.5.4"
+    assert payload["router"] == {
+        "min_containers": 1,
+        "buffer_containers": 1,
+        "max_containers": None,
+    }
+    observed = payload["engines"]
     assert set(observed) == set(base_models())
     assert len({entry["class_name"] for entry in observed.values()}) == len(base_models())
     for model, entry in observed.items():
@@ -872,7 +540,8 @@ print(json.dumps(observed, sort_keys=True))
         assert entry["instance_model"] == model
         assert entry["class_model"] == model
         assert entry["min_containers"] == 1
-        assert entry["max_containers"] == 2
+        assert entry["buffer_containers"] == 1
+        assert entry["max_containers"] is None
 
 
 def test_changed_hosted_sources_describe_warm_policy() -> None:
@@ -906,8 +575,9 @@ def test_changed_hosted_sources_describe_warm_policy() -> None:
     assert len(base_models()) == 2
     assert "current two-model catalog" in readme
     assert f"warm floor of {configured_warm_container_floor()} GPU containers" in readme
-    assert f"hard ceiling of {configured_hard_gpu_ceiling()}" in readme
-    assert f"`max_inputs={configured_router_async_capacity()}`" in readme
+    assert "no flash-configured maximum" in readme.lower()
+    assert "`max_inputs=36`" in readme
+    assert "`target_inputs=27`" in readme
 
 
 def test_health_reports_pinned_gpu_over_derived_tier(modal_app_module):
@@ -998,8 +668,8 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
     """The pool dispatches every call through the model's immutable warm class."""
     mod = modal_app_module
     bound_models: list[str] = []
-    generate_calls: list[tuple[dict, dict, str | None, str]] = []
-    stream_calls: list[tuple[dict, dict, str | None, str]] = []
+    generate_calls: list[tuple[dict, dict, str | None, str, float]] = []
+    stream_calls: list[tuple[dict, dict, str | None, str, float]] = []
     register_calls: list[tuple[dict, str | None]] = []
 
     class _Dump:
@@ -1009,33 +679,59 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
             *,
             deployment_generation: str | None = None,
             generation_id: str | None = None,
+            pre_header_dispatch_deadline: float = 123.0,
         ) -> None:
             self.value = value
             self.deployment_generation = deployment_generation
             self.generation_id = generation_id
+            self._pre_header_dispatch_deadline = pre_header_dispatch_deadline
 
         def model_dump(self, *, by_alias: bool) -> dict:
             assert by_alias is True
             return self.value
 
     async def _generate(
-        payload: dict, record: dict, checkpoint: str | None, generation_id: str
+        payload: dict,
+        record: dict,
+        checkpoint: str | None,
+        generation_id: str,
+        deadline: float,
     ) -> dict:
-        generate_calls.append((payload, record, checkpoint, generation_id))
+        generate_calls.append((payload, record, checkpoint, generation_id, deadline))
         return {"ok": True}
 
     async def _stream_generate(
-        payload: dict, record: dict, checkpoint: str | None, generation_id: str
+        payload: dict,
+        record: dict,
+        checkpoint: str | None,
+        generation_id: str,
+        deadline: float,
     ):
-        stream_calls.append((payload, record, checkpoint, generation_id))
+        stream_calls.append((payload, record, checkpoint, generation_id, deadline))
         yield {"delta": "hello"}
         yield {"delta": " world"}
 
     async def _register(record: dict, deployment_generation: str | None) -> None:
         register_calls.append((record, deployment_generation))
 
+    class _Call:
+        def __init__(self, result: dict) -> None:
+            self.result = result
+            self.cancelled = False
+            self.get = types.SimpleNamespace(aio=self._get)
+            self.cancel = types.SimpleNamespace(aio=self._cancel)
+
+        async def _get(self) -> dict:
+            return self.result
+
+        async def _cancel(self) -> None:
+            self.cancelled = True
+
+    async def _spawn_generate(*args: Any) -> _Call:
+        return _Call(await _generate(*args))
+
     class _FakeEngine:
-        generate = types.SimpleNamespace(remote=types.SimpleNamespace(aio=_generate))
+        generate = types.SimpleNamespace(spawn=types.SimpleNamespace(aio=_spawn_generate))
         stream_generate = types.SimpleNamespace(
             remote_gen=types.SimpleNamespace(aio=_stream_generate)
         )
@@ -1050,9 +746,11 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
     monkeypatch.setattr(mod, "_engine_cls_for", lambda _base_model: _bind)
     pool = mod._ModalEnginePool()
     generation_id = "fsgen-00000000000000000000000000000001"
+    deadline = time.time() + 60
     payload = _Dump(
         {"messages": [{"role": "user", "content": "hello"}]},
         generation_id=generation_id,
+        pre_header_dispatch_deadline=deadline,
     )
     record = _Dump(
         {"adapter_id": "run@step-1.sha"},
@@ -1097,6 +795,7 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
         },
         "step-1",
         generation_id,
+        deadline,
     )
     assert generate_calls == [expected_inference_call]
     assert stream_calls == [expected_inference_call]
@@ -1109,6 +808,252 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
             "generation-1",
         )
     ]
+
+
+def test_modal_stream_midstream_close_closes_owned_remote_iterator(
+    modal_app_module, monkeypatch
+) -> None:
+    closed = 0
+
+    class _RemoteStream:
+        def __init__(self) -> None:
+            self.sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> dict[str, str]:
+            if not self.sent:
+                self.sent = True
+                return {"type": "ready"}
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed += 1
+
+    class _Engine:
+        stream_generate = types.SimpleNamespace(
+            remote_gen=types.SimpleNamespace(aio=lambda *_args: _RemoteStream())
+        )
+
+    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _base_model: lambda: _Engine())
+    payload = types.SimpleNamespace(
+        generation_id="fsgen-00000000000000000000000000000001",
+        _pre_header_dispatch_deadline=time.time() + 60,
+        model_dump=lambda **_kwargs: {"adapter_id": "revision"},
+    )
+    record = types.SimpleNamespace(
+        deployment_generation=None,
+        model_dump=lambda **_kwargs: {"adapter_id": "revision"},
+    )
+
+    async def scenario() -> None:
+        stream = modal_app_module._ModalEnginePool().stream_generate(
+            "Qwen/Qwen3.5-9B", payload, record
+        )
+        assert await anext(stream) == {"type": "ready"}
+        await stream.aclose()
+
+    asyncio.run(scenario())
+
+    assert closed == 1
+
+
+def test_modal_stream_first_event_expires_and_closes_iterator(
+    modal_app_module, monkeypatch
+) -> None:
+    closed = 0
+
+    class _RemoteStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> dict[str, str]:
+            await asyncio.Event().wait()
+            return {"type": "ready"}
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed += 1
+            raise RuntimeError("cleanup failed")
+
+    class _Engine:
+        stream_generate = types.SimpleNamespace(
+            remote_gen=types.SimpleNamespace(aio=lambda *_args: _RemoteStream())
+        )
+
+    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _base_model: lambda: _Engine())
+    deadline = time.time() + 0.01
+    payload = types.SimpleNamespace(
+        generation_id="fsgen-00000000000000000000000000000001",
+        _pre_header_dispatch_deadline=deadline,
+        model_dump=lambda **_kwargs: {"adapter_id": "revision"},
+    )
+    record = types.SimpleNamespace(
+        deployment_generation=None,
+        model_dump=lambda **_kwargs: {"adapter_id": "revision"},
+    )
+
+    async def scenario() -> None:
+        stream = modal_app_module._ModalEnginePool().stream_generate(
+            "Qwen/Qwen3.5-9B", payload, record
+        )
+        with pytest.raises(modal_app_module.PreHeaderDispatchExpired):
+            await anext(stream)
+
+    asyncio.run(scenario())
+
+    assert closed == 1
+    assert payload._pre_header_dispatch_deadline == deadline
+
+
+def test_modal_stream_deadline_applies_only_to_first_event(modal_app_module, monkeypatch) -> None:
+    deadline = 123.0
+    remaining_calls: list[float] = []
+    forwarded_deadlines: list[float] = []
+
+    def remaining(value: float) -> float:
+        remaining_calls.append(value)
+        if len(remaining_calls) > 1:
+            raise AssertionError("pre-header deadline was reapplied after the first event")
+        return 60.0
+
+    async def remote_stream(*args: Any):
+        forwarded_deadlines.append(args[-1])
+        yield {"type": "ready"}
+        yield {"type": "delta"}
+
+    class _Engine:
+        stream_generate = types.SimpleNamespace(remote_gen=types.SimpleNamespace(aio=remote_stream))
+
+    monkeypatch.setattr(modal_app_module, "_remaining_pre_header_dispatch_time", remaining)
+    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _base_model: lambda: _Engine())
+    payload = types.SimpleNamespace(
+        generation_id="fsgen-00000000000000000000000000000001",
+        _pre_header_dispatch_deadline=deadline,
+        model_dump=lambda **_kwargs: {"adapter_id": "revision"},
+    )
+    record = types.SimpleNamespace(
+        deployment_generation=None,
+        model_dump=lambda **_kwargs: {"adapter_id": "revision"},
+    )
+
+    async def scenario() -> list[dict[str, str]]:
+        return [
+            event
+            async for event in modal_app_module._ModalEnginePool().stream_generate(
+                "Qwen/Qwen3.5-9B", payload, record
+            )
+        ]
+
+    assert asyncio.run(scenario()) == [{"type": "ready"}, {"type": "delta"}]
+    assert remaining_calls == [deadline]
+    assert forwarded_deadlines == [deadline]
+
+
+def test_blocked_modal_spawn_expires_with_absolute_deadline(modal_app_module) -> None:
+    spawn_cancelled = False
+
+    async def blocked_spawn() -> Any:
+        nonlocal spawn_cancelled
+        try:
+            await asyncio.Event().wait()
+        finally:
+            spawn_cancelled = True
+
+    method = types.SimpleNamespace(spawn=types.SimpleNamespace(aio=blocked_spawn))
+
+    async def scenario() -> None:
+        with pytest.raises(modal_app_module.PreHeaderDispatchExpired):
+            await modal_app_module._spawn_modal_call(method, time.time() + 0.01)
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    assert spawn_cancelled is True
+
+
+def test_blocked_modal_result_expires_and_cancels_exact_call(modal_app_module) -> None:
+    class _Call:
+        def __init__(self) -> None:
+            self.cancelled = 0
+            self.get = types.SimpleNamespace(aio=self._get)
+            self.cancel = types.SimpleNamespace(aio=self._cancel)
+
+        async def _get(self) -> dict[str, bool]:
+            await asyncio.Event().wait()
+            return {"ok": True}
+
+        async def _cancel(self) -> None:
+            self.cancelled += 1
+
+    call = _Call()
+
+    async def scenario() -> None:
+        with pytest.raises(modal_app_module.PreHeaderDispatchExpired):
+            await modal_app_module._await_modal_call(call, time.time() + 0.01)
+
+    asyncio.run(scenario())
+    assert call.cancelled == 1
+
+
+def test_modal_cancel_cleanup_failure_does_not_mask_primary_failures(modal_app_module) -> None:
+    class _ModalFailure(RuntimeError):
+        pass
+
+    class _Call:
+        def __init__(self, get: Any) -> None:
+            self.cancelled = 0
+            self.get = types.SimpleNamespace(aio=get)
+            self.cancel = types.SimpleNamespace(aio=self._cancel)
+
+        async def _cancel(self) -> None:
+            self.cancelled += 1
+            raise RuntimeError("cleanup failed")
+
+    async def blocked() -> dict[str, bool]:
+        await asyncio.Event().wait()
+        return {"ok": True}
+
+    async def modal_failure() -> dict[str, bool]:
+        raise _ModalFailure("modal failed")
+
+    async def scenario() -> tuple[int, int, int]:
+        timed_out = _Call(blocked)
+        with pytest.raises(modal_app_module.PreHeaderDispatchExpired):
+            await modal_app_module._await_modal_call(timed_out, time.time() + 0.01)
+
+        failed = _Call(modal_failure)
+        with pytest.raises(_ModalFailure, match="modal failed"):
+            await modal_app_module._await_modal_call(failed, time.time() + 60)
+
+        cancelled = _Call(blocked)
+        task = asyncio.create_task(modal_app_module._await_modal_call(cancelled, time.time() + 60))
+        await asyncio.sleep(0)
+        task.cancel()
+        result = await asyncio.gather(task, return_exceptions=True)
+        assert isinstance(result[0], asyncio.CancelledError)
+        return timed_out.cancelled, failed.cancelled, cancelled.cancelled
+
+    assert asyncio.run(scenario()) == (1, 1, 1)
+
+
+def test_completed_modal_call_is_not_cancelled(modal_app_module) -> None:
+    class _Call:
+        def __init__(self) -> None:
+            self.cancelled = 0
+            self.get = types.SimpleNamespace(aio=lambda: asyncio.sleep(0, result={"ok": True}))
+            self.cancel = types.SimpleNamespace(aio=self._cancel)
+
+        async def _cancel(self) -> None:
+            self.cancelled += 1
+
+    call = _Call()
+    result = asyncio.run(modal_app_module._await_modal_call(call, time.time() + 60))
+
+    assert result == {"ok": True}
+    assert call.cancelled == 0
 
 
 # ---- Functional: actually run _load() and capture the AsyncEngineArgs (vLLM/tokenizer stubbed) ----

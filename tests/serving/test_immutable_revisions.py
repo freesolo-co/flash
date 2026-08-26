@@ -909,6 +909,7 @@ def test_delete_run_alias_cascades_ready_alias_and_revisions(setup) -> None:
         "run_id": RUN_ID,
         "disabled_aliases": [RUN_ID],
         "disabled_revisions": [FINAL_REVISION],
+        "gpu_cleanup": "replica_local_opportunistic",
     }
     assert all(isinstance(value, str) for value in response.json()["disabled_aliases"])
     assert all(isinstance(value, str) for value in response.json()["disabled_revisions"])

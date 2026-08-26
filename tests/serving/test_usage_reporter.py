@@ -106,8 +106,8 @@ def test_lora_engines_keep_one_warm_container_per_model(modal_app_module):
     cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
     assert len(cls_calls) == len(modal_app_module.ENGINE_BY_MODEL)
     assert all(kwargs["min_containers"] == 1 for kwargs in cls_calls)
-    assert all(kwargs["max_containers"] == 2 for kwargs in cls_calls)
-    assert all(kwargs["buffer_containers"] == 0 for kwargs in cls_calls)
+    assert all("max_containers" not in kwargs for kwargs in cls_calls)
+    assert all(kwargs["buffer_containers"] == 1 for kwargs in cls_calls)
     assert sorted(kwargs["gpu"] for kwargs in cls_calls) == sorted(
         modal_app_module.gpu_for(model) for model in modal_app_module.ENGINE_BY_MODEL
     )
@@ -120,8 +120,7 @@ def test_lora_engines_keep_one_warm_container_per_model(modal_app_module):
     assert modal_app_module.app.function.call_args.kwargs == {
         "secrets": modal_app_module.runtime_secrets,
         "min_containers": 1,
-        "max_containers": 1,
-        "buffer_containers": 0,
+        "buffer_containers": 1,
         "timeout": modal_app_module.ROUTER_TIMEOUT_SECONDS,
     }
 
@@ -156,8 +155,8 @@ def test_modal_concurrency_matches_each_model_policy_and_router_bound(modal_app_
     ]
     assert engine_calls == expected
     assert calls[-1] == {
-        "max_inputs": modal_app_module.ROUTER_ASYNC_CAPACITY,
-        "target_inputs": modal_app_module.ROUTER_ASYNC_CAPACITY,
+        "max_inputs": modal_app_module.ROUTER_MAX_INPUTS,
+        "target_inputs": modal_app_module.ROUTER_TARGET_INPUTS,
     }
 
 
@@ -643,15 +642,15 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
     from flash.serving.src.io.schemas import AdapterRecord
 
     calls: list[dict[str, Any]] = []
+    shared_snapshot = tmp_path / "hub" / "snapshots" / "sha"
+    adapter_dir = shared_snapshot / "sft/run/seed0/adapter"
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
 
     def _snapshot_download(**kwargs: Any) -> str:
         calls.append(kwargs)
-        local_dir = Path(kwargs["local_dir"])
-        adapter_dir = local_dir / "sft/run/seed0/adapter"
-        adapter_dir.mkdir(parents=True, exist_ok=True)
-        (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
-        (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
-        return str(local_dir)
+        return str(shared_snapshot)
 
     class _Registry:
         def __init__(self) -> None:
@@ -668,12 +667,14 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
     monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.HF_HUB_CACHE_DIR", tmp_path / "hub")
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.registry = _Registry()
     engine._source_locks = {}
     engine._source_locks_guard = asyncio.Lock()
     engine._source_paths = {}
+    engine._adapter_cache_dir = tmp_path / "adapters"
     engine.settings = type("_Settings", (), {"hf_api_key": "hf_secret"})()
 
     first = AdapterRecord.model_validate(
@@ -696,13 +697,15 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
     assert len(calls) == 1
     assert calls[0]["repo_id"] == "org/run"
     assert calls[0]["repo_type"] == "dataset"
+    assert calls[0]["cache_dir"] == str(tmp_path / "hub")
+    assert "local_dir" not in calls[0]
     assert calls[0]["allow_patterns"] == [
         "sft/run/seed0/adapter/**",
         "sft/run/seed0/adapter/*",
     ]
 
 
-def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monkeypatch, tmp_path):
+def test_ensure_adapter_local_uses_existing_replica_cache(modal_app_module, monkeypatch, tmp_path):
     import asyncio
 
     from flash.serving.src.io.schemas import AdapterRecord
@@ -725,6 +728,7 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
     monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.HF_HUB_CACHE_DIR", tmp_path / "hub")
 
     record = AdapterRecord.model_validate(
         {
@@ -747,6 +751,7 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
     engine._source_locks = {}
     engine._source_locks_guard = asyncio.Lock()
     engine._source_paths = {}
+    engine._adapter_cache_dir = tmp_path / "adapters"
     engine.settings = type("_Settings", (), {"hf_api_key": "hf_secret"})()
 
     path = asyncio.run(engine._ensure_adapter_local_locked(record))
@@ -755,7 +760,7 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
     assert engine.registry.paths == {"a": cached_path}
 
 
-def test_ensure_adapter_local_redownloads_partial_volume_cache(
+def test_ensure_adapter_local_redownloads_partial_replica_cache(
     modal_app_module, monkeypatch, tmp_path
 ):
     import asyncio
@@ -790,24 +795,26 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
     partial_adapter_path.mkdir(parents=True)
     (partial_adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
     calls: list[dict[str, Any]] = []
+    shared_snapshot = tmp_path / "hub" / "snapshots" / "sha"
+    shared_adapter_path = shared_snapshot / "sft/run/seed0/adapter"
+    shared_adapter_path.mkdir(parents=True)
+    (shared_adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (shared_adapter_path / "adapter_model.safetensors").write_bytes(b"weights")
 
     def _snapshot_download(**kwargs: Any) -> str:
         calls.append(kwargs)
-        local_dir = Path(kwargs["local_dir"])
-        adapter_dir = local_dir / "sft/run/seed0/adapter"
-        adapter_dir.mkdir(parents=True, exist_ok=True)
-        (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
-        (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
-        return str(local_dir)
+        return str(shared_snapshot)
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
     monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
+    monkeypatch.setattr("flash.serving.src.store.settings.HF_HUB_CACHE_DIR", tmp_path / "hub")
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.registry = _Registry()
     engine._source_locks = {}
     engine._source_locks_guard = asyncio.Lock()
     engine._source_paths = {}
+    engine._adapter_cache_dir = tmp_path / "adapters"
     engine.settings = type("_Settings", (), {"hf_api_key": "hf_secret"})()
 
     path = asyncio.run(engine._ensure_adapter_local_locked(record))
@@ -818,7 +825,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
     assert engine.registry.paths == {"a": partial_adapter_path}
 
 
-def test_preload_cached_loras_adds_only_volume_cached_adapters(
+def test_preload_cached_loras_adds_only_replica_cached_adapters(
     modal_app_module, monkeypatch, tmp_path
 ):
     import asyncio
@@ -864,6 +871,7 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
     engine._adapter_locks_guard = asyncio.Lock()
     engine._source_paths = {}
     engine._lora_entries = {}
+    engine._adapter_cache_dir = tmp_path / "adapters"
     # _load() normally sets this; the object.__new__ engine here must too, or _add_lora_locked's
     # `if self._pin_loras` raises AttributeError (swallowed by the preload) and pinning never runs.
     engine._pin_loras = True

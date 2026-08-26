@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
 from flash.serving.src.accounting.usage_outbox import OfflineUsageStore, UsageStore
+from flash.serving.src.engine.errors import ServingCapacityUnavailable
 from flash.serving.src.http.adapter_routes import adapter_router
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
 from flash.serving.src.http.context import APP_STATE_ATTR, ServingContext
@@ -27,8 +28,6 @@ from flash.serving.src.http.inference_routes import inference_router
 from flash.serving.src.http.routing import AdapterRouter, EnginePool, health_body
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.store.lookup import AdapterLookup
-from flash.serving.src.traffic.admission import ServingCapacityUnavailable, ServingOverloaded
-from flash.serving.src.traffic.capacity import CapacityProvider, ConfiguredCapacityProvider
 
 THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 _CLEANUP_TIMEOUT_SECONDS = 10.0
@@ -62,7 +61,6 @@ def build_serving_app(
     reload_interval_seconds: float = 30.0,
     usage_store: UsageStore,
     chat_authorizer: Callable[[str, str], Awaitable["str | None"]] | None = None,
-    capacity_provider: CapacityProvider | None = None,
 ):
     """Front-door FastAPI app. ``reload_records`` re-reads persisted ready adapters so a router
     that missed a (un)registration on another container still resolves it: reload once on a miss
@@ -82,7 +80,6 @@ def build_serving_app(
     Trusted server-to-server callers presenting the shared internal key bypass it. If no
     ``chat_authorizer`` is wired, a non-internal request fails closed (503) — prod always wires it.
     """
-    capacity = capacity_provider or ConfiguredCapacityProvider()
     context = ServingContext(
         pool,
         router,
@@ -93,7 +90,6 @@ def build_serving_app(
             reload_interval_seconds=reload_interval_seconds,
         ),
         usage_store,
-        capacity,
         internal_key=internal_key,
         deployment_id=deployment_id,
         serving_release=deployment_sha,
@@ -109,29 +105,15 @@ def build_serving_app(
     )
     setattr(api.state, APP_STATE_ATTR, context)
 
-    @api.exception_handler(ServingOverloaded)
-    async def _serving_overloaded(_request: Request, exc: ServingOverloaded) -> JSONResponse:
-        return JSONResponse(
-            status_code=429,
-            content={
-                "error": {
-                    "message": "The serving model is at capacity. Retry shortly.",
-                    "type": "server_error",
-                    "code": exc.code,
-                }
-            },
-            headers={"Retry-After": str(exc.retry_after_seconds)},
-        )
-
     @api.exception_handler(ServingCapacityUnavailable)
-    async def _serving_capacity_unavailable(
+    async def _engine_capacity_unavailable(
         _request: Request, exc: ServingCapacityUnavailable
     ) -> JSONResponse:
         return JSONResponse(
             status_code=503,
             content={
                 "error": {
-                    "message": "The serving model has no fresh warm capacity.",
+                    "message": str(exc.detail),
                     "type": "server_error",
                     "code": exc.code,
                 }
@@ -143,13 +125,21 @@ def build_serving_app(
     api.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_CHAT_REQUEST_BYTES)
 
     @api.get("/healthz", tags=["system"])
-    async def healthz() -> dict[str, Any]:
-        return health_body(
+    async def healthz() -> Any:
+        body = health_body(
             router,
             deployment_sha=deployment_sha,
             deployment_id=deployment_id,
             capabilities=list(_CAPABILITIES),
         )
+        try:
+            usage_store.assert_healthy()
+        except Exception:
+            body["ok"] = False
+            body["accounting_ok"] = False
+            return JSONResponse(status_code=503, content=body)
+        body["accounting_ok"] = True
+        return body
 
     api.include_router(adapter_router)
     api.include_router(inference_router)
@@ -164,15 +154,10 @@ def _lifespan_for(
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: "FastAPI"):
-        await context.refresh_capacity_once()
-        refresh_tasks = (asyncio.create_task(context.refresh_capacity_periodically()),)
         try:
             await context.usage.start()
             yield
         finally:
-            for task in refresh_tasks:
-                task.cancel()
-            await asyncio.gather(*refresh_tasks, return_exceptions=True)
             try:
                 await context.usage.aclose()
             finally:

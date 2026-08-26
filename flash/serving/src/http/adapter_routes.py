@@ -157,10 +157,10 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
 
 
 async def _register_revision(context: ServingContext, stored: AdapterRecord) -> None:
-    """Load the revision onto its gpu engine, then promote the durable row to ready.
+    """Validate one gpu replica can load the revision, then promote the durable row to ready.
 
-    Deferred to a background task so registration returns as soon as the row is durable: the
-    engine load may cold-start a scaled-to-zero container. A failed load simply leaves the
+    This warmup does not establish global residency. Any other replica lazy-loads the same immutable
+    revision into its own materialization directory on first use. A failed validation leaves the
     revision disabled, which a later registration retries.
     """
     if stored.status == "ready" or stored.updated_at is None:
@@ -239,12 +239,13 @@ async def remove_adapter(
     # the rows that durably converged.
     result = await disable_matched(matches, get_authoritative=get_authoritative)
 
-    # phase 2: remove every durably disabled row from routing immediately. active hosted models
-    # schedule exact gpu eviction after the response. retired models have no engine to start, so their
-    # durable disable and router removal are the complete teardown.
+    # phase 2: remove every durably disabled row from this router immediately. the persisted fence is
+    # the cross-replica boundary. a modal unregister call reaches only one arbitrary engine replica,
+    # so it is opportunistic local cleanup while other replicas rely on lru or container teardown.
     cleanup_records = apply_teardown(context.router, result.pending_teardown)
     active_gpu_cleanup = is_supported_base_model(matches[0].base_model)
     if active_gpu_cleanup:
+        # one call reaches one arbitrary replica. this is opportunistic memory cleanup only.
         for cleanup_record, expected_generation in cleanup_records:
             background_tasks.add_task(
                 context.unregister_safe,
@@ -262,5 +263,7 @@ async def remove_adapter(
         matches[0].base_model,
         result.disabled_aliases,
         result.disabled_revisions,
-        gpu_cleanup=None if active_gpu_cleanup else "not_applicable_retired_model",
+        gpu_cleanup=(
+            "replica_local_opportunistic" if active_gpu_cleanup else "not_applicable_retired_model"
+        ),
     )

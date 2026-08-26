@@ -5,18 +5,26 @@ Multi-LoRA serving on Modal with **one warm exact-model engine class per active 
 - Each active base model has its own immutable `LoraEngine_<model>_<contract>` Modal class. Its
   identity covers the exact model and every decorator-affecting traffic policy value. The class's
   vLLM engine holds all adapters for that model, so many adapters share the model's GPU capacity.
-- `router` is a singleton CPU web endpoint that tracks adapter to base-model routing and dispatches
-  each request to the exact model class. It keeps one CPU container warm.
+- `router` is a CPU web endpoint that tracks adapter to base-model routing and dispatches each
+  request to the exact model class. Each router replica has finite concurrency with `max_inputs=36`
+  and `target_inputs=27`, independent of the number of engine replicas.
 
-Adding a LoRA calls `register.remote.aio(...)` on that base model's engine. The existing warm
-container handles registration and inference, and Modal may add the model's second container under
-traffic. Uncataloged base models are rejected instead of falling onto another model or GPU tier.
+Adding a LoRA validates the exact immutable revision on one engine replica before the durable row is
+made routable. That is not global residency. Any other replica lazy-loads and attests the same revision
+before generation, using a replica-local mutable final directory while the immutable Hugging Face,
+base-weight, and compile caches remain shared. Modal owns engine queueing and replica creation.
+Uncataloged base models are rejected instead of falling onto another model or GPU tier.
 
-Each GPU engine class uses `min_containers=1`, `max_containers=2`, and `buffer_containers=0`. The
-current two-model catalog therefore has a warm floor of 2 GPU containers and a hard ceiling of 4.
+Each CPU router and GPU engine function uses `min_containers=1` and `buffer_containers=1`, with no Flash-configured maximum.
+The current two-model catalog therefore has a warm floor of 2 GPU containers
+plus one requested buffer per model. Each engine replica keeps `max_inputs=8` and
+`target_inputs=6`. Modal workspace and platform limits still bound actual scaling.
 The product chat route allows 30 minutes and gives first-party serving a 1,700-second request budget,
-leaving frontend headroom. Adapter undeploy returns after durable routing state is disabled, while
-best-effort GPU eviction continues as response background work. The `start_all` entrypoint (`uv run
+leaving frontend headroom. Adapter undeploy returns after durable routing state is disabled. That
+persisted fence is the cross-replica correctness boundary: new requests refresh authoritative state
+before dispatch, while requests already in flight may finish. A single Modal unregister reaches only
+one arbitrary replica, so physical LoRA cleanup is replica-local and opportunistic, not fleet-wide.
+The `start_all` entrypoint (`uv run
 modal run flash/serving/app/modal_app.py`) remains an explicit manual diagnostic that checks the warm
 engines and blocks until each reports healthy. Pass `--base-model ...` to check one model.
 
@@ -26,7 +34,9 @@ register-routing, OpenAI shape, auth, 404s) — run with `uv run pytest tests/se
 
 Persistence is only for hydration and recovery. On startup each base model's engine loads
 _its_ ready adapters from the `hosted_lora_adapters` Supabase table; `POST /adapters`
-registers a new adapter on its base model's engine and tracks it in the router.
+registers a new adapter on its base model's engine and tracks it in the router. Durable request usage
+accounting is mandatory for inference. `/healthz` reports `accounting_ok`; an unhealthy accounting
+outbox makes readiness return 503 and inference fails closed before GPU dispatch.
 
 ## Deployment environments
 
@@ -36,10 +46,19 @@ isolation namespaces both. `SERVING_DEPLOYMENT_MODE` identifies the deployment a
 Modal environment `dev` and that production mode does not. The mode does not change autoscaling or
 engine behavior.
 
-Both environments keep one warm container per advertised model, allow exactly two containers per
-model, and expose a bounded two-request application queue per model. The CPU router is a singleton
-with `max_inputs=36`: the two models' 32 hard engine slots plus four bounded waiters. Live Modal
-function stats cap dispatch below that hard bound when current warm capacity is lower.
+Both environments keep one warm container and request one buffer container for every advertised
+model and for each CPU router function. Flash omits `max_containers`, so Modal owns queueing and
+replica scaling subject to workspace and platform limits. Each engine replica admits at most eight
+inputs and targets six before scale-out. Each router replica admits at most 36 inputs and targets 27;
+those router values do not change with engine fleet size. Flash does not maintain a process-local
+application queue or use function statistics to authorize or deny a request. The router authors one
+private 120-second absolute pre-header deadline and forwards it unchanged to the engine. Non-streaming
+enqueue and result waits consume the remaining budget. The current legacy generator transport bounds
+only its first remote event; after that event, normal streaming is governed by the request timeout.
+The worker checks the same deadline before adapter hydration and immediately before GPU generation, so
+abandoned queued work cannot start late. Modal resource exhaustion and pre-header expiry return
+retryable `503 serving_capacity_unavailable` responses with `Retry-After: 1`; caller rate or quota
+limits remain the only reason for a 429.
 
 ### Production
 
@@ -118,8 +137,8 @@ GPUs, so there's nothing to tune at deploy time:
 - **On, hardcoded:** FP8 weights on the dense tiers + FP8 KV cache everywhere (see Quantization
   below), prefix caching (~4.7×
   throughput / ~10× lower TTFT for shared prompts), CUDA graphs where the per-model boot canary
-  leaves enough KV headroom, `disable_log_stats`, the prompt-token cache (2048), `MAX_INPUTS=64`
-  packing, multi-LoRA defaults (**16 hot** / **rank 32** / 256 CPU) with per-model rank overrides
+  leaves enough KV headroom, `disable_log_stats`, the prompt-token cache (2048), per-engine
+  `max_inputs=8` packing, multi-LoRA defaults (**16 hot** / **rank 32** / 256 CPU) with per-model rank overrides
   (**128** for the 9B, **64** for the 27B; the 35B MoE runs rank 64 at only 6 hot slots,
   every other tier keeps 16), and `VLLM_CACHE_ROOT` on the persistent volume so vLLM's
   torch.compile cache survives container replacement instead of recompiling on every cold start.

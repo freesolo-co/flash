@@ -143,15 +143,11 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
         )
 
 
-@pytest.mark.parametrize(
-    ("status_code", "code"),
-    [(503, "serving_capacity_unavailable"), (429, "serving_overloaded")],
-)
-def test_smoke_classifier_retries_exact_traffic_admission_envelopes(status_code, code):
+def test_smoke_classifier_retries_exact_pre_header_capacity_envelope():
     response = httpx.Response(
-        status_code,
+        503,
         headers={"Retry-After": "1.25"},
-        json={"error": {"type": "server_error", "code": code}},
+        json={"error": {"type": "server_error", "code": "serving_capacity_unavailable"}},
     )
 
     retryable = transport.retryable_smoke_unavailable(
@@ -161,17 +157,34 @@ def test_smoke_classifier_retries_exact_traffic_admission_envelopes(status_code,
     )
 
     assert retryable is not None
-    assert retryable.code == code
+    assert retryable.code == "serving_capacity_unavailable"
     assert retryable.retry_after_seconds == 1.25
+
+
+def test_smoke_classifier_does_not_retry_arbitrary_429():
+    response = httpx.Response(
+        429,
+        headers={"Retry-After": "1.25"},
+        json={"error": {"type": "server_error", "code": "rate_limit_exceeded"}},
+    )
+
+    assert (
+        transport.retryable_smoke_unavailable(
+            response,
+            requested_model="run-1",
+            expected_adapter_revision="run-1@final." + "a" * 40,
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("retry_after", [None, "", "0", "nan", "inf", "invalid"])
 def test_smoke_classifier_rejects_malformed_traffic_retry_headers(retry_after):
     headers = {} if retry_after is None else {"Retry-After": retry_after}
     response = httpx.Response(
-        429,
+        503,
         headers=headers,
-        json={"error": {"type": "server_error", "code": "serving_overloaded"}},
+        json={"error": {"type": "server_error", "code": "serving_capacity_unavailable"}},
     )
 
     assert (

@@ -21,7 +21,7 @@ from flash.serving.src.http.context import ServingContext
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.traffic.capacity import CapacitySnapshot
+from flash.serving.src.store.lookup import AdapterLookup
 from tests.serving.conftest import attest
 
 
@@ -227,7 +227,41 @@ def app_setup():
     return client, pool, router
 
 
-def test_unregister_safe_records_exact_gpu_cleanup_failure(capsys):
+def test_durable_fence_blocks_two_router_identities_while_resolved_work_can_finish() -> None:
+    revision = _rec("fenced", QWEN)
+    state = {"record": revision}
+    routers = [AdapterRouter([revision]), AdapterRouter([revision])]
+    lookups = [
+        AdapterLookup(
+            router,
+            reload_records=lambda: [state["record"]] if state["record"].status == "ready" else [],
+            lookup_record=lambda _adapter_id: state["record"],
+            reload_interval_seconds=0.0,
+        )
+        for router in routers
+    ]
+
+    async def scenario() -> tuple[AdapterRecord, list[int]]:
+        in_flight = (await lookups[0].resolve(revision.adapter_id))[1]
+        state["record"] = revision.model_copy(
+            update={"status": "disabled", "updated_at": "2026-08-26T00:00:02Z"}
+        )
+        statuses: list[int] = []
+        for lookup in lookups:
+            try:
+                await lookup.resolve(revision.adapter_id)
+            except HTTPException as exc:
+                statuses.append(exc.status_code)
+        return in_flight, statuses
+
+    in_flight, statuses = asyncio.run(scenario())
+
+    assert in_flight == revision
+    assert statuses == [404, 404]
+    assert all(router.resolve(revision.adapter_id) is None for router in routers)
+
+
+def test_unregister_safe_records_replica_local_gpu_cleanup_failure(capsys):
     class _FailingPool:
         async def unregister(self, base_model, adapter_id, expected_generation):
             raise RuntimeError(
@@ -240,7 +274,7 @@ def test_unregister_safe_records_exact_gpu_cleanup_failure(capsys):
     asyncio.run(context.unregister_safe(QWEN, "active@final.sha", "generation-1"))
 
     assert (
-        f"hosted adapter gpu cleanup failed for active@final.sha on {QWEN}: "
+        f"hosted adapter replica-local gpu cleanup failed for active@final.sha on {QWEN}: "
         f"RuntimeError('exact eviction failed for {QWEN} active@final.sha generation-1')"
         in capsys.readouterr().out
     )
@@ -355,225 +389,15 @@ def test_generate_routes_to_the_adapters_base_model(app_setup):
     assert pool.generated == [(QWEN, _revision_id("qa")), (QWEN_35B, _revision_id("mc"))]
 
 
-@pytest.mark.parametrize(
-    ("path", "payload"),
-    [
-        ("/generate", {"adapter_id": "qa", "prompt": "hi"}),
-        ("/adapters/qa/generate", {"prompt": "hi"}),
-        (
-            "/v1/chat/completions",
-            {"model": "qa", "messages": [{"role": "user", "content": "hi"}]},
-        ),
-    ],
-)
-def test_successful_nonstream_admission_headers(
-    app_setup, path: str, payload: dict[str, object]
-) -> None:
+def test_successful_inference_omits_process_local_capacity_headers(app_setup) -> None:
     client, _, _ = app_setup
-
-    response = client.post(path, json=payload)
-
-    assert response.status_code == 200
-    assert response.headers["X-Freesolo-Queue-Duration-Seconds"] == "0.000000"
-    assert response.headers["X-Freesolo-Application-Active"] == "1"
-    assert response.headers["X-Freesolo-Application-Pending"] == "0"
-
-
-def test_successful_stream_admission_headers(app_setup) -> None:
-    client, _, _ = app_setup
-
-    with client.stream(
-        "POST",
-        "/v1/chat/completions",
-        json={
-            "model": "qa",
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": True,
-        },
-    ) as response:
-        assert response.status_code == 200
-        assert response.headers["X-Freesolo-Queue-Duration-Seconds"] == "0.000000"
-        assert response.headers["X-Freesolo-Application-Active"] == "1"
-        assert response.headers["X-Freesolo-Application-Pending"] == "0"
-        response.read()
-
-
-def test_zero_live_capacity_returns_retryable_503_body() -> None:
-    class UnavailableCapacity:
-        async def capacity_snapshot(
-            self, model: str, observed_local_active: int
-        ) -> CapacitySnapshot:
-            return CapacitySnapshot.unavailable_snapshot(
-                model,
-                "test:unavailable",
-                time.monotonic(),
-                "no_warm_runners",
-                observed_local_active=observed_local_active,
-            )
-
-        def current_dispatch_capacity(self, _model: str) -> int:
-            return 0
-
-    client = _serve(
-        FakePool(),
-        _router_for("qa", QWEN),
-        capacity_provider=UnavailableCapacity(),
-    )
 
     response = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"})
 
-    assert response.status_code == 503
-    assert response.headers["Retry-After"] == "1"
-    assert response.json() == {
-        "error": {
-            "message": "The serving model has no fresh warm capacity.",
-            "type": "server_error",
-            "code": "serving_capacity_unavailable",
-        }
-    }
-
-
-def test_blocked_stats_do_not_accumulate_before_admission_under_burst() -> None:
-    from httpx import ASGITransport, AsyncClient
-
-    class BlockedCapacity:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def capacity_snapshot(
-            self, model: str, observed_local_active: int
-        ) -> CapacitySnapshot:
-            del model, observed_local_active
-            self.calls += 1
-            await asyncio.Event().wait()
-            raise AssertionError("blocked stats unexpectedly completed")
-
-        def current_dispatch_capacity(self, _model: str) -> int:
-            return 0
-
-    capacity = BlockedCapacity()
-    pool = FakePool()
-    app = build_serving_app(
-        pool,
-        _router_for("qa", QWEN),
-        capacity_provider=capacity,
-        chat_authorizer=_allow,
-    )
-
-    async def scenario():
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
-            return await asyncio.gather(
-                *(
-                    client.post(
-                        "/generate",
-                        json={"adapter_id": "qa", "prompt": "hi"},
-                        headers={"Authorization": "Bearer t"},
-                    )
-                    for _ in range(20)
-                )
-            )
-
-    responses = asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
-
-    assert all(response.status_code == 503 for response in responses)
-    assert capacity.calls == 0
-    assert pool.generated == []
-    snapshot = app.state.serving_context.admission.snapshot(QWEN)
-    assert snapshot.active == 0
-    assert snapshot.queued == 0
-
-
-def test_full_admission_queue_returns_retryable_429_body() -> None:
-    from httpx import ASGITransport, AsyncClient
-
-    class OneSlotCapacity:
-        async def capacity_snapshot(
-            self, model: str, observed_local_active: int
-        ) -> CapacitySnapshot:
-            return CapacitySnapshot(
-                model=model,
-                deployment_identity="test:one-slot",
-                observed_at=time.monotonic(),
-                total_runners=1,
-                running_inputs=0,
-                input_headroom=1,
-                backlog=0,
-                observed_local_active=observed_local_active,
-                local_active_limit=1,
-            )
-
-        def current_dispatch_capacity(self, _model: str) -> int:
-            return 1
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    class BlockingPool(FakePool):
-        async def generate(self, base_model, payload, record, *, expected_checkpoint=None):
-            entered.set()
-            await release.wait()
-            return await super().generate(
-                base_model,
-                payload,
-                record,
-                expected_checkpoint=expected_checkpoint,
-            )
-
-    app = build_serving_app(
-        BlockingPool(),
-        _router_for("qa", QWEN),
-        capacity_provider=OneSlotCapacity(),
-        chat_authorizer=_allow,
-    )
-
-    async def scenario():
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
-
-            async def send():
-                return await client.post(
-                    "/generate",
-                    json={"adapter_id": "qa", "prompt": "hi"},
-                    headers={"Authorization": "Bearer t"},
-                )
-
-            active = asyncio.create_task(send())
-            entered_wait = asyncio.create_task(entered.wait())
-            done, _ = await asyncio.wait(
-                {active, entered_wait},
-                timeout=5,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            assert entered_wait in done, "the active route exited before entering generation"
-            await entered_wait
-            assert not active.done(), "the active route exited while generation was blocked"
-
-            waiters = (asyncio.create_task(send()), asyncio.create_task(send()))
-            deadline = asyncio.get_running_loop().time() + 5
-            while app.state.serving_context.admission.snapshot(QWEN).queued < 2:
-                completed = [task for task in waiters if task.done()]
-                assert not completed, "an admission waiter exited before the queue filled"
-                assert asyncio.get_running_loop().time() < deadline, (
-                    "the admission queue did not fill"
-                )
-                await asyncio.sleep(0.01)
-
-            overloaded = await send()
-            release.set()
-            responses = await asyncio.wait_for(asyncio.gather(active, *waiters), timeout=5)
-            return overloaded, responses
-
-    overloaded, responses = asyncio.run(scenario())
-
-    assert overloaded.status_code == 429
-    assert overloaded.headers["Retry-After"] == "1"
-    assert overloaded.json() == {
-        "error": {
-            "message": "The serving model is at capacity. Retry shortly.",
-            "type": "server_error",
-            "code": "serving_overloaded",
-        }
-    }
-    assert all(response.status_code == 200 for response in responses)
+    assert response.status_code == 200
+    assert "X-Freesolo-Queue-Duration-Seconds" not in response.headers
+    assert "X-Freesolo-Application-Active" not in response.headers
+    assert "X-Freesolo-Application-Pending" not in response.headers
 
 
 def test_chat_template_kwargs_forwarded_on_generate(app_setup):

@@ -11,7 +11,7 @@ import asyncio
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import Awaitable
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -39,7 +39,6 @@ from flash.serving.src.io.responses import (
 )
 from flash.serving.src.io.schemas import GenerateRequest
 from flash.serving.src.io.streaming import _close_async_iterator
-from flash.serving.src.traffic.admission import AdmissionLease
 
 _FLASH_CHECKPOINT_MODEL_RE = re.compile(
     r"(?P<run_id>flash-[0-9]{1,20}-[0-9a-f]{8})/step-[0-9]{1,18}"
@@ -56,9 +55,7 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     context.reject_unsettleable_thinking(payload, target)
     await _prepare_generate_request(payload, target)
     identity = new_request_identity(request, traffic=traffic)
-    lease = await _acquire_until_disconnect(context, request, target.base_model)
-    admission_headers = context.admission_headers(target.base_model, lease)
-    admitted_at = captured_now()
+    captured_at = captured_now()
     try:
         result = await _await_until_disconnect(
             request,
@@ -68,7 +65,7 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
                 target,
                 identity=identity,
                 traffic=traffic,
-                captured_at=admitted_at,
+                captured_at=captured_at,
                 expected_checkpoint=_expected_checkpoint(request),
             ),
         )
@@ -76,9 +73,7 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, "durable serving accounting unavailable"
         ) from exc
-    finally:
-        lease.release()
-    return _inference_json_response(result, target, headers=admission_headers)
+    return _inference_json_response(result, target)
 
 
 @inference_router.post("/adapters/{adapter_id}/generate", tags=["inference"])
@@ -93,9 +88,7 @@ async def generate_for_adapter(
     context.reject_unsettleable_thinking(req, target)
     await _prepare_generate_request(req, target)
     identity = new_request_identity(request, traffic=traffic)
-    lease = await _acquire_until_disconnect(context, request, target.base_model)
-    admission_headers = context.admission_headers(target.base_model, lease)
-    admitted_at = captured_now()
+    captured_at = captured_now()
     try:
         result = await _await_until_disconnect(
             request,
@@ -105,7 +98,7 @@ async def generate_for_adapter(
                 target,
                 identity=identity,
                 traffic=traffic,
-                captured_at=admitted_at,
+                captured_at=captured_at,
                 expected_checkpoint=_expected_checkpoint(request),
             ),
         )
@@ -113,9 +106,7 @@ async def generate_for_adapter(
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, "durable serving accounting unavailable"
         ) from exc
-    finally:
-        lease.release()
-    return _inference_json_response(result, target, headers=admission_headers)
+    return _inference_json_response(result, target)
 
 
 def _path_adapter_id(adapter_id: str) -> str:
@@ -186,9 +177,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     await _prepare_generate_request(req, target)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     identity = new_request_identity(request, openai_completion_id=completion_id, traffic=traffic)
-    lease = await _acquire_until_disconnect(context, request, target.base_model)
-    admission_headers = context.admission_headers(target.base_model, lease)
-    admitted_at = captured_now()
+    captured_at = captured_now()
     created = int(time.time())
     if stream:
         return await _stream_chat_completion(
@@ -203,9 +192,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
             include_usage=include_usage,
             identity=identity,
             traffic=traffic,
-            admitted_at=admitted_at,
-            lease=lease,
-            admission_headers=admission_headers,
+            captured_at=captured_at,
         )
 
     try:
@@ -217,7 +204,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
                 target,
                 identity=identity,
                 traffic=traffic,
-                captured_at=admitted_at,
+                captured_at=captured_at,
                 expected_checkpoint=_expected_checkpoint(request),
             ),
         )
@@ -225,8 +212,6 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, "durable serving accounting unavailable"
         ) from exc
-    finally:
-        lease.release()
     # already attested in `generate_once`, before usage was metered; this only strips the field
     # off the body so it does not leak into the OpenAI-shaped response.
     lora_request_adapter = generation.pop("lora_request_adapter", None)
@@ -240,38 +225,9 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         provenance=provenance,
     )
     response_headers = _provenance_headers(provenance, active_checkpoint)
-    response_headers.update(admission_headers)
     if target.is_revision:
         response_headers["X-Freesolo-LoRA-Request-Adapter"] = lora_request_adapter
     return JSONResponse(response, headers=response_headers)
-
-
-async def _acquire_until_disconnect(
-    context: ServingContext, request: Request, model: str
-) -> AdmissionLease:
-    acquisition = asyncio.create_task(context.acquire_admission(model))
-    disconnect = asyncio.create_task(_wait_for_disconnect(request))
-    transferred = False
-    lease: AdmissionLease | None = None
-    try:
-        done, _ = await asyncio.wait({acquisition, disconnect}, return_when=asyncio.FIRST_COMPLETED)
-        if disconnect in done:
-            disconnect.result()
-            raise asyncio.CancelledError
-        lease = acquisition.result()
-        transferred = True
-        return lease
-    finally:
-        disconnect.cancel()
-        if not acquisition.done():
-            acquisition.cancel()
-        acquisition_result, _ = await asyncio.gather(
-            acquisition, disconnect, return_exceptions=True
-        )
-        if lease is None and isinstance(acquisition_result, AdmissionLease):
-            lease = acquisition_result
-        if lease is not None and not transferred:
-            lease.release()
 
 
 async def _await_until_disconnect(request: Request, awaitable: Awaitable[Any]) -> Any:
@@ -311,41 +267,6 @@ class _ClosingStreamingResponse(StreamingResponse):
             await _close_async_iterator(self.body_iterator)
 
 
-class _LeasedAsyncIterator:
-    """Own one stream iterator and its admission lease through explicit or natural close."""
-
-    __slots__ = ("_closed", "_events", "_lease")
-
-    def __init__(self, events: AsyncIterator[bytes], lease: AdmissionLease) -> None:
-        self._events = events
-        self._lease = lease
-        self._closed = False
-
-    def __aiter__(self) -> "_LeasedAsyncIterator":
-        return self
-
-    async def __anext__(self) -> bytes:
-        if self._closed:
-            raise StopAsyncIteration
-        try:
-            return await anext(self._events)
-        except StopAsyncIteration:
-            await self.aclose()
-            raise
-        except BaseException:
-            await self.aclose()
-            raise
-
-    async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            await _close_async_iterator(self._events)
-        finally:
-            self._lease.release()
-
-
 async def _discard_prepared_stream(usage_session: Any, events: Any) -> None:
     try:
         first = await anext(events)
@@ -370,9 +291,7 @@ async def _stream_chat_completion(
     include_usage: bool,
     identity: Any,
     traffic: Any,
-    admitted_at: Any,
-    lease: AdmissionLease,
-    admission_headers: dict[str, str],
+    captured_at: Any,
 ) -> StreamingResponse:
     preparation = asyncio.create_task(
         context.prepare_stream(
@@ -395,7 +314,7 @@ async def _stream_chat_completion(
         prepared = preparation.result()
         events, checkpoint_headers, thinking, first = prepared
         usage_session = context.usage_session(
-            identity, traffic, requested, target, first, admitted_at
+            identity, traffic, requested, target, first, captured_at
         )
         try:
             await usage_session.capture(first)
@@ -406,19 +325,16 @@ async def _stream_chat_completion(
                 "durable serving accounting unavailable",
             ) from exc
         response = _ClosingStreamingResponse(
-            _LeasedAsyncIterator(
-                context.chat_stream(
-                    record=requested,
-                    events=events,
-                    adapter_id=adapter_id,
-                    completion_id=completion_id,
-                    created=created,
-                    include_usage=include_usage,
-                    usage_session=usage_session,
-                    thinking=thinking,
-                    choice_count=getattr(req, "n", 1),
-                ),
-                lease,
+            context.chat_stream(
+                record=requested,
+                events=events,
+                adapter_id=adapter_id,
+                completion_id=completion_id,
+                created=created,
+                include_usage=include_usage,
+                usage_session=usage_session,
+                thinking=thinking,
+                choice_count=getattr(req, "n", 1),
             ),
             media_type="text/event-stream",
             # Disable proxy and CDN buffering so each SSE chunk reaches the client immediately.
@@ -428,7 +344,6 @@ async def _stream_chat_completion(
                 "X-Accel-Buffering": "no",
                 "Cache-Control": "no-cache",
                 **checkpoint_headers,
-                **admission_headers,
             },
         )
         transferred = True
@@ -446,8 +361,6 @@ async def _stream_chat_completion(
             if usage_session is None:
                 first = prepared[3]
                 usage_session = context.usage_session(
-                    identity, traffic, requested, target, first, admitted_at
+                    identity, traffic, requested, target, first, captured_at
                 )
             await _discard_prepared_stream(usage_session, prepared[0])
-        if not transferred:
-            lease.release()

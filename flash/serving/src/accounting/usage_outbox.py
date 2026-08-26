@@ -16,6 +16,7 @@ from typing import Annotated, Any, Literal, Protocol
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from flash.serving.src.accounting.usage_retry import is_transient_rpc_code
 from flash.serving.src.store.settings import Settings
 from flash.serving.src.store.supabase_rest import supabase_headers
 
@@ -237,6 +238,7 @@ class ReconciliationUnavailable(UsageOutboxError):
 class UsageStore(Protocol):
     enabled: bool
 
+    def assert_healthy(self) -> None: ...
     async def start(self) -> None: ...
     async def capture(self, event: UsageEvent) -> None: ...
     async def finalize(self, event: UsageEvent) -> None: ...
@@ -251,6 +253,9 @@ class OfflineUsageStore:
     """Explicit offline-only store used when app tests do not inject persistence."""
 
     enabled = False
+
+    def assert_healthy(self) -> None:
+        return None
 
     async def start(self) -> None:
         return None
@@ -425,6 +430,15 @@ class DurableUsageOutbox:
         self._generation_lease_deadlines: dict[str, datetime] = {}
         self._active_leases: set[str] = set()
         self._background_error: BaseException | None = None
+
+    def assert_healthy(self) -> None:
+        self._raise_background_error()
+        if self._stopping.is_set():
+            raise UsageOutboxError("usage_outbox_not_accepting_requests")
+        if self._worker is not None and self._worker.done():
+            raise UsageOutboxError("usage_outbox_worker_stopped")
+        if self._heartbeat_worker is not None and self._heartbeat_worker.done():
+            raise UsageOutboxError("usage_outbox_heartbeat_stopped")
 
     async def start(self) -> None:
         if self._worker is not None:
@@ -643,7 +657,13 @@ class DurableUsageOutbox:
                     self._wake.set()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                if not _is_transient_rpc_error(exc):
+                    self._background_error = exc
+                    self._stopping.set()
+                    self._wake.set()
+                    self._heartbeat_wake.set()
+                    return
                 await self._sleep(self._poll_seconds)
             if self._wake.is_set():
                 continue
@@ -692,7 +712,7 @@ class DurableUsageOutbox:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if not _is_transient_heartbeat_error(exc):
+                if not _is_transient_rpc_error(exc):
                     raise
                 active_deadlines = [
                     deadline
@@ -910,17 +930,8 @@ class DurableUsageOutbox:
             raise UsageOutboxError("usage_outbox_shutdown_failed") from errors[0]
 
 
-def _is_transient_heartbeat_error(exc: BaseException) -> bool:
-    if not isinstance(exc, UsageOutboxError):
-        return False
-    code = str(exc)
-    if code == "supabase_transport_failure":
-        return True
-    match = re.fullmatch(r"supabase_rpc_([0-9]{3})", code)
-    if match is None:
-        return False
-    status_code = int(match.group(1))
-    return status_code in {408, 429} or status_code >= 500
+def _is_transient_rpc_error(exc: BaseException) -> bool:
+    return isinstance(exc, UsageOutboxError) and is_transient_rpc_code(str(exc))
 
 
 def _generation_capture_result(data: Any) -> dict[str, Any]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from flash.serving.src.engine.support import (
     _adapter_source_cache_dir,
     _adapter_source_ident,
     _load_adapters_for_base,
+    _replica_adapter_cache_dir,
 )
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.store.registry import AdapterRegistry
@@ -109,9 +111,124 @@ def test_unregister_skips_cleanup_for_a_newer_deployment_generation() -> None:
 
     assert legacy["skipped_stale_generation"] is True
     assert stale["skipped_stale_generation"] is True
+    assert legacy["cleanup_scope"] == "replica_local"
+    assert stale["cleanup_scope"] == "replica_local"
     assert removed["removed"] == record.adapter_id
+    assert removed["cleanup_scope"] == "replica_local"
+    assert removed["engine_replica_id"] == stale["engine_replica_id"]
     assert engine.registry.get(record.adapter_id) is None
     assert evicted == [record.adapter_id]
+
+
+def test_unregister_never_removes_lora_during_blocked_stream_lifetime(tmp_path: Path) -> None:
+    record = _revision("a" * 40).model_copy(update={"deployment_generation": "generation-1"})
+    request = SimpleNamespace(lora_int_id=42, lora_name=record.adapter_id)
+    release = asyncio.Event()
+    iterator_closed = asyncio.Event()
+    removed: list[int] = []
+
+    class _Engine:
+        def generate(self, *_args: object, **_kwargs: object):
+            async def outputs():
+                try:
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(
+                                index=0,
+                                text="partial",
+                                finish_reason=None,
+                                token_ids=[1],
+                            )
+                        ],
+                        prompt_token_ids=[1],
+                        num_cached_tokens=0,
+                    )
+                    await release.wait()
+                    yield SimpleNamespace(
+                        outputs=[
+                            SimpleNamespace(
+                                index=0,
+                                text="done",
+                                finish_reason="stop",
+                                token_ids=[2],
+                            )
+                        ],
+                        prompt_token_ids=[1],
+                        num_cached_tokens=0,
+                    )
+                finally:
+                    iterator_closed.set()
+
+            return outputs()
+
+        async def remove_lora(self, int_id: int) -> bool:
+            removed.append(int_id)
+            return True
+
+    engine = _LoraEngineImpl()
+    engine.base_model = BASE_MODEL
+    engine.registry = AdapterRegistry()
+    engine.registry.upsert(record, revive=True)
+    (tmp_path / "adapter_config.json").write_text("{}")
+    (tmp_path / "adapter_model.safetensors").write_bytes(b"weights")
+    engine.registry.set_local_path(record, tmp_path)
+    engine._adapter_locks = {}
+    engine._adapter_locks_guard = asyncio.Lock()
+    engine._lora_entries = {
+        record.adapter_id: _LoraEntry(_adapter_source_ident(record), request, "loaded")
+    }
+    engine.engine = _Engine()
+    engine.reasoning_parser = None
+    engine._prompt_cache_size = 0
+
+    async def ensure_local(_record: AdapterRecord) -> Path:
+        return tmp_path
+
+    async def prompt_input(*_args: object) -> dict[str, list[int]]:
+        return {"prompt_token_ids": [1]}
+
+    engine._ensure_adapter_local_locked = ensure_local  # type: ignore[method-assign]
+    engine._prepare_prompt_input = prompt_input  # type: ignore[method-assign]
+
+    async def scenario() -> tuple[dict[str, object], list[dict[str, object]]]:
+        stream = engine._stream_generate({"adapter_id": record.adapter_id, "prompt": "hi"})
+        ready = await anext(stream)
+        cleanup = await engine._unregister(record.adapter_id, "generation-1")
+        assert removed == []
+        with pytest.raises(ValueError, match="Unknown adapter id"):
+            await engine._lora_request(record.adapter_id)
+        release.set()
+        remaining = [event async for event in stream]
+        return cleanup, remaining
+
+    cleanup, remaining = asyncio.run(scenario())
+
+    assert cleanup["cleanup_scope"] == "replica_local"
+    assert cleanup["removed"] == record.adapter_id
+    assert [event["type"] for event in remaining] == [
+        "delta",
+        "delta",
+        "choice_finished",
+        "final",
+    ]
+    assert iterator_closed.is_set()
+    assert removed == []
+
+
+def test_generation_rejects_forwarded_revision_material_that_differs_from_local_identity() -> None:
+    local = _revision("a" * 40).model_copy(update={"updated_at": "2026-08-26T00:00:02Z"})
+    forwarded = local.model_copy(
+        update={"repo_id": "org/different", "updated_at": "2026-08-26T00:00:01Z"}
+    )
+    engine = _LoraEngineImpl()
+    engine.base_model = BASE_MODEL
+    engine.registry = AdapterRegistry()
+    engine.registry.upsert(local, revive=True)
+    engine._adapter_locks = {}
+    engine._adapter_locks_guard = asyncio.Lock()
+
+    with pytest.raises(ValueError, match="identity differs"):
+        asyncio.run(engine._lora_request(local.adapter_id, forwarded.model_dump(by_alias=True)))
 
 
 def test_add_lora_exception_releases_new_entry_for_retry(tmp_path: Path) -> None:
@@ -163,44 +280,26 @@ def test_rejected_new_lora_releases_entry_and_reaches_engine_on_retry(tmp_path: 
     assert engine._entries()[record.adapter_id].state == "loaded"
 
 
-@pytest.mark.parametrize(
-    ("outcome", "message"),
-    [
-        ("missing", "vLLM cannot confirm LoRA removal"),
-        ("raises", "worker unavailable"),
-        ("false", "vLLM rejected LoRA removal"),
-    ],
-)
-def test_loaded_lora_failed_removal_retains_unconfirmed_entry(
-    outcome: str, message: str, tmp_path: Path
-) -> None:
+def test_loaded_lora_cleanup_is_replica_local_and_never_calls_remove_lora() -> None:
     record = _revision("a" * 40)
     request = SimpleNamespace(lora_int_id=42)
     engine = _LoraEngineImpl()
     engine._lora_entries = {
         record.adapter_id: _LoraEntry(_adapter_source_ident(record), request, "loaded")
     }
+    removed: list[int] = []
 
-    if outcome == "missing":
-        engine.engine = object()
-    else:
+    class _Engine:
+        async def remove_lora(self, int_id: int) -> bool:
+            removed.append(int_id)
+            return True
 
-        class _Engine:
-            async def remove_lora(self, _int_id: int) -> bool:
-                if outcome == "raises":
-                    raise RuntimeError("worker unavailable")
-                return False
+    engine.engine = _Engine()
 
-        engine.engine = _Engine()
+    asyncio.run(engine._evict_loaded_lora(record.adapter_id))
 
-    with pytest.raises(RuntimeError, match=message):
-        asyncio.run(engine._evict_loaded_lora(record.adapter_id))
-
-    entry = engine._entries()[record.adapter_id]
-    assert entry.lora_request is request
-    assert entry.state == "unconfirmed"
-    with pytest.raises(RuntimeError, match="registration is unconfirmed"):
-        engine._cached_lora_request_locked(record, tmp_path)
+    assert engine._entries()[record.adapter_id].lora_request is request
+    assert removed == []
 
 
 def test_reserved_lora_evict_releases_without_engine_removal() -> None:
@@ -274,18 +373,19 @@ def test_unregister_tombstones_missing_record_for_expected_generation() -> None:
 def test_snapshot_download_receives_exact_hub_sha(monkeypatch, tmp_path: Path) -> None:
     record = _revision("a" * 40)
     calls: list[dict[str, object]] = []
+    shared_snapshot = tmp_path / "hub" / "snapshots" / ("a" * 40)
+    adapter_dir = shared_snapshot / "checkpoints/step-20"
+    adapter_dir.mkdir(parents=True)
+    (adapter_dir / "adapter_config.json").write_text("{}")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
 
     def snapshot_download(**kwargs: object) -> str:
         calls.append(kwargs)
-        local_dir = Path(str(kwargs["local_dir"]))
-        adapter_dir = local_dir / "checkpoints/step-20"
-        adapter_dir.mkdir(parents=True)
-        (adapter_dir / "adapter_config.json").write_text("{}")
-        (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
-        return str(local_dir)
+        return str(shared_snapshot)
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
-    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path)
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "replicas")
+    monkeypatch.setattr("flash.serving.src.store.settings.HF_HUB_CACHE_DIR", tmp_path / "hub")
 
     engine = _LoraEngineImpl()
     engine.registry = AdapterRegistry()
@@ -296,16 +396,72 @@ def test_snapshot_download_receives_exact_hub_sha(monkeypatch, tmp_path: Path) -
     engine._lora_entries = {}
 
     path = asyncio.run(engine._ensure_adapter_local_locked(record))
-    relative = path.relative_to(tmp_path)
-    assert relative.parts[0] == "sources"
+    relative = path.relative_to(tmp_path / "replicas")
+    assert relative.parts[0].startswith("replica-")
+    assert relative.parts[1] == "sources"
     assert relative.parts[-2:] == ("checkpoints", "step-20")
     assert calls[0]["repo_id"] == "org/run"
     assert calls[0]["repo_type"] == "model"
     assert calls[0]["revision"] == "a" * 40
+    assert calls[0]["cache_dir"] == str(tmp_path / "hub")
+    assert "local_dir" not in calls[0]
     assert calls[0]["allow_patterns"] == [
         "checkpoints/step-20/**",
         "checkpoints/step-20/*",
     ]
+
+
+def test_two_engine_replicas_materialize_same_revision_without_shared_final_path(
+    monkeypatch, tmp_path: Path
+) -> None:
+    record = _revision("a" * 40)
+    barrier = threading.Barrier(2)
+    cache_dirs: list[Path] = []
+    shared_snapshot = tmp_path / "hub" / "snapshots" / ("a" * 40)
+    adapter_dir = shared_snapshot / "checkpoints/step-20"
+    adapter_dir.mkdir(parents=True)
+    (adapter_dir / "adapter_config.json").write_text("{}")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
+
+    def snapshot_download(**kwargs: object) -> str:
+        cache_dirs.append(Path(str(kwargs["cache_dir"])))
+        barrier.wait(timeout=2)
+        return str(shared_snapshot)
+
+    async def run() -> tuple[Path, Path]:
+        engines = [_LoraEngineImpl(), _LoraEngineImpl()]
+        for engine in engines:
+            engine.registry = AdapterRegistry()
+            engine.settings = SimpleNamespace(hf_api_key="token")
+            engine._source_locks = {}
+            engine._source_locks_guard = asyncio.Lock()
+            engine._source_paths = {}
+            engine._lora_entries = {}
+        tasks = [
+            asyncio.create_task(engine._ensure_adapter_local_locked(record)) for engine in engines
+        ]
+        return tuple(await asyncio.gather(*tasks))  # type: ignore[return-value]
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "replicas")
+    monkeypatch.setattr("flash.serving.src.store.settings.HF_HUB_CACHE_DIR", tmp_path / "hub")
+
+    first, second = asyncio.run(run())
+
+    assert first != second
+    assert cache_dirs == [tmp_path / "hub", tmp_path / "hub"]
+    assert all(
+        path.relative_to(tmp_path / "replicas").parts[0].startswith("replica-")
+        for path in (first, second)
+    )
+    assert (first / "adapter_model.safetensors").read_bytes() == b"weights"
+    assert (second / "adapter_model.safetensors").read_bytes() == b"weights"
+
+
+def test_replica_adapter_cache_identity_is_stable_and_distinct(tmp_path: Path) -> None:
+    first = _replica_adapter_cache_dir(tmp_path, "replica-a")
+    assert first == _replica_adapter_cache_dir(tmp_path, "replica-a")
+    assert first != _replica_adapter_cache_dir(tmp_path, "replica-b")
 
 
 def test_runtime_containment_rejects_schema_bypass(monkeypatch, tmp_path: Path) -> None:

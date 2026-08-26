@@ -9,6 +9,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     field_validator,
     model_validator,
@@ -381,6 +382,8 @@ def internal_adapter_payload(record: AdapterRecord) -> dict[str, Any]:
 
 class GenerateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    _pre_header_dispatch_deadline: float | None = PrivateAttr(default=None)
 
     adapter_id: str
     # the cpu front door overwrites this before every production dispatch. direct offline engine

@@ -79,20 +79,42 @@ class AdapterLookup:
     def _is_stale(self) -> bool:
         return time.monotonic() - self._last_reload["at"] >= self._reload_interval_seconds
 
+    async def _refresh_exact_revision(
+        self,
+        adapter_id: str,
+        resolved: tuple[AdapterRecord, AdapterRecord],
+    ) -> tuple[AdapterRecord, AdapterRecord] | None:
+        if not resolved[0].is_revision or self._lookup_record is None:
+            return resolved
+        authoritative = await asyncio.to_thread(self._lookup_record, adapter_id)
+        if (
+            authoritative is None
+            or authoritative.status != "ready"
+            or not authoritative.is_revision
+        ):
+            self._router.remove(adapter_id)
+            return None
+        self._router.upsert(authoritative)
+        return self._router.resolve(adapter_id)
+
     async def resolve(
         self, adapter_id: str, *, require_supported_base_model: bool = True
     ) -> tuple[AdapterRecord, AdapterRecord]:
         resolved = self._router.resolve(adapter_id)
-        stale = resolved is not None and self._is_stale()
         if resolved is not None and self._reload_records is not None:
             if resolved[0].is_alias:
-                if await self._reload_safe():
-                    resolved = self._router.resolve(adapter_id)
-            elif stale:
+                # mutable aliases must re-read durable routing authority before every dispatch. a
+                # storage failure cannot fall back to a cached ready alias after another router may
+                # have fenced it.
+                await self.reload()
+                resolved = self._router.resolve(adapter_id)
+            elif self._is_stale():
                 self._schedule_reload()
         elif resolved is None and self._reload_records is not None:
             await self.reload()
             resolved = self._router.resolve(adapter_id)
+        if resolved is not None:
+            resolved = await self._refresh_exact_revision(adapter_id, resolved)
         if resolved is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
         if require_supported_base_model:

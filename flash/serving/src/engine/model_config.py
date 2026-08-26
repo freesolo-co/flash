@@ -50,13 +50,10 @@ DEFAULT_GPU = "L4"
 
 @dataclass(frozen=True, slots=True)
 class HostedTrafficPolicy:
-    """Validated per-model limits for hosted request admission and container scaling."""
+    """Validated per-model Modal registration policy."""
 
     min_containers: int
-    max_containers: int
     buffer_containers: int
-    queue_capacity: int
-    retry_after_seconds: int
     max_num_seqs: int
     max_inputs: int
     target_inputs: int
@@ -70,10 +67,7 @@ class HostedTrafficPolicy:
             raise ValueError("hosted traffic policy requires an explicit positive max_num_seqs")
         return cls(
             min_containers=1,
-            max_containers=2,
-            buffer_containers=0,
-            queue_capacity=2,
-            retry_after_seconds=1,
+            buffer_containers=1,
             max_num_seqs=max_num_seqs,
             max_inputs=max_num_seqs,
             target_inputs=max(1, max_num_seqs * 3 // 4),
@@ -82,10 +76,7 @@ class HostedTrafficPolicy:
     def __post_init__(self) -> None:
         values = (
             self.min_containers,
-            self.max_containers,
             self.buffer_containers,
-            self.queue_capacity,
-            self.retry_after_seconds,
             self.max_num_seqs,
             self.max_inputs,
             self.target_inputs,
@@ -98,14 +89,10 @@ class HostedTrafficPolicy:
             raise ValueError("hosted traffic max_inputs must equal max_num_seqs")
         if self.target_inputs != max(1, self.max_num_seqs * 3 // 4):
             raise ValueError("hosted traffic target_inputs must equal 75 percent of max_num_seqs")
-        if self.min_containers != 1 or self.max_containers != 2:
-            raise ValueError("hosted traffic container limits must be exactly one warm and two max")
-        if self.buffer_containers != 0:
-            raise ValueError("hosted traffic buffer_containers must be zero")
-        if self.queue_capacity != 2:
-            raise ValueError("hosted traffic queue_capacity must be exactly two")
-        if self.retry_after_seconds != 1:
-            raise ValueError("hosted traffic retry_after_seconds must be exactly one")
+        if self.min_containers != 1:
+            raise ValueError("hosted traffic min_containers must be exactly one")
+        if self.buffer_containers != 1:
+            raise ValueError("hosted traffic buffer_containers must be exactly one")
 
 
 SERVING_MODELS: list[dict[str, Any]] = [
@@ -217,21 +204,6 @@ def hosted_traffic_policy_for(base_model: str) -> HostedTrafficPolicy:
 
 def configured_warm_container_floor() -> int:
     return sum(hosted_traffic_policy_for(model).min_containers for model in base_models())
-
-
-def configured_hard_gpu_ceiling() -> int:
-    return sum(hosted_traffic_policy_for(model).max_containers for model in base_models())
-
-
-def configured_router_async_capacity() -> int:
-    """Finite router concurrency for every model's hard slots plus bounded waiters."""
-    capacity = sum(
-        policy.max_inputs * policy.max_containers + policy.queue_capacity
-        for policy in _HOSTED_TRAFFIC_POLICY_BY_MODEL.values()
-    )
-    if capacity <= 0:
-        raise ValueError("hosted router async capacity must be positive")
-    return capacity
 
 
 def _config_for(base_model: str) -> dict[str, Any]:

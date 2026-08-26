@@ -6,8 +6,11 @@ state, so they are testable without constructing an engine.
 """
 
 import hashlib
+import os
 import re
+import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +85,12 @@ def _adapter_source_ident(record: Any) -> tuple[str, str, str, str | None]:
     )
 
 
+def _replica_adapter_cache_dir(root: Path, replica_id: str) -> Path:
+    """Return one mutable adapter-materialization root per engine replica."""
+    digest = hashlib.sha256(replica_id.encode("utf-8")).hexdigest()[:24]
+    return root / f"replica-{digest}"
+
+
 def _adapter_source_cache_dir(root: Path, record: Any) -> Path:
     repo_id, repo_type, hf_revision, subfolder = _adapter_source_ident(record)
     raw = "\0".join((repo_id, repo_type, hf_revision, subfolder or ""))
@@ -113,6 +122,31 @@ def _adapter_cache_ready(path: Path) -> bool:
         )
     except OSError:
         return False
+
+
+def _materialize_adapter_snapshot(
+    snapshot_root: Path, local_dir: Path, subfolder: str | None
+) -> Path:
+    """Atomically copy one immutable hub snapshot into a replica-local final directory."""
+    source = _adapter_cache_path(snapshot_root, subfolder)
+    if not _adapter_cache_ready(source):
+        raise RuntimeError(
+            f"downloaded adapter cache is incomplete: {source} has no non-empty adapter_model "
+            "tensor file"
+        )
+    staging = local_dir.with_name(f".{local_dir.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        target = _adapter_cache_path(staging, subfolder)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, target)
+        if not _adapter_cache_ready(target):
+            raise RuntimeError("replica-local adapter materialization is incomplete")
+        if local_dir.exists():
+            shutil.rmtree(local_dir)
+        os.replace(staging, local_dir)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return _adapter_cache_path(local_dir, subfolder)
 
 
 def _stream_usage_fields(

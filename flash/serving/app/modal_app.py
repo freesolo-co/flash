@@ -5,12 +5,12 @@ README to deploy.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
 import time
 import uuid
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -139,20 +139,12 @@ def scaledown_window_for(gpu: str) -> int:
     return SCALEDOWN_WINDOW_SECONDS_BY_GPU.get(gpu, DEFAULT_SCALEDOWN_WINDOW_SECONDS)
 
 
-# each advertised model keeps one warm engine and may scale to exactly two containers.
+# each advertised model and the cpu router keep one warm container plus one buffer container.
 MIN_CONTAINERS = 1
-MAX_CONTAINERS = 2
-BUFFER_CONTAINERS = 0
-# Concurrent requests packed onto one base-model GPU before Modal autoscales a new (costly) one.
-# A real-GPU sweep (scripts/gpu_canary.py::sweep_concurrency on A10G/Qwen2.5-1.5B) showed vLLM
-# throughput scaling near-linearly with no saturation through 128 concurrent, while TTFT stayed
-# <60 ms — so the old default of 32 left ~2x of each GPU idle. 64 packs ~2.3x the throughput per
-# GPU for ~+14% per-request latency (now blunted by the fp8 KV cache, which is on for every base —
-# see settings.KV_CACHE_DTYPE), roughly halving GPU count for the same load.
-# Per-engine concurrency is sized by _engine_concurrency from each model's max_num_seqs; these are
-# the router/global ceiling. TARGET_INPUTS auto-derives to 48 (= 64*3//4).
-MAX_INPUTS = 64
-TARGET_INPUTS = max(1, MAX_INPUTS * 3 // 4)
+BUFFER_CONTAINERS = 1
+# router concurrency is per cpu replica and independent of the number of gpu engine replicas.
+ROUTER_MAX_INPUTS = 36
+ROUTER_TARGET_INPUTS = 27
 
 # engines enable trust_remote_code, so their secret uses an allowlist: future credentials
 # default to staying router-only. engines hydrate adapter state per request from the router-forwarded
@@ -301,20 +293,13 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 # model_config is a pure-stdlib module (no heavy deps), so importing it at module scope is safe for
 # `modal deploy` (which imports modal_app.py locally) — unlike the vllm/transformers imports, which
 # stay lazy inside the engine methods.
+from flash.serving.src.engine.dispatch import PreHeaderDispatchExpired  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
 from flash.serving.src.engine.model_config import (  # noqa: E402
     HostedTrafficPolicy,
     base_models,
-    configured_router_async_capacity,
     gpu_for,
     hosted_traffic_policy_for,
-)
-from flash.serving.src.traffic.capacity import (  # noqa: E402
-    CAPACITY_POLL_INTERVAL_SECONDS,
-    CAPACITY_REFRESH_TIMEOUT_SECONDS,
-    CAPACITY_SNAPSHOT_MAX_AGE_SECONDS,
-    CapacitySnapshot,
-    fixed_local_active_limit,
 )
 
 
@@ -332,7 +317,6 @@ def _policy_contract(base_model: str) -> dict[str, Any]:
         "startup_timeout": STARTUP_TIMEOUT_SECONDS,
         "timeout": TIMEOUT_SECONDS,
         "min_containers": policy.min_containers,
-        "max_containers": policy.max_containers,
         "buffer_containers": policy.buffer_containers,
         "max_inputs": policy.max_inputs,
         "target_inputs": policy.target_inputs,
@@ -377,9 +361,14 @@ def _build_engine(base_model: str, class_name: str, policy: HostedTrafficPolicy)
             record_dict: dict[str, Any] | None = None,
             expected_checkpoint: str | None = None,
             generation_id: str | None = None,
+            pre_header_dispatch_deadline: float | None = None,
         ) -> dict[str, Any]:
             return await self._generate(
-                payload_dict, record_dict, expected_checkpoint, generation_id
+                payload_dict,
+                record_dict,
+                expected_checkpoint,
+                generation_id,
+                pre_header_dispatch_deadline,
             )
 
         @modal.method(is_generator=True)
@@ -389,9 +378,14 @@ def _build_engine(base_model: str, class_name: str, policy: HostedTrafficPolicy)
             record_dict: dict[str, Any] | None = None,
             expected_checkpoint: str | None = None,
             generation_id: str | None = None,
+            pre_header_dispatch_deadline: float | None = None,
         ):
             async for event in self._stream_generate(
-                payload_dict, record_dict, expected_checkpoint, generation_id
+                payload_dict,
+                record_dict,
+                expected_checkpoint,
+                generation_id,
+                pre_header_dispatch_deadline,
             ):
                 yield event
 
@@ -426,7 +420,6 @@ def _build_engine(base_model: str, class_name: str, policy: HostedTrafficPolicy)
         startup_timeout=STARTUP_TIMEOUT_SECONDS,
         timeout=TIMEOUT_SECONDS,
         min_containers=policy.min_containers,
-        max_containers=policy.max_containers,
         buffer_containers=policy.buffer_containers,
     )(
         modal.concurrent(
@@ -451,123 +444,91 @@ def _engine_cls_for(base_model: str) -> Any:
     return ENGINE_BY_MODEL[base_model]
 
 
-def _capacity_deployment_identity(base_model: str) -> str:
-    return f"modal-app-class:{APP_NAME}/{_engine_class_name(base_model)}"
+def _remaining_pre_header_dispatch_time(deadline: float) -> float:
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        raise PreHeaderDispatchExpired("request expired before gpu generation began")
+    return remaining
+
+
+async def _await_task_before_deadline(task: asyncio.Task[Any], deadline: float) -> Any:
+    done, _ = await asyncio.wait(
+        {task},
+        timeout=_remaining_pre_header_dispatch_time(deadline),
+    )
+    if task not in done:
+        raise PreHeaderDispatchExpired("request expired before gpu generation began")
+    return task.result()
+
+
+async def _cancel_modal_call(call: Any) -> None:
+    with contextlib.suppress(BaseException):
+        await call.cancel.aio()
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+_MODAL_CLEANUP_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _start_modal_call_cleanup(call: Any) -> None:
+    cleanup = asyncio.create_task(_cancel_modal_call(call))
+    _MODAL_CLEANUP_TASKS.add(cleanup)
+    cleanup.add_done_callback(_MODAL_CLEANUP_TASKS.discard)
+
+
+def _cancel_modal_call_when_spawned(spawn: asyncio.Task[Any]) -> None:
+    def cancel_if_created(task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        with contextlib.suppress(BaseException):
+            call = task.result()
+            _start_modal_call_cleanup(call)
+
+    spawn.add_done_callback(cancel_if_created)
+
+
+async def _spawn_modal_call(method: Any, deadline: float, *args: Any) -> Any:
+    """Acquire a cancellable handle within the remaining pre-header dispatch budget."""
+    spawn = asyncio.create_task(method.spawn.aio(*args))
+    try:
+        return await _await_task_before_deadline(spawn, deadline)
+    except PreHeaderDispatchExpired:
+        _cancel_modal_call_when_spawned(spawn)
+        spawn.cancel()
+        raise
+    except asyncio.CancelledError:
+        _cancel_modal_call_when_spawned(spawn)
+        spawn.cancel()
+        raise
+
+
+async def _await_modal_call(call: Any, deadline: float) -> Any:
+    """Await one spawned modal call within the remaining pre-header dispatch budget."""
+    result = asyncio.create_task(call.get.aio())
+    try:
+        return await _await_task_before_deadline(result, deadline)
+    except BaseException:
+        result.cancel()
+        result.add_done_callback(_consume_task_result)
+        await _cancel_modal_call(call)
+        raise
+
+
+async def _close_remote_iterator(remote_stream: Any, iterator: Any) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        close = getattr(remote_stream, "aclose", None)
+    if close is not None:
+        with contextlib.suppress(BaseException):
+            await close()
 
 
 class _ModalEnginePool:
-    """Dispatch and live capacity for each model's dedicated Modal engine class."""
-
-    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
-        self._clock = clock
-        self._capacity: dict[str, CapacitySnapshot] = {}
-        self._capacity_locks: dict[str, asyncio.Lock] = {}
-        self._capacity_changed: Callable[[str], None] | None = None
-
-    def bind_capacity_changed(self, callback: Callable[[str], None]) -> None:
-        self._capacity_changed = callback
-
-    async def capacity_snapshot(self, model: str, observed_local_active: int) -> CapacitySnapshot:
-        now = self._clock()
-        current = self._capacity.get(model)
-        if current is not None and current.is_fresh(
-            now, max_age_seconds=CAPACITY_POLL_INTERVAL_SECONDS
-        ):
-            return current
-        lock = self._capacity_locks.setdefault(model, asyncio.Lock())
-        async with lock:
-            now = self._clock()
-            current = self._capacity.get(model)
-            if current is not None and current.is_fresh(
-                now, max_age_seconds=CAPACITY_POLL_INTERVAL_SECONDS
-            ):
-                return current
-            snapshot = await self._fetch_capacity_snapshot(model, observed_local_active)
-            current = self._capacity.get(model)
-            now = self._clock()
-            if (
-                snapshot.error == "stats_unavailable"
-                and current is not None
-                and current.is_dispatchable(
-                    now,
-                    model=model,
-                    deployment_identity=_capacity_deployment_identity(model),
-                    max_age_seconds=CAPACITY_SNAPSHOT_MAX_AGE_SECONDS,
-                )
-            ):
-                return current
-            self._capacity[model] = snapshot
-            if self._capacity_changed is not None:
-                self._capacity_changed(model)
-            return snapshot
-
-    async def _fetch_capacity_snapshot(
-        self, model: str, observed_local_active: int
-    ) -> CapacitySnapshot:
-        deployment_identity = _capacity_deployment_identity(model)
-        policy = hosted_traffic_policy_for(model)
-        hard_limit = policy.max_inputs * policy.max_containers
-        try:
-            engine = _engine_cls_for(model)()
-            stats = await asyncio.wait_for(
-                engine.generate.get_current_stats.aio(),
-                timeout=CAPACITY_REFRESH_TIMEOUT_SECONDS,
-            )
-            observed_at = self._clock()
-            counts = {
-                "total_runners": stats.num_total_runners,
-                "running_inputs": stats.num_running_inputs,
-                "input_headroom": stats.input_headroom,
-                "backlog": stats.backlog,
-            }
-            if any(
-                isinstance(value, bool) or not isinstance(value, int) or value < 0
-                for value in counts.values()
-            ):
-                raise ValueError("invalid Modal function stats")
-            if counts["total_runners"] <= 0:
-                return CapacitySnapshot.unavailable_snapshot(
-                    model,
-                    deployment_identity,
-                    observed_at,
-                    "no_warm_runners",
-                    observed_local_active=observed_local_active,
-                    **counts,
-                )
-            return CapacitySnapshot(
-                model=model,
-                deployment_identity=deployment_identity,
-                observed_at=observed_at,
-                observed_local_active=observed_local_active,
-                local_active_limit=fixed_local_active_limit(
-                    observed_local_active,
-                    counts["running_inputs"],
-                    counts["input_headroom"],
-                    hard_limit,
-                ),
-                **counts,
-            )
-        except Exception:
-            return CapacitySnapshot.unavailable_snapshot(
-                model,
-                deployment_identity,
-                self._clock(),
-                "stats_unavailable",
-                observed_local_active=observed_local_active,
-            )
-
-    def current_dispatch_capacity(self, model: str) -> int:
-        snapshot = self._capacity.get(model)
-        now = self._clock()
-        deployment_identity = _capacity_deployment_identity(model)
-        if snapshot is None or not snapshot.is_dispatchable(
-            now,
-            model=model,
-            deployment_identity=deployment_identity,
-            max_age_seconds=CAPACITY_SNAPSHOT_MAX_AGE_SECONDS,
-        ):
-            return 0
-        return snapshot.local_active_limit
+    """Dispatch each model directly to its dedicated Modal engine class."""
 
     @staticmethod
     def _record_payload(record: Any) -> dict[str, Any]:
@@ -588,13 +549,20 @@ class _ModalEnginePool:
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
+        deadline = payload._pre_header_dispatch_deadline
+        if deadline is None:
+            raise RuntimeError("pre-header dispatch deadline is required before modal dispatch")
         engine = _engine_cls_for(base_model)()
-        return await engine.generate.remote.aio(
+        call = await _spawn_modal_call(
+            engine.generate,
+            deadline,
             payload.model_dump(by_alias=True),
             self._record_payload(record),
             expected_checkpoint,
             generation_id,
+            deadline,
         )
+        return await _await_modal_call(call, deadline)
 
     async def stream_generate(
         self,
@@ -607,20 +575,32 @@ class _ModalEnginePool:
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
+        deadline = payload._pre_header_dispatch_deadline
+        if deadline is None:
+            raise RuntimeError("pre-header dispatch deadline is required before modal dispatch")
         engine = _engine_cls_for(base_model)()
         remote_stream = engine.stream_generate.remote_gen.aio(
             payload.model_dump(by_alias=True),
             self._record_payload(record),
             expected_checkpoint,
             generation_id,
+            deadline,
         )
+        iterator = remote_stream.__aiter__()
+        first = asyncio.create_task(anext(iterator))
         try:
-            async for event in remote_stream:
+            try:
+                yield await _await_task_before_deadline(first, deadline)
+            except StopAsyncIteration:
+                return
+            except BaseException:
+                first.cancel()
+                first.add_done_callback(_consume_task_result)
+                raise
+            async for event in iterator:
                 yield event
         finally:
-            close = getattr(remote_stream, "aclose", None)
-            if close is not None:
-                await close()
+            await _close_remote_iterator(remote_stream, iterator)
 
     async def register(self, base_model: str, record: Any) -> None:
         engine = _engine_cls_for(base_model)()
@@ -805,9 +785,6 @@ def _build_chat_authorizer(settings: Any) -> Any:
     return authorize
 
 
-ROUTER_ASYNC_CAPACITY = configured_router_async_capacity()
-
-
 def _base_model_records() -> list:
     """One open, no-LoRA record per served base model, seeded into the router IN MEMORY.
 
@@ -835,14 +812,13 @@ def _base_model_records() -> list:
 
 @app.function(
     secrets=runtime_secrets,
-    min_containers=1,
-    max_containers=1,
-    buffer_containers=0,
+    min_containers=MIN_CONTAINERS,
+    buffer_containers=BUFFER_CONTAINERS,
     timeout=ROUTER_TIMEOUT_SECONDS,
 )
 @modal.concurrent(
-    max_inputs=ROUTER_ASYNC_CAPACITY,
-    target_inputs=ROUTER_ASYNC_CAPACITY,
+    max_inputs=ROUTER_MAX_INPUTS,
+    target_inputs=ROUTER_TARGET_INPUTS,
 )
 @modal.asgi_app(
     label=APP_NAME,
@@ -877,7 +853,6 @@ def router():
         # the adapter (the backend authorizes), or the shared internal key to bypass. The authorizer
         # must be wired (backend URL + internal key) or non-internal chat fails closed.
         chat_authorizer=_build_chat_authorizer(settings),
-        capacity_provider=pool,
     )
 
 
@@ -885,9 +860,9 @@ def router():
 def start_all(base_model: str | None = None) -> None:
     """Explicitly boot deployed gpu engines and wait for them to report healthy.
 
-    Normal deploys keep one warm container for every advertised model and may scale each model to
-    two containers. This manual diagnostic verifies one model with ``--base-model`` or every catalog
-    model without changing that one-warm/two-max policy.
+    Normal deploys keep one warm container and one buffer container for every advertised model.
+    This manual diagnostic verifies one model with ``--base-model`` or every catalog model without
+    changing that Modal-managed scaling policy.
     """
     from flash.serving.src.engine.model_config import base_models
 

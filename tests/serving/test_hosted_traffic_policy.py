@@ -1,4 +1,4 @@
-"""Hosted serving traffic policy derivation and catalog totals."""
+"""Hosted serving traffic policy derivation."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from flash.serving.src.engine.model_config import (
     SERVING_MODELS,
     HostedTrafficPolicy,
     base_models,
-    configured_hard_gpu_ceiling,
     configured_warm_container_floor,
     hosted_traffic_policy_for,
 )
@@ -24,15 +23,11 @@ def test_catalog_policy_derives_8_max_and_6_target_inputs() -> None:
         assert policy.max_inputs == 8
         assert policy.target_inputs == 6
         assert policy.min_containers == 1
-        assert policy.max_containers == 2
-        assert policy.buffer_containers == 0
-        assert policy.queue_capacity == 2
-        assert policy.retry_after_seconds == 1
+        assert policy.buffer_containers == 1
 
 
-def test_catalog_warm_floor_and_hard_gpu_ceiling_are_aggregated() -> None:
+def test_catalog_warm_floor_is_aggregated() -> None:
     assert configured_warm_container_floor() == len(base_models())
-    assert configured_hard_gpu_ceiling() == 2 * len(base_models())
 
 
 def test_catalog_remains_json_serializable() -> None:
@@ -42,11 +37,8 @@ def test_catalog_remains_json_serializable() -> None:
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("min_containers", 2, "container limits"),
-        ("max_containers", 3, "container limits"),
-        ("buffer_containers", 1, "buffer_containers"),
-        ("queue_capacity", 9, "queue_capacity"),
-        ("retry_after_seconds", 2, "retry_after_seconds"),
+        ("min_containers", 2, "min_containers"),
+        ("buffer_containers", 0, "buffer_containers"),
         ("max_num_seqs", 0, "max_num_seqs"),
         ("max_inputs", 7, "max_inputs"),
         ("target_inputs", 7, "target_inputs"),

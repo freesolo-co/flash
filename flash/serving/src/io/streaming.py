@@ -58,8 +58,9 @@ async def prepare_stream(
         require_attested_revision(first, target)
     except BaseException as exc:
         # cancellation while waiting for the first engine event must still enter the pool iterator's
-        # finally block, which aborts the remote generation. ordinary dispatch failures need the same
-        # release before their existing http error mapping runs.
+        # finally block and release its local stream resources. Modal 1.5.4 exposes no supported
+        # FunctionCall cancellation handle for generator methods, so iterator closure alone must not
+        # be described as cancelling the remote gpu invocation.
         if events is not None:
             with contextlib.suppress(Exception):
                 await _close_async_iterator(events)
