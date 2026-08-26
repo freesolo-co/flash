@@ -558,6 +558,11 @@ def _resolve_evaluation_target(
             raise
         _err(f"env eval failed: could not resolve verified checkpoints for {run_id}: {exc}")
         return args.target, _err("overall: FAIL")
+    except Exception as exc:
+        if getattr(args, "debug", False):
+            raise
+        _err(f"env eval failed: could not resolve verified checkpoints for {run_id}: {exc}")
+        return args.target, _err("overall: FAIL")
     verified = run.get("verified_checkpoints") if isinstance(run, dict) else None
     if not isinstance(verified, list) or any(not isinstance(item, str) for item in verified):
         _err(f"env eval failed: control plane returned invalid checkpoint authority for {run_id}")

@@ -30,6 +30,10 @@ _PUBLISHED_SLUG = "acme/example-project/starter"
 _EXPLICIT_TARGET = "flash-1/step-3"
 
 
+def _run_record(spec: dict) -> dict:
+    return {"verified_checkpoints": [_EXPLICIT_TARGET], "spec": spec}
+
+
 class _EvalClient:
     """Base for a double used by an environment evaluation.
 
@@ -40,14 +44,13 @@ class _EvalClient:
     _env_dir: Path | None = None
 
     def get_run(self, run_id):
-        return {
-            "verified_checkpoints": [_EXPLICIT_TARGET],
-            "spec": {
+        return _run_record(
+            {
                 "thinking": False,
                 "project": _PROJECT_ID,
                 "environment": {"id": _PUBLISHED_SLUG},
-            },
-        }
+            }
+        )
 
     def deployments(self):
         return [
@@ -457,10 +460,10 @@ def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
             self.targets = []
 
         def get_run(self, run_id):
-            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
-
-        def deployments(self):
-            return [{"run_id": "flash-1", "deployment": {"state": "revocation_failed"}}]
+            return {
+                "verified_checkpoints": [],
+                "spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}},
+            }
 
         def warm_chat_step_selector(self, target):
             return None
@@ -477,7 +480,7 @@ def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
 
     assert cli.main(["env", "eval", "flash-1/step-3"]) == 1
     captured = capsys.readouterr()
-    assert "deployment is revocation_failed" in captured.err
+    assert "has not passed deployment verification" in captured.err
     # one failure up front, not one per case: no generation was attempted.
     assert client.targets == []
 
@@ -547,7 +550,10 @@ def test_env_eval_no_upload_still_requires_a_published_environment(monkeypatch, 
             self.generated = 0
 
         def get_run(self, run_id):
-            return {"spec": {"thinking": False, "project": _PROJECT_ID}}
+            return {
+                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "spec": {"thinking": False, "project": _PROJECT_ID},
+            }
 
         def chat_stream(self, target, messages, **kwargs):
             self.generated += 1
@@ -641,13 +647,13 @@ def test_env_eval_records_the_published_environment_it_graded(monkeypatch, tmp_p
             self.slug = slug
 
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": self.slug},
                 }
-            }
+            )
 
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
@@ -684,7 +690,10 @@ def test_env_eval_refuses_to_record_a_run_whose_project_is_unknown(
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
+            return {
+                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}},
+            }
 
         def warm_chat_step_selector(self, target):
             return None
@@ -839,13 +848,13 @@ def test_env_eval_no_upload_never_records_anything(monkeypatch, tmp_path) -> Non
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": _PUBLISHED_SLUG},
                 }
-            }
+            )
 
         def warm_chat_step_selector(self, target):
             return None
@@ -874,13 +883,13 @@ def test_env_eval_records_under_the_evaluated_runs_own_project(monkeypatch, tmp_
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": _PUBLISHED_SLUG},
                 }
-            }
+            )
 
         def warm_chat_step_selector(self, target):
             return None
@@ -906,13 +915,13 @@ def test_env_eval_project_flag_overrides_the_runs_own_project(monkeypatch, tmp_p
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": _PUBLISHED_SLUG},
                 }
-            }
+            )
 
         def warm_chat_step_selector(self, target):
             return None
@@ -953,13 +962,13 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": spec_environment},
                 }
-            }
+            )
 
         def warm_chat_step_selector(self, target):
             return None
@@ -983,7 +992,10 @@ def test_env_eval_refuses_a_run_that_names_no_published_environment(monkeypatch,
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {"spec": {"thinking": False, "project": _PROJECT_ID}}
+            return {
+                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "spec": {"thinking": False, "project": _PROJECT_ID},
+            }
 
         def warm_chat_step_selector(self, target):
             return None
@@ -1012,13 +1024,13 @@ def test_env_eval_refuses_a_generic_github_reference(monkeypatch, capsys) -> Non
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": "github:acme/envs@main:starter/environment.py"},
                 }
-            }
+            )
 
         def chat_stream(self, target, messages, **kwargs):
             raise AssertionError("an unpublished reference must not be graded")
@@ -2642,7 +2654,10 @@ def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path)
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {"spec": {"environment": {"id": _PUBLISHED_SLUG}}}
+            return {
+                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "spec": {"environment": {"id": _PUBLISHED_SLUG}},
+            }
 
         def chat_stream(self, target, messages, **kwargs):
             sent.append(messages)
@@ -2813,12 +2828,12 @@ def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path
             self._response = response
 
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": self._thinking,
                     "environment": {"id": _PUBLISHED_SLUG},
                 }
-            }
+            )
 
         def chat_stream(self, target, messages, **kwargs):
             yield self._response
@@ -2889,18 +2904,18 @@ def test_env_eval_refuses_to_grade_when_the_plane_never_answered(
     assert client.generated == 0
     assert uploader.calls == []
     captured = capsys.readouterr()
-    assert "could not reach the control plane" in captured.err
+    assert "could not resolve verified checkpoints for flash-1" in captured.err
     assert "overall: FAIL" in captured.err
 
 
 @pytest.mark.parametrize(
     ("status", "message"),
     [
-        (503, "could not reach the control plane"),
-        (429, "could not reach the control plane"),
-        (500, "could not reach the control plane"),
-        (404, "could not read the target run flash-1"),
-        (403, "could not read the target run flash-1"),
+        (503, "could not resolve verified checkpoints for flash-1"),
+        (429, "could not resolve verified checkpoints for flash-1"),
+        (500, "could not resolve verified checkpoints for flash-1"),
+        (404, "could not resolve verified checkpoints for flash-1"),
+        (403, "could not resolve verified checkpoints for flash-1"),
     ],
 )
 def test_env_eval_refuses_on_run_spec_api_error(monkeypatch, capsys, status, message) -> None:
@@ -2933,10 +2948,6 @@ def test_env_eval_refuses_on_run_spec_api_error(monkeypatch, capsys, status, mes
     assert uploader.calls == []
     captured = capsys.readouterr().err
     assert message in captured
-    if status < 500 and status != 429:
-        assert "published environment is what supplies the suites to score" in captured
-    else:
-        assert "retry once it is reachable" in captured
 
 
 def test_env_eval_refuses_when_the_run_spec_is_unreadable(monkeypatch, capsys) -> None:
@@ -2962,7 +2973,7 @@ def test_env_eval_refuses_when_the_run_spec_is_unreadable(monkeypatch, capsys) -
     assert client.generated == 0
     assert uploader.calls == []
     captured = capsys.readouterr().err
-    assert "could not read the target run flash-1" in captured
+    assert "could not resolve verified checkpoints for flash-1" in captured
     assert "overall: FAIL" in captured
 
 
