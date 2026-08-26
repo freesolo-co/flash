@@ -122,6 +122,7 @@ def normalize_tools(
         raise error_type(f"tools may contain at most {_MAX_TOOLS} declarations")
     normalized: list[FunctionTool] = []
     names: set[str] = set()
+    enum_budget = [0]
     for index, raw in enumerate(value):
         if type(raw) is not dict or set(raw) != {"type", "function"}:
             raise error_type(f"tools[{index}] must contain exactly type and function")
@@ -147,14 +148,7 @@ def normalize_tools(
         if description is not None and type(description) is not str:
             raise error_type(f"tools[{index}].function.description must be a string")
         budget = [0]
-        parameters = _normalize_schema(
-            function["parameters"],
-            f"tools[{index}].function.parameters",
-            error_type,
-            depth=0,
-            budget=budget,
-            root=True,
-        )
+        parameters = _normalize_schema(function["parameters"], f"tools[{index}].function.parameters", error_type, depth=0, budget=budget, enum_budget=enum_budget, root=True)  # fmt: skip
         normalized.append(FunctionTool(name, description, parameters))
     if _contains_unpaired_surrogate([tool.wire() for tool in normalized]):
         raise error_type("tools cannot contain an unpaired surrogate")
@@ -345,6 +339,7 @@ def _normalize_schema(
     *,
     depth: int,
     budget: list[int],
+    enum_budget: list[int],
     root: bool = False,
 ) -> dict[str, Any]:
     if type(raw) is not dict:
@@ -370,7 +365,6 @@ def _normalize_schema(
         enum = raw["enum"]
         if type(enum) is not list or not enum or len(enum) > _MAX_ENUM_VALUES:
             raise error_type(f"{path}.enum must be a nonempty bounded array")
-        enum_budget = [0]
         for enum_index, item in enumerate(enum):
             _validate_json_value_complexity(
                 item,
@@ -414,6 +408,7 @@ def _normalize_schema(
                 error_type,
                 depth=depth + 1,
                 budget=budget,
+                enum_budget=enum_budget,
             )
             for name, child in properties.items()
         }
@@ -424,9 +419,7 @@ def _normalize_schema(
     elif schema_type == "array":
         if "items" not in raw:
             raise error_type(f"{path} array schemas require items")
-        normalized["items"] = _normalize_schema(
-            raw["items"], f"{path}.items", error_type, depth=depth + 1, budget=budget
-        )
+        normalized["items"] = _normalize_schema(raw["items"], f"{path}.items", error_type, depth=depth + 1, budget=budget, enum_budget=enum_budget)  # fmt: skip
         forbidden = {"properties", "required", "additionalProperties"} & set(raw)
         if forbidden:
             raise error_type(f"{path} array schema contains object-only keywords")

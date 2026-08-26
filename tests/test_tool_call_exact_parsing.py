@@ -645,6 +645,52 @@ def test_enum_aggregate_nodes_are_bounded_before_fingerprinting() -> None:
         normalize_tools(_enum_tool(enum))
 
 
+@pytest.mark.parametrize(("width", "accepted"), [(510, True), (511, False)])
+def test_enum_nodes_are_bounded_across_tool_declarations(width: int, accepted: bool) -> None:
+    first_enum = [[*range(width), 1_000_000 + index] for index in range(64)]
+    second_enum = [[*range(width), 2_000_000 + index] for index in range(64)]
+    declarations = _enum_tool(first_enum) + _enum_tool(second_enum)
+    declarations[1]["function"]["name"] = "store_two"
+
+    if accepted:
+        assert len(normalize_tools(declarations)) == 2
+    else:
+        with pytest.raises(ValueError, match="enum value complexity"):
+            normalize_tools(declarations)
+
+
+def test_enum_limit_precedes_rejected_declaration_copy_and_fingerprint(monkeypatch) -> None:
+    first_enum = [[*range(511), 1_000_000 + index] for index in range(64)]
+    second_enum = [[*range(511), 2_000_000 + index] for index in range(64)]
+    declarations = _enum_tool(first_enum) + _enum_tool(second_enum)
+    declarations[1]["function"]["name"] = "store_two"
+    copied_first = fingerprinted_first = False
+    original_copy = tool_calls_module._json_copy
+    original_fingerprint = tool_calls_module._json_value_fingerprint
+
+    def tracked_copy(value, *args):
+        nonlocal copied_first
+        if value is second_enum:
+            pytest.fail("rejected enum must not be copied")
+        copied_first |= value is first_enum
+        return original_copy(value, *args)
+
+    def tracked_fingerprint(value):
+        nonlocal fingerprinted_first
+        if type(value) is list and value and type(value[-1]) is int:
+            if value[-1] >= 2_000_000:
+                pytest.fail("rejected enum must not be fingerprinted")
+            fingerprinted_first |= value[-1] >= 1_000_000
+        return original_fingerprint(value)
+
+    monkeypatch.setattr(tool_calls_module, "_json_copy", tracked_copy)
+    monkeypatch.setattr(tool_calls_module, "_json_value_fingerprint", tracked_fingerprint)
+    with pytest.raises(ValueError, match="enum value complexity"):
+        normalize_tools(declarations)
+    assert copied_first
+    assert fingerprinted_first
+
+
 def test_string_enum_allows_nonstructural_parameter_delimiter_text() -> None:
     declaration = _exact_tools()[0].wire()
     enum_value = "before </parameter> after"
