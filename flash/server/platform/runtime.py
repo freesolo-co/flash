@@ -269,122 +269,84 @@ def _fail_blocked_recovery(
     return applied
 
 
-def _start_resubmit(
-    spec,
-    *,
-    expected_remote: dict | None = None,
-    expected_state: str | None = None,
-    expected_retry_snapshot: dict,
-    next_attempt: int,
-) -> bool:
-    from flash.runner.accounting.reconciliation import _compare_and_prepare_resubmit
-    from flash.runner.lifecycle.attempts import _verified_opd_retry_state
-    from flash.runner.lifecycle.status import source_snapshot_from_status
+def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
+    """Claim one provider-clear handleless launch without advancing an active claim."""
+    from flash.runner.lifecycle.attempts import (
+        _verified_opd_retry_state,
+        active_launch_claim_from_raw,
+        claim_is_live,
+        reserve_handleless_recovery_launch,
+    )
+    from flash.runner.lifecycle.status import (
+        _load_status_json,
+        decode_next_attempt,
+        source_snapshot_from_status,
+    )
     from flash.runner.supervise.lifecycle import _run_job_background
+    from flash.server.platform.locks import _deploy_lock
 
     try:
         source_snapshot_from_status(get_status(spec.run_id), required=True)
     except Exception as exc:
-        _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
+        _fail_blocked_recovery(spec, str(exc), expected_remote=None)
         return False
     reason = _recovery_block_reason(spec)
     if reason is not None:
         if _recovery_wall_deadline_is_open(spec):
             return False
-        _fail_blocked_recovery(spec, reason, expected_remote=expected_remote)
+        _fail_blocked_recovery(spec, reason, expected_remote=None)
         return False
-    opd_resume_revision = None
-    opd_resume_world_size = None
-    if spec.algorithm == "opd":
-        try:
-            verified_attempt, opd_resume_revision, opd_resume_world_size = (
-                _verified_opd_retry_state(spec.run_id)
-            )
-            if verified_attempt != next_attempt:
-                raise RuntimeError("opd recovery attempt identity changed")
-        except Exception as exc:
-            _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
-            return False
-    if not _compare_and_prepare_resubmit(
-        spec.run_id,
-        expected_remote,
-        expected_state=expected_state,
-        expected_retry_snapshot=expected_retry_snapshot,
-        next_attempt=next_attempt,
-    ):
-        return False
-    with contextlib.suppress(Exception):
-        _append_run_log(
-            spec.run_id,
-            "control plane restarted without a durable handle; resubmitting",
-        )
-    threading.Thread(
-        target=_run_job_background,
-        args=(
-            spec,
-            None,
-            (
-                next_attempt,
-                opd_resume_revision,
-                opd_resume_world_size,
-                dict(expected_retry_snapshot),
-            ),
-        ),
-        daemon=True,
-    ).start()
-    return True
-
-
-def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
-    """Authorize and claim one handleless initial or replacement launch."""
-    from flash.runner.lifecycle import state as lifecycle_state
-    from flash.runner.lifecycle.attempts import _infer_next_attempt
-    from flash.runner.lifecycle.status import _load_status_json
-    from flash.runner.supervise.retry_decision import RetryState, decide_failure_atomically
-    from flash.server.platform.locks import _deploy_lock
-
     with _deploy_lock(spec.run_id):
         raw = _load_status_json(spec.run_id)
-        next_attempt = _infer_next_attempt(raw)
-        snapshot = raw[lifecycle_state._RETRY_STATE_KEY]
-        if next_attempt:
-            retry_state = RetryState.from_snapshot(spec, snapshot)
-            plan = retry_state.persisted_plan(next_attempt - 1)
-            if plan is None:
-                decision = decide_failure_atomically(
-                    spec.run_id,
-                    spec,
-                    expected_remote=None,
-                    expected_retry_snapshot=snapshot,
-                    failure="poll_error",
-                    chosen=None,
-                    candidates=None,
-                    attempt=next_attempt - 1,
-                )
-                if decision is None:
-                    return None
-                snapshot, plan = decision.snapshot, decision.plan
-            if not plan.retry:
+        stale_claim = active_launch_claim_from_raw(raw)
+        if stale_claim is not None and claim_is_live(spec.run_id, stale_claim):
+            return None
+        revision = world_size = None
+        if spec.algorithm == "opd" and stale_claim is None:
+            try:
+                verified_attempt, revision, world_size = _verified_opd_retry_state(spec.run_id)
+                if verified_attempt != decode_next_attempt(raw):
+                    raise RuntimeError("opd recovery attempt identity changed")
+            except Exception as exc:
+                _fail_blocked_recovery(spec, str(exc), expected_remote=None)
+                return False
+        reservation = reserve_handleless_recovery_launch(
+            spec.run_id,
+            expected_state=expected_state,
+            provider_clear_confirmed=True,
+            expected_stale_claim=stale_claim,
+            resume_revision=revision,
+            resume_world_size=world_size,
+        )
+        if reservation.active:
+            return None
+        if reservation.claim is None:
+            if reservation.retry_plan is not None and not reservation.retry_plan.retry:
                 _fail_blocked_recovery(
                     spec,
                     "retry policy rejected handleless replacement",
                     expected_remote=None,
                 )
                 return False
-        return _start_resubmit(
-            spec,
-            expected_remote=None,
-            expected_state=expected_state,
-            expected_retry_snapshot=snapshot,
-            next_attempt=next_attempt,
-        )
+            return None
+        with contextlib.suppress(Exception):
+            _append_run_log(
+                spec.run_id,
+                "control plane restarted without a durable handle; resubmitting",
+            )
+        threading.Thread(
+            target=_run_job_background,
+            args=(spec, None, reservation.claim),
+            daemon=True,
+        ).start()
+        return True
 
 
 def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
-    from flash.runner.lifecycle.attempts import _latest_reserved_attempt
+    from flash.runner.lifecycle.attempts import latest_reserved_attempt
     from flash.runner.supervise.lifecycle import _completed_attempt_metrics
 
-    attempt = _latest_reserved_attempt(spec.run_id)
+    attempt = latest_reserved_attempt(spec.run_id)
     if attempt is None:
         return None
     providers = {

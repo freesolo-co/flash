@@ -701,32 +701,6 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
     )
 
 
-def test_retry_floor_distinguishes_executed_widths_of_one_class():
-    """A wider shape remains eligible only when it has strictly more usable vram."""
-    from flash.providers.core.base import Candidate
-    from flash.runner.supervise.retry_decision import RetryState, _transition_failure
-
-    two = Candidate(
-        provider="runpod", gpu=_TRI_PROVIDER_GPU, hourly_usd=3.0, vram_gb=80, gpu_count=2
-    )
-    four = Candidate(
-        provider="runpod", gpu=_TRI_PROVIDER_GPU, hourly_usd=3.0, vram_gb=80, gpu_count=4
-    )
-    state = RetryState(infra_retries=1, oom_retries=1, cache_retries=0)
-
-    state, plan = _transition_failure(
-        state,
-        "stalled",
-        chosen=two,
-        candidates=(two, four),
-        managed_cache_mounted=False,
-        attempt=0,
-    )
-
-    assert plan.retry
-    assert state.select_candidate((two, four))[1] is four
-
-
 def _submittable(
     algorithm: str,
     *,

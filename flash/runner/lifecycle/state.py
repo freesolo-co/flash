@@ -37,6 +37,7 @@ _NEXT_ATTEMPT_KEY = "next_attempt"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
 _OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
 _RETRY_STATE_KEY = "retry_state"
+_ACTIVE_LAUNCH_CLAIM_KEY = "active_launch_claim"
 _PRIVATE_STATUS_KEYS = frozenset(
     {
         _RUN_DEADLINE_AT_KEY,
@@ -44,6 +45,7 @@ _PRIVATE_STATUS_KEYS = frozenset(
         _CLEANUP_REMOTES_KEY,
         _OPD_RETRY_CONTRACT_KEY,
         _RETRY_STATE_KEY,
+        _ACTIVE_LAUNCH_CLAIM_KEY,
     }
 )
 _PRIVATE_VALUE_UNSET = object()
@@ -318,6 +320,7 @@ def _save_status(
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
     _retry_state: dict | object | None = _PRIVATE_VALUE_UNSET,
+    _active_launch_claim: dict | object | None = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import deadlines
 
@@ -351,6 +354,7 @@ def _save_status(
             _cleanup_remotes=_cleanup_remotes,
             _opd_retry_contract_version=_opd_retry_contract_version,
             _retry_state=_retry_state,
+            _active_launch_claim=_active_launch_claim,
         )
 
 
@@ -362,6 +366,7 @@ def _save_status_unlocked(
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
     _retry_state: dict | object | None = _PRIVATE_VALUE_UNSET,
+    _active_launch_claim: dict | object | None = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import reporting
     from flash.runner.lifecycle.status import _load_status_json
@@ -384,6 +389,7 @@ def _save_status_unlocked(
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
         _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
         _RETRY_STATE_KEY: _retry_state,
+        _ACTIVE_LAUNCH_CLAIM_KEY: _active_launch_claim,
     }
     data = _status_storage_dict(status)
     for key in _PRIVATE_STATUS_KEYS:

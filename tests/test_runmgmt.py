@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import tempfile
 
 import pytest
@@ -32,6 +33,16 @@ _SOURCE_SNAPSHOT = valid_source_snapshot()
 _RETIRED_MODELS = ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B")
 
 
+def _hold_launch_claim(runs_dir: str, run_id: str, claim_queue, exit_event) -> None:
+    import flash.runner.lifecycle.attempts as attempts
+    import flash.runner.lifecycle.state as state
+
+    state.RUNS_DIR = runs_dir
+    claim = attempts.reserve_verified_attempt_launch(run_id)
+    claim_queue.put(claim.to_dict() if claim is not None else None)
+    exit_event.wait(timeout=30)
+
+
 def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):
     remote = {
         "provider": "runpod",
@@ -39,6 +50,7 @@ def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1
         "endpoint_name": f"{endpoint_id}-name",
         "key_fingerprint": _RUNPOD_FINGERPRINT,
         "attempt": attempt,
+        "launch_claim_token": f"claim-{attempt}",
         "started_ts": started_ts,
         **extra,
     }
@@ -57,6 +69,7 @@ def _lambda_remote(instance_id="instance", attempt=0, started_ts=1.0, **extra):
         "gpu": "A100",
         "hourly_usd": 1.0,
         "attempt": attempt,
+        "launch_claim_token": f"claim-{attempt}",
         "started_ts": started_ts,
         **extra,
     }
@@ -72,6 +85,7 @@ def _vast_remote(instance_id=7, attempt=0, started_ts=1.0, **extra):
         "gpu": "RTX 4090",
         "hourly_usd": 0.5,
         "attempt": attempt,
+        "launch_claim_token": f"claim-{attempt}",
         "started_ts": started_ts,
         **extra,
     }
@@ -1241,48 +1255,172 @@ def test_concurrent_initial_attempt_reservation_has_one_winner(monkeypatch, tmp_
         _next_attempt=0,
     )
 
-    def reserve(_index):
-        try:
-            return runner_attempts._reserve_attempt(spec.run_id)
-        except RuntimeError as exc:
-            return str(exc)
-
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(reserve, range(16)))
+        results = list(
+            pool.map(
+                lambda _index: runner_attempts.reserve_verified_attempt_launch(spec.run_id),
+                range(16),
+            )
+        )
 
-    assert results.count(0) == 1
-    assert all(
-        result == 0 or "lacks exact persisted retry authorization" in result for result in results
+    claims = [claim for claim in results if claim is not None]
+    assert len(claims) == 1
+    assert claims[0].attempt == 0
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._NEXT_ATTEMPT_KEY] == 1
+    assert raw[runner_state._ACTIVE_LAUNCH_CLAIM_KEY] == claims[0].to_dict()
+    runner_attempts.release_launch_claim(spec.run_id, claims[0])
+
+
+def test_multiprocess_launch_claim_cannot_be_stolen_until_owner_exits(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    runs_dir = str(tmp_path / "runs")
+    monkeypatch.setattr(runner_state, "RUNS_DIR", runs_dir)
+    spec = JobSpec(run_id="multiprocess-claim", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
     )
-    assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 1
+    context = multiprocessing.get_context("spawn")
+    claim_queue = context.Queue()
+    exit_event = context.Event()
+    process = context.Process(
+        target=_hold_launch_claim,
+        args=(runs_dir, spec.run_id, claim_queue, exit_event),
+    )
+    process.start()
+    try:
+        first = runner_attempts.AttemptLaunchClaim.from_dict(claim_queue.get(timeout=10))
+        blocked = runner_attempts.reserve_handleless_recovery_launch(
+            spec.run_id,
+            expected_state="provisioning",
+            provider_clear_confirmed=True,
+            expected_stale_claim=first,
+        )
+        assert blocked.claim is None
+        assert blocked.active
+    finally:
+        exit_event.set()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=10)
+    assert process.exitcode == 0
+
+    recovered = runner_attempts.reserve_handleless_recovery_launch(
+        spec.run_id,
+        expected_state="provisioning",
+        provider_clear_confirmed=True,
+        expected_stale_claim=first,
+    )
+    assert recovered.claim is not None
+    assert recovered.claim.attempt == first.attempt
+    assert recovered.claim.token != first.token
+    runner_attempts.release_launch_claim(spec.run_id, recovered.claim)
+
+
+def test_attempt_launch_claim_validates_and_defensively_copies_snapshot():
+    from flash.core.spec import JobSpec
+    from flash.runner.supervise.retry_decision import RetryState
+
+    spec = JobSpec(run_id="claim-copy", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    snapshot = RetryState.initial_for_spec(spec).to_snapshot()
+    claim = runner_attempts.AttemptLaunchClaim(0, snapshot, "claim-token")
+
+    snapshot["last_decision"] = {"mutated": True}
+    returned = claim.retry_snapshot
+    returned["infra_used"] = 99
+
+    assert claim.retry_snapshot == RetryState.initial_for_spec(spec).to_snapshot()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        (True, {}, "token", None, None),
+        (-1, {}, "token", None, None),
+        (0, [], "token", None, None),
+        (0, {}, "", None, None),
+        (0, {}, "token", "", 1),
+        (0, {}, "token", "revision", True),
+        (0, {}, "token", "revision", 0),
+        (0, {}, "token", "revision", None),
+        (0, {}, "token", None, 1),
+    ],
+)
+def test_attempt_launch_claim_rejects_invalid_typed_fields(args):
+    with pytest.raises(ValueError, match="launch claim"):
+        runner_attempts.AttemptLaunchClaim(*args)
+
+
+def test_provider_launch_and_handle_persistence_require_exact_claim_token(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="claim-fence", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert claim is not None
+    stale = runner_attempts.AttemptLaunchClaim(
+        claim.attempt,
+        claim.retry_snapshot,
+        "stale-token",
+    )
+
+    runner_attempts.require_attempt_launch_current(spec.run_id, spec, claim)
+    with pytest.raises(RuntimeError, match="claim changed"):
+        runner_attempts.require_attempt_launch_current(spec.run_id, spec, stale)
+    assert not runner_attempts.persist_claimed_remote(
+        spec.run_id,
+        stale,
+        {"provider": "runpod", "attempt": stale.attempt},
+    )
+    assert runner_attempts.persist_claimed_remote(
+        spec.run_id,
+        claim,
+        {"provider": "runpod", "attempt": claim.attempt},
+    )
+
+    raw = runner_status._load_status_json(spec.run_id)
+    assert runner_state._ACTIVE_LAUNCH_CLAIM_KEY not in raw
+    assert raw["remote"]["launch_claim_token"] == claim.token
+    assert not runner_attempts.claim_is_live(spec.run_id, claim)
 
 
 def test_replacement_reservation_requires_exact_previous_authorization(monkeypatch, tmp_path):
     from flash.core.spec import JobSpec
-    from flash.runner.supervise.retry_decision import decide_failure_atomically
+    from flash.runner.supervise.retry_decision import (
+        FailureObservation,
+        ObservedDecisionState,
+        decide_failure_atomically,
+    )
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="authorized-attempts", model="Qwen/Qwen3.5-4B", algorithm="sft")
     runner_state._save_status(
         runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
     )
-    assert runner_attempts._reserve_attempt(spec.run_id) == 0
-    with pytest.raises(RuntimeError, match="attempt 1 lacks exact persisted retry authorization"):
-        runner_attempts._reserve_attempt(spec.run_id)
-    raw = runner_status._load_status_json(spec.run_id)
+    first = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert first is not None
+    assert first.attempt == 0
+    assert runner_attempts.reserve_verified_attempt_launch(spec.run_id) is None
     decision = decide_failure_atomically(
         spec.run_id,
         spec,
+        claim_token=first.token,
         expected_remote=None,
-        expected_retry_snapshot=raw[runner_state._RETRY_STATE_KEY],
-        failure="poll_error",
-        chosen=None,
-        candidates=None,
+        expected_retry_snapshot=first.retry_snapshot,
+        observation=FailureObservation.create(
+            "poll_error", chosen=None, candidates=None, managed_cache_mounted=False
+        ),
         attempt=0,
     )
-    assert decision is not None
-    assert decision.plan.retry
-    assert runner_attempts._reserve_attempt(spec.run_id) == 1
+    assert decision.state is ObservedDecisionState.PERSISTED
+    second = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert second is not None
+    assert second.attempt == 1
 
 
 @pytest.mark.parametrize(
@@ -1690,7 +1828,11 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypat
 def _retry_snapshot_authorizing(spec, attempt: int, *, infra_used: int = 1, floor: float = 0.0):
     from dataclasses import replace
 
-    from flash.runner.supervise.retry_decision import RetryState
+    from flash.runner.supervise.retry_decision import (
+        PersistedRetryDecision,
+        RetryPlan,
+        RetryState,
+    )
 
     state = RetryState.initial_for_spec(spec)
     if attempt == 0:
@@ -1699,22 +1841,26 @@ def _retry_snapshot_authorizing(spec, attempt: int, *, infra_used: int = 1, floo
         state,
         infra_used=infra_used,
         usable_vram_floor=floor,
-        last_decision_attempt=attempt - 1,
-        last_decision_failure="poll_error",
-        last_decision_retry=True,
-        last_decision_action="retrying allocation (resume from last checkpoint)",
-        last_infra_retry_ordinal=infra_used,
+        last_decision=PersistedRetryDecision(
+            attempt - 1,
+            "poll_error",
+            RetryPlan(
+                True,
+                "retrying allocation (resume from last checkpoint)",
+                infra_used,
+            ),
+        ),
     )
     return state.to_snapshot()
 
 
 def test_next_attempt_requires_persisted_integer_identity():
 
-    assert runner_attempts._infer_next_attempt({"next_attempt": 0}) == 0
-    assert runner_attempts._infer_next_attempt({"next_attempt": 7}) == 7
+    assert runner_status.decode_next_attempt({"next_attempt": 0}) == 0
+    assert runner_status.decode_next_attempt({"next_attempt": 7}) == 7
     for raw in ({}, {"next_attempt": True}, {"next_attempt": -1}, {"next_attempt": "1"}):
         with pytest.raises(RuntimeError, match="next attempt identity"):
-            runner_attempts._infer_next_attempt(raw)
+            runner_status.decode_next_attempt(raw)
 
 
 def test_handleless_state_without_next_attempt_is_rejected(monkeypatch, tmp_path):
@@ -1731,7 +1877,7 @@ def test_handleless_state_without_next_attempt_is_rejected(monkeypatch, tmp_path
         json.dump(raw, file)
 
     with pytest.raises(RuntimeError, match="next attempt identity is missing"):
-        runner_attempts._reserve_attempt(spec.run_id)
+        runner_attempts.reserve_verified_attempt_launch(spec.run_id)
 
 
 def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatch, tmp_path):
@@ -1788,7 +1934,9 @@ def test_reserved_attempt_survives_handleless_restart_without_reusing_zero(monke
         ).gpu.max_wall_seconds
         == 200
     )
-    assert runner_attempts._reserve_attempt(spec.run_id) == 0
+    first = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert first is not None
+    assert first.attempt == 0
     assert runner_status.get_status(spec.run_id).remote is None
     assert (
         runner_deadlines._spec_with_remaining_wall(
@@ -1796,25 +1944,88 @@ def test_reserved_attempt_survives_handleless_restart_without_reusing_zero(monke
         ).gpu.max_wall_seconds
         == 120
     )
-    from flash.runner.supervise.retry_decision import decide_failure_atomically
-
-    raw = runner_status._load_status_json(spec.run_id)
-    decision = decide_failure_atomically(
+    runner_attempts.release_launch_claim(spec.run_id, first)
+    recovered = runner_attempts.reserve_attempt_launch(
         spec.run_id,
-        spec,
-        expected_remote=None,
-        expected_retry_snapshot=raw[runner_state._RETRY_STATE_KEY],
-        failure="poll_error",
-        chosen=None,
-        candidates=None,
-        attempt=0,
-    )
-    assert decision is not None
-    assert decision.plan.retry
-    assert runner_attempts._reserve_attempt(spec.run_id) == 1
+        expected_state="provisioning",
+        recover_handleless=True,
+        provider_clear_confirmed=True,
+        expected_stale_claim=first,
+        transition_state="provisioning",
+    ).claim
+    assert recovered is not None
+    assert recovered.attempt == 0
+    assert recovered.token != first.token
     raw = runner_status._load_status_json(spec.run_id)
-    assert raw[runner_state._NEXT_ATTEMPT_KEY] == 2
+    assert raw[runner_state._NEXT_ATTEMPT_KEY] == 1
     assert raw[runner_state._RUN_DEADLINE_AT_KEY] == 300.0
+
+
+def test_stale_attach_failure_cannot_fail_newer_launch_owner(monkeypatch, tmp_path):
+    import io
+
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="stale-attach-failure",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_wall_seconds=200),
+    )
+    remote = _runpod_remote(
+        "endpoint-stale",
+        "job-stale",
+        attempt=0,
+        allocated_gpu="RTX 4090",
+        allocated_gpu_count=1,
+        allocated_usable_vram_gb=24.0,
+    )
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(
+        status,
+        _run_deadline_at=status.created_at + 200,
+        _next_attempt=1,
+        _retry_state=_retry_snapshot_authorizing(spec, 1),
+    )
+    monkeypatch.setattr(runner_artifacts, "stage_environment_package", lambda worker, **_k: worker)
+    monkeypatch.setattr(runner_submit, "_persist_effective_worker_spec", lambda _spec: True)
+    newer = []
+
+    def replace_owner(_spec, _log, **kwargs):
+        stale = kwargs["reserved_claim"]
+        runner_attempts.release_launch_claim(spec.run_id, stale)
+        replacement = runner_attempts.reserve_attempt_launch(
+            spec.run_id,
+            expected_state="provisioning",
+            recover_handleless=True,
+            provider_clear_confirmed=True,
+            expected_stale_claim=stale,
+            transition_state="provisioning",
+        ).claim
+        assert replacement is not None
+        newer.append(replacement)
+        raise RuntimeError("stale supervisor failed")
+
+    monkeypatch.setattr(runner_lifecycle, "_run_training", replace_owner)
+
+    with pytest.raises(RuntimeError, match="stale supervisor failed"):
+        runner_attach._resume_after_confirmed_teardown(
+            spec.run_id,
+            spec,
+            remote,
+            1,
+            _SOURCE_SNAPSHOT,
+            io.StringIO(),
+            failure="stalled",
+        )
+
+    current = runner_status.get_status(spec.run_id)
+    raw = runner_status._load_status_json(spec.run_id)
+    assert current.state == "provisioning"
+    assert current.error is None
+    assert raw[runner_state._ACTIVE_LAUNCH_CLAIM_KEY] == newer[0].to_dict()
 
 
 def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tmp_path):
@@ -1869,6 +2080,8 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
     resumed = []
 
     def fake_run_training(_spec, _log, **kwargs):
+        assert kwargs["reserved_claim"].attempt == expected_next
+        runner_status._update(spec.run_id, "running")
         resumed.append(expected_next)
 
     monkeypatch.setattr(runner_lifecycle, "_run_training", fake_run_training)
@@ -1949,6 +2162,7 @@ def test_attach_failure_restores_floor_and_skips_equal_cross_provider_candidates
             run_spec.seed,
             log,
             source_snapshot=kwargs["source_snapshot"],
+            reserved_claim=kwargs["reserved_claim"],
         )
 
     monkeypatch.setattr(runner_lifecycle, "_run_training", resume)
@@ -2035,6 +2249,7 @@ def test_attach_cache_fallback_restores_exact_shape_and_drops_managed_cache(monk
             run_spec.seed,
             log,
             source_snapshot=kwargs["source_snapshot"],
+            reserved_claim=kwargs["reserved_claim"],
         )
 
     monkeypatch.setattr(runner_lifecycle, "_run_training", resume)
@@ -2043,7 +2258,7 @@ def test_attach_cache_fallback_restores_exact_shape_and_drops_managed_cache(monk
 
     assert submitted == [("H100", 2, None)]
     retry = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
-    assert retry["cache_used"] == 1
+    assert "cache_used" not in retry
     assert retry["drop_weight_cache"] is True
     assert retry["cache_retry_shape"] == ["runpod", "H100", 2]
 
@@ -2108,7 +2323,11 @@ def test_attach_does_not_reset_a_consumed_infrastructure_budget(monkeypatch, tmp
     from flash.core.spec import GpuSpec, JobSpec
     from flash.providers.core import registry as providers
     from flash.providers.core.base import PollResult
-    from flash.runner.supervise.retry_decision import RetryState
+    from flash.runner.supervise.retry_decision import (
+        PersistedRetryDecision,
+        RetryPlan,
+        RetryState,
+    )
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -2128,11 +2347,15 @@ def test_attach_does_not_reset_a_consumed_infrastructure_budget(monkeypatch, tmp
         initial,
         infra_used=initial.infra_retries,
         usable_vram_floor=24.0,
-        last_decision_attempt=4,
-        last_decision_failure="stalled",
-        last_decision_retry=True,
-        last_decision_action="retrying allocation (resume from last checkpoint)",
-        last_infra_retry_ordinal=initial.infra_retries,
+        last_decision=PersistedRetryDecision(
+            4,
+            "stalled",
+            RetryPlan(
+                True,
+                "retrying allocation (resume from last checkpoint)",
+                initial.infra_retries,
+            ),
+        ),
     )
     runner_state._save_status(
         provisioned_status(spec, state="running", remote=remote),
@@ -2164,220 +2387,6 @@ def test_attach_does_not_reset_a_consumed_infrastructure_budget(monkeypatch, tmp
     retry = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
     assert retry["infra_used"] == state.infra_retries
     assert retry["usable_vram_floor"] == 80.0
-
-
-def test_atomic_attach_decision_is_immutable_for_attempt(monkeypatch, tmp_path):
-    import io
-
-    from flash.core.spec import GpuSpec, JobSpec
-    from flash.providers.core.base import PollResult
-    from flash.runner.supervise.retry_decision import (
-        decide_failure_atomically,
-        retry_candidate_from_remote,
-    )
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="attach-decision-race",
-        model="Qwen/Qwen3.5-9B",
-        algorithm="sft",
-        gpu=GpuSpec(max_retries=2),
-    )
-    remote = _runpod_remote(
-        attempt=0,
-        allocated_gpu="RTX 4090",
-        allocated_gpu_count=1,
-        allocated_usable_vram_gb=24.0,
-    )
-    status = provisioned_status(spec, state="running", remote=remote)
-    status.source_snapshot = _SOURCE_SNAPSHOT
-    runner_state._save_status(status, _next_attempt=1)
-    initial_snapshot = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
-    stale_context = runner_attach._build_attach_context(spec, remote)
-    chosen = retry_candidate_from_remote(remote)
-
-    winner = decide_failure_atomically(
-        spec.run_id,
-        spec,
-        expected_remote=remote,
-        expected_retry_snapshot=initial_snapshot,
-        failure="stalled",
-        chosen=chosen,
-        candidates=None,
-        attempt=0,
-    )
-    stale = decide_failure_atomically(
-        spec.run_id,
-        spec,
-        expected_remote=remote,
-        expected_retry_snapshot=initial_snapshot,
-        failure="job_failed",
-        chosen=chosen,
-        candidates=None,
-        attempt=0,
-    )
-
-    assert winner is not None
-    assert winner.plan.retry is True
-    assert stale is None
-    assert sum(decision is not None and decision.plan.retry for decision in (winner, stale)) == 1
-
-    winning_snapshot = winner.snapshot
-    conflicting = decide_failure_atomically(
-        spec.run_id,
-        spec,
-        expected_remote=remote,
-        expected_retry_snapshot=winning_snapshot,
-        failure="job_failed",
-        chosen=chosen,
-        candidates=None,
-        attempt=0,
-    )
-    assert conflicting is not None
-    assert conflicting.plan.retry is True
-    assert conflicting.plan.infra_retry_ordinal == winner.plan.infra_retry_ordinal
-    assert conflicting.snapshot == winning_snapshot
-    assert conflicting.state.last_decision_failure == "stalled"
-    assert conflicting.plan.action == winner.plan.action
-    assert runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY] == (
-        winning_snapshot
-    )
-
-    observer_b = runner_attach._build_attach_context(spec, remote)
-    observer_c = runner_attach._build_attach_context(spec, remote)
-    monkeypatch.setattr(
-        runner_lifecycle,
-        "_runpod_completed_metrics",
-        lambda *_args, **_kwargs: None,
-    )
-    teardowns = []
-    monkeypatch.setattr(
-        runner_lifecycle,
-        "_strict_teardown_handle",
-        lambda *_args, **_kwargs: teardowns.append("teardown") or True,
-    )
-    launches = []
-    monkeypatch.setattr(
-        runner_lifecycle,
-        "_run_training",
-        lambda *_args, **_kwargs: launches.append(1),
-    )
-    stale_status = runner_attach._handle_failed_attach_poll(
-        spec.run_id,
-        stale_context,
-        PollResult(False, failure="job_failed", detail="stale conflicting poll"),
-        io.StringIO(),
-    )
-    assert stale_status.remote == remote
-    assert teardowns == []
-    assert launches == []
-
-    recovered = runner_attach._handle_failed_attach_poll(
-        spec.run_id,
-        observer_b,
-        PollResult(False, failure="job_failed", detail="post-win conflicting poll"),
-        io.StringIO(),
-    )
-    assert recovered.state == "running"
-    assert recovered.remote is None
-    assert teardowns == ["teardown"]
-    assert launches == [1]
-
-    repeated = runner_attach._handle_failed_attach_poll(
-        spec.run_id,
-        observer_c,
-        PollResult(False, failure="oom", detail="repeated conflicting poll"),
-        io.StringIO(),
-    )
-    assert repeated.state == "running"
-    assert repeated.remote is None
-    assert teardowns == ["teardown"]
-    assert launches == [1]
-    assert runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY] == (
-        winning_snapshot
-    )
-
-
-def test_post_win_observer_finishes_immutable_terminal_attach_decision(monkeypatch, tmp_path):
-    import io
-
-    from flash.core.spec import GpuSpec, JobSpec
-    from flash.providers.core.base import PollResult
-    from flash.runner.supervise.retry_decision import (
-        decide_failure_atomically,
-        retry_candidate_from_remote,
-    )
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="attach-terminal-decision-race",
-        model="Qwen/Qwen3.5-9B",
-        algorithm="sft",
-        gpu=GpuSpec(max_retries=2),
-    )
-    remote = _runpod_remote(
-        attempt=0,
-        allocated_gpu="RTX 4090",
-        allocated_gpu_count=1,
-        allocated_usable_vram_gb=24.0,
-    )
-    runner_state._save_status(
-        provisioned_status(spec, state="running", remote=remote),
-        _next_attempt=1,
-    )
-    initial_snapshot = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
-    winner = decide_failure_atomically(
-        spec.run_id,
-        spec,
-        expected_remote=remote,
-        expected_retry_snapshot=initial_snapshot,
-        failure="job_failed",
-        chosen=retry_candidate_from_remote(remote),
-        candidates=None,
-        attempt=0,
-    )
-    assert winner is not None
-    assert winner.plan.retry is False
-    winning_snapshot = winner.snapshot
-    observer_b = runner_attach._build_attach_context(spec, remote)
-    observer_c = runner_attach._build_attach_context(spec, remote)
-
-    monkeypatch.setattr(
-        runner_lifecycle,
-        "_runpod_completed_metrics",
-        lambda *_args, **_kwargs: None,
-    )
-    teardowns = []
-    monkeypatch.setattr(
-        runner_lifecycle,
-        "_strict_teardown_handle",
-        lambda *_args, **_kwargs: teardowns.append("teardown") or True,
-    )
-    monkeypatch.setattr(
-        runner_lifecycle,
-        "_run_training",
-        lambda *_args, **_kwargs: pytest.fail("terminal decision launched replacement"),
-    )
-
-    recovered = runner_attach._handle_failed_attach_poll(
-        spec.run_id,
-        observer_b,
-        PollResult(False, failure="stalled", detail="post-win conflicting poll"),
-        io.StringIO(),
-    )
-    assert recovered.state == "failed"
-    assert teardowns == ["teardown"]
-    repeated = runner_attach._handle_failed_attach_poll(
-        spec.run_id,
-        observer_c,
-        PollResult(False, failure="oom", detail="repeated conflicting poll"),
-        io.StringIO(),
-    )
-    assert repeated.state == "failed"
-    assert teardowns == ["teardown"]
-    assert runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY] == (
-        winning_snapshot
-    )
 
 
 def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tmp_path):
@@ -2551,6 +2560,8 @@ def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
         recovered_attempt=0,
         next_attempt=1,
         source_snapshot=None,
+        retry_snapshot={},
+        launch_claim_token="claim-0",
     )
     result = SimpleNamespace(ok=True, metrics={"wall_seconds": 3600.0})
     adopted = {}
@@ -2989,219 +3000,108 @@ def test_fail_blocked_recovery_keeps_success_with_lagging_metrics_pending(monkey
     assert status.error is None
 
 
-@pytest.mark.parametrize("state_name", ["queued", "provisioning"])
-def test_handleless_initial_attempt_uses_no_retry_budget(monkeypatch, tmp_path, state_name):
+def _fake_recovery_thread(monkeypatch, runtime):
+    started = []
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+
+    class Thread:
+        def __init__(self, *, target, args, daemon):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            started.append(self.args)
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    return started
+
+
+def test_two_handleless_observers_share_one_prelaunch_claim(monkeypatch, tmp_path):
     import flash.server.platform.runtime as runtime
     from flash.core.spec import GpuSpec, JobSpec
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
-        run_id=f"initial-{state_name}",
+        run_id="handleless-two-observers",
         model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(max_retries=1),
     )
-    runner_state._save_status(
-        runner_state.RunStatus(run_id=spec.run_id, state=state_name, spec=spec.to_dict())
-    )
-
-    captured = {}
-    monkeypatch.setattr(
-        runtime,
-        "_start_resubmit",
-        lambda *_args, **kwargs: captured.update(kwargs) or True,
-    )
-
-    assert runtime._start_handleless_resubmit(spec, state_name) is True
-    assert captured["next_attempt"] == 0
-    snapshot = captured["expected_retry_snapshot"]
-    assert snapshot["infra_used"] == 0
-    assert snapshot["last_decision_attempt"] is None
-
-
-def test_handleless_reserved_attempt_persists_and_reuses_one_candidate_less_retry(
-    monkeypatch, tmp_path
-):
-    import flash.server.platform.runtime as runtime
-    from flash.core.spec import GpuSpec, JobSpec
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="reserved-undecided",
-        model="Qwen/Qwen3.5-9B",
-        algorithm="sft",
-        gpu=GpuSpec(max_retries=1),
-    )
-    runner_state._save_status(
-        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict()),
-        _next_attempt=1,
-    )
-
-    captured = []
-    monkeypatch.setattr(
-        runtime,
-        "_start_resubmit",
-        lambda *_args, **kwargs: captured.append(kwargs) or None,
-    )
-
-    assert runtime._start_handleless_resubmit(spec, "provisioning") is None
-    assert runtime._start_handleless_resubmit(spec, "provisioning") is None
-
-    assert captured[0] == captured[1]
-    assert captured[0]["next_attempt"] == 1
-    snapshot = captured[0]["expected_retry_snapshot"]
-    assert snapshot["infra_used"] == 1
-    assert snapshot["last_decision_attempt"] == 0
-    assert snapshot["last_decision_failure"] == "poll_error"
-
-
-def test_reserved_recovery_rejects_a_newer_retry_snapshot_before_allocation(monkeypatch, tmp_path):
-    import io
-
-    from flash.core.spec import GpuSpec, JobSpec
-    from flash.runner.supervise import seed_submission as submission
-    from flash.runner.supervise.retry_decision import RetryState, decide_failure_atomically
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="reserved-recovery-snapshot",
-        model="Qwen/Qwen3.5-9B",
-        algorithm="sft",
-        gpu=GpuSpec(max_retries=2, max_wall_seconds=3600),
-    )
-    claimed = _retry_snapshot_authorizing(spec, 1)
-    runner_state._save_status(
-        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict()),
-        _next_attempt=2,
-        _retry_state=claimed,
-    )
-    decision = decide_failure_atomically(
-        spec.run_id,
-        spec,
-        expected_remote=None,
-        expected_retry_snapshot=claimed,
-        failure="poll_error",
-        chosen=None,
-        candidates=None,
-        attempt=1,
-    )
-    assert decision is not None
-    assert decision.plan.retry
-    ctx = submission._SubmitContext(
-        spec=spec,
-        seed=spec.seed,
-        log=io.StringIO(),
-        runtime_secrets={},
-        source_snapshot=_SOURCE_SNAPSHOT,
-        retry_state=RetryState.from_snapshot(spec, claimed),
-        reserved_retry=(1, None, None, claimed),
-    )
-
-    with pytest.raises(RuntimeError, match="retry snapshot changed before attempt preparation"):
-        submission._prepare_attempt(ctx)
-
-
-def test_handleless_stale_older_decision_is_replaced_before_launch(monkeypatch, tmp_path):
-    import flash.server.platform.runtime as runtime
-    from flash.core.spec import GpuSpec, JobSpec
-    from flash.runner.supervise.retry_decision import decide_failure_atomically
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="stale-handleless-decision",
-        model="Qwen/Qwen3.5-9B",
-        algorithm="sft",
-        gpu=GpuSpec(max_retries=2),
-    )
-    runner_state._save_status(
-        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict()),
-        _next_attempt=1,
-    )
-    raw = runner_status._load_status_json(spec.run_id)
-    first = decide_failure_atomically(
-        spec.run_id,
-        spec,
-        expected_remote=None,
-        expected_retry_snapshot=raw[runner_state._RETRY_STATE_KEY],
-        failure="poll_error",
-        chosen=None,
-        candidates=None,
-        attempt=0,
-    )
-    assert first is not None
-    assert first.plan.retry
-    assert runner_attempts._reserve_attempt(spec.run_id) == 1
-
-    captured = {}
-    monkeypatch.setattr(
-        runtime,
-        "_start_resubmit",
-        lambda *_args, **kwargs: captured.update(kwargs) or True,
-    )
+    status = provisioned_status(spec, state="provisioning")
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status)
+    started = _fake_recovery_thread(monkeypatch, runtime)
 
     assert runtime._start_handleless_resubmit(spec, "provisioning") is True
-    assert captured["next_attempt"] == 2
-    snapshot = captured["expected_retry_snapshot"]
-    assert snapshot["last_decision_attempt"] == 1
-    assert snapshot["infra_used"] == 2
+    assert runtime._start_handleless_resubmit(spec, "provisioning") is None
+
+    assert len(started) == 1
+    claim = started[0][2]
+    assert claim.attempt == 0
+    assert claim.retry_snapshot["infra_used"] == 0
+    assert claim.retry_snapshot["last_decision"] is None
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._NEXT_ATTEMPT_KEY] == 1
+    assert raw[runner_state._ACTIVE_LAUNCH_CLAIM_KEY] == claim.to_dict()
 
 
-def test_handleless_lost_attempt_with_zero_retries_blocks_launch(monkeypatch, tmp_path):
+def test_handleless_stale_claim_is_reclaimed_without_poll_error(monkeypatch, tmp_path):
     import flash.server.platform.runtime as runtime
-    from flash.core.spec import GpuSpec, JobSpec
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="zero-retry-handleless",
-        model="Qwen/Qwen3.5-9B",
-        algorithm="sft",
-        gpu=GpuSpec(max_retries=0),
-    )
-    runner_state._save_status(
-        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict()),
-        _next_attempt=1,
-    )
+    spec = JobSpec(run_id="stale-handleless-claim", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    status = provisioned_status(spec, state="provisioning")
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status)
+    original = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert original is not None
+    runner_attempts.release_launch_claim(spec.run_id, original)
+    started = _fake_recovery_thread(monkeypatch, runtime)
 
-    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
-    monkeypatch.setattr(
-        runtime,
-        "_start_resubmit",
-        lambda *_args, **_kwargs: pytest.fail("retry=false claimed a replacement"),
-    )
+    assert runtime._start_handleless_resubmit(spec, "provisioning") is True
 
-    assert runtime._start_handleless_resubmit(spec, "provisioning") is False
-    snapshot = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
-    assert snapshot["last_decision_attempt"] == 0
-    assert snapshot["infra_used"] == 0
+    replacement = started[0][2]
+    assert replacement.attempt == original.attempt == 0
+    assert replacement.token != original.token
+    assert replacement.retry_snapshot["last_decision"] is None
+    assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 1
 
 
-def test_handleless_retry_false_blocks_background_launch(monkeypatch, tmp_path):
-    import flash.server.platform.runtime as runtime
-    from flash.core.spec import GpuSpec, JobSpec
+def test_attach_clear_and_reserve_is_atomic_against_second_observer(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="blocked-handleless-launch",
-        model="Qwen/Qwen3.5-9B",
-        algorithm="sft",
-        gpu=GpuSpec(max_retries=0),
-    )
-    runner_state._save_status(
-        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict()),
-        _next_attempt=1,
-    )
-    monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
-    monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
-    monkeypatch.setattr(
-        runtime,
-        "_start_resubmit",
-        lambda *_args, **_kwargs: pytest.fail("retry=false launched a background replacement"),
-    )
-    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    spec = JobSpec(run_id="attach-clear-reserve", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote(attempt=0)
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    retry_snapshot = _retry_snapshot_authorizing(spec, 1)
+    runner_state._save_status(status, _next_attempt=1, _retry_state=retry_snapshot)
 
-    runtime._resubmit_recovered_runs([(spec, "provisioning")])
+    winner = runner_attempts.reserve_verified_attempt_launch(
+        spec.run_id,
+        expected_remote=remote,
+        expected_next_attempt=1,
+        expected_retry_snapshot=retry_snapshot,
+        transition_state="provisioning",
+    )
+    loser = runner_attempts.reserve_verified_attempt_launch(
+        spec.run_id,
+        expected_remote=remote,
+        expected_next_attempt=1,
+        expected_retry_snapshot=retry_snapshot,
+        transition_state="provisioning",
+    )
 
-    assert runner_status.get_status(spec.run_id).state == "failed"
+    assert winner is not None
+    assert winner.attempt == 1
+    assert loser is None
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw["remote"] is None
+    assert raw[runner_state._NEXT_ATTEMPT_KEY] == 2
+    assert raw[runner_state._ACTIVE_LAUNCH_CLAIM_KEY] == winner.to_dict()
 
 
 def test_recovery_launch_cas_requires_exact_snapshot_and_attempt(monkeypatch, tmp_path):
@@ -3212,77 +3112,33 @@ def test_recovery_launch_cas_requires_exact_snapshot_and_attempt(monkeypatch, tm
     runner_state._save_status(
         runner_state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
     )
-    raw = runner_status._load_status_json(spec.run_id)
-    snapshot = raw[runner_state._RETRY_STATE_KEY]
+    snapshot = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
 
-    assert not runner_reconciliation._compare_and_prepare_resubmit(
-        spec.run_id,
-        None,
-        expected_state="queued",
-        expected_retry_snapshot={**snapshot, "infra_used": 1},
-        next_attempt=0,
-    )
-    assert not runner_reconciliation._compare_and_prepare_resubmit(
-        spec.run_id,
-        None,
-        expected_state="queued",
-        expected_retry_snapshot=snapshot,
-        next_attempt=1,
-    )
-    assert runner_reconciliation._compare_and_prepare_resubmit(
-        spec.run_id,
-        None,
-        expected_state="queued",
-        expected_retry_snapshot=snapshot,
-        next_attempt=0,
-    )
-    assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 1
-
-
-def test_start_resubmit_deadline_adopts_completed_handleless_attempt(monkeypatch, tmp_path):
-    import flash.server.platform.runtime as runtime
-    from flash.core.spec import GpuSpec, JobSpec
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
-    spec = JobSpec(
-        run_id="deadline-complete",
-        model="Qwen/Qwen3.5-9B",
-        algorithm="sft",
-        gpu=GpuSpec(max_wall_seconds=120),
-    )
-    runner_state._save_status(
-        runner_state.RunStatus(
-            run_id=spec.run_id,
-            state="provisioning",
-            spec=spec.to_dict(),
-            created_at=100.0,
-        ),
-        _run_deadline_at=220.0,
-        _next_attempt=1,
-    )
-    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
-    monkeypatch.setattr(
-        runtime,
-        "_handleless_completed_metrics",
-        lambda *_args, **_kwargs: {"wall_seconds": 5.0},
-    )
-
-    raw = runner_status._load_status_json(spec.run_id)
     assert (
-        runtime._start_resubmit(
-            spec,
-            expected_remote=None,
-            expected_retry_snapshot=raw[runner_state._RETRY_STATE_KEY],
-            next_attempt=1,
-        )
-        is False
+        runner_attempts.reserve_attempt_launch(
+            spec.run_id,
+            expected_state="queued",
+            expected_retry_snapshot={**snapshot, "infra_used": 1},
+        ).claim
+        is None
     )
-
-    status = runner_status.get_status(spec.run_id)
-    assert status.state == "done"
-    assert status.remote is None
-    assert status.error is None
+    assert (
+        runner_attempts.reserve_attempt_launch(
+            spec.run_id,
+            expected_state="queued",
+            expected_next_attempt=1,
+            expected_retry_snapshot=snapshot,
+        ).claim
+        is None
+    )
+    claim = runner_attempts.reserve_attempt_launch(
+        spec.run_id,
+        expected_state="queued",
+        expected_next_attempt=0,
+        expected_retry_snapshot=snapshot,
+    ).claim
+    assert claim is not None
+    assert claim.attempt == 0
 
 
 @pytest.mark.parametrize("status_read_fails", [False, True])
@@ -3323,7 +3179,7 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
             raise OSError("status store unavailable")
         return real_get_status(run_id)
 
-    monkeypatch.setattr(runtime, "_start_resubmit", start_resubmit)
+    monkeypatch.setattr(runtime, "_start_handleless_resubmit", start_resubmit)
     monkeypatch.setattr(runtime, "get_status", get_status)
     started = []
 
@@ -3448,7 +3304,9 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
         runner_attach, "attach_run", lambda _run_id: pytest.fail("attach dispatched")
     )
     monkeypatch.setattr(
-        runtime, "_start_resubmit", lambda *_args, **_kwargs: pytest.fail("resubmit")
+        runtime,
+        "_start_handleless_resubmit",
+        lambda *_args, **_kwargs: pytest.fail("resubmit"),
     )
     terminated = []
     monkeypatch.setattr(
@@ -3576,17 +3434,13 @@ def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypat
     started = []
     monkeypatch.setattr(
         runtime,
-        "_start_resubmit",
+        "_start_handleless_resubmit",
         lambda *args, **kwargs: started.append((args, kwargs)) or True,
     )
 
     runtime._deferred_resubmit_loop(spec)
 
-    assert len(started) == 1
-    assert started[0][1]["expected_remote"] is None
-    assert started[0][1]["expected_state"] == "provisioning"
-    assert started[0][1]["next_attempt"] == 0
-    assert isinstance(started[0][1]["expected_retry_snapshot"], dict)
+    assert started == [((spec, "provisioning"), {})]
     assert runner_status.get_status(spec.run_id).state == "provisioning"
 
 
@@ -3657,16 +3511,12 @@ def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch
         attempts.append((args, kwargs))
         return len(attempts) == 2
 
-    monkeypatch.setattr(runtime, "_start_resubmit", start_resubmit)
+    monkeypatch.setattr(runtime, "_start_handleless_resubmit", start_resubmit)
 
     runtime._deferred_resubmit_loop(spec)
 
-    assert len(attempts) == 2
+    assert attempts == [((spec, "provisioning"), {}), ((spec, "provisioning"), {})]
     assert sleeps == [runtime._DEFERRED_RECOVERY_RETRY_S]
-    assert attempts[0][1] == attempts[1][1]
-    assert attempts[0][1]["expected_remote"] is None
-    assert attempts[0][1]["expected_state"] == "provisioning"
-    assert attempts[0][1]["next_attempt"] == 0
 
 
 def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp_path):
@@ -3889,9 +3739,15 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
         assert status.remote["endpoint_id"] == "endpoint-race"
         assert status.remote["job_id"] == "job-race"
         assert status.remote["attempt"] == 0
+        assert isinstance(status.remote["launch_claim_token"], str)
         raw = runner_status._load_status_json(spec.run_id)
         assert raw[runner_state._CLEANUP_REMOTES_KEY] == [
-            _runpod_remote("endpoint-race", "job-race", attempt=0)
+            _runpod_remote(
+                "endpoint-race",
+                "job-race",
+                attempt=0,
+                launch_claim_token=status.remote["launch_claim_token"],
+            )
         ]
 
 
@@ -3963,7 +3819,12 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
 
     raw = runner_status._load_status_json(spec.run_id)
     assert raw["remote"] == remote_a
-    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [remote_b]
+    cleanup_remote = raw[runner_state._CLEANUP_REMOTES_KEY][0]
+    assert isinstance(cleanup_remote["launch_claim_token"], str)
+    assert cleanup_remote == {
+        **remote_b,
+        "launch_claim_token": cleanup_remote["launch_claim_token"],
+    }
 
 
 def test_run_training_bails_when_running_cas_rejects(monkeypatch):

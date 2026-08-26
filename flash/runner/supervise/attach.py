@@ -58,14 +58,14 @@ def _resume_after_confirmed_teardown(
     """CAS-clear one captured remote, then resume its next attempt exactly once."""
     from flash.runner.accounting.artifacts import stage_environment_package
     from flash.runner.accounting.reconciliation import (
-        _compare_and_clear_remote,
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
-    from flash.runner.lifecycle.attempts import _verified_opd_next_attempt
+    from flash.runner.lifecycle import state as lifecycle_state
+    from flash.runner.lifecycle.attempts import reserve_verified_attempt_launch
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at, _spec_with_remaining_wall
     from flash.runner.lifecycle.status import (
-        _update,
+        _load_status_json,
         get_status,
         reallocation_spec_from_status,
         source_snapshot_from_status,
@@ -73,12 +73,11 @@ def _resume_after_confirmed_teardown(
     from flash.runner.lifecycle.submit import _persist_effective_worker_spec
     from flash.runner.supervise.errors import _RunCancelled
     from flash.runner.supervise.lifecycle import _run_training
-    from flash.runner.supervise.retry_decision import (
-        _drop_weight_cache,
-        require_retry_authorization,
-    )
+    from flash.runner.supervise.retry_decision import RetryState, _drop_weight_cache
 
-    retry_state = require_retry_authorization(run_id, worker_spec, next_attempt)
+    raw = _load_status_json(run_id)
+    retry_snapshot = raw[lifecycle_state._RETRY_STATE_KEY]
+    retry_state = RetryState.from_snapshot(worker_spec, retry_snapshot)
     try:
         from flash.snapshot.archive import parse_descriptor
 
@@ -88,14 +87,6 @@ def _resume_after_confirmed_teardown(
     except Exception as exc:
         _compare_and_fail_remote(run_id, persisted_remote, str(exc))
         return get_status(run_id)
-    if worker_spec.algorithm == "opd":
-        verified_next_attempt = _verified_opd_next_attempt(run_id)
-        if verified_next_attempt != next_attempt:
-            raise RuntimeError(
-                "persisted opd attempt identity does not match the attached worker; "
-                "replacement is blocked"
-            )
-        next_attempt = verified_next_attempt
     try:
         _spec_with_remaining_wall(worker_spec, require_provider_minimum=True)
     except RuntimeError as exc:
@@ -111,14 +102,18 @@ def _resume_after_confirmed_teardown(
     worker_spec = stage_environment_package(worker_spec, deadline_at=deadline_at)
     if not _persist_effective_worker_spec(worker_spec):
         raise _RunCancelled(f"run {run_id} went terminal before environment staging")
-    if not _compare_and_clear_remote(run_id, persisted_remote):
+    claim = reserve_verified_attempt_launch(
+        run_id,
+        expected_remote=persisted_remote,
+        expected_next_attempt=next_attempt,
+        expected_retry_snapshot=retry_snapshot,
+        transition_state="provisioning",
+    )
+    if claim is None:
         print(
-            f"attach: {run_id} persisted remote changed before clear; not resuming",
+            f"attach: {run_id} persisted ownership changed before replacement reservation",
             file=log,
         )
-        return get_status(run_id)
-    if not _update(run_id, "running"):
-        print(f"attach: {run_id} went terminal during recovery; not resuming", file=log)
         return get_status(run_id)
     print(
         f"attach: {run_id} resubmitting from the latest checkpoint before the "
@@ -131,20 +126,15 @@ def _resume_after_confirmed_teardown(
             log,
             prior_cost=float(get_status(run_id).cost_usd or 0.0),
             source_snapshot=source_snapshot,
+            reserved_claim=claim,
         )
     except _RunCancelled:
         raise
     except Exception as exc:
-        current = get_status(run_id)
-        current_remote = current.remote
-        current_attempt = (
-            _attempt_int(current_remote.get("attempt"))
-            if isinstance(current_remote, dict)
-            else None
-        )
-        if current_remote is None or (
-            current_attempt is not None and current_attempt >= next_attempt
-        ):
+        from flash.runner.lifecycle.attempts import attempt_claim_is_current
+
+        if attempt_claim_is_current(run_id, claim):
+            current_remote = get_status(run_id).remote
             if current_remote is not None:
                 with contextlib.suppress(Exception):
                     _record_cleanup_remote(run_id, current_remote)
@@ -502,7 +492,8 @@ class _AttachContext:
     recovered_attempt: int
     next_attempt: int
     source_snapshot: dict | None
-    retry_snapshot: dict | None = None
+    retry_snapshot: dict
+    launch_claim_token: str
 
 
 def _build_attach_context(
@@ -527,6 +518,9 @@ def _build_attach_context(
     provider_name = remote.get("provider")
     if not isinstance(provider_name, str) or not provider_name:
         raise ValueError("persisted provider identity is missing or invalid")
+    launch_claim_token = remote.pop("launch_claim_token", None)
+    if not isinstance(launch_claim_token, str) or not launch_claim_token:
+        raise ValueError("persisted launch claim token is missing or invalid")
     recovered_attempt = _attempt_int(remote.get("attempt"))
     if recovered_attempt is None:
         raise ValueError("persisted attempt identity is missing or invalid")
@@ -545,6 +539,7 @@ def _build_attach_context(
         next_attempt=recovered_attempt + 1,
         source_snapshot=source_snapshot,
         retry_snapshot=retry_snapshot,
+        launch_claim_token=launch_claim_token,
     )
 
 
@@ -682,6 +677,10 @@ def _handle_failed_attach_poll(
         _worker_provably_gone,
     )
     from flash.runner.supervise.retry_decision import (
+        FailureObservation,
+        ObservedDecisionState,
+        RetryState,
+        _managed_cache_mounted,
         decide_failure_atomically,
         retry_candidate_from_remote,
     )
@@ -726,19 +725,29 @@ def _handle_failed_attach_poll(
         )
         return get_status(run_id)
     chosen = retry_candidate_from_remote(context.persisted_remote)
-    decision = decide_failure_atomically(
+    observed = decide_failure_atomically(
         run_id,
         context.worker_spec,
+        claim_token=context.launch_claim_token,
         expected_remote=context.persisted_remote,
         expected_retry_snapshot=context.retry_snapshot,
-        failure=result.failure,
-        chosen=chosen,
-        candidates=None,
+        observation=FailureObservation.create(
+            result.failure,
+            chosen=chosen,
+            candidates=None,
+            managed_cache_mounted=_managed_cache_mounted(
+                context.worker_spec,
+                RetryState.from_snapshot(context.worker_spec, context.retry_snapshot),
+                chosen,
+            ),
+        ),
         attempt=context.recovered_attempt,
     )
-    if decision is None:
+    if observed.state is ObservedDecisionState.OWNERSHIP_LOST:
         return get_status(run_id)
-    plan = decision.plan
+    if observed.decision is None:
+        raise AssertionError("attached retry decision was not persisted")
+    plan = observed.decision.plan
     print(f"attach: {run_id} {plan.action}", file=log)
     try:
         resource_deleted = _strict_teardown_handle(context.handle, run_id)

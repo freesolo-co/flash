@@ -20,6 +20,7 @@ import time
 from flash.core.catalog import validate_model_for_algorithm
 from flash.core.spec import JobSpec
 from flash.core.spec_persistence import validate_persisted_spec_envelope
+from flash.providers._lifecycle.instances.poll import _attempt_int
 from flash.runner.lifecycle import attempts, preparation, reporting, state
 from flash.runner.lifecycle.state import RunStatus
 
@@ -50,6 +51,16 @@ def _load_status_json(run_id: str) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"invalid stored run status for {run_id}")
     return value
+
+
+def decode_next_attempt(raw: dict) -> int:
+    """Decode the neutral persisted next-attempt counter."""
+    if state._NEXT_ATTEMPT_KEY not in raw:
+        raise RuntimeError("stored next attempt identity is missing")
+    stored = raw[state._NEXT_ATTEMPT_KEY]
+    if _attempt_int(stored) is None:
+        raise RuntimeError("stored next attempt identity is invalid")
+    return stored
 
 
 def get_status(run_id: str) -> RunStatus:
@@ -341,7 +352,7 @@ def validate_terminal_source_metrics(
         if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
             expected_attempt = candidate
     if expected_attempt is None:
-        expected_attempt = attempts._latest_reserved_attempt(status.run_id)
+        expected_attempt = attempts.latest_reserved_attempt(status.run_id)
     if (
         isinstance(expected_attempt, bool)
         or not isinstance(expected_attempt, int)

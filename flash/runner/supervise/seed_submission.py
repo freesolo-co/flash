@@ -10,15 +10,17 @@ from dataclasses import dataclass, field, replace
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
+from flash.runner.lifecycle.attempts import AttemptLaunchClaim
 from flash.runner.supervise import lifecycle as _lifecycle
 from flash.runner.supervise.retry_decision import (
-    AtomicRetryDecision,
+    FailureObservation,
+    ObservedDecisionState,
+    ObservedRetryDecision,
     RetryState,
     _candidate_usable_vram_gb,
     _drop_weight_cache,
     _managed_cache_mounted,
     decide_failure_atomically,
-    load_retry_state,
 )
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
@@ -30,8 +32,7 @@ class _SubmitContext:
     log: object
     runtime_secrets: dict[str, str] | None
     source_snapshot: dict
-    retry_state: RetryState
-    reserved_retry: tuple[int, str | None, int | None, dict] | None = None
+    reserved_claim: AttemptLaunchClaim | None = None
     last_handle: dict = field(default_factory=dict)
     current_gpu: dict = field(default_factory=dict)
     current_usable_vram_gb: float = 0.0
@@ -42,10 +43,10 @@ class _SubmitContext:
     seen_endpoints: dict[str, dict] = field(default_factory=dict)
     submission_lock: object | None = None
     last_detail: str | None = None
+    current_claim: AttemptLaunchClaim | None = None
 
     def on_handle(self, handle: dict) -> None:
         from flash.runner.accounting.reconciliation import _preserve_cleanup_remote
-        from flash.runner.lifecycle.status import _update
         from flash.runner.supervise.errors import _TerminalHandleRace
 
         try:
@@ -58,10 +59,14 @@ class _SubmitContext:
                 raise RuntimeError("provider handle identity does not match the selected provider")
             if canonical_handle["attempt"] != self.current_attempt:
                 raise RuntimeError("provider handle attempt does not match the reserved attempt")
+            claim = self.current_claim
+            if claim is None or claim.attempt != self.current_attempt:
+                raise RuntimeError("provider handle has no active launch claim")
             if canonical_handle.get("endpoint_id"):
                 self.seen_endpoints[canonical_handle["endpoint_id"]] = dict(canonical_handle)
             persisted_handle = {
                 **canonical_handle,
+                "launch_claim_token": claim.token,
                 "seed": int(self.seed),
                 "allocated_gpu": self.current_gpu.get("name"),
                 # carried beside the gpu name for the same reason and by the same route: the
@@ -72,9 +77,12 @@ class _SubmitContext:
                 "allocated_usable_vram_gb": self.current_usable_vram_gb,
                 "on_last_gpu": bool(self.current_on_last_gpu),
             }
-            if _update(self.spec.run_id, "running", remote=persisted_handle):
+            from flash.runner.lifecycle.attempts import persist_claimed_remote
+
+            if persist_claimed_remote(self.spec.run_id, claim, persisted_handle):
                 self.last_handle.clear()
                 self.last_handle.update(persisted_handle)
+                self.current_claim = None
                 return
             resource_deleted = False
             with contextlib.suppress(Exception):
@@ -142,11 +150,19 @@ class _SubmitContext:
 
 @dataclass(frozen=True)
 class _PreparedAttempt:
-    attempt: int
+    claim: AttemptLaunchClaim
     attempt_spec: JobSpec
     runtime_secrets: dict[str, str]
     retry_state: RetryState
-    retry_snapshot: dict
+
+    @property
+    def attempt(self) -> int:
+        return self.claim.attempt
+
+    @property
+    def retry_snapshot(self) -> dict:
+        return self.claim.retry_snapshot
+
     # the rank count a pinned opd resume checkpoint was written at, or None when this attempt
     # resumes from nothing. allocation is pinned to it: the worker refuses a pinned checkpoint
     # whose fsdp width differs from the attempt's, so re-ranking onto another shape would strand
@@ -177,8 +193,7 @@ class _AttemptOutcome:
     candidates: tuple = ()
     run_spec: JobSpec | None = None
     candidate_not_started: bool = False
-    failure_decision: AtomicRetryDecision | None = None
-    failure_decision_attempted: bool = False
+    failure_decision: ObservedRetryDecision = field(default_factory=ObservedRetryDecision.pending)
 
 
 @dataclass(frozen=True)
@@ -195,7 +210,7 @@ def _build_context(
     log,
     runtime_secrets: dict[str, str] | None,
     source_snapshot: dict | None,
-    reserved_retry: tuple[int, str | None, int | None] | None,
+    reserved_claim: AttemptLaunchClaim | None,
 ) -> _SubmitContext:
     from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
     from flash.snapshot.archive import parse_descriptor
@@ -203,25 +218,16 @@ def _build_context(
     source_snapshot = parse_descriptor(
         source_snapshot or source_snapshot_from_status(get_status(spec.run_id), required=True)
     ).to_dict()
-    retry_state = load_retry_state(spec.run_id, spec)
-    if reserved_retry is not None and (
-        not isinstance(reserved_retry, tuple)
-        or len(reserved_retry) != 4
-        or isinstance(reserved_retry[0], bool)
-        or not isinstance(reserved_retry[0], int)
-        or reserved_retry[0] < 0
-        or not isinstance(reserved_retry[3], dict)
-    ):
-        raise RuntimeError("reserved attempt identity or retry snapshot is invalid")
+    if reserved_claim is not None and not isinstance(reserved_claim, AttemptLaunchClaim):
+        raise RuntimeError("reserved launch claim is invalid")
     return _SubmitContext(
         spec=spec,
         seed=seed,
         log=log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
-        retry_state=retry_state,
-        reserved_retry=reserved_retry,
-        current_attempt=reserved_retry[0] if reserved_retry else 0,
+        reserved_claim=reserved_claim,
+        current_attempt=reserved_claim.attempt if reserved_claim else 0,
     )
 
 
@@ -344,10 +350,8 @@ def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
 
 
 def _prepare_attempt(ctx: _SubmitContext) -> _PreparationOutcome:
-    from flash.runner.lifecycle import state as lifecycle_state
-    from flash.runner.lifecycle.attempts import _reserve_attempt, _verified_opd_retry_state
+    from flash.runner.lifecycle.attempts import reserve_verified_attempt_launch
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
-    from flash.runner.lifecycle.status import _load_status_json
 
     ctx.raise_if_cancelled()
     if ctx.last_handle:
@@ -359,42 +363,29 @@ def _prepare_attempt(ctx: _SubmitContext) -> _PreparationOutcome:
     except RuntimeError:
         ctx.gc_seen_endpoints()
         raise
-    claimed_retry_snapshot = None
-    if ctx.reserved_retry is not None:
-        attempt, opd_resume_revision, resume_world_size, claimed_retry_snapshot = ctx.reserved_retry
-        ctx.reserved_retry = None
-    else:
-        if ctx.spec.algorithm == "opd":
-            expected_next_attempt, opd_resume_revision, resume_world_size = (
-                _verified_opd_retry_state(ctx.spec.run_id)
-            )
-        else:
-            expected_next_attempt, opd_resume_revision, resume_world_size = None, None, None
-        attempt = _reserve_attempt(
-            ctx.spec.run_id,
-            expected_next_attempt=expected_next_attempt,
-        )
-    raw = _load_status_json(ctx.spec.run_id)
-    retry_snapshot = raw[lifecycle_state._RETRY_STATE_KEY]
-    if claimed_retry_snapshot is not None and retry_snapshot != claimed_retry_snapshot:
-        raise RuntimeError("reserved recovery retry snapshot changed before attempt preparation")
-    retry_state = RetryState.from_snapshot(ctx.spec, retry_snapshot)
-    ctx.retry_state = retry_state
-    ctx.current_attempt = attempt
-    _mark_attempt_boundary(ctx, attempt)
+    claim = ctx.reserved_claim
+    ctx.reserved_claim = None
+    if claim is None:
+        claim = reserve_verified_attempt_launch(ctx.spec.run_id)
+        if claim is None:
+            from flash.runner.supervise.errors import _LaunchOwnershipLost
+
+            raise _LaunchOwnershipLost("attempt launch reservation lost ownership")
+    retry_state = RetryState.from_snapshot(ctx.spec, claim.retry_snapshot)
+    ctx.current_claim = claim
+    ctx.current_attempt = claim.attempt
+    _mark_attempt_boundary(ctx, claim.attempt)
     attempt_runtime_secrets = dict(ctx.runtime_secrets or {})
     attempt_runtime_secrets.pop(OPD_RESUME_REVISION_ENV, None)
-    if opd_resume_revision is not None:
-        attempt_runtime_secrets[OPD_RESUME_REVISION_ENV] = opd_resume_revision
+    if claim.resume_revision is not None:
+        attempt_runtime_secrets[OPD_RESUME_REVISION_ENV] = claim.resume_revision
     return _PreparationOutcome(
         prepared=_PreparedAttempt(
-            attempt,
+            claim,
             attempt_spec,
             attempt_runtime_secrets,
             retry_state,
-            retry_snapshot,
-            # only a pinned resume constrains the shape; without one the retry re-ranks freely.
-            resume_world_size=resume_world_size if opd_resume_revision is not None else None,
+            resume_world_size=claim.resume_world_size,
         )
     )
 
@@ -535,7 +526,8 @@ def _build_candidate_plan(
         return None
 
     cache_fallback_available = (
-        prepared.retry_state.cache_used < prepared.retry_state.cache_retries
+        not prepared.retry_state.drop_weight_cache
+        and prepared.retry_state.cache_retries > 0
         and _managed_cache_mounted(prepared.attempt_spec, prepared.retry_state, chosen)
     )
     on_last_gpu = prepared.retry_state.on_last_gpu(
@@ -665,7 +657,7 @@ def _submit_candidate(
     prepared: _PreparedAttempt,
     plan: _CandidatePlan,
 ):
-    from flash.runner.lifecycle.attempts import _require_attempt_launch_current
+    from flash.runner.lifecycle.attempts import require_attempt_launch_current
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import get_status
     from flash.runner.lifecycle.submit import _persist_effective_worker_spec
@@ -677,12 +669,7 @@ def _submit_candidate(
     ctx.submission_lock.acquire()
     try:
         try:
-            _require_attempt_launch_current(
-                ctx.spec.run_id,
-                ctx.spec,
-                prepared.attempt,
-                prepared.retry_snapshot,
-            )
+            require_attempt_launch_current(ctx.spec.run_id, ctx.spec, prepared.claim)
         except RuntimeError as exc:
             raise _RunCancelled(
                 f"run {ctx.spec.run_id} attempt {prepared.attempt} lost provider launch authorization"
@@ -718,11 +705,15 @@ def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOut
         decision = decide_failure_atomically(
             ctx.spec.run_id,
             ctx.spec,
+            claim_token=prepared.claim.token,
             expected_remote=dict(ctx.last_handle) if ctx.last_handle else None,
             expected_retry_snapshot=prepared.retry_snapshot,
-            failure=result.failure,
-            chosen=None,
-            candidates=allocation.candidates,
+            observation=FailureObservation.create(
+                result.failure,
+                chosen=None,
+                candidates=allocation.candidates,
+                managed_cache_mounted=False,
+            ),
             attempt=prepared.attempt,
         )
         return _AttemptOutcome(
@@ -730,7 +721,6 @@ def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOut
             candidates=allocation.candidates,
             candidate_not_started=True,
             failure_decision=decision,
-            failure_decision_attempted=True,
         )
     result, candidate_not_started = _submit_candidate(ctx, prepared, plan)
     return _AttemptOutcome(
@@ -778,22 +768,35 @@ def _handle_failure(
 
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
-    decision = outcome.failure_decision
-    if not outcome.failure_decision_attempted:
-        decision = decide_failure_atomically(
+    observed = outcome.failure_decision
+    if observed.state is ObservedDecisionState.PENDING:
+        observed = decide_failure_atomically(
             ctx.spec.run_id,
             ctx.spec,
+            claim_token=prepared.claim.token,
             expected_remote=dict(ctx.last_handle) if ctx.last_handle else None,
             expected_retry_snapshot=prepared.retry_snapshot,
-            failure=result.failure,
-            chosen=outcome.chosen,
-            candidates=outcome.candidates,
+            observation=FailureObservation.create(
+                result.failure,
+                chosen=outcome.chosen,
+                candidates=outcome.candidates,
+                managed_cache_mounted=_managed_cache_mounted(
+                    prepared.attempt_spec,
+                    prepared.retry_state,
+                    outcome.chosen,
+                ),
+            ),
             attempt=prepared.attempt,
         )
-    if decision is None:
+    from flash.runner.lifecycle.attempts import release_launch_claim
+
+    release_launch_claim(ctx.spec.run_id, prepared.claim)
+    ctx.current_claim = None
+    if observed.state is ObservedDecisionState.OWNERSHIP_LOST:
         return _FailureDecision(None, False, lost_ownership=True)
-    ctx.retry_state = decision.state
-    plan = decision.plan
+    if observed.state is not ObservedDecisionState.PERSISTED or observed.decision is None:
+        raise AssertionError("unhandled retry decision state")
+    plan = observed.decision.plan
     retry_delay = (
         _retry_delay(ctx, plan.infra_retry_ordinal)
         if plan.retry and outcome.candidate_not_started
@@ -814,7 +817,7 @@ def submit_seed_supervised(
     log,
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
-    reserved_retry: tuple[int, str | None, int | None] | None = None,
+    reserved_claim: AttemptLaunchClaim | None = None,
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures."""
     if spec.algorithm == "opd":
@@ -829,7 +832,7 @@ def submit_seed_supervised(
         log,
         runtime_secrets,
         source_snapshot,
-        reserved_retry,
+        reserved_claim,
     )
     _require_opd_configuration(ctx)
     while True:
@@ -844,7 +847,9 @@ def submit_seed_supervised(
         if decision.metrics is not None:
             return decision.metrics
         if decision.lost_ownership:
-            raise RuntimeError(f"seed {seed} lost retry decision ownership")
+            from flash.runner.supervise.errors import _LaunchOwnershipLost
+
+            raise _LaunchOwnershipLost(f"seed {seed} lost retry decision ownership")
         if not decision.retry:
             break
         if decision.retry_delay:

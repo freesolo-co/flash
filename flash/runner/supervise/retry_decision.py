@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from enum import Enum
 
 from flash.core.spec import JobSpec
 
@@ -17,16 +18,13 @@ _STATE_KEYS = frozenset(
         "usable_vram_floor",
         "infra_used",
         "oom_used",
-        "cache_used",
         "drop_weight_cache",
         "cache_retry_shape",
-        "last_decision_attempt",
-        "last_decision_failure",
-        "last_decision_retry",
-        "last_decision_action",
-        "last_infra_retry_ordinal",
+        "last_decision",
     }
 )
+_DECISION_KEYS = frozenset({"attempt", "failure", "plan"})
+_PLAN_KEYS = frozenset({"retry", "action", "infra_retry_ordinal"})
 
 
 @dataclass(frozen=True)
@@ -45,21 +43,47 @@ class RetryPlan:
 
 
 @dataclass(frozen=True)
+class PersistedRetryDecision:
+    attempt: int
+    failure: str
+    plan: RetryPlan
+
+
+@dataclass(frozen=True)
+class FailureObservation:
+    failure: str
+    chosen: object | None
+    candidates: tuple | None
+    managed_cache_mounted: bool
+
+    @classmethod
+    def create(
+        cls,
+        failure: str | None,
+        *,
+        chosen,
+        candidates,
+        managed_cache_mounted: bool,
+    ) -> FailureObservation:
+        return cls(
+            failure or "unknown",
+            chosen,
+            None if candidates is None else tuple(candidates),
+            bool(managed_cache_mounted),
+        )
+
+
+@dataclass(frozen=True)
 class RetryState:
     infra_retries: int
     oom_retries: int
     cache_retries: int
     infra_used: int = 0
     oom_used: int = 0
-    cache_used: int = 0
     usable_vram_floor: float = 0.0
     drop_weight_cache: bool = False
     cache_retry_shape: tuple[str, str, int] | None = None
-    last_decision_attempt: int | None = None
-    last_decision_failure: str | None = None
-    last_decision_retry: bool | None = None
-    last_decision_action: str | None = None
-    last_infra_retry_ordinal: int | None = None
+    last_decision: PersistedRetryDecision | None = None
 
     @classmethod
     def initial_for_spec(cls, spec: JobSpec) -> RetryState:
@@ -84,23 +108,17 @@ class RetryState:
             for key, label, maximum in (
                 ("infra_used", "infra retry count", maxima.infra_retries),
                 ("oom_used", "oom retry count", maxima.oom_retries),
-                ("cache_used", "cache retry count", maxima.cache_retries),
             )
         }
         drop = raw["drop_weight_cache"]
         shape = _restore_cache_shape(raw["cache_retry_shape"])
-        if type(drop) is not bool or counters["cache_used"] != int(drop):
-            raise ValueError("persisted retry state has inconsistent cache-drop state")
+        if type(drop) is not bool:
+            raise ValueError("persisted retry state has invalid cache-drop state")
+        if drop and maxima.cache_retries == 0:
+            raise ValueError("persisted retry state exceeds cache retry budget")
         if shape is not None and not drop:
             raise ValueError("persisted retry state has an unarmed cache retry shape")
-        attempt = raw["last_decision_attempt"]
-        decision = (
-            raw["last_decision_failure"],
-            raw["last_decision_retry"],
-            raw["last_decision_action"],
-            raw["last_infra_retry_ordinal"],
-        )
-        _validate_last_decision(attempt, decision, counters)
+        decision = _restore_last_decision(raw["last_decision"], counters)
         return cls(
             maxima.infra_retries,
             maxima.oom_retries,
@@ -109,11 +127,7 @@ class RetryState:
             usable_vram_floor=float(floor),
             drop_weight_cache=drop,
             cache_retry_shape=shape,
-            last_decision_attempt=attempt,
-            last_decision_failure=decision[0],
-            last_decision_retry=decision[1],
-            last_decision_action=decision[2],
-            last_infra_retry_ordinal=decision[3],
+            last_decision=decision,
         )
 
     def to_snapshot(self) -> dict:
@@ -122,18 +136,14 @@ class RetryState:
             "usable_vram_floor": float(self.usable_vram_floor),
             "infra_used": self.infra_used,
             "oom_used": self.oom_used,
-            "cache_used": self.cache_used,
             "drop_weight_cache": self.drop_weight_cache,
             "cache_retry_shape": list(self.cache_retry_shape) if self.cache_retry_shape else None,
-            "last_decision_attempt": self.last_decision_attempt,
-            "last_decision_failure": self.last_decision_failure,
-            "last_decision_retry": self.last_decision_retry,
-            "last_decision_action": self.last_decision_action,
-            "last_infra_retry_ordinal": self.last_infra_retry_ordinal,
+            "last_decision": _decision_snapshot(self.last_decision),
         }
 
     def persisted_plan(self, attempt: int) -> RetryPlan | None:
-        return _persisted_plan(self, attempt)
+        decision = self.last_decision
+        return decision.plan if decision is not None and decision.attempt == attempt else None
 
     def select_candidate(self, candidates):
         eligible = _strictly_larger_candidates(candidates, self.usable_vram_floor)
@@ -149,9 +159,9 @@ class RetryState:
         )
 
     def on_last_gpu(self, chosen, candidates, *, cache_fallback_available: bool) -> bool:
-        if chosen is None or (
-            self.infra_used >= self.infra_retries and not cache_fallback_available
-        ):
+        if cache_fallback_available:
+            return False
+        if chosen is None or self.infra_used >= self.infra_retries:
             return True
         floor = _candidate_usable_vram_gb(chosen)
         return not any(_candidate_usable_vram_gb(candidate) > floor for candidate in candidates)
@@ -159,9 +169,32 @@ class RetryState:
 
 @dataclass(frozen=True)
 class AtomicRetryDecision:
-    state: RetryState
     snapshot: dict
     plan: RetryPlan
+
+
+class ObservedDecisionState(Enum):
+    PENDING = "pending"
+    PERSISTED = "persisted"
+    OWNERSHIP_LOST = "ownership_lost"
+
+
+@dataclass(frozen=True)
+class ObservedRetryDecision:
+    state: ObservedDecisionState
+    decision: AtomicRetryDecision | None = None
+
+    @classmethod
+    def pending(cls) -> ObservedRetryDecision:
+        return cls(ObservedDecisionState.PENDING)
+
+    @classmethod
+    def persisted(cls, decision: AtomicRetryDecision) -> ObservedRetryDecision:
+        return cls(ObservedDecisionState.PERSISTED, decision)
+
+    @classmethod
+    def ownership_lost(cls) -> ObservedRetryDecision:
+        return cls(ObservedDecisionState.OWNERSHIP_LOST)
 
 
 def _bounded_count(value: object, label: str, maximum: int) -> int:
@@ -170,23 +203,12 @@ def _bounded_count(value: object, label: str, maximum: int) -> int:
     return value
 
 
-def _validate_last_decision(attempt, decision: tuple, counters: dict) -> None:
-    failure, retry, action, ordinal = decision
-    if attempt is None:
-        if any(value is not None for value in decision) or any(counters.values()):
-            raise ValueError("persisted retry state has an incomplete last decision")
-        return
-    if (
-        isinstance(attempt, bool)
-        or not isinstance(attempt, int)
-        or attempt < 0
-        or not isinstance(failure, str)
-        or not failure
-        or type(retry) is not bool
-        or not isinstance(action, str)
-        or not action
-    ):
-        raise ValueError("persisted retry state has an invalid last decision")
+def _restore_plan(raw: object, counters: dict) -> RetryPlan:
+    if not isinstance(raw, dict) or set(raw) != _PLAN_KEYS:
+        raise ValueError("persisted retry state has an invalid last decision plan")
+    retry, action, ordinal = raw["retry"], raw["action"], raw["infra_retry_ordinal"]
+    if type(retry) is not bool or not isinstance(action, str) or not action:
+        raise ValueError("persisted retry state has an invalid last decision plan")
     if ordinal is not None and (
         isinstance(ordinal, bool)
         or not isinstance(ordinal, int)
@@ -194,6 +216,40 @@ def _validate_last_decision(attempt, decision: tuple, counters: dict) -> None:
         or retry is not True
     ):
         raise ValueError("persisted retry state has invalid infrastructure retry ordinal")
+    return RetryPlan(retry, action, ordinal)
+
+
+def _restore_last_decision(raw: object, counters: dict) -> PersistedRetryDecision | None:
+    if raw is None:
+        if any(counters.values()):
+            raise ValueError("persisted retry state has an incomplete last decision")
+        return None
+    if not isinstance(raw, dict) or set(raw) != _DECISION_KEYS:
+        raise ValueError("persisted retry state has an invalid last decision")
+    attempt, failure = raw["attempt"], raw["failure"]
+    if (
+        isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt < 0
+        or not isinstance(failure, str)
+        or not failure
+    ):
+        raise ValueError("persisted retry state has an invalid last decision")
+    return PersistedRetryDecision(attempt, failure, _restore_plan(raw["plan"], counters))
+
+
+def _decision_snapshot(decision: PersistedRetryDecision | None) -> dict | None:
+    if decision is None:
+        return None
+    return {
+        "attempt": decision.attempt,
+        "failure": decision.failure,
+        "plan": {
+            "retry": decision.plan.retry,
+            "action": decision.plan.action,
+            "infra_retry_ordinal": decision.plan.infra_retry_ordinal,
+        },
+    }
 
 
 def _restore_cache_shape(value: object) -> tuple[str, str, int] | None:
@@ -262,31 +318,30 @@ def _managed_cache_mounted(spec: JobSpec, state: RetryState, chosen) -> bool:
     )
 
 
-def _persisted_plan(state: RetryState, attempt: int) -> RetryPlan | None:
-    if attempt != state.last_decision_attempt:
-        return None
-    return RetryPlan(
-        bool(state.last_decision_retry),
-        str(state.last_decision_action),
-        state.last_infra_retry_ordinal,
-    )
-
-
-def _finish(state: RetryState, plan: RetryPlan, failure: str, attempt: int):
+def _finish(
+    state: RetryState,
+    plan: RetryPlan,
+    observation: FailureObservation,
+    attempt: int,
+) -> tuple[RetryState, RetryPlan]:
     return replace(
         state,
-        last_decision_attempt=attempt,
-        last_decision_failure=failure,
-        last_decision_retry=plan.retry,
-        last_decision_action=plan.action,
-        last_infra_retry_ordinal=plan.infra_retry_ordinal,
+        last_decision=PersistedRetryDecision(attempt, observation.failure, plan),
     ), plan
 
 
-def _transition_failure(state, failure, *, chosen, candidates, managed_cache_mounted, attempt):
-    failure = failure or "unknown"
+def transition_failure(
+    state: RetryState,
+    observation: FailureObservation,
+    *,
+    attempt: int,
+) -> tuple[RetryState, RetryPlan]:
+    """Return the pure retry transition for one typed failure observation."""
+    failure = observation.failure
+    chosen = observation.chosen
+    candidates = observation.candidates
     if failure not in CANDIDATE_RETRY_FAILURES:
-        return _finish(state, RetryPlan(False, "not retrying"), failure, attempt)
+        return _finish(state, RetryPlan(False, "not retrying"), observation, attempt)
     if chosen is None:
         if failure == "no_capacity":
             plan = RetryPlan(False, "not retrying: allocation reported no capacity")
@@ -296,15 +351,15 @@ def _transition_failure(state, failure, *, chosen, candidates, managed_cache_mou
             plan = RetryPlan(True, "retrying allocation (resume from last checkpoint)", ordinal)
         else:
             plan = RetryPlan(False, "not retrying")
-        return _finish(state, plan, failure, attempt)
+        return _finish(state, plan, observation, attempt)
     if (
         failure in CACHE_FALLBACK_FAILURES
-        and managed_cache_mounted
-        and state.cache_used < state.cache_retries
+        and observation.managed_cache_mounted
+        and not state.drop_weight_cache
+        and state.cache_retries > 0
     ):
         state = replace(
             state,
-            cache_used=1,
             drop_weight_cache=True,
             cache_retry_shape=_candidate_shape(chosen),
         )
@@ -314,7 +369,7 @@ def _transition_failure(state, failure, *, chosen, candidates, managed_cache_mou
                 True,
                 f"retrying cacheless on the same {chosen.gpu} @ {chosen.provider} (resume from last checkpoint)",
             ),
-            failure,
+            observation,
             attempt,
         )
     floor = max(state.usable_vram_floor, _candidate_usable_vram_gb(chosen))
@@ -344,7 +399,7 @@ def _transition_failure(state, failure, *, chosen, candidates, managed_cache_mou
             f"retrying on a strictly larger GPU (> {floor:g} GB usable vram; resume from last checkpoint)",
             ordinal,
         )
-    return _finish(state, plan, failure, attempt)
+    return _finish(state, plan, observation, attempt)
 
 
 def retry_candidate_from_remote(remote: object) -> _PersistedCandidate:
@@ -369,17 +424,7 @@ def retry_candidate_from_remote(remote: object) -> _PersistedCandidate:
     return _PersistedCandidate(provider, gpu, count, float(usable))
 
 
-def load_retry_state(run_id: str, spec: JobSpec) -> RetryState:
-    from flash.runner.lifecycle import state
-    from flash.runner.lifecycle.status import _load_status_json
-
-    try:
-        return RetryState.from_snapshot(spec, _load_status_json(run_id)[state._RETRY_STATE_KEY])
-    except (KeyError, ValueError) as exc:
-        raise RuntimeError("persisted retry state is missing or invalid") from exc
-
-
-def _require_retry_authorization_from_raw(spec: JobSpec, raw: dict, attempt: int) -> RetryState:
+def require_retry_authorization_from_raw(spec: JobSpec, raw: dict, attempt: int) -> RetryState:
     from flash.runner.lifecycle import state
 
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
@@ -388,9 +433,9 @@ def _require_retry_authorization_from_raw(spec: JobSpec, raw: dict, attempt: int
         retry_state = RetryState.from_snapshot(spec, raw[state._RETRY_STATE_KEY])
     except (KeyError, ValueError) as exc:
         raise RuntimeError("persisted retry state is missing or invalid") from exc
+    decision = retry_state.last_decision
     if attempt > 0 and (
-        retry_state.last_decision_attempt != attempt - 1
-        or retry_state.last_decision_retry is not True
+        decision is None or decision.attempt != attempt - 1 or decision.plan.retry is not True
     ):
         raise RuntimeError(
             f"attempt {attempt} lacks exact persisted retry authorization for attempt {attempt - 1}"
@@ -403,23 +448,50 @@ def require_retry_authorization(run_id: str, spec: JobSpec, attempt: int) -> Ret
     from flash.runner.lifecycle.status import _load_status_json
 
     with state._status_guard(run_id):
-        return _require_retry_authorization_from_raw(spec, _load_status_json(run_id), attempt)
+        return require_retry_authorization_from_raw(spec, _load_status_json(run_id), attempt)
+
+
+def _claim_owns_failure(
+    raw: dict,
+    *,
+    claim_token: str,
+    attempt: int,
+    expected_retry_snapshot: dict,
+    expected_remote: dict | None,
+) -> bool:
+    from flash.runner.lifecycle import state
+
+    if expected_remote is not None:
+        return bool(
+            expected_remote.get("launch_claim_token") == claim_token
+            and expected_remote.get("attempt") == attempt
+            and raw.get(state._ACTIVE_LAUNCH_CLAIM_KEY) is None
+        )
+    claim = raw.get(state._ACTIVE_LAUNCH_CLAIM_KEY)
+    return bool(
+        isinstance(claim, dict)
+        and claim.get("token") == claim_token
+        and claim.get("attempt") == attempt
+        and claim.get("retry_snapshot") == expected_retry_snapshot
+    )
 
 
 def decide_failure_atomically(
     run_id: str,
     spec: JobSpec,
     *,
+    claim_token: str,
     expected_remote: dict | None,
     expected_retry_snapshot: dict,
-    failure: str | None,
-    chosen,
-    candidates,
+    observation: FailureObservation,
     attempt: int,
-) -> AtomicRetryDecision | None:
+) -> ObservedRetryDecision:
     from flash.runner.lifecycle import state
-    from flash.runner.lifecycle.attempts import _infer_next_attempt
-    from flash.runner.lifecycle.status import _load_status_json, _runstatus_from_json
+    from flash.runner.lifecycle.status import (
+        _load_status_json,
+        _runstatus_from_json,
+        decode_next_attempt,
+    )
 
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise ValueError("retry decision attempt is invalid")
@@ -430,29 +502,39 @@ def decide_failure_atomically(
             raw.get("state") in state.TERMINAL_STATES
             or raw.get("remote") != expected_remote
             or snapshot != expected_retry_snapshot
-            or _infer_next_attempt(raw) - 1 != attempt
+            or decode_next_attempt(raw) - 1 != attempt
+            or not _claim_owns_failure(
+                raw,
+                claim_token=claim_token,
+                attempt=attempt,
+                expected_retry_snapshot=expected_retry_snapshot,
+                expected_remote=expected_remote,
+            )
         ):
-            return None
+            return ObservedRetryDecision.ownership_lost()
         retry_state = RetryState.from_snapshot(spec, snapshot)
-        plan = _persisted_plan(retry_state, attempt)
+        plan = retry_state.persisted_plan(attempt)
         if plan is not None:
-            return AtomicRetryDecision(retry_state, dict(snapshot), plan)
+            return ObservedRetryDecision.persisted(AtomicRetryDecision(dict(snapshot), plan))
         if attempt == 0:
-            if retry_state.last_decision_attempt is not None:
+            if retry_state.last_decision is not None:
                 raise RuntimeError("initial attempt has inconsistent persisted retry history")
-        elif (
-            retry_state.last_decision_attempt != attempt - 1
-            or retry_state.last_decision_retry is not True
-        ):
-            raise RuntimeError("failed attempt lacks exact prior retry authorization")
-        retry_state, plan = _transition_failure(
-            retry_state,
-            failure,
-            chosen=chosen,
-            candidates=candidates,
-            managed_cache_mounted=_managed_cache_mounted(spec, retry_state, chosen),
-            attempt=attempt,
-        )
+        else:
+            previous = retry_state.last_decision
+            if (
+                previous is None
+                or previous.attempt != attempt - 1
+                or previous.plan.retry is not True
+            ):
+                raise RuntimeError("failed attempt lacks exact prior retry authorization")
+        retry_state, plan = transition_failure(retry_state, observation, attempt=attempt)
         snapshot = retry_state.to_snapshot()
-        state._save_status_unlocked(_runstatus_from_json(raw), _retry_state=snapshot)
-        return AtomicRetryDecision(retry_state, snapshot, plan)
+        state._save_status_unlocked(
+            _runstatus_from_json(raw),
+            _retry_state=snapshot,
+            _active_launch_claim=None,
+        )
+        from flash.runner.lifecycle import claim_lock
+
+        claim_lock.release(run_id, claim_token)
+        return ObservedRetryDecision.persisted(AtomicRetryDecision(snapshot, plan))

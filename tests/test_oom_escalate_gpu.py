@@ -336,33 +336,6 @@ def test_non_sft_oom_escalation_still_uses_every_rented_card():
     assert _strictly_larger_candidates([fallback], _candidate_usable_vram_gb(failed)) == ()
 
 
-def test_retry_floor_and_filter_use_one_executed_width_scale():
-    from flash.providers.core.allocator import _executed_width, _fitting_candidates
-    from flash.providers.core.base import Candidate
-    from flash.runner.supervise.retry_decision import RetryState, _transition_failure
-
-    failed = _fitting_candidates(
-        [Candidate("runpod", "RTX 4090", 0.69, 24, 4)],
-        35,
-        _executed_width("sft", {"batch_size": 8}, {"sft_retained_examples": 10}),
-    )[0]
-    larger = Candidate("runpod", "A100 SXM 40GB", 1.0, 40, 1)
-    state = RetryState(infra_retries=0, oom_retries=1, cache_retries=0)
-
-    state, decision = _transition_failure(
-        state,
-        "oom",
-        chosen=failed,
-        candidates=(failed, larger),
-        managed_cache_mounted=False,
-        attempt=0,
-    )
-
-    assert decision.retry
-    assert state.usable_vram_floor == pytest.approx(35.2)
-    assert state.select_candidate((failed, larger))[1] is larger
-
-
 def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
     """The escalation filter must measure candidates the way the allocator sized them.
 

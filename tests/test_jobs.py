@@ -72,14 +72,17 @@ def _runpod_handle_dict(
     attempt=0,
     started_ts=1.0,
 ):
-    return _runpod_handle(
-        jobs,
-        endpoint_id=endpoint_id,
-        endpoint_name=endpoint_name,
-        job_id=job_id,
-        attempt=attempt,
-        started_ts=started_ts,
-    ).to_dict()
+    return {
+        **_runpod_handle(
+            jobs,
+            endpoint_id=endpoint_id,
+            endpoint_name=endpoint_name,
+            job_id=job_id,
+            attempt=attempt,
+            started_ts=started_ts,
+        ).to_dict(),
+        "launch_claim_token": f"claim-{attempt}",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3830,6 +3833,7 @@ def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypa
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "job",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                 },
                 source_snapshot=_SOURCE_SNAPSHOT,
@@ -3925,6 +3929,7 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "job",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                     "allocated_gpu": "RTX 4090",
                     "allocated_gpu_count": 1,
@@ -4018,6 +4023,7 @@ def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "job",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                     "allocated_gpu": "RTX 4090",
                     "allocated_gpu_count": 1,
@@ -4088,6 +4094,7 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "job",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
         }
         runner_state._save_status(
@@ -4123,6 +4130,7 @@ def test_attach_setup_failure_does_not_overwrite_concurrent_cancel(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "job",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
         }
         runner_state._save_status(
@@ -4169,6 +4177,7 @@ def test_attach_setup_failure_does_not_steal_precommit_cancel(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "job",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
         }
         runner_state._save_status(
@@ -4569,8 +4578,7 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
 
 
 def test_supervisor_marks_on_last_gpu_on_the_largest_survivor(monkeypatch):
-    # on_last_gpu remains a queue-grace timing input: false while a strictly larger candidate exists,
-    # then true on the largest surviving candidate.
+    # on_last_gpu stays false for the cached attempt while its exact cacheless fallback remains.
     import dataclasses
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -4627,10 +4635,9 @@ def test_supervisor_marks_on_last_gpu_on_the_largest_survivor(monkeypatch):
         runner_submit.submit_job(spec, dry_run=False, background=False)
 
         assert runner_status.get_status("lastgpu").state == "done"
-        assert last_flags == [False, True]
-        # The winning (last) attempt persisted on_last_gpu into the handle so a reattach reproduces
-        # its stall tuning (see test_reattach_poll_reproduces_persisted_on_last_gpu).
-        assert runner_status.get_status("lastgpu").remote.get("on_last_gpu") is True
+        assert last_flags == [False, False]
+        # the cached attempt keeps ordinary queue grace because its exact cacheless fallback remains.
+        assert runner_status.get_status("lastgpu").remote.get("on_last_gpu") is False
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
@@ -4770,6 +4777,7 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
                 "allocated_gpu": "RTX 5090",
                 "on_last_gpu": True,
                 "attempt": 2,
+                "launch_claim_token": "claim-2",
                 "started_ts": 1.0,
             },
         )
@@ -4906,6 +4914,7 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "job-1",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                 },
                 deployment={"state": "ready"},
@@ -4969,6 +4978,7 @@ def test_cancel_uses_rest_handle(monkeypatch):
                 "key_fingerprint": _RUNPOD_FINGERPRINT,
                 "job_id": "jX",
                 "attempt": 0,
+                "launch_claim_token": "claim-0",
                 "started_ts": 1.0,
             },
         )
@@ -5014,6 +5024,7 @@ def test_attach_completes_run(monkeypatch):
                 "job_id": "jA",
                 "on_last_gpu": False,
                 "attempt": 0,
+                "launch_claim_token": "claim-0",
                 "started_ts": 1.0,
                 "allocated_gpu": "RTX 4090",
                 "allocated_gpu_count": 1,
@@ -5055,6 +5066,7 @@ def test_attach_cleanup_survives_unreadable_final_status(monkeypatch):
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "j-finally",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                 },
             )
@@ -5111,6 +5123,7 @@ def test_attach_confirmed_cancel_survives_unreadable_cleanup_status(monkeypatch)
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "j-cancel",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                 },
             )
@@ -5166,6 +5179,7 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "j-stale",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
             "allocated_gpu": "RTX 4090",
             "allocated_gpu_count": 1,
@@ -5253,6 +5267,7 @@ def test_attach_unparseable_spec_fails_closed_and_tears_down(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "jBad",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
         }
         from dataclasses import replace
@@ -5314,6 +5329,7 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
                 "job_id": "jA",
                 "on_last_gpu": False,
                 "attempt": 0,
+                "launch_claim_token": "claim-0",
                 "started_ts": 1.0,
                 "allocated_gpu": "RTX 4090",
                 "allocated_gpu_count": 1,
@@ -5338,7 +5354,9 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
             prior_cost,
             runtime_secrets=None,
             source_snapshot=None,
+            reserved_claim=None,
         ):
+            assert reserved_claim is not None
             seen["remote"] = runner_status.get_status(spec.run_id).remote
             seen["source_snapshot"] = source_snapshot
             runner_status._update(spec.run_id, "done", cost_usd=prior_cost)
@@ -5376,6 +5394,7 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
                     "job_id": "jA",
                     "on_last_gpu": True,
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                     "allocated_gpu": "RTX 4090",
                     "allocated_gpu_count": 1,
@@ -5422,6 +5441,7 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
                 "job_id": "jA",
                 "on_last_gpu": False,
                 "attempt": 0,
+                "launch_claim_token": "claim-0",
                 "started_ts": 1.0,
                 "allocated_gpu": "RTX 4090",
                 "allocated_gpu_count": 1,
@@ -5445,7 +5465,9 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
             prior_cost,
             runtime_secrets=None,
             source_snapshot=None,
+            reserved_claim=None,
         ):
+            assert reserved_claim is not None
             seen["prior_cost"] = prior_cost
             seen["source_snapshot"] = source_snapshot
             runner_status._update(spec.run_id, "done", cost_usd=prior_cost)
@@ -5475,6 +5497,7 @@ def test_attach_worker_error_fails_without_replacement(monkeypatch):
             "job_id": "jA",
             "on_last_gpu": False,
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
             "allocated_gpu": "RTX 4090",
             "allocated_gpu_count": 1,
@@ -5527,6 +5550,7 @@ def test_attach_does_not_resume_over_unconfirmed_runpod_teardown(
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "job-old",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
             "allocated_gpu": "RTX 4090",
             "allocated_gpu_count": 1,
@@ -5606,6 +5630,7 @@ def test_attach_preserves_newer_remote_before_compare_and_clear(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "job-old",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
             "allocated_gpu": "RTX 4090",
             "allocated_gpu_count": 1,
@@ -5686,6 +5711,7 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch, rema
                     "gpu": "RTX 4090",
                     "hourly_usd": 0.5,
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                     "allocated_gpu": "RTX 4090",
                     "allocated_gpu_count": 1,
@@ -5761,6 +5787,7 @@ def _vast_recovery_remote(instance_id=101, attempt=0):
         "gpu": "RTX 4090",
         "hourly_usd": 0.5,
         "attempt": attempt,
+        "launch_claim_token": f"claim-{attempt}",
         "started_ts": 100.0,
     }
 
@@ -5868,11 +5895,27 @@ def test_attach_reconciliation_cleans_endpoint_after_background_completion(monke
 def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
+        from dataclasses import replace
+
         import flash.runner.supervise.attach as attach_mod
         from flash.providers.core import registry as providers
+        from flash.runner.supervise.retry_decision import (
+            PersistedRetryDecision,
+            RetryPlan,
+            RetryState,
+        )
 
         remote = _vast_recovery_remote()
         spec = _spec("vast-reconcile-clear")
+        retry_state = replace(
+            RetryState.initial_for_spec(spec),
+            infra_used=1,
+            last_decision=PersistedRetryDecision(
+                0,
+                "stalled",
+                RetryPlan(True, "retrying", infra_retry_ordinal=1),
+            ),
+        )
         runner_state._save_status(
             runner_state.RunStatus(
                 run_id=spec.run_id,
@@ -5880,7 +5923,9 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
                 spec=spec.to_dict(),
                 remote=remote,
                 source_snapshot=_SOURCE_SNAPSHOT,
-            )
+            ),
+            _next_attempt=1,
+            _retry_state=retry_state.to_snapshot(),
         )
 
         class Provider:
@@ -5893,11 +5938,13 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
         monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
         resumed = []
-        monkeypatch.setattr(
-            runner_lifecycle,
-            "_run_training",
-            lambda *args, **kwargs: resumed.append(1),
-        )
+
+        def resume_training(*_args, **kwargs):
+            assert kwargs["reserved_claim"].attempt == 1
+            resumed.append(1)
+            runner_status._update(spec.run_id, "running")
+
+        monkeypatch.setattr(runner_lifecycle, "_run_training", resume_training)
 
         attach_mod._reconcile_attached_remote(
             spec.run_id,
