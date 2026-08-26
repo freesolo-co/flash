@@ -27,9 +27,32 @@ from flash.serving.src.stream_channel.protocol import (
 _T = TypeVar("_T")
 
 
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+
 def _consume_task_result(task: asyncio.Task[Any]) -> None:
     with contextlib.suppress(asyncio.CancelledError, Exception):
         task.exception()
+
+
+def _retain_background_task(task: asyncio.Task[Any]) -> None:
+    _BACKGROUND_TASKS.add(task)
+
+    def finish(completed: asyncio.Task[Any]) -> None:
+        _consume_task_result(completed)
+        _BACKGROUND_TASKS.discard(completed)
+
+    task.add_done_callback(finish)
+
+
+async def _stop_task(task: asyncio.Task[Any]) -> None:
+    if not task.done():
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
+        if not done:
+            _retain_background_task(task)
+            return
+    _consume_task_result(task)
 
 
 class _LeaseWatch:
@@ -123,12 +146,7 @@ class _LeaseWatch:
             if abort is not None:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(abort(), timeout=CLEANUP_SECONDS)
-            operation_task.cancel()
-            done, _ = await asyncio.wait({operation_task}, timeout=CLEANUP_SECONDS)
-            if done:
-                await asyncio.gather(operation_task, return_exceptions=True)
-            else:
-                operation_task.add_done_callback(_consume_task_result)
+            await _stop_task(operation_task)
 
         try:
             self.check()
@@ -158,8 +176,9 @@ class _LeaseWatch:
     async def close(self) -> None:
         if self._task is None:
             return
-        self._task.cancel()
-        await asyncio.gather(self._task, return_exceptions=True)
+        task = self._task
+        self._task = None
+        await _stop_task(task)
 
 
 async def _close_stream(stream: Any) -> None:
@@ -202,9 +221,7 @@ async def _finish_cleanup(operation: Awaitable[Any]) -> asyncio.CancelledError |
         task.cancel()
     except Exception:
         pass
-    if not task.done():
-        task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    await _stop_task(task)
     return cancellation
 
 

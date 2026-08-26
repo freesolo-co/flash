@@ -25,10 +25,32 @@ from flash.serving.src.stream_channel.protocol import (
     StreamChannelError,
 )
 
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
 
 def _consume_task_result(task: asyncio.Task[Any]) -> None:
     with contextlib.suppress(asyncio.CancelledError, Exception):
         task.exception()
+
+
+def _retain_background_task(task: asyncio.Task[Any]) -> None:
+    _BACKGROUND_TASKS.add(task)
+
+    def finish(completed: asyncio.Task[Any]) -> None:
+        _consume_task_result(completed)
+        _BACKGROUND_TASKS.discard(completed)
+
+    task.add_done_callback(finish)
+
+
+async def _stop_task(task: asyncio.Task[Any]) -> None:
+    if not task.done():
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
+        if not done:
+            _retain_background_task(task)
+            return
+    _consume_task_result(task)
 
 
 async def _cancel_spawn_task_result(
@@ -40,7 +62,7 @@ async def _cancel_spawn_task_result(
     except (asyncio.CancelledError, Exception):
         return
     with contextlib.suppress(Exception):
-        await _bounded_shield(cancel(call), CALL_RESULT_SECONDS)
+        await cancel(call)
 
 
 def _schedule_spawn_result_cancel(
@@ -48,7 +70,7 @@ def _schedule_spawn_result_cancel(
     cancel: Callable[[Any], Awaitable[None]],
 ) -> None:
     cleanup = asyncio.create_task(_cancel_spawn_task_result(task, cancel))
-    cleanup.add_done_callback(_consume_task_result)
+    _retain_background_task(cleanup)
 
 
 async def _bounded_shield(operation: Awaitable[Any], deadline_seconds: float) -> None:
@@ -56,12 +78,7 @@ async def _bounded_shield(operation: Awaitable[Any], deadline_seconds: float) ->
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=deadline_seconds)
     except (TimeoutError, asyncio.CancelledError):
-        task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
-        if done:
-            await asyncio.gather(task, return_exceptions=True)
-        else:
-            task.add_done_callback(_consume_task_result)
+        await _stop_task(task)
         raise
 
 
@@ -88,9 +105,10 @@ async def _spawn_cancellation_safe(
                 task.add_done_callback(
                     lambda completed: _schedule_spawn_result_cancel(completed, cancel)
                 )
+                _retain_background_task(task)
             raise cancellation from None
         with contextlib.suppress(Exception):
-            await _bounded_shield(cancel(call), CALL_RESULT_SECONDS)
+            await cancel(call)
         raise cancellation
 
 
@@ -145,16 +163,15 @@ class _ControlWriter:
             return
         self._cancelled = True
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(self._write("cancel"), timeout=CLEANUP_SECONDS)
+            await _bounded_shield(self._write("cancel"), CLEANUP_SECONDS)
 
     async def stop_heartbeats(self) -> None:
         self._stopped.set()
         task = self._heartbeat_task
         if task is None:
             return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
         self._heartbeat_task = None
+        await _stop_task(task)
 
     async def _write(self, kind: str) -> None:
         async with self._lock:
@@ -255,8 +272,10 @@ class CancellableStreamChannel:
                 function_call_id = getattr(spawned, "object_id", None)
                 if isinstance(function_call_id, str) and function_call_id:
                     control.bind(function_call_id)
-                await control.cancel()
-                await _cancel_call(spawned)
+                try:
+                    await _cancel_call(spawned)
+                finally:
+                    await control.cancel()
 
             try:
                 await control.initial()
@@ -300,12 +319,13 @@ class CancellableStreamChannel:
                         if envelope.terminal:
                             if envelope.kind == "error":
                                 try:
-                                    await self._call_result(call_result_task)
+                                    manifest = await self._call_result(call_result_task)
                                 except StreamChannelError:
                                     raise
                                 except Exception:
                                     completed = True
                                     raise
+                                validator.reconcile(manifest)
                                 completed = True
                                 raise StreamChannelError(
                                     envelope.error_code or ChannelErrorCode.CHANNEL_FAULT,
@@ -345,15 +365,15 @@ class CancellableStreamChannel:
                                 "function completed before terminal data became visible",
                             )
             finally:
-                await control.stop_heartbeats()
+                if not completed and call is not None:
+                    with contextlib.suppress(Exception):
+                        await _cancel_call(call)
                 if not completed:
                     await control.cancel()
-                    if call is not None:
-                        with contextlib.suppress(Exception):
-                            await _cancel_call(call)
-                if call_result_task is not None and not call_result_task.done():
-                    call_result_task.cancel()
-                    await asyncio.gather(call_result_task, return_exceptions=True)
+                else:
+                    await control.stop_heartbeats()
+                if call_result_task is not None:
+                    await _stop_task(call_result_task)
                 await _clear_partition(queue, DATA_PARTITION)
                 await _clear_partition(queue, CONTROL_PARTITION)
 

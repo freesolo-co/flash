@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -283,7 +284,12 @@ def validate_control(value: Any) -> ControlEnvelope:
     if call_id is not None:
         call_id = _string(call_id, label="function call id")
     lease = raw["lease_deadline_unix"]
-    if not isinstance(lease, (int, float)) or isinstance(lease, bool) or lease <= 0:
+    if (
+        not isinstance(lease, (int, float))
+        or isinstance(lease, bool)
+        or not math.isfinite(lease)
+        or lease <= 0
+    ):
         raise StreamChannelError(ChannelErrorCode.PROTOCOL_ERROR, "invalid lease deadline")
     return ControlEnvelope(
         kind=kind,
