@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import types
 
 import pytest
@@ -29,6 +30,7 @@ import flash.serve.contract.errors as serving_errors
 from flash.providers.runpod.serverless.endpoints import (
     _run_suffix,
     _select_endpoint_resources,
+    attempt_suffix,
     endpoint_name,
 )
 from tests._helpers.runner import provisioned_status
@@ -46,8 +48,25 @@ def _remote(endpoint_id, job_id, attempt):
         "key_fingerprint": _RUNPOD_FINGERPRINT,
         "job_id": job_id,
         "attempt": attempt,
+        "fence": attempt + 1,
         "started_ts": float(attempt + 1),
     }
+
+
+def _attempt_record(attempt, fence):
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    now = time.time()
+    return AttemptRecord(
+        attempt_id=attempt,
+        fence=fence,
+        state="active",
+        reserved_at=now,
+        grant_deadline_at=now + 60,
+        work_deadline_at=now + 120,
+        run_deadline_at=now + 180,
+        result_deadline_at=now + 240,
+    ).to_dict()
 
 
 def _res(name):
@@ -114,11 +133,14 @@ def test_isolate_flash_state_resets_runpod_flash_manager_on_scope_change(tmp_pat
 
 
 def test_select_matches_live_prefixed_endpoint():
-    target = endpoint_name("RTX 5090", _run_suffix("flash-123-c220526e"))  # flash-5090-c220526e
+    run_id = "flash-123-c220526e"
+    target = endpoint_name("RTX 5090", _run_suffix(run_id))
     resources = {
-        "u1": _res(f"live-{target}"),  # the live-provisioned resource for this run
-        "u2": _res("flash-5090-deadbeef"),  # a different run
-        "u3": _res("live-flash-4090-c220526e"),  # different GPU class
+        "u1": _res(f"live-{endpoint_name('RTX 5090', attempt_suffix(run_id, 0))}"),
+        "u2": _res(target),
+        "u3": _res(f"{target}-r1"),
+        "u4": _res("flash-5090-deadbeef-a0"),
+        "u5": _res(f"live-flash-4090-{attempt_suffix(run_id, 0)}"),
     }
     assert _select_endpoint_resources(resources, target) == ["u1"]
 
@@ -538,8 +560,7 @@ def test_terminate_endpoint_from_async_context_does_not_raise(monkeypatch):
 
     run_id = "flash-1-abcd1234"
     friendly = canonical_gpu("RTX 5090")
-    target = endpoint_name(friendly, _run_suffix(run_id))
-    resource_name = f"live-{target}"
+    resource_name = f"live-{endpoint_name(friendly, attempt_suffix(run_id, 0))}"
 
     monkeypatch.setattr(auth, "ensure_auth", lambda: None)
     monkeypatch.setattr(ep_mod, "isolate_flash_state", lambda _: None)
@@ -637,7 +658,7 @@ def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-retry"})
-    remote = {**_remote("endpoint-exact", "job-exact", 7), "seed": 42}
+    remote = _remote("endpoint-exact", "job-exact", 7)
     runner_state._save_status(provisioned_status(spec, state="running", remote=remote))
     events = []
 
@@ -771,17 +792,16 @@ def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path,
 # Recovery TOCTOU: a run flipped terminal mid-recovery must not submit paid work
 # ---------------------------------------------------------------------------
 def _make_poll_provider(monkeypatch, *, on_poll):
-    """Wire flash.providers.get_provider to a stub provider whose poll() runs ``on_poll``.
-
-    Also no-ops _gc_run_endpoints so attach_run's teardown doesn't reach the real SDK.
-    """
+    """Wire a stub poller and confirm its exact teardown without reaching a provider api."""
     from flash.providers.core import registry as providers
 
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda *a, **k: None)
+    monkeypatch.setattr(runner_lifecycle, "_attempt_result_metrics", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", lambda *_a, **_k: True)
 
     class _StubProvider:
-        def poll(self, handle, spec, seed, *, log=None, _deadline_at=None):
-            return on_poll(handle, spec, seed)
+        def poll_attempt(self, handle, spec, *, log=None, _deadline_at=None):
+            return on_poll(handle, spec)
 
         def cancel(self, _handle):
             return None
@@ -803,11 +823,13 @@ def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkey
     from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-race-terminal"})
+    remote = _remote("ep-1", "job-1", 0)
     st = runner_state.RunStatus(
         run_id=spec.run_id,
         state="running",
         spec=spec.to_dict(),
-        remote=_remote("ep-1", "job-1", 0),
+        remote=remote,
+        attempt=_attempt_record(remote["attempt"], remote["fence"]),
     )
     runner_state._save_status(st)
 
@@ -821,7 +843,7 @@ def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkey
 
     from flash.providers.core.base import PollResult
 
-    def racing_poll(handle, spec, seed):
+    def racing_poll(handle, spec):
         # A concurrent recovery/cancel flips the run terminal AFTER attach_run's initial check
         # (top of attach_run) but BEFORE the not-ok recovery resume below.
         runner_status._update(spec.run_id, "failed", error="raced terminal by another thread")
@@ -846,7 +868,13 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
     from flash.core.spec import JobSpec
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-recover-active"})
-    st = provisioned_status(spec, state="running", remote=_remote("ep-1", "job-1", 0))
+    remote = _remote("ep-1", "job-1", 0)
+    st = provisioned_status(
+        spec,
+        state="running",
+        remote=remote,
+        attempt=_attempt_record(remote["attempt"], remote["fence"]),
+    )
     st.source_snapshot = _SOURCE_SNAPSHOT
     runner_state._save_status(st)
 
@@ -860,7 +888,7 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
 
     _make_poll_provider(
         monkeypatch,
-        on_poll=lambda h, s, seed: PollResult(False, failure="stalled", detail="redeploy"),
+        on_poll=lambda h, s: PollResult(False, failure="stalled", detail="redeploy"),
     )
 
     out = runner_attach.attach_run(spec.run_id)
@@ -872,7 +900,7 @@ def test_run_training_bails_on_terminal_before_paid_work(tmp_path, monkeypatch):
     """Defense in depth: _run_training's own pre-submit guard bails on ANY terminal state
     (not just `cancelled`). If the run is terminal when training is entered — e.g. a concurrent
     thread marked it `done`/`failed` after the caller decided to resume — it must raise
-    _RunCancelled and never call _submit_seed_supervised (the paid GPU submit)."""
+    _RunCancelled and never call _run_attempts_supervised (the paid GPU submit)."""
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     from flash.core.spec import JobSpec
@@ -886,7 +914,7 @@ def test_run_training_bails_on_terminal_before_paid_work(tmp_path, monkeypatch):
     submitted = {"n": 0}
     monkeypatch.setattr(
         runner_lifecycle,
-        "_submit_seed_supervised",
+        "_run_attempts_supervised",
         lambda *a, **k: submitted.__setitem__("n", submitted["n"] + 1),
     )
 
@@ -2139,7 +2167,7 @@ def _fake_sdk_with_orphan(monkeypatch, *, rest_find, rest_delete, resources=None
             monkeypatch.setitem(sys.modules, mod_name, stub)
     monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", fake_rm_mod)
 
-    target = endpoint_name(canonical_gpu("RTX 5090"), _run_suffix("flash-q-1"))
+    target = endpoint_name(canonical_gpu("RTX 5090"), attempt_suffix("flash-q-1", 0))
     monkeypatch.setattr(
         runpod_api, "list_endpoints_by_key", lambda: ({_RUNPOD_FINGERPRINT: rest_find(target)}, [])
     )
@@ -2200,7 +2228,7 @@ def test_terminate_keeps_undeploy_failures_when_rest_enumeration_is_unreachable(
 
     _fake_sdk_with_orphan(
         monkeypatch,
-        resources={"u1": _res(f"live-{endpoint_name('RTX 5090', _run_suffix('flash-q-1'))}")},
+        resources={"u1": _res(f"live-{endpoint_name('RTX 5090', attempt_suffix('flash-q-1', 0))}")},
         undeploy=_undeploy_boom,
         rest_find=_enumeration_down,
         rest_delete=lambda _eid: True,

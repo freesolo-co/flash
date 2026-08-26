@@ -50,11 +50,11 @@ _RUNNING = {"IN_PROGRESS"}
 _NO_CAPACITY_GRACE_S = 420.0
 # A worker that RunPod allocated and then marked unhealthy is a broken image, not a cold DC, and no
 # amount of waiting fixes it. Without its own timer that case reads as "capacity found" forever and
-# holds a paid endpoint for the whole _PRELOAD_TIMEOUT_S. Matches poll_job's unhealthy_grace_s, which
+# holds a paid endpoint for the whole _PRELOAD_TIMEOUT_S. Matches poll_attempt's unhealthy_grace_s, which
 # calls the same condition a failed image pull and retries on a fresh endpoint.
 _UNHEALTHY_GRACE_S = 240.0
 # Boxes held throttled with nothing usable are RunPod declining to schedule the pinned class here.
-# Matches poll_job's throttled_grace_s, which calls the same condition no_capacity and walks to the
+# Matches poll_attempt's throttled_grace_s, which calls the same condition no_capacity and walks to the
 # next-best GPU. Longer than the unhealthy grace because throttling can still come good.
 _THROTTLED_GRACE_S = 300.0
 
@@ -112,7 +112,7 @@ def _only_unhealthy_workers(workers: dict | None) -> bool:
     """True when every box this datacenter gave us failed to start.
 
     A throttled box is capacity contention, not a failed image: it may still become runnable, and
-    ``poll_job`` gives it its own longer grace. Calling a mixed unhealthy+throttled endpoint a
+    ``poll_attempt`` gives it its own longer grace. Calling a mixed unhealthy+throttled endpoint a
     broken image would tear it down at the shorter grace and blame a failed image pull for what is
     actually a busy datacenter.
     """
@@ -124,7 +124,7 @@ def _only_unhealthy_workers(workers: dict | None) -> bool:
 
 
 def _throttled_workers(workers: dict | None) -> bool:
-    """True while RunPod is holding boxes throttled with nothing usable -- the same call ``poll_job``
+    """True while RunPod is holding boxes throttled with nothing usable -- the same call ``poll_attempt``
 
     A mixed unhealthy+throttled endpoint sits in the one gap the other two timers leave:
     ``_has_worker`` counts the unhealthy box as allocated capacity so the starvation timer resets,
@@ -261,7 +261,7 @@ def _poll_until_done(
     poll_interval_s: float,
 ) -> dict:
     deadline = _preload().time.time() + timeout_s
-    # Same GraceTimer poll_job runs, for the same reason: each grace is measured over an UNBROKEN
+    # Same GraceTimer poll_attempt runs, for the same reason: each grace is measured over an UNBROKEN
     # run of confirmed readings, so it arms on the first such reading rather than at launch. Timing
     # from launch would let an unreadable health API age a timer silently, and the first definite
     # reading after that would fire instantly -- deleting an endpoint whose download may be
@@ -290,7 +290,7 @@ def _poll_until_done(
             # after an interruption it must serve a FRESH grace window: carrying the old anchor
             # forward would charge the whole running interval to starvation and the first
             # zero-worker reading after the re-queue would delete an endpoint that never actually
-            # waited on capacity. Same reasoning as poll_job clearing its in-queue timers.
+            # waited on capacity. Same reasoning as poll_attempt clearing its in-queue timers.
             starved.since = unhealthy.since = throttled.since = None
         # Health is re-read on EVERY queued poll rather than latched off after the first
         # worker sighting. A box that is reported and then reclaimed while the job is
@@ -335,7 +335,7 @@ def _poll_until_done(
                     )
                 # Throttled boxes count as allocated capacity above and block the unhealthy timer,
                 # so without this a mixed unhealthy+throttled endpoint clears both every poll and
-                # burns the whole timeout. Same call poll_job makes: RunPod is not scheduling here.
+                # burns the whole timeout. Same call poll_attempt makes: RunPod is not scheduling here.
                 if throttled.expired(
                     _throttled_workers(workers), now, _preload()._THROTTLED_GRACE_S
                 ):

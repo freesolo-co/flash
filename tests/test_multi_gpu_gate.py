@@ -456,7 +456,7 @@ def test_vast_rejects_an_offer_whose_card_count_disagrees():
 
 
 def test_lambda_submit_requests_the_allocated_card_count():
-    """``submit_run_lambda`` must ask for gpu.count cards, not one.
+    """``submit_attempt_lambda`` must ask for gpu.count cards, not one.
 
     This is the expensive half of the contract: the worker spawns gpu.count ranks regardless, so a
     single-card rental oversubscribes one card while the run bills for the full wall time.
@@ -473,9 +473,8 @@ def test_lambda_submit_requests_the_allocated_card_count():
     try:
         monkey.setattr(lj, "usable_instances", fake_usable)
         with pytest.raises(lj.lambda_api.LambdaApiError):
-            lj.submit_run_lambda(
+            lj.submit_attempt_lambda(
                 _submittable("grpo", count=4, provider="lambda"),
-                42,
                 deadline_at=9_999_999_999.0,
             )
     finally:
@@ -484,7 +483,7 @@ def test_lambda_submit_requests_the_allocated_card_count():
 
 
 def test_vast_submit_requests_the_allocated_card_count():
-    """``submit_run_vast`` must search for gpu.count cards, not one. Same billing exposure."""
+    """``submit_attempt_vast`` must search for gpu.count cards, not one. Same billing exposure."""
     import flash.providers.vast.jobs as vj
 
     seen: dict = {}
@@ -497,9 +496,8 @@ def test_vast_submit_requests_the_allocated_card_count():
     try:
         monkey.setattr(vj, "usable_offers", fake_offers)
         with pytest.raises(vj.vast_api.VastApiError):
-            vj.submit_run_vast(
+            vj.submit_attempt_vast(
                 _submittable("grpo", count=4, provider="vast"),
-                42,
                 deadline_at=9_999_999_999.0,
             )
     finally:

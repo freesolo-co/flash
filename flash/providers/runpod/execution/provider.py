@@ -71,10 +71,9 @@ class RunpodProvider:
             for count in rentable_gpu_counts(constraints.max_gpu_count)
         ]
 
-    def submit_run(
+    def submit_attempt(
         self,
         spec,
-        seed: int,
         *,
         log: Any = None,
         on_handle: Any = None,
@@ -85,10 +84,8 @@ class RunpodProvider:
         source_snapshot: dict | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        from flash.core.spec import require_matching_seed
-        from flash.providers.runpod.execution.job_execution import submit_run
+        from flash.providers.runpod.execution.job_execution import submit_attempt
 
-        seed = require_matching_seed(spec, seed)
         kwargs = {
             "log": log,
             "on_handle": on_handle,
@@ -96,27 +93,25 @@ class RunpodProvider:
             "fence": fence,
             "on_last_gpu": on_last_gpu,
             "source_snapshot": source_snapshot,
-            **deadline_kwargs(submit_run, _deadline_at),
+            **deadline_kwargs(submit_attempt, _deadline_at),
         }
         if runtime_secrets:
             kwargs["runtime_secrets"] = runtime_secrets
-        return submit_run(spec, seed, **kwargs)
+        return submit_attempt(spec, **kwargs)
 
-    def poll(
+    def poll_attempt(
         self,
         handle: JobHandle,
         spec,
-        seed: int,
         *,
         log: Any = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        from flash.core.spec import gpu_count_of, require_matching_seed
+        from flash.core.spec import gpu_count_of
         from flash.providers.runpod.execution import polling as runpod_polling
         from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
         from flash.providers.runpod.execution.jobs import capacity_wait_kwargs
 
-        seed = require_matching_seed(spec, seed)
         hd = handle.to_dict()
         rh = RunpodJobHandle.from_dict(hd)
         if not rh.job_id:
@@ -124,11 +119,11 @@ class RunpodProvider:
         if log is not None:
             print(f"attaching: job={rh.job_id} endpoint={rh.endpoint_name}", file=log, flush=True)
         on_last_gpu = bool(hd.get("on_last_gpu", False))
-        return runpod_polling.poll_job(
+        return runpod_polling.poll_attempt(
             rh,
             spec,
             log=log,
-            **deadline_kwargs(runpod_polling.poll_job, _deadline_at),
+            **deadline_kwargs(runpod_polling.poll_attempt, _deadline_at),
             # the persisted scarcity flag controls queue grace, not capacity wording. recovery
             # rebuilds the unpinned allocation with a fresh candidate set, so claiming no escalation
             # remains would be false.

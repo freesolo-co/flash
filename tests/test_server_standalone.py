@@ -637,7 +637,7 @@ def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
 
     monkeypatch.setenv("GITHUB_TOKEN", "  \t ")
     monkeypatch.setenv("HF_TOKEN", " hf_real ")
-    env = build_worker_env(spec, 0)
+    env = build_worker_env(spec)
     assert "GITHUB_TOKEN" not in env
     # the real token still travels, stripped: this is a blank-only rejection, not a blanket one.
     assert env["HF_TOKEN"] == "hf_real"

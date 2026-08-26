@@ -78,8 +78,10 @@ def _build_payload(builders, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
     kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
+    if len(args) < 2:
+        kwargs.setdefault("attempt", 0)
     kwargs.setdefault("fence", 1)
-    attempt_id = kwargs.get("attempt", args[2] if len(args) > 2 else 0)
+    attempt_id = kwargs.get("attempt", args[1] if len(args) > 1 else 0)
     deadline_at = kwargs["deadline_at"]
     attempt = _instance_attempt(
         provider="lambda",
@@ -89,7 +91,10 @@ def _build_payload(builders, *args, **kwargs):
         attempt_id=attempt_id,
         fence=kwargs["fence"],
     )
-    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
+    with patch(
+        "flash.runner.lifecycle.status.get_status",
+        return_value=SimpleNamespace(attempt=attempt.to_dict()),
+    ):
         return builders.build_payload(*args, **kwargs)
 
 
@@ -97,6 +102,7 @@ def _launch(jobs, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
     kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
+    kwargs.setdefault("attempt", 0)
     kwargs.setdefault("fence", 1)
     deadline_at = kwargs["deadline_at"]
     attempt = _instance_attempt(
@@ -107,7 +113,10 @@ def _launch(jobs, *args, **kwargs):
         attempt_id=kwargs.get("attempt", 0),
         fence=kwargs["fence"],
     )
-    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
+    with patch(
+        "flash.runner.lifecycle.status.get_status",
+        return_value=SimpleNamespace(attempt=attempt.to_dict()),
+    ):
         return jobs.launch_and_submit(*args, **kwargs)
 
 
@@ -115,6 +124,7 @@ def _submit(jobs, *args, **kwargs):
     if "deadline_at" not in kwargs:
         kwargs["deadline_at"] = _deadline_at()
     kwargs.setdefault("source_snapshot", SOURCE_SNAPSHOT)
+    kwargs.setdefault("attempt", 0)
     kwargs.setdefault("fence", 1)
     deadline_at = kwargs["deadline_at"]
     attempt = _instance_attempt(
@@ -125,8 +135,11 @@ def _submit(jobs, *args, **kwargs):
         attempt_id=kwargs.get("attempt", 0),
         fence=kwargs["fence"],
     )
-    with patch("flash.runner.lifecycle.status.get_status", return_value=SimpleNamespace(attempt=attempt.to_dict())):
-        return jobs.submit_run_lambda(*args, **kwargs)
+    with patch(
+        "flash.runner.lifecycle.status.get_status",
+        return_value=SimpleNamespace(attempt=attempt.to_dict()),
+    ):
+        return jobs.submit_attempt_lambda(*args, **kwargs)
 
 
 def _inst(gpu="A10", region="us-east-1", itype="gpu_1x_a10", price=1.29, disk_gb=None):
@@ -149,7 +162,7 @@ def _handle(started_ts=10_000.0, rate=1.29):
         instance_id="i-9999",
         instance_type="gpu_1x_a10",
         region="us-east-1",
-        name="flash-x-s0-a0",
+        name="flash-x-a0",
         gpu="A10",
         hourly_usd=rate,
         attempt=0,
@@ -167,7 +180,7 @@ def test_user_data_ships_payload_and_runs_worker_image(monkeypatch):
     monkeypatch.setenv("LAMBDA_API_KEY", "lk-supersecret")
     monkeypatch.setenv("HF_TOKEN", "hf-worker-token")
     deadline_at = time.time() + 3600
-    payload = _build_payload(builders, _spec(), seed=0, attempt=1, deadline_at=deadline_at)
+    payload = _build_payload(builders, _spec(), attempt=1, deadline_at=deadline_at)
     assert payload["phase"] == "sft"
     assert payload["attempt"] == 1
     assert payload["hf_prefix"] == "sft/flash-1700000000-abcd1234"
@@ -229,7 +242,7 @@ def test_user_data_skips_capacity_for_baked_image_default(monkeypatch):
     """build_user_data always uses the baked WORKER_IMAGE (no per-host stack install)."""
     from flash.providers.lambda_.jobs import builders
 
-    payload = _build_payload(builders, _spec(), seed=0, attempt=0)
+    payload = _build_payload(builders, _spec(), attempt=0)
     script = builders.build_user_data(payload)
     # No base training-stack pip install in the cloud-init (the image is baked); only the worker
     # container's own per-run extra_pip runs (inside _bootstrap, not the host script).
@@ -248,7 +261,7 @@ def test_image_per_sm_selects_arch_tag():
     # a baked GPU class appends the arch tag by default, and it lands in the cloud-init
     assert builders.lambda_image("H100") == f"{WORKER_IMAGE}-sm90"  # H100 = sm90
     assert builders.lambda_image("A10") == f"{WORKER_IMAGE}-sm86"  # A10 = sm86
-    payload = _build_payload(builders, _spec(gpu_type="H100"), seed=0, attempt=0)
+    payload = _build_payload(builders, _spec(gpu_type="H100"), attempt=0)
     script = builders.build_user_data(payload, gpu="H100")
     assert f"{WORKER_IMAGE}-sm90" in script
 
@@ -357,7 +370,7 @@ def test_bootstrap_sets_lambda_arm():
     # And Lambda's build_payload is what sets flash_arm='lambda'.
     from flash.providers.lambda_.jobs import builders
 
-    assert _build_payload(builders, _spec(), 0, 0)["flash_arm"] == "lambda"
+    assert _build_payload(builders, _spec())["flash_arm"] == "lambda"
 
 
 class _FakePipProc:
@@ -857,7 +870,6 @@ def test_bootstrap_promotes_attempt_and_fence_to_worker_env():
         _build_payload(
             builders,
             _spec(),
-            seed=0,
             attempt=2,
             fence=4,
             source_snapshot=SOURCE_SNAPSHOT,
@@ -869,7 +881,6 @@ def test_bootstrap_promotes_attempt_and_fence_to_worker_env():
         _build_payload(
             builders,
             _spec(),
-            seed=0,
             attempt=2,
             fence=4,
             source_snapshot=SOURCE_SNAPSHOT,
@@ -955,12 +966,12 @@ def test_launch_walks_regions_on_capacity_rejection(monkeypatch):
 
     monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
     insts = [_inst(region=r) for r in ("us-east-1", "us-west-1", "us-west-2")]
-    h = _launch(jobs, _spec(), seed=0, instances=insts, attempt=2)
+    h = _launch(jobs, _spec(), instances=insts, attempt=2)
     assert attempts == ["us-east-1", "us-west-1", "us-west-2"]
     assert h.instance_id == "i-4242"
     assert h.region == "us-west-2"
     assert h.gpu == "A10"
-    assert h.name == "flash-1700000000-abcd1234-s0-a2"
+    assert h.name == "flash-1700000000-abcd1234-a2"
 
 
 def test_launch_refreshes_capacity_once_when_all_taken(monkeypatch):
@@ -982,7 +993,7 @@ def test_launch_refreshes_capacity_once_when_all_taken(monkeypatch):
         "usable_instances",
         lambda gpu, force=False, gpu_count=1: [_inst(region="us-fresh-1")],
     )
-    h = _launch(jobs, _spec(), seed=0, instances=[_inst(region="us-east-1")], attempt=0)
+    h = _launch(jobs, _spec(), instances=[_inst(region="us-east-1")], attempt=0)
     assert created == ["us-fresh-1"]
     assert h.instance_id == "i-7"
 
@@ -1001,7 +1012,7 @@ def test_launch_refuses_primary_creation_below_minimum_deadline_allowance(monkey
     )
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
-        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0, deadline_at=159.0)
+        _launch(jobs, _spec(), instances=[_inst()], attempt=0, deadline_at=159.0)
 
     assert launched == []
 
@@ -1222,7 +1233,6 @@ def test_launch_refuses_an_instance_type_below_the_run_disk_floor(monkeypatch):
         _launch(
             jobs,
             _spec(disk_gb=800),
-            seed=0,
             instances=[_inst(disk_gb=512.0)],
             attempt=0,
         )
@@ -1237,9 +1247,9 @@ def test_launch_accepts_a_disk_capable_or_unmeasured_instance_type(monkeypatch):
     monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
     monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: "i-1")
 
-    assert _launch(jobs, _spec(disk_gb=200), seed=0, instances=[_inst(disk_gb=512.0)], attempt=0)
+    assert _launch(jobs, _spec(disk_gb=200), instances=[_inst(disk_gb=512.0)], attempt=0)
     # an unreported SKU disk is not a proven miss, so it must not block the launch
-    assert _launch(jobs, _spec(disk_gb=800), seed=0, instances=[_inst()], attempt=0)
+    assert _launch(jobs, _spec(disk_gb=800), instances=[_inst()], attempt=0)
 
 
 def test_launch_refuses_a_disk_undersized_refreshed_candidate(monkeypatch):
@@ -1268,8 +1278,6 @@ def test_launch_refuses_a_disk_undersized_refreshed_candidate(monkeypatch):
         _launch(
             jobs,
             _spec(disk_gb=800),
-            seed=0,
-            # unmeasured disk passes the pre-loop gate untouched; only the refresh reveals it undersized.
             instances=[_inst(region="us-east-1", disk_gb=None)],
             attempt=0,
         )
@@ -1320,7 +1328,6 @@ def test_launch_never_rents_an_undersized_sku_from_a_mixed_candidate_list(monkey
     assert _launch(
         jobs,
         _spec(disk_gb=800),
-        seed=0,
         instances=[
             _inst(region="us-small-1", disk_gb=100.0),  # provably undersized, listed FIRST
             _inst(region="us-big-1", disk_gb=1024.0),
@@ -1352,7 +1359,7 @@ def test_post_launch_interrupt_does_not_layer_a_run_label_reap_on_exact_cleanup(
     monkeypatch.setattr(jobs, "_lambda_job_handle", interrupt)
 
     with pytest.raises(KeyboardInterrupt):
-        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+        _launch(jobs, _spec(), instances=[_inst()], attempt=0)
 
     assert exact == ["i-1"]  # the rented box was terminated by id
     assert reaped == []  # ... so the run-wide reap must NOT also fire
@@ -1390,7 +1397,6 @@ def test_interrupt_while_the_cacheless_launch_request_is_in_flight_reaps_by_labe
         _launch(
             jobs,
             _spec(network_volume="flash-weights"),
-            seed=0,
             instances=[_inst()],
             attempt=0,
         )
@@ -1437,7 +1443,6 @@ def test_cacheless_ambiguous_reject_keeps_the_guard_armed_through_reconciliation
         _launch(
             jobs,
             _spec(network_volume="flash-weights"),
-            seed=0,
             instances=[_inst()],
             attempt=0,
         )
@@ -1491,7 +1496,6 @@ def test_cacheless_retry_that_never_reaches_its_request_does_not_reap_the_run_la
         _launch(
             jobs,
             _spec(network_volume="flash-weights"),
-            seed=0,
             instances=[_inst()],
             attempt=0,
         )
@@ -1538,7 +1542,7 @@ def test_interrupt_after_publication_returns_terminates_only_this_instance(
     monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
 
     with pytest.raises(interrupt_type):
-        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+        _launch(jobs, _spec(), instances=[_inst()], attempt=0)
 
     assert terminated == ["i-4242"]  # the box this seed rented is cleaned up by id
     assert reaped == []  # and no concurrent seed sharing the run label is touched
@@ -1558,9 +1562,9 @@ def test_launch_raises_when_no_capacity(monkeypatch):
     )
     monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, gpu_count=1: [])
     with pytest.raises(lambda_api.LambdaApiError, match="no capacity"):
-        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+        _launch(jobs, _spec(), instances=[_inst()], attempt=0)
     with pytest.raises(lambda_api.LambdaApiError, match="no Lambda capacity"):
-        _launch(jobs, _spec(), seed=0, instances=[], attempt=0)
+        _launch(jobs, _spec(), instances=[], attempt=0)
 
 
 def test_resolve_ssh_key_names(monkeypatch):
@@ -1605,7 +1609,7 @@ def test_cache_ensures_filesystem_and_attaches_at_launch(monkeypatch):
     )
 
     spec = _spec(network_volume="flash-weights")
-    _launch(jobs, spec, seed=0, instances=[_inst(region="us-east-1")], attempt=0)
+    _launch(jobs, spec, instances=[_inst(region="us-east-1")], attempt=0)
 
     assert ensured == [("flash-weights", "us-east-1")]  # create-if-absent in THIS region
     assert calls[0]["fs"] == ["flash-weights"]  # attached at launch (Lambda can't attach later)
@@ -1629,7 +1633,7 @@ def test_cache_bind_uses_returned_mount_point(monkeypatch):
         lambda n, r, deadline_at=None: "/mnt/lambda-fs/flash-weights",
     )
 
-    _launch(jobs, _spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
+    _launch(jobs, _spec(network_volume="flash-weights"), instances=[_inst()], attempt=0)
 
     assert calls[0]["fs"] == ["flash-weights"]
     # the bind uses the REAL mount_point, and never the stale default
@@ -1645,8 +1649,6 @@ def test_cache_payload_points_base_model_prefetch_at_the_bind(monkeypatch):
     payload = _build_payload(
         builders,
         _spec(network_volume="flash-weights"),
-        0,
-        0,
         cache_host_mount="/lambda/nfs/flash-weights",
     )
     assert payload["env"]["FLASH_WEIGHT_CACHE_DIR"] == "/weight-cache/hf-cache/hub"
@@ -1663,7 +1665,7 @@ def test_cache_falls_back_to_cold_when_filesystem_unavailable(monkeypatch):
             lambda_api.LambdaApiError("filesystem quota exceeded")
         ),
     )
-    _launch(jobs, _spec(network_volume="flash-weights"), seed=0, instances=[_inst()], attempt=0)
+    _launch(jobs, _spec(network_volume="flash-weights"), instances=[_inst()], attempt=0)
     assert calls[0]["fs"] is None  # no filesystem attached
     assert "/weight-cache" not in calls[0]["user_data"]  # cold user_data, no bind
 
@@ -1692,7 +1694,6 @@ def test_filesystem_attach_reject_retries_same_region_cold(monkeypatch):
     h = _launch(
         jobs,
         _spec(network_volume="flash-weights"),
-        seed=0,
         instances=[_inst(region="us-east-1")],
         attempt=0,
     )
@@ -1728,7 +1729,6 @@ def test_filesystem_reject_rechecks_deadline_before_cacheless_creation(monkeypat
         _launch(
             jobs,
             _spec(network_volume="flash-weights"),
-            seed=0,
             instances=[_inst(region="us-east-1")],
             attempt=0,
             deadline_at=200.0,
@@ -1758,7 +1758,6 @@ def test_capacity_reject_does_not_trigger_cold_fs_retry(monkeypatch):
     h = _launch(
         jobs,
         _spec(network_volume="flash-weights"),
-        seed=0,
         instances=[_inst(region="us-east-1"), _inst(region="us-west-2")],
         attempt=0,
     )
@@ -1794,7 +1793,6 @@ def test_preload_mode_skips_region_when_cache_unavailable(monkeypatch):
         _launch(
             jobs,
             _spec(network_volume="flash-weights"),
-            seed=0,
             instances=insts,
             attempt=0,
             mode="preload",
@@ -1839,7 +1837,6 @@ def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
         _launch(
             jobs,
             _spec(network_volume="flash-weights"),
-            seed=0,
             instances=[_inst(region="us-east-1")],
             attempt=0,
             mode="preload",
@@ -1856,7 +1853,7 @@ def test_no_cache_never_touches_filesystems(monkeypatch):
         raise AssertionError("ensure_filesystem must not be called without a requested cache")
 
     monkeypatch.setattr(lambda_api, "ensure_filesystem", boom)
-    _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)  # spec has no network_volume
+    _launch(jobs, _spec(), instances=[_inst()], attempt=0)  # spec has no network_volume
     assert calls[0]["fs"] is None
     assert "/weight-cache" not in calls[0]["user_data"]
 
@@ -1883,7 +1880,7 @@ def test_cache_ensured_per_region_in_the_walk(monkeypatch):
 
     monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
     insts = [_inst(region="us-east-1"), _inst(region="us-west-2")]
-    _launch(jobs, _spec(network_volume="flash-weights"), seed=0, instances=insts, attempt=0)
+    _launch(jobs, _spec(network_volume="flash-weights"), instances=insts, attempt=0)
     # Ensured in every region we actually attempted (east failed capacity, west succeeded) — never a
     # whole-fleet pre-create.
     assert ensured == ["us-east-1", "us-west-2"]
@@ -1968,7 +1965,7 @@ def test_poll_lambda_returns_current_fenced_result_before_status(monkeypatch):
         results=[PollResult(True, metrics={"wall_seconds": 12.0})],
     )
 
-    result = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=0)
 
     assert result.ok
     assert result.metrics == {"wall_seconds": 12.0}
@@ -2014,6 +2011,7 @@ def test_poll_lambda_retries_result_download_and_costs_manifest_finished_at(monk
             AttemptArtifacts("revision", 9_101.0, None, manifest.to_dict()),
         ]
     )
+
     def read_artifacts(*_args, **_kwargs):
         observed = next(reads)
         if isinstance(observed, Exception):
@@ -2025,10 +2023,9 @@ def test_poll_lambda_retries_result_download_and_costs_manifest_finished_at(monk
     monkeypatch.setattr(poll_instance, "persist_attempt_artifacts", lambda *_args: None)
     monkeypatch.setattr(poll_instance.time, "time", _instance_clock(step=1.0))
 
-    result = jobs.poll_lambda_job(
+    result = jobs.poll_lambda_attempt(
         _handle(started_ts=9_000.0),
         _spec(),
-        seed=0,
         interval_s=0,
     )
 
@@ -2046,7 +2043,7 @@ def test_poll_lambda_dead_instance_waits_for_result_deadline(monkeypatch):
     )
     monkeypatch.setattr(poll_instance.time, "time", _instance_clock())
 
-    result = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=0)
 
     assert result.failure == "job_preempted"
     assert "terminated" in result.detail
@@ -2062,7 +2059,7 @@ def test_poll_lambda_dead_instance_before_grant_waits_for_result_deadline(monkey
     )
     monkeypatch.setattr(poll_instance.time, "time", _instance_clock())
 
-    result = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=0)
 
     assert result.failure == "job_preempted"
     assert "terminated" in result.detail
@@ -2079,10 +2076,9 @@ def test_poll_lambda_active_without_progress_uses_attempt_deadline(monkeypatch):
     )
     monkeypatch.setattr(poll_instance.time, "time", _instance_clock())
 
-    result = jobs.poll_lambda_job(
+    result = jobs.poll_lambda_attempt(
         _handle(),
         _spec(),
-        seed=0,
         interval_s=0,
         deadline_at=10_000.0,
     )
@@ -2100,7 +2096,7 @@ def test_poll_lambda_preserves_provisioning_deadline(monkeypatch):
     )
     monkeypatch.setattr(poll_instance.time, "time", _instance_clock())
 
-    result = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=0)
 
     assert result.failure == "job_preempted"
     assert "grant deadline" in result.detail
@@ -2123,7 +2119,7 @@ def test_poll_lambda_bounds_provider_status_failures(monkeypatch):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(lambda_api.LambdaApiError("offline")),
     )
 
-    result = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=0)
+    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=0)
 
     assert result.failure == "poll_error"
 
@@ -2148,7 +2144,7 @@ def test_lambda_poll_adapter_carries_attempt_fence_and_cost_stamp(monkeypatch):
 
     monkeypatch.setattr(jobs, "poll_instance_job", capture)
 
-    result = jobs.poll_lambda_job(_handle(started_ts=9_000.0), _spec(), seed=0)
+    result = jobs.poll_lambda_attempt(_handle(started_ts=9_000.0), _spec())
     metrics = {"wall_seconds": 100.0}
     captured["adapter"].stamp_cost_and_notes(metrics, end_ts=9_100.0, launch_ts=9_000.0)
 
@@ -2166,13 +2162,15 @@ def test_provider_initial_and_reattached_poll_keep_same_deadline(monkeypatch):
 
     captured = []
 
-    def fake_poll(_handle, _spec, _seed, *, log=None, deadline_at=None):
+    def fake_poll(_handle, _spec, *, log=None, deadline_at=None):
         captured.append(deadline_at)
         return PollResult(True, metrics={})
 
     monkeypatch.setattr(jobs, "usable_instances", lambda _gpu, **_kwargs: [_inst()])
-    monkeypatch.setattr(jobs, "launch_and_submit", lambda *_args, **_kwargs: _handle(started_ts=1.0))
-    monkeypatch.setattr(jobs, "poll_lambda_job", fake_poll)
+    monkeypatch.setattr(
+        jobs, "launch_and_submit", lambda *_args, **_kwargs: _handle(started_ts=1.0)
+    )
+    monkeypatch.setattr(jobs, "poll_lambda_attempt", fake_poll)
     monkeypatch.setattr(
         "flash.providers.lambda_.client.api.terminate_instance_confirmed",
         lambda _instance_id: None,
@@ -2180,16 +2178,16 @@ def test_provider_initial_and_reattached_poll_keep_same_deadline(monkeypatch):
     provider = LambdaProvider()
     spec = _spec()
 
-    assert provider.submit_run(
+    assert provider.submit_attempt(
         spec,
-        seed=0,
         source_snapshot=SOURCE_SNAPSHOT,
         _deadline_at=12_345.0,
     ).ok
     handle = JobHandle.from_dict(_handle(started_ts=1.0).to_dict())
-    assert provider.poll(handle, spec, seed=0, _deadline_at=12_345.0).ok
+    assert provider.poll_attempt(handle, spec, _deadline_at=12_345.0).ok
 
     assert captured == [12_345.0, 12_345.0]
+
 
 # ---------------------------------------------------------------------------
 # the cost-safety invariant: every exit path terminates the instance
@@ -2213,7 +2211,7 @@ def _wire_runner(monkeypatch, poll_outcome):
             raise poll_outcome
         return poll_outcome
 
-    monkeypatch.setattr(jobs, "poll_lambda_job", fake_poll)
+    monkeypatch.setattr(jobs, "poll_lambda_attempt", fake_poll)
     return jobs, terminated, PollResult
 
 
@@ -2222,7 +2220,7 @@ def test_runner_terminates_on_success(monkeypatch):
 
     jobs, terminated, _ = _wire_runner(monkeypatch, PollResult(True, metrics={"a": 1}))
     handles = []
-    res = _submit(jobs, _spec(), seed=0, on_handle=handles.append)
+    res = _submit(jobs, _spec(), on_handle=handles.append)
     assert res.ok
     assert terminated == [["i-9999"]]
     assert handles
@@ -2249,7 +2247,7 @@ def test_runner_preserves_success_when_teardown_is_unconfirmed(monkeypatch, capl
     handles = []
     caplog.set_level("ERROR")
 
-    res = _submit(jobs, _spec(), seed=0, on_handle=handles.append)
+    res = _submit(jobs, _spec(), on_handle=handles.append)
 
     assert res.ok
     assert res.metrics == {"a": 1}
@@ -2271,20 +2269,20 @@ def test_runner_propagates_process_control_from_teardown(monkeypatch, control_ex
     )
 
     with pytest.raises(control_exc):
-        _submit(jobs, _spec(), seed=0)
+        _submit(jobs, _spec())
 
 
 def test_runner_terminates_on_failure_and_exception(monkeypatch):
     from flash.providers.core.base import PollResult
 
     jobs, terminated, _ = _wire_runner(monkeypatch, PollResult(False, failure="job_preempted"))
-    res = _submit(jobs, _spec(), seed=0)
+    res = _submit(jobs, _spec())
     assert not res.ok
     assert terminated == [["i-9999"]]
 
     jobs, terminated, _ = _wire_runner(monkeypatch, KeyboardInterrupt())
     with pytest.raises(KeyboardInterrupt):
-        _submit(jobs, _spec(), seed=0)
+        _submit(jobs, _spec())
     assert terminated == [["i-9999"]]
 
 
@@ -2297,20 +2295,20 @@ def test_runner_terminates_when_handle_persist_fails(monkeypatch):
         raise RuntimeError("status store unreachable")
 
     with pytest.raises(RuntimeError, match="status store unreachable"):
-        _submit(jobs, _spec(), seed=0, on_handle=boom)
+        _submit(jobs, _spec(), on_handle=boom)
     assert terminated == [["i-9999"]]
 
 
 def test_submit_rejects_policy_word_gpu():
-    """submit_run_lambda needs a concrete class; a policy word ("cheapest") — which the allocator
+    """submit_attempt_lambda needs a concrete class; a policy word ("cheapest") — which the allocator
     resolves upstream — must fail with a clear error, not an opaque KeyError."""
     from flash.providers.lambda_.client import api as lambda_api
-    from flash.providers.lambda_.jobs import submit_run_lambda
+    from flash.providers.lambda_.jobs import submit_attempt_lambda
 
     spec = _spec()
     object.__setattr__(spec.gpu, "type", "cheapest")
     with pytest.raises(lambda_api.LambdaApiError, match="concrete gpu class"):
-        submit_run_lambda(spec, seed=0)
+        submit_attempt_lambda(spec)
 
 
 # ---------------------------------------------------------------------------
@@ -2319,49 +2317,25 @@ def test_submit_rejects_policy_word_gpu():
 def test_instance_label_always_sweepable():
     from flash.providers.lambda_.jobs.builders import instance_label
 
-    assert instance_label("flash-1700-abcd", 0, 1) == "flash-1700-abcd-s0-a1"
-    assert instance_label("fail-fast", 0, 0) == "flash-fail-fast-s0-a0"  # prefix forced
+    assert instance_label("flash-1700-abcd", 1) == "flash-1700-abcd-a1"
+    assert instance_label("fail-fast", 0) == "flash-fail-fast-a0"  # prefix forced
 
 
-def test_instance_label_bounds_seed_and_attempt():
-    """The seed/attempt suffix is the only caller-supplied text appended after the (already-bounded)
-    run prefix: an absurd seed OR attempt (or a non-int) must NOT push the name past the 60-char
-    provider cap, which would get the name silently truncated and desync it from the sweep-matched
-    prefix. BOTH numeric fields are bounded so the WHOLE suffix stays <= _SUFFIX_BUDGET."""
-    from flash.providers._lifecycle.instances.instance import (
-        _MAX_NAME,
-        _SUFFIX_BUDGET,
-        run_label_prefix,
-    )
+def test_instance_label_preserves_complete_attempt_suffix():
+    from flash.providers._lifecycle.instances.instance import _MAX_NAME, run_label_prefix
     from flash.providers.lambda_.jobs.builders import instance_label
 
-    def suffix_of(rid, label):
-        return label[len(run_label_prefix(rid)) :]
-
-    # Normal small ids: unchanged.
-    assert instance_label("flash-1700000000-abcd1234", 0, 0) == "flash-1700000000-abcd1234-s0-a0"
-    # Absurdly large seed: name stays within the cap (and keeps the -a boundary).
-    rid = "flash-1700000000-abcd1234"
-    huge = instance_label(rid, 123456789012345, 0)
-    assert len(huge) <= _MAX_NAME
-    assert len(suffix_of(rid, huge)) <= _SUFFIX_BUDGET
-    assert "-a0" in huge
-    # Absurdly large ATTEMPT (corrupt) alone: still bounded (the earlier fix only trimmed seed).
-    huge_att = instance_label(rid, 0, 999999999999)
-    assert len(huge_att) <= _MAX_NAME
-    assert len(suffix_of(rid, huge_att)) <= _SUFFIX_BUDGET
-    assert huge_att.startswith(rid + "-s")  # framing + prefix intact for sweep matching
-    # BOTH seed and attempt huge together: whole suffix bounded.
-    both_huge = instance_label(rid, 123456789, 987654321)
-    assert len(both_huge) <= _MAX_NAME
-    assert len(suffix_of(rid, both_huge)) <= _SUFFIX_BUDGET
-    # A long run id AND both fields huge together still fit.
-    both = instance_label("flash-" + "x" * 80, 99999999999, 7777777)
-    assert len(both) <= _MAX_NAME
-    # Seed formatting remains defensive, but attempt identity is strict.
-    assert instance_label(rid, "weird", 0).startswith(rid + "-s0-a0")
+    run_id = "flash-1700000000-abcd1234"
+    assert instance_label(run_id, 0) == f"{run_id}-a0"
+    assert instance_label(run_id, 987654321) == f"{run_id}-a987654321"
+    long_run_id = "flash-" + "x" * 80
+    label = instance_label(long_run_id, 7777777)
+    assert label == f"{run_label_prefix(long_run_id)}-a7777777"
+    assert len(label) <= _MAX_NAME
+    with pytest.raises(ValueError, match="exceeds the provider name budget"):
+        instance_label(run_id, 999999999999)
     with pytest.raises(ValueError, match="attempt identity is invalid"):
-        instance_label(rid, 0, "bad")
+        instance_label(run_id, "bad")
 
 
 def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
@@ -2369,8 +2343,8 @@ def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
 
     instances = [
-        {"id": "i-1", "name": "flash-fail-fast-s0-a0"},  # forced-prefix name
-        {"id": "i-2", "name": "flash-other-run-s0-a0"},  # different run -> keep
+        {"id": "i-1", "name": "flash-fail-fast-a0"},  # forced-prefix name
+        {"id": "i-2", "name": "flash-other-run-a0"},  # different run -> keep
     ]
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
@@ -2390,9 +2364,9 @@ def test_run_instances_remaining_uses_exact_labels_and_exact_lookup(monkeypatch)
 
     run_id = "flash-100"
     rows = [
-        {"id": "i-live", "name": jobs.instance_label(run_id, 0, 0)},
-        {"id": "i-gone", "name": jobs.instance_label(run_id, 1, 0)},
-        {"id": "i-other", "name": jobs.instance_label("flash-1000", 0, 0)},
+        {"id": "i-live", "name": jobs.instance_label(run_id, 0)},
+        {"id": "i-gone", "name": jobs.instance_label(run_id, 0)},
+        {"id": "i-other", "name": jobs.instance_label("flash-1000", 0)},
     ]
     lookups = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda *, strict: rows)
@@ -2426,7 +2400,7 @@ def test_run_instances_remaining_fails_closed_on_enumeration_lookup_or_identity(
     monkeypatch.setattr(
         lambda_api,
         "list_instances",
-        lambda *, strict: [{"id": "i-1", "name": jobs.instance_label("run1", 0, 0)}],
+        lambda *, strict: [{"id": "i-1", "name": jobs.instance_label("run1", 0)}],
     )
 
     def lookup_failure(instance_id, *, strict):
@@ -2439,7 +2413,7 @@ def test_run_instances_remaining_fails_closed_on_enumeration_lookup_or_identity(
     monkeypatch.setattr(
         lambda_api,
         "list_instances",
-        lambda *, strict: [{"id": None, "name": jobs.instance_label("run1", 0, 0)}],
+        lambda *, strict: [{"id": None, "name": jobs.instance_label("run1", 0)}],
     )
     with pytest.raises(lambda_api.LambdaApiError, match="no usable id"):
         provider.run_instances_remaining("run1")
@@ -2467,8 +2441,8 @@ def test_sweep_orphans_label_safety(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
 
     instances = [
-        {"id": "i-1", "name": "flash-1700-aaaa-s0-a0"},  # orphan -> terminate
-        {"id": "i-2", "name": "flash-1700-bbbb-s0-a1"},  # active run -> keep
+        {"id": "i-1", "name": "flash-1700-aaaa-a0"},  # orphan -> terminate
+        {"id": "i-2", "name": "flash-1700-bbbb-a1"},  # active run -> keep
         {"id": "i-3", "name": "someone-elses-workload"},  # not ours -> NEVER touch
         {"id": "i-4", "name": ""},  # unnamed -> NEVER touch
     ]
@@ -2488,8 +2462,8 @@ def test_sweep_orphans_prefix_not_shielded_by_longer_run_id(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
 
     instances = [
-        {"id": "i-1", "name": jobs.instance_label("flash-100", 0, 0)},  # live -> KEEP
-        {"id": "i-2", "name": jobs.instance_label("flash-1000", 0, 0)},  # orphan -> terminate
+        {"id": "i-1", "name": jobs.instance_label("flash-100", 0)},  # live -> KEEP
+        {"id": "i-2", "name": jobs.instance_label("flash-1000", 0)},  # orphan -> terminate
     ]
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
@@ -2505,8 +2479,8 @@ def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
 
     instances = [
-        {"id": "i-1", "name": jobs.instance_label("fail-fast", 0, 0)},  # live run -> KEEP
-        {"id": "i-2", "name": jobs.instance_label("orphan-run", 0, 0)},  # no live run -> terminate
+        {"id": "i-1", "name": jobs.instance_label("fail-fast", 0)},  # live run -> KEEP
+        {"id": "i-2", "name": jobs.instance_label("orphan-run", 0)},  # no live run -> terminate
     ]
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
@@ -2535,12 +2509,12 @@ def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
     # reap parser is tested against the REAL, possibly-truncated VM name, not the raw run id.
     fresh = preload_instance_run_id("lambda", "us-east-1", int(time.time()) + 1800, "abcdef")
     instances = [
-        {"id": "i-1", "name": instance_label(fresh, 0, 0)},  # in-deadline warm box -> KEEP
+        {"id": "i-1", "name": instance_label(fresh, 0)},  # in-deadline warm box -> KEEP
         {
             "id": "i-legacy",
-            "name": "flash-preload-lambda-us-east-1-abcdef-s0-a0",
+            "name": "flash-preload-lambda-us-east-1-abcdef-a0",
         },  # no deadline -> KEEP
-        {"id": "i-2", "name": "flash-1700-cccc-s0-a0"},  # genuine orphan -> terminate
+        {"id": "i-2", "name": "flash-1700-cccc-a0"},  # genuine orphan -> terminate
     ]
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
@@ -2570,7 +2544,7 @@ def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
     # the front-loaded deadline token must survive the provider name-budget truncation to be reaped.
     stale_deadline = int(time.time()) - int(PRELOAD_REAP_GRACE_S) - 600
     stale = preload_instance_run_id("lambda", "us-west-1", stale_deadline, "deadbe")
-    instances = [{"id": "i-9", "name": instance_label(stale, 0, 0)}]
+    instances = [{"id": "i-9", "name": instance_label(stale, 0)}]
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
     monkeypatch.setattr(
@@ -2684,7 +2658,7 @@ def test_ambiguous_launch_reconciles_and_stops(monkeypatch):
     insts = [_inst(region=r) for r in ("us-east-1", "us-west-1")]
     log = io.StringIO()
     with pytest.raises(UnreconciledCreateError, match="refusing another create") as exc_info:
-        _launch(jobs, _spec(), seed=0, instances=insts, attempt=0, log=log)
+        _launch(jobs, _spec(), instances=insts, attempt=0, log=log)
     assert attempts == ["us-east-1"]  # stopped after the first ambiguous failure (no 2nd launch)
     assert "provider body secret" not in str(exc_info.value)
     assert "provider body secret" not in log.getvalue()
@@ -2709,7 +2683,7 @@ def test_launch_success_log_failure_does_not_leak_handle(monkeypatch):
         return _say
 
     monkeypatch.setattr(jobs, "make_say", raising_say)
-    h = _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+    h = _launch(jobs, _spec(), instances=[_inst()], attempt=0)
     assert h.instance_id == "i-4242"
 
 
@@ -2718,7 +2692,7 @@ def test_launch_success_log_failure_does_not_leak_handle(monkeypatch):
 def test_post_launch_baseexception_cleans_and_never_walks_regions(
     monkeypatch, interrupt_type, terminate_confirmed
 ):
-    # submit_run_lambda's finally only exists once launch_and_submit RETURNS a handle, so an
+    # submit_attempt_lambda's finally only exists once launch_and_submit RETURNS a handle, so an
     # interrupt between a successful launch and that return would strand a paid box. Vast closes
     # this window with an exact destroy plus a run-label fallback; Lambda must do the same.
     import flash.providers.lambda_.jobs as jobs
@@ -2756,7 +2730,6 @@ def test_post_launch_baseexception_cleans_and_never_walks_regions(
         _launch(
             jobs,
             spec,
-            seed=0,
             instances=[_inst(region="us-east-1"), _inst(region="us-west-1")],
             attempt=0,
         )
@@ -2809,7 +2782,7 @@ def test_post_launch_preserves_original_baseexception_when_cleanup_raises(
     monkeypatch.setattr(jobs, "terminate_run_instances", terminate_label)
 
     with pytest.raises(interrupt_type) as exc_info:
-        _launch(jobs, spec, seed=0, instances=[_inst()], attempt=0)
+        _launch(jobs, spec, instances=[_inst()], attempt=0)
 
     # a cleanup that itself dies must never replace the interruption the caller has to see
     assert exc_info.value is original
@@ -2824,7 +2797,7 @@ def test_launch_success_say_baseexception_does_not_trigger_run_wide_reap(
     """say() raising a BaseException on the successful-launch route must be handled ONLY by
     _rent_instance's own exact cleanup; the outer coarse label reap must not also fire, since
     _rent_instance already owns cleanup for this instance and a run-wide reap on top of it would
-    hit every other concurrently-launched seed of the same multi-seed run."""
+    hit every other concurrently launched attempt of the same run."""
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
@@ -2846,7 +2819,7 @@ def test_launch_success_say_baseexception_does_not_trigger_run_wide_reap(
     monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
 
     with pytest.raises(interrupt_type):
-        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+        _launch(jobs, _spec(), instances=[_inst()], attempt=0)
 
     assert terminated == ["i-4242"]  # the helper's own exact cleanup ran
     assert reaped == []  # the outer coarse label reap must not also fire
@@ -2895,7 +2868,6 @@ def test_cacheless_retry_success_say_baseexception_does_not_trigger_run_wide_rea
         _launch(
             jobs,
             _spec(network_volume="flash-weights"),
-            seed=0,
             instances=[_inst(region="us-east-1")],
             attempt=0,
         )
@@ -2936,7 +2908,6 @@ def test_interrupt_while_building_the_success_message_terminates_only_this_insta
         _launch(
             jobs,
             _spec(),
-            seed=0,
             instances=[_inst(price=_ExplodingPrice(1.25))],
             attempt=0,
         )
@@ -2971,7 +2942,7 @@ def test_launch_rejected_by_the_apis_own_allowance_check_does_not_reap_the_run(m
     monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
 
     with pytest.raises(RuntimeError, match="provider allowance remaining"):
-        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+        _launch(jobs, _spec(), instances=[_inst()], attempt=0)
 
     assert reaped == []  # nothing was rented, so no seed of this run may be terminated
     assert terminated == []
@@ -3026,7 +2997,6 @@ def test_cacheless_clean_reject_say_baseexception_does_not_trigger_run_wide_reap
         _launch(
             jobs,
             _spec(network_volume="flash-weights"),
-            seed=0,
             instances=[_inst(region="us-east-1")],
             attempt=0,
         )
@@ -3253,7 +3223,6 @@ def test_build_user_data_spills_large_spec_out_of_cloud_init(monkeypatch):
     ):
         representative = inst.build_payload(
             _spec(),
-            seed=0,
             attempt=7,
             fence=1,
             arm="lambda",
@@ -3463,7 +3432,7 @@ def test_ambiguous_reject_keeps_the_guard_armed_when_the_announcement_raises(
     monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
 
     with pytest.raises(interrupt_type):
-        _launch(jobs, _spec(), seed=0, instances=[_inst()], attempt=0)
+        _launch(jobs, _spec(), instances=[_inst()], attempt=0)
 
     # the guard stayed armed through the raising announcement, so the outer handler still sweeps
     # the run label - the only thing that can find a box rented but never named.

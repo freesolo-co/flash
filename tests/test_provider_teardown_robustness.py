@@ -72,8 +72,8 @@ def test_lambda_sweep_reports_only_truly_reaped(monkeypatch):
     from flash.providers.lambda_.client import api as la_api
 
     instances = [
-        {"id": "i-a", "name": "flash-1700-aaaa-s0-a0"},
-        {"id": "i-b", "name": "flash-1700-bbbb-s0-a0"},
+        {"id": "i-a", "name": "flash-1700-aaaa-a0"},
+        {"id": "i-b", "name": "flash-1700-bbbb-a0"},
     ]
     monkeypatch.setattr(la_api, "list_instances", lambda: instances)
     # i-b terminate fails -> terminate_instances returns only the ids actually torn down
@@ -89,11 +89,11 @@ def test_label_bounded_and_sweep_matches_for_long_run_id():
     from flash.providers._lifecycle.instances.instance import instance_label, run_label_prefix
 
     long_id = "flash-" + "x" * 200
-    name = instance_label(long_id, 0, 0)
+    name = instance_label(long_id, 0)
     assert len(name) <= 60
     # the bounded prefix the sweep matches on is a prefix of the launched name
     assert name.startswith(run_label_prefix(long_id))
-    assert name == run_label_prefix(long_id) + "-s0-a0"
+    assert name == run_label_prefix(long_id) + "-a0"
     # deterministic + collision-resistant: two distinct long ids -> distinct bounded prefixes
     assert run_label_prefix(long_id) != run_label_prefix("flash-" + "y" * 200)
     # short ids pass through unchanged (the common case)
@@ -118,7 +118,6 @@ def test_user_data_fails_fast_and_throttles_bootlog():
         "env": {"HF_TOKEN": "t"},
     }
     s = build_user_data(payload, image="img:tag")
-    assert "capsule.pyz failmark" in s  # host writes the attempt-failure marker
     assert 'fail "worker image pull failed' in s  # fail fast when the image can't pull
     assert 'fail "worker container did not start' in s
     assert "sleep 120" in s  # boot-log throttled to 120s

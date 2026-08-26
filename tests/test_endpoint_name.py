@@ -9,7 +9,14 @@ GC/reuse, so the fix is a per-run unique endpoint name.
 
 from __future__ import annotations
 
-from flash.providers.runpod.serverless.endpoints import _run_suffix, endpoint_name
+import pytest
+
+from flash.providers.runpod.serverless.endpoints import (
+    _endpoint_name_matches_run,
+    _run_suffix,
+    attempt_suffix,
+    endpoint_name,
+)
 
 
 def test_endpoint_name_default():
@@ -17,18 +24,19 @@ def test_endpoint_name_default():
     assert endpoint_name("RTX 4090") == "flash-4090"
 
 
-def test_endpoint_name_unique_per_run():
-    a = endpoint_name("RTX 5090", _run_suffix("flash-1780837378-c220526e"))
-    b = endpoint_name("RTX 5090", _run_suffix("flash-1780840000-deadbeef"))
-    assert a.startswith("flash-5090-")
-    assert a != b, "different runs must get different endpoint names (no template collision)"
-    # deterministic: same run_id -> same name (a retry reuses its own endpoint)
-    assert a == endpoint_name("RTX 5090", _run_suffix("flash-1780837378-c220526e"))
-    # COLLISION FIX: run_ids sharing a trailing segment (e.g. both end in the card name) must
-    # NOT collide onto one endpoint -- the old split("-")[-1] bug caused stale-config reuse.
-    c = endpoint_name("RTX 5090", _run_suffix("val-9b-grpo-s4096-a100"))
-    d = endpoint_name("RTX 5090", _run_suffix("mr-4b-grpo-s8192-a100"))
-    assert c != d, "run_ids sharing a tail must still get distinct endpoints"
+def test_endpoint_name_unique_per_run_and_attempt():
+    run_a = "flash-1780837378-c220526e"
+    run_b = "flash-1780840000-deadbeef"
+    a0 = endpoint_name("RTX 5090", attempt_suffix(run_a, 0))
+    a1 = endpoint_name("RTX 5090", attempt_suffix(run_a, 1))
+    b0 = endpoint_name("RTX 5090", attempt_suffix(run_b, 0))
+    assert a0.endswith("-a0")
+    assert a1.endswith("-a1")
+    assert len({a0, a1, b0}) == 3
+    assert a0 == endpoint_name("RTX 5090", attempt_suffix(run_a, 0))
+    c = endpoint_name("RTX 5090", attempt_suffix("val-9b-grpo-s4096-a100", 0))
+    d = endpoint_name("RTX 5090", attempt_suffix("mr-4b-grpo-s8192-a100", 0))
+    assert c != d
 
 
 def test_endpoint_name_sanitizes_suffix():
@@ -38,6 +46,19 @@ def test_endpoint_name_sanitizes_suffix():
     tail = name.rsplit("-", 1)[-1]
     assert tail.isalnum()
     assert len(tail) <= 24
+
+
+def test_attempt_suffix_is_bounded_and_old_names_do_not_match():
+    run_id = "flash-" + "x" * 200
+    suffix = attempt_suffix(run_id, 987654321)
+    assert suffix.endswith("-a987654321")
+    assert len(suffix) <= 24
+    target = endpoint_name("RTX 5090", _run_suffix(run_id))
+    assert _endpoint_name_matches_run(endpoint_name("RTX 5090", suffix), target)
+    assert not _endpoint_name_matches_run(target, target)
+    assert not _endpoint_name_matches_run(f"{target}r1", target)
+    with pytest.raises(ValueError, match="exceeds the endpoint name budget"):
+        attempt_suffix(run_id, 999999999999)
 
 
 def test_run_suffix_none_safe():

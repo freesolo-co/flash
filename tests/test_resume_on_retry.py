@@ -6,7 +6,7 @@ rather than restarting from scratch. This file locks in the two live load-bearin
 
   1. worker resume: ``hf_resume_checkpoint`` pulls the stream and returns the highest-step
      checkpoint directory used by the training backend.
-  2. control plane: ``_submit_seed_supervised`` relaunches on the same run id and seed for every
+  2. control plane: ``_run_attempts_supervised`` relaunches on the same run id and seed for every
      infra-shaped failure; a genuine worker error fails fast instead.
 
 All HF/provider/network boundaries are stubbed; nothing here touches a GPU or the network.
@@ -912,7 +912,7 @@ def test_opd_pinned_revision_topology_mismatch_fails_closed(monkeypatch, tmp_pat
 
 
 # ============================================================================================
-# 3. control plane - _submit_seed_supervised relaunches the same run on infra-shaped failure
+# 3. control plane - _run_attempts_supervised relaunches the same run on infra-shaped failure
 # ============================================================================================
 def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
     gpu = {"type": "RTX 4090", "max_retries": 2}
@@ -921,7 +921,7 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
         {
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
-            # authoritative seed 0 matches the literal seed threaded into _submit_seed_supervised below.
+            # authoritative seed 0 matches the literal seed threaded into _run_attempts_supervised below.
             "seed": 0,
             "run_id": run_id,
             "train": {"epochs": 1, "max_examples": 1, "hf_repo": "owner/runs"},
@@ -1037,19 +1037,19 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
 
     calls = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        calls.append((run_spec.run_id, seed))
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
+        calls.append((run_spec.run_id, run_spec.seed))
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         if attempt == 0:
             return PollResult(False, failure=failure, detail="infra")
         return PollResult(True, metrics={"train_tokens": 4096})
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "submit_attempt", fake_submit)
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
 
-    metrics = runner_lifecycle._submit_seed_supervised(spec, 0, log)
+    metrics = runner_lifecycle._run_attempts_supervised(spec, log)
 
     assert metrics["train_tokens"] == 4096
     assert calls == [(spec.run_id, 0), (spec.run_id, 0)], "retry must reuse the same run_id + seed"
@@ -1076,7 +1076,7 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
     )
 
     class _RaisingVast:
-        def submit_run(self, run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def submit_attempt(self, run_spec, log=None, on_handle=None, attempt=0, **_):
             submits.append(attempt)
             on_handle(_vast_handle(attempt))
             return PollResult(False, failure="job_preempted", detail="resource lost")
@@ -1102,7 +1102,7 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
     log = io.StringIO()
 
     with pytest.raises(RuntimeError, match="teardown could not be confirmed"):
-        runner_lifecycle._submit_seed_supervised(spec, 0, log)
+        runner_lifecycle._run_attempts_supervised(spec, log)
 
     assert submits == [0], "must NOT launch a second worker over a possibly-live box"
     assert gc_calls == [spec.run_id], "force-reap the run's label before failing terminally"
@@ -1128,7 +1128,7 @@ def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orc
         lambda *a, **k: Allocation("lambda", "A10", 1.29, 12, (candidate,)),
     )
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_kwargs):
         submits.append(attempt)
         on_handle(_lambda_handle(attempt))
         return PollResult(False, failure="job_preempted", detail="resource lost")
@@ -1136,7 +1136,7 @@ def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orc
     def unconfirmed(_instance_id):
         raise lambda_api.LambdaApiError("private provider termination response")
 
-    monkeypatch.setattr(lambda_jobs, "submit_run_lambda", fake_submit)
+    monkeypatch.setattr(lambda_jobs, "submit_attempt_lambda", fake_submit)
     monkeypatch.setattr(lambda_api, "terminate_instance_confirmed", unconfirmed)
     monkeypatch.setattr(
         lambda_jobs,
@@ -1149,7 +1149,7 @@ def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orc
     log = io.StringIO()
 
     with pytest.raises(RuntimeError, match="teardown could not be confirmed") as caught:
-        runner_lifecycle._submit_seed_supervised(spec, 0, log)
+        runner_lifecycle._run_attempts_supervised(spec, log)
 
     assert submits == [0]
     assert gc_calls == [spec.run_id]
@@ -1171,14 +1171,14 @@ def test_terminal_runpod_job_allows_retry_and_persists_leaked_endpoint(
 
     submits = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         submits.append(attempt)
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         if attempt == 0:
             return PollResult(False, failure="job_preempted", detail="resource lost")
         return PollResult(True, metrics={"train_tokens": 4096})
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "submit_attempt", fake_submit)
     monkeypatch.setattr(
         runpod_api,
         "delete_endpoint_for_fingerprint",
@@ -1204,85 +1204,13 @@ def test_terminal_runpod_job_allows_retry_and_persists_leaked_endpoint(
     spec = _spec(run_id=f"flash-terminal-{terminal_status.lower()}")
     _seed_status(orch, spec)
 
-    metrics = runner_lifecycle._submit_seed_supervised(spec, 0, io.StringIO())
+    metrics = runner_lifecycle._run_attempts_supervised(spec, io.StringIO())
 
     assert metrics["train_tokens"] == 4096
     assert submits == [0, 1]
     raw = runner_status._load_status_json(spec.run_id)
     assert [item["endpoint_id"] for item in raw[runner_state._CLEANUP_REMOTES_KEY]] == ["ep0"]
     assert runner_status.get_status(spec.run_id).remote["endpoint_id"] == "ep1"
-
-
-def test_await_runpod_completed_metrics_bounds_pending_poll_to_grace(monkeypatch):
-    # a terminal-ok runpod job whose output never becomes readable must not pin the supervisor for
-    # the remainder of a (default 24h) run wall deadline: the synchronous metrics-lag poll is bounded
-    # to ~the grace window measured from first observation, not the run deadline that callers pass in.
-    import time as _time
-
-    import flash.runner.supervise.lifecycle as lifecycle
-
-    fake_clock = {"now": 1_000.0}
-    monkeypatch.setattr(_time, "time", lambda: fake_clock["now"])
-    monkeypatch.setattr(
-        _time, "sleep", lambda seconds: fake_clock.__setitem__("now", fake_clock["now"] + seconds)
-    )
-    probes = {"n": 0}
-
-    def always_pending(_handle, *, deadline_at):
-        # mirror _runpod_completed_metrics' grace decision against the deadline it is handed.
-        probes["n"] += 1
-        if (
-            deadline_at is not None
-            and _time.time() >= deadline_at + lifecycle._RECOVERY_MARKER_GRACE_S
-        ):
-            return  # grace expired: signal "no metrics" like _runpod_completed_metrics
-        raise lifecycle._CompletedAttemptPending("output metrics not readable yet")
-
-    monkeypatch.setattr(lifecycle, "_runpod_completed_metrics", always_pending)
-    far_deadline = fake_clock["now"] + 24 * 3600.0
-
-    result = lifecycle._await_runpod_completed_metrics(object(), far_deadline)
-
-    assert result is None
-    # bounded to ~grace/poll-interval probes and ~grace of elapsed time, not the 24h deadline.
-    max_probes = lifecycle._RECOVERY_MARKER_GRACE_S / lifecycle._RECOVERY_METRICS_POLL_S + 2
-    assert probes["n"] <= max_probes
-    assert (
-        fake_clock["now"] - 1_000.0
-        <= lifecycle._RECOVERY_MARKER_GRACE_S + lifecycle._RECOVERY_METRICS_POLL_S
-    )
-
-
-def test_await_runpod_completed_metrics_checks_cancellation_before_sleep(monkeypatch):
-    import flash.runner.supervise.lifecycle as lifecycle
-    from flash.runner.supervise.errors import _RunCancelled
-
-    monkeypatch.setattr(
-        lifecycle,
-        "_runpod_completed_metrics",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            lifecycle._CompletedAttemptPending("output metrics not readable yet")
-        ),
-    )
-    monkeypatch.setattr(
-        lifecycle.time,
-        "sleep",
-        lambda _seconds: pytest.fail("cancelled pending wait must not sleep"),
-    )
-    checks = []
-
-    def check_cancelled():
-        checks.append(True)
-        raise _RunCancelled("run was cancelled")
-
-    with pytest.raises(_RunCancelled, match="was cancelled"):
-        lifecycle._await_runpod_completed_metrics(
-            object(),
-            lifecycle.time.time() + 1_000.0,
-            check_cancelled=check_cancelled,
-        )
-
-    assert checks == [True]
 
 
 @pytest.mark.parametrize(
@@ -1304,7 +1232,7 @@ def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
     submits = []
     teardown_events = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         submits.append(attempt)
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         return PollResult(False, failure="job_preempted", detail="resource lost")
@@ -1328,7 +1256,7 @@ def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
             raise RuntimeError("private status response")
         return {"status": "IN_PROGRESS"}
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "submit_attempt", fake_submit)
     monkeypatch.setattr(runpod_api, "cancel_job", cancel_job)
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
     monkeypatch.setattr(runpod_api, "job_status", job_status)
@@ -1339,7 +1267,7 @@ def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
     log = io.StringIO()
 
     with pytest.raises(RuntimeError, match="teardown could not be confirmed") as caught:
-        runner_lifecycle._submit_seed_supervised(spec, 0, log)
+        runner_lifecycle._run_attempts_supervised(spec, log)
 
     assert submits == [0]
     assert teardown_events[:2] == [("cancel", "ep0", "j0"), ("delete", "ep0")]
@@ -1374,7 +1302,7 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
         lambda eid, jid, **_kw: cancels.append(eid) or {"id": jid, "status": "CANCELLED"},
     )
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         if attempt == 0:
             on_handle(_runpod_handle("ep0", "j0"))  # provisioned, then lost infra-shaped
             return PollResult(False, failure="job_preempted", detail="resource lost")
@@ -1386,13 +1314,13 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
         on_handle(_runpod_handle("ep2", "j2", 2))  # fresh endpoint on the final retry
         return PollResult(True, metrics={"train_tokens": 4096})
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "submit_attempt", fake_submit)
 
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
 
-    metrics = runner_lifecycle._submit_seed_supervised(spec, 0, log)
+    metrics = runner_lifecycle._run_attempts_supervised(spec, log)
 
     assert metrics["train_tokens"] == 4096, "the run must reach the successful final retry"
     assert cancels == ["ep0"], (
@@ -1416,18 +1344,18 @@ def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
 
     calls = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         calls.append(attempt)
         on_handle(_runpod_handle())
         return PollResult(False, failure="job_failed", detail="ValueError in reward_fn")
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "submit_attempt", fake_submit)
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
 
     with pytest.raises(RuntimeError, match="failed after retries"):
-        runner_lifecycle._submit_seed_supervised(spec, 0, log)
+        runner_lifecycle._run_attempts_supervised(spec, log)
 
     assert calls == [0], "a non-infra failure must fail fast, not relaunch"
     assert "not retrying" in log.getvalue()
@@ -1443,17 +1371,17 @@ def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
 
     calls = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         calls.append(attempt)
         raise UnreconciledCreateError("ambiguous vast create; aborting the offer walk")
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "submit_attempt", fake_submit)
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
 
     with pytest.raises(RuntimeError, match="failed after retries"):
-        runner_lifecycle._submit_seed_supervised(spec, 0, log)
+        runner_lifecycle._run_attempts_supervised(spec, log)
 
     assert calls == [0], "an unreconciled create must fail fast, not relaunch (no double-provision)"
     assert "not retrying" in log.getvalue()
@@ -1469,19 +1397,19 @@ def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypa
     from flash.providers.core.base import PollResult
     from flash.providers.runpod.execution import job_execution as rp_jobs
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         if attempt == 0:
             print("Traceback (most recent call last):\ntorch.OutOfMemoryError: CUDA OOM", file=log)
             return PollResult(False, failure="job_preempted", detail="resource lost")
         print("worker: stage=rl_step attempt=1 step=1", file=log)
         return PollResult(True, metrics={"train_tokens": 4096})
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "submit_attempt", fake_submit)
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
 
-    runner_lifecycle._submit_seed_supervised(spec, 0, log)
+    runner_lifecycle._run_attempts_supervised(spec, log)
 
     text = log.getvalue()
     marker = "---- attempt 1 starts here; everything above it is from earlier attempts ----"
@@ -1504,18 +1432,18 @@ def test_the_marker_does_not_claim_one_previous_attempt_after_two_failures(orch,
     from flash.providers.core.base import PollResult
     from flash.providers.runpod.execution import job_execution as rp_jobs
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         if attempt < 2:
             print(f"attempt {attempt} output", file=log)
             return PollResult(False, failure="job_preempted", detail="resource lost")
         return PollResult(True, metrics={"train_tokens": 4096})
 
-    monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
+    monkeypatch.setattr(rp_jobs, "submit_attempt", fake_submit)
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
 
-    runner_lifecycle._submit_seed_supervised(spec, 0, log)
+    runner_lifecycle._run_attempts_supervised(spec, log)
 
     text = log.getvalue()
     assert "---- attempt 2 starts here" in text
@@ -1531,13 +1459,13 @@ def test_a_single_attempt_run_gets_no_boundary_marker(orch, monkeypatch):
 
     monkeypatch.setattr(
         rp_jobs,
-        "submit_run",
+        "submit_attempt",
         lambda *a, **k: PollResult(True, metrics={"train_tokens": 4096}),
     )
     spec = _spec()
     _seed_status(orch, spec)
     log = io.StringIO()
 
-    runner_lifecycle._submit_seed_supervised(spec, 0, log)
+    runner_lifecycle._run_attempts_supervised(spec, log)
 
     assert "starts here; everything above" not in log.getvalue()

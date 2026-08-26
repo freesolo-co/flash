@@ -272,10 +272,10 @@ def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
     )
 
     lam_instances = [
-        {"id": "i-live", "name": lambda_jobs.instance_label("flash-live", 0, 0)},  # live -> KEEP
+        {"id": "i-live", "name": lambda_jobs.instance_label("flash-live", 0)},  # live -> KEEP
         {
             "id": "i-orphan",
-            "name": lambda_jobs.instance_label("flash-dead", 0, 0),
+            "name": lambda_jobs.instance_label("flash-dead", 0),
         },  # our leak -> kill
         {"id": "i-foreign", "name": "not-ours"},  # non-flash name -> never touch
     ]
@@ -311,9 +311,9 @@ def test_sweep_spares_other_control_planes_live_instances(monkeypatch):
     )
 
     lam_instances = [
-        {"id": "i-mine", "name": lambda_jobs.instance_label("flash-mine", 0, 0)},  # ours, live
+        {"id": "i-mine", "name": lambda_jobs.instance_label("flash-mine", 0)},  # ours, live
         # Another control plane's box, named with ITS run id — we have no record of it.
-        {"id": "i-theirs", "name": lambda_jobs.instance_label("flash-theirs", 0, 0)},
+        {"id": "i-theirs", "name": lambda_jobs.instance_label("flash-theirs", 0)},
     ]
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: lam_instances)
@@ -335,8 +335,8 @@ def test_sweep_resolves_active_labels_after_listing(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
 
     events = []
-    fresh = jobs.instance_label("flash-fresh", 0, 0)
-    orphan = jobs.instance_label("flash-old", 0, 0)
+    fresh = jobs.instance_label("flash-fresh", 0)
+    orphan = jobs.instance_label("flash-old", 0)
 
     def fake_list():
         events.append("list")
@@ -370,7 +370,7 @@ def test_sweep_skips_when_active_set_resolution_raises(monkeypatch):
     monkeypatch.setattr(
         lambda_api,
         "list_instances",
-        lambda: [{"id": "i-live", "name": jobs.instance_label("flash-live", 0, 0)}],
+        lambda: [{"id": "i-live", "name": jobs.instance_label("flash-live", 0)}],
     )
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)

@@ -234,7 +234,7 @@ def _fail_blocked_recovery(
 ) -> bool:
     from flash.runner.accounting.reconciliation import _compare_and_fail_remote
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-    from flash.runner.supervise.lifecycle import _adopt_completed_attempt, _CompletedAttemptPending
+    from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
     status = get_status(spec.run_id)
     if status.remote is None:
@@ -242,10 +242,7 @@ def _fail_blocked_recovery(
             deadline_at = _load_run_deadline_at(spec.run_id)
         except RuntimeError:
             deadline_at = float(status.created_at) + float(spec.gpu.max_wall_seconds)
-        try:
-            metrics = _handleless_completed_metrics(spec, status, deadline_at)
-        except _CompletedAttemptPending:
-            return False
+        metrics = _handleless_completed_metrics(spec, status, deadline_at)
         if metrics is not None:
             applied = _adopt_completed_attempt(
                 spec.run_id,
@@ -751,7 +748,7 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
         # run remains, so a phantom that surfaced in the sweep->resubmit gap (Vast's instance list is
         # eventually consistent) can't get a SECOND worker writing the same seed-scoped artifacts.
         # A run still `queued` never reached that window: the runner enqueues as `queued` and lifecycle's
-        # `_update(..., "provisioning")` fires BEFORE any `provider.submit_run`, and nothing regresses
+        # `_update(..., "provisioning")` fires before any `provider.submit_attempt`, and nothing regresses
         # `provisioning`->`queued`, so a `queued` run made no create and can't have left a phantom. Skip
         # the guard for it — else a purely-queued run whose VAST_API_KEY was dropped after submit would
         # fail closed in _confirm_run_clear (unenumerable recorded Vast) and defer forever. The guard

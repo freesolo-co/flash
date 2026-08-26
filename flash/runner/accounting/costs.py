@@ -53,7 +53,7 @@ def _pinned_offline_allocation(provider: str, gpu_type: str, gpu_count: int):
     the offline shape search treats the spec's card count as a ceiling and re-optimizes under it,
     so a live allocator's 2/4/8-card rental would be repriced on whatever smaller shape the static
     rate table prefers. an explicit allocation is the same mechanism the accepted quote was built
-    on (see seed submission), so an estimate that consumes it reproduces the quote's exact
+    on (see attempt supervision), so an estimate that consumes it reproduces the quote's exact
     geometry. the pin fixes geometry, not price: rates stay offline, mirroring the shape search's
     own rate choice, and cancel out of any partial/full ratio. never raises -- an unpriceable pin
     returns ``None`` so the caller degrades to the spec-derived shape instead of failing a charge.
@@ -165,7 +165,7 @@ def charge_usd_for_spec(
 def _rented_basis(remote) -> tuple[str, str, int]:
     """The substrate a run actually rented: (provider, gpu type, card count) from its handle.
 
-    the provider handle is the only durable record of the rented shape -- seed submission persists
+    the provider handle is the only durable record of the rented shape -- attempt supervision persists
     ``allocated_gpu``/``allocated_gpu_count`` beside the provider precisely because the spec's own
     count is just the ceiling the allocator searched under. a successful cancel tears the handle
     down before billing runs, so the cancel path captures it pre-teardown and passes it here.
@@ -356,10 +356,9 @@ def actual_steps_run(status: RunStatus) -> int:
     """return current-fence cumulative work for cancellation billing."""
     progress = status.progress if isinstance(status.progress, dict) else {}
     attempt = status.attempt if isinstance(status.attempt, dict) else {}
-    if (
-        progress.get("attempt_id") != attempt.get("attempt_id")
-        or progress.get("fence") != attempt.get("fence")
-    ):
+    if progress.get("attempt_id") != attempt.get("attempt_id") or progress.get(
+        "fence"
+    ) != attempt.get("fence"):
         return 0
     completed = progress.get("completed_steps")
     if isinstance(completed, int) and not isinstance(completed, bool) and completed > 0:

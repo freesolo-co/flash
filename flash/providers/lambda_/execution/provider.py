@@ -46,10 +46,9 @@ class LambdaProvider(InstanceProvider):
 
         return hourly_rate(gpu)
 
-    def _submit_run(
+    def _submit_attempt(
         self,
         spec,
-        seed: int,
         *,
         log: Any,
         on_handle: Any,
@@ -59,11 +58,10 @@ class LambdaProvider(InstanceProvider):
         source_snapshot: dict | None,
         deadline_at: float | None,
     ) -> PollResult:
-        from flash.providers.lambda_.jobs import submit_run_lambda
+        from flash.providers.lambda_.jobs import submit_attempt_lambda
 
-        return submit_run_lambda(
+        return submit_attempt_lambda(
             spec,
-            seed,
             log=log,
             on_handle=on_handle,
             attempt=attempt,
@@ -73,21 +71,19 @@ class LambdaProvider(InstanceProvider):
             deadline_at=deadline_at,
         )
 
-    def _poll_job(
+    def _poll_attempt(
         self,
         handle: JobHandle,
         spec,
-        seed: int,
         *,
         log: Any,
         deadline_at: float | None,
     ) -> PollResult:
-        from flash.providers.lambda_.jobs import poll_lambda_job
+        from flash.providers.lambda_.jobs import poll_lambda_attempt
 
-        return poll_lambda_job(
+        return poll_lambda_attempt(
             handle,
             spec,
-            seed,
             log=log,
             deadline_at=deadline_at,
         )

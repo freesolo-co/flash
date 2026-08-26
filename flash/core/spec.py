@@ -268,18 +268,6 @@ CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
 TRAINER_BACKEND = "verl"
 
 
-def require_matching_seed(spec: JobSpec, seed: Any) -> int:
-    """Require the retained provider seed argument to match the authoritative JobSpec seed."""
-    provided = parse_seed(seed)
-    canonical = parse_seed(spec.seed)
-    if provided != canonical:
-        raise ValueError(
-            f"provider seed {provided} does not match JobSpec.seed {canonical}; "
-            "use spec.seed as the provider seed"
-        )
-    return canonical
-
-
 def _model_revision(value: Any) -> str:
     """parse an optional exact model-repository revision."""
     if not isinstance(value, str):

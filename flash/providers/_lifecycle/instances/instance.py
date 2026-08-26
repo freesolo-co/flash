@@ -55,29 +55,19 @@ def run_label_prefix(run_id: str) -> str:
 
 
 def label_matches_run(label: str, prefix: str) -> bool:
-    """True iff ``label`` belongs to the run whose prefix is ``prefix`` — an EXACT match, or the prefix
-    followed by the ``-s`` seed boundary. Boundary-anchored so ``flash-100`` never matches
-    ``flash-1000-...`` (or vice versa). The single label-ownership test every instance provider's sweep
-    and run-scoped teardown shares."""
-    return label == prefix or label.startswith(prefix + "-s")
+    """Return whether a label is the exact run prefix or uses its attempt boundary."""
+    return label == prefix or label.startswith(prefix + "-a")
 
 
-def instance_label(run_id: str, seed: int, attempt: int) -> str:
-    """Instance name: run-derived so ``sweep_orphans`` can tell ours from anything else on the
-    account, and bounded (via ``run_label_prefix``) so the provider never truncates it."""
-    try:
-        seed_i = int(seed)
-    except (TypeError, ValueError):
-        seed_i = 0
+def instance_label(run_id: str, attempt: int) -> str:
+    """Build a bounded run-owned instance name with the complete attempt identity."""
     attempt_i = _attempt_int(attempt)
     if attempt_i is None:
         raise ValueError("instance attempt identity is invalid")
-    seed_s, attempt_s = str(seed_i), str(attempt_i)
-    # Bound the whole suffix to _SUFFIX_BUDGET: split the digit budget between attempt and seed.
-    digit_budget = _SUFFIX_BUDGET - len("-s-a")
-    attempt_s = attempt_s[: max(1, min(len(attempt_s), max(1, digit_budget - 1)))]
-    seed_s = seed_s[: max(0, digit_budget - len(attempt_s))]
-    return f"{run_label_prefix(run_id)}-s{seed_s}-a{attempt_s}"
+    suffix = f"-a{attempt_i}"
+    if len(suffix) > _SUFFIX_BUDGET:
+        raise ValueError("instance attempt identity exceeds the provider name budget")
+    return f"{run_label_prefix(run_id)}{suffix}"
 
 
 @dataclass
@@ -189,7 +179,6 @@ fi
 
 def build_payload(
     spec,
-    seed: int,
     attempt: int,
     fence: int,
     *,
@@ -202,7 +191,6 @@ def build_payload(
     deadline_at: float | None = None,
 ) -> dict:
     """The bootstrap input, including the deadlines and fenced identity the instance cannot infer."""
-    from flash.core.spec import require_matching_seed
     from flash.envs.loading.base import worker_pip_with_extras
     from flash.providers._lifecycle.net.worker import (
         build_worker_env,
@@ -210,12 +198,10 @@ def build_payload(
     )
     from flash.snapshot.archive import parse_descriptor
 
-    canonical_seed = require_matching_seed(spec, seed)
     # strip the runpod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.
     env = strip_runpod_volume_env(
         build_worker_env(
             spec,
-            canonical_seed,
             runtime_secrets=runtime_secrets,
         )
     )

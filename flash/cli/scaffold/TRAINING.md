@@ -364,7 +364,9 @@ remove that failover, and cannot be combined with `providers`. An unknown name i
 time and the error lists the names your plane accepts. `[gpu] type` pins one exact active
 validated GPU class. Run artifacts are stored in a
 private environment-scoped repo with content-addressed Flash code snapshots. Set `seed` only at the
-top level. Compose or tweak configs without editing files: `--config extra.toml` (deep-merge) and
+top level. A run has exactly one authoritative seed and may execute many durable fenced attempts on
+replacement hosts or GPU classes. Every attempt uses that same `seed`; retry is an action and budget
+policy, not a second run or seed identity. Compose or tweak configs without editing files: `--config extra.toml` (deep-merge) and
 `--set key=value` (e.g. `--set train.epochs=3`). `--gpus N` is
 shorthand for `--set gpu.count=N`; both land in one override list, so repeats resolve left to
 right.
@@ -412,7 +414,8 @@ by one later record. The terminal result manifest carries the final metrics and 
 
 `flash runs status` separates four kinds of information:
 
-- `attempt`: the current attempt, fence, state, and fixed deadlines;
+- `attempt`: the current durable attempt, fence, state, and fixed deadlines. Attempt identity is
+  separate from the run's one top-level seed;
 - `progress`: the latest cumulative worker observation, including completed steps and metrics;
 - `resource`: the latest provider observation, including provider state and transport availability;
 - `result`: the terminal worker outcome once the immutable result manifest is visible.

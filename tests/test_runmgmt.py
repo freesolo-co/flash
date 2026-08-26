@@ -542,7 +542,7 @@ def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         runner_lifecycle,
-        "_submit_seed_supervised",
+        "_run_attempts_supervised",
         lambda *a, **k: {"wall_seconds": 1.0, "cost_usd": 0.01},
     )
     monkeypatch.setattr(
@@ -612,7 +612,7 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
         def __init__(self):
             self.attempts = []
 
-        def submit_run(self, _spec, _seed, *, on_handle, attempt, **_kwargs):
+        def submit_attempt(self, _spec, *, on_handle, attempt, **_kwargs):
             self.attempts.append(attempt)
             on_handle(
                 _runpod_remote(
@@ -635,8 +635,8 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    metrics = lifecycle._submit_seed_supervised(
-        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    metrics = lifecycle._run_attempts_supervised(
+        spec, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
     )
 
     assert metrics["wall_seconds"] == 1.0
@@ -691,7 +691,7 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
         def __init__(self):
             self.attempts = []
 
-        def submit_run(self, _spec, _seed, *, attempt, on_handle, **_kwargs):
+        def submit_attempt(self, _spec, *, attempt, on_handle, **_kwargs):
             self.attempts.append(attempt)
             if attempt == 0:
                 raise RuntimeError("provider accepted create but response was lost")
@@ -708,9 +708,7 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    lifecycle._submit_seed_supervised(
-        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
-    )
+    lifecycle._run_attempts_supervised(spec, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT)
 
     assert provider.attempts == [0, 1]
     assert runner_status.get_status(spec.run_id).remote["attempt"] == 1
@@ -770,7 +768,7 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
             self.walls = []
             self.attempts = []
 
-        def submit_run(self, run_spec, _seed, *, on_handle, attempt, **_kwargs):
+        def submit_attempt(self, run_spec, *, on_handle, attempt, **_kwargs):
             self.walls.append(run_spec.gpu.max_wall_seconds)
             self.attempts.append(attempt)
             on_handle(
@@ -795,9 +793,7 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    lifecycle._submit_seed_supervised(
-        spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
-    )
+    lifecycle._run_attempts_supervised(spec, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT)
 
     assert provider.attempts == [0, 1]
     assert allocation_walls == [200.0, 120.0]
@@ -865,7 +861,7 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
         def __init__(self):
             self.attempts = []
 
-        def submit_run(self, _spec, _seed, *, attempt, **_kwargs):
+        def submit_attempt(self, _spec, *, attempt, **_kwargs):
             self.attempts.append(attempt)
             clock["now"] = 245.0
             raise RuntimeError("provider body secret")
@@ -875,7 +871,7 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
 
     log = io.StringIO()
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance") as exc_info:
-        lifecycle._submit_seed_supervised(spec, spec.seed, log, source_snapshot=_SOURCE_SNAPSHOT)
+        lifecycle._run_attempts_supervised(spec, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert provider.attempts == [0]
     assert allocations == [True]
@@ -1576,9 +1572,7 @@ def test_new_attempt_requires_full_provider_minimum_before_allocation(monkeypatc
     monkeypatch.setattr(allocator, "allocate", lambda *_args, **_kwargs: allocations.append(True))
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
-        lifecycle._submit_seed_supervised(
-            spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
-        )
+        lifecycle._run_attempts_supervised(spec, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT)
 
     assert allocations == []
     assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 0
@@ -1678,7 +1672,7 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
     poll_walls = []
 
     class FailedProvider:
-        def poll(self, _handle, poll_spec, *_args, **_kwargs):
+        def poll_attempt(self, _handle, poll_spec, **_kwargs):
             poll_walls.append(poll_spec.gpu.max_wall_seconds)
             return PollResult(False, failure="job_preempted", detail="worker stopped")
 
@@ -2079,7 +2073,7 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     )
 
     class Provider:
-        def poll(self, *_args, **_kwargs):
+        def poll_attempt(self, *_args, **_kwargs):
             polled.append(True)
             raise AssertionError("expired recovery must not poll")
 
@@ -2139,7 +2133,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
         def destroy(self, _handle):
             raise RuntimeError("teardown unconfirmed")
 
-        def poll(self, *_args, **_kwargs):
+        def poll_attempt(self, *_args, **_kwargs):
             raise AssertionError("expired recovery must not poll")
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
@@ -2180,13 +2174,12 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
     )
     monkeypatch.setattr(
         polling,
-        "poll_job",
+        "poll_attempt",
         lambda *_args, **_kwargs: PollResult(True, metrics={"wall_seconds": 1.0}),
     )
 
-    job_execution.submit_run(
+    job_execution.submit_attempt(
         spec,
-        0,
         attempt=2,
         source_snapshot=_SOURCE_SNAPSHOT,
         on_handle=handles.append,
@@ -2862,7 +2855,7 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
             self.submits = []
             self.teardown = []
 
-        def submit_run(self, _spec, _seed, *, attempt, on_handle, **_kwargs):
+        def submit_attempt(self, _spec, *, attempt, on_handle, **_kwargs):
             self.submits.append(attempt)
             runner_status._update(spec.run_id, "cancelled")
             on_handle(
@@ -2886,9 +2879,8 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
     with pytest.raises(runner_errors._TerminalHandleRace):
-        lifecycle._submit_seed_supervised(
+        lifecycle._run_attempts_supervised(
             spec,
-            spec.seed,
             io.StringIO(),
             source_snapshot=_SOURCE_SNAPSHOT,
         )
@@ -2954,7 +2946,7 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
     class Provider:
         supports_weight_cache = False
 
-        def submit_run(self, _spec, _seed, *, on_handle, **_kwargs):
+        def submit_attempt(self, _spec, *, on_handle, **_kwargs):
             runner_status._update(spec.run_id, "cancelled", remote=remote_a)
             on_handle(remote_b)
             raise AssertionError("terminal handle callback must not return")
@@ -2968,9 +2960,8 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
 
     with pytest.raises(runner_errors._TerminalHandleRace):
-        lifecycle._submit_seed_supervised(
+        lifecycle._run_attempts_supervised(
             spec,
-            spec.seed,
             io.StringIO(),
             source_snapshot=_SOURCE_SNAPSHOT,
         )
@@ -3001,7 +2992,7 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     submitted: list[bool] = []
     monkeypatch.setattr(
         runner_lifecycle,
-        "_submit_seed_supervised",
+        "_run_attempts_supervised",
         lambda *a, **k: submitted.append(True) or {},
     )
 

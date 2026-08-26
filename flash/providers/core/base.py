@@ -884,10 +884,9 @@ class Provider(Protocol):
         lookup blip so allocate() can degrade to the others yet still tell 'no fit' from 'outage'."""
         ...
 
-    def submit_run(
+    def submit_attempt(
         self,
         spec: JobSpec,
-        seed: int,
         *,
         log: Any = None,
         on_handle: Any = None,
@@ -904,11 +903,10 @@ class Provider(Protocol):
         """
         ...
 
-    def poll(
+    def poll_attempt(
         self,
         handle: JobHandle,
         spec: JobSpec,
-        seed: int,
         *,
         log: Any = None,
         _deadline_at: float | None = None,

@@ -850,26 +850,31 @@ def endpoint_name(friendly_gpu: str, suffix: str | None = None) -> str:
 
 
 def _run_suffix(run_id: str | None) -> str | None:
-    """Stable, collision-free per-run endpoint suffix: sha1(run_id)[:8] with a readable prefix.
-
-    Using only the last segment of run_id collides when run_ids end in a GPU name.
-    """
+    """Build the bounded hashed run prefix reserved for attempt endpoint names."""
     if not run_id:
         return None
     import hashlib
     import re
 
-    h = hashlib.sha1(run_id.encode()).hexdigest()[:8]
-    prefix = re.sub(r"[^a-z0-9]", "", run_id.lower())[-12:]
-    return f"{prefix}{h}" if prefix else h
+    digest = hashlib.sha1(run_id.encode()).hexdigest()[:8]
+    readable = re.sub(r"[^a-z0-9]", "", run_id.lower())[-3:]
+    return f"{readable}{digest}" if readable else digest
+
+
+def attempt_suffix(run_id: str, attempt: int) -> str:
+    """Build a bounded suffix that preserves the complete explicit attempt ordinal."""
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        raise ValueError("RunPod attempt identity is invalid")
+    run_prefix = _run_suffix(run_id)
+    suffix = f"{run_prefix}-a{attempt}"
+    if len(suffix) > 24:
+        raise ValueError("RunPod attempt identity exceeds the endpoint name budget")
+    return suffix
 
 
 def _endpoint_name_matches_run(name: str, target: str) -> bool:
     canonical = str(name or "").removeprefix("live-")
-    return (
-        canonical == target
-        or re.fullmatch(re.escape(target) + r"r[1-9][0-9]*", canonical) is not None
-    )
+    return re.fullmatch(re.escape(target) + r"-a[0-9]+", canonical) is not None
 
 
 def _select_endpoint_resources(resources: dict, target: str) -> list[str]:

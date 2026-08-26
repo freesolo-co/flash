@@ -481,7 +481,6 @@ class _AttachContext:
     worker_spec: JobSpec
     persisted_remote: dict
     handle: JobHandle
-    seed: int
     recovered_attempt: int
     next_attempt: int
     source_snapshot: dict | None
@@ -496,7 +495,6 @@ def _build_attach_context(
     from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
 
     remote = dict(persisted_remote)
-    seed = int(remote.pop("seed", worker_spec.seed))
     remote.pop("code_prefix", None)
     source_snapshot = source_snapshot_from_status(get_status(worker_spec.run_id))
     provider_name = remote.get("provider")
@@ -514,7 +512,6 @@ def _build_attach_context(
         worker_spec=worker_spec,
         persisted_remote=persisted_remote,
         handle=JobHandle.from_dict(remote),
-        seed=seed,
         recovered_attempt=recovered_attempt,
         next_attempt=recovered_attempt + 1,
         source_snapshot=source_snapshot,
@@ -800,10 +797,9 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             f"attaching to {run_id}: provider={context.handle.provider} {context.handle.data}",
             file=log,
         )
-        result = get_provider(context.handle.provider).poll(
+        result = get_provider(context.handle.provider).poll_attempt(
             context.handle,
             poll_spec,
-            context.seed,
             log=log,
             _deadline_at=_load_run_deadline_at(run_id),
         )

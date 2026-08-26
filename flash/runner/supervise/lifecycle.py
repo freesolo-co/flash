@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from flash.core.spec import JobSpec, gpu_count_of, require_matching_seed
+from flash.core.spec import JobSpec, gpu_count_of
 
 # Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
 # max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
@@ -162,25 +162,22 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _submit_seed_supervised(
+def _run_attempts_supervised(
     spec: JobSpec,
-    seed: int,
     log,
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     attempt_start: int = 0,
 ) -> dict:
-    """Run one seed with bounded auto-retry on infra-shaped failures.
+    """Run one run through bounded attempt retries on infra-shaped failures.
 
     Retries resume from the latest HF checkpoint on a fresh host. Genuine worker errors fail fast.
     ``attempt_start`` offsets persisted identities without expanding this invocation's retry budget.
     """
-    seed = require_matching_seed(spec, seed)
-    from flash.runner.supervise.seed_submission import submit_seed_supervised
+    from flash.runner.supervise.attempt_supervision import run_attempts_supervised
 
-    return submit_seed_supervised(
+    return run_attempts_supervised(
         spec,
-        seed,
         log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
@@ -219,7 +216,7 @@ def _run_job_inner(
     try:
         # dev replaced the explicit code upload with managed source snapshots, so staging only has
         # to pin the environment package before the provider is allocated. the staged package rides
-        # into the persisted snapshot at the per-attempt persist in `_submit_seed_supervised`, which
+        # into the persisted snapshot at the per-attempt persist in `_run_attempts_supervised`, which
         # already runs after this with the fully planned spec -- persisting a second time here would
         # hash a half-planned spec no later integrity check can reproduce.
         deadline_at = _load_run_deadline_at(spec.run_id)
@@ -268,7 +265,7 @@ def _run_training(
         validate_terminal_source_metrics,
     )
     from flash.runner.supervise.errors import _RunCancelled
-    from flash.runner.supervise.lifecycle import _submit_seed_supervised
+    from flash.runner.supervise.lifecycle import _run_attempts_supervised
 
     if spec.algorithm == "opd":
         from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
@@ -294,9 +291,8 @@ def _run_training(
         file=log,
         flush=True,
     )
-    metrics = _submit_seed_supervised(
+    metrics = _run_attempts_supervised(
         spec,
-        spec.seed,
         log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,

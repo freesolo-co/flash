@@ -25,6 +25,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- Each training run now owns one authoritative top-level `seed` and may execute multiple durable
+  fenced attempts on replacement hosts or GPU classes. Retry remains an action and budget policy,
+  not an identity. Provider handles and CLI status expose attempt identity without persisting a
+  duplicate seed. RunPod endpoints use an explicit `aN` suffix for every attempt, including attempt
+  zero, while Lambda and Vast instances use `<run-prefix>-aN`. Resource cleanup recognizes only the
+  exact run prefix and the new attempt boundary.
 - Active training and hosted serving now expose exactly `Qwen/Qwen3.5-9B`,
   `Qwen/Qwen3.8-27B`, and `Qwen/Qwen3.6-35B-A3B`. Qwen3.8 uses the immutable BF16 revision
   `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` and official native block-FP8 serving revision
@@ -70,15 +76,17 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Deployment cutover
 
-This release requires a maintenance-window cutover because old mutable lifecycle records are not
-translated or read by the new protocol:
+This release requires a maintenance-window cutover because old mutable lifecycle records and old
+provider resource names are not translated or read by the new protocol:
 
 1. Stop new training submissions.
 2. Drain or explicitly cancel every old-source queued, provisioning, running, finalizing, or
    reconciling attempt.
-3. Confirm that no old RunPod job or endpoint and no Lambda or Vast instance remains.
+3. Confirm that no old RunPod job or endpoint and no Lambda or Vast instance remains. Old RunPod
+   `rN` or implicit-attempt names and old Lambda or Vast `-s<seed>-a<attempt>` names are deliberately
+   not matched after cutover.
 4. Confirm that cleanup ledgers contain no unconfirmed resources.
-5. Deploy the Flash control plane, worker images, and CLI package together at version `1.2.119`.
+5. Deploy the Flash control plane, worker images, and CLI package together at version `1.2.121`.
 6. Accept that Freesolo live progress is unavailable until its separate consumer update; lifecycle
    mirroring continues without `lastHeartbeat` or `gpuStatus`.
 7. Run the smallest safe SFT, GRPO, and OPD lifecycle smokes before reopening submissions.

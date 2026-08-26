@@ -44,7 +44,7 @@ def test_worker_retry_path_has_no_github_pin_fallback() -> None:
 
 
 def test_submit_context_preserves_controller_staged_identity_without_resolving(monkeypatch) -> None:
-    from flash.runner.supervise import seed_submission
+    from flash.runner.supervise import attempt_supervision
 
     monkeypatch.setattr(
         runner_artifacts,
@@ -52,7 +52,7 @@ def test_submit_context_preserves_controller_staged_identity_without_resolving(m
         lambda _spec: (_ for _ in ()).throw(AssertionError("worker retry must not resolve github")),
     )
     spec = _staged_spec()
-    context = seed_submission._build_context(
+    context = attempt_supervision._build_context(
         spec,
         spec.seed,
         io.StringIO(),
