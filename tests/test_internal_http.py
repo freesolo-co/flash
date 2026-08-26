@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import types
 import urllib.error
 import urllib.request
 import urllib.response
@@ -1071,6 +1072,42 @@ def test_urlopen_replaced_before_helper_import_is_called(
     assert result.returncode == 0, result.stderr
 
 
+def test_unknown_stdlib_urlopen_fails_closed_before_transport(monkeypatch) -> None:
+    contacted: list[str] = []
+
+    class UnexpectedTransport(urllib.request.BaseHandler):
+        def https_open(self, request):
+            contacted.append(request.full_url)
+            raise AssertionError("transport was contacted")
+
+    original = urllib.request.urlopen
+    code = original.__code__.replace(co_names=(*original.__code__.co_names, "vendor_hook"))
+    vendor_urlopen = types.FunctionType(
+        code,
+        original.__globals__,
+        original.__name__,
+        original.__defaults__,
+        original.__closure__,
+    )
+    vendor_urlopen.__kwdefaults__ = original.__kwdefaults__
+    vendor_urlopen.__module__ = original.__module__
+    vendor_urlopen.__qualname__ = original.__qualname__
+    monkeypatch.setattr(urllib.request, "urlopen", vendor_urlopen)
+    urllib.request.install_opener(urllib.request.build_opener(UnexpectedTransport()))
+
+    with pytest.raises(urllib.error.URLError) as exc_info:
+        _urlopen_no_redirect(urllib.request.Request("https://source.invalid/data"), timeout=3.0)
+
+    assert exc_info.value.reason == "stdlib urllib transport cannot be classified safely"
+    assert str(exc_info.value) == (
+        "<urlopen error stdlib urllib transport cannot be classified safely>"
+    )
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert "vendor_hook" not in str(exc_info.value)
+    assert contacted == []
+
+
 def test_urlopen_helper_preserves_late_bound_monkeypatch(monkeypatch) -> None:
     seen = []
     response = object()
@@ -1105,6 +1142,74 @@ def test_urlopen_helper_preserves_explicit_injected_transport() -> None:
 
     assert actual is response
     assert seen == [("https://source.invalid/data", 3.0)]
+
+
+def test_explicit_injected_stdlib_code_clone_is_called_directly() -> None:
+    original = urllib.request.urlopen
+    calls: list[tuple[str, float]] = []
+    globals_copy = dict(original.__globals__)
+
+    class RecordingOpener:
+        def open(self, request, data=None, timeout=None):
+            calls.append((request.full_url, timeout))
+            return "injected-response"
+
+    globals_copy["_opener"] = RecordingOpener()
+    replacement = types.FunctionType(
+        original.__code__,
+        globals_copy,
+        original.__name__,
+        original.__defaults__,
+        original.__closure__,
+    )
+    replacement.__kwdefaults__ = original.__kwdefaults__
+    replacement.__module__ = original.__module__
+    replacement.__qualname__ = original.__qualname__
+
+    actual = _urlopen_no_redirect(
+        urllib.request.Request("https://source.invalid/data"),
+        timeout=3.0,
+        urlopen=replacement,
+    )
+
+    assert actual == "injected-response"
+    assert calls == [("https://source.invalid/data", 3.0)]
+
+
+def test_explicit_global_urlopen_is_compared_against_one_snapshot(monkeypatch) -> None:
+    explicit = urllib.request.urlopen
+    calls: list[str] = []
+    reads = 0
+
+    class TerminalHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            calls.append("opener")
+            return _response(request.full_url)
+
+    def replacement(request, timeout):
+        calls.append("replacement")
+        return _response(request.full_url)
+
+    class SwitchingRequestModule(types.ModuleType):
+        def __getattribute__(self, name):
+            nonlocal reads
+            if name == "urlopen":
+                reads += 1
+                return explicit if reads == 1 else replacement
+            return super().__getattribute__(name)
+
+    monkeypatch.setattr(urllib.request, "__class__", SwitchingRequestModule)
+    urllib.request.install_opener(urllib.request.build_opener(TerminalHandler()))
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/data"),
+        timeout=3.0,
+        urlopen=explicit,
+    ) as response:
+        assert response.read() == b"ok"
+
+    assert reads == 1
+    assert calls == ["opener"]
 
 
 def test_unsnapshotable_installed_handler_fails_before_transport() -> None:

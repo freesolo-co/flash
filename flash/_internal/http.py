@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import enum
 import inspect
 import os
 import struct
@@ -43,6 +44,7 @@ _STDLIB_URLOPEN_NAMES = (
 )
 _HANDLER_COPY_ERROR = "installed urllib handler cannot be copied safely"
 _OPENER_COPY_ERROR = "installed urllib opener cannot be copied safely"
+_URLOPEN_CLASSIFICATION_ERROR = "stdlib urllib transport cannot be classified safely"
 _SNAPSHOT_DEPTH_MAX = 8
 _SNAPSHOT_ITEMS_MAX = 256
 _ABSENT_SLOT = object()
@@ -71,6 +73,12 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     http_error_307 = http_error_redirect
     http_error_308 = http_error_redirect
     https_response = http_response
+
+
+class _UrlopenKind(enum.Enum):
+    STDLIB = enum.auto()
+    INJECTED = enum.auto()
+    UNKNOWN_STDLIB = enum.auto()
 
 
 @dataclass(frozen=True)
@@ -334,27 +342,38 @@ def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
         raise urllib.error.URLError(_OPENER_COPY_ERROR)
 
 
-def _is_stdlib_urlopen(transport: object) -> bool:
+def _classify_urlopen(transport: object) -> _UrlopenKind:
     if type(transport) is not types.FunctionType:
-        return False
+        return _UrlopenKind.INJECTED
+    try:
+        metadata_matches = (
+            object.__getattribute__(transport, "__module__") == urllib.request.__name__
+            and object.__getattribute__(transport, "__name__") == "urlopen"
+            and object.__getattribute__(transport, "__qualname__") == "urlopen"
+        )
+    except Exception:
+        return _UrlopenKind.INJECTED
+    if not metadata_matches:
+        return _UrlopenKind.INJECTED
     try:
         code = object.__getattribute__(transport, "__code__")
         module_file = os.path.realpath(urllib.request.__file__)
         code_file = os.path.realpath(code.co_filename)
         arguments = code.co_varnames[: code.co_argcount + code.co_kwonlyargcount]
-        return (
-            object.__getattribute__(transport, "__module__") == urllib.request.__name__
-            and object.__getattribute__(transport, "__name__") == "urlopen"
-            and object.__getattribute__(transport, "__qualname__") == "urlopen"
-            and code_file == module_file
+        origin_matches = (
+            code_file == module_file
             and code.co_name == "urlopen"
             and code.co_argcount == 3
             and code.co_kwonlyargcount == 4
             and arguments == _STDLIB_URLOPEN_ARGUMENTS
-            and code.co_names == _STDLIB_URLOPEN_NAMES
         )
     except Exception:
-        return False
+        return _UrlopenKind.UNKNOWN_STDLIB
+    if not origin_matches:
+        return _UrlopenKind.INJECTED
+    if code.co_names != _STDLIB_URLOPEN_NAMES:
+        return _UrlopenKind.UNKNOWN_STDLIB
+    return _UrlopenKind.STDLIB
 
 
 def _urlopen_no_redirect(
@@ -365,8 +384,15 @@ def _urlopen_no_redirect(
 ):
     """open one authenticated request without allowing a credential-bearing redirect."""
 
-    transport = urllib.request.urlopen if urlopen is None else urlopen
-    if not _is_stdlib_urlopen(transport):
+    transport = urllib.request.urlopen
+    if urlopen is not None:
+        if urlopen is not transport:
+            return urlopen(request, timeout=timeout)
+        transport = urlopen
+    kind = _classify_urlopen(transport)
+    if kind is _UrlopenKind.INJECTED:
         return transport(request, timeout=timeout)
+    if kind is _UrlopenKind.UNKNOWN_STDLIB:
+        raise urllib.error.URLError(_URLOPEN_CLASSIFICATION_ERROR)
     opener = _active_no_redirect_opener()
     return opener.open(request, timeout=timeout)
